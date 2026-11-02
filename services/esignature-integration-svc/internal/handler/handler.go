@@ -12,6 +12,7 @@ import (
 	"zoiko.io/esignature-integration-svc/internal/domain"
 	"zoiko.io/esignature-integration-svc/internal/events"
 	"zoiko.io/esignature-integration-svc/internal/middleware"
+	"zoiko.io/esignature-integration-svc/internal/provider"
 	"zoiko.io/esignature-integration-svc/internal/store"
 )
 
@@ -25,20 +26,54 @@ type Handler struct {
 	publisher events.Publisher
 	authz     *authz.Client
 	logger    *zap.Logger
+	// providers holds the real e-signature adapters. nil or empty means no
+	// provider is configured, and every provider-asserted operation fails
+	// closed with 503 (see internal/provider).
+	providers *provider.Registry
 }
 
 func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
 }
 
-func RegisterRoutes(r chi.Router, h *Handler) {
-	r.Route("/v1/esignature", func(r chi.Router) {
-		r.Post("/envelopes", h.CreateEnvelope)
-		r.Get("/envelopes", h.ListEnvelopes)
-		r.Get("/envelopes/{id}", h.GetByID)
-		r.Post("/envelopes/{id}/status", h.UpdateStatus)
-		r.Patch("/envelopes/{id}/status", h.UpdateStatus)
+// WithProviders sets the provider registry. Without it the handler is fail-closed.
+func (h *Handler) WithProviders(reg *provider.Registry) *Handler {
+	h.providers = reg
+	return h
+}
+
+// providerAsserted lists the envelope statuses only a provider can make true.
+// VOIDED is the one status this service may decide on its own.
+var providerAsserted = map[string]bool{
+	domain.EnvelopeSent:      true,
+	domain.EnvelopeDelivered: true,
+	domain.EnvelopeSigned:    true,
+}
+
+var settableStatus = map[string]bool{
+	domain.EnvelopeSent:      true,
+	domain.EnvelopeDelivered: true,
+	domain.EnvelopeSigned:    true,
+	domain.EnvelopeVoided:    true,
+}
+
+func writeProviderNotConfigured(w http.ResponseWriter) {
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+		"error":   "esignature_provider_not_configured",
+		"message": "no e-signature provider adapter is configured for this deployment; nothing was sent and no provider state was recorded",
 	})
+}
+
+func RegisterRoutes(r chi.Router, h *Handler) {
+	// Flat patterns, not r.Route sub-routers: RegisterOrchestrationRoutes adds
+	// more /v1/esignature/envelopes/{id}/... routes, and two chi sub-routers
+	// mounted on overlapping prefixes shadow each other (the more specific
+	// mount 404'd GET /envelopes/{id} and POST /envelopes/{id}/status).
+	r.Post("/v1/esignature/envelopes", h.CreateEnvelope)
+	r.Get("/v1/esignature/envelopes", h.ListEnvelopes)
+	r.Get("/v1/esignature/envelopes/{id}", h.GetByID)
+	r.Post("/v1/esignature/envelopes/{id}/status", h.UpdateStatus)
+	r.Patch("/v1/esignature/envelopes/{id}/status", h.UpdateStatus)
 }
 
 func (h *Handler) CreateEnvelope(w http.ResponseWriter, r *http.Request) {
@@ -63,14 +98,26 @@ func (h *Handler) CreateEnvelope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the provider BEFORE anything is persisted: with none configured
+	// the request is refused outright instead of recording an envelope as
+	// SENT that no provider ever received (the previous behaviour).
+	adapter, err := h.providers.Resolve(req.Provider)
+	if err != nil {
+		writeProviderNotConfigured(w)
+		return
+	}
+
+	// Durable record first (PENDING), then the provider call, then SENT with
+	// the provider's own reference (ZS-SVC-S-001 §7.5: store the provider
+	// transaction id before assuming success).
 	env := &domain.SignatureEnvelope{
 		TenantID:      tenantID,
 		LegalEntityID: req.LegalEntityID,
-		Provider:      req.Provider,
+		Provider:      adapter.Name(),
 		DocumentTitle: req.DocumentTitle,
 		SignerEmail:   req.SignerEmail,
 		SignerName:    req.SignerName,
-		Status:        domain.EnvelopeSent,
+		Status:        domain.EnvelopePending,
 	}
 
 	if err := h.store.CreateEnvelope(r.Context(), env); err != nil {
@@ -78,6 +125,29 @@ func (h *Handler) CreateEnvelope(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create envelope")
 		return
 	}
+
+	res, err := adapter.Send(r.Context(), provider.SendRequest{
+		TenantID: tenantID, EnvelopeID: env.EnvelopeID, DocumentTitle: env.DocumentTitle,
+		SignerEmail: env.SignerEmail, SignerName: env.SignerName,
+	})
+	if err != nil || res.ExternalRef == "" {
+		// The envelope stays PENDING; the outcome at the provider is not
+		// claimed either way.
+		h.logger.Error("provider send failed", zap.String("envelope_id", env.EnvelopeID), zap.Error(err))
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"error": "provider_send_failed", "envelope_id": env.EnvelopeID, "status": env.Status,
+		})
+		return
+	}
+	sent, err := h.store.UpdateEnvelopeStatus(r.Context(), env.EnvelopeID, &domain.UpdateStatusRequest{
+		Status: domain.EnvelopeSent, ExternalRef: res.ExternalRef,
+	})
+	if err != nil {
+		h.logger.Error("failed to record provider reference", zap.String("envelope_id", env.EnvelopeID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "envelope sent but provider reference could not be recorded")
+		return
+	}
+	env = sent
 
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
 		EventType: "esignature.envelope.sent", AggregateID: env.EnvelopeID, TenantID: tenantID,
@@ -124,6 +194,10 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "status is required")
 		return
 	}
+	if !settableStatus[req.Status] {
+		writeError(w, http.StatusBadRequest, "status must be one of SENT, DELIVERED, SIGNED, VOIDED")
+		return
+	}
 
 	existing, err := h.store.GetEnvelopeByID(r.Context(), id)
 	if err != nil {
@@ -144,10 +218,24 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SENT/DELIVERED/SIGNED are facts about the provider. With no adapter
+	// for this envelope's provider there is nothing that could have produced
+	// them, so recording one would be fabricated.
+	if providerAsserted[req.Status] {
+		if _, err := h.providers.Resolve(existing.Provider); err != nil {
+			writeProviderNotConfigured(w)
+			return
+		}
+	}
+
 	env, err := h.store.UpdateEnvelopeStatus(r.Context(), id, &req)
 	if err != nil {
 		if errors.Is(err, domain.ErrEnvelopeNotFound) {
 			writeError(w, http.StatusNotFound, "envelope not found")
+			return
+		}
+		if errors.Is(err, domain.ErrInvalidEnvelopeTransition) {
+			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to update envelope status")

@@ -66,7 +66,10 @@ func (s *PgStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth) erro
 	}
 	c.CalculateHealthScore()
 
-	_, err = tx.Exec(ctx, `
+	// The upsert may land on an existing row for this entity/jurisdiction/
+	// domain, so the persisted status_id (and original created_at) are read
+	// back rather than assuming the freshly generated id was the one stored.
+	err = tx.QueryRow(ctx, `
 		INSERT INTO compliance_status_records
 			(status_id, tenant_id, legal_entity_id, jurisdiction_id, domain_name,
 			 overall_status, health_score, total_obligations, fulfilled_obligations,
@@ -84,12 +87,13 @@ func (s *PgStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth) erro
 			open_exceptions = EXCLUDED.open_exceptions,
 			last_evaluated_at = EXCLUDED.last_evaluated_at,
 			notes = EXCLUDED.notes,
-			updated_at = EXCLUDED.updated_at`,
+			updated_at = EXCLUDED.updated_at
+		RETURNING status_id, created_at`,
 		c.StatusID, c.TenantID, c.LegalEntityID, c.JurisdictionID, c.DomainName,
 		string(c.OverallStatus), c.HealthScore, c.TotalObligations, c.FulfilledObligations,
 		c.PendingObligations, c.OverdueObligations, c.OpenExceptions, c.LastEvaluatedAt,
 		c.Notes, c.EffectiveFrom, c.EffectiveTo, c.CreatedBy, c.CreatedAt, c.UpdatedAt,
-	)
+	).Scan(&c.StatusID, &c.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("upsert compliance status: %w", err)
 	}
@@ -112,7 +116,7 @@ func (s *PgStore) GetByID(ctx context.Context, id string) (*domain.ComplianceHea
 		SELECT status_id, tenant_id, legal_entity_id, jurisdiction_id, domain_name,
 		       overall_status, health_score, total_obligations, fulfilled_obligations,
 		       pending_obligations, overdue_obligations, open_exceptions, last_evaluated_at,
-		       notes, effective_from, effective_to, created_by, created_at, updated_at
+		       notes, effective_from::text, effective_to::text, created_by, created_at, updated_at
 		FROM compliance_status_records WHERE status_id = $1`, id,
 	).Scan(
 		&c.StatusID, &c.TenantID, &c.LegalEntityID, &c.JurisdictionID, &c.DomainName,
@@ -145,7 +149,7 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, domai
 		SELECT status_id, tenant_id, legal_entity_id, jurisdiction_id, domain_name,
 		       overall_status, health_score, total_obligations, fulfilled_obligations,
 		       pending_obligations, overdue_obligations, open_exceptions, last_evaluated_at,
-		       notes, effective_from, effective_to, created_by, created_at, updated_at
+		       notes, effective_from::text, effective_to::text, created_by, created_at, updated_at
 		FROM compliance_status_records
 		WHERE ($1 = '' OR legal_entity_id = $1)
 		  AND ($2 = '' OR jurisdiction_id = $2)

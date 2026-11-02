@@ -32,6 +32,10 @@ type Event struct {
 // PublishParams carries the envelope-level fields a call site supplies,
 // alongside the payload-level business object.
 type PublishParams struct {
+	// EventID and OccurredAt are set by the outbox relay so a redelivered
+	// event keeps its original identity; when empty, Publish generates them.
+	EventID       string
+	OccurredAt    time.Time
 	EventType     string
 	SubjectID     string
 	TenantID      string
@@ -63,6 +67,10 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 		Addr:     kafka.TCP(brokers...),
 		Topic:    topic,
 		Balancer: &kafka.LeastBytes{},
+		// The outbox relay publishes one event at a time; the 1s default
+		// batch timeout would cap it at one event per second.
+		BatchTimeout:           10 * time.Millisecond,
+		AllowAutoTopicCreation: true,
 	}
 	return &KafkaPublisher{writer: writer, logger: logger}
 }
@@ -74,10 +82,18 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, logger *zap.Logger) *Kafk
 }
 
 func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
-	evt := Event{
+	eventID := params.EventID
+	if eventID == "" {
 		// A fresh UUID per publish, not a deterministic string — see
 		// docs/architecture/known-gaps.md's event_id collision writeup.
-		EventID:       "evt-" + uuid.New().String(),
+		eventID = "evt-" + uuid.New().String()
+	}
+	occurredAt := params.OccurredAt
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	evt := Event{
+		EventID:       eventID,
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
 		SourceService: "anomaly-detection-svc",
@@ -86,7 +102,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		LegalEntityID: params.LegalEntityID,
 		ActorID:       params.ActorID,
 		CorrelationID: params.CorrelationID,
-		OccurredAt:    time.Now().UTC(),
+		OccurredAt:    occurredAt,
 		Payload:       params.Payload,
 	}
 	data, err := json.Marshal(evt)

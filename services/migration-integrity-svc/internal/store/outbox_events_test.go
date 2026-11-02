@@ -80,7 +80,7 @@ func createJob(t *testing.T, s *store.PgStore, tenantID string, invalidCount int
 		entries = append(entries, domain.AuditEntry{RecordRef: "rec-" + uuid.NewString()[:8], FieldName: "amount", ViolationType: domain.ViolationMissingRequired,
 			Severity: domain.SeverityMQ2, ReasonFamily: domain.ReasonSchema, OwnerID: "owner-1"})
 	}
-	require.NoError(t, s.CreateJob(context.Background(), tenantID, job, nil, entries, "principal-1", "corr-1"))
+	require.NoError(t, s.CreateJob(context.Background(), tenantID, job, nil, entries, "principal-1", "corr-1", store.IdempotencyClaim{}))
 	return job
 }
 
@@ -113,50 +113,81 @@ func TestPgStore_CreateJob_WithViolations_EnqueuesBothInOrder(t *testing.T) {
 	assert.Contains(t, rows[1].payload, `"invalid_count":3`)
 }
 
+// The rewrite replaced "a second archive silently succeeds" with explicit
+// replay protection: the same Idempotency-Key is refused inside the
+// transaction (the handler then replays the stored response), and a second
+// archive under a new key is an illegal transition. Either way exactly one
+// job_archived event exists.
 func TestPgStore_ArchiveJob_EnqueuesOnce_ReplayEmitsNothing(t *testing.T) {
 	s := newStore()
+	ctx := context.Background()
 	tenantID := uuid.NewString()
 	job := createJob(t, s, tenantID, 0)
+	claim := store.IdempotencyClaim{Key: uuid.NewString(), PrincipalID: "principal-2", Operation: "archive_job", RequestHash: "h-archive"}
 
-	require.NoError(t, s.ArchiveJob(context.Background(), tenantID, job.ID, "principal-2", "corr-2"))
-	require.NoError(t, s.ArchiveJob(context.Background(), tenantID, job.ID, "principal-2", "corr-3"), "replay still succeeds")
+	archived, err := s.ArchiveJob(ctx, tenantID, store.ArchiveCommand{JobID: job.ID, ExpectedVersion: job.Version, ActorID: "principal-2", CorrelationID: "corr-2"}, claim)
+	require.NoError(t, err)
+	assert.Equal(t, domain.JobStatusArchived, archived.Status)
+	assert.Equal(t, job.Version+1, archived.Version)
 
-	var archived []outboxRow
+	_, err = s.ArchiveJob(ctx, tenantID, store.ArchiveCommand{JobID: job.ID, ActorID: "principal-2", CorrelationID: "corr-3"}, claim)
+	assert.ErrorIs(t, err, store.ErrIdempotencyKeyInUse, "a replayed key never applies twice")
+	stored, err := s.FindIdempotentResponse(ctx, tenantID, "principal-2", claim.Key)
+	require.NoError(t, err)
+	require.NotNil(t, stored, "the first response is kept for replay")
+	assert.Equal(t, 200, stored.Status)
+	assert.Contains(t, string(stored.Body), `"status":"ARCHIVED"`)
+
+	_, err = s.ArchiveJob(ctx, tenantID, store.ArchiveCommand{JobID: job.ID, ActorID: "principal-2", CorrelationID: "corr-4"}, store.IdempotencyClaim{})
+	assert.ErrorIs(t, err, domain.ErrJobAlreadyArchived)
+
+	var archivedRows []outboxRow
 	for _, r := range outboxRows(t, tenantID, job.ID) {
 		if r.eventType == typeArchived {
-			archived = append(archived, r)
+			archivedRows = append(archivedRows, r)
 		}
 	}
-	require.Len(t, archived, 1, "a replayed archive must not record a second job_archived")
-	assert.Contains(t, archived[0].payload, `"event_type":"migration.job_archived"`)
-	assert.Contains(t, archived[0].payload, `"actor_id":"principal-2"`)
-	assert.Contains(t, archived[0].payload, `"correlation_id":"corr-2"`)
-	assert.Contains(t, archived[0].payload, `"legal_entity_id":"le-uk-1"`)
+	require.Len(t, archivedRows, 1, "a replayed archive must not record a second job_archived")
+	assert.Contains(t, archivedRows[0].payload, `"event_type":"migration.job_archived"`)
+	assert.Contains(t, archivedRows[0].payload, `"actor_id":"principal-2"`)
+	assert.Contains(t, archivedRows[0].payload, `"correlation_id":"corr-2"`)
+	assert.Contains(t, archivedRows[0].payload, `"legal_entity_id":"le-uk-1"`)
+
+	_, err = s.ArchiveJob(ctx, tenantID, store.ArchiveCommand{JobID: job.ID, ExpectedVersion: 1, ActorID: "p", CorrelationID: "c"}, store.IdempotencyClaim{})
+	assert.ErrorIs(t, err, store.ErrVersionMismatch, "a stale If-Match is refused before the state rule")
 }
 
+func remediate(s *store.PgStore, tenantID, jobID, entryID, reason, evidence, actor, corr string, claim store.IdempotencyClaim) (*domain.AuditEntry, error) {
+	entry, _, err := s.DispositionEntry(context.Background(), tenantID, store.DispositionCommand{
+		JobID: jobID, EntryID: entryID, TargetStatus: domain.EntryStatusRemediated,
+		Reason: reason, EvidenceRef: evidence, ActorID: actor, CorrelationID: corr,
+	}, claim)
+	return entry, err
+}
+
+// Ported from the pre-rewrite RemediateEntry test: the decision and its
+// evidence are recorded once; a replay (same key) or a second decision (new
+// key) can neither emit a second event nor rewrite the evidence.
 func TestPgStore_RemediateEntry_EnqueuesOnEntry_ReplayEmitsNothing(t *testing.T) {
 	s := newStore()
 	tenantID := uuid.NewString()
 	job := createJob(t, s, tenantID, 1)
 	entryID := job.AuditEntries[0].ID
+	claim := store.IdempotencyClaim{Key: uuid.NewString(), PrincipalID: "principal-3", Operation: "remediate_entry", RequestHash: "h-rem"}
 
-	got, err := s.RemediateEntry(context.Background(), tenantID, job.ID, entryID,
-		"source corrected and reloaded", "ticket-MIG-42", "principal-3", "corr-4")
+	got, err := remediate(s, tenantID, job.ID, entryID, "source corrected and reloaded", "ticket-MIG-42", "principal-3", "corr-4", claim)
 	require.NoError(t, err)
 	assert.True(t, got.IsRemediated)
+	assert.Equal(t, domain.EntryStatusRemediated, got.Status)
 	assert.Equal(t, "source corrected and reloaded", got.RemediationReason)
 	assert.Equal(t, "ticket-MIG-42", got.RemediationEvidenceRef)
 	assert.Equal(t, "principal-3", got.RemediatedBy)
 	require.NotNil(t, got.RemediatedAt)
 
-	// A replay with different evidence still succeeds but must neither emit a
-	// second remediation event nor rewrite the recorded decision.
-	replayed, err := s.RemediateEntry(context.Background(), tenantID, job.ID, entryID,
-		"a later, different story", "ticket-OTHER", "principal-9", "corr-5")
-	require.NoError(t, err, "replay still succeeds")
-	assert.Equal(t, "source corrected and reloaded", replayed.RemediationReason, "replay must not overwrite the reason")
-	assert.Equal(t, "ticket-MIG-42", replayed.RemediationEvidenceRef, "replay must not overwrite the evidence ref")
-	assert.Equal(t, "principal-3", replayed.RemediatedBy, "replay must not overwrite the actor")
+	_, err = remediate(s, tenantID, job.ID, entryID, "a later, different story", "ticket-OTHER", "principal-3", "corr-5", claim)
+	assert.ErrorIs(t, err, store.ErrIdempotencyKeyInUse, "same key: never applied twice")
+	_, err = remediate(s, tenantID, job.ID, entryID, "a later, different story", "ticket-OTHER", "principal-9", "corr-6", store.IdempotencyClaim{})
+	assert.ErrorIs(t, err, domain.ErrEntryAlreadyDecided, "a decision is immutable")
 
 	rows := outboxRows(t, tenantID, entryID)
 	require.Len(t, rows, 1, "aggregate is the entry (the old subject_id); a replay must not record a second remediation")
@@ -172,9 +203,10 @@ func TestPgStore_RemediateEntry_EnqueuesOnEntry_ReplayEmitsNothing(t *testing.T)
 	assert.Contains(t, p, `"remediated_by":"principal-3"`)
 	assert.Contains(t, p, `"remediated_at":`)
 
-	// And the evidence survives a read of the job.
+	// The evidence survives a read of the job, and the job's version moved.
 	read, err := s.GetJobByID(context.Background(), tenantID, job.ID)
 	require.NoError(t, err)
+	assert.Equal(t, job.Version+1, read.Version)
 	var found bool
 	for _, e := range read.AuditEntries {
 		if e.ID == entryID {
@@ -194,10 +226,12 @@ func TestPgStore_RemediateEntry_OtherTenant_RefusedAndEmitsNothing(t *testing.T)
 	job := createJob(t, s, tenantID, 1)
 	entryID := job.AuditEntries[0].ID
 
-	_, err := s.RemediateEntry(context.Background(), uuid.NewString(), job.ID, entryID,
-		"r", "e", "intruder", "corr-x")
-	require.Error(t, err)
+	_, err := remediate(s, uuid.NewString(), job.ID, entryID, "r", "e", "intruder", "corr-x", store.IdempotencyClaim{})
+	assert.ErrorIs(t, err, store.ErrJobNotFound, "another tenant's job is indistinguishable from a missing one")
 	assert.Empty(t, outboxRows(t, tenantID, entryID))
+
+	_, err = s.GetJobByID(context.Background(), uuid.NewString(), job.ID)
+	assert.ErrorIs(t, err, store.ErrJobNotFound)
 }
 
 type capturingWriter struct {

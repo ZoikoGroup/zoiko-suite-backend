@@ -118,6 +118,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.Create(r.Context(), f); err != nil {
+		if errors.Is(err, domain.ErrDuplicateRequirement) {
+			writeError(w, http.StatusConflict, domain.ErrDuplicateRequirement.Error())
+			return
+		}
 		h.logger.Error("create filing requirement failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create filing requirement")
 		return
@@ -302,6 +306,8 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "filing requirement not found")
 		case errors.Is(err, domain.ErrAlreadyConfirmed):
 			writeError(w, http.StatusConflict, "filing requirement is already confirmed")
+		case errors.Is(err, domain.ErrNotSubmitted):
+			writeError(w, http.StatusConflict, domain.ErrNotSubmitted.Error())
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to confirm filing requirement")
 		}
@@ -343,6 +349,10 @@ func (h *Handler) MarkOverdue(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrRequirementNotFound) {
 			writeError(w, http.StatusNotFound, "filing requirement not found")
+			return
+		}
+		if errors.Is(err, domain.ErrAlreadyOverdue) {
+			writeError(w, http.StatusConflict, "filing requirement is already marked overdue")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to mark filing requirement overdue")

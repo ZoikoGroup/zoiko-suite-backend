@@ -183,7 +183,7 @@ func (s *PgStore) ListPolicies(ctx context.Context, legalEntityID, category stri
 			}
 			out = append(out, p)
 		}
-		return nil
+		return rows.Err()
 	})
 	if err != nil {
 		return nil, err
@@ -596,7 +596,7 @@ func (s *PgStore) ListConsumptions(ctx context.Context, legalEntityID, spendPoli
 			}
 			out = append(out, c)
 		}
-		return nil
+		return rows.Err()
 	})
 	if err != nil {
 		return nil, err

@@ -78,7 +78,11 @@ func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
-	const appRole = "zoiko_app_test"
+	// TEST_APP_ROLE lets a shared cluster use a run-specific role name.
+	appRole := "zoiko_app_test"
+	if v := os.Getenv("TEST_APP_ROLE"); v != "" {
+		appRole = v
+	}
 	const appPassword = "zoiko_app_test_pw"
 
 	if _, err := admin.Exec(ctx, `DO $do$ BEGIN

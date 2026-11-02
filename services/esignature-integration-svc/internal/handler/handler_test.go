@@ -14,6 +14,7 @@ import (
 	"zoiko.io/esignature-integration-svc/internal/domain"
 	"zoiko.io/esignature-integration-svc/internal/events"
 	"zoiko.io/esignature-integration-svc/internal/middleware"
+	"zoiko.io/esignature-integration-svc/internal/provider"
 	"zoiko.io/esignature-integration-svc/internal/store"
 )
 
@@ -34,7 +35,9 @@ func setupTestRouter(t *testing.T) (chi.Router, *events.MockPublisher) {
 	pub := events.NewMockPublisher()
 	authzSrv := newGrantingAuthzServer(t)
 	az := authz.NewClient(authzSrv.URL)
-	h := New(st, pub, az, zap.NewNop())
+	// Test double for a provider adapter (testProvider, provider_failclosed_test.go):
+	// production has no adapter and fails closed — see TestCreateEnvelope_NoProvider_FailsClosed.
+	h := New(st, pub, az, zap.NewNop()).WithProviders(provider.NewRegistry(&testProvider{name: domain.ProviderDocuSign}))
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext)
 	RegisterRoutes(r, h)

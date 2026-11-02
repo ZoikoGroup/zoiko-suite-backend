@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -36,7 +38,7 @@ type Store interface {
 	// transaction as the insert.
 	CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.ReconciliationSuggestion, actorID, correlationID string) error
 	GetJobByID(ctx context.Context, tenantID, id string) (*domain.ReconciliationJob, error)
-	ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string) ([]domain.ReconciliationJob, error)
+	ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string, limit, offset int) ([]domain.ReconciliationJob, error)
 	// ApplyResolution enqueues "reconciliation.resolution_recommended" in
 	// the same transaction as the update.
 	// ref is the owning domain's record behind an EXECUTED decision (A5).
@@ -286,7 +288,7 @@ func scanItem(row pgx.Row, item *domain.ReconciliationSuggestion) error {
 	return canonicalizeItemAmounts(item)
 }
 
-func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string) ([]domain.ReconciliationJob, error) {
+func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string, limit, offset int) ([]domain.ReconciliationJob, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -312,7 +314,11 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA
 		args = append(args, status)
 		query += fmt.Sprintf(" AND status = $%d", len(args))
 	}
-	query += " ORDER BY analyzed_at DESC"
+	query += " ORDER BY analyzed_at DESC, id"
+	if limit > 0 {
+		args = append(args, limit, offset)
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+	}
 
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
@@ -352,7 +358,10 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 		FOR UPDATE`
 
 	if err := scanItem(tx.QueryRow(ctx, queryItem, itemID, jobID), &item); err != nil {
-		return nil, fmt.Errorf("unmatched item not found: %w", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrItemNotFound
+		}
+		return nil, fmt.Errorf("load unmatched item: %w", err)
 	}
 	if err := domain.ValidateResolutionTransition(item.SuggestionStatus, status); err != nil {
 		return nil, err
@@ -530,7 +539,7 @@ func (m *MemoryStore) GetJobByID(ctx context.Context, tenantID, id string) (*dom
 	return j, nil
 }
 
-func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string) ([]domain.ReconciliationJob, error) {
+func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string, limit, offset int) ([]domain.ReconciliationJob, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -549,6 +558,22 @@ func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sou
 			continue
 		}
 		result = append(result, *j)
+	}
+	sort.Slice(result, func(i, k int) bool {
+		if !result[i].AnalyzedAt.Equal(result[k].AnalyzedAt) {
+			return result[i].AnalyzedAt.After(result[k].AnalyzedAt)
+		}
+		return result[i].ID < result[k].ID
+	})
+	if limit > 0 {
+		if offset >= len(result) {
+			return []domain.ReconciliationJob{}, nil
+		}
+		end := offset + limit
+		if end > len(result) {
+			end = len(result)
+		}
+		result = result[offset:end]
 	}
 	return result, nil
 }
@@ -581,7 +606,7 @@ func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, item
 		}
 	}
 
-	return nil, fmt.Errorf("unmatched item not found")
+	return nil, domain.ErrItemNotFound
 }
 
 func (m *MemoryStore) ArchiveJob(ctx context.Context, tenantID, id string) error {

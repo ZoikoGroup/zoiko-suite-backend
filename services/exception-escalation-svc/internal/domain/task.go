@@ -207,3 +207,13 @@ var (
 	ErrTaskNotFound        = errors.New("task not found")
 	ErrTaskInvalidState    = errors.New("task is not in a state that permits this action")
 )
+
+// ValidTaskPriority reports whether p is one of the declared priorities
+// (mirrors the tasks_priority_check constraint).
+func ValidTaskPriority(p TaskPriority) bool {
+	switch p {
+	case TaskPriorityLow, TaskPriorityMedium, TaskPriorityHigh, TaskPriorityCritical:
+		return true
+	}
+	return false
+}

@@ -25,7 +25,7 @@ const (
 
 type AccessContext struct {
 	SubjectID           string `json:"subject_id"`
-	SubjectType         string `json:"subject_type"` // USER, SERVICE_ACCOUNT, BOT
+	SubjectType         string `json:"subject_type"`       // USER, SERVICE_ACCOUNT, BOT
 	DeviceTrustLevel    int    `json:"device_trust_level"` // 0 to 100
 	IPAddress           string `json:"ip_address"`
 	IsKnownLocation     bool   `json:"is_known_location"`

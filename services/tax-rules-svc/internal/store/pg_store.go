@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/tax-rules-svc/internal/domain"
@@ -73,6 +75,9 @@ func (s *PgStore) CreateTaxRule(ctx context.Context, r *domain.TaxRule) error {
 		r.CreatedBy, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrDuplicateRuleCode
+		}
 		return fmt.Errorf("insert tax rule: %w", err)
 	}
 
@@ -187,6 +192,12 @@ func (s *PgStore) UpdateTaxRule(ctx context.Context, r *domain.TaxRule) error {
 	}
 
 	return tx.Commit(ctx)
+}
+
+// isUniqueViolation reports a Postgres 23505 (unique_violation).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func errorsIs(err, target error) bool {

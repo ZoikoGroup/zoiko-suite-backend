@@ -52,6 +52,33 @@ paths:
                   status: { type: string, example: ok }
                   service: { type: string, example: carta-svc }
 
+  /readyz:
+    get:
+      summary: Readiness probe
+      description: |
+        Public (no identity headers). Pings the Postgres pool with a 2s
+        timeout; 503 when the database is unreachable, because every record
+        this service serves lives only there.
+      operationId: Readyz
+      responses:
+        '200':
+          description: Database reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        '503':
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: unavailable }
+                  reason: { type: string }
+
   /v1/carta/evaluate:
     post:
       summary: Evaluate an access request

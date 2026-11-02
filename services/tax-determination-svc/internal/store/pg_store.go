@@ -47,11 +47,11 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 // type in its currency field.
 const determinationColumns = `determination_id, tenant_id, transaction_id, source_module, legal_entity_id, jurisdiction_id,
 		       COALESCE(rule_id,''), tax_logic_snapshot_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage,
-		       calculated_tax_amount, exempt_amount, currency, status, effective_from, effective_to,
+		       calculated_tax_amount, exempt_amount, currency, status, effective_from::text, effective_to::text,
 		       evaluated_at, evaluated_by, created_at, updated_at,
 		       seller_party_id, buyer_party_id, seller_establishment_id, buyer_establishment_id,
 		       ship_from_jurisdiction_id, ship_to_jurisdiction_id,
-		       supply_jurisdiction_id, supply_date, place_of_supply_basis,
+		       supply_jurisdiction_id, supply_date::text, place_of_supply_basis,
 		       product_classification, supply_kind, supply_type, buyer_tax_registration_id,
 		       exemption_reason, exemption_certificate_ref,
 		       seller_registration_id, seller_registration_status`

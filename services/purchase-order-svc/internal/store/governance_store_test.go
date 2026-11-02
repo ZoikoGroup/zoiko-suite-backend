@@ -713,8 +713,8 @@ func (c *captured) PublishOutbox(_ context.Context, id, _ string, payload []byte
 }
 
 // The relay reads outbox_events across ALL tenants with no tenant set. Under a
-// restricted role that only works because the table has no row-level security
-// (migration 000007 removes the policy 000006 put on it): with the policy, it
+// restricted role that works because it declares app.outbox_relay, which the
+// FORCE'd policy from 000008_outbox_rls admits explicitly; without the flag it
 // would see nothing and no event would ever be published.
 func TestOutboxRelay_PublishesEnvelopeAcrossTenants_UnderRestrictedRole(t *testing.T) {
 	owner := openTestPool(t)

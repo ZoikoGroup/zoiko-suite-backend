@@ -16,12 +16,14 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/corporate-actions-svc/internal/authz"
+	"zoiko.io/corporate-actions-svc/internal/boardresolutions"
 	"zoiko.io/corporate-actions-svc/internal/config"
 	svcenvelope "zoiko.io/corporate-actions-svc/internal/envelope"
 	"zoiko.io/corporate-actions-svc/internal/events"
 	"zoiko.io/corporate-actions-svc/internal/evidencereq"
 	"zoiko.io/corporate-actions-svc/internal/handler"
 	"zoiko.io/corporate-actions-svc/internal/health"
+	"zoiko.io/corporate-actions-svc/internal/idempotency"
 	"zoiko.io/corporate-actions-svc/internal/middleware"
 	"zoiko.io/corporate-actions-svc/internal/mtls"
 	"zoiko.io/corporate-actions-svc/internal/store"
@@ -76,7 +78,8 @@ func main() {
 	}
 	evidenceReqClient := evidencereq.NewClient(cfg.EvidenceReqURL)
 
-	h := handler.New(pgStore, publisher, authzClient, evidenceReqClient, logger)
+	resolutionClient := boardresolutions.NewClient(cfg.BoardResolutionsURL)
+	h := handler.New(pgStore, publisher, authzClient, evidenceReqClient, resolutionClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -90,6 +93,11 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), logger))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))

@@ -230,8 +230,13 @@ func TestSeverity_OnlyMQ0Blocks(t *testing.T) {
 }
 
 func TestValidateRequest_ExceptionOwnerRequired(t *testing.T) {
+	// control_totals has been required since migration 000006 (ZS-MIG-001
+	// §17, MIG-INV-15), so the request declares a valid manifest; this test
+	// is only about the owner.
+	count := 1
 	r := ValidateMigrationRequest{LegalEntityID: "le", MigrationName: "m", SourceSystem: "s", TargetService: "t",
-		Records: []MigrationRecord{rec("A", nil)}, ExceptionOwnerID: "  "}
+		Records: []MigrationRecord{rec("A", nil)}, ExceptionOwnerID: "  ",
+		ControlTotals: &ControlTotalsDeclaration{RecordCount: &count, AmountTotal: "0"}}
 	if err := r.Validate(); err == nil || err.Error() != "exception_owner_id is required" {
 		t.Fatalf("blank owner must be refused, got %v", err)
 	}

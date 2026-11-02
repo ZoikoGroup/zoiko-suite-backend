@@ -42,7 +42,7 @@ func TestAnalyzeReconciliation_NoGovernedTolerance_RefusesRatherThanGuesses(t *t
 		t.Fatalf("expected 424 Failed Dependency when no tolerance policy is configured, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	jobs, err := memStore.ListJobs(req.Context(), "tenant-no-policy", "le-1", "", "")
+	jobs, err := memStore.ListJobs(req.Context(), "tenant-no-policy", "le-1", "", "", 0, 0)
 	if err != nil {
 		t.Fatalf("list jobs: %v", err)
 	}

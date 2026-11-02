@@ -179,7 +179,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req.Header.Set("X-Principal-Id", "filing_tracker_svc")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)

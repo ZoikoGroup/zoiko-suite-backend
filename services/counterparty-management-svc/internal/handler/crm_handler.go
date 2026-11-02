@@ -671,6 +671,12 @@ func (h *crmHandler) writeCRMErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "relationship has no candidate party link to confirm")
 	case errors.Is(err, domain.ErrInvalidStage):
 		writeError(w, http.StatusBadRequest, "invalid opportunity stage")
+	case errors.Is(err, domain.ErrInvalidConsentStatus):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, domain.ErrCannotMergeIntoSelf):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, domain.ErrRelationshipAlreadyMerged):
+		writeError(w, http.StatusConflict, err.Error())
 	default:
 		h.logger.Error("CRM store error", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "CRM store unavailable")

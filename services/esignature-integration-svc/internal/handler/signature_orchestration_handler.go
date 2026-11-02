@@ -12,6 +12,7 @@ import (
 	"zoiko.io/esignature-integration-svc/internal/domain"
 	"zoiko.io/esignature-integration-svc/internal/events"
 	"zoiko.io/esignature-integration-svc/internal/middleware"
+	"zoiko.io/esignature-integration-svc/internal/provider"
 	"zoiko.io/esignature-integration-svc/internal/store"
 )
 
@@ -40,6 +41,26 @@ type OrchestrationHandler struct {
 	publisher     events.Publisher
 	authz         *authz.Client
 	logger        *zap.Logger
+	// providers: nil/empty means no provider adapter, so signer progress
+	// (viewed/signed/declined) — a provider fact — cannot be recorded.
+	providers *provider.Registry
+}
+
+// WithProviders sets the provider registry. Without it signer-progress
+// markers fail closed with 503.
+func (h *OrchestrationHandler) WithProviders(reg *provider.Registry) *OrchestrationHandler {
+	h.providers = reg
+	return h
+}
+
+// requireProvider refuses a provider-asserted participant transition when no
+// adapter is configured: nothing could have observed the signer's action.
+func (h *OrchestrationHandler) requireProvider(w http.ResponseWriter) bool {
+	if !h.providers.Configured() {
+		writeProviderNotConfigured(w)
+		return false
+	}
+	return true
 }
 
 func NewOrchestrationHandler(st store.SignatureOrchestrationStore, envStore store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *OrchestrationHandler {
@@ -47,22 +68,20 @@ func NewOrchestrationHandler(st store.SignatureOrchestrationStore, envStore stor
 }
 
 func RegisterOrchestrationRoutes(r chi.Router, h *OrchestrationHandler) {
-	r.Route("/v1/esignature/profiles", func(r chi.Router) {
-		r.Post("/", h.CreateProfile)
-		r.Get("/{id}", h.GetProfile)
-		r.Post("/{id}/activate", h.ActivateProfile)
-		r.Post("/{id}/retire", h.RetireProfile)
-	})
-	r.Route("/v1/esignature/envelopes/{id}", func(r chi.Router) {
-		r.Post("/bind-profile", h.BindProfile)
-		r.Post("/amend", h.AmendEnvelope)
-		r.Post("/attempts", h.RecordProviderAttempt)
-		r.Get("/attempts", h.ListProviderAttempts)
-		r.Post("/participants", h.AddParticipant)
-		r.Get("/participants", h.ListParticipants)
-		r.Post("/completion-evidence", h.SealCompletionEvidence)
-		r.Get("/completion-evidence", h.GetCompletionEvidence)
-	})
+	// Flat patterns — see RegisterRoutes for why sub-routers are avoided.
+	r.Post("/v1/esignature/profiles", h.CreateProfile)
+	r.Post("/v1/esignature/profiles/", h.CreateProfile)
+	r.Get("/v1/esignature/profiles/{id}", h.GetProfile)
+	r.Post("/v1/esignature/profiles/{id}/activate", h.ActivateProfile)
+	r.Post("/v1/esignature/profiles/{id}/retire", h.RetireProfile)
+	r.Post("/v1/esignature/envelopes/{id}/bind-profile", h.BindProfile)
+	r.Post("/v1/esignature/envelopes/{id}/amend", h.AmendEnvelope)
+	r.Post("/v1/esignature/envelopes/{id}/attempts", h.RecordProviderAttempt)
+	r.Get("/v1/esignature/envelopes/{id}/attempts", h.ListProviderAttempts)
+	r.Post("/v1/esignature/envelopes/{id}/participants", h.AddParticipant)
+	r.Get("/v1/esignature/envelopes/{id}/participants", h.ListParticipants)
+	r.Post("/v1/esignature/envelopes/{id}/completion-evidence", h.SealCompletionEvidence)
+	r.Get("/v1/esignature/envelopes/{id}/completion-evidence", h.GetCompletionEvidence)
 	r.Post("/v1/esignature/attempts/{attempt_id}/reconcile", h.ReconcileAttempt)
 	r.Post("/v1/esignature/participants/{participant_id}/mark-viewed", h.MarkParticipantViewed)
 	r.Post("/v1/esignature/participants/{participant_id}/mark-signed", h.MarkParticipantSigned)
@@ -436,6 +455,9 @@ func (h *OrchestrationHandler) MarkParticipantViewed(w http.ResponseWriter, r *h
 		h.writeAuthzErr(w, err)
 		return
 	}
+	if !h.requireProvider(w) {
+		return
+	}
 	pt, err := h.store.MarkParticipantViewed(r.Context(), id)
 	if err != nil {
 		h.handleOrchestrationError(w, err)
@@ -452,6 +474,9 @@ func (h *OrchestrationHandler) MarkParticipantSigned(w http.ResponseWriter, r *h
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, "", PARTICIPANT_MANAGE); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	if !h.requireProvider(w) {
 		return
 	}
 	pt, err := h.store.MarkParticipantSigned(r.Context(), id)
@@ -479,6 +504,9 @@ func (h *OrchestrationHandler) DeclineParticipant(w http.ResponseWriter, r *http
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, "", PARTICIPANT_MANAGE); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	if !h.requireProvider(w) {
 		return
 	}
 	pt, err := h.store.DeclineParticipant(r.Context(), id, req.Reason)

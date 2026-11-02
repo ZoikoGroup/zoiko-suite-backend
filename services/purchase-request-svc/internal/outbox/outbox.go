@@ -177,6 +177,13 @@ func (r *Relay) RelayOnce(ctx context.Context) int {
 		return 0
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// The relay drains every tenant's backlog; outbox_events is under FORCE
+	// RLS, so it declares itself (migration 000008_outbox_rls) instead of
+	// running unscoped, which would see no rows at all.
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
+		r.log.Error("outbox relay: set relay scope failed", zap.Error(err))
+		return 0
+	}
 
 	rows, err := tx.Query(ctx, `
 		SELECT outbox_event_id, aggregate_id, event_type, payload, publish_attempts

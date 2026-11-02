@@ -69,6 +69,13 @@ func (h *Handler) CreateException(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The creator is the authenticated caller. A body value is only an echo:
+	// trusting it let a caller omit or forge created_by and then pass the
+	// resolve-time self-approval check on their own case.
+	if req.CreatedBy != "" && req.CreatedBy != principalID {
+		writeError(w, http.StatusForbidden, "created_by must match the calling principal")
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionExceptionCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -84,7 +91,7 @@ func (h *Handler) CreateException(w http.ResponseWriter, r *http.Request) {
 		LinkedObjectID:   req.LinkedObjectID,
 		Description:      req.Description,
 		AssignedToRole:   req.AssignedToRole,
-		CreatedBy:        req.CreatedBy,
+		CreatedBy:        principalID,
 	}
 
 	if err := h.store.CreateException(r.Context(), c); err != nil {

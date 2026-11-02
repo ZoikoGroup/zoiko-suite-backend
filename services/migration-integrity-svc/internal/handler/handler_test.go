@@ -84,9 +84,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		},
 	}
 
-	body, _ := json.Marshal(validateReq)
-	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
-	withEnvelope(req)
+	req := validateRequest(t, validateReq)
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	req.Header.Set("X-Principal-Id", "user-1")
 	req.Header.Set("Content-Type", "application/json")
@@ -115,8 +113,8 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 	if job.IntegrityScore != 20 {
 		t.Fatalf("expected integrity score 20, got %f", job.IntegrityScore)
 	}
-	if len(job.IntegrityChecks) != 4 {
-		t.Fatalf("expected 4 integrity checks (schema, identity, dup, format), got %d", len(job.IntegrityChecks))
+	if len(job.IntegrityChecks) != 5 {
+		t.Fatalf("expected 5 integrity checks (schema, identity, dup, format, control totals), got %d", len(job.IntegrityChecks))
 	}
 	if len(job.AuditEntries) == 0 {
 		t.Fatal("expected audit entries for violations")
@@ -155,9 +153,11 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 			RemediationEvidenceRef: "extract-run-2026-10-17/rec-002",
 		})
 		remReq := httptest.NewRequest(http.MethodPost, "/v1/migrations/"+job.ID+"/audit/"+entryID+"/remediate", bytes.NewBuffer(remBody))
+		remReq.Header.Set("X-Legal-Entity-Id", "LE-5005")
 		withEnvelope(remReq)
 		remReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
-		remReq.Header.Set("X-Principal-Id", "user-1")
+		// Not the submitter (user-1): segregation of duties.
+		remReq.Header.Set("X-Principal-Id", "user-2")
 		remReq.Header.Set("Content-Type", "application/json")
 		remRec := httptest.NewRecorder()
 		router.ServeHTTP(remRec, remReq)
@@ -175,8 +175,8 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		if remEntry.RemediationEvidenceRef != "extract-run-2026-10-17/rec-002" {
 			t.Fatalf("expected remediation_evidence_ref echoed, got %q", remEntry.RemediationEvidenceRef)
 		}
-		if remEntry.RemediatedBy != "user-1" {
-			t.Fatalf("expected remediated_by = user-1, got %q", remEntry.RemediatedBy)
+		if remEntry.RemediatedBy != "user-2" {
+			t.Fatalf("expected remediated_by = user-2, got %q", remEntry.RemediatedBy)
 		}
 		if remEntry.RemediatedAt == nil {
 			t.Fatal("expected remediated_at to be set")
@@ -185,6 +185,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 
 	// 5. Archive Job
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/migrations/"+job.ID, nil)
+	delReq.Header.Set("X-Legal-Entity-Id", "LE-5005")
 	withEnvelope(delReq)
 	delReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	delReq.Header.Set("X-Principal-Id", "user-1")
@@ -212,9 +213,7 @@ func TestValidateMigrationCleanData(t *testing.T) {
 		},
 	}
 
-	body, _ := json.Marshal(cleanReq)
-	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
-	withEnvelope(req)
+	req := validateRequest(t, cleanReq)
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	req.Header.Set("X-Principal-Id", "user-1")
 	rec := httptest.NewRecorder()
@@ -254,9 +253,7 @@ func TestValidateMigrationEmptyRefReportedAsMissingIdentity(t *testing.T) {
 			{Ref: "REC-900", Fields: map[string]string{"amount": "30.00"}},
 		},
 	}
-	body, _ := json.Marshal(validateReq)
-	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
-	withEnvelope(req)
+	req := validateRequest(t, validateReq)
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	req.Header.Set("X-Principal-Id", "user-1")
 	rec := httptest.NewRecorder()
@@ -325,7 +322,7 @@ func TestValidateMigration_ThresholdDecidesStatus(t *testing.T) {
 		{80, domain.JobStatusCompleted},
 	} {
 		router := newRouterWithThreshold(t, tc.threshold)
-		body, _ := json.Marshal(domain.ValidateMigrationRequest{
+		req := validateRequest(t, domain.ValidateMigrationRequest{
 			LegalEntityID:    "LE-THRESHOLD",
 			MigrationName:    "threshold acceptance fixture",
 			SourceSystem:     "LEGACY_ERP",
@@ -334,8 +331,6 @@ func TestValidateMigration_ThresholdDecidesStatus(t *testing.T) {
 			RequiredFields:   []string{"amount"},
 			Records:          records,
 		})
-		req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
-		withEnvelope(req)
 		req.Header.Set("X-Tenant-ID", "tenant-mig-threshold")
 		req.Header.Set("X-Principal-Id", "user-1")
 		rec := httptest.NewRecorder()

@@ -44,7 +44,7 @@ func Load() (*Config, error) {
 		AuthzServiceURL:         getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		TaxRulesServiceURL:      getEnvOrDefault("TAX_RULES_SERVICE_URL", "http://tax-rules-svc:8125"),
 		JurisdictionRulesURL:    getEnvOrDefault("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8081"),
-		GeneralLedgerURL:        getEnvOrDefault("GENERAL_LEDGER_URL", "http://general-ledger-svc:8091"),
+		GeneralLedgerURL:        getEnvOrDefault("GENERAL_LEDGER_URL", "http://general-ledger-svc:8098"),
 		EvidenceRequirementsURL: getEnvOrDefault("EVIDENCE_REQUIREMENTS_URL", "http://evidence-requirements-svc:8130"),
 
 		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",

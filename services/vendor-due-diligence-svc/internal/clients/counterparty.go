@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // CounterpartyClient calls counterparty-management-svc directly, pushing a
@@ -66,6 +68,17 @@ func (c *CounterpartyClient) do(ctx context.Context, method, tenantID, path stri
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-Id", tenantID)
+	c2 := callerFrom(ctx)
+	req.Header.Set("X-Principal-Id", c2.PrincipalID)
+	req.Header.Set("X-Workload-Id", "vendor-due-diligence-svc")
+	req.Header.Set("X-Legal-Entity-Id", c2.LegalEntityID)
+	req.Header.Set("X-Purpose-Context", "vendor_due_diligence")
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	if c2.CorrelationID != "" {
+		req.Header.Set("X-Correlation-ID", c2.CorrelationID)
+	}
+	req.Header.Set("Idempotency-Key", "vdd:"+c2.CheckID+":"+method+":"+path)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -1,7 +1,6 @@
 package handler_test
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -81,9 +80,7 @@ func validateOneJob(t *testing.T, router http.Handler, tenantID, entityID, princ
 			{Ref: "REC-READ-1", Fields: map[string]string{"amount": "12.00"}},
 		},
 	}
-	body, _ := json.Marshal(validateReq)
-	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
-	withEnvelope(req)
+	req := validateRequest(t, validateReq)
 	req.Header.Set("X-Tenant-ID", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
 	rec := httptest.NewRecorder()
@@ -171,7 +168,16 @@ func TestListJobs_RequiresLegalEntity(t *testing.T) {
 	router, _ := newRouterWithAuthz(t, nil)
 	validateOneJob(t, router, "tenant-read-authz", "LE-READ-1", "reader-1")
 
-	if rec := issueRead(t, router, "/v1/migrations", "tenant-read-authz", "reader-1"); rec.Code != http.StatusBadRequest {
+	// Neither the query nor X-Legal-Entity-Id (which the list falls back to)
+	// names a legal entity.
+	req := httptest.NewRequest(http.MethodGet, "/v1/migrations", nil)
+	withEnvelope(req)
+	req.Header.Del("X-Legal-Entity-Id")
+	req.Header.Set("X-Tenant-ID", "tenant-read-authz")
+	req.Header.Set("X-Principal-Id", "reader-1")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 without legal_entity_id, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
@@ -210,9 +216,7 @@ func TestReads_SourceValuesOnlyForAuthorizedReaders(t *testing.T) {
 				{Ref: "REC-VALUE-1", Fields: map[string]string{"salary": rawSalary}},
 			},
 		}
-		body, _ := json.Marshal(validateReq)
-		req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
-		withEnvelope(req)
+		req := validateRequest(t, validateReq)
 		req.Header.Set("X-Tenant-ID", "tenant-read-authz")
 		req.Header.Set("X-Principal-Id", principalID)
 		rec := httptest.NewRecorder()

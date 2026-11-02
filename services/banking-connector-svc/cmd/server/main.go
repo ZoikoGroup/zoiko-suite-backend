@@ -20,6 +20,7 @@ import (
 	svcenvelope "zoiko.io/banking-connector-svc/internal/envelope"
 	"zoiko.io/banking-connector-svc/internal/handler"
 	"zoiko.io/banking-connector-svc/internal/health"
+	"zoiko.io/banking-connector-svc/internal/idempotency"
 	"zoiko.io/banking-connector-svc/internal/middleware"
 	"zoiko.io/banking-connector-svc/internal/mtls"
 	"zoiko.io/banking-connector-svc/internal/store"
@@ -137,11 +138,13 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+	// Idempotency-Key replay for material writes (INV-08): a retried write
+	// with the same key is answered from its first response, not re-run.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(dbpool), logger))
+
 	r.Get("/healthz", health.Handler())
-	handler.RegisterRoutes(r, h)
-	handler.RegisterBNK02Routes(r, h, st, bankAcctClient, vaultClient)
-	handler.RegisterBNK0304Routes(r, h, st)
-	handler.RegisterControlPopulationRoutes(r, h, st)
+	r.Get("/readyz", health.ReadyHandler(dbpool))
+	handler.RegisterAll(r, h, st, bankAcctClient, vaultClient)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

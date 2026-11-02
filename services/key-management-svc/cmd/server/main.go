@@ -9,11 +9,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/key-management-svc/internal/authz"
+	"zoiko.io/key-management-svc/internal/config"
 	"zoiko.io/key-management-svc/internal/handler"
+	"zoiko.io/key-management-svc/internal/idempotency"
 	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
@@ -21,12 +24,33 @@ import (
 func main() {
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8143"
+	// Config fails on a missing DATABASE_URL or AUTHZ_SERVICE_URL: key
+	// metadata and version history are authoritative and live only in
+	// Postgres, so there is no in-memory fallback to start with.
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Fatal("invalid configuration", zap.Error(err))
 	}
+	port := cfg.Port
 
-	s := store.NewMemoryStore()
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		logger.Fatal("failed to parse DATABASE_URL", zap.Error(err))
+	}
+	poolCfg.MaxConns = 10
+	poolCfg.MinConns = 1
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = time.Minute
+	// The pool connects lazily, so a database that is down at boot does not
+	// crash-loop the process; /readyz reports it until it comes back.
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		logger.Fatal("failed to create database pool", zap.Error(err))
+	}
+	defer pool.Close()
+
+	s := store.NewPgStore(pool)
 	siemClient := siem.New(os.Getenv("SIEM_SERVICE_URL"), "key-management-svc", logger)
 
 	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
@@ -39,12 +63,11 @@ func main() {
 	// rejects all authorized traffic hides a deployment mistake until a user
 	// finds it. This dependency was added in Priority 2b and was missing from
 	// docker-compose.yml for two services, which is exactly how that happens.
-	authzURL := os.Getenv("AUTHZ_SERVICE_URL")
-	if authzURL == "" {
-		logger.Fatal("AUTHZ_SERVICE_URL is required: every authorized route would return 503 without it")
-	}
-	authzClient := authz.NewClient(authzURL)
-	h := handler.New(s, siemClient, authzClient, logger)
+	// (config.Load enforces it.)
+	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	h := handler.New(s, siemClient, authzClient, logger).
+		WithIdempotency(idempotency.NewPgStore(pool)).
+		WithReadiness(pool)
 	router := handler.NewRouter(h)
 
 	// Wrap router with apicontract middleware

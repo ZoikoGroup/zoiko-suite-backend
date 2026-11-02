@@ -14,6 +14,8 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/bankrec"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
+	"zoiko.io/reconciliation-intelligence-svc/internal/health"
+	"zoiko.io/reconciliation-intelligence-svc/internal/idempotency"
 	"zoiko.io/reconciliation-intelligence-svc/internal/ledger"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 )
@@ -237,6 +239,7 @@ type deps struct {
 	financialControlURL string
 	bankRecURL          string
 	ledgerURL           string
+	idem                idempotency.Store // nil: no Idempotency-Key replay
 }
 
 func newTestRouter(t *testing.T, d deps) http.Handler {
@@ -270,7 +273,7 @@ func newTestRouter(t *testing.T, d deps) http.Handler {
 		ledger.NewClient(d.ledgerURL, logger),
 		31,
 		logger)
-	return handler.NewRouter(h)
+	return handler.NewRouterWithDeps(h, health.ReadyzHandler(nil), d.idem)
 }
 
 func setupTestRouter(t *testing.T) http.Handler {

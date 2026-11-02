@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -119,6 +120,19 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.GrossPaymentAmount <= 0 {
 		writeError(w, http.StatusBadRequest, "gross_payment_amount must be greater than zero")
+		return
+	}
+	// effective_from is a NOT NULL DATE column; an empty or malformed value
+	// used to reach Postgres and surface as a 500. Default to today (UTC).
+	if req.EffectiveFrom == "" {
+		req.EffectiveFrom = time.Now().UTC().Format("2006-01-02")
+	} else if _, err := time.Parse("2006-01-02", req.EffectiveFrom); err != nil {
+		writeError(w, http.StatusBadRequest, "effective_from must be a date in YYYY-MM-DD format")
+		return
+	}
+	// Attribution comes from the verified principal, never the request body.
+	if req.CreatedBy != "" && req.CreatedBy != principalID {
+		writeError(w, http.StatusForbidden, "created_by must match the calling principal")
 		return
 	}
 
@@ -237,7 +251,16 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.Update(r.Context(), existing); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update withholding tax obligation")
+		switch {
+		case errors.Is(err, domain.ErrObligationNotFound):
+			writeError(w, http.StatusNotFound, "withholding tax obligation not found")
+		case errors.Is(err, domain.ErrAlreadyRemitted):
+			writeError(w, http.StatusConflict, "remitted withholding tax obligation cannot be updated")
+		case errors.Is(err, domain.ErrAlreadyCancelled):
+			writeError(w, http.StatusConflict, "cancelled withholding tax obligation cannot be updated")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to update withholding tax obligation")
+		}
 		return
 	}
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{

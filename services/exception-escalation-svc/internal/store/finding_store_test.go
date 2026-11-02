@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sort"
 	"testing"
+	"zoiko.io/exception-escalation-svc/internal/middleware"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -67,7 +68,10 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 // resolves an unset context to "default", which every call in a given
 // test agrees on, so this is a real single-tenant scope, not an unscoped
 // call.
-func ctx() context.Context { return context.Background() }
+// ctx carries the "default" tenant the fixtures are written under. It used to
+// be a bare Background context and lean on GetTenantID's old "default"
+// fallback, which was removed (a missing tenant must never alias a real one).
+func ctx() context.Context { return middleware.WithTenant(context.Background(), "default") }
 
 // newExceptionCaseForFindingTest inserts the exception_cases fixture row
 // directly rather than via store.CreateException: that method's own setRLS

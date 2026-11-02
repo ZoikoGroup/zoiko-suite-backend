@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
 	"zoiko.io/reconciliation-intelligence-svc/internal/bankrec"
@@ -17,6 +19,7 @@ import (
 	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/health"
+	"zoiko.io/reconciliation-intelligence-svc/internal/idempotency"
 	"zoiko.io/reconciliation-intelligence-svc/internal/ledger"
 	customMiddleware "zoiko.io/reconciliation-intelligence-svc/internal/middleware"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
@@ -57,7 +60,17 @@ func NewHandler(s store.Store, a *authz.Client, fc *financialcontrol.Client, br 
 	}
 }
 
+// NewRouter builds the route tree with no database behind /readyz (it
+// reports 503) and no Idempotency-Key replay store. The server uses
+// NewRouterWithDeps.
 func NewRouter(h *Handler) http.Handler {
+	return NewRouterWithDeps(h, health.ReadyzHandler(nil), nil)
+}
+
+// NewRouterWithDeps is NewRouter with the readiness probe and the
+// Idempotency-Key replay store supplied (health.ReadyzHandler(pool) and
+// idempotency.NewPgStore(pool) in production). A nil idem disables replay.
+func NewRouterWithDeps(h *Handler, readyz http.HandlerFunc, idem idempotency.Store) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
@@ -72,11 +85,18 @@ func NewRouter(h *Handler) http.Handler {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+	// Idempotency-Key replay: a retried write with the same key returns the
+	// first answer instead of running again. Reads and probes pass through.
+	if idem != nil {
+		r.Use(idempotency.Middleware(idem, h.logger))
+	}
+
 	// /healthz stays OUTSIDE the tenant gate. Liveness and readiness
 	// probes carry no tenant, so a blanket tenant requirement would 401
 	// every probe and the orchestrator would restart the container in a
 	// loop — a security fix that takes the service down.
 	r.Get("/healthz", health.Handler())
+	r.Get("/readyz", readyz)
 
 	// Everything below requires a gateway-verified tenant. Applied via
 	// With() on the route subtree rather than as a path exemption inside
@@ -109,6 +129,11 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 	dec.DisallowUnknownFields()
 	var req domain.AnalyzeReconciliationRequest
 	if err := dec.Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			h.respondError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
+			return
+		}
 		h.respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -230,7 +255,21 @@ func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobs, err := h.store.ListJobs(r.Context(), tenantID, legalEntityID, sourceA, status)
+	if status != "" && !domain.KnownJobStatuses[status] {
+		h.respondError(w, http.StatusBadRequest, "status must be one of ANALYZING, COMPLETED, ARCHIVED")
+		return
+	}
+	if sourceA != "" && !domain.KnownSourceSystems[domain.SourceSystem(sourceA)] {
+		h.respondError(w, http.StatusBadRequest, "source_system_a is not a known source system")
+		return
+	}
+	limit, offset, perr := parsePaging(r)
+	if perr != "" {
+		h.respondError(w, http.StatusBadRequest, perr)
+		return
+	}
+
+	jobs, err := h.store.ListJobs(r.Context(), tenantID, legalEntityID, sourceA, status, limit, offset)
 	if err != nil {
 		h.logger.Error("failed to list reconciliation jobs", zap.Error(err))
 		h.respondError(w, http.StatusInternalServerError, "failed to query reconciliation jobs")
@@ -242,9 +281,32 @@ func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.respondJSON(w, http.StatusOK, map[string]interface{}{
-		"data":  jobs,
-		"count": len(jobs),
+		"data":   jobs,
+		"count":  len(jobs),
+		"limit":  limit,
+		"offset": offset,
 	})
+}
+
+// parsePaging reads limit (default 50, 1..200) and offset (>= 0). Lists are
+// always bounded: an omitted limit is the default, never "every row".
+func parsePaging(r *http.Request) (limit, offset int, problem string) {
+	limit, offset = domain.DefaultJobListLimit, 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > domain.MaxJobListLimit {
+			return 0, 0, fmt.Sprintf("limit must be an integer between 1 and %d", domain.MaxJobListLimit)
+		}
+		limit = n
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return 0, 0, "offset must be a non-negative integer"
+		}
+		offset = n
+	}
+	return limit, offset, ""
 }
 
 // GetJobByID is authorized against the job's own legal entity, in the same
@@ -276,6 +338,13 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 	jobID := chi.URLParam(r, "id")
 	itemID := chi.URLParam(r, "itemId")
+
+	// Item ids are UUIDs; a malformed one is the caller's 400, never a
+	// database cast error relayed back.
+	if _, err := uuid.Parse(itemID); err != nil {
+		h.respondError(w, http.StatusBadRequest, "itemId must be a UUID")
+		return
+	}
 
 	var req domain.ApplyResolutionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -309,6 +378,10 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	if job.Status == "ARCHIVED" {
+		h.respondError(w, http.StatusConflict, domain.ErrJobArchived.Error())
+		return
+	}
 
 	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.SuggestionStatus, req.ResolutionNotes,
 		req.AuthoritativeRef, job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"))
@@ -322,8 +395,13 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if errors.Is(err, domain.ErrItemNotFound) {
+		h.respondError(w, http.StatusNotFound, domain.ErrItemNotFound.Error())
+		return
+	}
 	if err != nil {
-		h.respondError(w, http.StatusNotFound, err.Error())
+		h.logger.Error("apply resolution failed", zap.Error(err))
+		h.respondError(w, http.StatusInternalServerError, "failed to apply resolution")
 		return
 	}
 

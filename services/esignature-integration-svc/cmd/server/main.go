@@ -9,19 +9,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/esignature-integration-svc/internal/authz"
 	"zoiko.io/esignature-integration-svc/internal/config"
-	svcenvelope "zoiko.io/esignature-integration-svc/internal/envelope"
 	"zoiko.io/esignature-integration-svc/internal/events"
 	"zoiko.io/esignature-integration-svc/internal/handler"
-	"zoiko.io/esignature-integration-svc/internal/health"
-	"zoiko.io/esignature-integration-svc/internal/middleware"
+	"zoiko.io/esignature-integration-svc/internal/idempotency"
 	"zoiko.io/esignature-integration-svc/internal/mtls"
+	"zoiko.io/esignature-integration-svc/internal/provider"
+	"zoiko.io/esignature-integration-svc/internal/router"
 	"zoiko.io/esignature-integration-svc/internal/store"
 	"zoiko.io/esignature-integration-svc/internal/telemetry"
 )
@@ -80,27 +78,25 @@ func main() {
 	} else {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
-	h := handler.New(st, publisher, authzClient, logger)
+	// Provider adapters: empty ESIGN_PROVIDERS (the default) is fail-closed.
+	providers, err := provider.Build(cfg.ESignProviders)
+	if err != nil {
+		logger.Fatal("e-signature provider configuration invalid", zap.Error(err))
+	}
+	if !providers.Configured() {
+		logger.Warn("no e-signature provider configured: envelope send and provider-asserted status changes will return 503")
+	}
+	h := handler.New(st, publisher, authzClient, logger).WithProviders(providers)
 	orchestrationStore := store.NewPgOrchestrationStore(dbpool)
-	oh := handler.NewOrchestrationHandler(orchestrationStore, st, publisher, authzClient, logger)
+	oh := handler.NewOrchestrationHandler(orchestrationStore, st, publisher, authzClient, logger).WithProviders(providers)
 
-	r := chi.NewRouter()
-	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
-	r.Use(chimiddleware.Logger)
-	r.Use(chimiddleware.Recoverer)
-	r.Use(middleware.TenantContext)
-
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
-	// Recoverer and telemetry so a refusal is still traced, and ahead of every
-	// handler so no request reaches business logic without a resolved tenant,
-	// actor, correlation and — on material writes — an idempotency key.
-	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-
-	r.Get("/healthz", health.Handler())
-	handler.RegisterRoutes(r, h)
-	handler.RegisterOrchestrationRoutes(r, oh)
+	r := router.New(router.Deps{
+		DB:            dbpool,
+		Idem:          idempotency.NewPgStore(dbpool),
+		Handler:       h,
+		Orchestration: oh,
+		Logger:        logger,
+	})
 
 	srv := &http.Server{
 		Addr: ":" + cfg.Port, Handler: r,

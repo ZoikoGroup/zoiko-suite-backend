@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -59,6 +60,18 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "jurisdiction_id, rule_code, name, and category are required")
 		return
 	}
+	if !domain.ValidCategory(req.Category) {
+		writeError(w, http.StatusBadRequest, "category must be one of VAT, GST, SALES_TAX, CORPORATE_INCOME, WITHHOLDING, EXCISE, CUSTOMS")
+		return
+	}
+	if !validDate(req.EffectiveFrom) {
+		writeError(w, http.StatusBadRequest, "effective_from is required as a date in YYYY-MM-DD format")
+		return
+	}
+	if req.EffectiveTo != nil && !validDate(*req.EffectiveTo) {
+		writeError(w, http.StatusBadRequest, "effective_to must be a date in YYYY-MM-DD format")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -85,6 +98,10 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.CreateTaxRule(r.Context(), rule); err != nil {
+		if errors.Is(err, domain.ErrDuplicateRuleCode) {
+			writeError(w, http.StatusConflict, "tax rule with this jurisdiction_id, rule_code and version already exists")
+			return
+		}
 		h.logger.Error("create tax rule failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create tax rule")
 		return
@@ -162,6 +179,18 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if req.Category != "" && !domain.ValidCategory(req.Category) {
+		writeError(w, http.StatusBadRequest, "category must be one of VAT, GST, SALES_TAX, CORPORATE_INCOME, WITHHOLDING, EXCISE, CUSTOMS")
+		return
+	}
+	if req.Status != "" && !domain.ValidStatus(req.Status) {
+		writeError(w, http.StatusBadRequest, "status must be one of DRAFT, ACTIVE, DEPRECATED")
+		return
+	}
+	if req.EffectiveTo != nil && !validDate(*req.EffectiveTo) {
+		writeError(w, http.StatusBadRequest, "effective_to must be a date in YYYY-MM-DD format")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -224,6 +253,11 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+func validDate(s string) bool {
+	_, err := time.Parse("2006-01-02", s)
+	return err == nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

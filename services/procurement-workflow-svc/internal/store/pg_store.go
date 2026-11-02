@@ -108,6 +108,29 @@ func (s *PgStore) CreateCase(ctx context.Context, c *domain.ProcurementCase) (cr
 	return created, nil
 }
 
+// GetCaseByCorrelation returns the case created for (tenant, correlationID),
+// or domain.ErrCaseNotFound. Used to replay a retried create before any
+// downstream side effect (the spend check) runs again.
+func (s *PgStore) GetCaseByCorrelation(ctx context.Context, correlationID string) (*domain.ProcurementCase, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var c domain.ProcurementCase
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, "SELECT "+caseColumns+" FROM procurement_cases WHERE tenant_id = $1 AND correlation_id = $2", tenantID, correlationID)
+		return scanCase(row, &c)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrCaseNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
 func (s *PgStore) GetCase(ctx context.Context, caseID string) (*domain.ProcurementCase, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {

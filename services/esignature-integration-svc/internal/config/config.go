@@ -15,6 +15,12 @@ type Config struct {
 	AuthzMTLSURL     string
 
 	MTLSManagementServiceURL string
+
+	// ESignProviders is the comma-separated list of provider adapters to
+	// enable (ESIGN_PROVIDERS). Default empty = fail closed: no envelope can
+	// be sent and no provider-asserted status recorded. No adapter is
+	// implemented in this build, so any non-empty value fails startup.
+	ESignProviders string
 }
 
 func Load() *Config {
@@ -27,6 +33,7 @@ func Load() *Config {
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: getEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		ESignProviders:           os.Getenv("ESIGN_PROVIDERS"),
 	}
 }
 

@@ -20,8 +20,10 @@ import (
 	"zoiko.io/hris-connector-svc/internal/events"
 	"zoiko.io/hris-connector-svc/internal/handler"
 	"zoiko.io/hris-connector-svc/internal/health"
+	"zoiko.io/hris-connector-svc/internal/idempotency"
 	"zoiko.io/hris-connector-svc/internal/middleware"
 	"zoiko.io/hris-connector-svc/internal/mtls"
+	"zoiko.io/hris-connector-svc/internal/provider"
 	"zoiko.io/hris-connector-svc/internal/store"
 	"zoiko.io/hris-connector-svc/internal/telemetry"
 )
@@ -82,7 +84,12 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(st, publisher, authzClient, logger)
+	// No real HRIS provider adapter exists yet (see internal/provider): the
+	// registry is empty, so every sync answers 503 provider_not_configured
+	// instead of fabricating a result.
+	providers := provider.NewRegistry()
+	logger.Warn("no HRIS provider adapters registered: sync requests will fail closed with 503 provider_not_configured")
+	h := handler.New(st, publisher, authzClient, logger).WithProviders(providers)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -98,7 +105,12 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+	// Idempotency-Key replay for material writes (INV-08): a retried write
+	// with the same key is answered from its first response, not re-run.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(dbpool), logger))
+
 	r.Get("/healthz", health.Handler())
+	r.Get("/readyz", health.ReadyHandler(dbpool))
 	handler.RegisterRoutes(r, h)
 
 	srv := &http.Server{

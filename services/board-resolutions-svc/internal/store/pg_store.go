@@ -797,11 +797,18 @@ func (s *PgStore) GetQuorumEvidence(ctx context.Context, id string) (*domain.Quo
 		return nil, mapPgError(err)
 	}
 
-	var votesCast int
+	// Tallies come from the vote ledger, the same source as votesCast. The
+	// counter columns on board_resolutions are only written by CloseVoting,
+	// so while voting was OPEN this endpoint reported every tally as 0.
+	var votesCast, votesFor, votesAgainst, abstentions int
 	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM board_resolution_votes WHERE resolution_id=$1 AND tenant_id=$2`,
+		`SELECT count(*),
+		        count(*) FILTER (WHERE vote = 'FOR'),
+		        count(*) FILTER (WHERE vote = 'AGAINST'),
+		        count(*) FILTER (WHERE vote = 'ABSTAIN')
+		   FROM board_resolution_votes WHERE resolution_id=$1 AND tenant_id=$2`,
 		id, tenantID,
-	).Scan(&votesCast); err != nil {
+	).Scan(&votesCast, &votesFor, &votesAgainst, &abstentions); err != nil {
 		return nil, mapPgError(err)
 	}
 
@@ -816,9 +823,9 @@ func (s *PgStore) GetQuorumEvidence(ctx context.Context, id string) (*domain.Quo
 		RosterSize:      rosterSize,
 		QuorumThreshold: quorumThreshold,
 		VotesCast:       votesCast,
-		VotesFor:        r.VotesFor,
-		VotesAgainst:    r.VotesAgainst,
-		Abstentions:     r.Abstentions,
+		VotesFor:        votesFor,
+		VotesAgainst:    votesAgainst,
+		Abstentions:     abstentions,
 		QuorumMet:       votesCast >= quorumThreshold,
 	}, nil
 }

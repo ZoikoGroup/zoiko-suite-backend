@@ -39,6 +39,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS reconciliation_unmatched_items CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS reconciliation_jobs CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS eventing_outbox CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS idempotency_keys CASCADE;`)
 
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
@@ -49,6 +50,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000006_suggestion_data_model_names.up.sql",
 		"000007_suggestion_authoritative_ref.up.sql",
 		"000008_suggestion_candidate_match.up.sql",
+		"000009_rls_force_with_check.up.sql",
+		"000010_idempotency_keys.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -344,7 +347,7 @@ func TestPgStore_RunSourcedJob_TraceableAndUnmeasuredCountersStayNull(t *testing
 		t.Fatalf("item read back as run %q line %q, want %q %q", it.BankReconciliationRunID, it.StatementLineID, testRunID, testLineID)
 	}
 
-	listed, err := s.ListJobs(ctx, tenantID, "le-us", "", "")
+	listed, err := s.ListJobs(ctx, tenantID, "le-us", "", "", 0, 0)
 	if err != nil || len(listed) != 1 || listed[0].BankReconciliationRunID != testRunID {
 		t.Fatalf("ListJobs: %v %+v", err, listed)
 	}

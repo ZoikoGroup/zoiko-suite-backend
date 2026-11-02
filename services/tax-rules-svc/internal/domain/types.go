@@ -76,3 +76,21 @@ type UpdateTaxRuleRequest struct {
 	EffectiveTo        *string     `json:"effective_to,omitempty"`
 	UpdatedBy          string      `json:"updated_by"`
 }
+
+// ValidCategory reports whether c is one of the declared tax categories.
+func ValidCategory(c TaxCategory) bool {
+	switch c {
+	case CategoryVAT, CategoryGST, CategorySalesTax, CategoryCorporateIncome, CategoryWithholding, CategoryExcise, CategoryCustoms:
+		return true
+	}
+	return false
+}
+
+// ValidStatus reports whether s is one of the declared rule statuses.
+func ValidStatus(s RuleStatus) bool {
+	switch s {
+	case StatusDraft, StatusActive, StatusDeprecated:
+		return true
+	}
+	return false
+}

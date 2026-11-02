@@ -120,7 +120,18 @@ func (c *Client) Authorize(ctx context.Context, tenantID, actorID, action, resou
 }
 
 func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	// An authorization decision is only meaningful inside the caller's own,
+	// verified tenant. Without one there is nothing to ask authorization-svc
+	// about, so the answer is a denial — never a decision taken in a
+	// placeholder tenant (the client used to substitute 11111111-...).
+	tenantID := middleware.GetTenantID(ctx)
+	if tenantID == "" {
+		return ErrAuthorizationDenied
+	}
+
+	// The tenant is part of the cache key so a decision cached for one tenant
+	// can never be replayed for a request in another tenant.
+	key := tenantID + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
@@ -191,10 +202,8 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// CheckAllowed has already refused a request with no verified tenant.
 	tenantID := middleware.GetTenantID(ctx)
-	if tenantID == "" || tenantID == "default" {
-		tenantID = "11111111-1111-1111-1111-111111111111"
-	}
 	requestID := uuid.New().String()
 
 	req.Header.Set("X-Tenant-Id", tenantID)

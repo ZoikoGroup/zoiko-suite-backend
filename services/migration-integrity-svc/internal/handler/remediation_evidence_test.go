@@ -30,9 +30,7 @@ func createJobWithViolation(t *testing.T, router http.Handler) domain.MigrationJ
 			{Ref: "REC-100", Fields: map[string]string{"amount": "N/A"}},
 		},
 	}
-	body, _ := json.Marshal(validateReq)
-	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
-	withEnvelope(req)
+	req := validateRequest(t, validateReq)
 	req.Header.Set("X-Tenant-ID", "tenant-mig-66")
 	req.Header.Set("X-Principal-Id", "user-1")
 	req.Header.Set("Content-Type", "application/json")
@@ -52,9 +50,12 @@ func createJobWithViolation(t *testing.T, router http.Handler) domain.MigrationJ
 func remediate(t *testing.T, router http.Handler, jobID, entryID, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/"+jobID+"/audit/"+entryID+"/remediate", bytes.NewBufferString(body))
+	req.Header.Set("X-Legal-Entity-Id", "LE-6001") // the job's entity (createJobWithViolation)
 	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-mig-66")
-	req.Header.Set("X-Principal-Id", "user-1")
+	// Not the submitter (user-1): the submitter of a run may not disposition
+	// its quarantine items (segregation of duties).
+	req.Header.Set("X-Principal-Id", "user-2")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -103,7 +104,7 @@ func TestRemediateEntry_RecordsEvidence(t *testing.T) {
 	if entry.RemediationReason != "source corrected and reloaded" || entry.RemediationEvidenceRef != "ticket-MIG-42" {
 		t.Fatalf("expected evidence recorded on the entry, got %+v", entry)
 	}
-	if entry.RemediatedBy != "user-1" || entry.RemediatedAt == nil {
+	if entry.RemediatedBy != "user-2" || entry.RemediatedAt == nil {
 		t.Fatalf("expected remediated_by/remediated_at recorded, got %+v", entry)
 	}
 }

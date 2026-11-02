@@ -13,6 +13,8 @@ import (
 	authzpkg "zoiko.io/key-management-svc/internal/authz"
 	"zoiko.io/key-management-svc/internal/domain"
 	svcenvelope "zoiko.io/key-management-svc/internal/envelope"
+	"zoiko.io/key-management-svc/internal/health"
+	"zoiko.io/key-management-svc/internal/idempotency"
 	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
@@ -83,6 +85,25 @@ type Handler struct {
 	siem   *siem.Client
 	authz  AuthzChecker
 	logger *zap.Logger
+
+	// idem answers a retried material write from its first response. nil
+	// disables replay protection: unit tests only; cmd/server always sets
+	// the Postgres-backed store.
+	idem idempotency.Store
+	// db is what /readyz pings. nil reports not-ready.
+	db health.Pinger
+}
+
+// WithIdempotency installs Idempotency-Key replay for material writes.
+func (h *Handler) WithIdempotency(s idempotency.Store) *Handler {
+	h.idem = s
+	return h
+}
+
+// WithReadiness sets the dependency /readyz checks.
+func (h *Handler) WithReadiness(db health.Pinger) *Handler {
+	h.db = db
+	return h
 }
 
 // requirePrincipal returns the gateway-verified principal, or refuses the
@@ -139,10 +160,16 @@ func NewRouter(h *Handler) http.Handler {
 	// Refusals rendered as RFC 9457 problem+json, like every other error here.
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "key-management-svc"})
-	})
+	// Replay protection (INV-08): a retried register/rotate/disable with the
+	// same Idempotency-Key gets the first answer instead of running again,
+	// which for rotate would otherwise advance the version twice.
+	if h.idem != nil {
+		r.Use(idempotency.Middleware(h.idem, h.logger))
+	}
+	// Probes are public: the envelope policy exempts them and the tenant
+	// check lives in the handlers below, not on the router.
+	r.Get("/healthz", health.HealthzHandler("key-management-svc"))
+	r.Get("/readyz", health.ReadyzHandler(h.db))
 	r.Route("/v1/keys", func(r chi.Router) {
 		r.Post("/", h.RegisterKey)
 		r.Get("/", h.ListKeys)
@@ -182,6 +209,7 @@ func (h *Handler) RegisterKey(w http.ResponseWriter, r *http.Request) {
 		ExternalKeyARN: req.ExternalKeyARN,
 	}
 	if err := h.store.CreateKey(r.Context(), tenantID, key); err != nil {
+		h.logger.Error("register key failed", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to register key")
 		return
 	}
@@ -198,8 +226,7 @@ func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key, err := h.store.GetKeyByID(r.Context(), tenantID, chi.URLParam(r, "id"))
-	if err != nil {
-		h.errJSON(w, r, 404, "key not found")
+	if !h.lookupOK(w, r, err) {
 		return
 	}
 	if !h.authorize(w, r, principalID, key.LegalEntityID, KeyRead) {
@@ -231,7 +258,12 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, legalEntityID, KeyRead) {
 		return
 	}
-	keys, _ := h.store.ListKeys(r.Context(), tenantID, legalEntityID)
+	keys, err := h.store.ListKeys(r.Context(), tenantID, legalEntityID)
+	if err != nil {
+		h.logger.Error("list keys failed", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to list keys")
+		return
+	}
 	if keys == nil {
 		keys = []domain.CustomerKey{}
 	}
@@ -254,8 +286,7 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	// already happened — the authorization decision has to precede the
 	// mutation, which means fetching the row purely to learn whose it is.
 	existing, err := h.store.GetKeyByID(r.Context(), tenantID, id)
-	if err != nil {
-		h.errJSON(w, r, 404, "key not found")
+	if !h.lookupOK(w, r, err) {
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, KeyRotate) {
@@ -263,8 +294,7 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key, err := h.store.RotateKey(r.Context(), tenantID, id)
-	if err != nil {
-		h.errJSON(w, r, 404, "key not found")
+	if !h.lookupOK(w, r, err) {
 		return
 	}
 	// Doc 05 §13.2 names "secret retrieval" and key lifecycle events as
@@ -291,20 +321,33 @@ func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
 	// without a prior read there is no way to know whose key was disabled
 	// until after disabling it.
 	existing, err := h.store.GetKeyByID(r.Context(), tenantID, id)
-	if err != nil {
-		h.errJSON(w, r, 404, "key not found")
+	if !h.lookupOK(w, r, err) {
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, KeyDisable) {
 		return
 	}
 
-	if err := h.store.DisableKey(r.Context(), tenantID, id); err != nil {
-		h.errJSON(w, r, 404, "key not found")
+	if err := h.store.DisableKey(r.Context(), tenantID, id); !h.lookupOK(w, r, err) {
 		return
 	}
 	h.siem.Stream(r.Context(), tenantID, "key.disabled", siem.SeverityHigh, "Key disabled: "+id)
 	h.okJSON(w, r, 200, map[string]string{"message": "key disabled"})
+}
+
+// lookupOK maps a store error: ErrNotFound (unknown id, or another tenant's)
+// is 404; anything else is a storage failure, 500, never a misleading 404.
+func (h *Handler) lookupOK(w http.ResponseWriter, r *http.Request, err error) bool {
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, store.ErrNotFound):
+		h.errJSON(w, r, http.StatusNotFound, "key not found")
+	default:
+		h.logger.Error("key store failed", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "key store unavailable")
+	}
+	return false
 }
 
 func (h *Handler) okJSON(w http.ResponseWriter, r *http.Request, code int, v interface{}) {

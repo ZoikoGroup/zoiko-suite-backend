@@ -76,7 +76,7 @@ type RegistrationResolver interface {
 
 // RulesClient retrieves active dynamic tax rules. Interface allows testing without real HTTP calls.
 type RulesClient interface {
-	FetchActiveRule(ctx context.Context, tenantID, jurisdictionID, category string) (*rules.TaxRuleDTO, error)
+	FetchActiveRule(ctx context.Context, caller rules.Caller, jurisdictionID, category string) (*rules.TaxRuleDTO, error)
 }
 
 var _ RulesClient = (*rules.Client)(nil)
@@ -275,7 +275,15 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch dynamic tax rule from tax-rules-svc (TAX-03 Invariant 3: missing rule must block, fail closed)
-	rule, err := h.rulesClient.FetchActiveRule(r.Context(), tenantID, req.JurisdictionID, req.TaxCategory)
+	// Forward the caller's identity: tax-rules-svc requires both tenant and
+	// principal on reads and would otherwise answer 401.
+	ruleCaller := rules.Caller{
+		TenantID:      tenantID,
+		PrincipalID:   principalID,
+		LegalEntityID: req.LegalEntityID,
+		CorrelationID: correlationID,
+	}
+	rule, err := h.rulesClient.FetchActiveRule(r.Context(), ruleCaller, req.JurisdictionID, req.TaxCategory)
 	if err != nil {
 		h.logger.Error("failed to fetch active tax rule", zap.Error(err),
 			zap.String("jurisdiction_id", req.JurisdictionID),

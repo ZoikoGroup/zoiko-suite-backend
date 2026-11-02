@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -12,6 +13,7 @@ import (
 	"zoiko.io/hris-connector-svc/internal/domain"
 	"zoiko.io/hris-connector-svc/internal/events"
 	"zoiko.io/hris-connector-svc/internal/middleware"
+	"zoiko.io/hris-connector-svc/internal/provider"
 	"zoiko.io/hris-connector-svc/internal/store"
 )
 
@@ -24,11 +26,21 @@ type Handler struct {
 	store     store.Store
 	publisher events.Publisher
 	authz     *authz.Client
+	providers *provider.Registry
 	logger    *zap.Logger
 }
 
+// New builds the handler with an EMPTY provider registry: until a real
+// adapter is registered with WithProviders, every sync fails closed with
+// 503 provider_not_configured (see internal/provider's package doc).
 func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+	return &Handler{store: st, publisher: pub, authz: az, providers: provider.NewRegistry(), logger: logger}
+}
+
+// WithProviders installs the provider adapter registry.
+func (h *Handler) WithProviders(reg *provider.Registry) *Handler {
+	h.providers = reg
+	return h
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -92,7 +104,9 @@ func (h *Handler) CreateIntegration(w http.ResponseWriter, r *http.Request) {
 		SyncType:      req.SyncType,
 		Direction:     req.Direction,
 		ApiEndpoint:   req.ApiEndpoint,
-		Status:        domain.SyncCompleted,
+		// PENDING, not COMPLETED: registering an integration contacts no
+		// provider, so nothing has been synchronised yet.
+		Status: domain.SyncPending,
 	}
 
 	if err := h.store.CreateIntegration(r.Context(), integ); err != nil {
@@ -174,12 +188,43 @@ func (h *Handler) TriggerSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The sync is performed by the provider adapter. This used to persist a
+	// COMPLETED job with records_synced=1 without contacting any provider —
+	// a fabricated success. With no adapter registered the request now fails
+	// closed and nothing is recorded or published.
+	result, syncErr := h.providers.Sync(r.Context(), provider.SyncRequest{
+		TenantID: tenantID, IntegrationID: integ.IntegrationID, Provider: integ.ProviderName,
+		APIEndpoint: integ.ApiEndpoint, SyncType: req.SyncType,
+	})
+	if errors.Is(syncErr, provider.ErrProviderNotConfigured) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error":   "provider_not_configured",
+			"message": "no HRIS provider adapter is configured for provider " + integ.ProviderName + "; no sync was performed",
+		})
+		return
+	}
+
 	job := &domain.SyncJob{
 		IntegrationID: req.IntegrationID,
 		TenantID:      tenantID,
 		SyncType:      req.SyncType,
-		Status:        domain.SyncCompleted,
-		RecordsSynced: 1,
+	}
+	status := http.StatusCreated
+	if syncErr != nil {
+		// A real provider failure is recorded as a FAILED job (evidence of
+		// the attempt) without echoing provider detail to the caller.
+		h.logger.Warn("HRIS provider sync failed", zap.String("integration_id", integ.IntegrationID), zap.Error(syncErr))
+		job.Status = domain.SyncFailed
+		job.ErrorMessage = "provider sync failed"
+		status = http.StatusBadGateway
+	} else {
+		job.Status = domain.SyncCompleted
+		job.RecordsSynced = result.RecordsSynced
+		completed := result.CompletedAt
+		if completed.IsZero() {
+			completed = time.Now().UTC()
+		}
+		job.CompletedAt = &completed
 	}
 
 	if err := h.store.CreateSyncJob(r.Context(), job); err != nil {
@@ -194,7 +239,7 @@ func (h *Handler) TriggerSync(w http.ResponseWriter, r *http.Request) {
 		LegalEntityID: integ.LegalEntityID, ActorID: principalID,
 		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: job,
 	})
-	writeJSON(w, http.StatusCreated, job)
+	writeJSON(w, status, job)
 }
 
 func (h *Handler) ListSyncJobs(w http.ResponseWriter, r *http.Request) {

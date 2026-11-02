@@ -99,6 +99,9 @@ func (h *findingHandler) GetMisstatementSummary(w http.ResponseWriter, r *http.R
 		h.writeFindingErr(w, err)
 		return
 	}
+	if summary == nil {
+		summary = []domain.MisstatementRecord{}
+	}
 	writeJSON(w, http.StatusOK, summary)
 }
 
@@ -311,12 +314,22 @@ func (h *findingHandler) ResolveScopeLimitation(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	tenantID := middleware.GetTenantID(r.Context())
-	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionFindingManage); err != nil {
+	limitationID := chi.URLParam(r, "limitation_id")
+	limitation, err := h.store.GetScopeLimitation(r.Context(), limitationID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	finding, err := h.store.GetFinding(r.Context(), limitation.FindingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	updated, err := h.store.ResolveScopeLimitation(r.Context(), domain.ResolveScopeLimitationParams{LimitationID: chi.URLParam(r, "limitation_id"), TenantID: tenantID})
+	updated, err := h.store.ResolveScopeLimitation(r.Context(), domain.ResolveScopeLimitationParams{LimitationID: limitationID, TenantID: middleware.GetTenantID(r.Context())})
 	if err != nil {
 		h.writeFindingErr(w, err)
 		return
@@ -329,6 +342,9 @@ func (h *findingHandler) ListOpenScopeLimitations(w http.ResponseWriter, r *http
 	if err != nil {
 		h.writeFindingErr(w, err)
 		return
+	}
+	if limitations == nil {
+		limitations = []domain.ScopeLimitation{}
 	}
 	writeJSON(w, http.StatusOK, limitations)
 }

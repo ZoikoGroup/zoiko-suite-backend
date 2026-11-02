@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/corporate-tax-svc/internal/domain"
@@ -84,6 +86,9 @@ func (s *PgStore) Create(ctx context.Context, r *domain.TaxReturn) error {
 		r.CreatedBy, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrDuplicateReturn
+		}
 		return fmt.Errorf("insert corporate tax return: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -103,12 +108,12 @@ func (s *PgStore) GetByID(ctx context.Context, id string) (*domain.TaxReturn, er
 	var status string
 	err = tx.QueryRow(ctx, `
 		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
-		       fiscal_year, accounting_period_start, accounting_period_end,
+		       fiscal_year, accounting_period_start::text, accounting_period_end::text,
 		       gross_revenue, allowable_deductions, taxable_income, tax_rate_percent,
 		       gross_tax_liability, tax_credits, net_tax_payable, tax_already_paid,
 		       balance_due, currency, status, submitted_at, submitted_by,
 		       assessed_tax_amount, assessment_reference, notes,
-		       effective_from, effective_to, created_by, created_at, updated_at
+		       effective_from::text, effective_to::text, created_by, created_at, updated_at
 		FROM corporate_tax_returns WHERE return_id = $1 AND tenant_id = $2`, id, middleware.GetTenantID(ctx),
 	).Scan(
 		&r.ReturnID, &r.TenantID, &r.LegalEntityID, &r.JurisdictionID, &r.TaxRegistrationNumber,
@@ -142,12 +147,12 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, statu
 
 	rows, err := tx.Query(ctx, `
 		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
-		       fiscal_year, accounting_period_start, accounting_period_end,
+		       fiscal_year, accounting_period_start::text, accounting_period_end::text,
 		       gross_revenue, allowable_deductions, taxable_income, tax_rate_percent,
 		       gross_tax_liability, tax_credits, net_tax_payable, tax_already_paid,
 		       balance_due, currency, status, submitted_at, submitted_by,
 		       assessed_tax_amount, assessment_reference, notes,
-		       effective_from, effective_to, created_by, created_at, updated_at
+		       effective_from::text, effective_to::text, created_by, created_at, updated_at
 		FROM corporate_tax_returns
 		WHERE tenant_id = $5
 		  AND ($1 = '' OR legal_entity_id = $1)
@@ -228,12 +233,12 @@ func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.T
 	var status string
 	err = tx.QueryRow(ctx, `
 		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
-		       fiscal_year, accounting_period_start, accounting_period_end,
+		       fiscal_year, accounting_period_start::text, accounting_period_end::text,
 		       gross_revenue, allowable_deductions, taxable_income, tax_rate_percent,
 		       gross_tax_liability, tax_credits, net_tax_payable, tax_already_paid,
 		       balance_due, currency, status, submitted_at, submitted_by,
 		       assessed_tax_amount, assessment_reference, notes,
-		       effective_from, effective_to, created_by, created_at, updated_at
+		       effective_from::text, effective_to::text, created_by, created_at, updated_at
 		FROM corporate_tax_returns WHERE return_id = $1 AND tenant_id = $2 FOR UPDATE`,
 		id, middleware.GetTenantID(ctx),
 	).Scan(
@@ -293,12 +298,12 @@ func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxRe
 	var status string
 	err = tx.QueryRow(ctx, `
 		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
-		       fiscal_year, accounting_period_start, accounting_period_end,
+		       fiscal_year, accounting_period_start::text, accounting_period_end::text,
 		       gross_revenue, allowable_deductions, taxable_income, tax_rate_percent,
 		       gross_tax_liability, tax_credits, net_tax_payable, tax_already_paid,
 		       balance_due, currency, status, submitted_at, submitted_by,
 		       assessed_tax_amount, assessment_reference, notes,
-		       effective_from, effective_to, created_by, created_at, updated_at
+		       effective_from::text, effective_to::text, created_by, created_at, updated_at
 		FROM corporate_tax_returns WHERE return_id = $1 AND tenant_id = $2 FOR UPDATE`,
 		id, middleware.GetTenantID(ctx),
 	).Scan(
@@ -317,6 +322,12 @@ func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxRe
 		return nil, err
 	}
 	r.Status = domain.FilingStatus(status)
+	// An assessment answers a submission: a DRAFT has not been filed and an
+	// already-assessed/settled return is past this step. Checked under the
+	// row lock taken by FOR UPDATE above.
+	if r.Status != domain.StatusSubmitted {
+		return nil, domain.ErrInvalidStatusTransition
+	}
 
 	now := time.Now().UTC()
 	r.Status = domain.StatusAssessed
@@ -469,4 +480,10 @@ func (s *PgStore) ListNexusRecords(ctx context.Context, legalEntityID, jurisdict
 	}
 	_ = tx.Commit(ctx)
 	return records, nil
+}
+
+// isUniqueViolation reports a Postgres 23505 (unique_violation).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

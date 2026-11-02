@@ -21,6 +21,7 @@ import (
 	"zoiko.io/withholding-tax-svc/internal/events"
 	"zoiko.io/withholding-tax-svc/internal/handler"
 	"zoiko.io/withholding-tax-svc/internal/health"
+	"zoiko.io/withholding-tax-svc/internal/idempotency"
 	"zoiko.io/withholding-tax-svc/internal/middleware"
 	"zoiko.io/withholding-tax-svc/internal/mtls"
 	"zoiko.io/withholding-tax-svc/internal/store"
@@ -95,6 +96,11 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), logger))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))

@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
@@ -33,7 +32,13 @@ type Store interface {
 	RevokeCert(ctx context.Context, tenantID, id string) (*domain.MtlsCertificate, error)
 	CreatePolicy(ctx context.Context, tenantID string, pol *domain.CommunicationPolicy) error
 	ListPolicies(ctx context.Context, tenantID string) ([]domain.CommunicationPolicy, error)
+	// Ping reports whether the store can serve requests; /readyz calls it.
+	Ping(ctx context.Context) error
 }
+
+// ErrNotFound is a record that does not exist in the caller's tenant. A
+// record in another tenant is indistinguishable from one that does not exist.
+var ErrNotFound = errors.New("certificate not found")
 
 // ErrCertRevoked refuses an operation that would bring a revoked
 // certificate record back into use.
@@ -45,9 +50,16 @@ var ErrCertRevoked = errors.New("certificate is revoked")
 func clone(c *domain.MtlsCertificate) *domain.MtlsCertificate {
 	cp := *c
 	cp.PriorSerialNumbers = append([]string(nil), c.PriorSerialNumbers...)
+	if c.RevokedAt != nil {
+		t := *c.RevokedAt
+		cp.RevokedAt = &t
+	}
 	return &cp
 }
 
+// MemoryStore is the in-process Store used by unit tests. It is NOT the
+// production store: cmd/server wires PgStore, because certificate records and
+// their rotation/revocation lifecycle must survive a restart.
 type MemoryStore struct {
 	mu       sync.RWMutex
 	certs    map[string]*domain.MtlsCertificate
@@ -80,7 +92,7 @@ func (m *MemoryStore) GetCertByID(ctx context.Context, tenantID, id string) (*do
 	defer m.mu.RUnlock()
 	c, ok := m.certs[id]
 	if !ok || c.TenantID != tenantID {
-		return nil, fmt.Errorf("certificate not found")
+		return nil, ErrNotFound
 	}
 	return clone(c), nil
 }
@@ -109,7 +121,7 @@ func (m *MemoryStore) ReplaceCertMaterial(ctx context.Context, tenantID, id stri
 	defer m.mu.Unlock()
 	c, ok := m.certs[id]
 	if !ok || c.TenantID != tenantID {
-		return nil, fmt.Errorf("certificate not found")
+		return nil, ErrNotFound
 	}
 	if c.Status == domain.CertStatusRevoked {
 		return nil, ErrCertRevoked
@@ -131,11 +143,13 @@ func (m *MemoryStore) RevokeCert(ctx context.Context, tenantID, id string) (*dom
 	defer m.mu.Unlock()
 	c, ok := m.certs[id]
 	if !ok || c.TenantID != tenantID {
-		return nil, fmt.Errorf("certificate not found")
+		return nil, ErrNotFound
 	}
 	if c.Status != domain.CertStatusRevoked {
+		now := time.Now()
 		c.Status = domain.CertStatusRevoked
-		c.UpdatedAt = time.Now()
+		c.RevokedAt = &now
+		c.UpdatedAt = now
 	}
 	return clone(c), nil
 }
@@ -161,3 +175,6 @@ func (m *MemoryStore) ListPolicies(ctx context.Context, tenantID string) ([]doma
 	}
 	return result, nil
 }
+
+// Ping always succeeds: the map is in process.
+func (m *MemoryStore) Ping(context.Context) error { return nil }

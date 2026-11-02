@@ -11,6 +11,13 @@ var (
 	ErrAlreadyConfirmed    = errors.New("filing requirement is already confirmed")
 	ErrAlreadyOverdue      = errors.New("filing requirement is already marked overdue")
 
+	// ErrNotSubmitted is a confirm of a filing that was never submitted.
+	ErrNotSubmitted = errors.New("only a SUBMITTED filing requirement can be confirmed")
+
+	// ErrDuplicateRequirement is a second requirement for the same entity,
+	// jurisdiction, filing type and period (uk_filing_req_period).
+	ErrDuplicateRequirement = errors.New("filing requirement for this entity, jurisdiction, filing type and period already exists")
+
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".
 	ErrTenantMissing = errors.New("tenant scope missing")

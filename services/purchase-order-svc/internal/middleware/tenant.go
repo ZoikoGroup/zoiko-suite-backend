@@ -4,6 +4,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strings"
 )
 
 type tenantCtxKey struct{}
@@ -45,6 +46,15 @@ func CorrelationIDFromContext(ctx context.Context) string {
 func TenantContext() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Every /v1 route is tenant-scoped. Refuse an unscoped call here with
+			// 401 rather than letting it surface later as a 404 (a lookup under
+			// an empty tenant, indistinguishable from "no such order").
+			if strings.HasPrefix(r.URL.Path, "/v1/") && r.Header.Get("X-Tenant-Id") == "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"tenant_scope_missing","code":"TENANT_SCOPE_MISSING","detail":"X-Tenant-Id is required"}`))
+				return
+			}
 			ctx := r.Context()
 			if tenantID := r.Header.Get("X-Tenant-Id"); tenantID != "" {
 				ctx = WithTenant(ctx, tenantID)

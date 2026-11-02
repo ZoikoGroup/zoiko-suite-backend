@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -14,6 +15,7 @@ import (
 	authzpkg "zoiko.io/siem-integration-svc/internal/authz"
 	"zoiko.io/siem-integration-svc/internal/domain"
 	svcenvelope "zoiko.io/siem-integration-svc/internal/envelope"
+	"zoiko.io/siem-integration-svc/internal/idempotency"
 	"zoiko.io/siem-integration-svc/internal/store"
 )
 
@@ -61,6 +63,15 @@ type Handler struct {
 	store  store.Store
 	authz  AuthzChecker
 	logger *zap.Logger
+	idem   idempotency.Store
+}
+
+// WithIdempotency enables Idempotency-Key replay on material writes, backed by
+// st (production: idempotency.NewPgStore). No answer here carries a secret —
+// the exporter credential is json:"-" — so every answer may be replayed.
+func (h *Handler) WithIdempotency(st idempotency.Store) *Handler {
+	h.idem = st
+	return h
 }
 
 func New(s store.Store, az AuthzChecker, l *zap.Logger) *Handler {
@@ -151,9 +162,28 @@ func NewRouter(h *Handler) http.Handler {
 	// Refusals rendered as RFC 9457 problem+json, like every other error here.
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
+	if h.idem != nil {
+		// After the envelope, before any handler. /v1/siem/stream is
+		// envelope-exempt; a caller that sends a key is still deduplicated.
+		r.Use(idempotency.Middleware(h.idem, h.logger))
+	}
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "siem-integration-svc"})
+	})
+	// Readiness: the store must answer within 2s. Public like /healthz (the
+	// envelope's ServicePolicy exempts both; no handler reads a tenant here).
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		if err := h.store.Ping(ctx); err != nil {
+			h.logger.Warn("readiness: store unavailable", zap.Error(err))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "unavailable", "reason": "database unreachable"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 	})
 	r.Route("/v1/siem", func(r chi.Router) {
 		r.Post("/exporters", h.CreateExporter)
@@ -194,6 +224,17 @@ func (h *Handler) CreateExporter(w http.ResponseWriter, r *http.Request) {
 		AuthToken:     req.AuthToken,
 	}
 	if err := h.store.CreateExporter(r.Context(), tenantID, exp); err != nil {
+		if errors.Is(err, store.ErrCredentialSealingUnavailable) {
+			// Never fall back to storing the credential in plaintext.
+			apicontract.WriteProblem(w, r, apicontract.Problem{
+				Status:    http.StatusServiceUnavailable,
+				Code:      "credential_sealing_unavailable",
+				Detail:    "auth_token cannot be stored: no credential sealing key is configured (SIEM_CREDENTIAL_KEY)",
+				Retryable: false,
+			})
+			return
+		}
+		h.logger.Error("failed to create exporter", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to create exporter")
 		return
 	}
@@ -211,7 +252,7 @@ func (h *Handler) GetExporter(w http.ResponseWriter, r *http.Request) {
 	}
 	exp, err := h.store.GetExporterByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		h.errJSON(w, r, 404, "exporter not found")
+		h.lookupFailed(w, r, err)
 		return
 	}
 	// Authorized against the exporter row's own legal entity, never a
@@ -302,7 +343,7 @@ func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
 		Payload:    req.Payload,
 	}
 	if err := h.store.StreamEvent(r.Context(), tenantID, evt); err != nil {
-		h.errJSON(w, r, 404, err.Error())
+		h.lookupFailed(w, r, err)
 		return
 	}
 	h.okJSON(w, r, 201, evt)
@@ -336,17 +377,35 @@ func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	exp, err := h.store.GetExporterByID(r.Context(), tenantID, exporterID)
 	if err != nil {
-		h.errJSON(w, r, 404, "exporter not found")
+		h.lookupFailed(w, r, err)
 		return
 	}
 	if !h.authorize(w, r, principalID, exp.LegalEntityID, SiemEventRead) {
 		return
 	}
-	evts, _ := h.store.ListEvents(r.Context(), tenantID, exporterID)
+	evts, err := h.store.ListEvents(r.Context(), tenantID, exporterID)
+	if err != nil {
+		// Not an empty 200: "no events" and "could not read events" must differ.
+		h.logger.Error("failed to list events", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to list events")
+		return
+	}
 	if evts == nil {
 		evts = []domain.SIEMEvent{}
 	}
 	h.okJSON(w, r, 200, map[string]interface{}{"data": evts, "count": len(evts)})
+}
+
+// lookupFailed answers a failed exporter read: 404 when it does not exist in
+// the caller's tenant (a foreign one looks the same), 500 when the store
+// failed. The store error itself is logged, never echoed to the caller.
+func (h *Handler) lookupFailed(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		h.errJSON(w, r, http.StatusNotFound, "exporter not found")
+		return
+	}
+	h.logger.Error("exporter store failure", zap.Error(err))
+	h.errJSON(w, r, http.StatusInternalServerError, "exporter store unavailable")
 }
 
 // errJSON answers a refusal that names no code of its own. The code is the

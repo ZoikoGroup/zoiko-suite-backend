@@ -28,6 +28,7 @@ type FindingStore interface {
 	LinkRemediation(ctx context.Context, p domain.LinkRemediationParams) (*domain.RemediationEvidence, error)
 	RecordScopeLimitation(ctx context.Context, p domain.RecordScopeLimitationParams) (*domain.ScopeLimitation, error)
 	ResolveScopeLimitation(ctx context.Context, p domain.ResolveScopeLimitationParams) (*domain.ScopeLimitation, error)
+	GetScopeLimitation(ctx context.Context, limitationID string) (*domain.ScopeLimitation, error)
 	ListOpenScopeLimitations(ctx context.Context, tenantID, findingID string) ([]domain.ScopeLimitation, error)
 	CloseFinding(ctx context.Context, p domain.CloseFindingParams) (*domain.AuditFinding, error)
 	ReopenFinding(ctx context.Context, p domain.ReopenFindingParams) (*domain.AuditFinding, error)
@@ -106,6 +107,9 @@ func (s *PgStore) AccumulateMisstatement(ctx context.Context, p domain.Accumulat
 	if err := s.findingSetRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+	if err := requireFindingInTx(ctx, tx, p.FindingID, p.TenantID); err != nil {
+		return nil, err
+	}
 	id := "misstatement-" + uuid.New().String()
 	row := tx.QueryRow(ctx, `INSERT INTO misstatement_records (misstatement_id, finding_id, tenant_id, amount, corrects_misstatement_id, recorded_by_principal_id)
 		VALUES ($1,$2,$3,$4,$5,$6) RETURNING misstatement_id, finding_id, amount, corrects_misstatement_id, is_corrected, recorded_by_principal_id, recorded_at`,
@@ -161,6 +165,9 @@ func (s *PgStore) RecordMaterialityEvaluation(ctx context.Context, p domain.Reco
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.findingSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	if err := requireFindingInTx(ctx, tx, p.FindingID, p.TenantID); err != nil {
 		return nil, err
 	}
 	var nextVersion int
@@ -229,6 +236,9 @@ func (s *PgStore) RecordManagementResponse(ctx context.Context, p domain.RecordM
 	if err := s.findingSetRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+	if err := requireFindingInTx(ctx, tx, p.FindingID, p.TenantID); err != nil {
+		return nil, err
+	}
 	id := "mgmtresp-" + uuid.New().String()
 	row := tx.QueryRow(ctx, `INSERT INTO management_responses (response_id, finding_id, tenant_id, response_text, remediation_plan, responded_by_principal_id)
 		VALUES ($1,$2,$3,$4,$5,$6) RETURNING response_id, finding_id, response_text, remediation_plan, responded_by_principal_id, responded_at`,
@@ -255,6 +265,9 @@ func (s *PgStore) LinkRemediation(ctx context.Context, p domain.LinkRemediationP
 	if err := s.findingSetRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+	if err := requireFindingInTx(ctx, tx, p.FindingID, p.TenantID); err != nil {
+		return nil, err
+	}
 	id := "remediation-" + uuid.New().String()
 	row := tx.QueryRow(ctx, `INSERT INTO remediation_evidence (remediation_id, finding_id, tenant_id, evidence_ref, reperformed, recorded_by_principal_id)
 		VALUES ($1,$2,$3,$4,$5,$6) RETURNING remediation_id, finding_id, evidence_ref, reperformed, recorded_by_principal_id, recorded_at`,
@@ -279,6 +292,9 @@ func (s *PgStore) RecordScopeLimitation(ctx context.Context, p domain.RecordScop
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.findingSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	if err := requireFindingInTx(ctx, tx, p.FindingID, p.TenantID); err != nil {
 		return nil, err
 	}
 	id := "scopelimit-" + uuid.New().String()
@@ -431,4 +447,43 @@ func (s *PgStore) ReopenFinding(ctx context.Context, p domain.ReopenFindingParam
 		return nil, err
 	}
 	return f, nil
+}
+
+// requireFindingInTx refuses a child record (misstatement, evaluation,
+// response, remediation, scope limitation) for a finding that does not exist
+// in this tenant. There is no FK from the child tables, so without this an
+// unknown finding_id silently produced an orphan row.
+func requireFindingInTx(ctx context.Context, tx pgx.Tx, findingID, tenantID string) error {
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM audit_findings WHERE finding_id=$1 AND tenant_id=$2)`, findingID, tenantID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return domain.ErrFindingNotFound
+	}
+	return nil
+}
+
+// GetScopeLimitation reads one scope limitation in the caller's tenant, so a
+// command on it can be authorized against its finding's legal entity.
+func (s *PgStore) GetScopeLimitation(ctx context.Context, limitationID string) (*domain.ScopeLimitation, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.findingSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	l := &domain.ScopeLimitation{}
+	err = tx.QueryRow(ctx, `SELECT limitation_id, finding_id, description, still_impacts_report, recorded_by_principal_id, recorded_at, resolved_at
+		FROM scope_limitations WHERE limitation_id=$1 AND tenant_id=$2`, limitationID, middleware.GetTenantID(ctx)).
+		Scan(&l.LimitationID, &l.FindingID, &l.Description, &l.StillImpactsReport, &l.RecordedByPrincipalID, &l.RecordedAt, &l.ResolvedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrScopeLimitationNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
 }

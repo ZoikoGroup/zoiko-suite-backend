@@ -22,6 +22,7 @@ import (
 	"zoiko.io/vat-gst-svc/internal/evidencereq"
 	"zoiko.io/vat-gst-svc/internal/handler"
 	"zoiko.io/vat-gst-svc/internal/health"
+	"zoiko.io/vat-gst-svc/internal/idempotency"
 	"zoiko.io/vat-gst-svc/internal/middleware"
 	"zoiko.io/vat-gst-svc/internal/mtls"
 	"zoiko.io/vat-gst-svc/internal/store"
@@ -95,6 +96,11 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), logger))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))

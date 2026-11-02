@@ -48,14 +48,15 @@ type SIEMExporter struct {
 	// time someone added a fourth read route; the wire format simply
 	// cannot carry it now. Nothing needs it there: CreateExporterRequest
 	// carries its own AuthToken field for input, and this struct is never
-	// JSON round-tripped for persistence (the store is in-memory).
+	// JSON round-tripped for persistence.
 	//
 	// Two deeper problems this does NOT fix, both tracked as row 8p-a:
 	//
-	//  1. The token is stored in plaintext. Doc 05 §13 calls for a vault
-	//     reference rather than the secret itself, which needs
-	//     secret-vault-integration-svc to be able to return material —
-	//     blocked on row 81.
+	//  1. Doc 05 §13 calls for a vault reference rather than the secret
+	//     itself, which needs secret-vault-integration-svc to be able to
+	//     return material — blocked on row 81. Until then PgStore seals the
+	//     token with AES-256-GCM (internal/credential) and refuses to store
+	//     it at all when no key is configured; it is never plaintext at rest.
 	//  2. Nothing ever READS this field. StreamEvent persists events
 	//     locally and never authenticates to the SIEM platform, so the
 	//     service currently collects and holds a live third-party
@@ -107,8 +108,12 @@ func (r *CreateExporterRequest) Validate() error {
 	if r.Name == "" {
 		return fmt.Errorf("name is required")
 	}
-	if r.Platform == "" {
+	switch r.Platform {
+	case "":
 		return fmt.Errorf("platform is required")
+	case PlatformSplunk, PlatformDatadog, PlatformElastic, PlatformSentinel, PlatformSyslog:
+	default:
+		return fmt.Errorf("platform must be one of SPLUNK, DATADOG, ELASTIC, SENTINEL, SYSLOG")
 	}
 	if r.EndpointURL == "" {
 		return fmt.Errorf("endpoint_url is required")
@@ -129,8 +134,12 @@ func (r *StreamEventRequest) Validate() error {
 	if r.Message == "" {
 		return fmt.Errorf("message is required")
 	}
-	if r.Severity == "" {
+	switch r.Severity {
+	case "":
 		r.Severity = SeverityMedium
+	case SeverityLow, SeverityMedium, SeverityHigh, SeverityCritical:
+	default:
+		return fmt.Errorf("severity must be one of LOW, MEDIUM, HIGH, CRITICAL")
 	}
 	return nil
 }

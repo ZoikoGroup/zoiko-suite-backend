@@ -86,7 +86,9 @@ func (m *MemoryStore) UpdateEnvelopeStatus(ctx context.Context, id string, req *
 		return nil, domain.ErrEnvelopeNotFound
 	}
 	env.Status = req.Status
-	env.ExternalRef = req.ExternalRef
+	if req.ExternalRef != "" {
+		env.ExternalRef = req.ExternalRef
+	}
 	env.UpdatedAt = time.Now().UTC()
 	return env, nil
 }

@@ -6,11 +6,19 @@ import (
 )
 
 var (
-	ErrDraftNotFound       = errors.New("filing draft not found")
-	ErrDraftAlreadyFinal   = errors.New("filing draft is already finalized")
-	ErrValidationBlocked   = errors.New("filing draft evidence validation failed")
-	ErrValidationRequired  = errors.New("filing draft must be validated before finalization")
-	ErrMissingRequiredDoc  = errors.New("missing required evidence document")
+	ErrDraftNotFound      = errors.New("filing draft not found")
+	ErrDraftAlreadyFinal  = errors.New("filing draft is already finalized")
+	ErrValidationBlocked  = errors.New("filing draft evidence validation failed")
+	ErrValidationRequired = errors.New("filing draft must be validated before finalization")
+	ErrMissingRequiredDoc = errors.New("missing required evidence document")
+
+	// ErrDraftNotPrepared is a finalize of a draft whose evidence validation
+	// has not passed (anything other than PREPARED).
+	ErrDraftNotPrepared = errors.New("filing draft must be PREPARED (evidence validated) before it can be finalized")
+
+	// ErrDuplicateDraft is a second draft for the same entity, jurisdiction,
+	// filing type and period (uk_filing_draft_period).
+	ErrDuplicateDraft = errors.New("filing draft for this entity, jurisdiction, filing type and period already exists")
 
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".

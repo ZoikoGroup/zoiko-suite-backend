@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/filing-tracker-svc/internal/domain"
@@ -75,6 +77,9 @@ func (s *PgStore) Create(ctx context.Context, f *domain.FilingRequirement) error
 		f.Notes, f.CreatedBy, f.CreatedAt, f.UpdatedAt,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrDuplicateRequirement
+		}
 		return fmt.Errorf("insert filing requirement: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -94,7 +99,7 @@ func (s *PgStore) GetByID(ctx context.Context, id string) (*domain.FilingRequire
 	var statusStr string
 	err = tx.QueryRow(ctx, `
 		SELECT filing_id, tenant_id, legal_entity_id, jurisdiction_id, filing_authority,
-		       filing_type, period_key, due_date, status, submission_reference,
+		       filing_type, period_key, due_date::text, status, submission_reference,
 		       submitted_at, submitted_by, confirmation_reference, confirmed_at,
 		       rejection_reason, notes, created_by, created_at, updated_at
 		FROM filing_requirements WHERE filing_id = $1`, id,
@@ -127,7 +132,7 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, filin
 
 	rows, err := tx.Query(ctx, `
 		SELECT filing_id, tenant_id, legal_entity_id, jurisdiction_id, filing_authority,
-		       filing_type, period_key, due_date, status, submission_reference,
+		       filing_type, period_key, due_date::text, status, submission_reference,
 		       submitted_at, submitted_by, confirmation_reference, confirmed_at,
 		       rejection_reason, notes, created_by, created_at, updated_at
 		FROM filing_requirements
@@ -246,6 +251,23 @@ func (s *PgStore) Confirm(ctx context.Context, id string, req *domain.ConfirmFil
 		return nil, err
 	}
 
+	// An authority acknowledgement confirms a submission: only a SUBMITTED
+	// filing can be confirmed. Re-checked under the row lock.
+	var current string
+	if err := tx.QueryRow(ctx, `SELECT status FROM filing_requirements WHERE filing_id=$1 FOR UPDATE`, id).Scan(&current); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrRequirementNotFound
+		}
+		return nil, err
+	}
+	switch domain.FilingStatus(current) {
+	case domain.StatusSubmitted:
+	case domain.StatusConfirmed:
+		return nil, domain.ErrAlreadyConfirmed
+	default:
+		return nil, domain.ErrNotSubmitted
+	}
+
 	now := time.Now().UTC()
 	f.Status = domain.StatusConfirmed
 	f.ConfirmationReference = &req.ConfirmationReference
@@ -307,4 +329,10 @@ func (s *PgStore) MarkOverdue(ctx context.Context, id, todayStr string) (*domain
 		return nil, err
 	}
 	return f, nil
+}
+
+// isUniqueViolation reports a Postgres 23505 (unique_violation).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

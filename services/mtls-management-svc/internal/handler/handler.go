@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/x509"
@@ -20,6 +21,7 @@ import (
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/domain"
 	svcenvelope "zoiko.io/mtls-management-svc/internal/envelope"
+	"zoiko.io/mtls-management-svc/internal/idempotency"
 	"zoiko.io/mtls-management-svc/internal/siem"
 	"zoiko.io/mtls-management-svc/internal/store"
 )
@@ -85,6 +87,29 @@ type Handler struct {
 	authz     AuthzChecker
 	logger    *zap.Logger
 	bootstrap BootstrapTokens
+	idem      idempotency.Store
+}
+
+// WithIdempotency enables Idempotency-Key replay on material writes, backed by
+// st (production: idempotency.NewPgStore). Answers carrying a private key are
+// never stored — see carriesPrivateKey.
+func (h *Handler) WithIdempotency(st idempotency.Store) *Handler {
+	h.idem = st
+	return h
+}
+
+// carriesPrivateKey reports whether a response body holds a leaf private key
+// (ProvisionCert and RotateCert answers). Such an answer is returned once and
+// must not be written to the idempotency table.
+func carriesPrivateKey(body []byte) bool {
+	var probe struct {
+		PrivateKeyPEM string `json:"private_key_pem"`
+	}
+	if json.Unmarshal(body, &probe) == nil && probe.PrivateKeyPEM != "" {
+		return true
+	}
+	// Not JSON or not this shape: fail safe on anything that looks like a key.
+	return bytes.Contains(body, []byte("PRIVATE KEY"))
 }
 
 // BootstrapTokens maps a self-provisioning bootstrap token to the ONE service
@@ -195,9 +220,29 @@ func NewRouter(h *Handler) http.Handler {
 	// Refusals rendered as RFC 9457 problem+json, like every other error here.
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy(), svcenvelope.DefaultReporter()))
+	if h.idem != nil {
+		// After the envelope (which already refused a keyless material write),
+		// before any handler. A bootstrap POST is envelope-exempt but still
+		// deduplicated when it carries a key, as the internal/mtls clients do.
+		r.Use(idempotency.Middleware(h.idem, h.logger, idempotency.WithSecretDetector(carriesPrivateKey)))
+	}
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "mtls-management-svc"})
+	})
+	// Readiness: the certificate store must answer within 2s. Public, like
+	// /healthz (exempt in envelopePolicy; no route here reads a tenant).
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		if err := h.store.Ping(ctx); err != nil {
+			h.logger.Warn("readiness: certificate store unavailable", zap.Error(err))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "unavailable", "reason": "database unreachable"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 	})
 	r.Route("/v1/mtls", func(r chi.Router) {
 		r.Get("/crl", h.GetCRL) // CRLPath
@@ -384,6 +429,7 @@ func (h *Handler) recordAndRespond(w http.ResponseWriter, r *http.Request, tenan
 		UpdatedAt:      now,
 	}
 	if err := h.store.CreateCert(r.Context(), tenantID, cert); err != nil {
+		h.logger.Error("failed to record issued certificate", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to provision certificate")
 		return
 	}
@@ -411,7 +457,7 @@ func (h *Handler) GetCert(w http.ResponseWriter, r *http.Request) {
 	}
 	cert, err := h.store.GetCertByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		h.errJSON(w, r, 404, "certificate not found")
+		h.lookupFailed(w, r, err)
 		return
 	}
 	// Authorized against the certificate row own legal entity, never a
@@ -477,7 +523,7 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 
 	existing, err := h.store.GetCertByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, r, 404, "certificate not found")
+		h.lookupFailed(w, r, err)
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, MtlsCertRotate) {
@@ -511,7 +557,7 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		h.errJSON(w, r, 404, "certificate not found")
+		h.lookupFailed(w, r, err)
 		return
 	}
 
@@ -542,7 +588,7 @@ func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
 	// service-to-service authentication depends on this certificate.
 	existing, err := h.store.GetCertByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, r, 404, "certificate not found")
+		h.lookupFailed(w, r, err)
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, MtlsCertRevoke) {
@@ -562,7 +608,7 @@ func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
 	}
 	revoked, err := h.store.RevokeCert(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, r, 404, "certificate not found")
+		h.lookupFailed(w, r, err)
 		return
 	}
 	if err := h.revokeSerials(r, tenantID, revoked, principalID); err != nil {
@@ -604,6 +650,14 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		h.errJSON(w, r, 400, "policy_name is required")
 		return
 	}
+	// action is optional in the published contract, but when present it must
+	// be one the domain defines — the table refuses anything else.
+	switch req.Action {
+	case "", domain.PolicyAllow, domain.PolicyDeny:
+	default:
+		h.errJSON(w, r, 400, "action must be ALLOW or DENY")
+		return
+	}
 	// Scoped at the tenant, not a legal entity: a CommunicationPolicy has no
 	// legal_entity_id — it governs service-to-service traffic across the
 	// whole tenant. See the authorize() doc comment for why this service
@@ -619,6 +673,7 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		RequiresMtls:  req.RequiresMtls,
 	}
 	if err := h.store.CreatePolicy(r.Context(), tenantID, pol); err != nil {
+		h.logger.Error("failed to create policy", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to create policy")
 		return
 	}
@@ -775,6 +830,7 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:      now,
 	}
 	if err := h.store.CreateCert(r.Context(), tenantID, cert); err != nil {
+		h.logger.Error("failed to record issued certificate", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to provision certificate")
 		return
 	}
@@ -788,6 +844,18 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 		Certificate: *cert,
 		CACertPEM:   string(h.ca.CertificatePEM()),
 	})
+}
+
+// lookupFailed answers a failed store read or transition: 404 when the record
+// does not exist in the caller's tenant (a foreign record looks the same), 500
+// when the store itself failed — a database outage is not "not found".
+func (h *Handler) lookupFailed(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		h.errJSON(w, r, http.StatusNotFound, "certificate not found")
+		return
+	}
+	h.logger.Error("certificate store failure", zap.Error(err))
+	h.errJSON(w, r, http.StatusInternalServerError, "certificate store unavailable")
 }
 
 // errJSON answers a refusal that names no code of its own. The code is the

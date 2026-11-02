@@ -117,6 +117,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.Create(r.Context(), d); err != nil {
+		if errors.Is(err, domain.ErrDuplicateDraft) {
+			writeError(w, http.StatusConflict, domain.ErrDuplicateDraft.Error())
+			return
+		}
 		h.logger.Error("create filing draft failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create filing draft")
 		return
@@ -209,7 +213,14 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.Update(r.Context(), existing); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update filing draft")
+		switch {
+		case errors.Is(err, domain.ErrDraftNotFound):
+			writeError(w, http.StatusNotFound, "filing draft not found")
+		case errors.Is(err, domain.ErrDraftAlreadyFinal):
+			writeError(w, http.StatusConflict, "filing draft is already finalized")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to update filing draft")
+		}
 		return
 	}
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
@@ -348,6 +359,8 @@ func (h *Handler) Finalize(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnprocessableEntity, "filing draft must be validated before finalization")
 		case errors.Is(err, domain.ErrDraftAlreadyFinal):
 			writeError(w, http.StatusConflict, "filing draft is already finalized")
+		case errors.Is(err, domain.ErrDraftNotPrepared):
+			writeError(w, http.StatusConflict, domain.ErrDraftNotPrepared.Error())
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to finalize filing draft")
 		}

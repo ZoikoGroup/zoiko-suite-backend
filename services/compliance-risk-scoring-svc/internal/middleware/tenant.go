@@ -2,60 +2,50 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
+	"strings"
+
+	"zoiko.io/compliance-risk-scoring-svc/internal/problem"
 )
 
 type contextKey string
 
+// TenantIDKey is the request-context key holding the verified tenant.
 const TenantIDKey contextKey = "tenant_id"
 
-// TenantMiddleware records the gateway-verified X-Tenant-ID on the request
-// context, and REFUSES a request that carries none.
+// maxTenantIDLength matches risk_score_assessments.tenant_id VARCHAR(64).
+const maxTenantIDLength = 64
+
+// TenantMiddleware records the gateway-verified X-Tenant-Id on the request
+// context and REFUSES a request that carries none (401 problem+json) or one
+// longer than the column that stores it (400).
 //
-// It previously substituted the literal string "default-tenant" when the
-// header was absent, and GetTenantID returned the same literal as its
-// fallback — two independent fabrication sites, so fixing either alone
-// would have left the hole open.
+// History: this middleware once substituted the literal "default-tenant"
+// when the header was absent. Because the store pushes the tenant into
+// Postgres (set_config('app.tenant_id', ...)) and the RLS policy reads it
+// back, the fabricated value did not bypass RLS — it SATISFIED it, pooling
+// every header-less caller into one shared tenant. The tenant is now never
+// invented: no header, no request.
 //
-// That default was not a weaker version of a missing check; it was the
-// opposite of one. A missing check makes a request fail. This made it
-// SUCCEED, into a tenant that does not exist, shared by every header-less
-// caller.
-//
-// On this service that mattered more than usual, because the tenant value
-// does not stop at the application layer — the store pushes it straight
-// into Postgres:
-//
-//	SELECT set_config('app.tenant_id', $1, true)
-//
-// and the row-level security policy reads it back:
-//
-//	USING (tenant_id = current_setting('app.tenant_id', true))
-//
-// So with the fabricated default in place the policy was not bypassed, it
-// was SATISFIED. Postgres did exactly as instructed and returned every row
-// whose tenant_id was 'default-tenant', which is how all header-less
-// callers came to share each other's rows legitimately, inside the policy.
-//
-// That is worse than having no policy at all, because everything looks
-// correct from the outside: pg_class reports the policy exists, and any
-// test that passes a real tenant goes green. The database was faithfully
-// enforcing the caller's own fabricated assertion against itself.
-//
-// GetTenantID now returns "" when there is no verified tenant. "" matches
-// no real tenant_id and, pushed through set_config, matches no row — so the
-// failure mode is an empty result rather than a shared bucket.
+// The envelope middleware already refuses tenant-less WRITES; this gate is
+// what refuses tenant-less READS, which write-strict envelope mode admits.
 func TenantMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tenantID := r.Header.Get("X-Tenant-ID")
+		// Liveness/readiness probes carry no tenant; they touch no tenant
+		// data, so they are the only paths admitted without one.
+		switch r.URL.Path {
+		case "/healthz", "/readyz", "/health":
+			next.ServeHTTP(w, r)
+			return
+		}
+		tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-Id"))
 		if tenantID == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error":   "missing_tenant_scope",
-				"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
-			})
+			problem.Write(w, r, http.StatusUnauthorized, "missing_tenant_scope",
+				"X-Tenant-Id is required; the gateway sets it from a verified identity envelope", nil)
+			return
+		}
+		if len(tenantID) > maxTenantIDLength {
+			problem.Write(w, r, http.StatusBadRequest, "invalid_tenant_id", "X-Tenant-Id must be at most 64 characters", nil)
 			return
 		}
 
@@ -64,19 +54,16 @@ func TenantMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// WithTenant returns a context carrying tenantID. Used by tests to build a
-// scoped context without going through an HTTP request.
+// WithTenant returns a context carrying tenantID (tests).
 func WithTenant(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, TenantIDKey, tenantID)
 }
 
 // GetTenantID returns the verified tenant, or "" when there is none. It
-// never substitutes a placeholder: see TenantMiddleware for why the previous
-// "default-tenant" fallback turned a working RLS policy into one that
-// silently pooled unrelated tenants.
+// never substitutes a placeholder.
 func GetTenantID(ctx context.Context) string {
-	if val, ok := ctx.Value(TenantIDKey).(string); ok {
-		return val
+	if value, ok := ctx.Value(TenantIDKey).(string); ok {
+		return value
 	}
 	return ""
 }

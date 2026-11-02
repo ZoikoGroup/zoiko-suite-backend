@@ -3,6 +3,10 @@ package config
 import "os"
 
 type Config struct {
+	// ListenHost is the interface the HTTP server binds to; empty = all.
+	// Set LISTEN_HOST=127.0.0.1 to bind loopback only (e.g. when another
+	// process already publishes the same port on 0.0.0.0).
+	ListenHost   string
 	Port         string
 	DatabaseURL  string
 	KafkaBrokers string
@@ -26,6 +30,7 @@ type Config struct {
 
 func Load() *Config {
 	return &Config{
+		ListenHost:   getEnv("LISTEN_HOST", ""),
 		Port:         getEnv("PORT", "8138"),
 		DatabaseURL:  getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/reporting_orchestration?sslmode=disable"),
 		KafkaBrokers: getEnv("KAFKA_BROKERS", "localhost:9092"),

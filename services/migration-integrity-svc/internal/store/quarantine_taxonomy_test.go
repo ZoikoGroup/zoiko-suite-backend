@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/migration-integrity-svc/internal/domain"
+	"zoiko.io/migration-integrity-svc/internal/store"
 )
 
 func TestPgStore_QuarantineClassificationRoundTrips(t *testing.T) {
@@ -42,7 +43,7 @@ func TestPgStore_QuarantineClassificationRoundTrips(t *testing.T) {
 		RecordsChecked: 10, RecordsPassed: 9, RecordsFailed: 1, Severity: domain.SeverityMQ0}}
 	entries := []domain.AuditEntry{{RecordRef: "", ViolationType: domain.ViolationMissingSourceIdentity,
 		Severity: domain.SeverityMQ0, ReasonFamily: domain.ReasonIdentity, OwnerID: "owner-9"}}
-	require.NoError(t, s.CreateJob(ctx, tenantID, job, checks, entries, "principal-1", "corr-1"))
+	require.NoError(t, s.CreateJob(ctx, tenantID, job, checks, entries, "principal-1", "corr-1", store.IdempotencyClaim{}))
 
 	read, err := s.GetJobByID(ctx, tenantID, job.ID)
 	require.NoError(t, err)
@@ -55,12 +56,15 @@ func TestPgStore_QuarantineClassificationRoundTrips(t *testing.T) {
 	assert.Equal(t, domain.ReasonIdentity, e.ReasonFamily)
 	assert.Equal(t, "owner-9", e.OwnerID)
 
-	jobs, err := s.ListJobs(ctx, tenantID, "le-uk-1", "")
+	jobs, _, err := s.ListJobs(ctx, tenantID, store.ListFilter{LegalEntityID: "le-uk-1", Limit: 50})
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
 	assert.Equal(t, 1, jobs[0].BlockerCount, "list must carry the blocker count: it explains a FAILED job without its entries")
 
-	rem, err := s.RemediateEntry(ctx, tenantID, job.ID, e.ID, "identity restored", "ticket-1", "owner-9", "corr-2")
+	rem, _, err := s.DispositionEntry(ctx, tenantID, store.DispositionCommand{
+		JobID: job.ID, EntryID: e.ID, TargetStatus: domain.EntryStatusRemediated,
+		Reason: "identity restored", EvidenceRef: "ticket-1", ActorID: "owner-9", CorrelationID: "corr-2",
+	}, store.IdempotencyClaim{})
 	require.NoError(t, err)
 	assert.Equal(t, domain.SeverityMQ0, rem.Severity)
 	assert.Equal(t, domain.ReasonIdentity, rem.ReasonFamily)
@@ -93,7 +97,7 @@ func TestPgStore_RefusesUnknownSeverityOrFamily(t *testing.T) {
 			now := time.Now().UTC()
 			job := &domain.MigrationJob{ID: uuid.NewString(), LegalEntityID: "le-uk-1", MigrationName: "bad",
 				SourceSystem: "s", TargetService: "t", Status: domain.JobStatusFailed, StartedAt: &now, CompletedAt: &now}
-			err := s.CreateJob(ctx, tenantID, job, nil, []domain.AuditEntry{tc.entry}, "p", "c")
+			err := s.CreateJob(ctx, tenantID, job, nil, []domain.AuditEntry{tc.entry}, "p", "c", store.IdempotencyClaim{})
 			require.Error(t, err)
 			var n int
 			require.NoError(t, superPool.QueryRow(ctx, `SELECT count(*) FROM migration_jobs WHERE id = $1`, job.ID).Scan(&n))
@@ -133,14 +137,18 @@ func TestMigration000005_BackfillsLegacyRowsAndReverses(t *testing.T) {
 		_, err = pool.Exec(ctx, string(b))
 		require.NoError(t, err, path)
 	}
+	// Stop at 000004 to write legacy rows; migrations after 000005 are
+	// applied at the end, on top of the legacy data.
 	var up5 string
+	var later []string
 	for _, f := range files {
 		if strings.Contains(filepath.Base(f), "000005_") {
 			up5 = f
 			continue
 		}
 		if filepath.Base(f) > "000005" {
-			t.Fatalf("migration %s after 000005: extend this test to stop at 000004", f)
+			later = append(later, f)
+			continue
 		}
 		exec(f)
 	}
@@ -244,4 +252,9 @@ func TestMigration000005_BackfillsLegacyRowsAndReverses(t *testing.T) {
 	var owner string
 	require.NoError(t, pool.QueryRow(ctx, `SELECT owner_id FROM migration_audit_entries WHERE owner_id IS NOT NULL`).Scan(&owner))
 	assert.Equal(t, "owner-1", owner)
+
+	// Every later migration applies on top of the 000005-upgraded legacy data.
+	for _, f := range later {
+		exec(f)
+	}
 }

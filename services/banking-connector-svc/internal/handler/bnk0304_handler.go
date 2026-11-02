@@ -34,22 +34,18 @@ type BNK0304Handler struct {
 // from RegisterRoutes in cmd/server/main.go.
 func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304Store) {
 	bh := &BNK0304Handler{Handler: h, bnk0304Store: bnk0304Store}
-	r.Route("/v1/banking/statements", func(r chi.Router) {
-		r.Post("/ingest", bh.IngestStatement)
-		r.Post("/{id}/validate", bh.ValidateStatement)
-		r.Post("/{id}/accept", bh.AcceptStatement)
-		r.Post("/{id}/quarantine", bh.QuarantineStatement)
-		r.Post("/{id}/reprocess", bh.ReprocessQuarantinedStatement)
-	})
-	r.Route("/v1/banking/transactions", func(r chi.Router) {
-		r.Post("/normalize", bh.NormalizeTransaction)
-		r.Post("/{id}/re-normalize", bh.ReNormalizeTransaction)
-		r.Post("/quarantine", bh.QuarantineTransaction)
-	})
+	// Full paths, not r.Route(...): a Route on /v1/banking/statements shadowed
+	// the legacy POST /v1/banking/statements registered by RegisterRoutes.
+	r.Post("/v1/banking/statements/ingest", bh.IngestStatement)
+	r.Post("/v1/banking/statements/{id}/validate", bh.ValidateStatement)
+	r.Post("/v1/banking/statements/{id}/accept", bh.AcceptStatement)
+	r.Post("/v1/banking/statements/{id}/quarantine", bh.QuarantineStatement)
+	r.Post("/v1/banking/statements/{id}/reprocess", bh.ReprocessQuarantinedStatement)
+	r.Post("/v1/banking/transactions/normalize", bh.NormalizeTransaction)
+	r.Post("/v1/banking/transactions/{id}/re-normalize", bh.ReNormalizeTransaction)
+	r.Post("/v1/banking/transactions/quarantine", bh.QuarantineTransaction)
 	r.Post("/v1/banking/transaction-mappings", bh.CreateTransactionMapping)
-	r.Route("/v1/banking/canonical-transactions", func(r chi.Router) {
-		r.Get("/{id}", bh.GetCanonicalTransaction)
-	})
+	r.Get("/v1/banking/canonical-transactions/{id}", bh.GetCanonicalTransaction)
 	r.Post("/v1/banking/mapping-exceptions/{id}/approve", bh.ApproveMappingException)
 }
 

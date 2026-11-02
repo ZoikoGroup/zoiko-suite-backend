@@ -18,6 +18,8 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/config"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
+	"zoiko.io/reconciliation-intelligence-svc/internal/health"
+	"zoiko.io/reconciliation-intelligence-svc/internal/idempotency"
 	"zoiko.io/reconciliation-intelligence-svc/internal/ledger"
 	"zoiko.io/reconciliation-intelligence-svc/internal/mtls"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
@@ -121,7 +123,7 @@ func main() {
 	ledgerClient := ledger.NewClient(cfg.GeneralLedgerURL, logger)
 
 	h := handler.NewHandler(dataStore, authzClient, financialControlClient, bankRecClient, ledgerClient, cfg.CandidateSearchHorizonDays, logger)
-	router := handler.NewRouter(h)
+	router := handler.NewRouterWithDeps(h, health.ReadyzHandler(dbPool), idempotency.NewPgStore(dbPool))
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

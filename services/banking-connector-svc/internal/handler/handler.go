@@ -31,18 +31,20 @@ func New(st store.Store, az *authz.Client, logger *zap.Logger) *Handler {
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
-	r.Route("/v1/banking", func(r chi.Router) {
-		r.Post("/connections", h.CreateConnection)
-		r.Get("/connections", h.ListConnections)
-		r.Get("/connections/{id}", h.GetConnectionByID)
-		r.Post("/statements", h.IngestStatement)
-		r.Get("/connections/{id}/statements", h.ListStatements)
+	// Full paths on the shared router, not r.Route("/v1/banking", ...): the
+	// BNK-02/03/04 registrations add routes under the same prefix, and a
+	// mounted subrouter here plus their routes there made one of the two
+	// unreachable (route shadowing -> 404). routes_contract_test.go pins it.
+	r.Post("/v1/banking/connections", h.CreateConnection)
+	r.Get("/v1/banking/connections", h.ListConnections)
+	r.Get("/v1/banking/connections/{id}", h.GetConnectionByID)
+	r.Post("/v1/banking/statements", h.IngestStatement)
+	r.Get("/v1/banking/connections/{id}/statements", h.ListStatements)
 
-		// Postman compatibility aliases
-		r.Post("/accounts", h.CreateConnection)
-		r.Get("/accounts", h.ListConnections)
-		r.Get("/accounts/{id}", h.GetConnectionByID)
-	})
+	// Postman compatibility aliases
+	r.Post("/v1/banking/accounts", h.CreateConnection)
+	r.Get("/v1/banking/accounts", h.ListConnections)
+	r.Get("/v1/banking/accounts/{id}", h.GetConnectionByID)
 }
 
 func populateAliases(conn *domain.BankConnection) {

@@ -167,7 +167,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.Create(r.Context(), ret); err != nil {
-		h.logger.Error("failed to create corporate tax return", zap.Error(err))
+		if errors.Is(err, domain.ErrDuplicateReturn) {
+			writeError(w, http.StatusConflict, domain.ErrDuplicateReturn.Error())
+			return
+		}
+		h.logger.Error("create corporate tax return failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create corporate tax return")
 		return
 	}
@@ -211,7 +215,13 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if returns == nil {
 		returns = []domain.TaxReturn{}
 	}
-	writeJSON(w, http.StatusOK, returns)
+	// Envelope, like every other tax list (tax-rules, determinations, vat
+	// returns): {corporate_tax_returns, total}. A bare array here broke the
+	// contract callers already parse.
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"corporate_tax_returns": returns,
+		"total":                 len(returns),
+	})
 }
 
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
@@ -354,6 +364,10 @@ func (h *Handler) Assess(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrTaxReturnNotFound) {
 			writeError(w, http.StatusNotFound, "corporate tax return not found")
+			return
+		}
+		if errors.Is(err, domain.ErrInvalidStatusTransition) {
+			writeError(w, http.StatusConflict, "only SUBMITTED corporate tax returns can be assessed")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to record assessment")

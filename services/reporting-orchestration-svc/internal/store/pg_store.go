@@ -1,32 +1,26 @@
+// Package store is reporting-orchestration-svc's Postgres persistence.
+//
+// Every request-scoped method runs inside inTenantTx, which sets
+// app.tenant_id for the row-level-security policies (migrations 000001-3)
+// AND every query also filters tenant_id explicitly — two independent
+// tenant-isolation mechanisms. State changes and their outbox events are
+// written in the same transaction.
 package store
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"sync"
-	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"zoiko.io/reporting-orchestration-svc/internal/domain"
 )
 
-// ─── Interface ────────────────────────────────────────────────────────────────
-
-type Store interface {
-	CreateDefinition(ctx context.Context, tenantID string, def *domain.ReportDefinition) error
-	GetDefinitionByID(ctx context.Context, tenantID, id string) (*domain.ReportDefinition, error)
-	ListDefinitions(ctx context.Context, tenantID, legalEntityID, reportType string) ([]domain.ReportDefinition, error)
-	UpdateDefinitionStatus(ctx context.Context, tenantID, id string, status domain.DefinitionStatus) error
-
-	CreateRun(ctx context.Context, tenantID string, run *domain.ReportRun) error
-	GetRunByID(ctx context.Context, tenantID, id string) (*domain.ReportRun, error)
-	UpdateRun(ctx context.Context, tenantID string, run *domain.ReportRun) error
-	ListRuns(ctx context.Context, tenantID, definitionID, status string) ([]domain.ReportRun, error)
-}
-
-// ─── PgStore ──────────────────────────────────────────────────────────────────
-
+// PgStore implements every store interface the handlers depend on.
 type PgStore struct {
 	pool *pgxpool.Pool
 }
@@ -35,231 +29,330 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 	return &PgStore{pool: pool}
 }
 
-func (s *PgStore) setTenant(ctx context.Context, tx interface {
-	Exec(ctx context.Context, sql string, args ...interface{}) (interface{ RowsAffected() int64 }, error)
-}, tenantID string) error {
-	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
-	return err
+// Page is a bounded window of a list query. The handler validates the bounds.
+type Page struct {
+	Limit  int
+	Offset int
 }
 
-func (s *PgStore) CreateDefinition(ctx context.Context, tenantID string, def *domain.ReportDefinition) error {
+// inTenantTx runs fn inside a transaction scoped to tenantID for RLS, and
+// commits only when fn returns nil.
+func (s *PgStore) inTenantTx(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
-		return err
-	}
-	def.ID = uuid.New().String()
-	def.TenantID = tenantID
-	def.Status = domain.DefStatusActive
-	def.CreatedAt = time.Now()
-	def.UpdatedAt = time.Now()
+	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set tenant scope: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+// insertOutboxEvent writes event to outbox_events inside tx. When the event
+// has no payload, defaultPayload (normally the resulting entity) is used.
+func insertOutboxEvent(ctx context.Context, tx pgx.Tx, event domain.OutboxEvent, defaultPayload interface{}) error {
+	if event.EventType == "" {
+		return nil // caller chose not to emit an event
+	}
+	payload := event.Payload
+	if payload == nil {
+		payload = defaultPayload
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal outbox payload: %w", err)
+	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO report_definitions
-		  (id, tenant_id, legal_entity_id, report_name, report_type, output_format,
-		   data_sources, schedule_cron, is_scheduled, status, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		def.ID, tenantID, def.LegalEntityID, def.ReportName, string(def.ReportType),
-		string(def.OutputFormat), def.DataSources, def.ScheduleCron, def.IsScheduled,
-		string(def.Status), def.CreatedAt, def.UpdatedAt,
+		INSERT INTO outbox_events
+		  (aggregate_type, aggregate_id, event_type, tenant_id, legal_entity_id, actor_id, correlation_id, payload)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		event.AggregateType, event.AggregateID, event.EventType, event.TenantID,
+		event.LegalEntityID, event.ActorID, event.CorrelationID, payloadJSON,
 	)
 	if err != nil {
-		return fmt.Errorf("insert report_definition: %w", err)
+		return fmt.Errorf("insert outbox event %s: %w", event.EventType, err)
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
-func (s *PgStore) GetDefinitionByID(ctx context.Context, tenantID, id string) (*domain.ReportDefinition, error) {
-	tx, err := s.pool.Begin(ctx)
+// ─── Report definitions ──────────────────────────────────────────────────────
+
+const definitionColumns = `id::text, tenant_id, legal_entity_id, report_name, report_type, output_format,
+	data_sources, COALESCE(schedule_cron, ''), is_scheduled, status, version, created_by, created_at, updated_at`
+
+func scanDefinition(row pgx.Row) (*domain.ReportDefinition, error) {
+	definition := &domain.ReportDefinition{}
+	err := row.Scan(
+		&definition.ID, &definition.TenantID, &definition.LegalEntityID, &definition.ReportName,
+		&definition.ReportType, &definition.OutputFormat, &definition.DataSources, &definition.ScheduleCron,
+		&definition.IsScheduled, &definition.Status, &definition.Version, &definition.CreatedBy,
+		&definition.CreatedAt, &definition.UpdatedAt,
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+	if definition.DataSources == nil {
+		definition.DataSources = []string{}
+	}
+	return definition, nil
+}
+
+// CreateDefinition inserts a new DRAFT definition plus its outbox event.
+func (s *PgStore) CreateDefinition(ctx context.Context, definition *domain.ReportDefinition, event domain.OutboxEvent) (*domain.ReportDefinition, error) {
+	var created *domain.ReportDefinition
+	err := s.inTenantTx(ctx, definition.TenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			INSERT INTO report_definitions
+			  (id, tenant_id, legal_entity_id, report_name, report_type, output_format,
+			   data_sources, schedule_cron, is_scheduled, status, version, created_by)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9,$10,1,$11)
+			RETURNING `+definitionColumns,
+			uuid.New().String(), definition.TenantID, definition.LegalEntityID, definition.ReportName,
+			string(definition.ReportType), string(definition.OutputFormat), definition.DataSources,
+			definition.ScheduleCron, definition.IsScheduled, string(domain.DefStatusDraft), definition.CreatedBy,
+		)
+		var err error
+		created, err = scanDefinition(row)
+		if err != nil {
+			return fmt.Errorf("insert report_definition: %w", err)
+		}
+		event.AggregateID = created.ID
+		return insertOutboxEvent(ctx, tx, event, created)
+	})
+	return created, err
+}
+
+// GetDefinition returns the tenant's definition, or ErrDefinitionNotFound.
+func (s *PgStore) GetDefinition(ctx context.Context, tenantID, id string) (*domain.ReportDefinition, error) {
+	var found *domain.ReportDefinition
+	err := s.inTenantTx(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		found, err = scanDefinition(tx.QueryRow(ctx,
+			`SELECT `+definitionColumns+` FROM report_definitions WHERE id = $1 AND tenant_id = $2`, id, tenantID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDefinitionNotFound
+		}
+		return err
+	})
+	return found, err
+}
+
+// DefinitionFilter narrows ListDefinitions; empty fields are ignored.
+type DefinitionFilter struct {
+	LegalEntityID string
+	ReportType    string
+	Status        string
+}
+
+// ListDefinitions returns one page of the tenant's definitions, newest first.
+func (s *PgStore) ListDefinitions(ctx context.Context, tenantID string, filter DefinitionFilter, page Page) ([]domain.ReportDefinition, error) {
+	definitions := []domain.ReportDefinition{}
+	err := s.inTenantTx(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+definitionColumns+`
+			FROM report_definitions
+			WHERE tenant_id = $1
+			  AND ($2 = '' OR legal_entity_id = $2)
+			  AND ($3 = '' OR report_type = $3)
+			  AND ($4 = '' OR status = $4)
+			ORDER BY created_at DESC, id
+			LIMIT $5 OFFSET $6`,
+			tenantID, filter.LegalEntityID, filter.ReportType, filter.Status, page.Limit, page.Offset)
+		if err != nil {
+			return fmt.Errorf("list report_definitions: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			definition, err := scanDefinition(rows)
+			if err != nil {
+				return fmt.Errorf("scan report_definition: %w", err)
+			}
+			definitions = append(definitions, *definition)
+		}
+		return rows.Err()
+	})
+	return definitions, err
+}
+
+// TransitionDefinitionParams describes one lifecycle change.
+type TransitionDefinitionParams struct {
+	TenantID        string
+	DefinitionID    string
+	ToStatus        domain.DefinitionStatus
+	ExpectedVersion int // If-Match; 0 = no precondition
+	Event           domain.OutboxEvent
+}
+
+// DefinitionTransition is the outcome of TransitionDefinitionStatus.
+type DefinitionTransition struct {
+	FromStatus domain.DefinitionStatus
+	Definition *domain.ReportDefinition
+}
+
+// TransitionDefinitionStatus moves a definition along its lifecycle.
+//
+// Steps, all in one transaction:
+//  1. lock the row (FOR UPDATE) — 404 if missing or another tenant's;
+//  2. check If-Match against version — 412 on mismatch;
+//  3. check the lifecycle table — 409 when the transition is illegal;
+//  4. update status, bump version;
+//  5. write the outbox event.
+func (s *PgStore) TransitionDefinitionStatus(ctx context.Context, p TransitionDefinitionParams) (*DefinitionTransition, error) {
+	var result *DefinitionTransition
+	err := s.inTenantTx(ctx, p.TenantID, func(tx pgx.Tx) error {
+		current, err := scanDefinition(tx.QueryRow(ctx,
+			`SELECT `+definitionColumns+` FROM report_definitions WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+			p.DefinitionID, p.TenantID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDefinitionNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		if p.ExpectedVersion != 0 && p.ExpectedVersion != current.Version {
+			return domain.ErrVersionMismatch
+		}
+		if !domain.CanTransitionDefinition(current.Status, p.ToStatus) {
+			return domain.ErrIllegalTransition
+		}
+
+		updated, err := scanDefinition(tx.QueryRow(ctx, `
+			UPDATE report_definitions
+			SET status = $1, version = version + 1, updated_at = now()
+			WHERE id = $2 AND tenant_id = $3
+			RETURNING `+definitionColumns,
+			string(p.ToStatus), p.DefinitionID, p.TenantID))
+		if err != nil {
+			return fmt.Errorf("update report_definition status: %w", err)
+		}
+
+		result = &DefinitionTransition{FromStatus: current.Status, Definition: updated}
+		return insertOutboxEvent(ctx, tx, p.Event, map[string]interface{}{
+			"definition":  updated,
+			"from_status": current.Status,
+			"to_status":   updated.Status,
+		})
+	})
+	return result, err
+}
+
+// ─── Report runs ─────────────────────────────────────────────────────────────
+
+// DATE columns are read as ::text (pgx cannot scan DATE into string).
+const runColumns = `id::text, tenant_id, definition_id::text, triggered_by, requested_by,
+	COALESCE(period_start::text, ''), COALESCE(period_end::text, ''), status, row_count,
+	COALESCE(output_location, ''), COALESCE(error_message, ''), started_at, completed_at, created_at`
+
+func scanRun(row pgx.Row) (*domain.ReportRun, error) {
+	run := &domain.ReportRun{}
+	err := row.Scan(
+		&run.ID, &run.TenantID, &run.DefinitionID, &run.TriggeredBy, &run.RequestedBy,
+		&run.PeriodStart, &run.PeriodEnd, &run.Status, &run.RowCount,
+		&run.OutputLocation, &run.ErrorMessage, &run.StartedAt, &run.CompletedAt, &run.CreatedAt,
+	)
+	if err != nil {
 		return nil, err
 	}
-	var d domain.ReportDefinition
-	err = tx.QueryRow(ctx, `
-		SELECT id, tenant_id, legal_entity_id, report_name, report_type, output_format,
-		       data_sources, COALESCE(schedule_cron,''), is_scheduled, status, created_at, updated_at
-		FROM report_definitions WHERE id=$1`, id).Scan(
-		&d.ID, &d.TenantID, &d.LegalEntityID, &d.ReportName, &d.ReportType, &d.OutputFormat,
-		&d.DataSources, &d.ScheduleCron, &d.IsScheduled, &d.Status, &d.CreatedAt, &d.UpdatedAt,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("report definition not found: %w", err)
-	}
-	return &d, nil
+	return run, nil
 }
 
-func (s *PgStore) ListDefinitions(ctx context.Context, tenantID, legalEntityID, reportType string) ([]domain.ReportDefinition, error) {
-	return nil, nil
+// CreateRun records a run against an ACTIVE definition.
+//
+// The definition row is locked FOR SHARE in the same transaction, so a
+// concurrent PAUSE/DEPRECATE cannot slip in between the status check and
+// the insert.
+func (s *PgStore) CreateRun(ctx context.Context, run *domain.ReportRun, event domain.OutboxEvent) (*domain.ReportRun, error) {
+	var created *domain.ReportRun
+	err := s.inTenantTx(ctx, run.TenantID, func(tx pgx.Tx) error {
+		var definitionStatus domain.DefinitionStatus
+		err := tx.QueryRow(ctx,
+			`SELECT status FROM report_definitions WHERE id = $1 AND tenant_id = $2 FOR SHARE`,
+			run.DefinitionID, run.TenantID).Scan(&definitionStatus)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDefinitionNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if definitionStatus != domain.DefStatusActive {
+			return domain.ErrDefinitionNotActive
+		}
+
+		row := tx.QueryRow(ctx, `
+			INSERT INTO report_runs
+			  (id, tenant_id, definition_id, triggered_by, requested_by, period_start, period_end,
+			   status, row_count, output_location, error_message, started_at, completed_at, created_at)
+			VALUES ($1,$2,$3,$4,$5,NULLIF($6,'')::date,NULLIF($7,'')::date,$8,$9,NULLIF($10,''),NULLIF($11,''),$12,$13,$14)
+			RETURNING `+runColumns,
+			uuid.New().String(), run.TenantID, run.DefinitionID, string(run.TriggeredBy), run.RequestedBy,
+			run.PeriodStart, run.PeriodEnd, string(run.Status), run.RowCount, run.OutputLocation,
+			run.ErrorMessage, run.StartedAt, run.CompletedAt, run.CreatedAt,
+		)
+		created, err = scanRun(row)
+		if err != nil {
+			return fmt.Errorf("insert report_run: %w", err)
+		}
+		event.AggregateID = created.ID
+		return insertOutboxEvent(ctx, tx, event, created)
+	})
+	return created, err
 }
 
-func (s *PgStore) UpdateDefinitionStatus(ctx context.Context, tenantID, id string, status domain.DefinitionStatus) error {
-	_, err := s.pool.Exec(ctx, "UPDATE report_definitions SET status=$1, updated_at=$2 WHERE id=$3", string(status), time.Now(), id)
-	return err
-}
-
-func (s *PgStore) CreateRun(ctx context.Context, tenantID string, run *domain.ReportRun) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
+// GetRun returns the tenant's run, or ErrRunNotFound.
+func (s *PgStore) GetRun(ctx context.Context, tenantID, id string) (*domain.ReportRun, error) {
+	var found *domain.ReportRun
+	err := s.inTenantTx(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		found, err = scanRun(tx.QueryRow(ctx,
+			`SELECT `+runColumns+` FROM report_runs WHERE id = $1 AND tenant_id = $2`, id, tenantID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrRunNotFound
+		}
 		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
-		return err
-	}
-	run.ID = uuid.New().String()
-	run.TenantID = tenantID
-	run.CreatedAt = time.Now()
-
-	_, err = tx.Exec(ctx, `
-		INSERT INTO report_runs
-		  (id, tenant_id, definition_id, triggered_by, period_start, period_end,
-		   status, row_count, output_location, error_message, started_at, completed_at, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-		run.ID, tenantID, run.DefinitionID, string(run.TriggeredBy),
-		run.PeriodStart, run.PeriodEnd, string(run.Status), run.RowCount,
-		run.OutputLocation, run.ErrorMessage, run.StartedAt, run.CompletedAt, run.CreatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("insert report_run: %w", err)
-	}
-	return tx.Commit(ctx)
+	})
+	return found, err
 }
 
-func (s *PgStore) GetRunByID(ctx context.Context, tenantID, id string) (*domain.ReportRun, error) {
-	return nil, fmt.Errorf("not implemented")
+// RunFilter narrows ListRuns; empty fields are ignored.
+type RunFilter struct {
+	DefinitionID string
+	Status       string
 }
 
-func (s *PgStore) UpdateRun(ctx context.Context, tenantID string, run *domain.ReportRun) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE report_runs SET status=$1, row_count=$2, output_location=$3, error_message=$4,
-		       started_at=$5, completed_at=$6 WHERE id=$7`,
-		string(run.Status), run.RowCount, run.OutputLocation, run.ErrorMessage,
-		run.StartedAt, run.CompletedAt, run.ID,
-	)
-	return err
-}
-
-func (s *PgStore) ListRuns(ctx context.Context, tenantID, definitionID, status string) ([]domain.ReportRun, error) {
-	return nil, nil
-}
-
-// ─── MemoryStore ──────────────────────────────────────────────────────────────
-
-type MemoryStore struct {
-	mu          sync.RWMutex
-	definitions map[string]*domain.ReportDefinition
-	runs        map[string]*domain.ReportRun
-}
-
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
-		definitions: make(map[string]*domain.ReportDefinition),
-		runs:        make(map[string]*domain.ReportRun),
-	}
-}
-
-func (m *MemoryStore) CreateDefinition(ctx context.Context, tenantID string, def *domain.ReportDefinition) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	def.ID = uuid.New().String()
-	def.TenantID = tenantID
-	def.Status = domain.DefStatusActive
-	def.CreatedAt = time.Now()
-	def.UpdatedAt = time.Now()
-	m.definitions[def.ID] = def
-	return nil
-}
-
-func (m *MemoryStore) GetDefinitionByID(ctx context.Context, tenantID, id string) (*domain.ReportDefinition, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	d, ok := m.definitions[id]
-	if !ok || d.TenantID != tenantID {
-		return nil, fmt.Errorf("report definition not found")
-	}
-	return d, nil
-}
-
-func (m *MemoryStore) ListDefinitions(ctx context.Context, tenantID, legalEntityID, reportType string) ([]domain.ReportDefinition, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []domain.ReportDefinition
-	for _, d := range m.definitions {
-		if d.TenantID != tenantID {
-			continue
+// ListRuns returns one page of the tenant's runs, newest first.
+func (s *PgStore) ListRuns(ctx context.Context, tenantID string, filter RunFilter, page Page) ([]domain.ReportRun, error) {
+	runs := []domain.ReportRun{}
+	err := s.inTenantTx(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+runColumns+`
+			FROM report_runs
+			WHERE tenant_id = $1
+			  AND ($2 = '' OR definition_id::text = $2)
+			  AND ($3 = '' OR status = $3)
+			ORDER BY created_at DESC, id
+			LIMIT $4 OFFSET $5`,
+			tenantID, filter.DefinitionID, filter.Status, page.Limit, page.Offset)
+		if err != nil {
+			return fmt.Errorf("list report_runs: %w", err)
 		}
-		if legalEntityID != "" && d.LegalEntityID != legalEntityID {
-			continue
+		defer rows.Close()
+		for rows.Next() {
+			run, err := scanRun(rows)
+			if err != nil {
+				return fmt.Errorf("scan report_run: %w", err)
+			}
+			runs = append(runs, *run)
 		}
-		if reportType != "" && string(d.ReportType) != reportType {
-			continue
-		}
-		result = append(result, *d)
-	}
-	return result, nil
-}
-
-func (m *MemoryStore) UpdateDefinitionStatus(ctx context.Context, tenantID, id string, status domain.DefinitionStatus) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	d, ok := m.definitions[id]
-	if !ok || d.TenantID != tenantID {
-		return fmt.Errorf("report definition not found")
-	}
-	d.Status = status
-	d.UpdatedAt = time.Now()
-	return nil
-}
-
-func (m *MemoryStore) CreateRun(ctx context.Context, tenantID string, run *domain.ReportRun) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	run.ID = uuid.New().String()
-	run.TenantID = tenantID
-	run.CreatedAt = time.Now()
-	m.runs[run.ID] = run
-	return nil
-}
-
-func (m *MemoryStore) GetRunByID(ctx context.Context, tenantID, id string) (*domain.ReportRun, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	r, ok := m.runs[id]
-	if !ok || r.TenantID != tenantID {
-		return nil, fmt.Errorf("report run not found")
-	}
-	return r, nil
-}
-
-func (m *MemoryStore) UpdateRun(ctx context.Context, tenantID string, run *domain.ReportRun) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.runs[run.ID] = run
-	return nil
-}
-
-func (m *MemoryStore) ListRuns(ctx context.Context, tenantID, definitionID, status string) ([]domain.ReportRun, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var result []domain.ReportRun
-	for _, r := range m.runs {
-		if r.TenantID != tenantID {
-			continue
-		}
-		if definitionID != "" && r.DefinitionID != definitionID {
-			continue
-		}
-		if status != "" && string(r.Status) != status {
-			continue
-		}
-		result = append(result, *r)
-	}
-	return result, nil
+		return rows.Err()
+	})
+	return runs, err
 }

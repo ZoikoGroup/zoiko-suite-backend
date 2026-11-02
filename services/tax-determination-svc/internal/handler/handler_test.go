@@ -121,7 +121,7 @@ type stubRulesClient struct {
 	err  error
 }
 
-func (s *stubRulesClient) FetchActiveRule(_ context.Context, _, _, category string) (*rules.TaxRuleDTO, error) {
+func (s *stubRulesClient) FetchActiveRule(_ context.Context, _ rules.Caller, _, category string) (*rules.TaxRuleDTO, error) {
 	if s.err != nil {
 		return nil, s.err
 	}

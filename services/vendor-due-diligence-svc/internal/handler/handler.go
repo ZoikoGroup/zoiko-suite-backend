@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/vendor-due-diligence-svc/internal/clients"
 	"zoiko.io/vendor-due-diligence-svc/internal/domain"
 	svcmiddleware "zoiko.io/vendor-due-diligence-svc/internal/middleware"
 	"zoiko.io/vendor-due-diligence-svc/internal/store"
@@ -240,7 +241,10 @@ func (h *Handler) CreateCheck(w http.ResponseWriter, r *http.Request) {
 
 	h.publisher.PublishCompleted(r.Context(), correlationID, *check)
 
-	h.updateCounterparty(r.Context(), tenantID, check.CounterpartyID, riskOutcome)
+	h.updateCounterparty(clients.WithCaller(r.Context(), clients.Caller{
+		PrincipalID: principalID, LegalEntityID: check.LegalEntityID,
+		CorrelationID: correlationID, CheckID: check.CheckID,
+	}), tenantID, check.CounterpartyID, riskOutcome)
 
 	writeJSON(w, http.StatusCreated, domain.CheckDetailResponse{
 		Check:    *check,

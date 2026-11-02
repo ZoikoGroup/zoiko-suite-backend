@@ -173,10 +173,24 @@ func (s *PgStore) UpdateVATReturn(ctx context.Context, r *domain.VATReturn) erro
 	if err := s.setRLS(ctx, tx); err != nil {
 		return err
 	}
+	tenantID := middleware.GetTenantID(ctx)
+
+	// A filed (or accepted) return is what the authority holds; its figures
+	// must not change underneath it. Checked under the row lock.
+	var current string
+	if err := tx.QueryRow(ctx, `SELECT status FROM vat_returns WHERE return_id=$1 AND tenant_id=$2 FOR UPDATE`,
+		r.ReturnID, tenantID).Scan(&current); err != nil {
+		if err == pgx.ErrNoRows {
+			return domain.ErrVATReturnNotFound
+		}
+		return err
+	}
+	if st := domain.FilingStatus(current); st == domain.StatusFiled || st == domain.StatusAccepted {
+		return domain.ErrAlreadyFiled
+	}
 
 	r.NetTaxPayable = r.OutputTaxAmount - r.InputTaxAmount
 	r.UpdatedAt = time.Now().UTC()
-	tenantID := middleware.GetTenantID(ctx)
 
 	cmdTag, err := tx.Exec(ctx, `
 		UPDATE vat_returns

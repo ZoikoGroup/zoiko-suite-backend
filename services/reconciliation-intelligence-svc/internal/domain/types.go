@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -291,6 +292,11 @@ func (r *AnalyzeReconciliationRequest) Validate() error {
 	if r.JobName == "" {
 		return fmt.Errorf("job_name is required")
 	}
+	// reconciliation_jobs.job_name is VARCHAR(128): longer names failed the
+	// INSERT and surfaced as a 500 instead of the caller's 400.
+	if utf8.RuneCountInString(r.JobName) > MaxJobNameLength {
+		return fmt.Errorf("job_name must be at most %d characters", MaxJobNameLength)
+	}
 	if r.BankReconciliationRunID == "" {
 		return fmt.Errorf("bank_reconciliation_run_id is required")
 	}
@@ -532,3 +538,29 @@ func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.R
 		UpdatedAt:                  now,
 	}
 }
+
+// MaxJobNameLength matches reconciliation_jobs.job_name VARCHAR(128).
+const MaxJobNameLength = 128
+
+// Job list paging bounds: every list is bounded, never "all rows".
+const (
+	DefaultJobListLimit = 50
+	MaxJobListLimit     = 200
+)
+
+// KnownJobStatuses are the reconciliation_jobs.status values a list may filter on.
+var KnownJobStatuses = map[string]bool{"ANALYZING": true, "COMPLETED": true, "ARCHIVED": true}
+
+// KnownSourceSystems are the source_system_a values a list may filter on.
+var KnownSourceSystems = map[SourceSystem]bool{
+	SourceGeneralLedger: true, SourceBankStatement: true, SourceInvoices: true, SourcePayrollJournal: true,
+}
+
+// ErrItemNotFound: the unmatched item does not exist in this job (or tenant).
+// Handlers answer 404 with this fixed message; the underlying store error is
+// logged, never returned to the caller.
+var ErrItemNotFound = errors.New("unmatched item not found")
+
+// ErrJobArchived: decisions are refused on an ARCHIVED job, whose suggestions
+// are kept read-only as the audit trail.
+var ErrJobArchived = errors.New("reconciliation job is archived; its suggestions are read-only")

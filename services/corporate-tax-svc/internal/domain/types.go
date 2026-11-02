@@ -11,6 +11,14 @@ var (
 	ErrAlreadySubmitted    = errors.New("corporate tax return is already submitted")
 	ErrInvalidTaxYear      = errors.New("invalid tax year")
 
+	// ErrDuplicateReturn is a second return for the same legal entity,
+	// jurisdiction and fiscal year (uk_corp_tax_return).
+	ErrDuplicateReturn = errors.New("corporate tax return for this entity, jurisdiction and fiscal year already exists")
+
+	// ErrInvalidStatusTransition is a lifecycle step requested from a status
+	// that does not permit it (e.g. assessing a return never submitted).
+	ErrInvalidStatusTransition = errors.New("corporate tax return status does not permit this action")
+
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".
 	ErrTenantMissing = errors.New("tenant scope missing")
@@ -109,19 +117,19 @@ func (r *TaxReturn) Compute() {
 
 // NexusRecord represents a jurisdictional nexus established by an entity per Doc 04 §13.
 type NexusRecord struct {
-	NexusRecordID   string     `json:"nexus_record_id"`
-	TenantID        string     `json:"tenant_id"`
-	LegalEntityID   string     `json:"legal_entity_id"`
-	JurisdictionID  string     `json:"jurisdiction_id"`
-	NexusType       string     `json:"nexus_type"`
-	ThresholdAmount float64    `json:"threshold_amount"`
-	Currency        string     `json:"currency"`
-	Status          string     `json:"status"`
-	EffectiveFrom   string     `json:"effective_from"`
-	EffectiveTo     *string    `json:"effective_to,omitempty"`
-	CreatedBy       string     `json:"created_by"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	NexusRecordID   string    `json:"nexus_record_id"`
+	TenantID        string    `json:"tenant_id"`
+	LegalEntityID   string    `json:"legal_entity_id"`
+	JurisdictionID  string    `json:"jurisdiction_id"`
+	NexusType       string    `json:"nexus_type"`
+	ThresholdAmount float64   `json:"threshold_amount"`
+	Currency        string    `json:"currency"`
+	Status          string    `json:"status"`
+	EffectiveFrom   string    `json:"effective_from"`
+	EffectiveTo     *string   `json:"effective_to,omitempty"`
+	CreatedBy       string    `json:"created_by"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // CreateNexusRecordRequest is the inbound payload to establish a nexus record.

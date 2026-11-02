@@ -12,6 +12,8 @@ import (
 	authzpkg "zoiko.io/carta-svc/internal/authz"
 	"zoiko.io/carta-svc/internal/domain"
 	svcenvelope "zoiko.io/carta-svc/internal/envelope"
+	"zoiko.io/carta-svc/internal/health"
+	"zoiko.io/carta-svc/internal/idempotency"
 	"zoiko.io/carta-svc/internal/store"
 	apicontract "zoiko.io/identity-envelope/apicontract"
 )
@@ -69,10 +71,29 @@ type Handler struct {
 	store  store.Store
 	authz  AuthzChecker
 	logger *zap.Logger
+
+	// idem answers a retried material write from its first response. nil
+	// disables replay protection — unit tests only; cmd/server always sets
+	// the Postgres-backed store.
+	idem idempotency.Store
+	// db is what /readyz pings. nil reports not-ready.
+	db health.Pinger
 }
 
 func New(s store.Store, az AuthzChecker, l *zap.Logger) *Handler {
 	return &Handler{store: s, authz: az, logger: l}
+}
+
+// WithIdempotency installs Idempotency-Key replay for material writes.
+func (h *Handler) WithIdempotency(s idempotency.Store) *Handler {
+	h.idem = s
+	return h
+}
+
+// WithReadiness sets the dependency /readyz checks.
+func (h *Handler) WithReadiness(db health.Pinger) *Handler {
+	h.db = db
+	return h
 }
 
 // ── Why POST /v1/carta/evaluate has NO principal guard ──────────────────
@@ -158,10 +179,17 @@ func NewRouter(h *Handler) http.Handler {
 	// Refusals rendered as RFC 9457 problem+json, like every other error here.
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "carta-svc"})
-	})
+	// Replay protection (INV-08). A write without an Idempotency-Key passes
+	// straight through — which is how gateway-auth-svc's /evaluate calls
+	// arrive — so this deduplicates retries without refusing anything the
+	// envelope policy admits.
+	if h.idem != nil {
+		r.Use(idempotency.Middleware(h.idem, h.logger))
+	}
+	// Probes are public: the envelope policy exempts them and the tenant
+	// check lives in the handlers below, not on the router.
+	r.Get("/healthz", health.HealthzHandler("carta-svc"))
+	r.Get("/readyz", health.ReadyzHandler(h.db))
 	r.Route("/v1/carta", func(r chi.Router) {
 		r.Post("/evaluate", h.EvaluateAccess)
 		r.Get("/assessments", h.ListAssessments)
@@ -186,6 +214,7 @@ func (h *Handler) EvaluateAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	asm := domain.EvaluateAccess(&req, tenantID)
 	if err := h.store.SaveAssessment(r.Context(), tenantID, asm); err != nil {
+		h.logger.Error("save assessment failed", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to save assessment")
 		return
 	}
@@ -202,8 +231,13 @@ func (h *Handler) GetAssessment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	asm, err := h.store.GetAssessmentByID(r.Context(), tenantID, chi.URLParam(r, "id"))
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		h.errJSON(w, r, 404, "assessment not found")
+		return
+	}
+	if err != nil {
+		h.logger.Error("get assessment failed", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to read assessment")
 		return
 	}
 	// Authorized against the assessment row's own legal entity, never a
@@ -236,7 +270,12 @@ func (h *Handler) ListAssessments(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, legalEntityID, CartaAssessmentRead) {
 		return
 	}
-	asms, _ := h.store.ListAssessments(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("subject_id"))
+	asms, err := h.store.ListAssessments(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("subject_id"))
+	if err != nil {
+		h.logger.Error("list assessments failed", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to list assessments")
+		return
+	}
 	if asms == nil {
 		asms = []domain.CartaAssessment{}
 	}

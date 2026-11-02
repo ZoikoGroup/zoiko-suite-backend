@@ -373,23 +373,16 @@ func (h *Handler) ListEntries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// At least one entity filter is required. Without it, the authorization
-	// check below has no entity to verify against, so any caller could
-	// retrieve ALL intercompany entries across every legal entity in the
-	// tenant. This is the "filter that disables itself" shape documented in
-	// the backend-completion-tracker.
-	entityForAuthz := sourceEntityID
-	if entityForAuthz == "" {
-		entityForAuthz = targetEntityID
-	}
-	if entityForAuthz == "" {
-		writeError(w, http.StatusBadRequest, "missing_entity_filter",
-			"at least one of source_legal_entity_id or target_legal_entity_id is required")
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, entityForAuthz, actionViewEntry); err != nil {
-		h.writeAuthzErr(w, err)
-		return
+	// An explicit filter names an entity the caller asked about, so a denial
+	// on it is the caller's 403 — both filters are checked, not only the first.
+	for _, entityID := range []string{sourceEntityID, targetEntityID} {
+		if entityID == "" {
+			continue
+		}
+		if err := h.authz.CheckAllowed(r.Context(), principalID, entityID, actionViewEntry); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
 	}
 
 	list, err := h.store.ListEntries(r.Context(), sourceEntityID, targetEntityID)
@@ -399,10 +392,44 @@ func (h *Handler) ListEntries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if list == nil {
-		list = []domain.IntercompanyEntry{}
+	// Every row is then held to the same rule as GetEntry: the caller must be
+	// allowed to view the pair's source entity. Without this, omitting both
+	// filters (or filtering on target only) listed every pair in the tenant,
+	// including those of entities the caller has no authority over.
+	visible, err := h.authorizedEntries(r.Context(), principalID, list)
+	if err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	writeJSON(w, http.StatusOK, visible)
+}
+
+// authorizedEntries keeps the entries whose source entity the principal may
+// view, asking once per distinct entity. A denial drops that entity's rows; any
+// other authz failure is returned, so an unreachable authorization-svc fails
+// the list closed instead of returning a partial or unfiltered one.
+func (h *Handler) authorizedEntries(ctx context.Context, principalID string, list []domain.IntercompanyEntry) ([]domain.IntercompanyEntry, error) {
+	allowed := map[string]bool{}
+	out := make([]domain.IntercompanyEntry, 0, len(list))
+	for _, e := range list {
+		ok, seen := allowed[e.SourceLegalEntityID]
+		if !seen {
+			err := h.authz.CheckAllowed(ctx, principalID, e.SourceLegalEntityID, actionViewEntry)
+			switch {
+			case err == nil:
+				ok = true
+			case errors.Is(err, domain.ErrAuthorizationDenied):
+				ok = false
+			default:
+				return nil, err
+			}
+			allowed[e.SourceLegalEntityID] = ok
+		}
+		if ok {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // ── GET /v1/intercompany/reciprocal-balances ─────────────────────────────────────

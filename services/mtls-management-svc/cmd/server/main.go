@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/mtls-management-svc/internal/authz"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/handler"
+	"zoiko.io/mtls-management-svc/internal/idempotency"
 	"zoiko.io/mtls-management-svc/internal/siem"
 	"zoiko.io/mtls-management-svc/internal/store"
 )
@@ -144,7 +146,17 @@ func main() {
 		logger.Fatal("failed to open revocation ledger", zap.String("ca_data_dir", caDir), zap.Error(err))
 	}
 
-	s := store.NewMemoryStore()
+	// Certificate records, their rotation/revocation lifecycle and the
+	// communication policies are authoritative state: Postgres, never the
+	// in-memory map (which is for unit tests only). The pool connects lazily,
+	// so the service still starts and serves /healthz and the CRL while the
+	// database is down; /readyz reports 503 until it is reachable.
+	pool, err := newPool(databaseURL())
+	if err != nil {
+		logger.Fatal("invalid DATABASE_URL", zap.Error(err))
+	}
+	defer pool.Close()
+	s := store.NewPgStore(pool)
 	siemClient := siem.New(os.Getenv("SIEM_SERVICE_URL"), "mtls-management-svc", logger)
 
 	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
@@ -155,7 +167,8 @@ func main() {
 	if err != nil {
 		logger.Fatal("bootstrap tokens", zap.Error(err))
 	}
-	h := handler.New(s, internalCA, ledger, siemClient, authzClient, logger, bootstrapTokens)
+	h := handler.New(s, internalCA, ledger, siemClient, authzClient, logger, bootstrapTokens).
+		WithIdempotency(idempotency.NewPgStore(pool))
 
 	// Create router with apicontract middleware
 	r := chi.NewRouter()
@@ -177,4 +190,29 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+}
+
+// defaultDatabaseURL matches the sibling services' compose wiring.
+const defaultDatabaseURL = "postgres://postgres:postgres@postgres:5432/mtls_management?sslmode=disable"
+
+func databaseURL() string {
+	if v := os.Getenv("DATABASE_URL"); v != "" {
+		return v
+	}
+	return defaultDatabaseURL
+}
+
+// newPool builds the pgx pool without dialling: a database outage at boot
+// must show as an unready service, not a crash loop that also takes down the
+// CRL endpoint every verifier depends on.
+func newPool(dsn string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConns = 10
+	cfg.MaxConnLifetime = 30 * time.Minute
+	cfg.MaxConnIdleTime = 5 * time.Minute
+	cfg.HealthCheckPeriod = time.Minute
+	return pgxpool.NewWithConfig(context.Background(), cfg)
 }

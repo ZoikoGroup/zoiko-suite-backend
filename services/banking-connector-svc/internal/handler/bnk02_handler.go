@@ -38,18 +38,23 @@ type BNK02Handler struct {
 // RegisterRoutes in cmd/server/main.go.
 func RegisterBNK02Routes(r chi.Router, h *Handler, bnk02Store store.BNK02Store, bankAccts clients.BankAccountClient, vault clients.VaultClient) {
 	bh := &BNK02Handler{Handler: h, bnk02Store: bnk02Store, bankAccts: bankAccts, vault: vault}
-	r.Route("/v1/banking/connections", func(r chi.Router) {
-		r.Post("/request", bh.InitiateConnection)
-		r.Get("/{id}/events", bh.GetConnectionEvents)
-		r.Post("/{id}/complete-authorization", bh.CompleteConnectionAuthorization)
-		r.Post("/{id}/activate", bh.ActivateConnection)
-		r.Post("/{id}/refresh", bh.RefreshConnection)
-		r.Post("/{id}/trigger-reconsent", bh.TriggerReconsent)
-		r.Post("/{id}/suspend", bh.SuspendConnection)
-		r.Post("/{id}/revoke", bh.RevokeConnection)
-		r.Post("/{id}/reconnect", bh.ReconnectProvider)
-		r.Post("/{id}/rotate-credential", bh.RotateConnectionCredential)
-	})
+	// Registered as full paths, not r.Route("/v1/banking/connections", ...):
+	// a Route/Mount there shadowed RegisterRoutes' own /v1/banking subrouter,
+	// so GET/POST /v1/banking/connections, GET /v1/banking/connections/{id}
+	// and GET /v1/banking/connections/{id}/statements all answered 404.
+	const p = "/v1/banking/connections"
+	r.Post(p+"/request", bh.InitiateConnection)
+	r.Get(p+"/{id}/events", bh.GetConnectionEvents)
+	r.Post(p+"/{id}/complete-authorization", bh.CompleteConnectionAuthorization)
+	r.Post(p+"/{id}/activate", bh.ActivateConnection)
+	r.Post(p+"/{id}/refresh", bh.RefreshConnection)
+	r.Post(p+"/{id}/trigger-reconsent", bh.TriggerReconsent)
+	// SPEC_DEVIATIONS.md documents ReconsentConnection as /reconsent.
+	r.Post(p+"/{id}/reconsent", bh.TriggerReconsent)
+	r.Post(p+"/{id}/suspend", bh.SuspendConnection)
+	r.Post(p+"/{id}/revoke", bh.RevokeConnection)
+	r.Post(p+"/{id}/reconnect", bh.ReconnectProvider)
+	r.Post(p+"/{id}/rotate-credential", bh.RotateConnectionCredential)
 	r.Post("/v1/banking/region-policies", bh.CreateRegionPolicy)
 }
 

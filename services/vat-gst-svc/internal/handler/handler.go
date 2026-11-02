@@ -237,6 +237,14 @@ func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 	existing.InputTaxAmount = req.InputTaxAmount
 
 	if err := h.store.UpdateVATReturn(r.Context(), existing); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrVATReturnNotFound):
+			writeError(w, http.StatusNotFound, "vat return not found")
+			return
+		case errors.Is(err, domain.ErrAlreadyFiled):
+			writeError(w, http.StatusConflict, "filed vat return cannot be updated")
+			return
+		}
 		h.logger.Error("failed to update vat return", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to update vat return")
 		return

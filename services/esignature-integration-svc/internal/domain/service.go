@@ -7,6 +7,9 @@ import (
 
 var (
 	ErrEnvelopeNotFound = errors.New("esignature envelope not found")
+	// ErrInvalidEnvelopeTransition is the database state-machine trigger
+	// (migration 003) refusing a status change, e.g. SIGNED -> VOIDED.
+	ErrInvalidEnvelopeTransition = errors.New("invalid envelope status transition")
 )
 
 const (

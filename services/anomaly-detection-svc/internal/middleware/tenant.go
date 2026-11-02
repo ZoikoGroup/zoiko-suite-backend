@@ -27,6 +27,13 @@ const TenantIDKey contextKey = "tenant_id"
 // vat-gst-svc and withholding-tax-svc.
 func TenantContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Probes run before any gateway sets identity headers; they touch no
+		// tenant data, so they are the only paths admitted without a tenant.
+		switch r.URL.Path {
+		case "/healthz", "/readyz", "/health":
+			next.ServeHTTP(w, r)
+			return
+		}
 		tenantID := r.Header.Get("X-Tenant-ID")
 		if tenantID == "" {
 			w.Header().Set("Content-Type", "application/json")

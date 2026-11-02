@@ -55,3 +55,21 @@ func TestGetTenantID_NoContext_ReturnsEmpty(t *testing.T) {
 		t.Fatalf("expected empty string for a context with no tenant, got %q", got)
 	}
 }
+
+// Probes must answer without identity headers (the e2e audit found /healthz
+// returning 401 here), and only the probes are exempt.
+func TestTenantContext_ProbesExempt(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	for _, path := range []string{"/healthz", "/readyz", "/health"} {
+		w := httptest.NewRecorder()
+		TenantContext(next).ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s without X-Tenant-ID: expected 200, got %d", path, w.Code)
+		}
+	}
+	w := httptest.NewRecorder()
+	TenantContext(next).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz/x", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("non-probe path must still be refused, got %d", w.Code)
+	}
+}

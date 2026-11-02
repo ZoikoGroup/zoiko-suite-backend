@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/esignature-integration-svc/internal/domain"
@@ -152,7 +154,7 @@ func (p *PgStore) ListEnvelopes(ctx context.Context, legalEntityID string) ([]do
 func (p *PgStore) UpdateEnvelopeStatus(ctx context.Context, id string, req *domain.UpdateStatusRequest) (*domain.SignatureEnvelope, error) {
 	query := `
 		UPDATE signature_envelopes
-		SET status = $1, external_ref = $2, updated_at = $3
+		SET status = $1, external_ref = COALESCE(NULLIF($2, ''), external_ref), updated_at = $3
 		WHERE envelope_id = $4
 		  AND tenant_id = $5
 		RETURNING envelope_id, tenant_id, legal_entity_id, provider, document_title, signer_email, signer_name, status, COALESCE(external_ref,''), created_at, updated_at
@@ -165,6 +167,11 @@ func (p *PgStore) UpdateEnvelopeStatus(ctx context.Context, id string, req *doma
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrEnvelopeNotFound
+		}
+		// P0001 = RAISE EXCEPTION from the forward-only status trigger (003).
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "P0001" {
+			return nil, fmt.Errorf("%w: %s", domain.ErrInvalidEnvelopeTransition, pgErr.Message)
 		}
 		return nil, err
 	}

@@ -41,12 +41,14 @@ type MtlsCertificate struct {
 	// only the current one, which is all the record used to remember.
 	PriorSerialNumbers []string   `json:"prior_serial_numbers,omitempty"`
 	ValidFrom          time.Time  `json:"valid_from"`
-	ValidTo        time.Time  `json:"valid_to"`
-	RotationDays   int        `json:"rotation_days"`
-	AutoRotate     bool       `json:"auto_rotate"`
-	Status         CertStatus `json:"status"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ValidTo            time.Time  `json:"valid_to"`
+	RotationDays       int        `json:"rotation_days"`
+	AutoRotate         bool       `json:"auto_rotate"`
+	Status             CertStatus `json:"status"`
+	// RevokedAt is when the record became REVOKED (absent otherwise).
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 // ProvisionCertResult is returned exactly once, from the provision/rotate

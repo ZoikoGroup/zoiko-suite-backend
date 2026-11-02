@@ -288,6 +288,14 @@ func (h *Handler) DeactivatePolicy(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListConsumptions(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	spendPolicyID := r.URL.Query().Get("spend_policy_id")
+	// spend_policy_id is a uuid column; an unparseable filter used to reach
+	// Postgres and come back as a 503 store_unavailable.
+	if spendPolicyID != "" {
+		if _, err := uuid.Parse(spendPolicyID); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_spend_policy_id", "spend_policy_id must be a UUID")
+			return
+		}
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {

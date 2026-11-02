@@ -176,6 +176,10 @@ func (h *taskHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, task_type, linked_object_type, and linked_object_id are required")
 		return
 	}
+	if req.Priority != "" && !domain.ValidTaskPriority(req.Priority) {
+		writeError(w, http.StatusBadRequest, "priority must be one of LOW, MEDIUM, HIGH, CRITICAL")
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionTaskCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return

@@ -1,17 +1,38 @@
+# BUILD CONTEXT IS services/, NOT THIS DIRECTORY:
+#   docker build -f migration-integrity-svc/Dockerfile services/
+# go.mod replaces zoiko.io/eventing with ../eventing, and Docker can only COPY
+# from inside the build context. Dockerfile.dockerignore next to this file
+# trims the context to the two directories the build reads.
+
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git
+
+# The service sits at /app/migration-integrity-svc so the replace directive's ../eventing
+# resolves to /app/eventing.
+WORKDIR /app/migration-integrity-svc
+
+COPY eventing/ /app/eventing/
+COPY migration-integrity-svc/go.mod migration-integrity-svc/go.sum ./
+RUN go mod download
+
+COPY migration-integrity-svc/ ./
+
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/healthcheck ./cmd/healthcheck
+
 FROM alpine:3.19
 
 RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 
-COPY server /app/server
-COPY healthcheck /app/healthcheck
-
-RUN chmod +x /app/server /app/healthcheck
+COPY --from=builder /app/server /app/server
+COPY --from=builder /app/healthcheck /app/healthcheck
 
 EXPOSE 8139
 
-HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
-  CMD ["/app/healthcheck"]
+# cmd/healthcheck probes the public /healthz endpoint.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3   CMD ["/app/healthcheck"]
 
-CMD ["/app/server"]
+ENTRYPOINT ["/app/server"]

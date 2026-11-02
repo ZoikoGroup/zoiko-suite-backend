@@ -72,7 +72,7 @@ func TestPgStore_CreateAndGet(t *testing.T) {
 	vendorID := "v-001"
 	now := time.Now().UTC()
 	pc := &domain.ProcurementCase{
-		CaseID:                 "case-001",
+		CaseID:                 "0e1c5a4e-0000-4000-8000-000000000001",
 		TenantID:               "tenant-a",
 		LegalEntityID:          "le-001",
 		RequestedByPrincipalID: "user-001",
@@ -95,7 +95,7 @@ func TestPgStore_CreateAndGet(t *testing.T) {
 		t.Fatalf("expected created to be true")
 	}
 
-	got, err := s.GetCase(ctx, "case-001")
+	got, err := s.GetCase(ctx, "0e1c5a4e-0000-4000-8000-000000000001")
 	if err != nil {
 		t.Fatalf("GetCase failed: %v", err)
 	}

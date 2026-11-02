@@ -74,19 +74,22 @@ func NewClientWithHTTPClient(authzURL string, httpClient *http.Client, logger *z
 	}
 }
 
-func (c *Client) Authorize(ctx context.Context, tenantID, userID, action, resource string) (bool, error) {
-	// Delegated to Governance Plane Authorization Service
-	return true, nil
-}
-
-func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+// CheckAllowed asks authorization-svc whether principalID may perform
+// actionType on legalEntityID within tenantID. It fails closed: nil means
+// GRANTED; ErrAuthorizationDenied means an explicit denial; anything else
+// (transport error, non-200, undecodable body) is ErrAuthzServiceUnavailable.
+//
+// The tenant is part of the cache key: the 000001-era key was
+// principal|entity|action, so a decision for one tenant could be reused for
+// a same-named principal and entity in another tenant.
+func (c *Client) CheckAllowed(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error {
+	key := tenantID + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, tenantID, principalID, legalEntityID, actionType)
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -136,8 +139,9 @@ func (c *Client) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+func (c *Client) checkAllowedLive(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error {
 	reqBody, err := json.Marshal(map[string]string{
+		"tenant_id":       tenantID,
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
 		"action_type":     actionType,
@@ -151,6 +155,8 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
