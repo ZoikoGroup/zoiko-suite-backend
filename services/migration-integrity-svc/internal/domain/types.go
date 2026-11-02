@@ -245,9 +245,10 @@ func (r *RemediateRequest) Validate() error {
 
 // ─── Integrity Engine ─────────────────────────────────────────────────────────
 
-// PerformIntegrityValidation runs schema, source identity, duplicate, and
-// format integrity checks on the provided migration records. Returns checks,
-// audit entries, valid count, invalid count, and an integrity score (0–100%).
+// PerformIntegrityValidation runs schema, source identity, duplicate,
+// format, and currency-code integrity checks on the provided migration
+// records. Returns checks, audit entries, valid count, invalid count, and
+// an integrity score (0–100%).
 //
 // Every audit entry is classified where it is raised (§16 severity and
 // reason family) and owned by the request's exception owner. The
@@ -457,6 +458,59 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		CreatedAt:      now,
 	})
 
+	// ── Check 5: Currency Code Validity ───────────────────────────────────────
+	// MIG-C12 "currency codes/minor units/functional currency valid";
+	// MIG-N12 "Source uses invalid currency code -> Quarantine; no silent
+	// substitution." An unrecognized code is a reference the record makes to
+	// a currency that does not exist, so this is the REFERENTIAL_INTEGRITY
+	// check and ORPHANED_REFERENCE violation A7 named as declared but never
+	// produced, not a new check type. MQ1/REFERENCE, matching
+	// ReasonReference's own "unknown account, tax code, currency, dimension,
+	// entity" and the amount-format check's reasoning: a currency a loader
+	// cannot resolve is a financial value that cannot load.
+	//
+	// Minor-unit and functional-currency validity (the rest of MIG-C12) are
+	// not checked here: this service holds no functional-currency context
+	// and no minor-unit table per code, only the ISO 4217 alphabetic list
+	// itself (SPEC_DEVIATIONS A7).
+	currencyFailed := 0
+	for i, rec := range req.Records {
+		val, exists := rec.Fields["currency_code"]
+		if !exists || strings.TrimSpace(val) == "" {
+			continue
+		}
+		code := strings.ToUpper(strings.TrimSpace(val))
+		if !validISO4217Codes[code] {
+			currencyFailed++
+			violated[i] = true
+			auditEntries = append(auditEntries, AuditEntry{
+				TenantID:      tenantID,
+				JobID:         jobID,
+				RecordRef:     rec.Ref,
+				FieldName:     "currency_code",
+				SourceValue:   val,
+				ViolationType: ViolationOrphanedRef,
+				Severity:      SeverityMQ1,
+				ReasonFamily:  ReasonReference,
+				OwnerID:       owner,
+				IsRemediated:  false,
+				CreatedAt:     now,
+			})
+		}
+	}
+	checks = append(checks, IntegrityCheck{
+		TenantID:       tenantID,
+		JobID:          jobID,
+		CheckName:      "Currency Code Validity",
+		CheckType:      CheckReferentialInteg,
+		RecordsChecked: totalRecords,
+		RecordsPassed:  totalRecords - currencyFailed,
+		RecordsFailed:  currencyFailed,
+		Severity:       sev(currencyFailed, SeverityMQ1),
+		Detail:         "Validated currency_code against the ISO 4217 alphabetic code list",
+		CreatedAt:      now,
+	})
+
 	// ── Compute final score ───────────────────────────────────────────────────
 	invalidCount := len(violated)
 	validCount := totalRecords - invalidCount
@@ -506,6 +560,48 @@ func EvaluateJobStatus(score float64, validCount, invalidCount, blockerCount int
 // decimalRe is a plain signed decimal: "5", "-5", "5.25", "5.", ".5". It refuses
 // "1.2.3", "-", ".", "1-2" and "--", which a per-character scan let through.
 var decimalRe = regexp.MustCompile(`^-?([0-9]+\.?[0-9]*|\.[0-9]+)$`)
+
+// validISO4217Codes is the ISO 4217 alphabetic currency code list (active
+// codes, plus the small number of still-encountered recently-superseded
+// ones a real source extract can carry — e.g. SLL alongside its 2022
+// replacement SLE). It is a static, self-contained reference list: no
+// functional-currency or minor-unit table exists per code (SPEC_DEVIATIONS
+// A7), only membership in this alphabet.
+var validISO4217Codes = func() map[string]bool {
+	codes := strings.Fields(`
+		AED AFN ALL AMD ANG AOA ARS AUD AWG AZN
+		BAM BBD BDT BGN BHD BIF BMD BND BOB BOV BRL BSD BTN BWP BYN BZD
+		CAD CDF CHE CHF CHW CLF CLP CNY COP COU CRC CUC CUP CVE CZK
+		DJF DKK DOP DZD
+		EGP ERN ETB EUR
+		FJD FKP
+		GBP GEL GHS GIP GMD GNF GTQ GYD
+		HKD HNL HTG HUF
+		IDR ILS INR IQD IRR ISK
+		JMD JOD JPY
+		KES KGS KHR KMF KPW KRW KWD KYD KZT
+		LAK LBP LKR LRD LSL LYD
+		MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MXV MYR MZN
+		NAD NGN NIO NOK NPR NZD
+		OMR
+		PAB PEN PGK PHP PKR PLN PYG
+		QAR
+		RON RSD RUB RWF
+		SAR SBD SCR SDG SEK SGD SHP SLE SLL SOS SRD SSP STN SVC SYP SZL
+		THB TJS TMT TND TOP TRY TTD TWD TZS
+		UAH UGX USD USN UYI UYU UYW UZS
+		VED VES VND VUV
+		WST
+		XAF XAG XAU XBA XBB XBC XBD XCD XDR XOF XPD XPF XPT XSU XTS XUA XXX
+		YER
+		ZAR ZMW ZWL
+	`)
+	m := make(map[string]bool, len(codes))
+	for _, c := range codes {
+		m[c] = true
+	}
+	return m
+}()
 
 func sev(failCount int, whenFailed Severity) Severity {
 	if failCount > 0 {
