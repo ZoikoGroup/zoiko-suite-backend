@@ -15,10 +15,13 @@ package handler
 import (
 	"context"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
 
 // OwnershipService is the ORG-04 half of the service contract.
@@ -28,6 +31,10 @@ type OwnershipService interface {
 	RejectOwnershipRelationship(ctx context.Context, relationshipID string, req domain.OwnershipDecisionRequest) (*domain.OwnershipRelationship, error)
 	SupersedeOwnershipRelationship(ctx context.Context, relationshipID string, req domain.SupersedeOwnershipRequest) (*domain.OwnershipRelationship, error)
 	EndOwnershipRelationship(ctx context.Context, relationshipID string, req domain.EndOwnershipRequest) (*domain.OwnershipRelationship, error)
+	GetOwnershipGraph(ctx context.Context, asOf time.Time, root string) (*domain.OwnershipGraphView, error)
+	GetGroupAsOf(ctx context.Context, legalEntityID string, asOf time.Time) (*domain.GroupView, error)
+	ListEntityParents(ctx context.Context, legalEntityID string, asOf time.Time) (*registry.EntityParents, error)
+	ExplainControlChain(ctx context.Context, legalEntityID string, asOf time.Time) (*domain.ControlChainView, error)
 	GetOwnershipRelationship(ctx context.Context, relationshipID string) (*domain.OwnershipRelationship, error)
 }
 
@@ -38,6 +45,10 @@ func registerOwnershipRoutes(r chi.Router, h *Handler) {
 	r.Post("/ownership-relationships/{relationshipID}/rejection", h.RejectOwnershipRelationship)
 	r.Post("/ownership-relationships/{relationshipID}/supersession", h.SupersedeOwnershipRelationship)
 	r.Post("/ownership-relationships/{relationshipID}/end", h.EndOwnershipRelationship)
+	r.Get("/ownership-graph", h.GetOwnershipGraph)
+	r.Get("/entities/{entityID}/group", h.GetGroupAsOf)
+	r.Get("/entities/{entityID}/parents", h.ListEntityParents)
+	r.Get("/entities/{entityID}/control-chain", h.ExplainControlChain)
 }
 
 // ProposeOwnershipRelationship files a PROPOSED relationship.
@@ -127,4 +138,77 @@ func (h *Handler) EndOwnershipRelationship(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusOK, rel)
+}
+
+// asOfParam reads the optional as_of query parameter (RFC3339 or YYYY-MM-DD);
+// absent means now. A malformed value is answered 400 and ok is false.
+func asOfParam(w http.ResponseWriter, r *http.Request) (time.Time, bool) {
+	raw := strings.TrimSpace(r.URL.Query().Get("as_of"))
+	if raw == "" {
+		return time.Now().UTC(), true
+	}
+	t, err := parseAsOf(raw)
+	if err != nil {
+		writeErrJSON(w, r, http.StatusBadRequest,
+			"as_of must be an RFC3339 timestamp or a YYYY-MM-DD date", correlationID(r))
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// GetOwnershipGraph returns the group structure in force at as_of, optionally
+// limited to what root_entity_id owns or controls.
+func (h *Handler) GetOwnershipGraph(w http.ResponseWriter, r *http.Request) {
+	asOf, ok := asOfParam(w, r)
+	if !ok {
+		return
+	}
+	view, err := h.svc.GetOwnershipGraph(r.Context(), asOf, strings.TrimSpace(r.URL.Query().Get("root_entity_id")))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// GetGroupAsOf returns the corporate group an entity belonged to at as_of.
+func (h *Handler) GetGroupAsOf(w http.ResponseWriter, r *http.Request) {
+	asOf, ok := asOfParam(w, r)
+	if !ok {
+		return
+	}
+	view, err := h.svc.GetGroupAsOf(r.Context(), chi.URLParam(r, "entityID"), asOf)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// ListEntityParents returns an entity's direct owners and controllers at as_of.
+func (h *Handler) ListEntityParents(w http.ResponseWriter, r *http.Request) {
+	asOf, ok := asOfParam(w, r)
+	if !ok {
+		return
+	}
+	out, err := h.svc.ListEntityParents(r.Context(), chi.URLParam(r, "entityID"), asOf)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ExplainControlChain explains who owns and controls an entity at as_of.
+func (h *Handler) ExplainControlChain(w http.ResponseWriter, r *http.Request) {
+	asOf, ok := asOfParam(w, r)
+	if !ok {
+		return
+	}
+	view, err := h.svc.ExplainControlChain(r.Context(), chi.URLParam(r, "entityID"), asOf)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }

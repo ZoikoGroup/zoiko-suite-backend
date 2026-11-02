@@ -357,4 +357,7 @@ type OwnershipStore interface {
 	// ErrInvalidInput (a date outside the relationship's own interval).
 	EndOwnershipRelationship(ctx context.Context, relationshipID string, expectedVersion int64,
 		endDate time.Time, endedBy, reason, evidenceRef, correlationID string) (*domain.OwnershipRelationship, error)
+	// ListOwnershipInForceAt returns the relationships part of the group
+	// structure at asOf (see the store for what counts).
+	ListOwnershipInForceAt(ctx context.Context, asOf time.Time) ([]domain.OwnershipRelationship, error)
 }

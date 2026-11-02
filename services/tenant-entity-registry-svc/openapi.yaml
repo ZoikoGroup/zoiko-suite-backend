@@ -1669,6 +1669,124 @@ paths:
         "409": { description: "Stale expected_version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "422": { description: "The relationship is not ACTIVE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
+  # ── ORG-04 read surfaces ────────────────────────────────────────────────────
+  #
+  # as_of is BUSINESS time. The structure on a past date is rebuilt from each
+  # relationship's own valid interval, so a relationship since superseded or
+  # ended still appears on the dates it applied. Needs ENTITY_OWNERSHIP_VIEW;
+  # beneficial_notes are returned only to a caller who also holds
+  # ENTITY_OWNERSHIP_VIEW_SENSITIVE, and are otherwise omitted.
+
+  /v1/ownership-graph:
+    get:
+      operationId: getOwnershipGraph
+      summary: ORG-04 GetOwnershipGraph, the group structure at a business instant
+      description: |
+        Every relationship in force at as_of, ordered deterministically. With
+        root_entity_id, only what that entity owns or controls, directly or
+        through others.
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AsOf"
+        - name: root_entity_id
+          in: query
+          required: false
+          description: Limit the graph to this entity and everything below it.
+          schema: { type: string }
+        - $ref: "#/components/parameters/CorrelationID"
+      responses:
+        "200":
+          description: The graph
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipGraph"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entities/{entityID}/group:
+    get:
+      operationId: getGroupAsOf
+      summary: ORG-04 GetGroupAsOf, the corporate group an entity belonged to
+      description: |
+        Every entity connected to this one through relationships in force at
+        as_of, and the entities at the top of the group. An entity with no
+        relationships is a group of one, its own ultimate parent.
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/AsOf"
+        - $ref: "#/components/parameters/CorrelationID"
+      responses:
+        "200":
+          description: The group
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipGroup"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entities/{entityID}/parents:
+    get:
+      operationId: listEntityParents
+      summary: ORG-04 ListEntityParents, an entity's direct owners and controllers
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/AsOf"
+        - $ref: "#/components/parameters/CorrelationID"
+      responses:
+        "200":
+          description: The direct parents at as_of
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityParents"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entities/{entityID}/control-chain:
+    get:
+      operationId: explainControlChain
+      summary: ORG-04 ExplainControlChain, who owns and controls an entity and why
+      description: |
+        Every path from an ultimate parent down to the entity through the
+        relationships in force at as_of, with each link's evidence.
+
+        effective_ownership_pct multiplies the equity along a path and sums the
+        paths from one ultimate parent (capped at 100). A path that crosses a
+        CONTROL link carries no equity, so its figure is null. A link controls
+        when it is a CONTROL relationship or holds a majority of the votes
+        (voting_pct, or ownership_pct where no voting figure is recorded); a
+        path controls only when every link on it does.
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/AsOf"
+        - $ref: "#/components/parameters/CorrelationID"
+      responses:
+        "200":
+          description: The control chains
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ControlChain"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   # ── Workspaces ─────────────────────────────────────────────────────────────
   #
   # These five routes have existed since migration 000005 and were absent from
@@ -1839,6 +1957,12 @@ components:
         Verified by the Authorization Service on every material action.
 
   parameters:
+    AsOf:
+      name: as_of
+      in: query
+      required: false
+      description: Business time, an RFC3339 timestamp or a YYYY-MM-DD date (read as midnight UTC). Defaults to now.
+      schema: { type: string }
     RelationshipID:
       name: relationshipID
       in: path
@@ -2437,6 +2561,72 @@ components:
         evidence_ref:     { type: string }
         reason:           { type: string }
         correlation_id:   { type: string }
+
+    OwnershipGraph:
+      type: object
+      required: [as_of, entities, relationships]
+      properties:
+        as_of:                  { type: string, format: date-time }
+        root_legal_entity_id:   { type: string }
+        entities:               { type: array, items: { type: string } }
+        relationships:          { type: array, items: { $ref: "#/components/schemas/OwnershipRelationship" } }
+
+    OwnershipGroup:
+      type: object
+      required: [as_of, legal_entity_id, ultimate_parents, members, relationships]
+      properties:
+        as_of:             { type: string, format: date-time }
+        legal_entity_id:   { type: string }
+        ultimate_parents:  { type: array, items: { type: string } }
+        members:           { type: array, items: { type: string } }
+        relationships:     { type: array, items: { $ref: "#/components/schemas/OwnershipRelationship" } }
+
+    EntityParents:
+      type: object
+      required: [as_of, legal_entity_id, parents]
+      properties:
+        as_of:            { type: string, format: date-time }
+        legal_entity_id:  { type: string }
+        parents:          { type: array, items: { $ref: "#/components/schemas/OwnershipRelationship" } }
+
+    ChainLink:
+      type: object
+      required: [relationship_id, parent_legal_entity_id, child_legal_entity_id, relationship_kind, controlling, evidence_ref]
+      properties:
+        relationship_id:         { type: string, format: uuid }
+        parent_legal_entity_id:  { type: string }
+        child_legal_entity_id:   { type: string }
+        relationship_kind:       { type: string, enum: [OWNERSHIP, CONTROL] }
+        ownership_pct:           { type: number }
+        voting_pct:              { type: number }
+        control_type:            { type: string, enum: [VOTING, BOARD, CONTRACTUAL, OTHER] }
+        controlling:             { type: boolean }
+        evidence_ref:            { type: string }
+
+    ControlPath:
+      type: object
+      required: [links, effective_ownership_pct, controls]
+      properties:
+        links:                   { type: array, items: { $ref: "#/components/schemas/ChainLink" }, description: "Top-down: from the ultimate parent to the entity." }
+        effective_ownership_pct: { type: number, nullable: true }
+        controls:                { type: boolean }
+
+    ControlChain:
+      type: object
+      required: [as_of, legal_entity_id, chains]
+      properties:
+        as_of:            { type: string, format: date-time }
+        legal_entity_id:  { type: string }
+        chains:
+          type: array
+          items:
+            type: object
+            required: [ultimate_parent_legal_entity_id, effective_ownership_pct, controls, paths]
+            properties:
+              ultimate_parent_legal_entity_id: { type: string }
+              effective_ownership_pct:         { type: number, maximum: 100 }
+              controls:                        { type: boolean }
+              paths:                           { type: array, items: { $ref: "#/components/schemas/ControlPath" } }
 
     OwnershipDecisionRequest:
       type: object

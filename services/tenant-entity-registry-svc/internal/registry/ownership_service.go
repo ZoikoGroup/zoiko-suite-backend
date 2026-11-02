@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/events"
 )
 
 // ProposeOwnershipRelationship files a PROPOSED ownership or control
@@ -38,6 +39,7 @@ func (s *Service) ProposeOwnershipRelationship(ctx context.Context, req domain.P
 	}
 
 	r := s.newOwnershipRow(ctx, req)
+	ctx = WithEvent(ctx, events.OwnershipRecord)
 	if err := s.store.CreateOwnershipRelationship(ctx, r); err != nil {
 		return nil, fmt.Errorf("store.CreateOwnershipRelationship: %w", err)
 	}
@@ -122,6 +124,7 @@ func (s *Service) decideOwnership(ctx context.Context, relationshipID string, re
 		}
 	}
 
+	ctx = WithEvent(ctx, events.OwnershipRecord)
 	out, err := s.store.DecideOwnershipRelationship(ctx, relationshipID, version, to, decider, req.DecisionNote, req.CorrelationID)
 	if err != nil {
 		if errors.Is(err, ErrSelfApproval) {
@@ -139,7 +142,22 @@ func (s *Service) GetOwnershipRelationship(ctx context.Context, relationshipID s
 		return nil, fmt.Errorf("store.GetOwnershipRelationship: %w", err)
 	}
 	if rel == nil {
+		// Evaluate at the caller's own scope so an unauthorized caller learns
+		// nothing about which ids exist.
+		if err := s.authorize(ctx, "entity.ownership", "view"); err != nil {
+			return nil, err
+		}
 		return nil, ErrNotFound
+	}
+	if err := s.authorizeEntities(ctx, "entity.ownership", "view", rel.ChildLegalEntityID, rel.ParentLegalEntityID); err != nil {
+		return nil, err
+	}
+	sensitive, err := s.canViewSensitive(ctx, rel.ChildLegalEntityID)
+	if err != nil {
+		return nil, err
+	}
+	if !sensitive {
+		rel.BeneficialNotes = nil
 	}
 	return rel, nil
 }
@@ -195,6 +213,7 @@ func (s *Service) SupersedeOwnershipRelationship(ctx context.Context, relationsh
 
 	r := s.newOwnershipRow(ctx, proposal)
 	r.SupersedesRelationshipID = &old.RelationshipID
+	ctx = WithEvent(ctx, events.OwnershipRecord)
 	if err := s.store.CreateOwnershipRelationship(ctx, r); err != nil {
 		return nil, fmt.Errorf("store.CreateOwnershipRelationship: %w", err)
 	}
@@ -229,10 +248,143 @@ func (s *Service) EndOwnershipRelationship(ctx context.Context, relationshipID s
 	if err != nil {
 		return nil, err
 	}
+	ctx = WithEvent(ctx, events.OwnershipRecord)
 	out, err := s.store.EndOwnershipRelationship(ctx, relationshipID, version, req.EndDate.UTC(),
 		domain.PrincipalFromContext(ctx), req.Reason, req.EvidenceRef, req.CorrelationID)
 	if err != nil {
 		return nil, fmt.Errorf("store.EndOwnershipRelationship: %w", err)
 	}
 	return out, nil
+}
+
+// ── ORG-04 read surfaces ────────────────────────────────────────────────────
+//
+// Reads need ENTITY_OWNERSHIP_VIEW. Beneficial and control notes need the
+// separate ENTITY_OWNERSHIP_VIEW_SENSITIVE (s4.4 "sensitive beneficial/control
+// information scoped"): a caller without it still gets the structure, with the
+// notes removed, rather than an error, so the graph stays usable for the many
+// callers who need the shape but not the people behind it.
+
+// canViewSensitive decides whether notes may be returned. entityID "" asks at
+// the tenant scope. A denial is not an error: it means "mask". An outage is an
+// error, because masking is a security decision and must fail closed.
+func (s *Service) canViewSensitive(ctx context.Context, entityID string) (bool, error) {
+	var err error
+	if entityID == "" {
+		err = s.authorize(ctx, "entity.ownership", "view_sensitive")
+	} else {
+		err = s.authorizeEntity(ctx, entityID, "entity.ownership", "view_sensitive")
+	}
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, ErrUnauthorized):
+		return false, nil
+	}
+	return false, err
+}
+
+// maskNotes removes beneficial notes from every relationship, in place.
+func maskNotes(rels []domain.OwnershipRelationship) {
+	for i := range rels {
+		rels[i].BeneficialNotes = nil
+	}
+}
+
+// asOfOrNow treats the zero time as "now".
+func asOfOrNow(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Now().UTC()
+	}
+	return t.UTC()
+}
+
+// readGraph loads the relationships in force at asOf, authorized at one entity
+// (or at the tenant when entityID is "").
+func (s *Service) readGraph(ctx context.Context, entityID string, asOf time.Time) ([]domain.OwnershipRelationship, bool, error) {
+	var err error
+	if entityID == "" {
+		err = s.authorize(ctx, "entity.ownership", "view")
+	} else {
+		err = s.authorizeEntity(ctx, entityID, "entity.ownership", "view")
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if entityID != "" {
+		if _, err := s.GetEntity(ctx, entityID); err != nil {
+			return nil, false, err
+		}
+	}
+	sensitive, err := s.canViewSensitive(ctx, entityID)
+	if err != nil {
+		return nil, false, err
+	}
+	rels, err := s.store.ListOwnershipInForceAt(ctx, asOf)
+	if err != nil {
+		return nil, false, fmt.Errorf("store.ListOwnershipInForceAt: %w", err)
+	}
+	return rels, sensitive, nil
+}
+
+// GetOwnershipGraph returns the group structure in force at asOf (now when
+// zero), optionally limited to what root owns or controls.
+func (s *Service) GetOwnershipGraph(ctx context.Context, asOf time.Time, root string) (*domain.OwnershipGraphView, error) {
+	asOf = asOfOrNow(asOf)
+	rels, sensitive, err := s.readGraph(ctx, root, asOf)
+	if err != nil {
+		return nil, err
+	}
+	view := domain.GraphAsOf(rels, asOf, root)
+	if !sensitive {
+		maskNotes(view.Relationships)
+	}
+	return &view, nil
+}
+
+// GetGroupAsOf returns the corporate group the entity belonged to at asOf.
+func (s *Service) GetGroupAsOf(ctx context.Context, legalEntityID string, asOf time.Time) (*domain.GroupView, error) {
+	asOf = asOfOrNow(asOf)
+	rels, sensitive, err := s.readGraph(ctx, legalEntityID, asOf)
+	if err != nil {
+		return nil, err
+	}
+	view := domain.GroupAsOf(rels, asOf, legalEntityID)
+	if !sensitive {
+		maskNotes(view.Relationships)
+	}
+	return &view, nil
+}
+
+// EntityParents is the answer to ListEntityParents.
+type EntityParents struct {
+	AsOf          time.Time                      `json:"as_of"`
+	LegalEntityID string                         `json:"legal_entity_id"`
+	Parents       []domain.OwnershipRelationship `json:"parents"`
+}
+
+// ListEntityParents returns the entity's direct owners and controllers at asOf.
+func (s *Service) ListEntityParents(ctx context.Context, legalEntityID string, asOf time.Time) (*EntityParents, error) {
+	asOf = asOfOrNow(asOf)
+	rels, sensitive, err := s.readGraph(ctx, legalEntityID, asOf)
+	if err != nil {
+		return nil, err
+	}
+	out := &EntityParents{AsOf: asOf, LegalEntityID: legalEntityID, Parents: domain.ParentsAsOf(rels, asOf, legalEntityID)}
+	if !sensitive {
+		maskNotes(out.Parents)
+	}
+	return out, nil
+}
+
+// ExplainControlChain explains who owns and controls the entity at asOf, with
+// every path, its effective ownership and whether it amounts to control.
+func (s *Service) ExplainControlChain(ctx context.Context, legalEntityID string, asOf time.Time) (*domain.ControlChainView, error) {
+	asOf = asOfOrNow(asOf)
+	rels, _, err := s.readGraph(ctx, legalEntityID, asOf)
+	if err != nil {
+		return nil, err
+	}
+	view := domain.ExplainControlChain(rels, asOf, legalEntityID)
+	return &view, nil
 }

@@ -368,3 +368,13 @@ func TestOwnership_EndRefusals(t *testing.T) {
 		require.ErrorIs(t, err, registry.ErrInvalidTransition)
 	})
 }
+
+func (m *memStore) ListOwnershipInForceAt(_ context.Context, asOf time.Time) ([]domain.OwnershipRelationship, error) {
+	var out []domain.OwnershipRelationship
+	for _, r := range m.ownership {
+		if domain.InForceAt(*r, asOf) {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}

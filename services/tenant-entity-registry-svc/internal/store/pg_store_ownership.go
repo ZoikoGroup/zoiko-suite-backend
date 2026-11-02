@@ -258,18 +258,22 @@ func (s *PgStore) DecideOwnershipRelationship(ctx context.Context, relationshipI
 		}
 
 		if status == domain.OwnershipActive && exclude != "" {
-			tag, err := tx.Exec(ctx, `
+			retired, err := scanOwnership(tx.QueryRow(ctx, `
 				UPDATE ownership_relationships
 				   SET status = 'SUPERSEDED',
 				       valid_to = CASE WHEN valid_to IS NULL OR valid_to > $1 THEN $1 ELSE valid_to END,
 				       record_version = record_version + 1
-				 WHERE relationship_id = $2 AND tenant_id = $3 AND status = 'ACTIVE'`,
-				r.ValidFrom, exclude, tid)
+				 WHERE relationship_id = $2 AND tenant_id = $3 AND status = 'ACTIVE'
+				RETURNING `+ownershipColumns,
+				r.ValidFrom, exclude, tid))
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("%w: the relationship being superseded is no longer ACTIVE", registry.ErrStateConflict)
+			}
 			if err != nil {
 				return err
 			}
-			if tag.RowsAffected() != 1 {
-				return fmt.Errorf("%w: the relationship being superseded is no longer ACTIVE", registry.ErrStateConflict)
+			if err := s.enqueueFor(ctx, tx, domain.OwnershipSupersession{Previous: retired, Replacement: r}); err != nil {
+				return err
 			}
 		}
 		out = r
@@ -320,6 +324,36 @@ func (s *PgStore) EndOwnershipRelationship(ctx context.Context, relationshipID s
 		}
 		out = r
 		return s.enqueueFor(ctx, tx, r)
+	})
+	return out, err
+}
+
+// ListOwnershipInForceAt returns the tenant's relationships that were part of
+// the group structure at asOf: approved (ACTIVE) or since SUPERSEDED or ENDED,
+// with valid_from <= asOf < valid_to. A superseded or ended row keeps the date
+// it stopped, so a past date sees it as it was then.
+func (s *PgStore) ListOwnershipInForceAt(ctx context.Context, asOf time.Time) ([]domain.OwnershipRelationship, error) {
+	s.log.Debug("store.ListOwnershipInForceAt", zap.Time("as_of", asOf))
+	tid := domain.TenantFromContext(ctx)
+
+	var out []domain.OwnershipRelationship
+	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+ownershipColumns+` FROM ownership_relationships
+			 WHERE tenant_id = $1 AND status IN ('ACTIVE', 'SUPERSEDED', 'ENDED')
+			   AND valid_from <= $2 AND (valid_to IS NULL OR valid_to > $2)`, tid, asOf)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, err := scanOwnership(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *r)
+		}
+		return rows.Err()
 	})
 	return out, err
 }

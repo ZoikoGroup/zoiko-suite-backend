@@ -335,6 +335,10 @@ func allRoutes() []route {
 		{"reject ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/rejection", `{"expected_version":1}`, http.StatusOK, relID},
 		{"supersede ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/supersession", `{"expected_version":2}`, http.StatusCreated, relID},
 		{"end ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/end", `{"expected_version":2}`, http.StatusOK, relID},
+		{"ownership graph", http.MethodGet, "/v1/ownership-graph?as_of=2026-03-31", "", http.StatusOK, ""},
+		{"entity group as-of", http.MethodGet, "/v1/entities/" + entityID + "/group?as_of=2026-03-31", "", http.StatusOK, entityID},
+		{"list entity parents", http.MethodGet, "/v1/entities/" + entityID + "/parents", "", http.StatusOK, entityID},
+		{"explain control chain", http.MethodGet, "/v1/entities/" + entityID + "/control-chain?as_of=2026-03-31", "", http.StatusOK, entityID},
 	}
 }
 

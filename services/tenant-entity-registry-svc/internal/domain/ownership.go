@@ -219,3 +219,12 @@ func (r SupersedeOwnershipRequest) AsProposal(old OwnershipRelationship) Propose
 		EvidenceRef: r.EvidenceRef, Reason: r.Reason, CorrelationID: r.CorrelationID,
 	}
 }
+
+// OwnershipSupersession is the result of approving a supersession as seen by the
+// relationship it retired: the original (now SUPERSEDED) and what replaced it.
+// The store hands it to the event builder so the retired relationship gets its
+// own event, attributed to the replacement's approver.
+type OwnershipSupersession struct {
+	Previous    *OwnershipRelationship
+	Replacement *OwnershipRelationship
+}
