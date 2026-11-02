@@ -154,8 +154,16 @@ const LifecycleSourceService = "identity-context-svc"
 var (
 	// principalStatusEvents is the projecting group.
 	principalStatusEvents = map[string]bool{
+		// The legacy name, kept so events still on the topic from before the
+		// rename are projected when replayed.
 		"principal.status.changed": true,
-		EventEmploymentChanged:     true,
+		// identity-context-svc's ZS-IAM-001 names, same payload (principal_id,
+		// tenant_id, new_status): SUSPENDED / DISABLED as .disabled, ACTIVE as
+		// .enabled. It stopped emitting principal.status.changed on 15 Oct
+		// 2026, and until these were listed no suspension reached layer 0.
+		"identity.subject.disabled": true,
+		"identity.subject.enabled":  true,
+		EventEmploymentChanged:      true,
 	}
 
 	// grantGraphEvents is the invalidating group: every event that changes
