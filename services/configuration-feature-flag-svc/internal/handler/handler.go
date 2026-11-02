@@ -775,6 +775,21 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 // distinguish it from load.
 const maxRequestBytes = 256 << 10 // 256 KiB
 
+// writeJSONWithETag writes a JSON response with an ETag header based on the
+// provided record version. Per API-3 (ZS-SVC-AA-001 §9), every GET on a
+// mutable aggregate returns ETag, and every mutation requires If-Match.
+func writeJSONWithETag(w http.ResponseWriter, status int, v any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, v)
+}
+
+// requireIfMatch checks the If-Match header against the current version.
+// Returns true if the request should proceed, false if it was rejected
+// (428 Precondition Required or 412 Precondition Failed already written).
+func requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
+}
+
 // decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
 // the cap is what stopped it: "too large" and "malformed" are different faults
 // and a caller can only act on the difference.
@@ -782,36 +797,6 @@ const maxRequestBytes = 256 << 10 // 256 KiB
 // The writes vec may be nil: the AA-001 routes count refusals on the two-label
 // GovernedWrites series only from the point the action is known, so an
 // invalid-JSON refusal before classification is not counted there.
-// writeJSONWithETag writes a JSON response with an ETag header based on the
-// provided record version. Per API-3 (ZS-SVC-AA-001 §9), every GET on a
-// mutable aggregate returns ETag, and every mutation requires If-Match.
-
-	apicontract.WriteETag(w, version)
-	writeJSON(w, status, v)
-}
-
-// requireIfMatch checks the If-Match header against the current version.
-// Returns true if the request should proceed, false if it was rejected
-// (428 Precondition Required or 412 Precondition Failed already written).
-
-	return apicontract.CheckIfMatch(w, r, currentVersion)
-}
-
-// writeJSONWithETag writes a JSON response with an ETag header based on the
-// provided record version. Per API-3 (ZS-SVC-AA-001 §9), every GET on a
-// mutable aggregate returns ETag, and every mutation requires If-Match.
-
-	apicontract.WriteETag(w, version)
-	writeJSON(w, status, v)
-}
-
-// requireIfMatch checks the If-Match header against the current version.
-// Returns true if the request should proceed, false if it was rejected
-// (428 Precondition Required or 412 Precondition Failed already written).
-
-	return apicontract.CheckIfMatch(w, r, currentVersion)
-}
-
 func (h *Handler) decodeJSON(w http.ResponseWriter, r *http.Request, dst any, writes *prometheus.CounterVec) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
@@ -1147,6 +1132,97 @@ func (h *Handler) FindConfigDefinition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, def)
+}
+
+// ── GET /v1/config/changes/{change_id} ──────────────────────────────────────
+
+// GetChange returns a governed change with its ETag, which the caller sends
+// back as If-Match on activate (API-3). Authorized like the commands it
+// precedes: by the change's own scope, so a tenant writer cannot read a
+// global change's version and a foreign tenant's change answers 403.
+//
+// Response:
+//
+//	200 → the change, ETag = record_version
+//	404 → change_not_found
+//	403 → tenant_scope_mismatch / authorization_denied
+//	503 → store or authz unavailable
+func (h *Handler) GetChange(w http.ResponseWriter, r *http.Request) {
+	changeID := chi.URLParam(r, "change_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.authorizeTarget(w, r, principalID, tenantScope, "change", changeID); !ok {
+		return
+	}
+
+	change, err := h.store.GetChange(r.Context(), changeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrChangeNotFound) {
+			writeError(w, r, http.StatusNotFound, "change_not_found", changeID)
+			return
+		}
+		h.log.Error("GetChange: store unavailable",
+			zap.String("change_id", changeID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSONWithETag(w, http.StatusOK, change, change.RecordVersion)
+}
+
+// ── GET /v1/emergency-changes/{emergency_change_id} ──────────────────────────
+
+// GetEmergencyChange returns an emergency change with its ETag, sent back as
+// If-Match on activate (API-3). Authorized by the emergency change's scope, as
+// GetChange is.
+//
+// Response:
+//
+//	200 → the emergency change, ETag = record_version
+//	404 → change_not_found
+//	403 → tenant_scope_mismatch / authorization_denied
+//	503 → store or authz unavailable
+func (h *Handler) GetEmergencyChange(w http.ResponseWriter, r *http.Request) {
+	emergencyChangeID := chi.URLParam(r, "emergency_change_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.authorizeTarget(w, r, principalID, tenantScope, "emergency", emergencyChangeID); !ok {
+		return
+	}
+
+	ec, err := h.store.GetEmergencyChange(r.Context(), emergencyChangeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrChangeNotFound) {
+			writeError(w, r, http.StatusNotFound, "change_not_found", emergencyChangeID)
+			return
+		}
+		h.log.Error("GetEmergencyChange: store unavailable",
+			zap.String("emergency_change_id", emergencyChangeID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSONWithETag(w, http.StatusOK, ec, ec.RecordVersion)
 }
 
 // ── POST /v1/config/definitions/{key}/publish ────────────────────────────────
@@ -1741,13 +1817,19 @@ func (h *Handler) ActivateChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check If-Match for optimistic concurrency (API-3).
+	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "change", changeID)
+	if !ok {
+		return
+	}
+
+	// If-Match (API-3), checked only once the caller is authorized for this
+	// change, so an unauthorized caller learns nothing about its version.
 	change, err := h.store.GetChange(r.Context(), changeID)
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
 			writeError(w, r, http.StatusNotFound, "change_not_found", changeID)
 		} else {
-			h.log.Error("ApproveChange: store unavailable",
+			h.log.Error("ActivateChange: store unavailable",
 				zap.String("change_id", changeID),
 				zap.String("correlation_id", correlationID),
 				zap.Error(err))
@@ -1756,11 +1838,6 @@ func (h *Handler) ActivateChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !requireIfMatch(w, r, change.RecordVersion) {
-		return
-	}
-
-	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "change", changeID)
-	if !ok {
 		return
 	}
 
@@ -1911,7 +1988,12 @@ func (h *Handler) ActivateEmergencyChange(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check If-Match for optimistic concurrency (API-3).
+	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "emergency", emergencyChangeID)
+	if !ok {
+		return
+	}
+
+	// If-Match (API-3), after authorization, as in ActivateChange.
 	ec, err := h.store.GetEmergencyChange(r.Context(), emergencyChangeID)
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
@@ -1926,11 +2008,6 @@ func (h *Handler) ActivateEmergencyChange(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !requireIfMatch(w, r, ec.RecordVersion) {
-		return
-	}
-
-	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "emergency", emergencyChangeID)
-	if !ok {
 		return
 	}
 

@@ -2,10 +2,13 @@
 --
 -- Revert record_version additions for mutable aggregates.
 
-ALTER TABLE attestation_results
-    DROP CONSTRAINT IF EXISTS attest_res_version_positive;
-ALTER TABLE attestation_results
-    DROP COLUMN IF EXISTS record_version;
+DROP TRIGGER IF EXISTS flag_retirements_bump_version ON flag_retirements;
+DROP TRIGGER IF EXISTS release_plans_bump_version ON release_plans;
+DROP TRIGGER IF EXISTS kill_switches_bump_version ON kill_switches;
+DROP TRIGGER IF EXISTS emergency_changes_bump_version ON emergency_changes;
+DROP TRIGGER IF EXISTS config_changes_bump_version ON config_changes;
+DROP TRIGGER IF EXISTS config_definitions_bump_version ON config_definitions;
+DROP FUNCTION IF EXISTS bump_record_version();
 
 ALTER TABLE flag_retirements
     DROP CONSTRAINT IF EXISTS flag_ret_version_positive;

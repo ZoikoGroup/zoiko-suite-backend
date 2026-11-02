@@ -126,6 +126,26 @@ type stubStore struct {
 	gotRemoval store.MarkFlagRemovedParams
 	retirement *domain.FlagRetirement
 	retireErr  error
+
+	// API-3 reads. Unset = a change at record_version 1.
+	getChange       *domain.ConfigChange
+	getChangeErr    error
+	getEmergency    *domain.EmergencyChange
+	getEmergencyErr error
+}
+
+func (s *stubStore) GetChange(_ context.Context, changeID string) (*domain.ConfigChange, error) {
+	if s.getChange == nil && s.getChangeErr == nil {
+		return &domain.ConfigChange{ChangeID: changeID, RecordVersion: 1}, nil
+	}
+	return s.getChange, s.getChangeErr
+}
+
+func (s *stubStore) GetEmergencyChange(_ context.Context, emergencyChangeID string) (*domain.EmergencyChange, error) {
+	if s.getEmergency == nil && s.getEmergencyErr == nil {
+		return &domain.EmergencyChange{EmergencyChangeID: emergencyChangeID, RecordVersion: 1}, nil
+	}
+	return s.getEmergency, s.getEmergencyErr
 }
 
 func (s *stubStore) RetireFlag(_ context.Context, params domain.RetireFlagParams) (*domain.FlagRetirement, error) {
@@ -1254,10 +1274,88 @@ func TestActivateChange_RequiresApproval(t *testing.T) {
 	s := &stubStore{activateErr: domain.ErrChangeApprovalRequired}
 	r := newTestRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes/c-1/activate", strings.NewReader(`{}`)))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 change_approval_required, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// API-3: activating a change or an emergency change needs the version the
+// caller last read. Missing → 428, stale → 412 (nothing activated), current →
+// the activation runs.
+func TestActivate_IfMatch(t *testing.T) {
+	cases := []struct {
+		name      string
+		path      string
+		activated func(*stubStore) string
+	}{
+		{"change", "/v1/config/changes/c-1/activate", func(s *stubStore) string { return s.activateChangeID }},
+		{"emergency", "/v1/emergency-changes/e-1/activate", func(s *stubStore) string { return s.activateEmergencyID }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/missing", func(t *testing.T) {
+			s := &stubStore{}
+			w := httptest.NewRecorder()
+			newTestRouter(s).ServeHTTP(w, authed(httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{}`))))
+			if w.Code != http.StatusPreconditionRequired {
+				t.Fatalf("expected 428, got %d: %s", w.Code, w.Body.String())
+			}
+			if tc.activated(s) != "" {
+				t.Error("activated without If-Match")
+			}
+		})
+		t.Run(tc.name+"/stale", func(t *testing.T) {
+			s := &stubStore{
+				getChange:    &domain.ConfigChange{ChangeID: "c-1", RecordVersion: 3},
+				getEmergency: &domain.EmergencyChange{EmergencyChangeID: "e-1", RecordVersion: 3},
+			}
+			req := authed(httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{}`)))
+			req.Header.Set("If-Match", `"v2"`)
+			w := httptest.NewRecorder()
+			newTestRouter(s).ServeHTTP(w, req)
+			if w.Code != http.StatusPreconditionFailed {
+				t.Fatalf("expected 412, got %d: %s", w.Code, w.Body.String())
+			}
+			if tc.activated(s) != "" {
+				t.Error("activated on a stale version")
+			}
+		})
+		t.Run(tc.name+"/current", func(t *testing.T) {
+			s := &stubStore{
+				activatedChange:    &domain.ConfigChange{ChangeID: "c-1"},
+				activatedEmergency: &domain.EmergencyChange{EmergencyChangeID: "e-1"},
+			}
+			req := authed(httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{}`)))
+			req.Header.Set("If-Match", `"v1"`)
+			w := httptest.NewRecorder()
+			newTestRouter(s).ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			if tc.activated(s) == "" {
+				t.Error("the activation never reached the store")
+			}
+		})
+	}
+}
+
+// The GETs a caller reads before activating return the version as an ETag.
+func TestGetChange_ReturnsETag(t *testing.T) {
+	for _, path := range []string{"/v1/config/changes/c-1", "/v1/emergency-changes/e-1"} {
+		s := &stubStore{
+			getChange:    &domain.ConfigChange{ChangeID: "c-1", RecordVersion: 4},
+			getEmergency: &domain.EmergencyChange{EmergencyChangeID: "e-1", RecordVersion: 4},
+		}
+		w := httptest.NewRecorder()
+		newTestRouter(s).ServeHTTP(w, authed(httptest.NewRequest(http.MethodGet, path, nil)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d: %s", path, w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("ETag"); got != `"v4"` {
+			t.Errorf("%s: ETag = %q, want \"v4\"", path, got)
+		}
 	}
 }
 
