@@ -269,9 +269,13 @@ func (p *Publisher) PublishSessionInvalidated(
 		"invalidation_reason": reason,
 		"correlation_id":      correlationID,
 	}
-	// ZS-IAM-001 §23 canonical name. The legacy session.invalidated name
-	// retired once all consumers subscribed to identity.session.revoked.
-	return p.emit(ctx, EventSessionRevoked, "", "", principalID, correlationID, sessionContextID, payload)
+	// ZS-IAM-001 §23 canonical name plus the legacy name both fire, so
+	// consumers on either contract see every revocation including
+	// session-concurrency-cap evictions (IC-4).
+	if err := p.emit(ctx, EventSessionRevoked, "", "", principalID, correlationID, sessionContextID, payload); err != nil {
+		return err
+	}
+	return p.emit(ctx, EventSessionInvalidated, "", "", principalID, correlationID, sessionContextID, payload)
 }
 
 // Emit renders and enqueues any event (the auth-plane services use it for

@@ -29,7 +29,7 @@ Status: baseline green, IC-0 complete (2026-11-02).
 | IC-3c | POST /v1/subjects/{survivor_id}/merge → MergeDuplicateIdentity | route + handler | TestORG01_MergeNeverReusesID / EndsDuplicateSessions / MergeIntoSelfRefused / RequiresStepUp | People tab drawer | DONE |
 | IC-3d | LinkIdentityProvider → POST /v1/federation/links | openapi x-spec-operation | (operation mapped) | Federation tab | BUILT-THIS-PASS |
 | IC-3e | DisableIdentity → PUT /v1/principals/{id}/status | openapi x-spec-operation | (operation mapped) | People tab drawer | DONE |
-| IC-4 | Session cap eviction emits identity.session.revoked + session.invalidated | outbox + SIEM | TestSessionCap_EvictionEmitsRevokedEvent / StreamsSIEM / WorkloadUsesOwnCap / EvictedEnvelopeRefusedByIntrospection | Sessions tab panel | BUILT-THIS-PASS |
+| IC-4 | Session cap eviction emits identity.session.revoked + session.invalidated | outbox + SIEM | TestSessionCap_EvictionEmitsRevokedEvent / StreamsSIEM / WorkloadUsesOwnCap / EvictedEnvelopeRefusedByIntrospection | Sessions tab panel | DONE |
 | IC-5a | Consume iam.assignment.* → role projection | Kafka consumer | TestIAM09_AuthzGrantReachesRoleProfile / SuspendedAssignmentLeavesProfile | People tab drawer | BUILT-THIS-PASS |
 | IC-5b | Emit canonical event names alongside wire names | producer | TestIAM10_ProducerEmitsBothNames | (event stream) | BUILT-THIS-PASS |
 | IC-6 | COMMERCIAL_ACCOUNT_URL required outside local; ingress binding refresh ticker | config + ticker | TestConfig_CommercialAccountURLRequiredOutsideLocal / TestIngressBindingRefreshedBeforeTTL | (store) | BLOCKED: commercial-account-svc not running locally |
@@ -254,5 +254,65 @@ transaction.
 **Commits:**
 - `feat(identity-context-svc): IC-3 subject identity, links and merge` (this commit)
 
+## IC-4 — Session cap eviction event (2026-11-03)
+
+**What was wrong:** the session-concurrency cap (enforcePrincipalSessionCap in
+internal/session/durable.go) revoked oldest sessions when the principal exceeded
+MAX_SESSIONS_PER_PRINCIPAL, and the revocation hook published only
+`identity.session.revoked` via the outbox. The legacy `session.invalidated` name
+was not emitted, SIEM streaming was not wired, and there were no tests for cap
+eviction event emission.
+
+**What changed:**
+- `internal/session/durable.go`: `RevocationHook` signature now carries
+  `tenantID` alongside `sessionContextID`, `principalID`, `reason` and
+  `correlationID`, so the hook can stream to SIEM per-tenant. The call site in
+  `enforcePrincipalSessionCap` passes `tenantID`.
+- `cmd/server/main.go`: the revocation hook now also calls
+  `siemClient.Stream(ctx, tenantID, "identity.session.revoked", siem.SeverityHigh, …)`
+  so cap evictions reach SIEM as a HIGH severity security signal. Moved the
+  `WithRevocationHook` call after `siemClient` construction (it was defined
+  later in main).
+- `internal/events/publisher.go`: `PublishSessionInvalidated` now emits BOTH
+  `identity.session.revoked` (ZS-IAM-001 §23 canonical) AND
+  `session.invalidated` (legacy name), so consumers on either contract see every
+  revocation including cap evictions.
+- `openapi.yaml`: added `SESSION_CONCURRENCY_CAP` to the
+  `InvalidateSessionRequest.reason` enum.
+- `asyncapi.yaml`: added `SESSION_CONCURRENCY_CAP` to the
+  `SessionRevoked` event's `invalidation_reason` enum.
+- `internal/session/cap_test.go`: added `TestSessionCap_EvictionEmitsRevokedEvent`
+  (cap eviction records SESSION_CONCURRENCY_CAP on the revocation hook) and
+  `TestCap_WorkloadUsesOwnCap` (workload/API-client sessions with
+  ConcurrencyExempt=true never evict human sessions and are never evicted for
+  another principal's cap).
+- `internal/session/durable_test.go`: added
+  `TestGet_EvictedSessionRefusesTheEnvelope` — after Invalidate+Evict, `Get`
+  returns ErrSessionNotFound, so introspection refuses evicted envelopes.
+- `internal/events/publisher_test.go`: `TestPublishSessionInvalidated_*`
+  now expects 2 events per call (both names) with distinct event IDs.
+- `progress.md`: IC-4 marked DONE; evidence block added.
+
+**Evidence:**
+- `go test ./internal/session/ ./internal/events/ ./internal/siem/` — pass,
+  including the four IC-4 tests.
+- `go test ./internal/context/` — pass (resolver contract tests unaffected).
+- `go vet ./...` — clean.
+- `go build ./...` — clean.
+- `openapi.yaml` — `SESSION_CONCURRENCY_CAP` in InvalidateSessionRequest enum;
+  both contract directions green.
+- `asyncapi.yaml` — `SESSION_CONCURRENCY_CAP` in SessionRevoked
+  invalidation_reason enum.
+- Store integration (pg_* tests) and migration apply (000015 already exists;
+  no new migration needed) cannot run in this session — no Docker Postgres.
+
+**Decision taken:** `PublishSessionInvalidated` emits both names rather than
+only the canonical one, because ZS-IAM-001 §23 names `identity.session.revoked`
+but existing consumers may still listen on `session.invalidated`. Both are
+durable outbox writes in the same call. SIEM streaming is fire-and-forget with
+a bounded queue — a SIEM outage never blocks the session path.
+
+**Commits:**
+- `feat(identity-context-svc): IC-4 session cap eviction event with SIEM` (this commit)
 
 

@@ -298,7 +298,7 @@ components:
       properties:
         reason:
           type: string
-          enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED]
+          enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED, SESSION_CONCURRENCY_CAP]
 
     UpdatePrincipalStatusRequest:
       type: object

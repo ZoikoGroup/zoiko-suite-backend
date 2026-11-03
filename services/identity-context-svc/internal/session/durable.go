@@ -87,7 +87,7 @@ type DurableCache struct {
 // RevocationHook is told about every session the concurrency cap ends, so the
 // revocation leaves the service as identity.session.revoked like any other
 // (it used to be recorded on the row and nowhere else).
-type RevocationHook func(ctx context.Context, sessionContextID, principalID string, reason domain.InvalidationReason, correlationID string)
+type RevocationHook func(ctx context.Context, sessionContextID, principalID, tenantID string, reason domain.InvalidationReason, correlationID string)
 
 // NewDurableCache wraps a Redis cache with a durable evidence store.
 func NewDurableCache(cache HotCache, store ContextStore, log *zap.Logger, maxSessionsPerPrincipal int) *DurableCache {
@@ -255,7 +255,7 @@ func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, sc domain
 			firstErr = err
 		}
 		if d.onRevoke != nil {
-			d.onRevoke(ctx, id, principalID, domain.InvalidationReasonSessionConcurrencyCap, sc.CorrelationID)
+			d.onRevoke(ctx, id, principalID, tenantID, domain.InvalidationReasonSessionConcurrencyCap, sc.CorrelationID)
 		}
 		revoked++
 	}

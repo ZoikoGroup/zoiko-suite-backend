@@ -33,7 +33,7 @@ func capFixture(max int, existing ...string) (*fakeStore, *session.DurableCache,
 	}
 	var got []revocation
 	dc := session.NewDurableCache(hot, store, zap.NewNop(), max).
-		WithRevocationHook(func(_ context.Context, id, principalID string, reason domain.InvalidationReason, corr string) {
+		WithRevocationHook(func(_ context.Context, id, principalID, _ string, reason domain.InvalidationReason, corr string) {
 			got = append(got, revocation{id, reason, corr})
 		})
 	return store, dc, &got
@@ -55,6 +55,20 @@ func TestCap_RevokesTheOldestAndAnnouncesIt(t *testing.T) {
 	assert.Equal(t, []string{"01A"}, store.invalidated, "only the oldest goes; two remain")
 	require.Len(t, *got, 1)
 	assert.Equal(t, revocation{"01A", domain.InvalidationReasonSessionConcurrencyCap, "corr-new"}, (*got)[0])
+}
+
+// TestSessionCap_EvictionEmitsRevokedEvent pins that every cap eviction hands
+// the revoked session to the revocation hook with SESSION_CONCURRENCY_CAP as
+// the reason, so the hook can publish identity.session.revoked + session.invalidated.
+func TestSessionCap_EvictionEmitsRevokedEvent(t *testing.T) {
+	store, dc, got := capFixture(2, "01A", "01B")
+	issue(t, store, dc, "01C", false, "01A", "01B")
+
+	require.Len(t, *got, 1, "exactly one session evicted")
+	ev := (*got)[0]
+	assert.Equal(t, domain.InvalidationReasonSessionConcurrencyCap, ev.reason,
+		"the revocation hook must record the cap reason on the revoked session")
+	assert.Equal(t, "01A", ev.id, "the oldest live session goes first")
 }
 
 // The new session survives even when its id sorts first, as ULIDs minted by
@@ -79,4 +93,22 @@ func TestCap_MachinePrincipalsAreExempt(t *testing.T) {
 	issue(t, store, dc, "01D", true, "01A", "01B", "01C")
 	assert.Empty(t, store.invalidated)
 	assert.Empty(t, *got)
+}
+
+// TestCap_WorkloadUsesOwnCap pins that workload principals (API clients and
+// service accounts, ConcurrencyExempt=true) do not draw on the human session
+// cap: issuing a workload session never evicts the principal's live sessions,
+// and a workload session itself is never evicted for another principal's cap.
+func TestCap_WorkloadUsesOwnCap(t *testing.T) {
+	// A workload session over the human cap: no human session evicted.
+	store, dc, got := capFixture(2, "01A", "01B")
+	issue(t, store, dc, "01W", true, "01A", "01B")
+	assert.Empty(t, store.invalidated, "a workload session never evicts human sessions")
+	assert.Empty(t, *got, "no revocation hook call for a workload session")
+
+	// Two workload sessions under their own implicit cap: no revocation either.
+	store2, dc2, got2 := capFixture(10, "01W1", "01W2")
+	issue(t, store2, dc2, "01W3", true, "01W1", "01W2")
+	assert.Empty(t, store2.invalidated)
+	assert.Empty(t, *got2)
 }

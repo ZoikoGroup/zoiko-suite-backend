@@ -269,7 +269,7 @@ components:
                   principal_id: { type: string }
                   invalidation_reason:
                     type: string
-                    enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED]
+                    enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED, SESSION_CONCURRENCY_CAP]
                   correlation_id: { type: string }
 
     RiskSignalUnavailable:
