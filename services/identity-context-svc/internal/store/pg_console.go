@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -205,6 +206,68 @@ func (s *PgStore) ListSupportContextsPage(ctx context.Context, tenantID, state s
 	return out, err
 }
 
+// ResetListFilter narrows GET /v1/password-resets.
+type ResetListFilter struct {
+	Status      string
+	PrincipalID string
+}
+
+// resetStatusExpr is a reset request's status as the console shows it: a
+// request still awaiting approval, or issued and unused, past its expiry is
+// EXPIRED, whether or not anything has touched the row since.
+const resetStatusExpr = `CASE WHEN status IN ('PENDING_APPROVAL', 'ISSUED') AND expires_at <= NOW() THEN 'EXPIRED' ELSE status END`
+
+// ListPasswordResetsPage returns one page of a tenant's governed password
+// resets, newest first: the Password resets register.
+func (s *PgStore) ListPasswordResetsPage(ctx context.Context, tenantID string, f ResetListFilter, offset, limit int) ([]domain.PasswordResetRequest, error) {
+	where := []string{"tenant_id = $1"}
+	args := []any{tenantID}
+	if f.Status != "" {
+		switch f.Status {
+		case "PENDING_APPROVAL", "ISSUED", "REJECTED", "COMPLETED", "EXPIRED":
+		default:
+			return nil, fmt.Errorf("%w: reset status %q", ErrInvalidFilter, f.Status)
+		}
+		args = append(args, f.Status)
+		where = append(where, fmt.Sprintf("(%s) = $%d", resetStatusExpr, len(args)))
+	}
+	if f.PrincipalID != "" {
+		args = append(args, f.PrincipalID)
+		where = append(where, fmt.Sprintf("principal_id = $%d", len(args)))
+	}
+	args = append(args, offset, limit)
+	query := `SELECT request_id, tenant_id, principal_id, requested_by, reason, approvals_required,
+		       approvals, ` + resetStatusExpr + `, created_at, decided_at, expires_at
+		  FROM password_reset_requests WHERE ` + strings.Join(where, " AND ") +
+		fmt.Sprintf(` ORDER BY created_at DESC, request_id DESC OFFSET $%d LIMIT $%d`, len(args)-1, len(args))
+
+	out := []domain.PasswordResetRequest{}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r domain.PasswordResetRequest
+			var approvals []byte
+			if err := rows.Scan(&r.RequestID, &r.TenantID, &r.PrincipalID, &r.RequestedBy, &r.Reason, &r.ApprovalsRequired,
+				&approvals, &r.Status, &r.CreatedAt, &r.DecidedAt, &r.ExpiresAt); err != nil {
+				return err
+			}
+			if err := json.Unmarshal(approvals, &r.Approvals); err != nil {
+				return fmt.Errorf("reset %s approvals: %w", r.RequestID, err)
+			}
+			if r.Approvals == nil {
+				r.Approvals = []domain.ResetApproval{}
+			}
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // AuthEventFilter narrows GET /v1/authentication-events.
 type AuthEventFilter struct {
 	PrincipalID string
@@ -372,7 +435,7 @@ func (s *PgStore) GetIdentitySummary(ctx context.Context, tenantID string) (*Ide
 			     AND a.role_id ILIKE '%ADMIN%' AND NOT ` + hasSecondFactor, &out.AdminsWithoutMFA},
 			{`SELECT COUNT(*) FROM support_contexts WHERE tenant_id = $1 AND approval_status = 'PENDING_APPROVAL' AND revoked_at IS NULL`, &out.SupportPendingApproval},
 			{`SELECT COUNT(*) FROM support_contexts WHERE tenant_id = $1 AND approval_status = 'APPROVED' AND revoked_at IS NULL AND expires_at > NOW()`, &out.SupportActive},
-			{`SELECT COUNT(*) FROM password_reset_requests WHERE tenant_id = $1 AND status = 'PENDING_APPROVAL'`, &out.PasswordResetsPending},
+			{`SELECT COUNT(*) FROM password_reset_requests WHERE tenant_id = $1 AND status = 'PENDING_APPROVAL' AND expires_at > NOW()`, &out.PasswordResetsPending},
 			{`SELECT COUNT(*) FROM authentication_events WHERE tenant_id = $1 AND outcome = 'FAILURE' AND occurred_at > NOW() - INTERVAL '24 hours'`, &out.FailedSignIns24h},
 			{`SELECT COUNT(*) FROM authentication_events WHERE tenant_id = $1 AND event_type = 'LOGIN' AND outcome = 'SUCCESS' AND occurred_at > NOW() - INTERVAL '24 hours'`, &out.SuccessfulSignIns24h},
 			{`SELECT COUNT(*) FROM identity_merges WHERE tenant_id = $1`, &out.MergedIdentities},
@@ -493,8 +556,14 @@ func (s *PgStore) projectDecision(ctx context.Context, tx pgx.Tx,
 		}
 	case "MFA_STEP_UP":
 		eventType, level = "STEP_UP", "MFA"
+		if strings.HasPrefix(basis, "passkey") {
+			level = "PASSKEY"
+		}
 	case "MFA_LOGIN":
 		eventType, level = "MFA_CHALLENGE", "MFA"
+		if strings.HasPrefix(basis, "passkey") {
+			level = "PASSKEY"
+		}
 	case "MFA_ACTIVATE", "MFA_REVOKE", "MFA_RESET":
 		if outcome != "ALLOWED" {
 			return nil

@@ -647,6 +647,9 @@ const (
 const (
 	CredentialTypePassword = "PASSWORD"
 	CredentialTypeTOTP     = "TOTP"
+	// CredentialTypeWebAuthn is a passkey / security key (webauthn_credentials,
+	// AU-11). It is the factor_type its events carry.
+	CredentialTypeWebAuthn = "WEBAUTHN"
 )
 
 // CredentialStatusPending is a TOTP factor generated but not yet proven: it

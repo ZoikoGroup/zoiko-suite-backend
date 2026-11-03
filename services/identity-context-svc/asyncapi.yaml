@@ -475,11 +475,12 @@ components:
 
     MFAFactorEnrolled:
       name: identity.mfa_factor.enrolled
-      title: A TOTP factor was proven and is now active
+      title: A second factor (TOTP or passkey) was proven and is now active
       summary: |
         Written through the outbox in the transaction that activates the
-        factor (and retires any previous one). Payload: principal_id,
-        tenant_id, factor_id, factor_type, correlation_id. Never any secret.
+        factor (and, for TOTP, retires any previous one). Payload:
+        principal_id, tenant_id, factor_id, factor_type (TOTP or WEBAUTHN; a
+        passkey adds backup_eligible), correlation_id. Never any secret.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -487,10 +488,10 @@ components:
 
     MFAFactorRevoked:
       name: identity.mfa_factor.revoked
-      title: A principal revoked its own TOTP factor
+      title: A principal revoked one of its own factors
       summary: |
         Requires a recent step-up. Payload: principal_id, tenant_id, factor_id,
-        reason, actor, correlation_id.
+        reason, actor, correlation_id; a passkey adds factor_type WEBAUTHN.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -502,7 +503,9 @@ components:
       summary: |
         Credential recovery (ZS-IAM-001 §3). Payload: principal_id (the
         subject), tenant_id, reason_code, purpose, actor (the administrator),
-        correlation_id. Also streamed to SIEM at high severity.
+        correlation_id. One event for the TOTP factors and one (factor_type
+        WEBAUTHN, reason) for the passkeys when either is retired. Also
+        streamed to SIEM at high severity.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -512,9 +515,12 @@ components:
       name: identity.step_up.succeeded
       title: A session was stepped up with a second factor
       summary: |
-        Written with the accepted code. Payload: principal_id, tenant_id,
-        factor_id, session_context_id, amr, correlation_id. Doc 05 §13.2 names
-        MFA/step-up events a required SIEM signal.
+        Written with the accepted code, or with a passkey assertion's sign
+        counter. Payload: principal_id, tenant_id, factor_id,
+        session_context_id (TOTP step-up), amr (["pwd","otp"] or
+        ["pwd","hwk"]), correlation_id; a passkey adds factor_type WEBAUTHN and
+        context (login or step_up). Doc 05 §13.2 names MFA/step-up events a
+        required SIEM signal.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"

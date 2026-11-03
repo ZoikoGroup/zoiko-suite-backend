@@ -299,6 +299,8 @@ func (h *Handler) RequestReset(w http.ResponseWriter, r *http.Request) {
 
 type decideResetRequest struct {
 	Decision string `json:"decision"`
+	// Reason is recorded on the approval and in identity.password_reset.decided.
+	Reason string `json:"reason"`
 }
 
 // DecideReset records an approver's decision (APPROVE or REJECT). The
@@ -333,7 +335,7 @@ func (h *Handler) DecideReset(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rr, err := h.lifecycle.DecideReset(r.Context(), actor, resetID, req.Decision)
+	rr, err := h.lifecycle.DecideReset(r.Context(), actor, resetID, req.Decision, req.Reason)
 	if err != nil {
 		h.lifecycleError(w, r, err)
 		return

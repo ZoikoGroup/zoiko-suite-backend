@@ -17,6 +17,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/siem"
+	"zoiko.io/identity-context-svc/internal/webauthn"
 )
 
 // The TOTP second factor and step-up (ZS-IAM-001 §3, §13, §14).
@@ -130,6 +131,9 @@ type MFAService struct {
 	siem      *siem.Client
 	policy    MFAPolicy
 	now       func() time.Time
+	// passkeys is the WebAuthn factor; nil when no relying party is
+	// configured (see mfa_passkey.go).
+	passkeys PasskeyFactor
 
 	wg sync.WaitGroup
 }
@@ -224,7 +228,9 @@ func (s *MFAService) Enrol(ctx context.Context, c *MFACaller, correlationID stri
 		return nil, ErrMFASessionInvalid
 	}
 	var err error
-	has, err := s.store.HasActiveTOTP(ctx, c.Principal.PrincipalID, c.Principal.TenantID)
+	// Any factor, not only TOTP: beside a passkey, a stolen password alone
+	// must not be able to add the thief's authenticator app either.
+	has, err := s.hasAnyFactor(ctx, c)
 	if err != nil {
 		return nil, fmt.Errorf("%w: factor lookup: %v", ErrAuthUnavailable, err)
 	}
@@ -364,7 +370,12 @@ func (s *MFAService) StepUp(ctx context.Context, c *MFACaller, code, correlation
 	if err := s.verifyCode(ctx, c, f, code, ActionMFAStepUp, false, correlationID, rec); err != nil {
 		return nil, err
 	}
+	return s.issueStepUp(c, amr, correlationID)
+}
 
+// issueStepUp mints the stepped-up login token for c once a second factor
+// (TOTP or passkey, named by amr) has verified.
+func (s *MFAService) issueStepUp(c *MFACaller, amr []string, correlationID string) (*domain.AuthenticateResponse, error) {
 	authTime := s.now()
 	// The step-up keeps the login session (sid) and the DPoP binding: it is
 	// a stronger assurance for the SAME session, so logging out still ends
@@ -452,7 +463,11 @@ func (s *MFAService) List(ctx context.Context, c *MFACaller) ([]domain.MFAFactor
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrAuthUnavailable, err)
 	}
-	return out, nil
+	pk, err := s.passkeyFactors(ctx, c)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAuthUnavailable, err)
+	}
+	return append(out, pk...), nil
 }
 
 // Revoke retires one of the caller's own factors. It needs a recent step-up:
@@ -536,12 +551,21 @@ func (s *MFAService) ResetFactors(ctx context.Context, admin *MFACaller, subject
 	if err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrAuthUnavailable, err)
 	}
-	if n > 0 {
-		s.siem.Stream(ctx, tenantID, "identity.mfa_factor.reset", siem.SeverityHigh,
-			fmt.Sprintf("Administrator %s reset %d TOTP factor(s) of principal %s (%s)",
-				admin.Principal.PrincipalID, n, subjectPrincipalID, reasonCode))
+	// A lost device may be the passkey: a reset that left it would leave the
+	// account's strongest factor with whoever holds the device.
+	var keys int
+	if s.passkeys != nil {
+		if keys, err = s.passkeys.Retire(ctx, tenantID, subjectPrincipalID, "", reason,
+			admin.Principal.PrincipalID, webauthn.ActionReset, correlationID); err != nil {
+			return n, fmt.Errorf("%w: retire passkeys: %v", ErrAuthUnavailable, err)
+		}
 	}
-	return n, nil
+	if n+keys > 0 {
+		s.siem.Stream(ctx, tenantID, "identity.mfa_factor.reset", siem.SeverityHigh,
+			fmt.Sprintf("Administrator %s reset %d TOTP factor(s) and %d passkey(s) of principal %s (%s)",
+				admin.Principal.PrincipalID, n, keys, subjectPrincipalID, reasonCode))
+	}
+	return n + keys, nil
 }
 
 // verifyCode checks code against factor f and records the outcome.
@@ -551,6 +575,7 @@ func (s *MFAService) verifyCode(ctx context.Context, c *MFACaller, f *domain.TOT
 	now := s.now()
 
 	if f.LockedUntil != nil && f.LockedUntil.After(now) {
+		mfaVerification("failure")
 		s.evidence(ctx, c, action, "DENIED", "totp_factor_locked", correlationID)
 		s.refused(ctx, c, action, "totp_factor_locked", siem.SeverityHigh, correlationID)
 		return ErrInvalidCode
@@ -577,6 +602,7 @@ func (s *MFAService) verifyCode(ctx context.Context, c *MFACaller, f *domain.TOT
 			s.log.Error("failed to record totp failure — lockout not advanced",
 				zap.String("principal_id", pid), zap.Error(recErr))
 		}
+		mfaVerification("failure")
 		reason, sev := "totp_mismatch", siem.SeverityMedium
 		if locked {
 			if ic8 := metrics.Default(); ic8 != nil {
@@ -599,20 +625,25 @@ func (s *MFAService) verifyCode(ctx context.Context, c *MFACaller, f *domain.TOT
 		if ic8 := metrics.Default(); ic8 != nil {
 			ic8.TOTPReplay.Inc()
 		}
+		mfaVerification("failure")
 		s.evidence(ctx, c, action, "DENIED", "totp_replayed", correlationID)
 		s.refused(ctx, c, action, "totp_replayed", siem.SeverityHigh, correlationID)
 		return ErrInvalidCode
 	case err != nil:
 		return fmt.Errorf("%w: accept code: %v", ErrAuthUnavailable, err)
 	}
-	if ic8 := metrics.Default(); ic8 != nil {
-		if err == nil {
-			ic8.MFAVerifications.WithLabelValues("success").Inc()
-		} else {
-			ic8.MFAVerifications.WithLabelValues("failure").Inc()
-		}
-	}
+	mfaVerification("success")
 	return nil
+}
+
+// mfaVerification counts one second-factor verification by outcome. Every
+// refusal path calls it with "failure": counting only at the end of
+// verifyCode, as before, meant a refused code returned first and the failure
+// series never moved.
+func mfaVerification(outcome string) {
+	if ic8 := metrics.Default(); ic8 != nil {
+		ic8.MFAVerifications.WithLabelValues(outcome).Inc()
+	}
 }
 
 // evidence appends a best-effort decision row; a failure is logged loudly.

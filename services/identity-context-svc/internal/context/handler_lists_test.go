@@ -25,6 +25,7 @@ type fakeConsole struct {
 	n          int
 	offsets    []int
 	principalF store.PrincipalListFilter
+	resetF     store.ResetListFilter
 }
 
 func (f *fakeConsole) ListPrincipalsPage(_ context.Context, _ string, flt store.PrincipalListFilter, offset, limit int) ([]store.PrincipalDetail, error) {
@@ -51,6 +52,17 @@ func (f *fakeConsole) ListAuthenticationEventsPage(_ context.Context, _ string, 
 }
 func (f *fakeConsole) ListAssuranceHistoryPage(_ context.Context, _, _ string, _, _ int) ([]store.AssuranceChange, error) {
 	return nil, nil
+}
+func (f *fakeConsole) ListPasswordResetsPage(_ context.Context, tenantID string, flt store.ResetListFilter, offset, limit int) ([]domain.PasswordResetRequest, error) {
+	f.offsets = append(f.offsets, offset)
+	f.resetF = flt
+	out := []domain.PasswordResetRequest{}
+	for i := offset; i < f.n && len(out) < limit; i++ {
+		out = append(out, domain.PasswordResetRequest{RequestID: "r-" + string(rune('a'+i)), TenantID: tenantID,
+			PrincipalID: "P-ALICE", RequestedBy: "P-ADMIN", Status: "PENDING_APPROVAL", ApprovalsRequired: 1,
+			Approvals: []domain.ResetApproval{}})
+	}
+	return out, nil
 }
 func (f *fakeConsole) GetIdentitySummary(_ context.Context, _ string) (*store.IdentitySummary, error) {
 	return &store.IdentitySummary{PrincipalsByStatus: map[string]int{"ACTIVE": 3}}, nil
@@ -147,6 +159,8 @@ func TestIC2_UnknownOrInvalidFilterRefused(t *testing.T) {
 		"/v1/context/support?filter[status]=BOGUS",
 		"/v1/authentication-events?filter[outcome]=MAYBE",
 		"/v1/authentication-events?filter[since]=yesterday",
+		"/v1/password-resets?filter[status]=MAYBE",
+		"/v1/password-resets?filter[requested_by]=P-ADMIN",
 		"/v1/principals?page_size=500",
 	} {
 		w := getAs(r, path, "tenant-a")
@@ -158,15 +172,15 @@ func TestIC2_ListsAuthorizeAtTheirReadAction(t *testing.T) {
 	az := &permittingAuthz{}
 	r := consoleRouter(t, &fakeConsole{}, az)
 	for _, path := range []string{"/v1/principals", "/v1/context/sessions", "/v1/context/support",
-		"/v1/authentication-events", "/v1/principals/p-1/assurance-history", "/v1/identity/summary"} {
+		"/v1/authentication-events", "/v1/principals/p-1/assurance-history", "/v1/identity/summary", "/v1/password-resets"} {
 		w := getAs(r, path, "tenant-a")
 		assert.Equal(t, http.StatusOK, w.Code, path+": "+w.Body.String())
 	}
 	assert.Equal(t, []string{"IDENTITY_PRINCIPAL_READ", "IDENTITY_SESSION_READ", "IDENTITY_SUPPORT_CONTEXT_REVIEW",
-		"IDENTITY_AUTH_EVENTS_READ", "IDENTITY_PRINCIPAL_READ", "IDENTITY_PRINCIPAL_READ"}, az.seen)
+		"IDENTITY_AUTH_EVENTS_READ", "IDENTITY_PRINCIPAL_READ", "IDENTITY_PRINCIPAL_READ", "IDENTITY_PRINCIPAL_READ"}, az.seen)
 
 	denied := consoleRouter(t, &fakeConsole{}, &denyingAuthz{})
-	for _, path := range []string{"/v1/principals", "/v1/identity/summary", "/v1/authentication-events"} {
+	for _, path := range []string{"/v1/principals", "/v1/identity/summary", "/v1/authentication-events", "/v1/password-resets"} {
 		w := getAs(denied, path, "tenant-a")
 		assert.Equal(t, http.StatusForbidden, w.Code, path)
 	}
@@ -177,4 +191,37 @@ func TestIC2_EmptyListIsAnArrayNeverNull(t *testing.T) {
 	w := getAs(r, "/v1/context/sessions", "tenant-a")
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"items":[]`)
+}
+
+func TestIC2_PasswordResetsRegisterPagesAndNamesTheRequester(t *testing.T) {
+	fc := &fakeConsole{n: 3}
+	r := consoleRouter(t, fc, &permittingAuthz{})
+
+	w := getAs(r, "/v1/password-resets?page_size=2&filter[status]=PENDING_APPROVAL&filter[principal_id]=P-ALICE", "tenant-a")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var first pageBody
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &first))
+	assert.Len(t, first.Items, 2)
+	require.NotEmpty(t, first.NextCursor)
+	assert.Equal(t, store.ResetListFilter{Status: "PENDING_APPROVAL", PrincipalID: "P-ALICE"}, fc.resetF)
+	// The console hides approve/reject from the requester: each row says who that is.
+	assert.Contains(t, string(first.Items[0]), `"requested_by":"P-ADMIN"`)
+	assert.Contains(t, string(first.Items[0]), `"approvals":[]`)
+
+	w = getAs(r, "/v1/password-resets?page_size=2&filter[status]=PENDING_APPROVAL&filter[principal_id]=P-ALICE&cursor="+first.NextCursor, "tenant-a")
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var second pageBody
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &second))
+	assert.Len(t, second.Items, 1)
+	assert.Empty(t, second.NextCursor)
+
+	// A cursor from another tenant or another filter is refused.
+	for _, tc := range []struct{ path, tenant string }{
+		{"/v1/password-resets?page_size=2&filter[status]=PENDING_APPROVAL&filter[principal_id]=P-ALICE&cursor=" + first.NextCursor, "tenant-b"},
+		{"/v1/password-resets?page_size=2&filter[status]=ISSUED&filter[principal_id]=P-ALICE&cursor=" + first.NextCursor, "tenant-a"},
+	} {
+		w := getAs(r, tc.path, tc.tenant)
+		assert.Equal(t, http.StatusBadRequest, w.Code, tc.path)
+		assert.Contains(t, w.Body.String(), "invalid_cursor")
+	}
 }

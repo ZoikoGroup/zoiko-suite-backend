@@ -428,8 +428,11 @@ func (s *Service) RequestReset(ctx context.Context, a Actor, principalID, reason
 // DecideReset records an approver's decision. The approver is neither the
 // requester nor the subject and holds a recent second-factor authentication;
 // the link is issued and delivered when the approvals are complete.
-func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision string) (*domain.PasswordResetRequest, error) {
+func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision, reason string) (*domain.PasswordResetRequest, error) {
 	decision = strings.ToUpper(strings.TrimSpace(decision))
+	if reason = strings.TrimSpace(reason); len(reason) > 500 {
+		return nil, fmt.Errorf("%w: reason is at most 500 characters", ErrInvalid)
+	}
 	if decision != "APPROVE" && decision != "REJECT" {
 		return nil, fmt.Errorf("%w: decision must be APPROVE or REJECT", ErrInvalid)
 	}
@@ -448,7 +451,8 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision 
 	}
 	var issued string
 	rec, err := events.Render(events.EventPasswordResetDecided, a.TenantID, "", a.PrincipalID, a.CorrelationID, requestID,
-		map[string]any{"request_id": requestID, "principal_id": r.PrincipalID, "decided_by": a.PrincipalID, "decision": decision})
+		map[string]any{"request_id": requestID, "principal_id": r.PrincipalID, "decided_by": a.PrincipalID, "decision": decision,
+			"reason": reason})
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +460,7 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision 
 		ic8.PasswordResets.WithLabelValues(decision).Inc()
 	}
 	out, err := s.store.DecideResetRequest(ctx, a.TenantID, requestID,
-		domain.ResetApproval{ApproverID: a.PrincipalID, At: s.now(), Decision: decision},
+		domain.ResetApproval{ApproverID: a.PrincipalID, At: s.now(), Decision: decision, Reason: reason},
 		func(ctx context.Context, tx pgx.Tx, rr *domain.PasswordResetRequest) error {
 			issued = randomToken()
 			return s.store.InsertCredentialTokenTx(ctx, tx, domain.CredentialToken{TokenHash: hashToken(issued),

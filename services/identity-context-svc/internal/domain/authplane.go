@@ -150,6 +150,8 @@ type ResetApproval struct {
 	ApproverID string    `json:"approver_id"`
 	At         time.Time `json:"at"`
 	Decision   string    `json:"decision"`
+	// Reason is the approver's recorded reason, when they gave one.
+	Reason string `json:"reason,omitempty"`
 }
 
 // ── Federation (AU-07) ───────────────────────────────────────────────────────

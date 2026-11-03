@@ -38,6 +38,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/idempotency"
 	ic8metrics "zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/mfa"
+	"zoiko.io/identity-context-svc/internal/webauthn"
 	"zoiko.io/identity-context-svc/internal/mtlslistener"
 	"zoiko.io/identity-context-svc/internal/oidc"
 	"zoiko.io/identity-context-svc/internal/outbox"
@@ -440,6 +441,24 @@ func main() {
 			IssuerLabel:       cfg.MFAIssuerLabel,
 		})
 
+	// ── Passkeys (WebAuthn, AU-11) ────────────────────────────────────────
+	//
+	// The relying party is the issuer's host unless WEBAUTHN_RP_ID says
+	// otherwise. Ceremony challenges live in Redis so a begin answered by one
+	// replica can be finished on another, and each is taken exactly once.
+	passkeys, err := webauthn.New(webauthn.Config{
+		RPID:          cfg.AuthPlane.WebAuthnRPID,
+		RPDisplayName: cfg.AuthPlane.WebAuthnRPName,
+		RPOrigins:     cfg.AuthPlane.WebAuthnOrigins,
+	}, principalRepo, webauthn.NewRedisCeremonies(rdb), siemClient, log)
+	if err != nil {
+		log.Fatal("failed to build the passkey factor", zap.Error(err))
+	}
+	mfaService.WithPasskeys(passkeys)
+	log.Info("passkeys ready",
+		zap.String("rp_id", cfg.AuthPlane.WebAuthnRPID),
+		zap.Strings("rp_origins", cfg.AuthPlane.WebAuthnOrigins))
+
 	// ── Auth plane: throttle, OIDC provider, subject lifecycle (F-5) ──────
 	//
 	// Built 14–15 Oct and constructed by nothing until 19 Oct: the provider's
@@ -459,7 +478,7 @@ func main() {
 	}
 	provider, err := oidc.New(oidc.Options{
 		Cfg: cfg, Clients: oidcClients, Store: principalRepo, Pending: oidc.NewRedisPending(rdb), Ring: keyring,
-		AccessTokens: idpIssuer, AccessVerifier: verifier, Passwords: authenticator, MFA: loginMFA,
+		AccessTokens: idpIssuer, AccessVerifier: verifier, Passwords: authenticator, MFA: loginMFA, Passkeys: passkeys,
 		Sessions: resolver, Events: publisher, Limiter: loginLimiter, SIEM: siemClient, Log: log,
 		Metrics: oidc.NewMetrics(prometheus.DefaultRegisterer),
 	})

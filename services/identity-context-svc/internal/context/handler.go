@@ -384,6 +384,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/mfa/factors", h.ListMFAFactors)
 		r.Post("/principals/{principalID}/mfa/reset", h.ResetPrincipalMFA)
 
+		// ── Passkeys (WebAuthn, AU-11) ───────────────────────────────────────
+		// Same caller rule as TOTP. See handler_passkeys.go.
+		r.Post("/mfa/passkeys/register/begin", h.BeginPasskeyRegistration)
+		r.Post("/mfa/passkeys/register/finish", h.FinishPasskeyRegistration)
+		r.Get("/mfa/passkeys", h.ListPasskeys)
+		r.Post("/mfa/passkeys/revoke", h.RevokePasskey)
+		r.Post("/authenticate/step-up/passkey/begin", h.BeginPasskeyStepUp)
+		r.Post("/authenticate/step-up/passkey/finish", h.FinishPasskeyStepUp)
+
 		// ── GOV-01 queries ───────────────────────────────────────────────────
 		// ResolveTenantContext
 		r.Post("/context/resolve", h.ResolveContext)
@@ -442,6 +451,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/principals/{principalID}/password-resets", h.RequestReset)
 		r.Post("/password-resets/{resetID}/decide", h.DecideReset)
 		r.Get("/password-resets/{resetID}", h.GetReset)
+		// The Password resets register (console read model).
+		r.Get("/password-resets", h.ListPasswordResets)
 	})
 }
 

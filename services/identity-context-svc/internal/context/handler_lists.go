@@ -25,6 +25,7 @@ type ConsoleReader interface {
 	ListSupportContextsPage(ctx context.Context, tenantID, state string, offset, limit int) ([]domain.SupportContext, error)
 	ListAuthenticationEventsPage(ctx context.Context, tenantID string, f store.AuthEventFilter, offset, limit int) ([]domain.AuthenticationEvent, error)
 	ListAssuranceHistoryPage(ctx context.Context, tenantID, principalID string, offset, limit int) ([]store.AssuranceChange, error)
+	ListPasswordResetsPage(ctx context.Context, tenantID string, f store.ResetListFilter, offset, limit int) ([]domain.PasswordResetRequest, error)
 	GetIdentitySummary(ctx context.Context, tenantID string) (*store.IdentitySummary, error)
 }
 
@@ -221,6 +222,28 @@ func (h *Handler) GetAssuranceHistory(w http.ResponseWriter, r *http.Request) {
 	items, err := h.console.ListAssuranceHistoryPage(r.Context(), lr.tenantID, chi.URLParam(r, "principalID"), lr.offset, lr.page.PageSize+1)
 	if err != nil {
 		h.listFailed(w, r, "assurance history", lr.tenantID, err)
+		return
+	}
+	finishList(h, w, r, lr, items)
+}
+
+// ListPasswordResets is GET /v1/password-resets: the Password resets
+// register. Each row names its requester and approvers, so the console can
+// keep the approve and reject buttons from the person who asked.
+func (h *Handler) ListPasswordResets(w http.ResponseWriter, r *http.Request) {
+	lr, ok := h.beginList(w, r, "list_password_resets", IdentityPrincipalRead, []string{"status", "principal_id"}, "")
+	if !ok {
+		return
+	}
+	f := store.ResetListFilter{Status: lr.page.Filters["status"], PrincipalID: lr.page.Filters["principal_id"]}
+	if f.Status != "" && !oneOf(f.Status, "PENDING_APPROVAL", "ISSUED", "REJECTED", "COMPLETED", "EXPIRED") {
+		writeCoded(w, r, http.StatusBadRequest, "invalid_filter",
+			"filter[status] must be PENDING_APPROVAL, ISSUED, REJECTED, COMPLETED or EXPIRED")
+		return
+	}
+	items, err := h.console.ListPasswordResetsPage(r.Context(), lr.tenantID, f, lr.offset, lr.page.PageSize+1)
+	if err != nil {
+		h.listFailed(w, r, "password resets list", lr.tenantID, err)
 		return
 	}
 	finishList(h, w, r, lr, items)

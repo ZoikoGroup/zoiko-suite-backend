@@ -199,6 +199,82 @@ components:
           type: string
           enum: [PENDING]
 
+    PasskeyCeremony:
+      type: object
+      required: [options, ceremony]
+      properties:
+        options:
+          type: object
+          description: |
+            `{"publicKey": ...}`: PublicKeyCredentialCreationOptions for a
+            registration, PublicKeyCredentialRequestOptions for an assertion,
+            binary fields base64url-encoded.
+        ceremony:
+          type: string
+          description: Single-use handle for the finish call.
+    FinishPasskeyRequest:
+      type: object
+      required: [ceremony, credential]
+      properties:
+        ceremony:
+          type: string
+        nickname:
+          type: string
+          maxLength: 100
+          description: Registration only; a label the owner chooses.
+        credential:
+          type: object
+          description: The PublicKeyCredential the browser returned, with base64url binary fields.
+        correlation_id:
+          type: string
+    RevokePasskeyRequest:
+      type: object
+      required: [credential_id]
+      properties:
+        credential_id:
+          type: string
+        reason_code:
+          type: string
+        correlation_id:
+          type: string
+    WebAuthnCredential:
+      type: object
+      description: A registered passkey, without its public key.
+      properties:
+        credential_id:
+          type: string
+          description: base64url credential id
+        tenant_id:
+          type: string
+        principal_id:
+          type: string
+        attestation_type:
+          type: string
+        aaguid:
+          type: string
+        sign_count:
+          type: integer
+        transports:
+          type: array
+          items:
+            type: string
+        backup_eligible:
+          type: boolean
+        backup_state:
+          type: boolean
+        user_verified:
+          type: boolean
+        nickname:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, RETIRED]
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
     MFAFactor:
       type: object
       description: A factor without any secret material.
@@ -209,7 +285,7 @@ components:
           type: string
         type:
           type: string
-          enum: [TOTP]
+          enum: [TOTP, WEBAUTHN]
         status:
           type: string
           enum: [PENDING, ACTIVE, RETIRED]
@@ -413,6 +489,9 @@ components:
                 format: date-time
               decision:
                 type: string
+              reason:
+                type: string
+                description: The approver's recorded reason, when given.
         status:
           type: string
         created_at:
@@ -1930,6 +2009,10 @@ paths:
                 decision:
                   type: string
                   enum: [APPROVE, REJECT]
+                reason:
+                  type: string
+                  maxLength: 500
+                  description: Recorded on the approval and in identity.password_reset.decided.
       responses:
         "200":
           description: Decision recorded
@@ -2034,6 +2117,78 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
           description: Reset requests are not configured in this deployment
+
+  /v1/password-resets:
+    get:
+      summary: List governed password resets (Password resets register)
+      operationId: listPasswordResets
+      description: |
+        Console read model. Authorized at IDENTITY_PRINCIPAL_READ. Cursor-paged
+        (API-4): next_cursor is signed and bound to the tenant, route and filter
+        that produced it; an unknown filter[...] is refused. Each row names its
+        requester (`requested_by`) and approvals, so a console can keep the
+        approve and reject commands from the person who asked. A request
+        awaiting approval, or issued and unused, past its expiry reads EXPIRED.
+      parameters:
+        - $ref: "#/components/parameters/TenantHeader"
+        - $ref: "#/components/parameters/PrincipalHeader"
+        - $ref: "#/components/parameters/CorrelationHeader"
+        - $ref: "#/components/parameters/PageSize"
+        - $ref: "#/components/parameters/Cursor"
+        - name: "filter[status]"
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [PENDING_APPROVAL, ISSUED, REJECTED, COMPLETED, EXPIRED]
+        - name: "filter[principal_id]"
+          in: query
+          required: false
+          description: The subject of the reset
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, page_size]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PasswordResetRequest"
+                  next_cursor:
+                    type: string
+                    description: Absent on the last page.
+                  page_size:
+                    type: integer
+        "400":
+          description: Unknown filter, invalid filter value, page_size out of range, or a cursor that is malformed, tampered with, or minted for another tenant, route or filter (invalid_cursor)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: The caller lacks IDENTITY_PRINCIPAL_READ
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          description: Throttled
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: Console read models are not configured in this deployment
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
   # -- IC-2 console read models -----------------------------------------------
   #
@@ -3273,6 +3428,297 @@ paths:
                 $ref: "#/components/schemas/Problem"
           description: "`session_invalid`"
 
+  # -- Passkeys (WebAuthn, AU-11) ---------------------------------------------
+  #
+  # Same caller rule as the TOTP routes: the session envelope in Authorization,
+  # never X-Principal-Id. Begin returns the options for
+  # navigator.credentials.create/get and a single-use ceremony handle; finish
+  # takes the handle and the browser's PublicKeyCredential (base64url fields).
+
+  /v1/mfa/passkeys/register/begin:
+    post:
+      summary: Start registering a passkey
+      operationId: beginPasskeyRegistration
+      description: |
+        Returns PublicKeyCredentialCreationOptions (user verification required,
+        no attestation, the caller's existing passkeys excluded) and a ceremony
+        handle valid for one finish within five minutes. The same gate as a
+        TOTP enrolment: a first factor needs a login no older than
+        MFA_RECENT_AUTH_SECONDS (401 `reauthentication_required`); adding one
+        beside an existing TOTP factor or passkey needs a recent step-up (403
+        `step_up_required`). Never recorded for idempotent replay.
+      responses:
+        "200":
+          description: Creation options and the ceremony handle (no-store)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasskeyCeremony"
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`session_invalid` or `reauthentication_required`"
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`step_up_required` or `identity_mismatch`"
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`passkeys_not_configured`"
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`mfa_unavailable`: the store or the ceremony store is unreachable"
+
+  /v1/mfa/passkeys/register/finish:
+    post:
+      summary: Finish registering a passkey
+      operationId: finishPasskeyRegistration
+      description: |
+        Verifies the attestation response against the ceremony (challenge,
+        origin, RP ID hash, user presence and verification) and stores the
+        credential with `identity.mfa_factor.enrolled` (factor_type WEBAUTHN)
+        and an assurance-history row in the same transaction.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinishPasskeyRequest"
+      responses:
+        "201":
+          description: Registered (no key material)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebAuthnCredential"
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`ceremony_invalid` (unknown, expired, used, or issued to someone else) or a malformed body"
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`session_invalid` or `passkey_rejected`"
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`passkey_duplicate`: that credential is already registered"
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`passkeys_not_configured`"
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`mfa_unavailable`"
+
+  /v1/mfa/passkeys:
+    get:
+      summary: List the caller's own passkeys
+      operationId: listPasskeys
+      responses:
+        "200":
+          description: Active passkeys, without key material
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [passkeys, count]
+                properties:
+                  passkeys:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WebAuthnCredential"
+                  count:
+                    type: integer
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`session_invalid`"
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`passkeys_not_configured`"
+
+  /v1/mfa/passkeys/revoke:
+    post:
+      summary: Revoke one of the caller's own passkeys
+      operationId: revokePasskey
+      description: |
+        Needs a recent step-up (403 `step_up_required`), like revoking a TOTP
+        factor. Writes `identity.mfa_factor.revoked` with the change.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokePasskeyRequest"
+      responses:
+        "200":
+          description: Retired
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: credential_id missing
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`session_invalid`"
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`step_up_required` or `identity_mismatch`"
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`factor_not_found`"
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`passkeys_not_configured`"
+
+  /v1/authenticate/step-up/passkey/begin:
+    post:
+      summary: Start a passkey step-up of the current session
+      operationId: beginPasskeyStepUp
+      description: |
+        Returns PublicKeyCredentialRequestOptions (user verification required,
+        the caller's passkeys allowed) and a single-use ceremony handle.
+        Throttled with the TOTP step-up.
+      responses:
+        "200":
+          description: Request options and the ceremony handle (no-store)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasskeyCeremony"
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`session_invalid`"
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`mfa_not_enrolled`: the caller has no passkey"
+        "429":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Throttled
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`passkeys_not_configured`"
+
+  /v1/authenticate/step-up/passkey/finish:
+    post:
+      summary: Finish a passkey step-up
+      operationId: finishPasskeyStepUp
+      description: |
+        Verifies the assertion (challenge, origin, RP ID hash, user
+        verification, signature, and a signature counter that advanced) and
+        returns a NEW login token with `mfa_done`, `auth_time` = now and `amr`
+        `["pwd","hwk"]`. /v1/context/resolve exchanges it for an envelope with
+        `mfa_verified: true` and assurance PHISHING_RESISTANT. A refused
+        assertion counts against the step-up throttle. Never recorded for
+        idempotent replay: the response is a credential.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinishPasskeyRequest"
+      responses:
+        "200":
+          description: Stepped up — a new login token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticateResponse"
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`ceremony_invalid` or a malformed body"
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`session_invalid` or `passkey_rejected` (one answer for every verification failure, including a clone signal)"
+        "429":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Throttled
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`passkeys_not_configured`"
+        "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: "`mfa_unavailable`"
+
   /v1/principals/{principalId}/mfa/reset:
     post:
       summary: Reset another principal's second factor (administrator)
@@ -3282,9 +3728,9 @@ paths:
         (ZS-IAM-001 §3). The administrator is identified by their own session
         envelope, must hold `IDENTITY_MFA_RESET` in authorization-svc, must have
         stepped up within MFA_RECENT_AUTH_SECONDS, and cannot reset themselves.
-        Every ACTIVE and PENDING factor of the subject is retired;
-        `identity.mfa_factor.reset` is written with the change and streamed to
-        SIEM at high severity.
+        Every ACTIVE and PENDING factor of the subject is retired, passkeys
+        included; `identity.mfa_factor.reset` is written with each change and
+        streamed to SIEM at high severity.
       parameters:
         - name: principalId
           in: path
