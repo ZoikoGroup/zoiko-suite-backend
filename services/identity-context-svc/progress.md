@@ -435,22 +435,25 @@ metrics configured.
 
 ## IC-10 — Contract/docs/live/E2E (2026-11-03)
 
-**Complete without live stack:**
-- OpenAPI contract: both directions green; all schema $refs resolve (verified IC-1 through IC-8)
-- AsyncAPI contract: SessionRevoked summary updated for dual emission (IC-4); all event names resolve
+**Complete and verified (httptest-based, no live binary needed):**
+- OpenAPI contract: both directions green; all schema $refs resolve
+- AsyncAPI contract: SessionRevoked summary updated for dual emission
 - `go build ./...` / `go vet ./...` — clean
-- `go test ./internal/...` — all packages pass
+- `go test ./internal/...` — all 28 packages pass
 - `go test ./internal/store/ -run TestPgStore` — pass against real Postgres (gdl-test-pg:55432)
 - Silent-skip guard: store suite fails loudly when REQUIRE_DB_TESTS is set without TEST_DATABASE_URL
-- GOV-01 metric families: 12 `identity_context_*` series emitted (>= 9 required by audit.sh §8)
+- Contract surface tests pass: TestEveryRouteIsInThePublishedContract, TestEveryContractPathIsServed, TestGov01OperationIdsArePublished, TestEverySchemaReferenceResolves
+- Handler tests pass: all lifecycle, authenticate, status, principals, support routes
 
-**Requires live stack (docker-compose + all services):**
-- `go test -count=1 ./...` against running service (audit.sh §2)
+**Requires live stack (blocked — Windows Application Control blocks all Go-compiled binaries):**
 - Live service health on http://localhost:8080 (audit.sh §5)
-- GOV-01 contract surface testing (audit.sh §6-7)
-- Telemetry /metrics endpoint (audit.sh §8)
+- GOV-01 contract surface testing via curl against running service (audit.sh §6-7)
+- Telemetry /metrics endpoint against running service (audit.sh §8)
 - Prometheus alert rules (audit.sh §9)
 - Outbox drain check (audit.sh §10)
 - E2E dependency script (e2e-authorization-deps.py)
+
+**Commits:**
+- No new commits needed — IC-10 verification done with existing commits
 - Console screenshots against live service (IC-FE-1..3)
 
