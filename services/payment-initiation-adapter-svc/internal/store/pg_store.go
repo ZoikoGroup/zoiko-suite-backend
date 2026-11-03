@@ -52,6 +52,7 @@ type Store interface {
 	PrepareAttempt(ctx context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error)
 	FindAttempt(ctx context.Context, attemptID string) (*domain.PaymentInitiationAttempt, error)
 	FindByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.PaymentInitiationAttempt, error)
+	ListPaymentAttempts(ctx context.Context, f domain.ListPaymentAttemptsFilter) ([]domain.PaymentAttemptSummary, error)
 
 	MarkSubmitted(ctx context.Context, attemptID, providerRequestID, responseRef, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error)
 	MarkPendingUnknown(ctx context.Context, attemptID, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error)
@@ -278,7 +279,15 @@ func (s *PgStore) FindAttempt(ctx context.Context, attemptID string) (*domain.Pa
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
-		a, err = scanAttempt(tx.QueryRow(ctx, `SELECT `+attemptColumns+` FROM payment_initiation_attempts WHERE attempt_id = $1`, attemptID))
+		// Explicit predicate, not RLS alone: a connection that owns the table
+		// (the superuser this test/dev environment always connects as) bypasses
+		// RLS entirely, FORCE notwithstanding — found via a real cross-tenant
+		// leak in ListPaymentAttempts' own test, not assumed (SPEC_DEVIATIONS A11).
+		// Mirrors tenant_isolation's own NULL-tenant legacy carve-out (migration
+		// 000003) rather than silently narrowing it.
+		a, err = scanAttempt(tx.QueryRow(ctx, `SELECT `+attemptColumns+` FROM payment_initiation_attempts
+			WHERE attempt_id = $1 AND (tenant_id IS NULL OR tenant_id::text = NULLIF($2, ''))`,
+			attemptID, middleware.TenantFromContext(ctx)))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
@@ -295,7 +304,13 @@ func (s *PgStore) FindByIdempotencyKey(ctx context.Context, idempotencyKey strin
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
-		a, err = scanAttempt(tx.QueryRow(ctx, `SELECT `+attemptColumns+` FROM payment_initiation_attempts WHERE idempotency_key = $1`, idempotencyKey))
+		// Explicit predicate, not RLS alone (same reasoning as FindAttempt).
+		// PrepareAttempt's own cross-tenant-duplicate detection (B4) depends
+		// on this lookup genuinely not seeing another tenant's row — that
+		// behavior is unchanged, now enforced twice instead of once.
+		a, err = scanAttempt(tx.QueryRow(ctx, `SELECT `+attemptColumns+` FROM payment_initiation_attempts
+			WHERE idempotency_key = $1 AND (tenant_id IS NULL OR tenant_id::text = NULLIF($2, ''))`,
+			idempotencyKey, middleware.TenantFromContext(ctx)))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -306,6 +321,67 @@ func (s *PgStore) FindByIdempotencyKey(ctx context.Context, idempotencyKey strin
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return a, nil
+}
+
+const attemptSummaryColumns = `
+	attempt_id, legal_entity_id, source_reference, amount::text, currency,
+	status, execution_date, created_by_principal_id, submitted_at, resolved_at, created_at, updated_at`
+
+func scanAttemptSummary(row pgx.Row) (domain.PaymentAttemptSummary, error) {
+	var s domain.PaymentAttemptSummary
+	err := row.Scan(&s.AttemptID, &s.LegalEntityID, &s.SourceReference, &s.Amount, &s.Currency,
+		&s.Status, &s.ExecutionDate, &s.CreatedByPrincipalID, &s.SubmittedAt, &s.ResolvedAt, &s.CreatedAt, &s.UpdatedAt)
+	return s, err
+}
+
+// ListPaymentAttempts (SPEC_DEVIATIONS A1): keyset-paginated, not
+// offset-paginated, over (created_at, attempt_id) DESC — attempt_id is a
+// random (not time-ordered) UUID, so the cursor must carry both columns via
+// a row-value comparison against the cursor row, not attempt_id alone.
+func (s *PgStore) ListPaymentAttempts(ctx context.Context, f domain.ListPaymentAttemptsFilter) ([]domain.PaymentAttemptSummary, error) {
+	if f.LegalEntityID == "" {
+		// Never silently widen to "every entity" — see
+		// domain.ListPaymentAttemptsFilter's doc comment. The handler
+		// already refuses this before it reaches here; this is defense in
+		// depth for any other in-process caller.
+		return nil, nil
+	}
+	if f.Limit <= 0 || f.Limit > 500 {
+		f.Limit = 100
+	}
+	var out []domain.PaymentAttemptSummary
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		// Explicit tenant_id predicate, not RLS alone (same reasoning as
+		// FindAttempt) — found via a real cross-tenant leak in this exact
+		// query's own test, not assumed.
+		rows, err := tx.Query(ctx, `
+			SELECT `+attemptSummaryColumns+` FROM payment_initiation_attempts
+			WHERE legal_entity_id = $1::uuid
+			  AND (tenant_id IS NULL OR tenant_id::text = NULLIF($2, ''))
+			  AND ($3 = '' OR status = $3)
+			  AND ($4 = '' OR (created_at, attempt_id) < (
+			        SELECT created_at, attempt_id FROM payment_initiation_attempts WHERE attempt_id = $4::uuid))
+			ORDER BY created_at DESC, attempt_id DESC
+			LIMIT $5`,
+			f.LegalEntityID, middleware.TenantFromContext(ctx), f.Status, f.AfterID, f.Limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			summary, err := scanAttemptSummary(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, summary)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListPaymentAttempts failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
 }
 
 // findUnresolvedBySourceReference returns the attempt that currently owns a
@@ -536,9 +612,12 @@ func (s *PgStore) ResolveAmbiguous(ctx context.Context, attemptID string, req do
 func (s *PgStore) ListEvents(ctx context.Context, attemptID string) ([]domain.AttemptEvent, error) {
 	var out []domain.AttemptEvent
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		// Explicit predicate, not RLS alone (same reasoning as FindAttempt).
 		rows, err := tx.Query(ctx, `
 			SELECT event_id, tenant_id, attempt_id, event_type, detail, actor_principal_id, created_at
-			FROM attempt_events WHERE attempt_id = $1 ORDER BY created_at ASC`, attemptID)
+			FROM attempt_events
+			WHERE attempt_id = $1 AND (tenant_id IS NULL OR tenant_id::text = NULLIF($2, ''))
+			ORDER BY created_at ASC`, attemptID, middleware.TenantFromContext(ctx))
 		if err != nil {
 			return err
 		}

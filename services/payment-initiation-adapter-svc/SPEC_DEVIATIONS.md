@@ -22,14 +22,14 @@ and the section number is not printed on the BNK-06 page itself (§7 is the
 Overall: the command surface is complete. `InitiatePayment` is split into a
 durable `PrepareAttempt` followed by `SubmitAttempt` (B1), and
 `RetrySamePaymentAttempt`, `CancelBeforeSubmission`,
-`ResolveAmbiguousSubmission` and `QuarantinePaymentAttempt` all exist. Four of
-the five queries exist; `ListPaymentAttempts` does not (A1). The attempt row
+`ResolveAmbiguousSubmission` and `QuarantinePaymentAttempt` all exist, and all
+five queries now exist (`ListPaymentAttempts` closed A1). The attempt row
 is committed before any provider call, is immutable in its protected fields,
 reuses one idempotency key for every retry, and a timeout becomes
 `PENDING_UNKNOWN`, never `REJECTED`. The material gaps are that the
 authorized subject is never bound to the request's payer/payee/amount/
 currency/date (A2), the default send path has no durable in-flight CAS (A3),
-and the stored evidence is far thinner than the contract (A4). Roughly 75% of
+and the stored evidence is far thinner than the contract (A4). Roughly 80% of
 BNK-06.
 
 The INT-07 provider engine (`PROVIDER_ADAPTERS_ENABLED=true`) is materially
@@ -44,16 +44,48 @@ A later pass closed A6.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. `ListPaymentAttempts` is not implemented.** The §7 query line names
-  `GetPaymentAttempt; GetProviderReceipt; GetSubmissionState;
-  GetAttemptEvidence; ListPaymentAttempts`. There is no route, store method or
-  SQL for the list query; the only reads are by attempt id. Operators
-  therefore cannot answer "which attempts are `PENDING_UNKNOWN`/`SUBMITTING`
-  for this entity?" from this service, which is also the input BNK-07 and
-  reconciliation need. Adding it is not a small change: it needs a
-  tenant/entity-scoped filter, keyset pagination, a supporting index, and a
-  decision on which sensitive fields (`payer_account_ref`, `payee_ref`) may
-  appear in a list response under invariant 2. Documented, not added.
+- **A1. `ListPaymentAttempts` is not implemented. — Closed (migration
+  000008).** `GET /bnk06/attempts?legal_entity_id=...` requires
+  `legal_entity_id` (there is no tenant-wide list) and `PAYMENT_ATTEMPT_READ`
+  in that entity, exactly like every other BNK-06 read. `status` is an
+  optional filter; `after`/`limit` are a keyset cursor over
+  `(created_at, attempt_id)` DESC (not offset pagination — proven stable
+  under a concurrent insert between pages, see
+  `TestPgStore_ListPaymentAttempts_KeysetPaginationIsStableUnderConcurrentInsert`),
+  backed by a new composite index
+  (`idx_payment_initiation_attempts_entity_list`).
+
+  The sensitive-field decision: the list row
+  (`domain.PaymentAttemptSummary`) deliberately excludes
+  `payer_account_ref`, `payee_ref`, `authorization_fingerprint`,
+  `idempotency_key`, `payment_reference` and the free-text resolution
+  notes. `GetPaymentAttempt` already returns all of them raw to the same
+  `PAYMENT_ATTEMPT_READ`-holding principal for one attempt at a time; this
+  list endpoint is still narrower because bulk-enumerating those fields
+  across every attempt for an entity is a materially larger exposure than a
+  caller choosing to read them one id at a time, which is exactly
+  invariant 2's "raw values never appear in list APIs" concern. This is a
+  judgment call, recorded here rather than silently decided, and a reviewer
+  who wants list parity with `GetPaymentAttempt` can widen
+  `PaymentAttemptSummary` without any schema change.
+- **A11. `FindAttempt`, `FindByIdempotencyKey` and `ListEvents` had no
+  explicit tenant predicate — closed in this pass, found while testing A1.**
+  All three relied on row-level security alone
+  (`WHERE attempt_id = $1`/`WHERE idempotency_key = $1`, no `tenant_id`
+  anywhere in the query). RLS in this service is `FORCE`d, but `FORCE` does
+  not apply to a connection that owns the table — a superuser bypasses RLS
+  unconditionally, and this project's own dev/test environments (including
+  this service's own embedded-Postgres integration harness) connect as
+  exactly that. A real test proved the leak directly: two attempts with the
+  same `legal_entity_id` in different tenants, queried from one tenant's
+  context, returned both. All three queries now add an explicit
+  `(tenant_id IS NULL OR tenant_id::text = NULLIF($N, ''))` predicate —
+  mirroring `tenant_isolation`'s own NULL-tenant legacy carve-out (migration
+  000003) rather than silently narrowing it — so isolation holds even when
+  RLS does not. `FindByIdempotencyKey`'s cross-tenant-duplicate detection
+  (B4) is unchanged: it still depends on this lookup not seeing another
+  tenant's row, which is now enforced twice instead of once. Covered by
+  `TestPgStore_FindAttempt_FindByIdempotencyKey_ListEvents_ScopeByTenant`.
 - **A2. The authorized subject is not bound to the attempt's protected
   fields.** This is the largest gap. `PrepareAttempt` re-fetches the upstream
   authorization and compares only the opaque `ProposalFingerprint` string
