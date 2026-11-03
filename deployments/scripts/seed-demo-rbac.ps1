@@ -833,7 +833,15 @@ $BUNDLES = @(
                     "IDENTITY_SUPPORT_CONTEXT_ATTACH", "IDENTITY_SUPPORT_CONTEXT_REVIEW",
                     "IDENTITY_SUPPORT_CONTEXT_APPROVE", "IDENTITY_SUPPORT_CONTEXT_REVOKE",
                     "IDENTITY_CONTEXT_EXPLAIN", "IDENTITY_CONTEXT_CACHE_REFRESH",
-                    "IDENTITY_CONTEXT_TENANT_INVALIDATE")
+                    "IDENTITY_CONTEXT_TENANT_INVALIDATE",
+                    # Federation (access-control 000027, 3 Nov 2026): the
+                    # console's Federation tab reads, and the governed
+                    # connection commands when FEDERATION_ENABLED. The demo
+                    # principal holds both configure and approve, as it holds
+                    # both reset halves; the service refuses an approver who
+                    # proposed the version.
+                    "FEDERATION_READ", "FEDERATION_CONFIGURE", "FEDERATION_APPROVE",
+                    "FEDERATION_SUSPEND", "FEDERATION_LINK", "FEDERATION_PROVISIONING_MANAGE")
     },
     @{
         # siem-integration-svc (access-control 000024): configuring where the
