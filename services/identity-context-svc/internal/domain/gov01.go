@@ -111,6 +111,15 @@ const IngressUnknown = "UNKNOWN"
 // claim, which is a refusal, but it can never supply a tenant the token did
 // not claim. That is what keeps GOV-01 out of tenant master data while still
 // letting it satisfy negative path #2.
+// HostBinding is one tenant-entity-registry-svc host binding (ORG-02
+// ListTenantHostBindings), the source TenantIngressBinding is refreshed from.
+type HostBinding struct {
+	HostBindingID string `json:"host_binding_id"`
+	Hostname      string `json:"hostname"`
+	TenantID      string `json:"tenant_id"`
+	ActiveFlag    bool   `json:"active_flag"`
+}
+
 type TenantIngressBinding struct {
 	IngressIdentifier string      `json:"ingress_identifier"`
 	TenantID          string      `json:"tenant_id"`
@@ -222,26 +231,26 @@ var ErrResidencyDenied = errors.New("legal entity residency policy is not servab
 // with every action taken under it tagged with SupportContextID. Authorization
 // still runs, unchanged, on every request.
 type SupportContext struct {
-	SupportContextID        string `json:"support_context_id"`
-	TenantID                string `json:"tenant_id"`
-	SupportPrincipalID      string `json:"support_principal_id"`
+	SupportContextID   string `json:"support_context_id"`
+	TenantID           string `json:"tenant_id"`
+	SupportPrincipalID string `json:"support_principal_id"`
 	// SubjectPrincipalID narrows the grant to one principal's data. nil is a
 	// tenant-wide support context, which is the broader and rarer grant.
-	SubjectPrincipalID      *string `json:"subject_principal_id"`
-	ReasonCode              string  `json:"reason_code"`
-	Justification           string  `json:"justification"`
-	TicketRef               string  `json:"ticket_ref"`
-	ApproverPrincipalID     string  `json:"approver_principal_id"`
+	SubjectPrincipalID  *string `json:"subject_principal_id"`
+	ReasonCode          string  `json:"reason_code"`
+	Justification       string  `json:"justification"`
+	TicketRef           string  `json:"ticket_ref"`
+	ApproverPrincipalID string  `json:"approver_principal_id"`
 	// RequestedByPrincipalID made the request; ApprovalStatus is
 	// PENDING_APPROVAL until the named approver approves it with their own
 	// call (S1-1 / R-2). A pending request grants nothing: GrantedAt and
 	// ExpiresAt are restarted at approval.
-	RequestedByPrincipalID  string     `json:"requested_by_principal_id,omitempty"`
-	ApprovalStatus          string     `json:"approval_status"`
-	ApprovedAt              *time.Time `json:"approved_at,omitempty"`
-	RequestedTTLSeconds     int        `json:"requested_ttl_seconds,omitempty"`
-	GrantedAt               time.Time  `json:"granted_at"`
-	ExpiresAt               time.Time  `json:"expires_at"`
+	RequestedByPrincipalID string     `json:"requested_by_principal_id,omitempty"`
+	ApprovalStatus         string     `json:"approval_status"`
+	ApprovedAt             *time.Time `json:"approved_at,omitempty"`
+	RequestedTTLSeconds    int        `json:"requested_ttl_seconds,omitempty"`
+	GrantedAt              time.Time  `json:"granted_at"`
+	ExpiresAt              time.Time  `json:"expires_at"`
 	// RevokedAt and RevocationReason are append-only, set at most once.
 	RevokedAt        *time.Time `json:"revoked_at"`
 	RevocationReason *string    `json:"revocation_reason"`

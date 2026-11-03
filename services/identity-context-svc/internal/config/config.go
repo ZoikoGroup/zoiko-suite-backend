@@ -592,6 +592,13 @@ func Load() (*Config, error) {
 	if err := loadAuthPlane(cfg); err != nil {
 		return nil, err
 	}
+	// IAM-2: outside local development a resolve must be able to read the
+	// tenant's commercial entitlement; without the URL every session would
+	// carry UPSTREAM_NOT_CONFIGURED and nobody would notice.
+	if cfg.Environment != "local" && strings.TrimSpace(cfg.CommercialAccountURL) == "" {
+		return nil, fmt.Errorf("COMMERCIAL_ACCOUNT_URL is required in %s: the entitlement context reference (IAM-2) is read from commercial-account-svc", cfg.Environment)
+	}
+
 	key, err := cursorSigningKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), cfg.Environment)
 	if err != nil {
 		return nil, err

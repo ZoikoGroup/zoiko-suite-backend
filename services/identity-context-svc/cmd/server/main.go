@@ -693,6 +693,15 @@ func main() {
 	defer stopRetention()
 	go retentionWorker.Run(retentionCtx)
 
+	// S1-B3: ingress bindings are re-read from tenant-entity-registry-svc at
+	// half their TTL, so a binding is STALE only while the registry is down.
+	if cfg.IngressBindingTTLSeconds > 0 && cfg.TenantRegistryURL != "" {
+		refreshCtx, stopRefresh := context.WithCancel(context.Background())
+		defer stopRefresh()
+		go identityctx.NewIngressRefresher(principalRepo, upstreamRegistry, domain.Environment(cfg.Environment),
+			time.Duration(cfg.IngressBindingTTLSeconds)*time.Second, log).Run(refreshCtx)
+	}
+
 	// ── Server ────────────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),

@@ -253,6 +253,44 @@ func (s *PgStore) UpsertIngressBinding(ctx context.Context, b domain.TenantIngre
 	return nil
 }
 
+// ListIngressBindingTenants lists every tenant with a local ingress binding,
+// for the registry refresher (S1-B3).
+func (s *PgStore) ListIngressBindingTenants(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT tenant_id FROM tenant_ingress_bindings ORDER BY tenant_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list ingress binding tenants: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// DeactivateIngressBindingsExcept deactivates a tenant's active bindings whose
+// hostname the registry no longer lists, so a removed binding stops routing.
+func (s *PgStore) DeactivateIngressBindingsExcept(ctx context.Context, tenantID string, keep []string) (int, error) {
+	if tenantID == "" {
+		return 0, errors.New("DeactivateIngressBindingsExcept: tenant_id is required")
+	}
+	if keep == nil {
+		keep = []string{}
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE tenant_ingress_bindings
+		   SET active_flag = false, refreshed_at = NOW()
+		 WHERE tenant_id = $1 AND active_flag AND NOT (ingress_identifier = ANY($2))`, tenantID, keep)
+	if err != nil {
+		return 0, fmt.Errorf("deactivate ingress bindings: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // TouchIngressBindings marks a tenant's bindings stale so the next resolution
 // re-reads them, and reports how many were affected.
 //
