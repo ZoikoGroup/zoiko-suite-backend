@@ -125,7 +125,10 @@ type Store interface {
 	CreateFXReversalRun(ctx context.Context, run *domain.FXRevaluationRun) (replay bool, err error)
 	GetFXRevaluationRun(ctx context.Context, runID string) (*domain.FXRevaluationRun, error)
 	ListFXRevaluationRuns(ctx context.Context, legalEntityID, fiscalPeriod string) ([]domain.FXRevaluationRun, error)
-	ApproveFXRevaluationRun(ctx context.Context, runID, principalID string, at time.Time) error
+	// ApproveFXRevaluationRun claims the caller's Idempotency-Key
+	// (SPEC_DEVIATIONS A11); PostRevaluation's own already-POSTED check
+	// (not a claim) covers Post, as the doc comment there explains.
+	ApproveFXRevaluationRun(ctx context.Context, run *domain.FXRevaluationRun, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	MarkFXRevaluationPosted(ctx context.Context, runID, journalID, principalID string, at time.Time) error
 
 	// ACC-17 (Opening Balance & Migration) — see domain.MigrationBatch's
@@ -3580,6 +3583,10 @@ func (h *Handler) ReversePriorRevaluation(w http.ResponseWriter, r *http.Request
 // for why ACC-10 gets the same rule as ACC-07/08/09).
 func (h *Handler) ApproveRevaluation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -3601,12 +3608,11 @@ func (h *Handler) ApproveRevaluation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.ApproveFXRevaluationRun(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ RunID string }{id})
+	if _, err := h.store.ApproveFXRevaluationRun(r.Context(), run, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeFXRevaluationErr(w, err)
 		return
 	}
-	run.Status = domain.FXRevaluationStatusApproved
-	run.ApprovedAt, run.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, run)
 }
 
@@ -3807,6 +3813,8 @@ func (h *Handler) writeFXRevaluationErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("FX revaluation store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

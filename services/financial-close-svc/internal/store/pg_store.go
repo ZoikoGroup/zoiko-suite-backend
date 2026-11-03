@@ -1934,24 +1934,31 @@ func (s *PgStore) ListFXRevaluationRuns(ctx context.Context, legalEntityID, fisc
 	return out, nil
 }
 
-func (s *PgStore) ApproveFXRevaluationRun(ctx context.Context, runID, principalID string, at time.Time) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE fx_revaluation_runs SET status = $1, approved_at = $2, approved_by_principal_id = $3
-			WHERE run_id = $4 AND status = $5
-		`, domain.FXRevaluationStatusApproved, at, principalID, runID, domain.FXRevaluationStatusReview)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidFXRevaluationTransition
-		}
-		return nil
-	})
+// ApproveFXRevaluationRun moves run from REVIEW to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApproveFXRevaluationRun(ctx context.Context, run *domain.FXRevaluationRun, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApproveFXRevaluation, requestHash, targetFXRevaluationRun, run.RunID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE fx_revaluation_runs SET status = $1, approved_at = $2, approved_by_principal_id = $3
+				WHERE run_id = $4 AND status = $5
+			`, domain.FXRevaluationStatusApproved, at, principalID, run.RunID, domain.FXRevaluationStatusReview)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return domain.ErrInvalidFXRevaluationTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error {
+			existing, err := loadFXRun(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			*run = *existing
+			return nil
+		})
 }
 
 func (s *PgStore) MarkFXRevaluationPosted(ctx context.Context, runID, journalID, principalID string, at time.Time) error {

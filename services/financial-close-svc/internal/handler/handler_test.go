@@ -1018,20 +1018,30 @@ func (s *stubStore) ListFXRevaluationRuns(_ context.Context, legalEntityID, fisc
 	return out, nil
 }
 
-func (s *stubStore) ApproveFXRevaluationRun(_ context.Context, runID, principalID string, at time.Time) error {
+func (s *stubStore) ApproveFXRevaluationRun(_ context.Context, run *domain.FXRevaluationRun, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveFXRevaluation", hash); err != nil || replay {
+		if replay {
+			if found := s.fxRuns[id]; found != nil {
+				*run = *found
+			}
+		}
+		return replay, err
+	}
 	if s.approveFXErr != nil {
-		return s.approveFXErr
+		return false, s.approveFXErr
 	}
-	run, ok := s.fxRuns[runID]
+	existing, ok := s.fxRuns[run.RunID]
 	if !ok {
-		return domain.ErrFXRevaluationRunNotFound
+		return false, domain.ErrFXRevaluationRunNotFound
 	}
-	if run.Status != domain.FXRevaluationStatusReview {
-		return domain.ErrInvalidFXRevaluationTransition
+	if existing.Status != domain.FXRevaluationStatusReview {
+		return false, domain.ErrInvalidFXRevaluationTransition
 	}
-	run.Status = domain.FXRevaluationStatusApproved
-	run.ApprovedAt, run.ApprovedByPrincipalID = &at, &principalID
-	return nil
+	existing.Status = domain.FXRevaluationStatusApproved
+	existing.ApprovedAt, existing.ApprovedByPrincipalID = &at, &principalID
+	*run = *existing
+	s.recordClaim(key, "ApproveFXRevaluation", hash, run.RunID)
+	return false, nil
 }
 
 func (s *stubStore) MarkFXRevaluationPosted(_ context.Context, runID, journalID, principalID string, at time.Time) error {
@@ -3704,6 +3714,32 @@ func TestStartRevaluation_AssetGain_ComputesCorrectAdjustment(t *testing.T) {
 	_ = json.NewDecoder(rr.Body).Decode(&run)
 	if len(run.Items) != 1 || run.Items[0].AdjustmentAmount != 200.00 {
 		t.Fatalf("expected adjustment 200.00 (4600-4400), got %+v", run.Items)
+	}
+}
+
+// TestApproveRevaluation_RetryUnderSameKeyReplays is the ACC-10 mirror of
+// the ACC-07/08/09 lifecycle tests above (SPEC_DEVIATIONS A11).
+func TestApproveRevaluation_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1",
+		Status: domain.FXRevaluationStatusReview, CreatedByPrincipalID: "preparer-1"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/fx-revaluations/run-1/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/fx-revaluations/run-1/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.FXRevaluationRun
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.FXRevaluationStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
 	}
 }
 

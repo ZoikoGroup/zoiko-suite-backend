@@ -40,6 +40,11 @@ const (
 	// CreateAllocationRule, so it claims that new id instead.
 	CommandApproveAllocationRule   = "ApproveAllocationRule"
 	CommandSupersedeAllocationRule = "SupersedeAllocationRule"
+
+	// ACC-10 FX revaluation approve (SPEC_DEVIATIONS A11). Post already has
+	// its own idempotency (an already-POSTED run returns itself unchanged,
+	// checked in the handler) and is not part of this claim.
+	CommandApproveFXRevaluation = "ApproveFXRevaluation"
 )
 
 // claimTarget is the command_idempotency column naming what a command

@@ -454,8 +454,10 @@ Every command row of the §9–§21 wireframes carries "Idempotency-Key;
 expected_version where stateful". B3 adds claims to the four creates that
 mint an aggregate with no natural key. B10 closes the accrual lifecycle slice
 (Submit/Approve/Amend/Cancel); B11 closes the mirror prepayment slice
-(Approve/Modify/Terminate); B12 closes the ACC-09 allocation rule slice below
-(Approve/Supersede). The remaining commands rely on natural
+(Approve/Modify/Terminate); B12 closes the ACC-09 allocation rule slice
+(Approve/Supersede); B13 closes ACC-10's Approve below (Post already answers
+a replay with the run's current state via its own status check, not a
+claim). The remaining commands rely on natural
 keys or status guards, so a retry after a lost response returns a 4xx
 instead of the original result, or a duplicate append-only row:
 
@@ -467,7 +469,7 @@ instead of the original result, or a duplicate append-only row:
 | Prepayment recognize | original result (natural key) |
 | Allocation approve/supersede | original result (B12, claimed) |
 | Allocation execute / reprocess | original run (natural key / status) |
-| FX approve | 422; post: original (status) |
+| FX approve | original result (B13, claimed); post: original (status) |
 | Migration validate/approve/certify | 422; commit: original (status), now also retries reconciliation |
 | Period soft-close / close-review | 409 `invalid_period_transition` |
 | Period hard-close / reclose | 200 with current state |
@@ -946,3 +948,19 @@ currency, and the platform has nothing to backfill it from.
     `internal/store/allocation_rule_idempotency_integration_test.go` (replay
     for both commands, and the same already-superseded refusal), run against
     a real, disposable Postgres container per the verification note above.
+- **B13. ACC-10's Approve claims an Idempotency-Key; Post is deliberately
+  left as it was (closes A11's FX row).** `ApproveFXRevaluationRun` is a
+  transition, claimed via `transitionWithClaim` exactly like B10/B11/B12's
+  approve commands, targeting `targetFXRevaluationRun`. `PostRevaluation`
+  is NOT given a claim: its own handler-level check — a run already POSTED
+  returns its current state untouched, before any journal-posting work runs
+  — already gives a retry the original result without a second journal,
+  which is the same outcome a claim would produce, and predates this A11
+  pass (it is the spec's own negative path, "Revaluation replay duplicates
+  journal"). Adding `command_idempotency` on top would duplicate, not
+  strengthen, a guard that already works correctly.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestApproveRevaluation_RetryUnderSameKeyReplays`) and
+    `internal/store/fx_revaluation_idempotency_integration_test.go` (replay
+    for Approve), run against a real, disposable Postgres container per the
+    verification note above.

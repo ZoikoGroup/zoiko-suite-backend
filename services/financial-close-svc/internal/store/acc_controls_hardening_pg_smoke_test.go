@@ -106,7 +106,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateFXRevaluationRun(ctx, fx, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateFXRevaluationRun: %v", err)
 	}
-	if err := s.ApproveFXRevaluationRun(ctx, fx.RunID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApproveFXRevaluationRun(ctx, fx, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("FX revaluation self-approval: want ErrSelfApproval, got %v", err)
 	}
 
