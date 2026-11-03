@@ -442,6 +442,232 @@ paths:
 
   # ── Rules (public read) ────────────────────────────────────────────────────
 
+  /v1/admin/jurisdiction-imports:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: ImportJurisdictionUpdate, propose an externally sourced update (REF-01)
+      description: |
+        Proposes an update from an external source (an ISO 3166 edition, a regulator's list) as a
+        batch of rows: `ADD` a jurisdiction, `UPDATE` one (name, authority type, or its parent) or
+        `RETIRE` one, optionally naming its successor. **Proposing changes nothing.** Every row is
+        checked against the registry as it is now and its errors are kept, row by row, so a whole
+        file's problems are reported at once. A batch with a bad row is stored and can be read, but
+        **cannot be approved**.
+
+        A row names a jurisdiction by `jurisdiction_id`, or by `code` and `type` together, never by
+        code alone, because one code can mean a country and a tax authority. A name that matches no
+        active jurisdiction, or more than one, is a row error: the registry does not choose. A row
+        may name, as its parent or successor, a jurisdiction that an earlier row of the same file adds.
+
+        `(source_standard, source_version)` is imported once. The same content again (compared by
+        the import hash of the normalised content, so padding and time zones do not matter) answers
+        `200` with the first batch; different content for the same version is `409
+        import_version_conflict`. A rejected batch frees its version.
+
+        Needs `JURISDICTION_IMPORT_PROPOSE`. The principal who proposes cannot approve.
+      operationId: importJurisdictionUpdate
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProposeImportRequest' }
+      responses:
+        "200":
+          description: This source version was already proposed with the same content.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "201":
+          description: Proposed. Read `invalid_count` and each row's `validation_errors` before asking for approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "409":
+          description: This source version was already proposed or imported with different content (`import_version_conflict`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+    get:
+      tags: [Admin, Jurisdictions]
+      summary: List jurisdiction import batches (REF-01)
+      description: Newest first, without rows. Read one batch for its rows. Needs `JURISDICTION_IMPORT_VIEW`.
+      operationId: listJurisdictionImports
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [PROPOSED, APPROVED, REJECTED] }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: The batches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [imports]
+                properties:
+                  imports:
+                    type: array
+                    items: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}:
+    get:
+      tags: [Admin, Jurisdictions]
+      summary: Get a jurisdiction import batch with its rows (REF-01)
+      description: |
+        The batch, every row as it was sent, each row's validation errors and, once approved, each
+        row's outcome and the jurisdiction it concerned. Needs `JURISDICTION_IMPORT_VIEW`.
+      operationId: getJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The batch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}/approve:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: Approve and apply a jurisdiction import (REF-01)
+      description: |
+        Approval by a principal **other than the proposer** (`403 segregation_of_duties`, also
+        enforced by a database constraint). A batch with a row that failed validation is
+        `422 import_has_invalid_rows`.
+
+        Approval applies every row, in order, **in one transaction: all rows or none.** If a row
+        cannot be applied (the registry moved on since the proposal, or two moves would together
+        make a cycle) nothing is applied, the batch stays `PROPOSED` and the answer is
+        `422 import_row_failed` naming the row. Hierarchy changes are serialised, so two imports
+        approved at once cannot leave a cycle. The registry history records each change against
+        the batch, its evidence and the row's effective date.
+
+        The response carries counts that add up to the number of rows. Publishes, in the same
+        transaction, `jurisdiction.created` for an add, `jurisdiction.deactivated` for a
+        retirement, `jurisdiction.hierarchy.changed` for a move (previous and new parent, and the
+        import) and `jurisdiction.updated` (`change_type` `ATTRIBUTES_CHANGED`, with the previous
+        and current values) for a changed name or authority type. A row that changed nothing
+        publishes nothing. Needs `JURISDICTION_IMPORT_APPROVE`.
+      operationId: approveJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecideImportRequest' }
+      responses:
+        "200":
+          description: Approved and applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: The batch was already decided (`import_already_decided`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "422":
+          description: A row failed validation (`import_has_invalid_rows`), or a row could not be applied and nothing was (`import_row_failed`, with `item_no` and `message`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}/reject:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: Reject a jurisdiction import (REF-01)
+      description: |
+        Rejects a proposed batch, with a `reason` (required). Nothing in the registry changes and
+        the source version can be proposed again. The proposer may reject (withdraw) their own
+        batch. Needs `JURISDICTION_IMPORT_APPROVE`.
+      operationId: rejectJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecideImportRequest' }
+      responses:
+        "200":
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: The batch was already decided (`import_already_decided`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
   /v1/jurisdictions/{jurisdiction_id}/rules:
     get:
       tags: [Rules]
@@ -2648,6 +2874,98 @@ components:
       properties:
         valid_to: { type: string, format: date-time }
         reason: { type: string }
+
+    JurisdictionRef:
+      type: object
+      description: "A jurisdiction named by jurisdiction_id, or by code and type together. A code alone never names one."
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        code: { type: string, maxLength: 32 }
+        type: { type: string, maxLength: 64 }
+
+    ImportItemInput:
+      type: object
+      required: [action, target]
+      properties:
+        action: { type: string, enum: [ADD, UPDATE, RETIRE] }
+        target:
+          description: "What the row is about. For an ADD, the new jurisdiction's code and type; its id is assigned by the registry."
+          $ref: '#/components/schemas/JurisdictionRef'
+        jurisdiction_name: { type: string, maxLength: 500 }
+        authority_type: { type: string, maxLength: 64 }
+        parent:
+          description: "Where the jurisdiction sits. On an UPDATE, absent means unchanged. May name a jurisdiction an earlier row adds."
+          $ref: '#/components/schemas/JurisdictionRef'
+        effective_from:
+          type: string
+          format: date-time
+          description: "Required for an ADD. Optional for an UPDATE (default: when it is applied) and must follow the version in force. Not accepted for a RETIRE, which takes effect when approved."
+        successor:
+          description: "RETIRE only: the jurisdiction that takes over."
+          $ref: '#/components/schemas/JurisdictionRef'
+        note: { type: string, maxLength: 2000 }
+
+    ImportItem:
+      description: "A stored row: what was sent, what validation said and, once approved, what it did."
+      allOf:
+        - $ref: '#/components/schemas/ImportItemInput'
+        - type: object
+          required: [item_no, validation_errors]
+          properties:
+            item_no: { type: integer, minimum: 1 }
+            validation_errors:
+              type: array
+              items: { type: string }
+              description: "Empty when the row passed validation."
+            outcome: { type: string, enum: [ADDED, UPDATED, RETIRED, UNCHANGED] }
+            jurisdiction_id: { type: string, format: uuid }
+
+    ImportBatch:
+      type: object
+      required: [batch_id, source_standard, source_version, import_hash, evidence_ref, summary, status, item_count, invalid_count, proposed_by, proposed_at]
+      properties:
+        batch_id: { type: string, format: uuid }
+        source_standard: { type: string }
+        source_version: { type: string }
+        import_hash:
+          type: string
+          description: "SHA-256 of the normalised content: the same content hashes the same however it was formatted."
+        evidence_ref: { type: string }
+        summary: { type: string }
+        status: { type: string, enum: [PROPOSED, APPROVED, REJECTED] }
+        item_count: { type: integer }
+        invalid_count: { type: integer, description: "Rows that failed validation. A batch with any cannot be approved." }
+        proposed_by: { type: string }
+        proposed_at: { type: string, format: date-time }
+        decided_by: { type: string }
+        decided_at: { type: string, format: date-time }
+        decision_reason: { type: string }
+        added_count: { type: integer }
+        updated_count: { type: integer }
+        retired_count: { type: integer }
+        unchanged_count: { type: integer, description: "With the other three counts, adds up to item_count once approved." }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ImportItem' }
+
+    ProposeImportRequest:
+      type: object
+      required: [source_standard, source_version, evidence_ref, summary, items]
+      properties:
+        source_standard: { type: string, maxLength: 128 }
+        source_version: { type: string, maxLength: 64 }
+        evidence_ref: { type: string, description: "Where the source came from." }
+        summary: { type: string }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 2000
+          items: { $ref: '#/components/schemas/ImportItemInput' }
+
+    DecideImportRequest:
+      type: object
+      properties:
+        reason: { type: string, description: "Required to reject, optional to approve." }
 
     Jurisdiction:
       type: object

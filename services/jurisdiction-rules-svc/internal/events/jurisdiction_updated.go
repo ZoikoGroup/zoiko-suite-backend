@@ -19,14 +19,36 @@ const EventJurisdictionUpdated = "jurisdiction.updated"
 
 // Change types carried by jurisdiction.updated.
 const (
-	ChangeAliasAdded = "ALIAS_ADDED"
-	ChangeAliasEnded = "ALIAS_ENDED"
+	ChangeAliasAdded        = "ALIAS_ADDED"
+	ChangeAliasEnded        = "ALIAS_ENDED"
+	ChangeAttributesChanged = "ATTRIBUTES_CHANGED"
 )
+
+// ImportSource says which external source update a change came from, so a
+// consumer can tie it to the batch, the standard and the version.
+type ImportSource struct {
+	BatchID        string
+	SourceStandard string
+	SourceVersion  string
+	ImportHash     string
+}
+
+func (s *ImportSource) payload() map[string]any {
+	return map[string]any{
+		"batch_id": s.BatchID, "source_standard": s.SourceStandard,
+		"source_version": s.SourceVersion, "import_hash": s.ImportHash,
+	}
+}
 
 // JurisdictionChange says what changed about a jurisdiction.
 type JurisdictionChange struct {
 	Type  string
 	Alias *domain.JurisdictionAlias
+	// Before is the jurisdiction as it was, for an attribute change: the event
+	// then carries the previous and the current name and authority type.
+	Before *domain.Jurisdiction
+	// Import is the source update the change came from, when it came from one.
+	Import *ImportSource
 }
 
 // JurisdictionUpdatePublisher is the optional capability of a Publisher to emit
@@ -64,6 +86,13 @@ func marshalJurisdictionUpdated(j domain.Jurisdiction, c JurisdictionChange) []b
 			"valid_from":        a.ValidFrom,
 			"valid_to":          a.ValidTo,
 		}
+	}
+	if b := c.Before; b != nil {
+		payload["previous"] = map[string]any{"jurisdiction_name": b.JurisdictionName, "authority_type": b.AuthorityType}
+		payload["current"] = map[string]any{"jurisdiction_name": j.JurisdictionName, "authority_type": j.AuthorityType}
+	}
+	if c.Import != nil {
+		payload["import"] = c.Import.payload()
 	}
 	data, _ := json.Marshal(payload)
 	return data

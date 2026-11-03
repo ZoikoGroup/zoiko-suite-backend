@@ -146,7 +146,7 @@ func (s *PgStore) RetireJurisdictionWithQuerier(ctx context.Context, q Querier, 
 		if *p.SupersededBy == p.JurisdictionID {
 			return nil, false, domain.ErrInvalidSuccessor
 		}
-		if _, err := s.FindByID(ctx, *p.SupersededBy); err != nil {
+		if _, err := s.findActiveWith(ctx, q, *p.SupersededBy); err != nil {
 			if errors.Is(err, domain.ErrJurisdictionNotFound) {
 				return nil, false, domain.ErrInvalidSuccessor
 			}

@@ -714,7 +714,7 @@ func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, 
 		if parentID == params.JurisdictionID {
 			return nil, false, domain.ErrCyclicHierarchy
 		}
-		if _, err := s.FindByIDAny(ctx, parentID); err != nil {
+		if _, err := s.findAnyWith(ctx, q, parentID); err != nil {
 			if errors.Is(err, domain.ErrJurisdictionNotFound) {
 				return nil, false, domain.ErrParentNotFound
 			}
@@ -765,7 +765,7 @@ func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, 
 		  AND jurisdiction_type = $2
 		  AND COALESCE(parent_jurisdiction_id, '00000000-0000-0000-0000-000000000000'::UUID) = COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::UUID);`
 
-	row = s.pool.QueryRow(ctx, lookupQuery, params.JurisdictionCode, params.JurisdictionType, params.ParentJurisdictionID)
+	row = q.QueryRow(ctx, lookupQuery, params.JurisdictionCode, params.JurisdictionType, params.ParentJurisdictionID)
 	j, err = scanJurisdiction(row)
 	if err != nil {
 		s.log.Error("pg CreateJurisdiction lookup existing failed", zap.Error(err))
