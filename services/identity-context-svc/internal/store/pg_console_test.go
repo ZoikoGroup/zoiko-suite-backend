@@ -302,3 +302,31 @@ func TestORG01_MergeRefusesStaleOrMissing(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.PrincipalStatusActive, b.Status, "a refused merge changes nothing")
 }
+
+// A suspension leaves no tombstone, so the resume projects the assignment
+// again; a revocation's tombstone still keeps a late grant closed.
+func TestIAM09_SuspendThenResumeReprojects(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	insertPrincipal(t, ctx, pool, "p-1", "t-1", "alice", "ACTIVE")
+	a := domain.PrincipalRoleAssignment{AssignmentID: "pra-1", PrincipalID: "p-1", RoleID: "role-1",
+		EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin"}
+	holders := func() []string {
+		t.Helper()
+		ids, err := s.FindPrincipalIDsByRole(ctx, "role-1", "t-1", time.Now())
+		require.NoError(t, err)
+		return ids
+	}
+
+	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", a))
+	assert.Equal(t, []string{"p-1"}, holders())
+	require.NoError(t, s.SuspendRoleAssignment(ctx, "t-1", "pra-1"))
+	assert.Empty(t, holders())
+	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", a))
+	assert.Equal(t, []string{"p-1"}, holders(), "resume re-projects a suspended assignment")
+
+	require.NoError(t, s.EndRoleAssignment(ctx, "t-1", "pra-1", time.Now()))
+	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", a))
+	assert.Empty(t, holders(), "a late grant after a revocation stays closed")
+}

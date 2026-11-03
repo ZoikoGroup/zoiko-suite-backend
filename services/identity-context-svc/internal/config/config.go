@@ -353,6 +353,7 @@ var DefaultConsumeTopics = []string{
 	"zoiko.delegated-authority.events", // authority.revoked / authority.expired / authority.delegated
 	"zoiko.access-control.events",      // role.updated
 	"zoiko.entity.events",              // entity.updated (tenant-entity-registry-svc)
+	"zoiko.authorization.events",       // iam.assignment.* (authorization-svc, IAM-09)
 }
 
 // Load reads configuration from environment variables with safe defaults.

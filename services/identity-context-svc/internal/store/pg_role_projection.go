@@ -69,6 +69,20 @@ func (s *PgStore) UpsertRoleAssignment(ctx context.Context, tenantID string, a d
 	return nil
 }
 
+// SuspendRoleAssignment removes a suspended assignment from the projection
+// (iam.assignment.suspended). No tombstone: unlike a revocation a suspension
+// is reversible, and iam.assignment.resumed projects the row again.
+func (s *PgStore) SuspendRoleAssignment(ctx context.Context, tenantID, assignmentID string) error {
+	if tenantID == "" || assignmentID == "" {
+		return errors.New("SuspendRoleAssignment: tenant_id and assignment_id are required")
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `DELETE FROM principal_role_assignments WHERE assignment_id = $1 AND tenant_id = $2`,
+			assignmentID, tenantID)
+		return err
+	})
+}
+
 // EndRoleAssignment closes a projected assignment (iam.assignment.revoked).
 // Never extends one: effective_to only moves earlier. The revocation is also
 // recorded as a tombstone, in the same transaction, so a grant for this

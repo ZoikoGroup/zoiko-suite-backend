@@ -141,6 +141,21 @@ channels:
           - $ref: "#/components/messages/AssignmentRevoked"
           - $ref: "#/components/messages/AssignmentGranted"
 
+  zoiko.authorization.events:
+    description: Owned by authorization-svc. Consumed only (IAM-09 role-profile drift).
+    subscribe:
+      summary: |
+        Assignment lifecycle written by authorization-svc's own triggers
+        (000026, 000038). The id is payload.principal_role_assignment_id.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/AssignmentGranted"
+          - $ref: "#/components/messages/AssignmentRevoked"
+          - $ref: "#/components/messages/AssignmentSuspended"
+          - $ref: "#/components/messages/AssignmentResumed"
+          - $ref: "#/components/messages/AssignmentExpired"
+          - $ref: "#/components/messages/AssignmentApproved"
+
   zoiko.entity.events:
     description: Owned by tenant-entity-registry-svc. Consumed only.
     subscribe:
@@ -933,6 +948,36 @@ components:
         principal_role_assignments, the table the resolver frames session
         roles from and handleRoleUpdated finds a role's holders in; it had no
         other feed. A principal unknown here is skipped. Revokes nothing.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentSuspended:
+      name: iam.assignment.suspended
+      title: An assignment was suspended
+      summary: |
+        The holder's sessions end and the assignment leaves the role
+        projection, without a revocation tombstone, so a resume restores it.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentResumed:
+      name: iam.assignment.resumed
+      title: A suspended assignment was resumed
+      summary: Projected again, exactly as iam.assignment.granted.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentExpired:
+      name: iam.assignment.expired
+      title: An assignment reached its end date
+      summary: Handled as iam.assignment.revoked.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentApproved:
+      name: iam.assignment.approved
+      title: A pending assignment was approved
+      summary: Handled as iam.assignment.granted.
       payload:
         $ref: "#/components/schemas/Envelope"
 

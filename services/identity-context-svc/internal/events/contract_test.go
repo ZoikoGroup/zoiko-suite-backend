@@ -86,6 +86,7 @@ func producedEventTypes() []string {
 		events.EventPrincipalStatusChanged,
 		events.EventSubjectDisabled,
 		events.EventSubjectEnabled,
+		events.EventSubjectMerged,
 		events.EventAuthenticationSucceeded,
 		events.EventAuthenticationFailed,
 		events.EventMFAFactorEnrolled,

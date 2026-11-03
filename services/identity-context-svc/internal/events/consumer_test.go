@@ -51,6 +51,7 @@ type fakeRoles struct {
 	byRole    map[string][]string
 	projected map[string]domain.PrincipalRoleAssignment
 	ended     []string
+	suspended []string
 }
 
 func (f *fakeRoles) FindPrincipalIDsByRole(_ context.Context, roleID, _ string, _ time.Time) ([]string, error) {
@@ -66,6 +67,14 @@ func (f *fakeRoles) UpsertRoleAssignment(_ context.Context, _ string, a domain.P
 	f.projected[a.AssignmentID] = a
 	f.byRole[a.RoleID] = append(f.byRole[a.RoleID], a.PrincipalID)
 	return nil
+}
+
+func (f *fakeRoles) SuspendRoleAssignment(ctx context.Context, tenantID, assignmentID string) error {
+	f.suspended = append(f.suspended, assignmentID)
+	err := f.EndRoleAssignment(ctx, tenantID, assignmentID, time.Time{})
+	f.ended = f.ended[:len(f.ended)-1]
+	delete(f.projected, assignmentID)
+	return err
 }
 
 func (f *fakeRoles) EndRoleAssignment(_ context.Context, _, assignmentID string, _ time.Time) error {
