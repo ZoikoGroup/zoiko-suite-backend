@@ -18,7 +18,6 @@ type IC8 struct {
 	MFAVerifications *prometheus.CounterVec
 	LoginLockouts    prometheus.Counter
 	TOTPReplay       prometheus.Counter
-	LoginThrottled   *prometheus.CounterVec
 	SessionsActive   prometheus.Gauge
 	SessionRevoc     *prometheus.CounterVec
 	PasswordResets   *prometheus.CounterVec
@@ -58,10 +57,6 @@ func New(reg prometheus.Registerer) *IC8 {
 			Name: "identity_totp_replay_refusals_total",
 			Help: "TOTP codes refused as replayed or already-used.",
 		}),
-		LoginThrottled: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "identity_login_throttled_total",
-			Help: "Credential requests refused 429 by route.",
-		}, []string{"route"}),
 		SessionsActive: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "identity_sessions_active",
 			Help: "Live sessions held by active principals, gauge.",
@@ -78,7 +73,7 @@ func New(reg prometheus.Registerer) *IC8 {
 
 	prometheus.MustRegister(
 		m.MFAVerifications, m.LoginLockouts, m.TOTPReplay,
-		m.LoginThrottled, m.SessionsActive, m.SessionRevoc, m.PasswordResets,
+		m.SessionsActive, m.SessionRevoc, m.PasswordResets,
 	)
 
 	return m

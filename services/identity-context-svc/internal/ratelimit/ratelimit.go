@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"zoiko.io/identity-context-svc/internal/metrics"
 )
 
 // ClientIP resolves the originating client of r. trusted are the proxies
@@ -237,22 +236,13 @@ func (l *Limiter) get(ctx context.Context, key string) (int64, time.Duration) {
 func (l *Limiter) Attempt(ctx context.Context, endpoint, ip, tenant string) Decision {
 	ipk := hashKey(ip)
 	if n, ttl := l.incr(ctx, "rl:attempt:"+endpoint+":"+ipk, time.Minute); n > int64(l.limits.AttemptsPerIPPerMinute) {
-		if ic8 := metrics.Default(); ic8 != nil {
-			ic8.LoginThrottled.WithLabelValues(endpoint).Inc()
-		}
 		return Decision{RetryAfter: ttl, Reason: "ip_rate"}
 	}
 	if n, ttl := l.get(ctx, "rl:fail:ip:"+ipk); n >= int64(l.limits.FailuresPerIP) {
-		if ic8 := metrics.Default(); ic8 != nil {
-			ic8.LoginThrottled.WithLabelValues(endpoint).Inc()
-		}
 		return Decision{RetryAfter: ttl, Reason: "ip_failures"}
 	}
 	if tenant != "" {
 		if n, ttl := l.get(ctx, "rl:fail:tenant:"+hashKey(tenant)); n >= int64(l.limits.FailuresPerTenant) {
-			if ic8 := metrics.Default(); ic8 != nil {
-				ic8.LoginThrottled.WithLabelValues(endpoint).Inc()
-			}
 			return Decision{RetryAfter: ttl, Reason: "tenant_failures"}
 		}
 	}

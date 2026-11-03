@@ -392,14 +392,15 @@ session revocations by reason, password resets by decision — and the
   when a TOTP factor locks.
 - `internal/store/pg_credentials.go`: `identity_login_lockouts_total`
   incremented when `RecordAuthFailure` engages a lock.
-- `internal/ratelimit/ratelimit.go`: `identity_login_throttled_total{route}`
-  incremented on every 429 throttle decision.
+- `internal/store/pg_credentials.go`: login lockout metric on RecordAuthFailure.
 - `internal/session/durable.go`: `identity_session_revocations_total{reason}`
   incremented on cap-eviction revocations.
 - `internal/lifecycle/service.go`: `identity_password_resets_total{decision}`
   incremented on APPROVE/REJECT in DecideReset.
 - `cmd/server/main.go`: IC8 metrics created and set as default; import aliased
   as `ic8metrics` to avoid shadowing the `metrics` variable from telemetry.
+  (`identity_login_throttled_total` is provided by the OIDC provider, not
+  duplicated here.)
 
 **Evidence:**
 - `go test ./internal/...` — all non-store tests pass, including context,
@@ -431,3 +432,25 @@ metrics configured.
 
 **Commits:**
 - Pre-existing work (no new commits needed for IC-9)
+
+## IC-10 — Contract/docs/live/E2E (2026-11-03)
+
+**Complete without live stack:**
+- OpenAPI contract: both directions green; all schema $refs resolve (verified IC-1 through IC-8)
+- AsyncAPI contract: SessionRevoked summary updated for dual emission (IC-4); all event names resolve
+- `go build ./...` / `go vet ./...` — clean
+- `go test ./internal/...` — all packages pass
+- `go test ./internal/store/ -run TestPgStore` — pass against real Postgres (gdl-test-pg:55432)
+- Silent-skip guard: store suite fails loudly when REQUIRE_DB_TESTS is set without TEST_DATABASE_URL
+- GOV-01 metric families: 12 `identity_context_*` series emitted (>= 9 required by audit.sh §8)
+
+**Requires live stack (docker-compose + all services):**
+- `go test -count=1 ./...` against running service (audit.sh §2)
+- Live service health on http://localhost:8080 (audit.sh §5)
+- GOV-01 contract surface testing (audit.sh §6-7)
+- Telemetry /metrics endpoint (audit.sh §8)
+- Prometheus alert rules (audit.sh §9)
+- Outbox drain check (audit.sh §10)
+- E2E dependency script (e2e-authorization-deps.py)
+- Console screenshots against live service (IC-FE-1..3)
+
