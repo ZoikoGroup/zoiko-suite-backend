@@ -311,6 +311,84 @@ components:
         reason:
           type: string
 
+    Principal:
+      type: object
+      required:
+        - principal_id
+        - tenant_id
+        - principal_type
+        - status
+      properties:
+        principal_id:
+          type: string
+        tenant_id:
+          type: string
+        principal_type:
+          type: string
+          enum: [HUMAN, SERVICE_ACCOUNT, API_CLIENT]
+        identity_provider_subject:
+          type: string
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, SUSPENDED, DISABLED, PENDING_ACTIVATION]
+        created_at:
+          type: string
+          format: date-time
+        record_version:
+          type: integer
+          format: int64
+
+    PasswordResetRequest:
+      type: object
+      required:
+        - request_id
+        - tenant_id
+        - principal_id
+        - requested_by
+        - reason
+        - status
+      properties:
+        request_id:
+          type: string
+        tenant_id:
+          type: string
+        principal_id:
+          type: string
+        requested_by:
+          type: string
+        reason:
+          type: string
+        approvals_required:
+          type: integer
+        approvals:
+          type: array
+          items:
+            type: object
+            properties:
+              approver_id:
+                type: string
+              at:
+                type: string
+                format: date-time
+              decision:
+                type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        decided_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
     # -- GOV-01 completion schemas ----------------------------------------------
     #
     # NOTE: this replaces an earlier ErrorResponse that declared `statusCode`
@@ -970,6 +1048,660 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
           description: authorization-svc is unreachable
+
+  # -- IC-1 subject lifecycle ------------------------------------------------
+  #
+  # Create, invite, activate, reset and govern subjects. Every command is
+  # authorised at the subject it acts on, carries Idempotency-Key on mutations,
+  # requires If-Match on mutations of an existing aggregate, returns ETag on
+  # reads, answers RFC 9457 problems, and writes its events through the outbox
+  # in the same transaction.
+
+  /v1/account/activate:
+    post:
+      summary: Activate a subject from an activation link
+      operationId: activateAccount
+      description: |
+        Pre-session: no verified caller. Redeems a one-time activation link,
+        sets the person's password and marks the subject ACTIVE. Throttled per
+        source IP within the tenant. Never confirms or denies an account.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token:
+                  type: string
+                password:
+                  type: string
+                  format: password
+      responses:
+        "200":
+          description: Subject activated
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Record version of the activated subject
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Malformed body, or link invalid / expired / already used
+        "429":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Rate limited — retry after Retry-After
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Account activation is not configured in this deployment
+
+  /v1/account/password:
+    post:
+      summary: Change the caller's own password
+      operationId: changePassword
+      description: |
+        Self-service password change. The caller proves possession of the
+        current password; no administrator grant is needed. Throttled per
+        source IP within the tenant.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, next_password]
+              properties:
+                current_password:
+                  type: string
+                  format: password
+                next_password:
+                  type: string
+                  format: password
+      responses:
+        "204":
+          description: Password changed
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Malformed body or next password fails policy
+        "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Current password is incorrect
+        "429":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Rate limited — retry after Retry-After
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Self-service password change is not configured in this deployment
+
+  /v1/account/password/forgot:
+    post:
+      summary: Request a password reset link
+      operationId: forgotPassword
+      description: |
+        Pre-session: no verified caller. Sends a reset link to an active
+        person's own address. Answers identically whether or not the account
+        exists (no enumeration). Throttled per source IP within the tenant.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        "202":
+          description: Reset requested (always, to avoid enumeration)
+        "429":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Rate limited — retry after Retry-After
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Forgotten password is not configured in this deployment
+
+  /v1/account/password/reset:
+    post:
+      summary: Complete a password reset from a reset link
+      operationId: completeReset
+      description: |
+        Pre-session: no verified caller. Redeems a one-time reset link, sets
+        the person's password and ends every session the person held.
+        Throttled per source IP within the tenant.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token:
+                  type: string
+                password:
+                  type: string
+                  format: password
+      responses:
+        "200":
+          description: Password reset complete
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Malformed body, or link invalid / expired / already used
+        "429":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Rate limited — retry after Retry-After
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Password reset completion is not configured in this deployment
+
+  /v1/principals:
+    post:
+      summary: Create a subject
+      operationId: createSubject
+      description: |
+        Creates a PENDING_ACTIVATION person (and sends the activation link) or
+        an ACTIVE workload (no password). Authorized at IDENTITY_PRINCIPAL_CREATE.
+        Mutations carry Idempotency-Key; a replay returns the first response.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [principal_type]
+              properties:
+                email:
+                  type: string
+                  format: email
+                display_name:
+                  type: string
+                principal_type:
+                  type: string
+                  enum: [HUMAN, SERVICE_ACCOUNT, API_CLIENT]
+                external_id:
+                  type: string
+                invite:
+                  type: boolean
+      responses:
+        "201":
+          description: Subject created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Principal"
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Malformed body or invalid principal_type
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: The caller lacks IDENTITY_PRINCIPAL_CREATE
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: A principal with this email or external id already exists
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Subject creation is not configured in this deployment
+
+  /v1/principals/{principalId}/invite:
+    post:
+      summary: (Re)send an activation link
+      operationId: inviteSubject
+      description: |
+        Re-sends the activation link to a PENDING_ACTIVATION person.
+        Authorized at IDENTITY_PRINCIPAL_CREATE. Mutation of an existing
+        aggregate — requires If-Match.
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Activation link sent
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Missing or stale If-Match (428/412)
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: The caller lacks IDENTITY_PRINCIPAL_CREATE
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Principal not found, or not awaiting activation
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: The principal is not awaiting activation
+        "428":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: If-Match header is required
+        "412":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: If-Match does not match the current record version
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Subject invitations are not configured in this deployment
+
+  /v1/principals/{principalId}/password-resets:
+    post:
+      summary: Request an administrator-initiated password reset
+      operationId: requestReset
+      description: |
+        Opens an administrator-initiated reset. It issues nothing until
+        independently approved. Authorized at IDENTITY_PASSWORD_RESET_REQUEST.
+        Mutation of an existing aggregate — requires If-Match.
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+      responses:
+        "202":
+          description: Reset requested, awaiting approval
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasswordResetRequest"
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Malformed body or missing/stale If-Match (428/412)
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: |
+            The caller lacks IDENTITY_PASSWORD_RESET_REQUEST, or is the
+            subject (a principal may not request its own reset)
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Principal not found
+        "428":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: If-Match header is required
+        "412":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: If-Match does not match the current record version
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Administrator-initiated reset is not configured in this deployment
+
+  /v1/password-resets/{resetId}/decide:
+    post:
+      summary: Decide an administrator-initiated reset
+      operationId: decideReset
+      description: |
+        Records an approver's APPROVE or REJECT decision. Authorized at
+        IDENTITY_PASSWORD_RESET_APPROVE. The requester and the subject cannot
+        approve (independent approval).
+      parameters:
+        - name: resetId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [APPROVE, REJECT]
+      responses:
+        "200":
+          description: Decision recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasswordResetRequest"
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Malformed body, unknown decision, or missing/stale If-Match (428/412)
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: |
+            The caller lacks IDENTITY_PASSWORD_RESET_APPROVE, is the requester
+            or the subject (independent approval), or step-up is required
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Reset request not found
+        "428":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: If-Match header is required
+        "412":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: If-Match does not match the current record version
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Reset decisions are not configured in this deployment
+
+  /v1/password-resets/{resetId}:
+    get:
+      summary: Read an administrator-initiated reset request
+      operationId: getReset
+      description: |
+        Read of an existing aggregate, authorized at IDENTITY_PRINCIPAL_READ.
+        Returns ETag on success.
+      parameters:
+        - name: resetId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Reset request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasswordResetRequest"
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Record version of the reset request
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: The caller lacks IDENTITY_PRINCIPAL_READ
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Reset request not found
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Reset requests are not configured in this deployment
 
   # -- GOV-01 contract operations ---------------------------------------------
   #

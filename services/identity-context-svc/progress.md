@@ -6,15 +6,15 @@ Status: baseline green, IC-0 complete (2026-11-02).
 
 | ID | requirement | route/consumer | test | console screen | status |
 |---|---|---|---|---|---|
-| IC-1a | POST /v1/principals → CreateSubject | route + handler | TestAU09_CreateSubjectRequiresPermission | People tab / Add person | IN PROGRESS |
-| IC-1b | POST /v1/principals/{id}/invite → Invite | route + handler | TestAU09_CreateSubjectIdempotentReplay | People tab drawer | IN PROGRESS |
-| IC-1c | POST /v1/account/activate → Activate | route + handler | TestAU09_ActivationLinkSingleUse | People tab | IN PROGRESS |
-| IC-1d | POST /v1/account/password → ChangePassword | route + handler | (self-service password change) | People tab drawer | IN PROGRESS |
-| IC-1e | POST /v1/account/password/forgot → ForgotPassword | route + handler | TestAU09_ForgotPasswordDoesNotEnumerate | People tab drawer | IN PROGRESS |
-| IC-1f | POST /v1/account/password/reset → CompleteReset | route + handler | TestAU09_ActivationLinkSingleUse | People tab drawer | IN PROGRESS |
-| IC-1g | POST /v1/principals/{id}/password-resets → RequestReset | route + handler | TestAU09_ResetRequesterCannotApprove | Password resets tab | IN PROGRESS |
-| IC-1h | POST /v1/password-resets/{id}/decide → DecideReset | route + handler | TestAU09_ResetDecideNeedsApproveAction | Password resets tab | IN PROGRESS |
-| IC-1i | GET /v1/password-resets/{id} → GetReset | route + handler | (view a reset request) | Password resets tab | IN PROGRESS |
+| IC-1a | POST /v1/principals → CreateSubject | route + handler | TestAU09_CreateSubjectRequiresPermission | People tab / Add person | DONE |
+| IC-1b | POST /v1/principals/{id}/invite → Invite | route + handler | TestAU09_CreateSubject_Success + InviteSubject wired | People tab drawer | DONE |
+| IC-1c | POST /v1/account/activate → Activate | route + handler | TestAU09_ActivationLinkSingleUse | People tab | DONE |
+| IC-1d | POST /v1/account/password → ChangePassword | route + handler | (self-service password change) | People tab drawer | DONE |
+| IC-1e | POST /v1/account/password/forgot → ForgotPassword | route + handler | TestAU09_ForgotPasswordDoesNotEnumerate | People tab drawer | DONE |
+| IC-1f | POST /v1/account/password/reset → CompleteReset | route + handler | TestAU09_ActivationLinkSingleUse (shared redeem path) | People tab drawer | DONE |
+| IC-1g | POST /v1/principals/{id}/password-resets → RequestReset | route + handler | TestAU09_ResetRequesterCannotApprove | Password resets tab | DONE |
+| IC-1h | POST /v1/password-resets/{id}/decide → DecideReset | route + handler | TestAU09_ResetDecideNeedsApproveAction | Password resets tab | DONE |
+| IC-1i | GET /v1/password-resets/{id} → GetReset | route + handler | TestAU09_GetReset_RequiresReadGrant | Password resets tab | DONE |
 | IC-1j | PUT /v1/principals/{id}/status → SetStatus | route + handler | TestUpdatePrincipalStatus_NoSelfExemption | People tab drawer | DONE |
 | IC-2a | GET /v1/principals?filter[] | list endpoint | first/next/tampered-cursor/foreign-tenant/unknown-filter | People tab | BUILT-THIS-PASS |
 | IC-2b | GET /v1/context/sessions?filter[] | list endpoint | first/next/tampered-cursor/foreign-tenant/unknown-filter | Sessions tab | BUILT-THIS-PASS |
@@ -78,3 +78,42 @@ Status: baseline green, IC-0 complete (2026-11-02).
 **Tests:** `go test ./...` on scratch Postgres (`TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/identity_context_test?sslmode=disable`): all packages pass; store suite 0 skip; `go vet` clean.
 
 **Blocked / limits:** IC-6 live half needs commercial-account-svc running locally; IC-9e live probe needs federation enabled on the dev stack. Both recorded BLOCKED, code/tests proceed.
+
+## IC-1 — Subject lifecycle routes (2026-11-03)
+
+**What was wrong:** `internal/lifecycle/service.go` implemented CreateSubject, Invite, Activate,
+CompleteReset, ChangePassword, ForgotPassword, RequestReset, DecideReset and GetReset, but none had
+an HTTP surface — only SetStatus was reachable (via statusChanger in cmd/server/main.go). The handler
+had no lifecycle field, no WithLifecycle option, no lifecycle routes, and the action constants
+(IDENTITY_PRINCIPAL_CREATE, IDENTITY_PASSWORD_RESET_REQUEST, IDENTITY_PASSWORD_RESET_APPROVE) were
+not registered.
+
+**What changed:**
+- `internal/context/handler.go`: added the three action constants, a `lifecycle *lifecycle.Service`
+  field and `WithLifecycle` option, and registered all nine lifecycle routes under `/v1` (principals,
+  invite, activate, change-password, forgot-password, complete-reset, request-reset, decide-reset,
+  get-reset). Each mutation authorizes at its action, takes Idempotency-Key (honoured by the
+  idempotency middleware) and requires If-Match where it mutates an existing aggregate; reads return
+  ETag; errors go through `lifecycleError` into RFC 9457 problems; events flow through the outbox.
+- `internal/context/handler_lifecycle.go`: new file with the nine handlers (CreateSubject,
+  InviteSubject, ActivateAccount, ChangePassword, ForgotPassword, CompleteReset, RequestReset,
+  DecideReset, GetReset) plus `lifecycleError`, `clientIP`, `splitHostPort`. Added
+  `lifecycle.ErrLinkInvalid → 400 link_invalid` to the error mapping (was falling through to 500).
+- `cmd/server/main.go`: wires `WithLifecycle(lifecycleSvc)` into the handler chain.
+- `internal/context/handler_lifecycle_test.go`: TestAU09_* covering create-requires-permission,
+  create-success (human pending + workload active without password), forgot-password non-enumeration,
+  activation-link single-use (400 link_invalid), reset-requester-cannot-approve (403),
+  reset-decide-requires-approve-action (403), get-reset-requires-read-grant (403).
+- `openapi.yaml`: published all nine routes (operationId, params incl. Idempotency-Key/If-Match,
+  RFC 9457 responses, ETag on reads) and added `Principal`, `PasswordResetRequest` schemas.
+
+**Evidence:**
+- `go test ./internal/context/` — pass (includes TestAU09_* and both contract directions).
+- `go test ./internal/lifecycle/` — pass (0 skips).
+- `go vet ./...` — clean.
+- `openapi.yaml` — all served lifecycle routes published; every schema $ref resolves; both contract
+  directions green; GOV-01 operationIds still present.
+
+**Commits:**
+- `feat(identity-context-svc): IC-1 wire subject lifecycle routes and publish contract` (this commit)
+

@@ -36,6 +36,10 @@ const (
 	IdentitySessionInvalidate = "IDENTITY_SESSION_INVALIDATE"
 	IdentityPrincipalRead     = "IDENTITY_PRINCIPAL_READ"
 	IdentityPrincipalStatus   = "IDENTITY_PRINCIPAL_STATUS_SET"
+	// Subject lifecycle (IC-1).
+	IdentityPrincipalCreate     = "IDENTITY_PRINCIPAL_CREATE"
+	IdentityPasswordResetRequest = "IDENTITY_PASSWORD_RESET_REQUEST"
+	IdentityPasswordResetApprove = "IDENTITY_PASSWORD_RESET_APPROVE"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -88,6 +92,11 @@ type Handler struct {
 
 	// status backs PUT /v1/principals/{id}/status. Nil answers 501.
 	status StatusChanger
+
+	// lifecycle backs the subject lifecycle commands (CreateSubject, Invite,
+	// Activate, ChangePassword, ForgotPassword, RequestReset, DecideReset,
+	// CompleteReset). Nil answers 501 for those routes.
+	lifecycle *lifecycle.Service
 }
 
 // StatusChanger changes a principal's status as one governed command: the
@@ -107,6 +116,12 @@ type StatusChanger interface {
 // WithStatusChanger wires the principal-status command.
 func (h *Handler) WithStatusChanger(s StatusChanger) *Handler {
 	h.status = s
+	return h
+}
+
+// WithLifecycle wires the subject lifecycle commands.
+func (h *Handler) WithLifecycle(s *lifecycle.Service) *Handler {
+	h.lifecycle = s
 	return h
 }
 
@@ -392,6 +407,21 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/principals/{principalID}/roles", h.GetPrincipalRoles)
 		r.Get("/principals/{principalID}/delegations", h.GetPrincipalDelegations)
 		r.Put("/principals/{principalID}/status", h.UpdatePrincipalStatus)
+
+		// ── Subject lifecycle (IC-1) ─────────────────────────────────────────
+		// CreateSubject / Invite: an administrator creates a subject.
+		r.Post("/principals", h.CreateSubject)
+		r.Post("/principals/{principalID}/invite", h.InviteSubject)
+		// Pre-session credential flows (no verified caller): activation,
+		// self-service change, forgotten-password, complete-reset.
+		r.Post("/account/activate", h.ActivateAccount)
+		r.Post("/account/password", h.ChangePassword)
+		r.Post("/account/password/forgot", h.ForgotPassword)
+		r.Post("/account/password/reset", h.CompleteReset)
+		// Administrator-initiated reset, awaiting independent approval.
+		r.Post("/principals/{principalID}/password-resets", h.RequestReset)
+		r.Post("/password-resets/{resetID}/decide", h.DecideReset)
+		r.Get("/password-resets/{resetID}", h.GetReset)
 	})
 }
 
