@@ -50,6 +50,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -981,6 +982,27 @@ func (s *Store) FindEntityStatus(ctx context.Context, legalEntityID, tenantID st
 
 func (s *Store) ProjectEntityStatus(ctx context.Context, params domain.ProjectEntityStatusParams) error {
 	return s.inner.ProjectEntityStatus(ctx, params)
+}
+
+// subjectMerger is the optional inner capability behind RepointMergedSubject;
+// optional so the many Inner test doubles need not grow a method they never use.
+type subjectMerger interface {
+	RepointMergedSubject(ctx context.Context, params domain.RepointMergedSubjectParams) (int, error)
+}
+
+// RepointMergedSubject moves a merged duplicate's assignments to its survivor
+// (identity.subject.merged) and drops the tenant's cached grant sources, so
+// neither subject is answered from the pre-merge grants.
+func (s *Store) RepointMergedSubject(ctx context.Context, params domain.RepointMergedSubjectParams) (int, error) {
+	m, ok := s.inner.(subjectMerger)
+	if !ok {
+		return 0, fmt.Errorf("%w: the inner store cannot re-point a merged subject", domain.ErrStoreUnavailable)
+	}
+	n, err := m.RepointMergedSubject(ctx, params)
+	if err == nil {
+		s.InvalidateGrantSourcesForTenant(params.TenantID)
+	}
+	return n, err
 }
 
 // FindEntityTenant memoises positive answers only. An entity never changes

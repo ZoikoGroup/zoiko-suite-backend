@@ -34,6 +34,17 @@ type lifecycleStub struct {
 
 	entities  []domain.ProjectEntityStatusParams
 	entityErr error
+
+	merges   []domain.RepointMergedSubjectParams
+	mergeErr error
+}
+
+func (s *lifecycleStub) RepointMergedSubject(_ context.Context, p domain.RepointMergedSubjectParams) (int, error) {
+	if s.mergeErr != nil {
+		return 0, s.mergeErr
+	}
+	s.merges = append(s.merges, p)
+	return 1, nil
 }
 
 func (s *lifecycleStub) ProjectPrincipalStatus(_ context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error) {

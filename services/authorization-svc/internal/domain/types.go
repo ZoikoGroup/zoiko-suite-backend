@@ -425,6 +425,16 @@ const (
 
 // ProjectEntityStatusParams is the lifecycle consumer's write for
 // entity.status.changed: latest event wins, older ones are ignored.
+// RepointMergedSubjectParams is identity-context-svc's identity.subject.merged:
+// DuplicateID was retired into SurvivorID (ORG-1 MergeDuplicateIdentity).
+type RepointMergedSubjectParams struct {
+	TenantID      string
+	SurvivorID    string
+	DuplicateID   string
+	Actor         string
+	CorrelationID string
+}
+
 type ProjectEntityStatusParams struct {
 	LegalEntityID   string
 	TenantID        string

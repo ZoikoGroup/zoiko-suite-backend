@@ -73,6 +73,7 @@ channels:
           - $ref: "#/components/messages/PrincipalStatusChanged"
           - $ref: "#/components/messages/SubjectDisabled"
           - $ref: "#/components/messages/SubjectEnabled"
+          - $ref: "#/components/messages/SubjectMerged"
           - $ref: "#/components/messages/LoginSessionStarted"
           - $ref: "#/components/messages/LoginSessionEnded"
           - $ref: "#/components/messages/RefreshTokenReuseDetected"
@@ -331,6 +332,42 @@ components:
         allOf:
           - $ref: "#/components/schemas/Envelope"
           - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    SubjectMerged:
+      name: identity.subject.merged
+      title: A duplicate subject was retired into its survivor (ORG-1 MergeDuplicateIdentity)
+      summary: |
+        Written to the outbox in the merge transaction, with principal.status.changed
+        and identity.subject.disabled for the duplicate. The duplicate's id is never
+        reissued and resolves to the survivor. authorization-svc reissues the
+        duplicate's live assignments to the survivor and ends the duplicate's.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [survivor_id, duplicate_id, tenant_id, actor]
+                properties:
+                  survivor_id:
+                    type: string
+                  duplicate_id:
+                    type: string
+                  principal_id:
+                    type: string
+                    description: The duplicate (the subject whose status changed).
+                  tenant_id:
+                    type: string
+                  new_status:
+                    type: string
+                    enum: [DISABLED]
+                  actor:
+                    type: string
+                  reason:
+                    type: string
+                  correlation_id:
+                    type: string
 
     LoginSessionStarted:
       name: identity.login_session.started
