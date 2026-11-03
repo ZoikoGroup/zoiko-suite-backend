@@ -104,6 +104,7 @@ func TestMain(m *testing.M) {
 		"000010_add_bnk09_authorization_and_events.up.sql",
 		"000011_add_eventing_outbox.up.sql",
 		"000012_eventing_outbox_rls.up.sql",
+		"000013_bnk01_history_reason_columns.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {

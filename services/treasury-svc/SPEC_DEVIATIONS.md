@@ -211,14 +211,31 @@ listed below; **Missing** = no route.
   gate. If tokenized raw identifiers are ever stored, the SoD line
   "sensitive identifier access requires purpose + step-up/JIT policy" applies
   and is unimplemented.
-- **A6. Thin evidence for status changes.**
+- **A6. Thin evidence for status changes. — Closed (migration 000013), one
+  sub-item intentional.**
   - The §7 evidence line asks for "prior/new values, source, verifier,
     effective dates, … actor/approver and reason". `suspend_reason` and
-    `close_reason` are stored on the row, but not in `bank_account_history`
-    or in the event payloads.
-  - Every event after `created` carries an empty correlation ID.
+    `close_reason` were stored on the row but not in `bank_account_history`
+    or the event payloads — migration 000006's own doc comment promised a
+    snapshot of "every field on bank_accounts that a BNK-01 command can
+    change," which these always were. Both columns now exist on
+    `bank_account_history` (migration 000013), are populated by
+    `recordAccountHistory`, are readable back through `GetBankAccount`/
+    `GetBankAccountAsOf`, and appear in the `suspended`/`closed` event
+    payloads. The history trigger (`reject_account_history_mutation`) was
+    extended to cover both new columns, so they are append-only like every
+    other field on that row.
+  - Every event after `created` carried an empty correlation ID —
+    `VerifyOwnershipParams`, `AmendBankAccountMetadataParams`,
+    `ChangeOperationalUseParams`, `SuspendAccountParams`,
+    `ReactivateAccountParams`, `CloseAccountParams` and
+    `RotateAccountTokenParams` all gained a `CorrelationID` field, threaded
+    from each handler's `X-Correlation-ID` header through to
+    `enqueueBankAccountEvent`.
   - `BankAccountChanged` is emitted as three finer events
-    (`metadata-amended`, `operational-use-changed`, `token-rotated`).
+    (`metadata-amended`, `operational-use-changed`, `token-rotated`) — left
+    as is: this is finer-grained evidence, not thinner, and the spec names
+    no single combined event type to conform to instead.
 - **A7. Maker-checker on ownership verification has a legacy hole.** The
   creator-cannot-verify check is `CreatedByPrincipalID != "" && == principal`.
   Accounts created before migration 000003 have an empty creator, so anyone
