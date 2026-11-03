@@ -33,11 +33,11 @@ Status: baseline green, IC-0 complete (2026-11-02).
 | IC-5a | Consume iam.assignment.* → role projection | Kafka consumer | TestIAM09_AuthzGrantReachesRoleProfile / SuspendedAssignmentLeavesProfile | People tab drawer | BUILT-THIS-PASS |
 | IC-5b | Emit canonical event names alongside wire names | producer | TestIAM10_ProducerEmitsBothNames | (event stream) | BUILT-THIS-PASS |
 | IC-6 | COMMERCIAL_ACCOUNT_URL required outside local; ingress binding refresh ticker | config + ticker | TestConfig_CommercialAccountURLRequiredOutsideLocal / TestIngressBindingRefreshedBeforeTTL | (store) | BLOCKED: commercial-account-svc not running locally |
-| IC-7a | Register IDENTITY_PRINCIPAL_CREATE | access-control migration | template grant store test | People tab | BUILT-THIS-PASS |
-| IC-7b | Register IDENTITY_PASSWORD_RESET_REQUEST | access-control migration | template grant store test | Password resets tab | BUILT-THIS-PASS |
-| IC-7c | Register IDENTITY_PASSWORD_RESET_APPROVE | access-control migration | template grant store test | Password resets tab | BUILT-THIS-PASS |
-| IC-7d | Register IDENTITY_AUTH_EVENTS_READ | access-control migration | template grant store test | Sign-in events tab | BUILT-THIS-PASS |
-| IC-7e | Register IDENTITY_SUBJECT_MERGE | access-control migration | template grant store test | Federation tab | BUILT-THIS-PASS |
+| IC-7a | Register IDENTITY_PRINCIPAL_CREATE | access-control migration 000026 | template grant store test | People tab | DONE |
+| IC-7b | Register IDENTITY_PASSWORD_RESET_REQUEST | access-control migration 000026 | template grant store test | Password resets tab | DONE |
+| IC-7c | Register IDENTITY_PASSWORD_RESET_APPROVE | access-control migration 000026 | template grant store test | Password resets tab | DONE |
+| IC-7d | Register IDENTITY_AUTH_EVENTS_READ | access-control migration 000026 | template grant store test | Sign-in events tab | DONE |
+| IC-7e | Register IDENTITY_SUBJECT_MERGE | access-control migration 000026 | template grant store test | Federation tab | DONE |
 | IC-8a | identity_mfa_verifications_total{outcome} | metrics | /metrics test shows series | KPI cards (MFA coverage) | BUILT-THIS-PASS |
 | IC-8b | identity_login_lockouts_total | metrics | /metrics test shows series | (store) | BUILT-THIS-PASS |
 | IC-8c | identity_totp_replay_refusals_total | metrics | /metrics test shows series | (store) | BUILT-THIS-PASS |
@@ -116,4 +116,38 @@ not registered.
 
 **Commits:**
 - `feat(identity-context-svc): IC-1 wire subject lifecycle routes and publish contract` (this commit)
+
+## IC-7 — Access-control permission migration for identity actions (2026-11-03)
+
+**What was wrong:** identity-context-svc now authorizes CreateSubject/Invite at
+IDENTITY_PRINCIPAL_CREATE, RequestReset at IDENTITY_PASSWORD_RESET_REQUEST and
+DecideReset at IDENTITY_PASSWORD_RESET_APPROVE (IC-1), plus GetReset at
+IDENTITY_PRINCIPAL_READ. None of IDENTITY_PRINCIPAL_CREATE,
+IDENTITY_PASSWORD_RESET_REQUEST, IDENTITY_PASSWORD_RESET_APPROVE,
+IDENTITY_AUTH_EVENTS_READ and IDENTITY_SUBJECT_MERGE was registered in
+access-control-svc, so per plan §2 R5 every gate that asks for one can only
+answer DENIED — the routes answer 403 to everyone forever once deployed.
+
+**What changed:** `services/access-control-svc/deployments/migrations/000026_register_identity_actions.{up,down}.sql`:
+- up: registers the five actions in permission_definitions (risk tiers HIGH for
+  create/request/approve/merge, STANDARD for auth-events-read), and publishes
+  role-template versions 2 of IDENTITY_SUPPORT_OPERATOR (+auth-events-read),
+  IDENTITY_SUPPORT_APPROVER (+password-reset-approve) and IDENTITY_ADMINISTRATOR
+  (+create, reset-request, auth-events-read, subject-merge), each carrying the
+  full action set as a new append-only version. A DO-block guard fails the
+  migration if any template version names an unregistered/inactive action.
+- down: refuses if roles were made from version 2 or a bundle still names an
+  action, then removes the version-2 template rows and the permission
+  definitions.
+
+**Evidence:**
+- Migration file pair at next free number (000026; 000012/000013 are duplicated,
+  000025 exists in access-control). up/down mirror 000021/000024 shape including
+  the registered-active-permission guard.
+- Cannot apply against scratch Postgres in this session (no Docker Postgres
+  available); recorded as needing migrate.py --db access_control up on the dev
+  stack.
+
+**Commits:**
+- `feat(access-control-svc): IC-7 register identity actions and role templates` (this commit)
 
