@@ -1456,24 +1456,40 @@ func (s *PgStore) ListAllocationRules(ctx context.Context, legalEntityID string)
 	return out, nil
 }
 
-func (s *PgStore) ApproveAllocationRule(ctx context.Context, ruleVersionID, principalID string, at time.Time) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
+// loadAllocationRuleVersion is the transitionWithClaim/createWithClaim load
+// callback shared by Approve/Supersede: on a replay, *rule is overwritten
+// with the version as it now stands (header plus drivers), the same
+// contract CreateAllocationRule gives.
+func (s *PgStore) loadAllocationRuleVersion(ctx context.Context, tx pgx.Tx, rule *domain.AllocationRule, id string) error {
+	existing, err := scanAllocationRule(tx.QueryRow(ctx, `SELECT `+allocationRuleColumns+` FROM allocation_rules WHERE rule_version_id = $1`, id))
+	if err != nil {
+		return err
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE allocation_rules SET status = $1, approved_at = $2, approved_by_principal_id = $3
-			WHERE rule_version_id = $4 AND status = $5
-		`, domain.AllocationRuleStatusApproved, at, principalID, ruleVersionID, domain.AllocationRuleStatusDraft)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidAllocationRuleTransition
-		}
-		return nil
-	})
+	if existing.Drivers, err = s.loadAllocationDrivers(ctx, tx, id); err != nil {
+		return err
+	}
+	*rule = *existing
+	return nil
+}
+
+// ApproveAllocationRule moves rule from DRAFT to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApproveAllocationRule(ctx context.Context, rule *domain.AllocationRule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApproveAllocationRule, requestHash, targetAllocationRule, rule.RuleVersionID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE allocation_rules SET status = $1, approved_at = $2, approved_by_principal_id = $3
+				WHERE rule_version_id = $4 AND status = $5
+			`, domain.AllocationRuleStatusApproved, at, principalID, rule.RuleVersionID, domain.AllocationRuleStatusDraft)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return domain.ErrInvalidAllocationRuleTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return s.loadAllocationRuleVersion(ctx, tx, rule, id) })
 }
 
 // ActivateAllocationRule moves APPROVED -> ACTIVE on the first successful
@@ -1504,40 +1520,47 @@ func (s *PgStore) ActivateAllocationRule(ctx context.Context, ruleVersionID stri
 // idx_allocation_rules_current_version UNIQUE(rule_id) WHERE effective_to
 // IS NULL is the second, database-enforced one — even a race between two
 // concurrent supersede attempts cannot leave two current versions.
-func (s *PgStore) SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error {
+// SupersedeAllocationRule claims idempotencyKey exactly as
+// CreateAllocationRule does (SPEC_DEVIATIONS A11): it mints a new version
+// (newVersion.RuleVersionID) on every call, so unlike the pure transitions
+// above it uses createWithClaim, not transitionWithClaim. requestHash must
+// therefore be computed from the request body (plus ruleID, which the body
+// does not carry), never from newVersion.RuleVersionID — the caller mints a
+// fresh one on every attempt, including a retry, so folding it into the hash
+// would make a retry never match its own first attempt.
+func (s *PgStore) SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time, idempotencyKey, requestHash string) (replay bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var currentVersion int
-		err := tx.QueryRow(ctx, `
-			UPDATE allocation_rules SET status = $1, effective_to = $2
-			WHERE rule_id = $3 AND effective_to IS NULL AND status IN ($4, $5)
-			RETURNING version
-		`, domain.AllocationRuleStatusSuperseded, supersededAt, ruleID,
-			domain.AllocationRuleStatusApproved, domain.AllocationRuleStatusActive,
-		).Scan(&currentVersion)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrNoCurrentRuleToSupersede
-		}
-		if err != nil {
-			return mapPgError(err)
-		}
+	return s.createWithClaim(ctx, idempotencyKey, CommandSupersedeAllocationRule, requestHash, targetAllocationRule, newVersion.RuleVersionID,
+		func(tx pgx.Tx) error {
+			var currentVersion int
+			err := tx.QueryRow(ctx, `
+				UPDATE allocation_rules SET status = $1, effective_to = $2
+				WHERE rule_id = $3 AND effective_to IS NULL AND status IN ($4, $5)
+				RETURNING version
+			`, domain.AllocationRuleStatusSuperseded, supersededAt, ruleID,
+				domain.AllocationRuleStatusApproved, domain.AllocationRuleStatusActive,
+			).Scan(&currentVersion)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrNoCurrentRuleToSupersede
+			}
+			if err != nil {
+				return mapPgError(err)
+			}
 
-		newVersion.Version = currentVersion + 1
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO allocation_rules (
-				rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
-				source_account_code, status, created_at, created_by_principal_id, currency_code
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''))
-		`, newVersion.RuleVersionID, ruleID, newVersion.Version, tenantID, newVersion.LegalEntityID, newVersion.Name,
-			newVersion.SourceAccountCode, domain.AllocationRuleStatusDraft, newVersion.CreatedAt, newVersion.CreatedByPrincipalID,
-			newVersion.CurrencyCode); err != nil {
-			return mapPgError(err)
-		}
-		return mapPgError(insertAllocationDrivers(ctx, tx, newVersion.RuleVersionID, newVersion.Drivers))
-	})
+			newVersion.Version = currentVersion + 1
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO allocation_rules (
+					rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
+					source_account_code, status, created_at, created_by_principal_id, currency_code
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''))
+			`, newVersion.RuleVersionID, ruleID, newVersion.Version, tenantID, newVersion.LegalEntityID, newVersion.Name,
+				newVersion.SourceAccountCode, domain.AllocationRuleStatusDraft, newVersion.CreatedAt, newVersion.CreatedByPrincipalID,
+				newVersion.CurrencyCode); err != nil {
+				return mapPgError(err)
+			}
+			return mapPgError(insertAllocationDrivers(ctx, tx, newVersion.RuleVersionID, newVersion.Drivers))
+		},
+		func(tx pgx.Tx, id string) error { return s.loadAllocationRuleVersion(ctx, tx, newVersion, id) })
 }
 
 const allocationRunColumns = `

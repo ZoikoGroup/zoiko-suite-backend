@@ -100,10 +100,13 @@ type Store interface {
 	GetCurrentAllocationRule(ctx context.Context, ruleID string) (*domain.AllocationRule, error)
 	GetAllocationRuleVersion(ctx context.Context, ruleVersionID string) (*domain.AllocationRule, error)
 	ListAllocationRules(ctx context.Context, legalEntityID string) ([]domain.AllocationRule, error)
-	ApproveAllocationRule(ctx context.Context, ruleVersionID, principalID string, at time.Time) error
+	// Approve/Supersede claim the caller's Idempotency-Key (SPEC_DEVIATIONS
+	// A11): see internal/store's doc comments on each for why Approve is a
+	// transition claim but Supersede is a create claim.
+	ApproveAllocationRule(ctx context.Context, rule *domain.AllocationRule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	// SupersedeAllocationRule is ACC-09's own SupersedeAllocationRule
 	// command — see its own doc comment in internal/store.
-	SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error
+	SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time, idempotencyKey, requestHash string) (replay bool, err error)
 	ActivateAllocationRule(ctx context.Context, ruleVersionID string) error
 	CreateAllocationRun(ctx context.Context, run *domain.AllocationRun) error
 	GetAllocationRunByRuleAndPeriod(ctx context.Context, ruleID, fiscalPeriod string) (*domain.AllocationRun, error)
@@ -2910,6 +2913,10 @@ func (h *Handler) ListAllocationRules(w http.ResponseWriter, r *http.Request) {
 // sod_allocation_rule_approver_independent).
 func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -2962,12 +2969,11 @@ func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) 
 	}
 
 	now := time.Now().UTC()
-	if err := h.store.ApproveAllocationRule(r.Context(), rule.RuleVersionID, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ RuleVersionID string }{rule.RuleVersionID})
+	if _, err := h.store.ApproveAllocationRule(r.Context(), rule, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeAllocationErr(w, err)
 		return
 	}
-	rule.Status = domain.AllocationRuleStatusApproved
-	rule.ApprovedAt, rule.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, rule)
 }
 
@@ -2978,6 +2984,10 @@ func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) 
 // eligible to post its own allocation run against the same source balance.
 func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.SupersedeAllocationRuleRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -3039,7 +3049,15 @@ func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request
 		CreatedAt:            now,
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.SupersedeAllocationRule(r.Context(), id, newVersion, now); err != nil {
+	requestHash := requestFingerprint(struct {
+		RuleID string
+		Req    domain.SupersedeAllocationRuleRequest
+	}{id, req})
+	replay, err := h.store.SupersedeAllocationRule(r.Context(), id, newVersion, now, idempotencyKey, requestHash)
+	if err != nil {
+		if writeClaimErr(w, err) {
+			return
+		}
 		if errors.Is(err, domain.ErrNoCurrentRuleToSupersede) {
 			writeError(w, http.StatusUnprocessableEntity, "no_current_rule_to_supersede", err.Error())
 			return
@@ -3048,11 +3066,12 @@ func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-
-	newVersion.RuleID = id
-	newVersion.TenantID = current.TenantID
-	newVersion.Status = domain.AllocationRuleStatusDraft
-	writeJSON(w, http.StatusCreated, newVersion)
+	if !replay {
+		newVersion.RuleID = id
+		newVersion.TenantID = current.TenantID
+		newVersion.Status = domain.AllocationRuleStatusDraft
+	}
+	writeCreateResult(w, replay, newVersion)
 }
 
 // allocationAmountsFor computes each driver's share of sourceAmount,
@@ -3349,6 +3368,8 @@ func (h *Handler) writeAllocationErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("allocation store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

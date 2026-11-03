@@ -806,30 +806,60 @@ func (s *stubStore) ListAllocationRules(_ context.Context, legalEntityID string)
 	return out, nil
 }
 
-func (s *stubStore) ApproveAllocationRule(_ context.Context, ruleVersionID, principalID string, at time.Time) error {
-	if s.approveRuleErr != nil {
-		return s.approveRuleErr
-	}
+// findAllocationRuleVersion searches the current-version-only map by
+// rule_version_id, since a superseded (non-current) version is never stored
+// — real enough for these stub tests, which never replay against a version
+// that has since been superseded again.
+func (s *stubStore) findAllocationRuleVersion(id string) *domain.AllocationRule {
 	for _, rule := range s.allocationRules {
-		if rule.RuleVersionID == ruleVersionID {
-			if rule.Status != domain.AllocationRuleStatusDraft {
-				return domain.ErrInvalidAllocationRuleTransition
-			}
-			rule.Status = domain.AllocationRuleStatusApproved
-			rule.ApprovedAt, rule.ApprovedByPrincipalID = &at, &principalID
-			return nil
+		if rule.RuleVersionID == id {
+			return rule
 		}
 	}
-	return domain.ErrAllocationRuleNotFound
+	return nil
 }
 
-func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error {
+func (s *stubStore) ApproveAllocationRule(_ context.Context, rule *domain.AllocationRule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveAllocationRule", hash); err != nil || replay {
+		if replay {
+			if found := s.findAllocationRuleVersion(id); found != nil {
+				*rule = *found
+			}
+		}
+		return replay, err
+	}
+	if s.approveRuleErr != nil {
+		return false, s.approveRuleErr
+	}
+	existing := s.findAllocationRuleVersion(rule.RuleVersionID)
+	if existing == nil {
+		return false, domain.ErrAllocationRuleNotFound
+	}
+	if existing.Status != domain.AllocationRuleStatusDraft {
+		return false, domain.ErrInvalidAllocationRuleTransition
+	}
+	existing.Status = domain.AllocationRuleStatusApproved
+	existing.ApprovedAt, existing.ApprovedByPrincipalID = &at, &principalID
+	*rule = *existing
+	s.recordClaim(key, "ApproveAllocationRule", hash, rule.RuleVersionID)
+	return false, nil
+}
+
+func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "SupersedeAllocationRule", hash); err != nil || replay {
+		if replay {
+			if found := s.findAllocationRuleVersion(id); found != nil {
+				*newVersion = *found
+			}
+		}
+		return replay, err
+	}
 	if s.supersedeRuleErr != nil {
-		return s.supersedeRuleErr
+		return false, s.supersedeRuleErr
 	}
 	current, ok := s.allocationRules[ruleID]
 	if !ok || (current.Status != domain.AllocationRuleStatusApproved && current.Status != domain.AllocationRuleStatusActive) {
-		return domain.ErrNoCurrentRuleToSupersede
+		return false, domain.ErrNoCurrentRuleToSupersede
 	}
 	newVersion.Version = current.Version + 1
 	newVersion.RuleID = ruleID
@@ -837,7 +867,8 @@ func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, ne
 	newVersion.Status = domain.AllocationRuleStatusDraft
 	cp := *newVersion
 	s.allocationRules[ruleID] = &cp
-	return nil
+	s.recordClaim(key, "SupersedeAllocationRule", hash, newVersion.RuleVersionID)
+	return false, nil
 }
 
 func (s *stubStore) ActivateAllocationRule(_ context.Context, ruleVersionID string) error {
@@ -3261,6 +3292,79 @@ func createApprovedAllocationRule(t *testing.T, s *stubStore, cl *stubClients, r
 		t.Fatalf("approve rule failed: %d %s", rr.Code, rr.Body.String())
 	}
 	return rule.RuleID
+}
+
+// TestApproveAllocationRule_RetryUnderSameKeyReplays and
+// TestSupersedeAllocationRule_RetryUnderSameKeyReplays are the ACC-09 mirror
+// of the ACC-07/ACC-08 lifecycle tests above (SPEC_DEVIATIONS A11).
+func TestApproveAllocationRule_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE", "6200-Ops": "ACTIVE"}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	req := domain.CreateAllocationRuleRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Name: "IT shared cost", SourceAccountCode: "5000-IT",
+		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 60}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 40}},
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/allocation-rules/", req, "preparer-1")
+	var rule domain.AllocationRule
+	_ = json.NewDecoder(createRR.Body).Decode(&rule)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+rule.RuleID+"/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+rule.RuleID+"/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AllocationRule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.AllocationRuleStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
+func TestSupersedeAllocationRule_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE", "6200-Ops": "ACTIVE"}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	ruleID := createApprovedAllocationRule(t, s, cl, r, []domain.AllocationDriver{
+		{RecipientAccountCode: "6100-Sales", WeightPercentage: 60}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 40},
+	})
+
+	req := domain.SupersedeAllocationRuleRequest{
+		CurrencyCode: testCurrency, Name: "IT shared cost (revised)", SourceAccountCode: "5000-ITSharedCost",
+		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 50}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 50}},
+	}
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first supersede: %d %s", first.Code, first.Body.String())
+	}
+	var firstVersion domain.AllocationRule
+	_ = json.NewDecoder(first.Body).Decode(&firstVersion)
+
+	retry := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried supersede under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AllocationRule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.RuleVersionID != firstVersion.RuleVersionID {
+		t.Fatalf("retry minted a second version: first %s, retry %s", firstVersion.RuleVersionID, replayed.RuleVersionID)
+	}
+
+	// A genuinely new attempt (a different key) must mint its own, distinct
+	// version rather than ever colliding with the replay logic above.
+	other := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, uuid.NewString())
+	if other.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("second genuine supersede attempt (rule already superseded by the first): want 422, got %d %s", other.Code, other.Body.String())
+	}
 }
 
 func evenDrivers() []domain.AllocationDriver {

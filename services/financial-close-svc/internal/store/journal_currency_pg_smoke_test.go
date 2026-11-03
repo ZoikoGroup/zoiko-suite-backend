@@ -72,12 +72,12 @@ func TestPgStore_JournalCurrency_RequiredAndWellFormedOnInsert_RealDB(t *testing
 	if _, err := s.CreateAllocationRule(ctx, rule, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
-	if err := s.ApproveAllocationRule(ctx, rule.RuleID, "approver-1", now); err != nil {
+	if _, err := s.ApproveAllocationRule(ctx, rule, "approver-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("ApproveAllocationRule: %v", err)
 	}
 	next := &domain.AllocationRule{RuleVersionID: uuid.New().String(), LegalEntityID: "le-1", Name: "IT v2", SourceAccountCode: "5000-IT",
 		CreatedAt: now, CreatedByPrincipalID: "preparer-2", Drivers: rule.Drivers}
-	if err := s.SupersedeAllocationRule(ctx, rule.RuleID, next, now); !errors.Is(err, domain.ErrCurrencyCodeMissing) {
+	if _, err := s.SupersedeAllocationRule(ctx, rule.RuleID, next, now, uuid.NewString(), testRequestHash); !errors.Is(err, domain.ErrCurrencyCodeMissing) {
 		t.Fatalf("supersede without currency: want ErrCurrencyCodeMissing, got %v", err)
 	}
 }

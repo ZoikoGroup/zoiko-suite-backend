@@ -47,6 +47,15 @@ A5 remains open and now records the new GL column a future DB-level guard must
 consult. Verification is under A4; the full plain and integration-tagged
 suites were re-run against a fresh disposable `postgres:16` container.
 
+Update (2026-11-03, A11 pass): closes A11's accrual (B10), prepayment (B11)
+and allocation-rule (B12) lifecycle slices, and corrects a real bug found
+while doing so — `transitionWithClaim` never refreshed the caller's struct
+after a genuinely new, successful transition, only on replay (see the
+correction note under B11/B12). Every claim-chain test in this pass was run
+with `TEST_DATABASE_URL` pointed at a real, disposable Postgres instance so
+it could not silently skip; the full `internal/store` `-tags=integration`
+suite was re-run the same way afterward.
+
 ## Verified controls
 
 Checked against code and schema, not comments:
@@ -444,8 +453,9 @@ recorded under that id in the tenant.
 Every command row of the §9–§21 wireframes carries "Idempotency-Key;
 expected_version where stateful". B3 adds claims to the four creates that
 mint an aggregate with no natural key. B10 closes the accrual lifecycle slice
-(Submit/Approve/Amend/Cancel); B11 closes the mirror prepayment slice below
-(Approve/Modify/Terminate). The remaining commands rely on natural
+(Submit/Approve/Amend/Cancel); B11 closes the mirror prepayment slice
+(Approve/Modify/Terminate); B12 closes the ACC-09 allocation rule slice below
+(Approve/Supersede). The remaining commands rely on natural
 keys or status guards, so a retry after a lost response returns a 4xx
 instead of the original result, or a duplicate append-only row:
 
@@ -455,7 +465,7 @@ instead of the original result, or a duplicate append-only row:
 | Accrual recognize / reverse | original result (natural key) |
 | Prepayment approve/modify/terminate | original result (B11, claimed) |
 | Prepayment recognize | original result (natural key) |
-| Allocation approve/supersede | 422 |
+| Allocation approve/supersede | original result (B12, claimed) |
 | Allocation execute / reprocess | original run (natural key / status) |
 | FX approve | 422; post: original (status) |
 | Migration validate/approve/certify | 422; commit: original (status), now also retries reconciliation |
@@ -866,3 +876,73 @@ currency, and the platform has nothing to backfill it from.
     `TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB` and
     `TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB` were updated
     for the new signatures.
+
+- **Correction to B10/B11 found while adding B12 (`transitionWithClaim` never
+  refreshed the caller's struct on a genuinely new, successful transition).**
+  `transitionWithClaim` originally just called `createWithClaim`.
+  `createWithClaim`'s own non-replay path never calls its `load` callback —
+  correct for a create, whose caller-supplied struct already holds exactly
+  what it is about to insert — but wrong for a transition, whose
+  caller-supplied struct reflects the resource's state *before* the
+  transition. The result: a genuinely new (non-replay) Submit, Approve,
+  Amend or Cancel left the handler's in-memory schedule exactly as the GET
+  had returned it — e.g. still `DRAFT` after a successful Submit — so a real
+  client's first call to any of these got back a response whose status had
+  not moved, even though the row in the database had. Only a *replay* (the
+  second call under the same key) ever returned the correct, current state,
+  because only the replay path calls `load`.
+  - *Why the stub-backed handler tests never caught it.* Every stub
+    implementation in `handler_test.go` explicitly copies the updated row
+    back into the caller's struct on its own first-success path (`*sch =
+    *s.schedules[...]`), independently of the claim/replay machinery. That
+    was written to match the *intended* behavior, which happened to diverge
+    from what `PgStore` actually did — a test double drifting from the real
+    implementation it stands in for.
+  - *How it surfaced.* Running the `openTestPool`-based integration suites
+    (`acc_controls_hardening_pg_smoke_test.go`,
+    `accrual_lifecycle_idempotency_integration_test.go`, and this pass's own
+    new tests) against a real, disposable Postgres with `TEST_DATABASE_URL`
+    exported — not the `tenant_isolation_test.go` `TestMain`, which starts
+    its own embedded Postgres for a *different* set of tests and does not
+    export `TEST_DATABASE_URL`, so every `openTestPool`-based test silently
+    skips unless the variable is set from outside the test binary. The B10
+    and B11 commits had only ever been verified with it unset, so this
+    defect shipped in both without a real-database test ever having run
+    against the new code paths.
+  - *The fix.* `transitionWithClaim` is no longer a one-line call to
+    `createWithClaim`; it has its own full attempt/retry loop that calls
+    `load(tx, targetID)` once more, in the same transaction, immediately
+    after a successful `perform` and claim insert — so both the replay path
+    and the genuinely-new-success path now leave the caller's struct current.
+    `createWithClaim` itself is untouched: the four aggregate creates (B3)
+    never needed this and still don't.
+  - *Verification.* Every B10/B11/B12 test was re-run with
+    `TEST_DATABASE_URL` pointed at a real, disposable Postgres instance (not
+    skipped), and the whole `internal/store` package's `-tags=integration`
+    suite was run the same way afterward — all pass. This is now the
+    standard this register holds every future `A11` pass to: a claim-chain
+    test that only ever ran skipped is not verification.
+
+- **B12. The ACC-09 allocation rule lifecycle claims an Idempotency-Key
+  (closes A11's allocation row).** `ApproveAllocationRule` and
+  `SupersedeAllocationRule` now require `Idempotency-Key`.
+  - *Two different claim shapes, same table.* `ApproveAllocationRule` is a
+    transition — it claims the EXISTING `rule_version_id` via
+    `transitionWithClaim`, the same shape B10/B11 use. `SupersedeAllocationRule`
+    is not: it mints a brand-new `rule_version_id` on every call (the handler
+    generates a fresh UUID even on a retry), so it uses `createWithClaim`
+    directly, exactly like `CreateAllocationRule` (B3) — the claim's target is
+    the *new* version's id, and `requestHash` is computed from the request
+    body plus the path's `rule_id` (never from the freshly-minted version id,
+    which would make a retry's own fresh id fail to match its first attempt's
+    hash). Both claim `targetAllocationRule` (`allocation_rule_version_id`);
+    the `command` column disambiguates which of the two (or `CreateAllocationRule`)
+    a given key was used for.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestApproveAllocationRule_RetryUnderSameKeyReplays`,
+    `TestSupersedeAllocationRule_RetryUnderSameKeyReplays`, the latter also
+    proving a retry mints no second version and a genuinely new key against
+    an already-superseded rule is refused) and
+    `internal/store/allocation_rule_idempotency_integration_test.go` (replay
+    for both commands, and the same already-superseded refusal), run against
+    a real, disposable Postgres container per the verification note above.

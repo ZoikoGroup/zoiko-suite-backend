@@ -94,7 +94,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateAllocationRule(ctx, rule, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
-	if err := s.ApproveAllocationRule(ctx, ruleID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApproveAllocationRule(ctx, rule, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("allocation rule self-approval: want ErrSelfApproval, got %v", err)
 	}
 
