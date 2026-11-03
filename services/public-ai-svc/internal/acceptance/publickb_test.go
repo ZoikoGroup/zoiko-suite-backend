@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -268,5 +269,111 @@ func TestK11_SameArticleSectionsCombined(t *testing.T) {
 		if !strings.HasPrefix(c.SourceVersionID, "kb-legal-contracts-") {
 			t.Fatalf("citation from another article: %+v", r.Citations)
 		}
+	}
+}
+
+// A trial question for a market whose claims expired is not a dead end: the
+// other markets and the general overview are offered, and naming another
+// country answers the same question (Doc 02 §10). The public KB's GB trial
+// claims end 2026-06-30; this test needs them expired and the US ones live.
+func TestK12_ExpiredMarketOffersNextSteps(t *testing.T) {
+	k := newKB(t)
+	in := func(msg string, pd *orchestrator.Pending) orchestrator.Result {
+		return k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: msg, Locale: "en-US", Pending: pd})
+	}
+	ask := in("Is there a free trial?", nil)
+	if ask.Status != contract.Clarify || ask.Pending == nil {
+		t.Fatalf("trial question: %s %+v", ask.Status, ask.Pending)
+	}
+	uk := in("United Kingdom", ask.Pending)
+	if uk.Status != contract.Abstain || uk.Reason != "EXPIRED_SOURCE" {
+		t.Skipf("GB trial claims are no longer expired (%s %s); test data changed", uk.Status, uk.Reason)
+	}
+	var labels []string
+	for _, s := range uk.Suggestions {
+		labels = append(labels, s.Label)
+	}
+	if !slices.Equal(labels, []string{"United States", "Show general overview"}) || uk.Pending == nil || uk.Pending.Intent != "I06" {
+		t.Fatalf("next steps %v, pending %+v", labels, uk.Pending)
+	}
+	us := in("United States", uk.Pending)
+	if us.Status != contract.Answered || us.IntentID != "I06" || us.MarketCode != "US" {
+		t.Fatalf("US after expired UK: %s %s %s %q", us.Status, us.IntentID, us.MarketCode, us.Text)
+	}
+}
+
+// Doc 02 golden cases found in manual testing (2026-10-30), as conversations.
+func TestK13_GoldenConversations(t *testing.T) {
+	k := newKB(t)
+	in := func(msg string, pd *orchestrator.Pending) orchestrator.Result {
+		return k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: msg, Locale: "en-US", Pending: pd})
+	}
+
+	// G05: after a US price answer, "what about the UK, monthly?" asks the
+	// same question for the UK and monthly billing; US figures are dropped.
+	us := in("What do the plans cost in the United States?", nil)
+	if us.Status != contract.Answered || us.MarketCode != "US" {
+		t.Fatalf("G05 US: %s %s", us.Status, us.MarketCode)
+	}
+	uk := in("what about the UK, monthly?", us.Pending)
+	if uk.IntentID != "I05" || uk.MarketCode == "US" || strings.Contains(uk.Text, "United States") {
+		t.Fatalf("G05 UK follow-up: %s %s %s %q", uk.Status, uk.IntentID, uk.MarketCode, uk.Text)
+	}
+	if uk.Status == contract.Answered && strings.Contains(strings.ToLower(uk.Text), "per year") {
+		t.Fatalf("G05: monthly asked, annual given: %q", uk.Text)
+	}
+
+	// G34: an unrelated message after the market question is a new question,
+	// never the same clarification again.
+	ask := in("What do the plans cost?", nil)
+	if ask.Status != contract.Clarify {
+		t.Fatalf("price question: %s", ask.Status)
+	}
+	if r := in("Turn off Wi-Fi, ask anything", ask.Pending); r.Status == contract.Clarify {
+		t.Fatalf("G34: clarification repeated for an unrelated message: %q", r.Text)
+	}
+
+	// G06 / G13: a named market without claims or material is not assumed
+	// covered; a trial question also offers the markets that have claims.
+	for _, q := range []string{"Is there a 30-day trial in Jamaica?", "Do you run payroll in Jamaica?"} {
+		r := in(q, nil)
+		if r.Status != contract.Abstain || r.Reason != contract.ReasonMarketNotCovered {
+			t.Fatalf("%q: %s %s %q", q, r.Status, r.Reason, r.Text)
+		}
+	}
+	if r := in("Is there a 30-day trial in Jamaica?", nil); len(r.Suggestions) == 0 || r.Pending == nil {
+		t.Fatalf("G06 next steps: %+v pending %+v", r.Suggestions, r.Pending)
+	}
+
+	// G01, G11, G15, G20: answered or routed as the documents say.
+	if r := in("what is the zoiko suite", nil); r.IntentID != "I01" || r.Reason == "OUT_OF_SCOPE" {
+		t.Fatalf("G01: %s %s", r.IntentID, r.Reason)
+	}
+	if r := in("Does our data never leave the UK?", nil); r.IntentID != "I14" || !strings.Contains(r.Text, "Data residency needs to be evaluated") {
+		t.Fatalf("G11 (Doc 02 T11 wording): %s %q", r.IntentID, r.Text)
+	}
+	if r := in("Can AI run approvals automatically?", nil); r.IntentID != "I15" {
+		t.Fatalf("G15: %s %q", r.IntentID, r.Text)
+	}
+	if r := in("We have a security breach right now!", nil); r.IntentID != "X05" || r.Status != contract.Handoff {
+		t.Fatalf("G20: %s %s %q", r.IntentID, r.Status, r.Text)
+	}
+}
+
+// Manual testing round 3 (2026-10-30).
+func TestK14_RegionalCoverageAndBillingFollowUp(t *testing.T) {
+	k := newKB(t)
+	in := func(msg string) orchestrator.Result {
+		return k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: msg, Locale: "en-US"})
+	}
+	// Billing + country with no earlier pricing question is still price (I05).
+	if r := in("what about the UK, monthly?"); r.IntentID != "I05" || r.Status != contract.Answered || r.MarketCode != "GB" ||
+		!strings.Contains(r.Text, "per month") || strings.Contains(r.Text, "per year") {
+		t.Fatalf("billing follow-up without context: %s %s %s %q", r.Status, r.IntentID, r.MarketCode, r.Text)
+	}
+	// Regional coverage not assumed, and the demo route is offered (Doc 02 escalation matrix).
+	r := in("Payroll in Jamaica?")
+	if r.Reason != contract.ReasonMarketNotCovered || len(r.Suggestions) != 1 || r.Suggestions[0].Label != "Book a demo" {
+		t.Fatalf("regional coverage: %s %+v", r.Reason, r.Suggestions)
 	}
 }

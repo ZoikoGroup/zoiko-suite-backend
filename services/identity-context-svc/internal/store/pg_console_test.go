@@ -303,7 +303,7 @@ func TestORG01_MergeRefusesStaleOrMissing(t *testing.T) {
 	assert.Equal(t, domain.PrincipalStatusActive, b.Status, "a refused merge changes nothing")
 }
 
-// A suspension leaves no tombstone, so the resume projects the assignment
+// A suspension leaves no tombstone, so the resume frames the assignment
 // again; a revocation's tombstone still keeps a late grant closed.
 func TestIAM09_SuspendThenResumeReprojects(t *testing.T) {
 	ctx := context.Background()
@@ -321,10 +321,11 @@ func TestIAM09_SuspendThenResumeReprojects(t *testing.T) {
 
 	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", a))
 	assert.Equal(t, []string{"p-1"}, holders())
-	require.NoError(t, s.SuspendRoleAssignment(ctx, "t-1", "pra-1"))
+	suspendedAt := time.Now().UTC()
+	require.NoError(t, s.SuspendRoleAssignment(ctx, "t-1", "pra-1", suspendedAt))
 	assert.Empty(t, holders())
-	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", a))
-	assert.Equal(t, []string{"p-1"}, holders(), "resume re-projects a suspended assignment")
+	require.NoError(t, s.ResumeRoleAssignment(ctx, "t-1", "pra-1", suspendedAt.Add(time.Minute)))
+	assert.Equal(t, []string{"p-1"}, holders(), "resume frames a suspended assignment again")
 
 	require.NoError(t, s.EndRoleAssignment(ctx, "t-1", "pra-1", time.Now()))
 	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", a))

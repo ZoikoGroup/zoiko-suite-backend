@@ -25,6 +25,10 @@ const (
 	PerIntentDisable       = "per_intent_disable"
 	ApprovedFallbackMode   = "approved_fallback_mode"
 	MaxConcurrentTurns     = "max_concurrent_turns"
+	// StructuredResponseEnabled turns on GET /menu and the structured turn
+	// fields (outcome, followups, cta, resolved citations). Off by default
+	// so existing clients see the unchanged contract (ADR-008).
+	StructuredResponseEnabled = "structured_response_enabled"
 )
 
 // Values is the effective flag set.
@@ -37,6 +41,7 @@ type Values struct {
 	DisabledIntents        map[string]bool
 	FallbackMode           string // "" or "static"
 	MaxConcurrentTurns     int
+	StructuredResponse     bool
 }
 
 // Defaults apply when a flag was never set.
@@ -91,6 +96,8 @@ func apply(v *Values, name string, raw []byte) error {
 		}
 		v.FallbackMode = m
 		return nil
+	case StructuredResponseEnabled:
+		return json.Unmarshal(raw, &v.StructuredResponse)
 	case MaxConcurrentTurns:
 		if err := json.Unmarshal(raw, &v.MaxConcurrentTurns); err != nil {
 			return err

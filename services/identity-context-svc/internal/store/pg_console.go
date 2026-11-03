@@ -393,6 +393,11 @@ const hasSecondFactor = `(EXISTS (SELECT 1 FROM principal_credentials c
 	 OR EXISTS (SELECT 1 FROM webauthn_credentials w
 	    WHERE w.principal_id = p.principal_id AND w.tenant_id = p.tenant_id AND w.status = 'ACTIVE'))`
 
+// assignmentNotSuspended is notSuspended on alias a: a suspended assignment
+// stays in the projection (000016) but holds nothing until it is resumed.
+const assignmentNotSuspended = `
+			     AND NOT (a.suspended_at IS NOT NULL AND (a.resumed_at IS NULL OR a.suspended_at > a.resumed_at))`
+
 // GetIdentitySummary counts what the console's KPI cards and panels show.
 func (s *PgStore) GetIdentitySummary(ctx context.Context, tenantID string) (*IdentitySummary, error) {
 	out := &IdentitySummary{
@@ -431,7 +436,7 @@ func (s *PgStore) GetIdentitySummary(ctx context.Context, tenantID string) (*Ide
 			{`SELECT COUNT(DISTINCT p.principal_id) FROM principals p
 			    JOIN principal_role_assignments a ON a.principal_id = p.principal_id AND a.tenant_id = p.tenant_id
 			   WHERE p.tenant_id = $1 AND p.status = 'ACTIVE' AND p.principal_type = 'HUMAN'
-			     AND a.effective_from <= NOW() AND a.effective_to > NOW()
+			     AND a.effective_from <= NOW() AND a.effective_to > NOW()` + assignmentNotSuspended + `
 			     AND a.role_id ILIKE '%ADMIN%' AND NOT ` + hasSecondFactor, &out.AdminsWithoutMFA},
 			{`SELECT COUNT(*) FROM support_contexts WHERE tenant_id = $1 AND approval_status = 'PENDING_APPROVAL' AND revoked_at IS NULL`, &out.SupportPendingApproval},
 			{`SELECT COUNT(*) FROM support_contexts WHERE tenant_id = $1 AND approval_status = 'APPROVED' AND revoked_at IS NULL AND expires_at > NOW()`, &out.SupportActive},
@@ -490,7 +495,7 @@ func (s *PgStore) GetIdentitySummary(ctx context.Context, tenantID string) (*Ide
 			  FROM principal_role_assignments a
 			  JOIN principals p ON p.principal_id = a.principal_id AND p.tenant_id = a.tenant_id
 			 WHERE a.tenant_id = $1 AND p.status = 'ACTIVE' AND p.principal_type = 'HUMAN'
-			   AND a.effective_from <= NOW() AND a.effective_to > NOW()
+			   AND a.effective_from <= NOW() AND a.effective_to > NOW()`+assignmentNotSuspended+`
 			 GROUP BY a.role_id ORDER BY 2 DESC, 1 LIMIT 8`, tenantID)
 		if err != nil {
 			return fmt.Errorf("identity summary roles: %w", err)

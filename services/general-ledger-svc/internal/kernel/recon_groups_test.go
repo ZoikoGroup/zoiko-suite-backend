@@ -36,7 +36,7 @@ func TestCreditNormalGroupsAreCompareOnTheCreditSide(t *testing.T) {
 
 func TestEveryReconciliationTypeHasItsControl(t *testing.T) {
 	for _, typ := range ReconTypes {
-		if typ == ReconEventPosting {
+		if ownSided(typ) {
 			continue
 		}
 		if _, ok := controlOf[typ]; !ok {

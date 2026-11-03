@@ -72,27 +72,30 @@ func TestIAM13IT_SuspendResumeAndAsOf(t *testing.T) {
 	if granted() {
 		t.Fatal("a suspended assignment still grants")
 	}
-	if _, err := f.s.SuspendRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant, "it-admin", ""); !errors.Is(err, domain.ErrInvalidTransition) {
-		t.Errorf("second suspend: err %v, want ErrInvalidTransition", err)
+	if s.ApprovalStatus != domain.ApprovalSuspended {
+		t.Fatalf("suspended row status %s, want %s", s.ApprovalStatus, domain.ApprovalSuspended)
+	}
+	if _, err := f.s.SuspendRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant, "it-admin", "again"); !errors.Is(err, domain.ErrAssignmentNotSuspendable) {
+		t.Errorf("second suspend: err %v, want ErrAssignmentNotSuspendable", err)
 	}
 	other := newFixture(t)
 	if _, err := other.s.SuspendRoleAssignment(other.ctx, a.PrincipalRoleAssignmentID, other.tenant, "x", ""); !errors.Is(err, domain.ErrRoleAssignmentNotFound) {
 		t.Errorf("suspend from another tenant: err %v, want ErrRoleAssignmentNotFound", err)
 	}
 
-	resumed, err := f.s.ResumeRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant)
+	resumed, err := f.s.ResumeRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant, "it-approver", "back from leave")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resumed.SuspendedAt != nil || resumed.Version != s.Version+1 {
+	if resumed.SuspendedAt != nil || resumed.ApprovalStatus != domain.ApprovalApproved || resumed.Version != s.Version+1 {
 		t.Fatalf("resumed row: %+v", resumed)
 	}
 	back := f.dbNow(t)
 	if !granted() {
 		t.Fatal("a resumed assignment grants nothing")
 	}
-	if _, err := f.s.ResumeRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant); !errors.Is(err, domain.ErrInvalidTransition) {
-		t.Errorf("second resume: err %v, want ErrInvalidTransition", err)
+	if _, err := f.s.ResumeRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant, "it-approver", ""); !errors.Is(err, domain.ErrAssignmentNotSuspended) {
+		t.Errorf("second resume: err %v, want ErrAssignmentNotSuspended", err)
 	}
 
 	if _, err := f.s.RevokeRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant); err != nil {

@@ -3,6 +3,7 @@ package domain
 import (
 	"context"
 	"strings"
+	"time"
 )
 
 // The acting principal, correlation id and stated reason of a request, carried
@@ -77,6 +78,9 @@ const (
 	ApprovalPending  = "PENDING_APPROVAL"
 	ApprovalRejected = "REJECTED"
 	ApprovalExpired  = "EXPIRED"
+	// ApprovalSuspended: an APPROVED assignment withheld without being ended
+	// (000037). It grants nothing, because every decision query requires APPROVED.
+	ApprovalSuspended = "SUSPENDED"
 )
 
 // ErrApprovalNotPending: the assignment is not awaiting a decision.
@@ -84,3 +88,37 @@ var ErrApprovalNotPending = errorString("the role assignment is not pending appr
 
 // ErrApprovalExpired: the pending assignment's approval window has passed.
 var ErrApprovalExpired = errorString("the role assignment's approval window has expired")
+
+// Assignment suspension (000037; ORG-06 s4.6 SuspendAssignment).
+var (
+	// ErrAssignmentNotSuspendable: only an APPROVED assignment that has not
+	// ended can be suspended.
+	ErrAssignmentNotSuspendable = errorString("only an approved assignment that has not ended can be suspended")
+	// ErrAssignmentNotSuspended: only a SUSPENDED assignment can be resumed.
+	ErrAssignmentNotSuspended = errorString("the role assignment is not suspended")
+	// ErrAssignmentEnded: a suspended assignment whose window has closed cannot
+	// be resumed; resuming would grant nothing and would say it had.
+	ErrAssignmentEnded = errorString("the role assignment's effective window has ended and it cannot be resumed")
+	// ErrSelfResume: nobody lifts the suspension of their own access.
+	ErrSelfResume = errorString("a principal cannot resume their own suspended assignment")
+)
+
+// AssignmentSuspension is one suspension of an assignment: when, by whom and
+// why, and (once closed) when, by whom and why it was lifted.
+type AssignmentSuspension struct {
+	SuspensionID              string     `json:"suspension_id"`
+	PrincipalRoleAssignmentID string     `json:"principal_role_assignment_id"`
+	SuspendedBy               string     `json:"suspended_by"`
+	SuspendedAt               time.Time  `json:"suspended_at"`
+	SuspensionReason          string     `json:"suspension_reason"`
+	ResumedBy                 *string    `json:"resumed_by,omitempty"`
+	ResumedAt                 *time.Time `json:"resumed_at,omitempty"`
+	ResumeReason              *string    `json:"resume_reason,omitempty"`
+}
+
+// AssignmentsAsOfQuery asks which assignments were authorizing at one instant.
+type AssignmentsAsOfQuery struct {
+	TenantID    string
+	PrincipalID string // empty = every principal in the tenant
+	AsOf        time.Time
+}

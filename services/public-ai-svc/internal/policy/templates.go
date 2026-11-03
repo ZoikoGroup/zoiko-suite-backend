@@ -107,9 +107,23 @@ func init() {
 
 // Suggestion chips offered when the assistant cannot answer.
 var (
-	SuggestLivePlatform = []contract.Chip{{Label: "Explore modules", Message: "What modules does ZoikoSuite include?"}, {Label: "Get support", Message: "I need help from support"}}
-	SuggestAreas        = []contract.Chip{{Label: "Explore modules", Message: "What modules does ZoikoSuite include?"}, {Label: "Pricing and trial", Message: "What plans are available, and is there a free trial?"}, {Label: "Security and trust", Message: "How is data secured?"}}
+	// SuggestCoverage follows "Other" country: the general answer to the same
+	// question, or the demo route where the team confirms coverage.
+	SuggestCoverage = []contract.Chip{{Label: "Show general overview", Message: "Show general overview"}, {Label: "Book a demo", Message: "I'd like to book a demo"}}
+	// SuggestRegionalCoverage follows a regional payroll, tax or legal
+	// question for a country without approved material: the demo route.
+	SuggestRegionalCoverage = []contract.Chip{{Label: "Book a demo", Message: "I'd like to book a demo"}}
+	SuggestLivePlatform     = []contract.Chip{{Label: "Explore modules", Message: "What modules does ZoikoSuite include?"}, {Label: "Get support", Message: "I need help from support"}}
+	SuggestAreas            = []contract.Chip{{Label: "Explore modules", Message: "What modules does ZoikoSuite include?"}, {Label: "Pricing and trial", Message: "What plans are available, and is there a free trial?"}, {Label: "Security and trust", Message: "How is data secured?"}}
 )
+
+// CountryName is a market's name on its own, as on a button ("United
+// Kingdom"), where MarketName is its name inside a sentence ("the United
+// Kingdom").
+func CountryName(code string) string {
+	n := strings.TrimPrefix(MarketName(code), "the ")
+	return strings.ToUpper(n[:1]) + n[1:]
+}
 
 // MarketName is how a market code is named in template text.
 func MarketName(code string) string {
@@ -118,8 +132,6 @@ func MarketName(code string) string {
 	}
 	return "that country"
 }
-
-var marketNames = map[string]string{"US": "the United States", "GB": "the United Kingdom", "IE": "Ireland"}
 
 // BoundaryTemplates are Doc 02's approved replies for intents whose answer
 // needs an approved source that does not exist yet. They are used only when

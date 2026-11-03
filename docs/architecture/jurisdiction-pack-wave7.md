@@ -15,7 +15,7 @@ RELEASED, EMERGENCY_BLOCKED or SUPERSEDED to `WITHDRAWN`). Each is a separate au
   and it rolls the version's ACTIVE deployments back with the reason. The artifact and every past decision stay resolvable (JUR-NEG-28).
 * RELEASED, WITHDRAWN and EMERGENCY_BLOCKED are reachable **only** through these commands: a database trigger refuses a bare status
   update without a matching `pack_release_events` row written in the same transaction. The event log is append-only.
-* `SUPERSEDED` has no command yet (it is still an allowed database edge); it is not built here.
+* `SUPERSEDED` now has a command, `POST .../supersede`, refused unless the newer version covers everything the older served: see [jurisdiction-pack-wave7-consistency.md](jurisdiction-pack-wave7-consistency.md).
 
 ## Rings, regions and rollout
 Rings (ordered, each with a `min_soak_seconds`) and regions are registered append-only. **Deploy** puts a RELEASED version into a ring and
@@ -32,8 +32,8 @@ Deploying a version whose rule window starts in the future is allowed; the resol
 
 **Rollback** takes a version out of one ring and region and restores a named older release there. The restore version must be the same
 pack, strictly older, RELEASED, re-verify, and have been active in that scope before. Rollback changes **future** resolution only
-(JUR-NEG-19): the response counts the decisions already made with the rolled-back version in that scope, says remediating them is a
-separate workflow that **does not exist**, and states that **no reconciliation was performed**.
+(JUR-NEG-19): the response counts the decisions already made with the rolled-back version in that scope, opens a **remediation case** for them in the same transaction (see
+[jurisdiction-pack-wave7-remediation.md](jurisdiction-pack-wave7-remediation.md)), and states that **no reconciliation was performed**.
 
 ## Emergency hotfix (s24)
 `hotfix` is declared while the version is DRAFT or REVIEW (never after certification), with severity P0 or P1, scope, incident,
@@ -72,13 +72,13 @@ registry routes are always mounted and the resolver's evidence insert needs the 
 * **Region residency (s3).** Packs are not tied to regions by residency rules; a region is only a deployment scope.
 
 ## Not built
-* Remediation workflow for outcomes made under a rolled-back or withdrawn version (named in every rollback response).
+* ~~Remediation workflow~~ for outcomes made under a rolled-back or withdrawn version: built as a case register, see [jurisdiction-pack-wave7-remediation.md](jurisdiction-pack-wave7-remediation.md). Still open there: no consuming service calls it yet, so re-evaluation itself is not automated.
 * A reconciliation or business-health signal for promotion; automatic promotion (every promotion is a human command).
-* Supersede command; compatibility matrices between pack families (s2); tenant elections/overrides (s28).
+* ~~Supersede command~~ (built, see [jurisdiction-pack-wave7-consistency.md](jurisdiction-pack-wave7-consistency.md)); compatibility matrices between pack families (s2); tenant elections/overrides (s28).
 * Reporting of the pack version each running service actually uses (metrics show skew between regions in the registry, not between processes).
-* Push-based notification of resolvers; a block or withdrawal reaches a resolver within its cache TTL unless the cache is invalidated.
+* ~~Push-based notification of resolvers~~: built (Postgres LISTEN/NOTIFY, `RESOLVER_PUSH_INVALIDATION`), see [jurisdiction-pack-wave7-remediation.md](jurisdiction-pack-wave7-remediation.md). The cache TTL remains the backstop.
 * Source-change **detection** (watching authorities): intake is manual.
-* CI coverage of the integration suite (`ci.yml` was not changed).
+* ~~CI coverage of the integration suite~~: done, `ci.yml` has a `jurisdiction-rules-svc` step running `internal/registryit` with `-tags=integration`.
 
 ## Verification
 Integration suite `internal/registryit` (embedded Postgres 16): release/withdraw/block with DB guards; dependency gates for publish, deploy and

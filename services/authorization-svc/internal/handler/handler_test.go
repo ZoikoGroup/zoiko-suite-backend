@@ -407,6 +407,8 @@ var stubAdminActions = []string{
 	// 000034-000036 governed changes: approval and publication.
 	"iam.break_glass.approve", "iam.authority_limit.manage", "iam.authority_limit.approve",
 	"iam.sod_rule.publish", "iam.policy.publish",
+	// 000037 assignment suspension (ORG-06).
+	"iam.assignment.suspend", "iam.assignment.resume",
 }
 
 // FindGrantedActions returns the seeded RBAC actions. requirePermission asks

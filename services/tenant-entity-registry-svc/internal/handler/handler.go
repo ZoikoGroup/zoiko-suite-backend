@@ -84,6 +84,9 @@ type Service interface {
 
 	// ORG-02/ORG-03 named commands and read surfaces — see org_handler.go.
 	ORGService
+
+	// ORG-04 ownership and control relationships — see ownership.go.
+	OwnershipService
 }
 
 // Handler holds all HTTP handler methods.
@@ -134,6 +137,7 @@ func RegisterRoutes(r chi.Router, h *Handler, mws ...func(http.Handler) http.Han
 		// ORG-02/ORG-03 surfaces, registered inside this same /v1 group so
 		// chi's static-before-parameter matching applies across all of them.
 		registerORGRoutes(r, h)
+		registerOwnershipRoutes(r, h)
 
 		// ── Tenants ─────────────────────────────────────────────────────────
 		r.Post("/tenants", h.ProvisionTenant)

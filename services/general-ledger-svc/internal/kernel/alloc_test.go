@@ -1,7 +1,9 @@
 package kernel
 
 import (
+	"encoding/json"
 	"math/big"
+	"strings"
 	"testing"
 )
 
@@ -127,3 +129,38 @@ func TestCompareBooksShowsWhereTheBooksDiffer(t *testing.T) {
 		t.Fatalf("%+v", c.Differences)
 	}
 }
+
+func TestACrossEntityRecipientNamesItsEntityAndItsBookTogether(t *testing.T) {
+	ent, book := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	good := fixed("50", "50")
+	good.Recipients[1].LegalEntityID, good.Recipients[1].BookID = ent, book
+	if err := good.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for what, mut := range map[string]func(*AllocRecipient){
+		"an entity without a book":    func(r *AllocRecipient) { r.BookID = "" },
+		"a book without an entity":    func(r *AllocRecipient) { r.LegalEntityID = "" },
+		"an entity that is not an id": func(r *AllocRecipient) { r.LegalEntityID = "acme" },
+		"a book that is not an id":    func(r *AllocRecipient) { r.BookID = "main" },
+	} {
+		c := fixed("50", "50")
+		c.Recipients[1].LegalEntityID, c.Recipients[1].BookID = ent, book
+		mut(&c.Recipients[1])
+		if err := c.Validate(); err == nil {
+			t.Fatalf("%s: accepted", what)
+		}
+	}
+	// a rule that names no entity hashes as it did before cross-entity recipients existed
+	plain := fixed("50", "50")
+	before := plain.hash()
+	if plain.hash() != before || string(mustJSON(plain)) != string(mustJSON(fixed("50", "50"))) {
+		t.Fatal("hash is stable")
+	}
+	if got := string(mustJSON(plain)); contains(got, "legal_entity_id") || contains(got, "book_id") {
+		t.Fatalf("an unset entity and book stay out of the content, so existing rule hashes do not change: %s", got)
+	}
+}
+
+func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
+
+func contains(s, sub string) bool { return strings.Contains(s, sub) }

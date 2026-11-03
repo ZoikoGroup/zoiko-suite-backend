@@ -51,6 +51,25 @@ type Config struct {
 	// empty means no deployment gating (lower environments only).
 	Ring   string
 	Region string
+	// SupportGate, when set, makes the resolver answer only for jurisdictions the rollout
+	// governance reports as supported for production (Wave 8: a LAUNCHED rollout and a
+	// RELEASED pack). Nil keeps the earlier behaviour: any verified RELEASED pack is served.
+	SupportGate SupportGate
+}
+
+// SupportAnswer is whether a jurisdiction is supported for production, and the rollout outcome behind it
+// (SUPPORTED, NOT_YET_SUPPORTED, SUSPENDED, NO_RELEASED_PACK or NO_ROLLOUT).
+type SupportAnswer struct {
+	Supported bool
+	Outcome   string
+}
+
+// SupportGate answers whether a jurisdiction is supported. An error fails the resolution closed.
+type SupportGate func(ctx context.Context, jurisdiction string) (SupportAnswer, error)
+
+type gateEntry struct {
+	ans SupportAnswer
+	at  time.Time
 }
 
 // Request asks which rule applies. PackRef (optionally with PackVersion)
@@ -173,8 +192,28 @@ type Resolver struct {
 	eligible   []domain.EligiblePack
 	eligibleAt time.Time
 	entries    map[string]*entry
+	gate       map[string]gateEntry
 
 	hits, misses, refreshes int
+}
+
+// supportOf answers the support gate, cached for the same bounded time as verified artifacts so a
+// suspension takes effect within the cache TTL (or at once after Invalidate).
+func (r *Resolver) supportOf(ctx context.Context, jurisdiction string) (SupportAnswer, error) {
+	r.mu.Lock()
+	if g, ok := r.gate[jurisdiction]; ok && r.fresh(g.at) {
+		r.mu.Unlock()
+		return g.ans, nil
+	}
+	r.mu.Unlock()
+	ans, err := r.cfg.SupportGate(ctx, jurisdiction)
+	if err != nil {
+		return SupportAnswer{}, err
+	}
+	r.mu.Lock()
+	r.gate[jurisdiction] = gateEntry{ans: ans, at: r.cfg.Now()}
+	r.mu.Unlock()
+	return ans, nil
 }
 
 // New builds a Resolver. At least one eligible status is required.
@@ -188,7 +227,7 @@ func New(src Source, cfg Config) (*Resolver, error) {
 	if cfg.CacheTTL < 0 {
 		cfg.CacheTTL = 0
 	}
-	return &Resolver{src: src, cfg: cfg, entries: map[string]*entry{}}, nil
+	return &Resolver{src: src, cfg: cfg, entries: map[string]*entry{}, gate: map[string]gateEntry{}}, nil
 }
 
 // Scope returns the ring and region this resolver instance serves (empty when ungated).
@@ -201,6 +240,7 @@ func (r *Resolver) Invalidate() {
 	defer r.mu.Unlock()
 	r.eligible, r.eligibleAt = nil, time.Time{}
 	r.entries = map[string]*entry{}
+	r.gate = map[string]gateEntry{}
 }
 
 // Stats reports cache behaviour for operations dashboards.
@@ -426,6 +466,17 @@ func (r *Resolver) Coverage(ctx context.Context, jurisdiction string, at time.Ti
 // resolution and obligation calculation so both obey the same eligibility,
 // version-selection, ring/region and fail-closed rules.
 func (r *Resolver) pick(ctx context.Context, jurisdiction, packRef, packVersion string, at time.Time, step func(string, ...any)) ([]*entry, string, error) {
+	// The support gate sits here, not in Resolve, so rule resolution, due dates and payroll parameter sets are all gated.
+	if r.cfg.SupportGate != nil {
+		ans, err := r.supportOf(ctx, jurisdiction)
+		if err != nil {
+			return nil, "", err
+		}
+		if !ans.Supported {
+			step("jurisdiction %s is not supported for production (rollout: %s): nothing is served until its rollout is LAUNCHED with a released pack", jurisdiction, ans.Outcome)
+			return nil, domain.OutcomeUnsupported, nil
+		}
+	}
 	var candidates []domain.EligiblePack
 	if packRef != "" && packVersion != "" {
 		p, err := r.src.FindPackVersion(ctx, packRef, packVersion)

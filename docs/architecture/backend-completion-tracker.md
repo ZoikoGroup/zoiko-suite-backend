@@ -413,19 +413,19 @@ as the table owner (a future regression, manual psql access, etc). Worth doing, 
 | 23 | benefits-svc | Not Started |
 | 24 | clause-template-svc | Not Started |
 | 25 | compensation-svc | Not Started |
-| 26 | compliance-risk-scoring-svc | Not Started |
-| 27 | compliance-status-svc | Not Started |
+| 26 | compliance-risk-scoring-svc | Done | Added migration `000002_force_rls` |
+| 27 | compliance-status-svc | Done | Added migration `000002_force_rls` |
 | 28 | consolidation-svc | Not Started |
 | 29 | contract-lifecycle-svc | Not Started |
-| 30 | corporate-actions-svc | Not Started |
-| 31 | corporate-tax-svc | Not Started |
+| 30 | corporate-actions-svc | Done | Added migration `000002_force_rls` |
+| 31 | corporate-tax-svc | Done | Added migration `000002_add_nexus_records_and_force_rls` |
 | 32 | counterparty-management-svc | Done |
-| 33 | decision-support-svc | Not Started |
+| 33 | decision-support-svc | Done | Added migration `000002_force_rls` |
 | 34 | employee-master-svc | Not Started |
 | 35 | employment-contracts-svc | Not Started |
 | 36 | exception-escalation-svc | Not Started |
-| 37 | filing-preparation-svc | Not Started |
-| 38 | filing-tracker-svc | Not Started |
+| 37 | filing-preparation-svc | Done | Added migration `000002_force_rls` |
+| 38 | filing-tracker-svc | Done | Added migration `000002_force_rls` |
 | 39 | forecasting-svc | Not Started |
 | 40 | intercompany-accounting-svc | Not Started |
 | 41 | invoice-approval-svc | Not Started |
@@ -438,15 +438,15 @@ as the table owner (a future regression, manual psql access, etc). Worth doing, 
 | 48 | payroll-run-svc | Not Started |
 | 49 | payroll-tax-svc | Not Started |
 | 50 | performance-review-svc | Not Started |
-| 51 | procurement-workflow-svc | Not Started |
-| 52 | reconciliation-intelligence-svc | Not Started |
+| 51 | procurement-workflow-svc | Done | Added migration `000002_force_rls` |
+| 52 | reconciliation-intelligence-svc | Done | Added migration `000007_force_rls` |
 | 53 | reporting-orchestration-svc | Not Started |
-| 54 | tax-determination-svc | Not Started |
-| 55 | tax-rules-svc | Not Started |
+| 54 | tax-determination-svc | Done | Added migration `000004_force_rls` |
+| 55 | tax-rules-svc | Done | Added migration `000002_force_rls` |
 | 56 | tenant-entity-registry-svc | **Done** — migration `000006`. FORCE on all 7 pre-existing tables plus the 4 new tenant-scoped ones; `residency_regions` (no tenant column) and `tenant_host_bindings` (read before a tenant is known, so a policy keyed on `app.tenant_id` would need the answer as input) are deliberately exempt and asserted as such by `TestORGTables_ForceRowLevelSecurityIsOn`. Explicit `WITH CHECK` was added too — cosmetic, exactly as Finding 1 above says, and written out only because the default is not obvious from reading the policy. **One non-cosmetic thing came out of this row**: the policies used `current_setting('app.tenant_id', true)::UUID`, and Postgres keeps a custom GUC in the session after a local `SET` is reset with `''` as its value — so `current_setting` returns `''`, not NULL, on any connection that has already served one scoped request, and `''::UUID` raises 22P02. That broke the outbox relay and host resolution, both of which deliberately do not set a tenant. Every policy now uses `NULLIF(current_setting(...), '')`. Any service copying this policy shape has the same latent bug. |
 | 57 | treasury-svc | Not Started |
-| 58 | vat-gst-svc | Not Started |
-| 59 | withholding-tax-svc | Not Started |
+| 58 | vat-gst-svc | Done | Added migration `000002_force_rls` |
+| 59 | withholding-tax-svc | Done | Added migration `000002_force_rls` |
 | 60 | workflow-history-svc | Not Started |
 | 61 | workforce-compliance-svc | Not Started |
 
@@ -479,10 +479,10 @@ as the table owner (a future regression, manual psql access, etc). Worth doing, 
 | 70 | Missing entity: `FiscalCalendar` (dangling FK column exists, no table) | Not Started | Verified: zero grep hits |
 | 71 | Missing entity: `TaxLogicSnapshot` (dangling FK in 2 services) | Not Started | Verified: zero grep hits |
 | 72 | Missing entity: `GrossToNetCalculationLog` | Not Started | Verified: zero grep hits |
-| 73 | Missing entity: `NexusRecord` | Not Started | Verified: zero grep hits |
+| 73 | Missing entity: `NexusRecord` | **Done** | Implemented `NexusRecord` in `corporate-tax-svc` (migration `000002`, store, domain, handlers, tests) |
 | 74 | Missing entity: chart-of-accounts (`Account`) in general-ledger-svc | **Exists — row was stale** | Re-verified 2026-10-07: migration `000007_add_chart_of_accounts` creates `chart_of_accounts`; `000008`–`000012` add account mapping, posting engine, approval lifecycle, posted ledger and outbox. Whether it meets ZS-SVC-B-001 ACC-01's full command set (CreateAccount, AmendAccountVersion, ActivateAccount, DeactivateAccount, ReparentAccount; ResolvePostingEligibility, GetAccountAsOf) has not been audited. |
 | 75 | Missing entity: `SchemaDependencyMap` (+ `compatibility_mode`) | Not Started | Verified: zero grep hits |
-| 76 | Missing entity: standalone `VendorProfile` (only scattered FK-shaped columns) | Not Started | Verified: zero grep hits |
+| 76 | Missing entity: standalone `VendorProfile` (only scattered FK-shaped columns) | **Done** | Implemented `VendorProfile` in `vendor-due-diligence-svc` (migration `000004`, store, domain, handlers, tests) |
 | 77 | Document Vault missing `virus_scan_status` and `digital_signature_id` (Doc 04 §15.5 requires both) | Not Started | Verified: zero grep hits in document-vault-svc migrations |
 | 78 | Obligation tracking duplicated across 3 services with non-identical schemas — violates §2.1 single-owner doctrine | Doc 04 §2.1 | Not Started | Verified: obligations-svc, obligation-tracking-svc, and filing-tracker-svc each have their OWN separate `obligations`/`filing_requirements` table |
 | 79 | Identity/role assignment duplicated across authorization-svc and identity-context-svc | Not Started | Untouched by the 2026-09-03 authorization-svc pass, and worth noting why: that pass resolved the *delegation* duplication (row 81) by making one side a projection of the other's events. The same move is NOT available here — identity-context-svc's `RoleDirectory` answers "who holds this role" to decide which SESSIONS a role change invalidates, which is a different question from "what may this principal do", and neither service is the obvious authority for it. **2026-09-10 — narrowed, and the reason sharpened.** This row said the delegation projection trick is "NOT available here" because identity-context-svc's `RoleDirectory` answers a different question. That stands. What has changed is that authorization-svc now consumes access-control-svc's `role.created` / `role.updated` / `permission.bundle.updated` — not as a projection, but to INVALIDATE its cached grant reads, since those writes reach one replica and are announced to all of them. So the duplication is unchanged and the staleness it used to cause is not. Deliberately still not a projection: inventing an upstream id to dedupe role assignments on would settle the ownership question this row is about by writing code. |

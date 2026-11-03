@@ -891,62 +891,6 @@ func (s *PgStore) DecideRoleAssignment(ctx context.Context, assignmentID, tenant
 	return a, nil
 }
 
-// SuspendRoleAssignment suspends an approved assignment that has not ended
-// (ORG-06 SuspendAssignment, 000038): it grants nothing from now until it is
-// resumed, and stays on record. One guarded UPDATE, scoped through the role
-// like RevokeRoleAssignment. An assignment that exists in the tenant but is
-// already suspended, ended or not approved is ErrInvalidTransition.
-func (s *PgStore) SuspendRoleAssignment(ctx context.Context, assignmentID, tenantID, suspendedBy, reason string) (*domain.PrincipalRoleAssignment, error) {
-	const query = `
-		UPDATE principal_role_assignments
-		   SET suspended_at = NOW(), suspended_by = $3, suspension_reason = NULLIF($4, '')
-		 WHERE principal_role_assignment_id = $1
-		   AND suspended_at IS NULL
-		   AND approval_status = 'APPROVED'
-		   AND (effective_to IS NULL OR effective_to > NOW())
-		   AND role_id IN (SELECT role_id FROM roles WHERE tenant_id = $2)
-		RETURNING ` + assignmentColumns + `;`
-	return s.transitionAssignment(ctx, "SuspendRoleAssignment", assignmentID, tenantID, query, suspendedBy, reason)
-}
-
-// ResumeRoleAssignment lifts a suspension; the assignment grants again from
-// now if it is still within its effective dates. ErrInvalidTransition when it
-// is not suspended or has ended meanwhile.
-func (s *PgStore) ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error) {
-	const query = `
-		UPDATE principal_role_assignments
-		   SET suspended_at = NULL, suspended_by = NULL, suspension_reason = NULL
-		 WHERE principal_role_assignment_id = $1
-		   AND suspended_at IS NOT NULL
-		   AND (effective_to IS NULL OR effective_to > NOW())
-		   AND role_id IN (SELECT role_id FROM roles WHERE tenant_id = $2)
-		RETURNING ` + assignmentColumns + `;`
-	return s.transitionAssignment(ctx, "ResumeRoleAssignment", assignmentID, tenantID, query)
-}
-
-// transitionAssignment runs a guarded assignment UPDATE whose $1/$2 are the
-// assignment and tenant. No row: ErrRoleAssignmentNotFound if the tenant has
-// no such assignment, else ErrInvalidTransition.
-func (s *PgStore) transitionAssignment(ctx context.Context, op, assignmentID, tenantID, query string, extra ...any) (*domain.PrincipalRoleAssignment, error) {
-	var a *domain.PrincipalRoleAssignment
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var scanErr error
-		a, scanErr = scanAssignment(tx.QueryRow(ctx, query, append([]any{assignmentID, tenantID}, extra...)...))
-		return scanErr
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		if _, findErr := s.FindRoleAssignmentByID(ctx, assignmentID, tenantID); findErr != nil {
-			return nil, findErr
-		}
-		return nil, domain.ErrInvalidTransition
-	}
-	if err != nil {
-		s.log.Error("pg "+op+" failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return a, nil
-}
-
 // FindRoleAssignmentsAsOf reconstructs the assignments that granted in the
 // tenant at asOf (ORG-06 GetAssignmentsAsOf), from the 000038 history: each
 // assignment's latest state recorded at or before asOf, kept when that state

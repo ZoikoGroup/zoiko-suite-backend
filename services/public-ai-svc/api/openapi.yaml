@@ -71,6 +71,43 @@ components:
         source_version_id: {type: string}
         claim_ids: {type: array, items: {type: string}}
         url_key: {type: string}
+        title: {type: string, description: "Structured responses only (ADR-008): approved source or official page title."}
+        route_key: {type: string, description: "Structured responses only: set when the citation is an official route."}
+        url: {type: string, format: uri, description: "Structured responses only: omitted until a real, allowlisted page exists."}
+    FollowUp:
+      type: object
+      additionalProperties: false
+      required: [id, label, intent_id, message]
+      description: An approved question from the Doc 02 menu and follow-up map (ADR-008). Never chosen by the model.
+      properties:
+        id: {type: string}
+        label: {type: string}
+        intent_id: {type: string, pattern: "^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10))$"}
+        message: {type: string, description: Fixed message the widget sends; it classifies to intent_id.}
+    CTALink:
+      type: object
+      additionalProperties: false
+      required: [route_key, label]
+      properties:
+        route_key: {type: string}
+        label: {type: string, description: Doc 02 §06 default CTA for the intent, or the official page title.}
+        url: {type: string, format: uri, description: Omitted until the signed route registry has a real page.}
+    MenuResponse:
+      type: object
+      additionalProperties: false
+      required: [schema_version, categories]
+      properties:
+        schema_version: {const: "1.0"}
+        categories:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, label, items]
+            properties:
+              id: {type: string}
+              label: {type: string, description: Doc 02 §22 public page family.}
+              items: {type: array, maxItems: 4, items: {$ref: "#/components/schemas/FollowUp"}}
     Action:
       type: object
       additionalProperties: false
@@ -136,6 +173,22 @@ components:
             slot: {type: string}
             question: {type: string}
             options: {type: array, items: {type: string}}
+        outcome:
+          type: string
+          description: Structured responses only (ADR-008). Typed form of status.
+          enum: [GROUNDED, CLARIFY, ABSTAIN, SAFE_FALLBACK, REFUSED, HANDOFF_OFFER]
+        followups:
+          type: array
+          maxItems: 4
+          description: Structured responses only. Approved follow-ups after ANSWERED or HANDOFF.
+          items: {$ref: "#/components/schemas/FollowUp"}
+        cta:
+          type: object
+          additionalProperties: false
+          description: Structured responses only. At most one primary and one secondary official route.
+          properties:
+            primary: {$ref: "#/components/schemas/CTALink"}
+            secondary: {$ref: "#/components/schemas/CTALink"}
     ConfigResponse:
       type: object
       required: [config_revision, assistant_display_name, capabilities, supported_locales, market_choices, public_routes, citation_links, privacy_notice_key]
@@ -328,6 +381,12 @@ paths:
       responses:
         "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/ConfigResponse"}}}}
         "304": {description: Not modified}
+  /menu:
+    get:
+      summary: Guided topic menu (ADR-008). 404 while structured_response_enabled is off.
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/MenuResponse"}}}}
+        "404": {$ref: "#/components/responses/Problem"}
   /health/public:
     get:
       summary: Coarse public health (no provider or region names)

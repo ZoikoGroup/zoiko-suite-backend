@@ -62,3 +62,56 @@ func TestMergedSubjectAssignmentsRepointed(t *testing.T) {
 		t.Fatal("another tenant's merge ended this tenant's assignment")
 	}
 }
+
+// A suspended assignment moves suspended, with its open suspension record
+// (000037), so the survivor's copy grants nothing and can still be resumed.
+func TestMergedSubjectSuspendedAssignmentMovesSuspended(t *testing.T) {
+	f := newFixture(t)
+	r := f.role(t, "it.merge.suspended")
+	entity := uuid.NewString()
+	dup, surv := "dup-"+uuid.NewString()[:8], "surv-"+uuid.NewString()[:8]
+	a := f.assign(t, dup, r.RoleID, domain.ApprovalApproved)
+	if _, err := f.s.SuspendRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant, "P-ADMIN", "investigation"); err != nil {
+		t.Fatal(err)
+	}
+	grants := func(principal string) []string {
+		t.Helper()
+		actions, _, err := f.s.FindGrantedActions(f.ctx, principal, entity, f.tenant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return actions
+	}
+
+	moved, err := f.s.RepointMergedSubject(f.ctx, domain.RepointMergedSubjectParams{TenantID: f.tenant,
+		SurvivorID: surv, DuplicateID: dup, Actor: "P-ADMIN", CorrelationID: "corr-merge-suspended"})
+	if err != nil || moved != 1 {
+		t.Fatalf("reissued %d (err %v), want 1", moved, err)
+	}
+	copies, err := f.s.ListRoleAssignments(f.ctx, f.tenant, surv, "", false)
+	if err != nil || len(copies) != 1 {
+		t.Fatalf("survivor assignments %v (err %v), want 1", copies, err)
+	}
+	c := copies[0]
+	if c.ApprovalStatus != domain.ApprovalSuspended || c.SuspendedBy == nil || *c.SuspendedBy != "P-ADMIN" {
+		t.Fatalf("survivor copy %+v, want SUSPENDED by P-ADMIN", c)
+	}
+	if has(grants(surv), "it.merge.suspended") {
+		t.Fatal("the suspended copy grants")
+	}
+	open, err := f.s.ListAssignmentSuspensions(f.ctx, c.PrincipalRoleAssignmentID, f.tenant)
+	if err != nil || len(open) != 1 || open[0].ResumedAt != nil || open[0].SuspensionReason != "investigation" {
+		t.Fatalf("survivor suspensions %+v (err %v), want one open with the original reason", open, err)
+	}
+
+	if _, err := f.s.ResumeRoleAssignment(f.ctx, c.PrincipalRoleAssignmentID, f.tenant, "P-APPROVER", "cleared"); err != nil {
+		t.Fatalf("resume on the survivor: %v", err)
+	}
+	if !has(grants(surv), "it.merge.suspended") {
+		t.Fatal("the resumed copy grants nothing")
+	}
+	old, err := f.s.FindRoleAssignmentByID(f.ctx, a.PrincipalRoleAssignmentID, f.tenant)
+	if err != nil || old.EffectiveTo == nil {
+		t.Fatalf("the duplicate's suspended assignment was not ended: %+v (err %v)", old, err)
+	}
+}

@@ -18,9 +18,10 @@ import (
 	"zoiko.io/authorization-svc/internal/siem"
 )
 
-// The ORG-06 role half (IAM-13): SuspendAssignment and its resume,
-// GetAssignmentsAsOf, and If-Match honoured — not yet required — on the
-// assignment mutations (000038).
+// The ORG-06 role half (IAM-13): If-Match honoured — not yet required — on
+// suspend and resume (000037) and the other assignment mutations, the checks a
+// resume shares with a grant, and the ?as_of= history read (000038). The
+// permission gates and store refusals are in assignment_suspension_test.go.
 
 const lifecycleTenant = "11111111-1111-4111-8111-111111111111"
 
@@ -42,15 +43,15 @@ func (s *lifecycleStore) SuspendRoleAssignment(_ context.Context, id, _, by, rea
 	}
 	s.suspended, s.gotSuspendBy, s.gotSuspendReason = true, by, reason
 	now := time.Now()
-	return &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: id, SuspendedAt: &now, Version: 3}, nil
+	return &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: id, ApprovalStatus: domain.ApprovalSuspended, SuspendedAt: &now, Version: 3}, nil
 }
 
-func (s *lifecycleStore) ResumeRoleAssignment(_ context.Context, id, _ string) (*domain.PrincipalRoleAssignment, error) {
+func (s *lifecycleStore) ResumeRoleAssignment(_ context.Context, id, _, _, _ string) (*domain.PrincipalRoleAssignment, error) {
 	if s.transitionErr != nil {
 		return nil, s.transitionErr
 	}
 	s.resumed = true
-	return &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: id, Version: 4}, nil
+	return &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: id, ApprovalStatus: domain.ApprovalApproved, Version: 4}, nil
 }
 
 func (s *lifecycleStore) FindRoleAssignmentsAsOf(_ context.Context, _, principalID string, asOf time.Time) ([]domain.PrincipalRoleAssignment, error) {
@@ -84,7 +85,7 @@ func lifecycleDo(t *testing.T, s handler.AuthorizationStore, method, path, body 
 func suspendedAssignment() domain.PrincipalRoleAssignment {
 	at := time.Now().Add(-time.Hour)
 	return domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: "a-1", PrincipalID: "p-1", RoleID: "r-1",
-		ApprovalStatus: domain.ApprovalApproved, SuspendedAt: &at, Version: 2}
+		ApprovalStatus: domain.ApprovalSuspended, SuspendedAt: &at, Version: 2}
 }
 
 func TestSuspendRoleAssignment_SuspendsWithReasonAndETag(t *testing.T) {
@@ -115,14 +116,14 @@ func TestSuspendRoleAssignment_StaleIfMatchChangesNothing(t *testing.T) {
 
 func TestSuspendRoleAssignment_WrongStateIsConflict(t *testing.T) {
 	s := newLifecycleStore(domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: "a-1", PrincipalID: "p-1", RoleID: "r-1", Version: 1})
-	s.transitionErr = domain.ErrInvalidTransition
+	s.transitionErr = domain.ErrAssignmentNotSuspendable
 	w := lifecycleDo(t, s, http.MethodPost, "/v1/admin/role-assignments/a-1/suspend", `{"reason_code":"LEAVE"}`, nil)
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "invalid_transition") {
-		t.Fatalf("expected 409 invalid_transition, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "assignment_not_suspendable") {
+		t.Fatalf("expected 409 assignment_not_suspendable, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-func TestSuspendRoleAssignment_RequiresRevokePermission(t *testing.T) {
+func TestSuspendRoleAssignment_RequiresSuspendPermission(t *testing.T) {
 	s := newLifecycleStore(domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: "a-1", Version: 1})
 	s.denyAdmin = true
 	w := lifecycleDo(t, s, http.MethodPost, "/v1/admin/role-assignments/a-1/suspend", `{"reason_code":"LEAVE"}`, nil)
@@ -137,6 +138,9 @@ func TestResumeRoleAssignment_Resumes(t *testing.T) {
 	if w.Code != http.StatusOK || !s.resumed {
 		t.Fatalf("expected 200 and a resume, got %d resumed=%v: %s", w.Code, s.resumed, w.Body.String())
 	}
+	if got := w.Header().Get("ETag"); got != `"v4"` {
+		t.Fatalf("expected ETag of the new version, got %q", got)
+	}
 }
 
 func TestResumeRoleAssignment_NotOnOwnAssignment(t *testing.T) {
@@ -144,18 +148,39 @@ func TestResumeRoleAssignment_NotOnOwnAssignment(t *testing.T) {
 	a.PrincipalID = "admin-1"
 	s := newLifecycleStore(a)
 	w := lifecycleDo(t, s, http.MethodPost, "/v1/admin/role-assignments/a-1/resume", `{"reason_code":"RETURNED"}`, nil)
-	if w.Code != http.StatusForbidden || s.resumed {
-		t.Fatalf("expected 403 self_grant_not_allowed, got %d resumed=%v: %s", w.Code, s.resumed, w.Body.String())
+	if w.Code != http.StatusForbidden || s.resumed || !strings.Contains(w.Body.String(), "self_resume_not_allowed") {
+		t.Fatalf("expected 403 self_resume_not_allowed, got %d resumed=%v: %s", w.Code, s.resumed, w.Body.String())
 	}
 }
 
 func TestResumeRoleAssignment_NotSuspendedIsConflict(t *testing.T) {
 	a := suspendedAssignment()
-	a.SuspendedAt = nil
+	a.ApprovalStatus, a.SuspendedAt = domain.ApprovalApproved, nil
 	s := newLifecycleStore(a)
+	s.transitionErr = domain.ErrAssignmentNotSuspended
 	w := lifecycleDo(t, s, http.MethodPost, "/v1/admin/role-assignments/a-1/resume", `{"reason_code":"RETURNED"}`, nil)
-	if w.Code != http.StatusConflict || s.resumed {
-		t.Fatalf("expected 409, got %d resumed=%v: %s", w.Code, s.resumed, w.Body.String())
+	if w.Code != http.StatusConflict || s.resumed || !strings.Contains(w.Body.String(), "assignment_not_suspended") {
+		t.Fatalf("expected 409 assignment_not_suspended, got %d resumed=%v: %s", w.Code, s.resumed, w.Body.String())
+	}
+}
+
+func TestResumeRoleAssignment_StaleIfMatchChangesNothing(t *testing.T) {
+	s := newLifecycleStore(suspendedAssignment())
+	w := lifecycleDo(t, s, http.MethodPost, "/v1/admin/role-assignments/a-1/resume", `{}`, map[string]string{"If-Match": `"v1"`})
+	if w.Code != http.StatusPreconditionFailed || s.resumed {
+		t.Fatalf("expected 412 and no resume, got %d resumed=%v: %s", w.Code, s.resumed, w.Body.String())
+	}
+}
+
+// A resume is refused when the principal now holds a conflicting duty: it may
+// have been granted one while the assignment was suspended.
+func TestResumeRoleAssignment_SoDConflictIsRefused(t *testing.T) {
+	s := newLifecycleStore(suspendedAssignment())
+	s.bundles = []domain.PermissionBundle{{PermissionBundleID: "b-1", RoleID: "r-1", ActiveFlag: true, PermittedActions: []string{"ap.invoice.approve"}}}
+	s.sodHasConflict, s.sodConflictAction = true, "ap.invoice.create"
+	w := lifecycleDo(t, s, http.MethodPost, "/v1/admin/role-assignments/a-1/resume", `{}`, nil)
+	if w.Code != http.StatusConflict || s.resumed || !strings.Contains(w.Body.String(), "sod_conflict") {
+		t.Fatalf("expected 409 sod_conflict, got %d resumed=%v: %s", w.Code, s.resumed, w.Body.String())
 	}
 }
 

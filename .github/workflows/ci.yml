@@ -188,6 +188,14 @@ jobs:
         # Proves /healthz and /readyz return 200 against a real DB.
         run: go test -v -tags=integration -count=1 -timeout=600s ./cmd/server/
 
+      - name: Integration test — jurisdiction-rules registry suite with embedded Postgres
+        if: matrix.service == 'jurisdiction-rules-svc'
+        working-directory: services/${{ matrix.service }}
+        # ZS-JUR-001: every database guard (append-only evidence, status edges, independence, rollout gates)
+        # is proved only here, against a real Postgres. embedded-postgres downloads the binaries, so no
+        # service container is needed.
+        run: go test -v -tags=integration -count=1 -timeout=900s ./internal/registryit/
+
       - name: Integration test — store isolation/pipeline (PgStore → DB)
         if: matrix.service == 'access-control-svc' || matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'evidence-requirements-svc' || matrix.service == 'payment-initiation-adapter-svc' || matrix.service == 'payment-status-svc' || matrix.service == 'tax-authority-interface-svc'
         working-directory: services/${{ matrix.service }}

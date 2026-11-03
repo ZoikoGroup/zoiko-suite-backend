@@ -28,23 +28,27 @@ func TestIAM09_AuthzGrantReachesRoleProfile(t *testing.T) {
 	assert.Empty(t, h.sessions.principals, "a grant only adds access")
 }
 
+// authorization-svc's payload names the assignment principal_role_assignment_id;
+// the suspension and its resume reach the projection under that id.
 func TestIAM09_SuspendedAssignmentLeavesProfile(t *testing.T) {
-	h := newHarness()
-	h.consumer.Handle(context.Background(), event(t, "iam.assignment.granted", "az-g2", "tenant-1",
+	c, sessions, roles, _ := suspHarness()
+	c.Handle(context.Background(), event(t, "iam.assignment.granted", "az-g2", "tenant-1",
 		authzAssignment("pra-2", "p-8", "role-6")))
-	require.Contains(t, h.roles.byRole["role-6"], "p-8")
+	require.Contains(t, roles.byRole["role-6"], "p-8")
 
-	h.consumer.Handle(context.Background(), event(t, "iam.assignment.suspended", "az-s2", "tenant-1",
+	c.Handle(context.Background(), event(t, "iam.assignment.suspended", "az-s2", "tenant-1",
 		authzAssignment("pra-2", "p-8", "role-6")))
-	assert.NotContains(t, h.roles.byRole["role-6"], "p-8", "a suspended assignment frames no role")
-	assert.Equal(t, []string{"pra-2"}, h.roles.suspended)
-	assert.Empty(t, h.roles.ended, "a suspension is not a revocation: no tombstone")
-	require.Len(t, h.sessions.principals, 1, "the holder's sessions end on suspension")
-	assert.Equal(t, "p-8", h.sessions.principals[0].id)
+	require.Len(t, roles.suspended, 1)
+	assert.Equal(t, "pra-2", roles.suspended[0].assignmentID, "the projection holds the assignment back")
+	assert.Empty(t, roles.ended, "a suspension is not a revocation: no tombstone")
+	require.Len(t, sessions.principals, 1, "the holder's sessions end on suspension")
+	assert.Equal(t, "p-8", sessions.principals[0].id)
 
-	h.consumer.Handle(context.Background(), event(t, "iam.assignment.resumed", "az-r2", "tenant-1",
+	c.Handle(context.Background(), event(t, "iam.assignment.resumed", "az-r2", "tenant-1",
 		authzAssignment("pra-2", "p-8", "role-6")))
-	assert.Contains(t, h.roles.byRole["role-6"], "p-8", "a resumed assignment frames the role again")
+	require.Len(t, roles.resumed, 1, "a resumed assignment frames the role again")
+	assert.Equal(t, "pra-2", roles.resumed[0].assignmentID)
+	assert.Len(t, sessions.principals, 1, "a resume ends nothing")
 }
 
 func TestIAM09_ExpiredAssignmentEndsLikeARevocation(t *testing.T) {

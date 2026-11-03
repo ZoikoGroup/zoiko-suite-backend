@@ -90,6 +90,9 @@ type ConsolMember struct {
 	InvestmentAccount string   `json:"investment_account,omitempty"`
 	InvestorEntityID  string   `json:"investor_entity_id,omitempty"`
 	EquityAccounts    []string `json:"equity_accounts,omitempty"`
+	// EquityRateDate, when set, translates the equity accounts named above at the spot rate of that date (the historical rate)
+	// instead of the closing rate; the difference lands in the translation reserve like any other rate difference.
+	EquityRateDate string `json:"equity_rate_date,omitempty"`
 }
 
 // ConsolMapping is one immutable version of the local-account to group-account map and the intercompany roles.
@@ -129,6 +132,23 @@ type ConsolInput struct {
 	InvestmentAccount string   `json:"investment_account,omitempty"`
 	InvestorEntityID  string   `json:"investor_entity_id,omitempty"`
 	EquityAccounts    []string `json:"equity_accounts,omitempty"`
+	EquityRateDate    string   `json:"equity_rate_date,omitempty"`
+}
+
+// EquityRateClass is the rate class of a member's equity translated at the historical rate of a date.
+func EquityRateClass(date string) string { return "EQ:" + date }
+
+// historical says whether a member's account is translated at its historical equity rate.
+func (in ConsolInput) historical(account string) bool {
+	if in.EquityRateDate == "" {
+		return false
+	}
+	for _, a := range in.EquityAccounts {
+		if a == account {
+			return true
+		}
+	}
+	return false
 }
 
 // ConsolRate is a rate a run translated with.
@@ -345,12 +365,16 @@ func (c *ConsolCompute) Compute() (*ConsolPopulation, error) {
 			}
 			typ := c.AccountTypes[l.AccountCode]
 			class := RateClassOf(typ)
-			rate, ok := c.rateFor(m.Input.FunctionalCurrency, class)
+			rateClass := class
+			if m.Input.historical(l.AccountCode) {
+				class, rateClass = "EQ", EquityRateClass(m.Input.EquityRateDate)
+			}
+			rate, ok := c.rateFor(m.Input.FunctionalCurrency, rateClass)
 			if !ok {
-				return nil, exc(FamFX, "CONSOLIDATION_RATE_UNAVAILABLE", "no %s rate for %s into %s", class, m.Input.FunctionalCurrency, c.Group.PresentationCurrency).with("currency", m.Input.FunctionalCurrency)
+				return nil, exc(FamFX, "CONSOLIDATION_RATE_UNAVAILABLE", "no %s rate for %s into %s", rateClass, m.Input.FunctionalCurrency, c.Group.PresentationCurrency).with("currency", m.Input.FunctionalCurrency)
 			}
 			if m.Input.FunctionalCurrency != c.Group.PresentationCurrency {
-				used[rateKey(m.Input.FunctionalCurrency, class)] = rate
+				used[rateKey(m.Input.FunctionalCurrency, rateClass)] = rate
 			}
 			tr := c.translate(net, rate.Rate)
 			pop.Lines = append(pop.Lines, ConsolLine{LegalEntityID: ent, LocalAccount: l.AccountCode, GroupAccount: ga, AccountType: typ, Class: class, Rate: rate.Rate,

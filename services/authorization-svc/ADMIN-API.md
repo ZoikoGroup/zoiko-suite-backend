@@ -62,8 +62,10 @@ until 7 Oct 2026 existed only in code. For the evaluation endpoints see
 |---|---|---|
 | `POST /v1/admin/role-assignments` | `iam.assignment.grant` (*platform* for `legal_entity_id` = the platform scope) | Body: `principal_id`, `role_id`, `legal_entity_id?`, `book_id?`, `org_unit_id?`, `effective_from`, `effective_to?`, `approval_reference?`. Self-assignment `403`; SoD conflict at the assignment's scope `409`. A **privileged** role (one granting any `iam.*` or protected platform action) or a platform-scope assignment by a caller without `iam.assignment.approve_privileged` is recorded `PENDING_APPROVAL` (`202`) and grants nothing until approved; with it, `201` `APPROVED`, `approved_by` = caller. |
 | `GET /v1/admin/role-assignments` | `iam.assignment.read` | Shows `approval_status` and `suspended_at`. `?principal_id=` is ORG-06 ListPrincipalAssignments. `?as_of=<RFC 3339>` is ORG-06 GetAssignmentsAsOf: the assignments that granted at that instant (approved, not suspended, within their dates), rebuilt from the append-only history (000038); a future or malformed `as_of` is `400 invalid_as_of`. |
-| `POST /v1/admin/role-assignments/{id}/suspend` | `iam.assignment.revoke` (*platform* for a platform-scope assignment) | **R**. ORG-06 SuspendAssignment: the assignment stops granting at once and stays on record. Only an `APPROVED` assignment that has not ended or been suspended (`409 invalid_transition`). The reason is kept as `suspension_reason`. |
-| `POST /v1/admin/role-assignments/{id}/resume` | `iam.assignment.grant` (*platform* for a platform-scope assignment) | **R**. Lifts a suspension. Never on one's own assignment (`403 self_grant_not_allowed`); a privileged role also needs `iam.assignment.approve_privileged`; re-runs the SoD check (`409 sod_conflict`). |
+| `GET /v1/admin/role-assignments/as-of` | `iam.assignment.read` | ORG-06 GetAssignmentsAsOf from the live rows and the suspension periods (000037): `as_of` RFC 3339 or `YYYY-MM-DD`, default now; `principal_id` narrows it. |
+| `POST /v1/admin/role-assignments/{id}/suspend` | `iam.assignment.suspend` (*platform* for a platform-scope assignment) | **R**, always required. ORG-06 SuspendAssignment: `approval_status` becomes `SUSPENDED`, the assignment stops granting at once and stays on record, and an `assignment_suspensions` row records who, when and why (000037). Only an `APPROVED` assignment that has not ended (`409 assignment_not_suspendable`). The reason is also kept as `suspension_reason`. |
+| `POST /v1/admin/role-assignments/{id}/resume` | `iam.assignment.resume` (*platform* for a platform-scope assignment) | Lifts a suspension and closes its record. Never on one's own assignment (`403 self_resume_not_allowed`); a privileged role also needs `iam.assignment.approve_privileged`; re-runs the SoD check (`409 sod_conflict`). Not suspended `409 assignment_not_suspended`; window closed meanwhile `409 assignment_ended`. |
+| `GET /v1/admin/role-assignments/{id}/suspensions` | `iam.assignment.read` | Every suspension of the assignment, oldest first, including lifted ones. |
 | `POST /v1/admin/role-assignments/{id}/approve` · `/reject` | `iam.assignment.approve_privileged` (*platform* for a platform-scope assignment) | **R**. The checker must be neither the requester nor the target (`403 checker_not_independent`). Approval re-runs the SoD check. Pending requests expire after 72 h (`409 approval_expired`). |
 | `POST /v1/admin/role-assignments/{id}/revoke` | `iam.assignment.revoke` (*platform* for a platform-scope assignment) | **R**. `{"effective_to": ...}` schedules the end instead of ending now. |
 
@@ -296,6 +298,13 @@ to the list.
   — append-only, one row per insert and real change, with actor, correlation id and reason.
   Rows that predate it are backfilled from `created_at` (pending until `approval_decided_at`
   where decided later). Events `iam.assignment.suspended` / `.resumed`.
+- **Merged with main's ORG-06 wave 4 (3 Nov).** main built suspension separately (000037:
+  `approval_status = 'SUSPENDED'`, `assignment_suspensions`, `iam.assignment.suspend` /
+  `.resume`). The merged service uses that model; the store keeps `suspended_at` /
+  `suspended_by` / `suspension_reason` in step with it, so the history and `?as_of=` above
+  still answer. Suspend and resume keep If-Match / ETag and the resume checks above.
+  Migration **000041** pins `authz_assignment_events()`: 000037 and 000038 each replaced it,
+  and which one survived depended on the order they ran.
 - **Quantity authority limits (S8-D1).** Migration **000040**: `limit_kind` `MONETARY` (every
   existing row, the default) or `QUANTITY`. A QUANTITY limit has no `currency` and whole-number
   bounds (both held by CHECKs); it is judged against the request's `quantity` attribute — the

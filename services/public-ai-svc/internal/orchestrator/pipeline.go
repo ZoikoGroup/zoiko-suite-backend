@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -152,11 +153,20 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	clarifications := 0
 	carried := false
 	secondary := dec.Secondary
-	if pd := in.Pending; pd != nil && (intent == pd.Intent || intent == "I29" || intent == "I04" ||
+	// A message without its own intent continues the open question only when
+	// it supplies something for it (a market, plan or billing term). Anything
+	// else is a new question, so an unrelated message never gets the same
+	// clarifying question again (Doc 02 §10, G34).
+	supplies := dec.Slots.MarketCode != "" || dec.Slots.PlanName != "" || dec.Slots.BillingCadence != ""
+	if pd := in.Pending; pd != nil && (intent == pd.Intent || ((intent == "I29" || intent == "I04") && supplies) ||
 		policy.IsGeneralOverview(in.Message) || policy.IsOtherMarket(in.Message)) {
-		// A reply to our clarifying question: keep the original question's
-		// intent and slots, add what the visitor just supplied.
+		// A reply to our clarifying question, or a follow-up to an answer
+		// ("what about the UK, monthly?"): keep the original question's
+		// intent; after a clarification also its slots.
 		intent, secondary, clarifications, carried = pd.Intent, pd.Secondary, pd.Clarifications, true
+		if pd.Answered {
+			pd = &Pending{Intent: pd.Intent, Secondary: pd.Secondary}
+		}
 		if dec.Slots.PlanName == "" {
 			dec.Slots.PlanName = pd.PlanName
 		}
@@ -172,7 +182,14 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	overview := carried && policy.IsGeneralOverview(in.Message)
 	if carried && policy.IsOtherMarket(in.Message) {
 		// "Other": a country we hold no verified claims for. Never guessed.
-		return p.fromTemplate(policy.TplAbstainCoverage, intent, snap, "", now, releaseID)
+		// It is not a dead end (Doc 02 escalation matrix: unsupported market
+		// -> demo): the question stays open so "Show general overview" still
+		// answers it, and the approved next steps are offered.
+		res := p.fromTemplate(policy.TplAbstainCoverage, intent, snap, "", now, releaseID)
+		res.Suggestions = policy.SuggestCoverage
+		res.Pending = &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName,
+			BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications}
+		return res
 	}
 	// "What plans are there, and is there a trial?" needs both answers, each
 	// from its own typed claim for the same market (Master prompt T1-T3).
@@ -219,12 +236,16 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				return res
 			case claims.Contradicted:
 				p.recordConflict(ctx, req, d, now)
-				return p.fromTemplate(withRoute(policy.TplAbstainConflict, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
+				res := p.fromTemplate(withRoute(policy.TplAbstainConflict, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
+				return keepAsking(res, snap, market, &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName,
+					BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications})
 			case claims.RevokedDecision, claims.ExpiredDecision:
+				pd := &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName,
+					BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications}
 				if req.Subject == claims.Trial {
-					return because(p.trialStale(intent, snap, market, now, releaseID), d.ReasonCode)
+					return keepAsking(because(p.trialStale(intent, snap, market, now, releaseID), d.ReasonCode), snap, market, pd)
 				}
-				return because(p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), d.ReasonCode)
+				return keepAsking(because(p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), d.ReasonCode), snap, market, pd)
 			case claims.InsufficientEvidence:
 				if req.Subject == claims.IntegrationStatus {
 					// No signed status for this connector: explain the capability
@@ -239,6 +260,19 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				if req.Subject == claims.Certification {
 					// Doc 02 T10: due-diligence route, never an asserted status.
 					return p.fromTemplate(policy.TplAbstainCertification, intent, snap, market, now, releaseID)
+				}
+				if req.Subject == claims.Residency {
+					// Doc 02 T11 (G11): the approved residency wording, never a
+					// single-country guarantee and never a bare "couldn't verify".
+					return p.fromTemplate(policy.BoundaryTemplates["I14"], intent, snap, market, now, releaseID)
+				}
+				if (req.Subject == claims.Price || req.Subject == claims.Trial) && market != "" && !slices.Contains(snap.Claims.Markets(), market) {
+					// G06: a named country with no claims at all is not covered
+					// (as for "Other"); the markets with claims and the general
+					// overview are offered, and the question stays open.
+					res := p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID)
+					return keepAsking(res, snap, market, &Pending{Intent: intent, Secondary: secondary,
+						PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications})
 				}
 				route := policy.DefaultRoute[intent]
 				if (req.Subject == claims.Price || req.Subject == claims.Trial) && market != "" {
@@ -290,13 +324,18 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			hits = withNeighbor(snap.KB, r.Hits, kq, snap)
 			if regionalIntents[intent] && market != "" && !hasMarketEvidence(hits, market) {
 				// G12/G13: a named country needs country-specific evidence; never assume coverage.
-				return p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID)
+				return regionalCoverage(p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID))
 			}
 		case knowledge.Stale:
 			return p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 		case knowledge.Revoked:
 			return because(p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), contract.ReasonSourceRevoked)
 		default:
+			if regionalIntents[intent] && market != "" {
+				// G13: a named country with no approved material at all is not
+				// assumed covered (same reply as G12 with material elsewhere).
+				return regionalCoverage(p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID))
+			}
 			if intent == "I29" {
 				// Off-topic and nothing approved matches: out of scope, with
 				// the help route (Doc 02 G34).
@@ -398,6 +437,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		// Plans/trials explained without a market: a reply naming a country
 		// ("uk") should get that market's verified prices or trial next.
 		res.Pending = &Pending{Intent: intent, PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence}
+	} else if (intent == "I05" || intent == "I06") && market != "" {
+		// Answered for one market: "what about the UK, monthly?" asks the
+		// same question again for the new market and billing only (G05).
+		res.Pending = &Pending{Intent: intent, Secondary: secondary, Answered: true}
 	}
 	return res
 }
@@ -574,6 +617,33 @@ func because(res Result, reason string) Result {
 
 // trialStale is the market-named abstention for trial terms that cannot be
 // verified (expired or revoked trial claim).
+// regionalCoverage offers the coverage confirmation route as a next step
+// (Doc 02 escalation matrix: regional payroll / tax / legal coverage -> demo).
+func regionalCoverage(res Result) Result {
+	res.Suggestions = policy.SuggestRegionalCoverage
+	return res
+}
+
+// keepAsking leaves a market-scoped pricing or trial question open when its
+// claim for that market cannot be stated (expired, revoked, conflicting), and
+// offers the other markets and the general overview as next steps, so the
+// reply is not a dead end and naming another country answers the same
+// question (Doc 02 §10). The other markets are only those with claims.
+func keepAsking(res Result, snap *release.Snapshot, market string, pd *Pending) Result {
+	if market == "" || (pd.Intent != "I05" && pd.Intent != "I06") {
+		return res
+	}
+	for _, m := range snap.Claims.Markets() {
+		if m != market {
+			name := policy.CountryName(m)
+			res.Suggestions = append(res.Suggestions, contract.Chip{Label: name, Message: name})
+		}
+	}
+	res.Suggestions = append(res.Suggestions, contract.Chip{Label: "Show general overview", Message: "Show general overview"})
+	res.Pending = pd
+	return res
+}
+
 func (p *Pipeline) trialStale(intent string, snap *release.Snapshot, market string, now time.Time, releaseID string) Result {
 	res := p.fromTemplate(policy.TplAbstainTrialStale, intent, snap, market, now, releaseID)
 	if text, err := policy.Render(res.Text, map[string]string{"market": policy.MarketName(market)}); err == nil {
@@ -628,7 +698,7 @@ func joinStatements(cards []model.ClaimCard) string {
 	for _, c := range cards {
 		parts = append(parts, c.Statement)
 	}
-	return strings.Join(parts, " ")
+	return model.ListStatements(parts)
 }
 
 // regionalIntents depend on country coverage (tax, payroll, legal).
@@ -673,8 +743,10 @@ func claimRequest(intent string, dec policy.Decision, msg string, reg *claims.Re
 	q := claims.Request{Market: market, AsOf: now}
 	switch intent {
 	case "I05", "I07":
-		if !carried && !policy.AsksPrice(msg) {
-			return q, false // "Which plans are there?" is answered from the approved pricing page
+		if !carried && !policy.AsksPrice(msg) && dec.Slots.BillingCadence == "" {
+			// "Which plans are there?" is answered from the approved pricing
+			// page; a billing term ("monthly") is a price question.
+			return q, false
 		}
 		q.Subject, q.SubjectID, q.BillingTerm = claims.Price, reg.PlanCode(dec.Slots.PlanName), dec.Slots.BillingCadence
 	case "I06":

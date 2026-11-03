@@ -53,6 +53,12 @@ type Jurisdiction struct {
 	// RowVersion increases on every update (000020): the aggregate version
 	// events carry and the ETag If-Match asserts.
 	RowVersion int64 `json:"row_version"`
+
+	// Retirement evidence (000027): why a retired jurisdiction was retired, the
+	// source that said so, and what replaces it. Empty until it is retired.
+	RetirementReason           *string `json:"retirement_reason,omitempty"`
+	RetirementEvidenceRef      *string `json:"retirement_evidence_ref,omitempty"`
+	SupersededByJurisdictionID *string `json:"superseded_by_jurisdiction_id,omitempty"`
 }
 
 // JurisdictionRule is an effective-dated applicability rule record.

@@ -252,7 +252,7 @@ func (s *PgStore) GenerateRecurringJournal(ctx context.Context, tenantID, templa
 func (s *PgStore) AccountControls(ctx context.Context, tenantID string, codes []string) (map[string]domain.AccountControl, error) {
 	out := map[string]domain.AccountControl{}
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT account_code, COALESCE(control_type, ''), counterparty_required FROM chart_of_accounts
+		rows, err := tx.Query(ctx, `SELECT account_code, COALESCE(control_type, ''), counterparty_required, dimension_policy FROM chart_of_accounts
 			WHERE tenant_id = $1::uuid AND account_code = ANY($2)`, tenantID, codes)
 		if err != nil {
 			return mapPgError(err)
@@ -261,8 +261,12 @@ func (s *PgStore) AccountControls(ctx context.Context, tenantID string, codes []
 		for rows.Next() {
 			var code string
 			var c domain.AccountControl
-			if err := rows.Scan(&code, &c.ControlType, &c.CounterpartyRequired); err != nil {
+			var policy []byte
+			if err := rows.Scan(&code, &c.ControlType, &c.CounterpartyRequired, &policy); err != nil {
 				return err
+			}
+			if len(policy) > 0 {
+				_ = json.Unmarshal(policy, &c.DimensionPolicy)
 			}
 			out[code] = c
 		}

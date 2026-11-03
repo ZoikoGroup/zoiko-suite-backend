@@ -54,6 +54,8 @@ type CloseEvidence struct {
 	Issues        []string       `json:"blocking_issues"`
 	Books         []BookEvidence `json:"books"`
 	Seal          *PeriodSeal    `json:"seal,omitempty"`
+	// IncompleteEvents are the period's accounting events that have not posted in every book that requires them (standard §4, §37).
+	IncompleteEvents *PeriodIncomplete `json:"incomplete_events,omitempty"`
 }
 
 // EvidenceService assembles close evidence.
@@ -64,6 +66,8 @@ type EvidenceService struct {
 	Seals   SealRepo
 	Snaps   SnapshotRepo
 	Pending PendingRepo
+	// Orch, when set, adds the events that have not posted in every book that requires them. The handler always sets it.
+	Orch *OrchestrationService
 }
 
 // For returns the evidence for an entity and period. require lists the reconciliation types that must have been run for each
@@ -130,6 +134,20 @@ func (s *EvidenceService) For(ctx context.Context, tenant, entity, period string
 			ev.Issues = append(ev.Issues, b.BookCode+": "+is)
 		}
 		ev.Books = append(ev.Books, be)
+	}
+	if s.Orch != nil {
+		inc, err := s.Orch.InPeriod(ctx, tenant, entity, period)
+		if err != nil {
+			return nil, err
+		}
+		ev.IncompleteEvents = inc
+		if inc.Count > 0 {
+			more := ""
+			if inc.Truncated {
+				more = " or more"
+			}
+			ev.Issues = append(ev.Issues, fmt.Sprintf("incomplete_events: %d%s accounting event(s) of the period have not posted in every book that requires them", inc.Count, more))
+		}
 	}
 	ev.Ready = len(ev.Issues) == 0
 	return ev, nil

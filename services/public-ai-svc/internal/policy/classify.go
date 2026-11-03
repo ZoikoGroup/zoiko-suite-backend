@@ -48,7 +48,7 @@ var exceptionRules = map[string][]*regexp.Regexp{
 	},
 	X05SecurityEscalate: {
 		pattern("vulnerability", "vulnerabilities", "found a bug in your security", "security flaw", "exploit", "data breach",
-			"was hacked", "been hacked", "been compromised", "was compromised", "phishing", "report a security", "responsible disclosure", "bug bounty"),
+			"was hacked", "been hacked", "been compromised", "was compromised", "security breach", "security incident", "been breached", "were breached", "under attack", "ransomware", "cyber attack", "cyberattack", "phishing", "report a security", "responsible disclosure", "bug bounty"),
 	},
 	X01PrivateAction: {
 		livePlatformRe,
@@ -81,6 +81,7 @@ var exceptionRules = map[string][]*regexp.Regexp{
 // phrases. tieOrder resolves equal scores (more specific / higher risk first).
 var intentRules = map[string]*regexp.Regexp{
 	"I01": pattern("what is zoikosuite", "what can zoikosuite do", "what does zoikosuite offer", "what is zoiko suite", "what's zoikosuite", "whats zoikosuite", "what does zoikosuite do", "what does zoiko suite do",
+		"what is the zoiko suite", "what is the zoikosuite", "what's the zoiko suite", "tell me about zoiko suite", "about zoiko suite", "explain zoiko suite",
 		"tell me about zoikosuite", "about zoikosuite", "explain zoikosuite", "describe zoikosuite", "introduce zoikosuite", "how does zoikosuite work",
 		"new to zoikosuite", "what kind of platform", "overview", "hello", "hi", "hey", "good morning", "who are you"),
 	"I02": pattern("feature*", "capabilit*", "module*", "accounts payable", "accounts receivable", "general ledger", "treasury", "procurement", "cash management", "what can you do"),
@@ -95,8 +96,8 @@ var intentRules = map[string]*regexp.Regexp{
 	"I11": pattern("migrat*", "switch from", "move from", "moving from", "import our data", "import data", "data import", "onboarding data"),
 	"I12": pattern("soc 2", "soc2", "iso 27001", "iso27001", "certif*", "secur*", "encrypt*", "penetration test", "pentest", "trust center", "compliance report", "mfa", "single sign-on"),
 	"I13": pattern("privacy", "gdpr", "dpa", "data processing agreement", "personal data", "data protection", "ccpa", "subprocessor*", "delete my data"),
-	"I14": pattern("data residency", "where is the data stored", "where is my data", "where is data stored", "data stored", "hosted", "hosting", "data center", "data centre", "eu data", "uk data", "deploy*", "on-premise", "on premise", "on-prem", "self-host*", "private cloud"),
-	"I15": pattern("governance", "approval workflow*", "approvals", "approve on behalf", "on behalf of", "who can approve", "approval limit*", "act for", "audit trail", "segregation of duties", "controls", "policy engine"),
+	"I14": pattern("data residency", "where is the data stored", "where is my data", "where is data stored", "data stored", "hosted", "hosting", "data center", "data centre", "eu data", "uk data", "never leave*", "data leave*", "leave the country", "data stay*", "stays in the", "data sovereignty", "data location", "deploy*", "on-premise", "on premise", "on-prem", "self-host*", "private cloud"),
+	"I15": pattern("governance", "approval workflow*", "approvals", "run approvals", "approve automatically", "approvals automatically", "automatic approval*", "auto-approv*", "approve on behalf", "on behalf of", "who can approve", "approval limit*", "act for", "audit trail", "segregation of duties", "controls", "policy engine"),
 	"I16": pattern("evidence", "audit evidence", "audit-ready", "audit ready", "auditor*", "audit log*", "audit trail evidence", "admissib*", "assurance"),
 	"I17": pattern("tax", "taxes", "taxation", "file tax*", "tax filing*", "tax return*", "vat", "gst", "sales tax", "tax compliance", "corporate tax", "withholding"),
 	"I18": pattern("payroll", "workforce", "human resources", "hr", "paye", "benefits", "leave management", "employee onboarding"),
@@ -112,7 +113,7 @@ var intentRules = map[string]*regexp.Regexp{
 	"I26": pattern("compare", "comparison", "vs", "versus", "better than", "alternative to", "competitor*", "netsuite", "sage intacct"),
 	"I27": pattern("accessibility", "screen reader", "wcag", "accessible", "keyboard navigation"),
 	"I28": pattern("billing", "payment method", "receipt*", "charged", "invoice from zoikosuite", "update my card", "billing address"),
-	"I30": pattern("responsible ai", "can ai", "does ai", "will ai", "ai approv*", "ai run*", "how do you use ai", "use ai", "uses ai", "artificial intelligence", "ai features", "ai model", "which model", "training data", "train on my data", "trained on", "hallucinat*", "are you an ai", "are you a bot"),
+	"I30": pattern("responsible ai", "can ai", "does ai", "will ai", "how do you use ai", "use ai", "uses ai", "artificial intelligence", "ai features", "ai model", "which model", "training data", "train on my data", "trained on", "hallucinat*", "are you an ai", "are you a bot"),
 }
 
 var tieOrder = []string{"I22", "I24", "I12", "I13", "I14", "I05", "I06", "I08", "I09", "I10", "I11", "I17", "I18", "I19", "I03", "I04", "I07", "I15", "I16", "I20", "I25", "I26", "I27", "I28", "I30", "I23", "I21", "I02", "I01"}
@@ -226,6 +227,11 @@ func Classify(msg string) Decision {
 	}
 	d.Primary, d.Secondary = classifyIntent(text)
 	d.Slots = extractSlots(text)
+	// "What about the UK, monthly?" with nothing else: a billing term and a
+	// country only make sense for price (Doc 02 I05 slots market, billing).
+	if d.Primary == "I29" && d.Slots.BillingCadence != "" && d.Slots.MarketCode != "" {
+		d.Primary = "I05"
+	}
 	return d
 }
 
@@ -259,25 +265,6 @@ func classifyIntent(text string) (string, string) {
 	return best, second
 }
 
-var markets = []struct {
-	code string
-	re   *regexp.Regexp
-}{
-	{"US", pattern("united states", "usa", "us market", "in the us", "america")},
-	{"GB", pattern("united kingdom", "uk", "britain", "great britain", "england", "scotland", "wales")},
-	{"IE", pattern("ireland")},
-	{"DE", pattern("germany")},
-	{"FR", pattern("france")},
-	{"NL", pattern("netherlands")},
-	{"ES", pattern("spain")},
-	{"IT", pattern("italy")},
-	{"CA", pattern("canada")},
-	{"AU", pattern("australia")},
-	{"IN", pattern("india")},
-	{"SG", pattern("singapore")},
-	{"AE", pattern("uae", "united arab emirates", "dubai")},
-}
-
 var (
 	planRe        = regexp.MustCompile(`(?i)\b(starter|growth|enterprise)\b`)
 	monthlyRe     = pattern("monthly", "per month", "a month", "month-to-month")
@@ -288,12 +275,9 @@ var (
 
 func extractSlots(text string) Slots {
 	var s Slots
-	for _, m := range markets {
-		if m.re.MatchString(text) {
-			s.MarketCode = m.code
-			break
-		}
-	}
+	// Any ISO 3166-1 country the visitor names (countries.go), longest
+	// alias first; naming a country is never coverage (claims decide that).
+	s.MarketCode = MarketOf(text)
 	if m := planRe.FindStringSubmatch(text); m != nil {
 		s.PlanName = strings.ToLower(m[1])
 	}

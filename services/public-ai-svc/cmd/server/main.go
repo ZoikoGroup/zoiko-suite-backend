@@ -105,6 +105,13 @@ func main() {
 	}
 	defer pub.Close() //nolint:errcheck
 
+	if cfg.StructuredResponseDev && (cfg.DatabaseURL == "" || cfg.SeedOnStart) {
+		// Dev/test only (config enforces); recorded like any other flag change.
+		if err := flags.Set(ctx, st, flags.StructuredResponseEnabled, []byte("true"), "local-dev", "PUBLIC_AI_STRUCTURED_RESPONSE", cfg.Environment); err != nil {
+			log.Fatal("structured response flag", zap.Error(err))
+		}
+		log.Warn("structured responses on (dev): GET /menu and turn followups/cta/outcome")
+	}
 	// Initial load; failures leave the service not-ready (fail closed).
 	if err := rt.Refresh(ctx); err != nil {
 		log.Error("release load failed; service is not ready", zap.Error(err))
@@ -140,7 +147,7 @@ func main() {
 	}
 	guard := limits.New(cfg, st, fl)
 	api := httpapi.New(cfg, log, httpapi.Deps{
-		Store: st, Sessions: session.New(st, cfg.SessionTTL), Answerer: guard.Wrap(pipeline), Config: rt, Routes: rt,
+		Store: st, Sessions: session.New(st, cfg.SessionTTL), Answerer: guard.Wrap(pipeline), Config: rt, Routes: rt, Flags: fl,
 		Limiter: guard.Middleware,
 		Ready: func() bool {
 			return cfg.Enabled && rt.Ready(3*refreshInterval) && fl.Healthy() && fl.Values().PublicAIEnabled

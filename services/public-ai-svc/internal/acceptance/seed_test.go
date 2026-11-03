@@ -130,6 +130,19 @@ func TestT4b_OtherCountryNotCovered(t *testing.T) {
 	if e.Reason != contract.ReasonMarketNotCovered {
 		t.Fatalf("reason = %s", e.Reason)
 	}
+	// Not a dead end: approved next steps, and the question stays open.
+	var labels []string
+	for _, s := range e.Suggestions {
+		labels = append(labels, s.Label)
+	}
+	if !slices.Equal(labels, []string{"Show general overview", "Book a demo"}) {
+		t.Fatalf("suggestions %v", labels)
+	}
+	o := c.say("Show general overview")
+	want(t, o, contract.Answered)
+	if o.StatusLabel != "MARKET_DEPENDENT" || digits.MatchString(o.Text) {
+		t.Fatalf("overview after Other: %s %q", o.StatusLabel, o.Text)
+	}
 }
 
 // T5: SOC 2 is on HOLD -> abstain with the trust route.

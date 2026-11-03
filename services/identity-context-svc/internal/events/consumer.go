@@ -40,10 +40,6 @@ type RoleDirectory interface {
 type RoleAssignmentProjector interface {
 	UpsertRoleAssignment(ctx context.Context, tenantID string, a domain.PrincipalRoleAssignment) error
 	EndRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error
-	// SuspendRoleAssignment takes a suspended assignment out of the
-	// projection WITHOUT a revocation tombstone, so its resume can project it
-	// again (IAM-09).
-	SuspendRoleAssignment(ctx context.Context, tenantID, assignmentID string) error
 }
 
 // RiskSignalWriter is the write half of the risk cache. Kept separate from the
@@ -392,14 +388,18 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 		return c.handleRoleUpdated(ctx, ev)
 	// IAM-09: authorization-svc (zoiko.authorization.events) and
 	// access-control-svc both publish the assignment lifecycle. An expiry
-	// ends authority like a revocation; a suspension ends it until resumed;
-	// an approval or a resume adds it back.
+	// ends authority like a revocation; an approval adds it, like a grant.
 	case "iam.assignment.revoked", "iam.assignment.expired":
 		return c.handleAssignmentRevoked(ctx, ev)
+	case "iam.assignment.granted", "iam.assignment.approved":
+		return c.handleAssignmentGranted(ctx, ev)
+	// A suspended assignment confers nothing until it is resumed (ORG-06), so
+	// the subject's sessions end as on a revocation; a resume only ADDS access,
+	// like a grant, and ends nothing.
 	case "iam.assignment.suspended":
 		return c.handleAssignmentSuspended(ctx, ev)
-	case "iam.assignment.granted", "iam.assignment.approved", "iam.assignment.resumed":
-		return c.handleAssignmentGranted(ctx, ev)
+	case "iam.assignment.resumed":
+		return c.handleAssignmentResumed(ctx, ev)
 	case "entity.updated":
 		return c.handleEntityUpdated(ctx, ev)
 	case "session.risk.changed", "risk.signal.updated":
@@ -586,40 +586,6 @@ func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) erro
 		zap.String("role_id", p.RoleID),
 		zap.Int("sessions_revoked", n),
 		zap.String("correlation_id", ev.CorrelationID))
-	return nil
-}
-
-// handleAssignmentSuspended: a suspended assignment confers nothing until it
-// is resumed, so the principal's sessions end exactly as on a revocation, but
-// the projection is removed without a tombstone so iam.assignment.resumed can
-// put it back.
-func (c *Consumer) handleAssignmentSuspended(ctx context.Context, ev inbound) error {
-	var p struct {
-		PrincipalID       string `json:"principal_id"`
-		AssignmentID      string `json:"assignment_id"`
-		AuthzAssignmentID string `json:"principal_role_assignment_id"`
-	}
-	_ = json.Unmarshal(ev.Payload, &p)
-	p.AssignmentID = firstNonEmpty(p.AssignmentID, p.AuthzAssignmentID)
-	if p.PrincipalID == "" {
-		c.log.Error("iam.assignment.suspended names no principal — cannot suspend", zap.String("event_id", ev.EventID))
-		return nil
-	}
-	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
-		return nil
-	}
-	if proj, ok := c.roles.(RoleAssignmentProjector); ok && p.AssignmentID != "" {
-		if err := proj.SuspendRoleAssignment(ctx, ev.TenantID, p.AssignmentID); err != nil {
-			c.log.Error("failed to suspend projected role assignment — will retry",
-				zap.String("assignment_id", p.AssignmentID), zap.Error(err))
-			return c.retry(ctx, ev, err)
-		}
-	}
-	if _, err := c.sessions.EvictAllForPrincipal(ctx, p.PrincipalID, ev.TenantID, domain.InvalidationReasonAdminRevoke); err != nil {
-		c.log.Error("failed to revoke sessions after assignment suspension — will retry",
-			zap.String("principal_id", p.PrincipalID), zap.Error(err))
-		return c.retry(ctx, ev, err)
-	}
 	return nil
 }
 

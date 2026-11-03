@@ -245,6 +245,10 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 	if env.AnswerClass == "" {
 		env.AnswerClass = contract.DefaultClass(env.Status)
 	}
+	structured := s.structuredOn()
+	if structured {
+		s.structure(&env, firstNonEmpty(res.MarketCode, firstNonEmpty(req.MarketCode, sess.MarketCode)))
+	}
 	if err := env.Validate(); err != nil {
 		// The orchestrator produced something outside the schema: never send it.
 		s.log.Error("response failed schema validation", zap.String("request_id", rid), zap.String("reason", err.Error()))
@@ -252,6 +256,10 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 		env.Citations, env.Actions, env.Flags = []contract.Citation{}, []contract.Action{}, nil
 		env.AnswerClass, env.StatusLabel, env.MarketCode, env.Clarification = contract.HandoffUnknown, "", "", nil
 		env.SecondaryIntentID, env.Reason, env.Suggestions, env.Draft = "", contract.ReasonValidationFailed, nil, false
+		env.Outcome, env.FollowUps, env.CTA = "", nil, nil
+		if structured {
+			env.Outcome = contract.OutcomeSafeFallback
+		}
 		diag.reason = contract.ReasonValidationFailed
 		if env.KnowledgeReleaseID == "" {
 			env.KnowledgeReleaseID = "none"

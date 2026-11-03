@@ -158,6 +158,9 @@ type MemberRequest struct {
 	InvestmentAccount string   `json:"investment_account,omitempty"`
 	InvestorEntityID  string   `json:"investor_entity_id,omitempty"`
 	EquityAccounts    []string `json:"equity_accounts,omitempty"`
+	// EquityRateDate, optional, with the capital terms: the equity accounts above are translated at the spot rate of this date
+	// (the date the equity arose, normally the acquisition) instead of the closing rate. It cannot be later than effective_from.
+	EquityRateDate string `json:"equity_rate_date,omitempty"`
 }
 
 // AddMember adds a member. The group's reporting entity cannot be a member: its own periods must stay open for the group book.
@@ -210,8 +213,21 @@ func (s *ConsolService) AddMember(ctx context.Context, tenant string, a Actor, g
 			}
 		}
 	}
+	if req.EquityRateDate != "" {
+		if !capital {
+			return nil, consolBad("equity_rate_date", "a historical equity rate needs the capital terms: it applies to the equity accounts named there")
+		}
+		rd, perr := time.Parse("2006-01-02", req.EquityRateDate)
+		if perr != nil {
+			return nil, consolBad("equity_rate_date", "a date, YYYY-MM-DD")
+		}
+		if rd.After(from) {
+			return nil, consolBad("equity_rate_date", "the date the equity arose cannot be after the member joins the group")
+		}
+		req.EquityRateDate = rd.Format("2006-01-02")
+	}
 	m := &ConsolMember{MemberID: uuid.NewString(), GroupID: g.GroupID, LegalEntityID: req.LegalEntityID, SourceBookID: bk.BookID, Method: method, OwnershipPct: pct.FloatString(4), EffectiveFrom: from.Format("2006-01-02"),
-		InvestmentAccount: req.InvestmentAccount, InvestorEntityID: req.InvestorEntityID, EquityAccounts: req.EquityAccounts}
+		InvestmentAccount: req.InvestmentAccount, InvestorEntityID: req.InvestorEntityID, EquityAccounts: req.EquityAccounts, EquityRateDate: req.EquityRateDate}
 	if err := s.Repo.InsertMember(ctx, tenant, m, a.PrincipalID, OutEvent{Fact: "consolidation-member.added", AggregateType: "consolidation-group", AggregateID: g.GroupID, Actor: a.PrincipalID,
 		CorrelationID: a.CorrelationID, LegalEntityID: g.ParentEntityID, Data: map[string]any{"group_id": g.GroupID, "member_id": m.MemberID, "legal_entity_id": m.LegalEntityID, "ownership_pct": m.OwnershipPct, "effective_from": m.EffectiveFrom}}); err != nil {
 		return nil, err
@@ -528,6 +544,29 @@ func (s *ConsolService) Run(ctx context.Context, tenant string, a Actor, req Con
 			rates[rateKey(cur, class)] = ConsolRate{Currency: cur, Class: class, Policy: pols[class].ID, Rate: b.Rate, RateID: b.RateID, RateType: b.RateType, AsOf: b.AsOf}
 		}
 	}
+	// a member whose equity is translated at its historical rate needs the spot rate of that date, which is a different rate from the closing one
+	for _, l := range ms {
+		cur, date := l.book.FunctionalCurrency, l.m.EquityRateDate
+		if date == "" || cur == g.PresentationCurrency {
+			continue
+		}
+		if _, done := rates[rateKey(cur, EquityRateClass(date))]; done {
+			continue
+		}
+		rd, _ := time.Parse("2006-01-02", date)
+		b, rerr := s.Rates.Basis(ctx, "SPOT_ON_DATE", cur, g.PresentationCurrency, rd)
+		if rerr != nil {
+			if e, isExc := AsException(rerr); isExc {
+				if e.Family == FamExt {
+					return nil, e
+				}
+				missing = append(missing, map[string]any{"currency": cur, "class": "EQ", "as_of": date, "code": e.Code, "detail": e.Detail})
+				continue
+			}
+			return nil, rerr
+		}
+		rates[rateKey(cur, EquityRateClass(date))] = ConsolRate{Currency: cur, Class: "EQ", Policy: "SPOT_ON_DATE", Rate: b.Rate, RateID: b.RateID, RateType: b.RateType, AsOf: b.AsOf}
+	}
 	if len(missing) > 0 {
 		return nil, exc(FamFX, "CONSOLIDATION_RATE_UNAVAILABLE", "%d rate(s) are not available under the group's translation policies: a consolidation never uses a stale or alternate rate", len(missing)).with("rates", missing)
 	}
@@ -565,7 +604,7 @@ func (s *ConsolService) Run(ctx context.Context, tenant string, a Actor, req Con
 		}
 		data = append(data, ConsolMemberData{
 			Input: ConsolInput{LegalEntityID: l.m.LegalEntityID, BookID: l.book.BookID, BookCode: l.book.BookCode, FunctionalCurrency: l.book.FunctionalCurrency, OwnershipPct: l.m.OwnershipPct,
-				SnapshotID: snap.SnapshotID, ContentHash: snap.ContentHash, LedgerWatermark: snap.LedgerWatermark, Sealed: sealed, InvestmentAccount: l.m.InvestmentAccount, InvestorEntityID: l.m.InvestorEntityID, EquityAccounts: l.m.EquityAccounts},
+				SnapshotID: snap.SnapshotID, ContentHash: snap.ContentHash, LedgerWatermark: snap.LedgerWatermark, Sealed: sealed, InvestmentAccount: l.m.InvestmentAccount, InvestorEntityID: l.m.InvestorEntityID, EquityAccounts: l.m.EquityAccounts, EquityRateDate: l.m.EquityRateDate},
 			Lines: snap.Lines, Positions: pos})
 	}
 

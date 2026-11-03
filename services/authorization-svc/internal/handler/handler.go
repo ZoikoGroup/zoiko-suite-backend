@@ -253,12 +253,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/role-assignments", h.CreateRoleAssignment)
 	r.Get("/v1/admin/role-assignments", h.ListRoleAssignments)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/revoke", h.RevokeRoleAssignment)
+	// ORG-06 s4.6: suspend and resume, the suspension history, and the
+	// as-of reconstruction (000037).
+	r.Post("/v1/admin/role-assignments/{assignment_id}/suspend", h.SuspendRoleAssignment)
+	r.Post("/v1/admin/role-assignments/{assignment_id}/resume", h.ResumeRoleAssignment)
+	r.Get("/v1/admin/role-assignments/{assignment_id}/suspensions", h.ListAssignmentSuspensions)
+	r.Get("/v1/admin/role-assignments/as-of", h.GetAssignmentsAsOf)
 	// Maker-checker on privileged assignments (GOV-12; ZS-IAM-001 §9, A20).
 	r.Post("/v1/admin/role-assignments/{assignment_id}/approve", h.ApproveRoleAssignment)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/reject", h.RejectRoleAssignment)
-	// ORG-06 SuspendAssignment (IAM-13; 000038).
-	r.Post("/v1/admin/role-assignments/{assignment_id}/suspend", h.SuspendRoleAssignment)
-	r.Post("/v1/admin/role-assignments/{assignment_id}/resume", h.ResumeRoleAssignment)
 
 	// GOV-03 commands (and the spec's illustrative contract surface).
 	r.Post("/v1/admin/authorization-cache/invalidate", h.InvalidateAuthorizationCache)

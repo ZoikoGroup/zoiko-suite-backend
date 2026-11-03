@@ -860,7 +860,7 @@ func (s *Store) DecideRoleAssignment(ctx context.Context, assignmentID, tenantID
 }
 
 // SuspendRoleAssignment and ResumeRoleAssignment stop and restart a grant
-// (000038), so cached grant sources are dropped like any revoke or approval.
+// (000037), so cached grant sources are dropped like any revoke or approval.
 func (s *Store) SuspendRoleAssignment(ctx context.Context, assignmentID, tenantID, suspendedBy, reason string) (*domain.PrincipalRoleAssignment, error) {
 	f, ok := s.inner.(interface {
 		SuspendRoleAssignment(ctx context.Context, assignmentID, tenantID, suspendedBy, reason string) (*domain.PrincipalRoleAssignment, error)
@@ -875,18 +875,40 @@ func (s *Store) SuspendRoleAssignment(ctx context.Context, assignmentID, tenantI
 	return a, err
 }
 
-func (s *Store) ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error) {
+func (s *Store) ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID, actor, reason string) (*domain.PrincipalRoleAssignment, error) {
 	f, ok := s.inner.(interface {
-		ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
+		ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID, actor, reason string) (*domain.PrincipalRoleAssignment, error)
 	})
 	if !ok {
 		return nil, domain.ErrStoreUnavailable
 	}
-	a, err := f.ResumeRoleAssignment(ctx, assignmentID, tenantID)
+	a, err := f.ResumeRoleAssignment(ctx, assignmentID, tenantID, actor, reason)
 	if err == nil {
 		s.invalidateGrantSources(tenantID)
 	}
 	return a, err
+}
+
+// ListAssignmentSuspensions and QueryAssignmentsAsOf are reads for audit,
+// never a decision: forwarded uncached.
+func (s *Store) ListAssignmentSuspensions(ctx context.Context, assignmentID, tenantID string) ([]domain.AssignmentSuspension, error) {
+	f, ok := s.inner.(interface {
+		ListAssignmentSuspensions(ctx context.Context, assignmentID, tenantID string) ([]domain.AssignmentSuspension, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.ListAssignmentSuspensions(ctx, assignmentID, tenantID)
+}
+
+func (s *Store) QueryAssignmentsAsOf(ctx context.Context, q domain.AssignmentsAsOfQuery) ([]domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		QueryAssignmentsAsOf(ctx context.Context, q domain.AssignmentsAsOfQuery) ([]domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.QueryAssignmentsAsOf(ctx, q)
 }
 
 // FindRoleAssignmentsAsOf is a history read for audit, never a decision:

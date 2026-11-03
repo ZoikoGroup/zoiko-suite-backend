@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -506,7 +507,6 @@ func ParseManualJournalPolicy(threshold, types string) (ManualJournalPolicy, err
 	return p, nil
 }
 
-
 // checkWave2Controls applies the subledger-aware rules of §12 and §17 to a manual journal: a line on an AR or AP control
 // account (or any account flagged for it) names its counterparty, and a reconciliation adjustment names the open case it settles.
 // Writes its own response and returns false on a refusal.
@@ -563,6 +563,31 @@ func (h *Handler) checkWave2Controls(w http.ResponseWriter, r *http.Request, req
 				fmt.Sprintf("line %d posts to account %s, which needs the counterparty (customer or supplier)", i+1, l.AccountCode))
 			return "", false
 		}
+		for _, d := range sortedPolicyKeys(c.DimensionPolicy) {
+			have := strings.TrimSpace(l.Dimensions[d]) != ""
+			switch c.DimensionPolicy[d] {
+			case "REQUIRED":
+				if !have {
+					writeError(w, http.StatusUnprocessableEntity, "dimension_required", fmt.Sprintf("line %d posts to account %s, which requires the dimension %s", i+1, l.AccountCode, d))
+					return "", false
+				}
+			case "PROHIBITED":
+				if have {
+					writeError(w, http.StatusUnprocessableEntity, "dimension_prohibited", fmt.Sprintf("line %d posts to account %s, which does not take the dimension %s", i+1, l.AccountCode, d))
+					return "", false
+				}
+			}
+		}
 	}
 	return reconBook, true
+}
+
+// sortedPolicyKeys lists an account's policy dimensions in a fixed order, so the first refusal is the same every time.
+func sortedPolicyKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

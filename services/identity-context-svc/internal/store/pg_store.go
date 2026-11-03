@@ -183,8 +183,7 @@ func (s *PgStore) FindActiveRoleAssignments(
 		  AND tenant_id = $2
 		  AND (legal_entity_id = $3 OR legal_entity_id IS NULL OR $3 IS NULL)
 		  AND effective_from <= NOW()
-		  AND effective_to   >  NOW()
-	`
+		  AND effective_to   >  NOW()` + notSuspended
 	assignments := []domain.PrincipalRoleAssignment{}
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, query, principalID, tenantID, legalEntityID)

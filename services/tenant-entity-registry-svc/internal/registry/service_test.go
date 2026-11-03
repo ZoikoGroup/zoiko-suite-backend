@@ -38,6 +38,7 @@ type memStore struct {
 	// test seeds them.
 	hierarchies map[string]*domain.EntityHierarchy
 	assignments map[string]*domain.EntityJurisdictionAssignment
+	ownership   map[string]*domain.OwnershipRelationship
 	// Minimal set — add more maps as tests require.
 }
 

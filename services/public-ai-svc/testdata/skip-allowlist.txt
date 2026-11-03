@@ -1,0 +1,13 @@
+# Tests allowed to skip in the public-ai-svc security job (Doc 07 §10: no
+# test is disabled without a recorded reason). One test per line, then the
+# reason. CI fails on any skip not listed here. Postgres tests run in the
+# service matrix job, which has a database.
+TestA35_NoEgressToPrivateServices        manual/infra: network egress policy of the deployment
+TestA38_KeyboardAndScreenReader          manual: screen-reader pass (axe and keyboard run in Playwright)
+TestG29_KeyboardScreenReader             manual: screen-reader pass (axe and keyboard run in Playwright)
+TestGroqLive                             needs GROQ_API_KEY (live provider, approval pending DEC-05)
+TestPostgresConformance                  needs TEST_DATABASE_URL (runs in the service matrix job)
+TestPostgresControlAuditAppendOnly       needs TEST_DATABASE_URL
+TestPostgresMigrationsRoundTrip          needs TEST_DATABASE_URL
+TestPostgresRevocationsAppendOnly        needs TEST_DATABASE_URL
+TestLatencyBudgetGate                    skipped only with -short

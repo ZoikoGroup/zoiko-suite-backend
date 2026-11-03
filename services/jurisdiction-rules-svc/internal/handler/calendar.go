@@ -457,6 +457,10 @@ func (h *Handler) CalculateObligation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !replayed && stored.Outcome == domain.DueCalculated {
+		h.emitRegistry(r, events.EventObligationDueDated, stored.DecisionID, actor, map[string]any{"decision_id": stored.DecisionID,
+			"jurisdiction_code": req.Jurisdiction, "obligation_code": req.ObligationCode})
+	}
 	status := http.StatusOK
 	switch stored.Outcome {
 	case domain.DueUnsupported, domain.DueInvalidFacts, domain.DueExtensionNotAllowed:

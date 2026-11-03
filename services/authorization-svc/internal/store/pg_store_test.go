@@ -134,12 +134,18 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000034_break_glass_approval_and_session_evidence.up.sql",
 		"000035_authority_limit_governance.up.sql",
 		"000036_rule_publication_approval.up.sql",
+		// Two branches each added a 000037 and a 000038; migrate.py applies by
+		// filename, so they run in this order.
+		"000037_assignment_suspension.up.sql",
 		"000037_record_version_sessions.up.sql",
-		// 000038 adds assignment suspension, version and history (IAM-13);
-		// 000039 a version on workload bindings; 000040 quantity limits.
+		"000038_assignment_expiry.up.sql",
+		// 000038 adds assignment version and history (IAM-13); 000039 a
+		// version on workload bindings; 000040 quantity limits.
 		"000038_assignment_suspension_and_history.up.sql",
 		"000039_workload_binding_version.up.sql",
 		"000040_quantity_authority_limits.up.sql",
+		// 000041: one authz_assignment_events() whichever of 000037 / 000038 ran last.
+		"000041_assignment_events_reconciled.up.sql",
 	}
 	// Three migrations have now been missed from this list. Refuse to run
 	// against a schema the list does not fully describe.

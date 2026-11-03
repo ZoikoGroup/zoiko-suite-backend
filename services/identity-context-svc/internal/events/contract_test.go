@@ -168,6 +168,8 @@ func TestEveryConsumedEventIsInTheContract(t *testing.T) {
 		"role.updated",
 		"iam.assignment.revoked",
 		"iam.assignment.granted",
+		"iam.assignment.suspended",
+		"iam.assignment.resumed",
 		"entity.updated",
 		"session.risk.changed",
 		"legal.hold.issued",

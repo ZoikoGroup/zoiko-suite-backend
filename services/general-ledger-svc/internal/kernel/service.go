@@ -105,6 +105,9 @@ type Repo interface {
 	PostUnit(ctx context.Context, u *PostingUnit) (*PostResult, error)
 	// RecordPostingFailure stores the evidence of a posting that did not complete and raises it on the outbox.
 	RecordPostingFailure(ctx context.Context, f *PostingFailure) error
+	// RecordEventRejection raises the rejection of an event at intake on the outbox. Nothing else is stored: a rejected event
+	// has no accounting consequence and is not a fact of the books.
+	RecordEventRejection(ctx context.Context, tenant string, out OutEvent) error
 	// PostingTrace resolves the lineage of a posting: event, rule, execution, journals, lines, relations and outbox ids.
 	PostingTrace(ctx context.Context, tenant string, q TraceQuery) (*Trace, error)
 
@@ -184,6 +187,37 @@ func (s *Service) SetBookStatus(ctx context.Context, tenant string, a Actor, id,
 // (a replay never creates a second consequence). The tenant and the entity are resolved by the caller, never trusted from
 // the payload.
 func (s *Service) RegisterEvent(ctx context.Context, tenant string, a Actor, e AccountingEvent) (*AccountingEvent, bool, error) {
+	stored, existing, err := s.registerEvent(ctx, tenant, a, e)
+	if err != nil {
+		s.eventRejected(ctx, tenant, a, e, err)
+	}
+	return stored, existing, err
+}
+
+// eventRejected raises AccountingEventRejected (standard §33) for an event the kernel refused at intake, so the source domain and
+// operations hear of it. Only a deterministic refusal is a rejection: an authorization failure, an unavailable dependency or a
+// storage error is not a verdict on the event. The notice is best effort, and the refusal itself is what the caller is told.
+func (s *Service) eventRejected(ctx context.Context, tenant string, a Actor, e AccountingEvent, cause error) {
+	x, ok := AsException(cause)
+	if !ok || x.Family == FamAuth && x.Code != "ENTITY_MISMATCH" || x.Family == FamExt {
+		return
+	}
+	id := e.SourceSystem + "/" + e.SourceEventID
+	if len(id) > 200 || id == "/" {
+		id = "unidentified-" + NewEventID()
+	}
+	data := map[string]any{"event_type": e.EventType, "event_version": e.EventVersion, "source_system": e.SourceSystem, "source_event_id": e.SourceEventID,
+		"idempotency_key": e.IdempotencyKey, "family": x.Family, "code": x.Code, "detail": x.Detail}
+	entity := ""
+	if _, err := uuid.Parse(e.LegalEntityID); err == nil {
+		entity = e.LegalEntityID
+		data["legal_entity_id"] = entity
+	}
+	_ = s.Repo.RecordEventRejection(ctx, tenant, OutEvent{Fact: "event.rejected", AggregateType: "accounting-event", AggregateID: id, Actor: a.PrincipalID,
+		CorrelationID: e.CorrelationID, LegalEntityID: entity, Data: data})
+}
+
+func (s *Service) registerEvent(ctx context.Context, tenant string, a Actor, e AccountingEvent) (*AccountingEvent, bool, error) {
 	e.TenantID = tenant
 	if err := e.Validate(); err != nil {
 		return nil, false, err

@@ -85,6 +85,13 @@ channels:
           # ── Structure ────────────────────────────────────────────────────
           - $ref: "#/components/messages/EntityHierarchyChanged"
           - $ref: "#/components/messages/EntityJurisdictionChanged"
+          # ── ORG-04 §4.4 ──────────────────────────────────────────────────
+          - $ref: "#/components/messages/OwnershipRelationshipProposed"
+          - $ref: "#/components/messages/OwnershipRelationshipActivated"
+          - $ref: "#/components/messages/OwnershipRelationshipSuperseded"
+          - $ref: "#/components/messages/OwnershipRelationshipEnded"
+          - $ref: "#/components/messages/OwnershipRelationshipRejected"
+          - $ref: "#/components/messages/ControlRelationshipChanged"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -249,6 +256,84 @@ components:
       name: entity.jurisdiction.changed
       title: A jurisdiction assignment was created or end-dated
       x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    # ── ORG-04 §4.4 ────────────────────────────────────────────────────────
+    #
+    # Every ORG-04 payload carries: tenant_id, relationship_id,
+    # parent_legal_entity_id, child_legal_entity_id, relationship_kind
+    # (OWNERSHIP | CONTROL), ownership_pct, voting_pct, control_type, status,
+    # change_type (PROPOSED | ACTIVATED | SUPERSEDED | ENDED | REJECTED),
+    # valid_from, valid_to and, where they apply, supersedes_relationship_id
+    # and replaced_by_relationship_id. Beneficial notes are NEVER in an event.
+    # The envelope's object_id is the relationship id and its entity is the CHILD.
+    # A CONTROL relationship's activation, supersession and end are all
+    # control.relationship.changed; an OWNERSHIP relationship's have their own names.
+
+    OwnershipRelationshipProposed:
+      name: ownership.relationship.proposed
+      title: An ownership or control relationship was proposed, awaiting a different principal's approval
+      description: |
+        Not a change to the group structure: nothing takes effect until approval.
+        Emitted for both OWNERSHIP and CONTROL relationships.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    OwnershipRelationshipActivated:
+      name: ownership.relationship.activated
+      title: An OWNERSHIP relationship was approved and is now part of the group structure
+      description: |
+        Consolidation and any consumer holding its own copy of the group graph
+        must apply it from `effective_at` (the relationship's valid_from). When
+        the relationship replaced another, `supersedes_relationship_id` names it.
+      x-spec-event: OwnershipRelationshipActivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    OwnershipRelationshipSuperseded:
+      name: ownership.relationship.superseded
+      title: An OWNERSHIP relationship was replaced by new terms
+      description: |
+        `effective_at` is when the original stops applying, which is when its
+        replacement starts; `replaced_by_relationship_id` names the replacement.
+        The original stays retrievable, so history before `effective_at` is unchanged.
+      x-spec-event: OwnershipRelationshipSuperseded
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    OwnershipRelationshipEnded:
+      name: ownership.relationship.ended
+      title: An OWNERSHIP relationship was ended
+      description: |
+        `effective_at` is the end date. `evidence_ref` is the evidence for the end.
+        The spec names no event for an end; this is the OWNERSHIP counterpart of
+        control.relationship.changed with change_type ENDED.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    OwnershipRelationshipRejected:
+      name: ownership.relationship.rejected
+      title: A proposed ownership or control relationship was refused
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ControlRelationshipChanged:
+      name: control.relationship.changed
+      title: A CONTROL relationship was activated, superseded or ended
+      description: |
+        The `change_type` says which. A CONTROL relationship carries no equity,
+        so ownership_pct is null unless a figure was recorded alongside it.
+      x-spec-event: ControlRelationshipChanged
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
