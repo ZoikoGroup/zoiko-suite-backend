@@ -516,9 +516,11 @@ type Party struct {
 	PartyKind     PartyKind   `json:"party_kind"`
 	Status        PartyStatus `json:"status"`
 	LegalEntityID *string     `json:"legal_entity_id,omitempty"`
-	MasterVersion int64       `json:"master_version"`
-	CreatedBy     string      `json:"created_by"`
-	CreatedAt     time.Time   `json:"created_at"`
+	// MergedInto is the survivor a MERGED party resolves to.
+	MergedInto    *string   `json:"merged_into,omitempty"`
+	MasterVersion int64     `json:"master_version"`
+	CreatedBy     string    `json:"created_by"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // PartyFact is one effective-dated, sourced fact.
@@ -575,6 +577,8 @@ type PartyView struct {
 	Identifiers  []PartyIdentifier `json:"identifiers"`
 	Roles        []PartyRole       `json:"roles"`
 	QualityFlags []string          `json:"quality_flags"`
+	// AliasIDs are the parties merged into this one.
+	AliasIDs []string `json:"alias_ids"`
 }
 
 // PartySummary is a search or find result.
@@ -605,6 +609,13 @@ type ResolutionCase struct {
 	Reason          string           `json:"reason"`
 	OpenedBy        string           `json:"opened_by"`
 	OpenedAt        time.Time        `json:"opened_at"`
+	RecordVersion   int64            `json:"record_version"`
+	ProposedFactID  *string          `json:"proposed_fact_id,omitempty"`
+	Decision        string           `json:"decision,omitempty"`
+	DecidedBy       string           `json:"decided_by,omitempty"`
+	DecidedAt       *time.Time       `json:"decided_at,omitempty"`
+	DecisionNote    string           `json:"decision_note,omitempty"`
+	ResolvedPartyID *string          `json:"resolved_party_id,omitempty"`
 }
 
 // CreatePartyResult is the answer to CreateParty.

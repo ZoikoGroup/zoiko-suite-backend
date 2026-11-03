@@ -46,6 +46,15 @@ func TestPartyEvents_CarryIdentityAndVersionButNeverAValue(t *testing.T) {
 		events.EventPartyIdentifierLinked: func() (*outbox.Record, error) {
 			return events.PartyIdentifierRecord(testParty, ident, "p-1", "corr")
 		},
+		events.EventPartiesMerged: func() (*outbox.Record, error) {
+			return events.PartiesMergedRecord(testParty, []string{"alias-1"}, "case-1", "p-1", "corr", map[string]any{"alias-1": map[string]any{"previous_status": "ACTIVE", "identifiers_moved": []string{"i1"}, "roles_moved": []string{"SUPPLIER"}}})
+		},
+		events.EventPartySplit: func() (*outbox.Record, error) {
+			return events.PartySplitRecord(testParty, "alias-1", "case-1", "p-1", "corr", map[string]any{})
+		},
+		events.EventMasterConflictResolved: func() (*outbox.Record, error) {
+			return events.ConflictResolvedRecord(domain.ResolutionCase{CaseID: "c1", TenantID: testParty.TenantID, CaseType: domain.CaseFactConflict, DecidedBy: "p-2", Decision: "KEEP_VERIFIED"}, "corr")
+		},
 		events.EventMasterConflictOpened: func() (*outbox.Record, error) { return events.ConflictOpenedRecord(c, "corr") },
 	}
 

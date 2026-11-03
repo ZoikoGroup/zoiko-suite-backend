@@ -202,7 +202,7 @@ func (s *Service) SearchParties(ctx context.Context, q domain.PartySearchQuery) 
 		return nil, "", fmt.Errorf("%w: role is not a party role", ErrInvalidInput)
 	}
 	switch q.Status {
-	case "", domain.PartyCandidate, domain.PartyActive, domain.PartyInactive:
+	case "", domain.PartyCandidate, domain.PartyActive, domain.PartyInactive, domain.PartyMerged:
 	default:
 		return nil, "", fmt.Errorf("%w: status is not a party status", ErrInvalidInput)
 	}

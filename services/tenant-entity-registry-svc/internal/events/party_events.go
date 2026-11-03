@@ -16,19 +16,23 @@ import (
 )
 
 const (
-	EventPartyCreated          = "party.created"           // PartyCreated / party_created
-	EventPartyProfileAmended   = "party.profile.amended"   // PartyProfileAmended
-	EventPartyFactPublished    = "party.fact.published"    // party_fact_published
-	EventPartyRoleAdded        = "party.role.added"        // PartyRoleAdded
-	EventPartyRoleRemoved      = "party.role.removed"      // (no spec name)
-	EventPartyIdentifierLinked = "party.identifier.linked" // LinkExternalIdentifier
-	EventMasterConflictOpened  = "master.conflict.opened"  // master_conflict_opened
+	EventPartyCreated           = "party.created"            // PartyCreated / party_created
+	EventPartyProfileAmended    = "party.profile.amended"    // PartyProfileAmended
+	EventPartyFactPublished     = "party.fact.published"     // party_fact_published
+	EventPartyRoleAdded         = "party.role.added"         // PartyRoleAdded
+	EventPartyRoleRemoved       = "party.role.removed"       // (no spec name)
+	EventPartyIdentifierLinked  = "party.identifier.linked"  // LinkExternalIdentifier
+	EventMasterConflictOpened   = "master.conflict.opened"   // master_conflict_opened
+	EventPartiesMerged          = "party.merged"             // PartiesMerged / master_merge_committed
+	EventPartySplit             = "party.split"              // PartySplit / master_split_committed
+	EventMasterConflictResolved = "master.conflict.resolved" // (no spec name)
 )
 
 // PartyEventNames is every party wire name the code can emit.
 var PartyEventNames = []string{
 	EventPartyCreated, EventPartyProfileAmended, EventPartyFactPublished, EventPartyRoleAdded,
 	EventPartyRoleRemoved, EventPartyIdentifierLinked, EventMasterConflictOpened,
+	EventPartiesMerged, EventPartySplit, EventMasterConflictResolved,
 }
 
 func partySpec(eventType string, p domain.Party, actor, corr string, payload map[string]any) RecordSpec {
@@ -98,6 +102,43 @@ func ConflictOpenedRecord(c domain.ResolutionCase, corr string) (*outbox.Record,
 		Payload: map[string]any{
 			"tenant_id": c.TenantID, "case_id": c.CaseID, "conflict_type": c.CaseType, "subject_party_id": c.SubjectPartyID,
 			"candidate_party_ids": ids, "severity": "REVIEW_REQUIRED",
+		},
+	})
+}
+
+// RemediationScope tells the domains that hold references to a merged or split party what to re-resolve. This
+// service re-points identifiers and roles itself; a domain re-points what it owns (an invoice's customer, a
+// contract's counterparty) prospectively, through the alias, and never rewrites a historical snapshot (s18.2).
+var RemediationScope = []string{"REFERENCES", "ROLES"}
+
+// PartiesMergedRecord is party.merged (master_merge_committed): the survivor, the aliases and the decision.
+func PartiesMergedRecord(survivor domain.Party, aliasIDs []string, caseID, actor, corr string, outcomes map[string]any) (*outbox.Record, error) {
+	return BuildRecord(partySpec(EventPartiesMerged, survivor, actor, corr, map[string]any{
+		"survivor_id": survivor.PartyID, "alias_ids": aliasIDs, "decision_ref": caseID,
+		"remediation_scope": RemediationScope, "outcomes": outcomes,
+	}))
+}
+
+// PartySplitRecord is party.split (master_split_committed): the party that was merged in error is distinct again.
+func PartySplitRecord(survivor domain.Party, restoredID, caseID, actor, corr string, outcomes map[string]any) (*outbox.Record, error) {
+	return BuildRecord(partySpec(EventPartySplit, survivor, actor, corr, map[string]any{
+		"survivor_id": survivor.PartyID, "restored_party_id": restoredID, "decision_ref": caseID,
+		"remediation_scope": RemediationScope, "outcomes": outcomes,
+	}))
+}
+
+// ConflictResolvedRecord is master.conflict.resolved for a decided stewardship case.
+func ConflictResolvedRecord(c domain.ResolutionCase, corr string) (*outbox.Record, error) {
+	subject := c.CaseID
+	if c.SubjectPartyID != nil {
+		subject = *c.SubjectPartyID
+	}
+	return BuildRecord(RecordSpec{
+		EventType: EventMasterConflictResolved, TenantID: c.TenantID, ActorID: c.DecidedBy, CorrelationID: corr,
+		ObjectID: c.CaseID, ObjectVersion: max64(c.RecordVersion, 1), PartitionKey: subject,
+		Payload: map[string]any{
+			"tenant_id": c.TenantID, "case_id": c.CaseID, "conflict_type": c.CaseType, "decision": c.Decision,
+			"resolved_party_id": c.ResolvedPartyID,
 		},
 	})
 }

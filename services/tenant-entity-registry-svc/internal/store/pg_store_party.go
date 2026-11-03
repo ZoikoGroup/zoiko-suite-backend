@@ -42,17 +42,21 @@ func lockPartyCreate(ctx context.Context, tx pgx.Tx, tenantID string) error {
 	return err
 }
 
-const partyColumns = `party_id, tenant_id, party_kind, status, legal_entity_id, master_version, created_by, created_at`
+const partyColumns = `party_id, tenant_id, party_kind, status, legal_entity_id, master_version, created_by, created_at, merged_into_party_id`
 
 func scanParty(row pgx.Row) (*domain.Party, error) {
 	var p domain.Party
-	var le *uuid.UUID
-	if err := row.Scan(&p.PartyID, &p.TenantID, &p.PartyKind, &p.Status, &le, &p.MasterVersion, &p.CreatedBy, &p.CreatedAt); err != nil {
+	var le, mi *uuid.UUID
+	if err := row.Scan(&p.PartyID, &p.TenantID, &p.PartyKind, &p.Status, &le, &p.MasterVersion, &p.CreatedBy, &p.CreatedAt, &mi); err != nil {
 		return nil, err
 	}
 	if le != nil {
 		s := le.String()
 		p.LegalEntityID = &s
+	}
+	if mi != nil {
+		s := mi.String()
+		p.MergedInto = &s
 	}
 	return &p, nil
 }
@@ -215,6 +219,14 @@ func replayCreate(ctx context.Context, tx pgx.Tx, tid string, cmd registry.Party
 		res.Case = c
 		if c != nil {
 			res.Candidates = c.Candidates
+			// A decided case answers the replay with the party the steward settled on.
+			if c.ResolvedPartyID != nil {
+				p, err := scanParty(tx.QueryRow(ctx, `SELECT `+partyColumns+` FROM parties WHERE party_id = $1 AND tenant_id = $2`, *c.ResolvedPartyID, tid))
+				if err != nil {
+					return nil, err
+				}
+				res.Party = p
+			}
 		}
 	}
 	if len(cand) > 0 {
@@ -285,7 +297,7 @@ func (s *PgStore) matchCreate(ctx context.Context, tx pgx.Tx, tid string, req do
 		       COALESCE((SELECT f.value FROM party_facts f WHERE f.tenant_id = p.tenant_id AND f.party_id = p.party_id
 		                  AND f.fact_type = 'COUNTRY' AND f.status = 'VERIFIED' AND f.superseded_at IS NULL
 		                  ORDER BY f.valid_from DESC LIMIT 1), '')
-		  FROM parties p WHERE p.tenant_id = $1 AND p.party_id = ANY($2::uuid[])`, tid, ids)
+		  FROM parties p WHERE p.tenant_id = $1 AND p.status <> 'MERGED' AND p.party_id = ANY($2::uuid[])`, tid, ids)
 	if err != nil {
 		return domain.MatchDecision{}, err
 	}
@@ -403,9 +415,11 @@ func (s *PgStore) insertNewParty(ctx context.Context, tx pgx.Tx, tid string, cmd
 			return nil, err
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO party_create_requests (tenant_id, create_request_id, fingerprint, outcome, party_id)
-		VALUES ($1,$2,$3,'CREATED',$4)`, tid, req.CreateRequestID, cmd.Fingerprint, id); err != nil {
-		return nil, err
+	if !cmd.SkipRequestRecord {
+		if _, err := tx.Exec(ctx, `INSERT INTO party_create_requests (tenant_id, create_request_id, fingerprint, outcome, party_id)
+			VALUES ($1,$2,$3,'CREATED',$4)`, tid, req.CreateRequestID, cmd.Fingerprint, id); err != nil {
+			return nil, err
+		}
 	}
 	rec, err := events.PartyCreatedRecord(*p, req.CorrelationID)
 	if err != nil {
@@ -448,9 +462,9 @@ func insertCase(ctx context.Context, tx pgx.Tx, c *domain.ResolutionCase, held [
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO resolution_cases (case_id, tenant_id, case_type, status, subject_party_id, candidates, held_request,
-		create_request_id, reason, opened_by, opened_at, correlation_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9,$10,$11,NULLIF($12,''))`,
-		c.CaseID, c.TenantID, c.CaseType, c.Status, c.SubjectPartyID, cand, held, c.CreateRequestID, c.Reason, c.OpenedBy, c.OpenedAt, corr)
+		create_request_id, reason, opened_by, opened_at, correlation_id, proposed_fact_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9,$10,$11,NULLIF($12,''),$13)`,
+		c.CaseID, c.TenantID, c.CaseType, c.Status, c.SubjectPartyID, cand, held, c.CreateRequestID, c.Reason, c.OpenedBy, c.OpenedAt, corr, c.ProposedFactID)
 	return err
 }
 
@@ -460,10 +474,12 @@ func loadCase(ctx context.Context, tx pgx.Tx, tid, caseID string) (*domain.Resol
 	}
 	var c domain.ResolutionCase
 	var cand []byte
-	var subject *uuid.UUID
+	var subject, factID, resolved *uuid.UUID
 	err := tx.QueryRow(ctx, `SELECT case_id, tenant_id, case_type, status, subject_party_id, candidates, COALESCE(create_request_id,''),
-		reason, opened_by, opened_at FROM resolution_cases WHERE case_id = $1 AND tenant_id = $2`, caseID, tid).
-		Scan(&c.CaseID, &c.TenantID, &c.CaseType, &c.Status, &subject, &cand, &c.CreateRequestID, &c.Reason, &c.OpenedBy, &c.OpenedAt)
+		reason, opened_by, opened_at, record_version, proposed_fact_id, COALESCE(decision,''), COALESCE(decided_by,''), decided_at,
+		COALESCE(decision_note,''), resolved_party_id FROM resolution_cases WHERE case_id = $1 AND tenant_id = $2`, caseID, tid).
+		Scan(&c.CaseID, &c.TenantID, &c.CaseType, &c.Status, &subject, &cand, &c.CreateRequestID, &c.Reason, &c.OpenedBy, &c.OpenedAt,
+			&c.RecordVersion, &factID, &c.Decision, &c.DecidedBy, &c.DecidedAt, &c.DecisionNote, &resolved)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -473,6 +489,14 @@ func loadCase(ctx context.Context, tx pgx.Tx, tid, caseID string) (*domain.Resol
 	if subject != nil {
 		s := subject.String()
 		c.SubjectPartyID = &s
+	}
+	if factID != nil {
+		s := factID.String()
+		c.ProposedFactID = &s
+	}
+	if resolved != nil {
+		s := resolved.String()
+		c.ResolvedPartyID = &s
 	}
 	if err := json.Unmarshal(cand, &c.Candidates); err != nil {
 		return nil, err
@@ -528,7 +552,7 @@ func (s *PgStore) GetPartyView(ctx context.Context, partyID string, asOf, knownA
 		}
 		v := &domain.PartyView{Party: *p, AsOf: fmtDate(day), KnownAt: knownAt.UTC(),
 			Names: []domain.PartyFact{}, Facts: []domain.PartyFact{}, PendingFacts: []domain.PartyFact{},
-			Identifiers: []domain.PartyIdentifier{}, Roles: []domain.PartyRole{}, QualityFlags: []string{}}
+			Identifiers: []domain.PartyIdentifier{}, Roles: []domain.PartyRole{}, QualityFlags: []string{}, AliasIDs: []string{}}
 		// A party that did not yet exist is not in the view.
 		if p.CreatedAt.After(knownAt) {
 			return nil
@@ -612,6 +636,23 @@ func (s *PgStore) GetPartyView(ctx context.Context, partyID string, asOf, knownA
 			return err
 		}
 
+		arows, err := tx.Query(ctx, `SELECT party_id FROM parties WHERE tenant_id = $1 AND merged_into_party_id = $2 ORDER BY party_id`, tid, partyID)
+		if err != nil {
+			return err
+		}
+		for arows.Next() {
+			var id string
+			if err := arows.Scan(&id); err != nil {
+				arows.Close()
+				return err
+			}
+			v.AliasIDs = append(v.AliasIDs, id)
+		}
+		arows.Close()
+		if err := arows.Err(); err != nil {
+			return err
+		}
+
 		hasLegal, hasVerifiedID := false, false
 		for _, n := range v.Names {
 			if n.FactType == domain.FactLegalName && n.Status == domain.FactVerified {
@@ -661,8 +702,8 @@ func (s *PgStore) ProposePartyFact(ctx context.Context, partyID string, req doma
 		if err := checkPartyVersion(req.ExpectedMasterVersion, p.MasterVersion, allowUnversioned); err != nil {
 			return err
 		}
-		if p.Status == domain.PartyInactive {
-			return fmt.Errorf("%w: the party is INACTIVE", registry.ErrStateConflict)
+		if err := partyWritable(p); err != nil {
+			return err
 		}
 		from, _ := domain.ParseDate(req.ValidFrom)
 		var to *time.Time
@@ -766,6 +807,7 @@ func (s *PgStore) ProposePartyFact(ctx context.Context, partyID string, req doma
 				SubjectPartyID: &partyID, Candidates: []domain.MatchCandidate{}, OpenedBy: actor, OpenedAt: now,
 				Reason: fmt.Sprintf("a proposed %s contradicts the verified %s in force; the verified fact stands until a steward decides", req.FactType, req.FactType),
 			}
+			c.ProposedFactID = &fact.FactID
 			if err := insertCase(ctx, tx, c, nil, req.CorrelationID); err != nil {
 				return err
 			}
@@ -795,8 +837,8 @@ func (s *PgStore) AddPartyRole(ctx context.Context, partyID string, req domain.A
 		if err := checkPartyVersion(req.ExpectedMasterVersion, p.MasterVersion, allowUnversioned); err != nil {
 			return err
 		}
-		if p.Status == domain.PartyInactive {
-			return fmt.Errorf("%w: the party is INACTIVE", registry.ErrStateConflict)
+		if err := partyWritable(p); err != nil {
+			return err
 		}
 		from, _ := domain.ParseDate(req.ValidFrom)
 		now := time.Now().UTC()
@@ -892,8 +934,8 @@ func (s *PgStore) LinkPartyIdentifier(ctx context.Context, partyID string, req d
 		if err := checkPartyVersion(req.ExpectedMasterVersion, p.MasterVersion, allowUnversioned); err != nil {
 			return err
 		}
-		if p.Status == domain.PartyInactive {
-			return fmt.Errorf("%w: the party is INACTIVE", registry.ErrStateConflict)
+		if err := partyWritable(p); err != nil {
+			return err
 		}
 		scope := domain.NormalizeScope(req.Scheme, req.Scope)
 		var holder, existingID string
@@ -918,7 +960,8 @@ func (s *PgStore) LinkPartyIdentifier(ctx context.Context, partyID string, req d
 				},
 				Reason: "an identifier maps to one party; a second party was asked to link it",
 			}
-			if err := insertCase(ctx, tx, c, nil, req.CorrelationID); err != nil {
+			held, _ := json.Marshal(req)
+			if err := insertCase(ctx, tx, c, held, req.CorrelationID); err != nil {
 				return err
 			}
 			out = &registry.PartyIdentifierOutcome{Party: *p, Case: c}
@@ -1015,7 +1058,7 @@ func (s *PgStore) SearchParties(ctx context.Context, q domain.PartySearchQuery) 
 		rows, err := tx.Query(ctx, partySummarySQL+`
 			WHERE p.tenant_id = $1
 			  AND ($2::text = '' OR p.party_kind = $2)
-			  AND ($3::text = '' OR p.status = $3)
+			  AND ($3::text = '' AND p.status <> 'MERGED' OR p.status = $3)
 			  AND ($4::text = '' OR EXISTS (SELECT 1 FROM party_roles r WHERE r.tenant_id = p.tenant_id AND r.party_id = p.party_id
 			        AND r.role_type = $4 AND r.removed_at IS NULL))
 			  AND ($5::text = '' OR EXISTS (SELECT 1 FROM party_facts f WHERE f.tenant_id = p.tenant_id AND f.party_id = p.party_id
@@ -1046,3 +1089,22 @@ func (s *PgStore) SearchParties(ctx context.Context, q domain.PartySearchQuery) 
 }
 
 var _ registry.PartyStore = (*PgStore)(nil)
+
+// partyWritable refuses a write to a party that is no longer live. A merged party is written to through its
+// survivor: the answer says where it went.
+func partyWritable(p *domain.Party) error {
+	switch p.Status {
+	case domain.PartyInactive:
+		return fmt.Errorf("%w: the party is INACTIVE", registry.ErrStateConflict)
+	case domain.PartyMerged:
+		return fmt.Errorf("%w: the party was merged into %s; write to the survivor", registry.ErrStateConflict, derefStr(p.MergedInto))
+	}
+	return nil
+}
+
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}

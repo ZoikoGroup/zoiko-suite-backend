@@ -100,6 +100,9 @@ func codeEventNames() []string {
 		events.EventPartyRoleRemoved,
 		events.EventPartyIdentifierLinked,
 		events.EventMasterConflictOpened,
+		events.EventPartiesMerged,
+		events.EventPartySplit,
+		events.EventMasterConflictResolved,
 	}
 }
 

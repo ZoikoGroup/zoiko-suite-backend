@@ -37,6 +37,9 @@ type PartyCreateCommand struct {
 	Request     domain.CreatePartyRequest
 	Actor       string
 	Fingerprint string
+	// SkipRequestRecord is set when a steward creates the party a held request asked for: the request id already
+	// has its REVIEW_REQUIRED record, and a second would break the append-only trail.
+	SkipRequestRecord bool
 }
 
 // PartyFactOutcome is what proposing a fact produced. Case is set when the proposal contradicted a verified fact.
@@ -60,4 +63,42 @@ type PartyIdentifierOutcome struct {
 	Party      domain.Party            `json:"party"`
 	Case       *domain.ResolutionCase  `json:"case,omitempty"`
 	NoOp       bool                    `json:"-"`
+}
+
+// PartyResolutionStore is the MDM-05 half: matching, stewardship decisions, merge, split and merge history. Like
+// PartyStore it is asserted by the service.
+type PartyResolutionStore interface {
+	// MatchParties answers what a create would do for this request, and why, without writing anything.
+	MatchParties(ctx context.Context, req domain.MatchPartiesRequest) (*domain.MatchPartiesResult, error)
+	ListResolutionCases(ctx context.Context, status, caseType string, limit int, after string) ([]domain.ResolutionCase, string, error)
+	// DecideResolutionCase settles a case under its row lock. The decider must differ from the opener
+	// (ErrSelfApproval); a stale case version is ErrVersionConflict.
+	DecideResolutionCase(ctx context.Context, caseID string, req domain.CaseDecisionRequest, actor string, allowUnversioned bool) (*CaseDecisionOutcome, error)
+	// MergeParties is MDM-05 s18.2 in one transaction. See MergeOutcome.
+	MergeParties(ctx context.Context, caseID string, req domain.MergePartiesRequest, actor string) (*MergeOutcome, error)
+	// SplitParties corrects a merge with new lineage; it erases nothing.
+	SplitParties(ctx context.Context, caseID string, req domain.SplitPartiesRequest, actor string) (*SplitOutcome, error)
+	ExplainMergeHistory(ctx context.Context, partyID string) (*domain.MergeHistory, error)
+}
+
+// CaseDecisionOutcome is a decided case, and the party the decision made or named.
+type CaseDecisionOutcome struct {
+	Case  domain.ResolutionCase `json:"case"`
+	Party *domain.Party         `json:"party,omitempty"`
+}
+
+// MergeOutcome is a committed merge: the survivor, the aliases (each still resolvable, status MERGED), the lineage
+// rows and what moved.
+type MergeOutcome struct {
+	Survivor domain.Party          `json:"survivor"`
+	Aliases  []domain.Party        `json:"aliases"`
+	Lineage  []domain.LineageEvent `json:"lineage"`
+	Case     domain.ResolutionCase `json:"case"`
+}
+
+// SplitOutcome is a committed split: the party that is distinct again, and its former survivor.
+type SplitOutcome struct {
+	Restored domain.Party        `json:"restored"`
+	Survivor domain.Party        `json:"survivor"`
+	Lineage  domain.LineageEvent `json:"lineage"`
 }

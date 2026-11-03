@@ -60,6 +60,11 @@ var registeredActionMigrations = []struct {
 		"PARTY_IDENTIFIER_LINK":   "STANDARD",
 		"PARTY_IDENTIFIER_REVEAL": "HIGH",
 	}},
+	{"000045_register_party_resolution_actions", "tenant-entity-registry-svc", map[string]string{
+		"PARTY_MERGE":             "CRITICAL",
+		"PARTY_SPLIT":             "HIGH",
+		"PARTY_RESOLUTION_DECIDE": "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

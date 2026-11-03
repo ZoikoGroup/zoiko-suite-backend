@@ -38,3 +38,7 @@ var (
 // ErrCreateRequestMismatch — a create_request_id already used for a DIFFERENT party request. 409,
 // IDEMPOTENCY_MISMATCH. Answering the first request's result would hand the caller a party they did not ask for.
 var ErrCreateRequestMismatch error = &kindError{"idempotency mismatch: this create_request_id was used for a different party request", ErrConflict}
+
+// ErrMergeProhibited — a merge MDM-05 forbids: it would collapse two distinct legal entities, it would chain, or a
+// party involved is not live. 409, MERGE_PROHIBITED.
+var ErrMergeProhibited error = &kindError{"merge prohibited", ErrConflict}

@@ -142,3 +142,25 @@ Where the spec leaves a choice, the code chooses the safer reading:
   state comes from the source class of the link until it is.
 - **Search reads the authoritative tables.** The spec expects a search projection; a projection lags a write, and
   the answer to "does this party already exist" must not.
+
+### Merge, split and stewardship (MDM-05, wave 2)
+
+- **Merge is a case decision.** `POST /v1/resolution/{case}:merge` decides an open DUPLICATE_REVIEW or
+  IDENTIFIER_CONFLICT case. Every party involved must be named by the case, and the steward sends the version of each
+  (s18.2 step 2). The spec's "authorization/WFC approval where material" is built as separation of duties: the
+  principal who opened the case cannot decide it, and the principal who merged cannot split. Every merge is treated as
+  material because this service cannot see which parties are linked to financial records. A workflow approval step in
+  front of the command is the place to relax that for low-impact objects; none is configured.
+- **Absorbed ids stay.** A merged party keeps its row, status `MERGED`, resolving to the survivor. Merges do not chain:
+  a survivor that was merged away, or a party that already absorbed others, is refused rather than re-pointed.
+- **Identifiers and roles are consolidated here; references are not.** The survivor gains the identifiers and roles it
+  lacked (new rows naming their source; the old rows end). `party.merged` carries `remediation_scope`, and each domain
+  re-points what it owns prospectively through the alias. A historical snapshot is never rewritten.
+- **A split restores, it does not guess.** Identifiers and a legal-entity link the merge moved go back; roles the merge
+  consolidated are left for the domains to re-resolve from `party.split`. The merge stays in the lineage.
+- **Matching skips merged parties.** A create resembling a merged-away name matches nothing; names are not copied to
+  the survivor. If that matters, steward the survivor's names with `facts:propose`.
+- **Decisions are not a merge.** `CREATE_NEW`, `LINK_EXISTING`, `DISMISS`, `ACCEPT_PROPOSED_FACT`, `KEEP_VERIFIED`,
+  `KEEP_HOLDER` and `MOVE_TO_REQUESTER` settle the other cases. Accepting a proposed fact supersedes the verified one
+  rather than editing it, and records the accepted fact as verified at decision time, so "what did we know then" still
+  has its answer.
