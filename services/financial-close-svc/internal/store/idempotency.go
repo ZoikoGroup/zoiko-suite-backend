@@ -45,6 +45,16 @@ const (
 	// its own idempotency (an already-POSTED run returns itself unchanged,
 	// checked in the handler) and is not part of this claim.
 	CommandApproveFXRevaluation = "ApproveFXRevaluation"
+
+	// ACC-17 migration batch approve/certify (SPEC_DEVIATIONS A11). Commit
+	// (MarkMigrationBatchPosted) already has its own idempotency (the
+	// handler's own RECONCILED/CERTIFIED/POSTED status switch) and is not
+	// part of this claim; Validate is not either — see its own note in
+	// SPEC_DEVIATIONS for why (it has two possible terminal outcomes,
+	// VALIDATED or QUARANTINED, which this house pattern does not yet
+	// model).
+	CommandApproveMigrationBatch = "ApproveMigrationBatch"
+	CommandCertifyMigrationBatch = "CertifyMigrationBatch"
 )
 
 // claimTarget is the command_idempotency column naming what a command
@@ -57,6 +67,7 @@ const (
 	targetPrepaymentSchedule claimTarget = "prepayment_schedule_id"
 	targetAllocationRule     claimTarget = "allocation_rule_version_id"
 	targetFXRevaluationRun   claimTarget = "fx_revaluation_run_id"
+	targetMigrationBatch     claimTarget = "migration_batch_id"
 )
 
 // commandClaim is one command_idempotency row.
@@ -71,7 +82,8 @@ func lookupCommandClaim(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey
 	err := tx.QueryRow(ctx, `
 		SELECT command, request_hash,
 		       COALESCE(accrual_schedule_id, prepayment_schedule_id,
-		                allocation_rule_version_id, fx_revaluation_run_id)::text
+		                allocation_rule_version_id, fx_revaluation_run_id,
+		                migration_batch_id)::text
 		FROM command_idempotency
 		WHERE tenant_id = $1 AND idempotency_key = $2
 	`, tenantID, idempotencyKey).Scan(&c.Command, &c.RequestHash, &c.TargetID)

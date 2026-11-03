@@ -138,10 +138,14 @@ type Store interface {
 	GetMigrationBatch(ctx context.Context, batchID string) (*domain.MigrationBatch, error)
 	MarkMigrationBatchValidated(ctx context.Context, batchID string, at time.Time) error
 	QuarantineMigrationBatch(ctx context.Context, batchID, fromStatus, reason string) error
-	ApproveMigrationBatch(ctx context.Context, batchID, principalID string, at time.Time) error
+	// Approve/Certify claim the caller's Idempotency-Key (SPEC_DEVIATIONS
+	// A11); Commit's own RECONCILED/CERTIFIED/POSTED switch covers Post, and
+	// Validate is deliberately not claimed — see internal/store's doc
+	// comment on CommandApproveMigrationBatch/CommandCertifyMigrationBatch.
+	ApproveMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	MarkMigrationBatchPosted(ctx context.Context, batchID, journalID string, at time.Time) error
 	MarkMigrationBatchReconciled(ctx context.Context, batchID string, at time.Time) error
-	CertifyMigrationBatch(ctx context.Context, batchID, principalID, reason string, at time.Time) error
+	CertifyMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, reason, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	ListQuarantinedMigrationBatches(ctx context.Context, legalEntityID string) ([]domain.MigrationBatch, error)
 
 	// ACC-16 (Signed Financial Snapshot) — see domain.FinancialSnapshot's
@@ -4052,6 +4056,10 @@ func (h *Handler) quarantineMigrationBatch(ctx context.Context, batchID, reason 
 // (migration 000021's sod_migration_approver_independent).
 func (h *Handler) ApproveMigrationBatchHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -4073,11 +4081,11 @@ func (h *Handler) ApproveMigrationBatchHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.ApproveMigrationBatch(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ BatchID string }{id})
+	if _, err := h.store.ApproveMigrationBatch(r.Context(), batch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeMigrationErr(w, err)
 		return
 	}
-	batch.Status, batch.ApprovedAt, batch.ApprovedByPrincipalID = domain.MigrationBatchStatusApproved, &now, &principalID
 	writeJSON(w, http.StatusOK, batch)
 }
 
@@ -4259,6 +4267,10 @@ func migrationReconciliationDiscrepancy(batch *domain.MigrationBatch, journal *d
 
 func (h *Handler) CertifyMigrationAccounting(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.CertifyMigrationBatchRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -4291,11 +4303,14 @@ func (h *Handler) CertifyMigrationAccounting(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.CertifyMigrationBatch(r.Context(), id, principalID, req.Reason, now); err != nil {
+	requestHash := requestFingerprint(struct {
+		BatchID string
+		Req     domain.CertifyMigrationBatchRequest
+	}{id, req})
+	if _, err := h.store.CertifyMigrationBatch(r.Context(), batch, principalID, req.Reason, idempotencyKey, requestHash, now); err != nil {
 		h.writeMigrationErr(w, err)
 		return
 	}
-	batch.Status, batch.CertifiedAt, batch.CertifiedByPrincipalID, batch.CertificationReason = domain.MigrationBatchStatusCertified, &now, &principalID, &req.Reason
 	writeJSON(w, http.StatusOK, batch)
 }
 
@@ -4359,6 +4374,8 @@ func (h *Handler) writeMigrationErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("migration batch store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

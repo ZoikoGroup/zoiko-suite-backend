@@ -455,9 +455,12 @@ expected_version where stateful". B3 adds claims to the four creates that
 mint an aggregate with no natural key. B10 closes the accrual lifecycle slice
 (Submit/Approve/Amend/Cancel); B11 closes the mirror prepayment slice
 (Approve/Modify/Terminate); B12 closes the ACC-09 allocation rule slice
-(Approve/Supersede); B13 closes ACC-10's Approve below (Post already answers
-a replay with the run's current state via its own status check, not a
-claim). The remaining commands rely on natural
+(Approve/Supersede); B13 closes ACC-10's Approve (Post already answers a
+replay with the run's current state via its own status check, not a claim);
+B14 closes ACC-17's Approve and Certify below, and records why Validate is
+left open — it has two possible terminal outcomes (VALIDATED or
+QUARANTINED) that this house pattern does not yet model. The remaining
+commands rely on natural
 keys or status guards, so a retry after a lost response returns a 4xx
 instead of the original result, or a duplicate append-only row:
 
@@ -470,7 +473,7 @@ instead of the original result, or a duplicate append-only row:
 | Allocation approve/supersede | original result (B12, claimed) |
 | Allocation execute / reprocess | original run (natural key / status) |
 | FX approve | original result (B13, claimed); post: original (status) |
-| Migration validate/approve/certify | 422; commit: original (status), now also retries reconciliation |
+| Migration validate/approve/certify | validate: still 422 (A11 residual, see B14); approve/certify: original result (B14, claimed); commit: original (status), now also retries reconciliation |
 | Period soft-close / close-review | 409 `invalid_period_transition` |
 | Period hard-close / reclose | 200 with current state |
 | Reopen request | 409 `reopen_request_pending` |
@@ -964,3 +967,52 @@ currency, and the platform has nothing to backfill it from.
     `internal/store/fx_revaluation_idempotency_integration_test.go` (replay
     for Approve), run against a real, disposable Postgres container per the
     verification note above.
+- **B14. ACC-17's Approve and Certify claim an Idempotency-Key; Commit and
+  Validate are deliberately not given one (closes A11's migration row for
+  two of its three named commands).**
+  - *Schema.* `command_idempotency` had no column for a migration batch.
+    Migration `000023` adds `migration_batch_id` (a real FK to
+    `migration_batches`), widens `chk_command_idempotency_one_target` to the
+    five columns, and adds the matching lookup index — the same shape B3's
+    four columns already have. The down migration refuses while any claim
+    names a batch, same posture as every other `command_idempotency` change
+    in this register.
+  - *Approve and Certify.* Both are plain transitions —
+    `ApproveMigrationBatch` (VALIDATED → APPROVED) and `CertifyMigrationBatch`
+    (RECONCILED → CERTIFIED) — claimed via `transitionWithClaim` exactly like
+    B10-B13's approve commands, targeting the new `targetMigrationBatch`.
+    `loadMigrationBatch` is the tx-scoped counterpart of `GetMigrationBatch`
+    (batch header plus crosswalk entries), used as the load callback so a
+    replay — and, per the B10/B11/B12/B13 correction note, a genuinely new
+    success too — carries the entries, not just the header.
+  - *Commit is unaffected.* `CommitOpeningPosting`'s own
+    RECONCILED/CERTIFIED/POSTED switch already answers a retry with the
+    batch's current state before doing any journal-posting work, predating
+    this pass (the spec's own negative path, "Commit repeated after
+    timeout"). Adding a claim on top would duplicate, not strengthen, a
+    guard that already works.
+  - *Validate is NOT claimed — left open.* Unlike every other command this
+    A11 pass closes, `ValidateOpeningBalances` does not have one fixed
+    success transition: it ends in VALIDATED (`MarkMigrationBatchValidated`)
+    or, on any of several validation failures, QUARANTINED
+    (`QuarantineMigrationBatch`), and both are reached only after real
+    external-dependency work (a chart-of-accounts read, and an AR/AP
+    existence check per open-item crosswalk entry). `transitionWithClaim`
+    and `createWithClaim` both assume one fixed target transition decided
+    before the claim is recorded; Validate would need the claim lookup to
+    gate entry to that external work BEFORE either branch runs, then record
+    the claim against whichever of the two transitions actually happened —
+    a different shape from every command this register has closed so far,
+    and not one to retrofit without its own design pass. Today a retry of
+    Validate still 422s regardless of which terminal state the first
+    attempt reached, exactly as before this pass; the only change is that it
+    is now a documented, scoped gap rather than an unexamined one.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestApproveMigrationBatch_RetryUnderSameKeyReplays`,
+    `TestCertifyMigrationBatch_RetryUnderSameKeyReplays`) and
+    `internal/store/migration_batch_idempotency_integration_test.go` (replay
+    for both commands, the latter also proving the crosswalk entries survive
+    a replay), run against a real, disposable Postgres container per the
+    verification note above. Migration `000023`'s down/up round-trip was
+    also checked by hand against the same running instance, per this
+    register's established convention for a schema change (A4, B4).

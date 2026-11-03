@@ -1118,12 +1118,22 @@ func (s *stubStore) QuarantineMigrationBatch(_ context.Context, batchID, fromSta
 	return nil
 }
 
-func (s *stubStore) ApproveMigrationBatch(_ context.Context, batchID, principalID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusValidated, domain.MigrationBatchStatusApproved); err != nil {
-		return err
+func (s *stubStore) ApproveMigrationBatch(_ context.Context, batch *domain.MigrationBatch, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveMigrationBatch", hash); err != nil || replay {
+		if replay {
+			if found := s.migrationBatches[id]; found != nil {
+				*batch = *found
+			}
+		}
+		return replay, err
 	}
-	s.migrationBatches[batchID].ApprovedAt, s.migrationBatches[batchID].ApprovedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionMigration(batch.BatchID, domain.MigrationBatchStatusValidated, domain.MigrationBatchStatusApproved); err != nil {
+		return false, err
+	}
+	s.migrationBatches[batch.BatchID].ApprovedAt, s.migrationBatches[batch.BatchID].ApprovedByPrincipalID = &at, &principalID
+	*batch = *s.migrationBatches[batch.BatchID]
+	s.recordClaim(key, "ApproveMigrationBatch", hash, batch.BatchID)
+	return false, nil
 }
 
 func (s *stubStore) MarkMigrationBatchPosted(_ context.Context, batchID, journalID string, at time.Time) error {
@@ -1142,13 +1152,23 @@ func (s *stubStore) MarkMigrationBatchReconciled(_ context.Context, batchID stri
 	return nil
 }
 
-func (s *stubStore) CertifyMigrationBatch(_ context.Context, batchID, principalID, reason string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified); err != nil {
-		return err
+func (s *stubStore) CertifyMigrationBatch(_ context.Context, batch *domain.MigrationBatch, principalID, reason, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "CertifyMigrationBatch", hash); err != nil || replay {
+		if replay {
+			if found := s.migrationBatches[id]; found != nil {
+				*batch = *found
+			}
+		}
+		return replay, err
 	}
-	b := s.migrationBatches[batchID]
+	if err := s.transitionMigration(batch.BatchID, domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified); err != nil {
+		return false, err
+	}
+	b := s.migrationBatches[batch.BatchID]
 	b.CertifiedAt, b.CertifiedByPrincipalID, b.CertificationReason = &at, &principalID, &reason
-	return nil
+	*batch = *b
+	s.recordClaim(key, "CertifyMigrationBatch", hash, batch.BatchID)
+	return false, nil
 }
 
 func (s *stubStore) ListQuarantinedMigrationBatches(_ context.Context, legalEntityID string) ([]domain.MigrationBatch, error) {
@@ -4010,6 +4030,58 @@ func TestValidateOpeningBalances_ControlTotalsMismatch_QuarantinesBatch(t *testi
 	validateRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1")
 	if validateRR.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 got %d: %s", validateRR.Code, validateRR.Body.String())
+	}
+}
+
+// TestApproveMigrationBatch_RetryUnderSameKeyReplays and
+// TestCertifyMigrationBatch_RetryUnderSameKeyReplays are the ACC-17 mirror of
+// the ACC-07/08/09/10 lifecycle tests above (SPEC_DEVIATIONS A11).
+func TestApproveMigrationBatch_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
+		Status: domain.MigrationBatchStatusValidated, CreatedByPrincipalID: "preparer-1"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.MigrationBatch
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.MigrationBatchStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
+func TestCertifyMigrationBatch_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
+		Status: domain.MigrationBatchStatusReconciled, CreatedByPrincipalID: "preparer-1"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	certReq := domain.CertifyMigrationBatchRequest{Reason: "cutover signed"}
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/certify", certReq, "certifier-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first certify: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/certify", certReq, "certifier-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried certify under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.MigrationBatch
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.MigrationBatchStatusCertified {
+		t.Fatalf("replay status = %q, want CERTIFIED", replayed.Status)
 	}
 }
 

@@ -123,10 +123,10 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if err := s.MarkMigrationBatchValidated(ctx, batch.BatchID, now); err != nil {
 		t.Fatalf("MarkMigrationBatchValidated: %v", err)
 	}
-	if err := s.ApproveMigrationBatch(ctx, batch.BatchID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApproveMigrationBatch(ctx, batch, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("migration self-approval: want ErrSelfApproval, got %v", err)
 	}
-	if err := s.ApproveMigrationBatch(ctx, batch.BatchID, "approver-1", now); err != nil {
+	if _, err := s.ApproveMigrationBatch(ctx, batch, "approver-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("ApproveMigrationBatch: %v", err)
 	}
 	if err := s.MarkMigrationBatchPosted(ctx, batch.BatchID, "journal-1", now); err != nil {
@@ -135,10 +135,10 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if err := s.MarkMigrationBatchReconciled(ctx, batch.BatchID, now); err != nil {
 		t.Fatalf("MarkMigrationBatchReconciled: %v", err)
 	}
-	if err := s.CertifyMigrationBatch(ctx, batch.BatchID, "preparer-1", "cutover signed", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.CertifyMigrationBatch(ctx, batch, "preparer-1", "cutover signed", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("migration self-certification: want ErrSelfApproval, got %v", err)
 	}
-	if err := s.CertifyMigrationBatch(ctx, batch.BatchID, "certifier-1", "cutover signed", now); err != nil {
+	if _, err := s.CertifyMigrationBatch(ctx, batch, "certifier-1", "cutover signed", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("independent certification refused: %v", err)
 	}
 }
@@ -468,7 +468,7 @@ func TestPgStore_ListPostedJournalLineage_ClassifiesInOneQuery_RealDB(t *testing
 	}
 	for _, step := range []func() error{
 		func() error { return s.MarkMigrationBatchValidated(ctx, batch.BatchID, now) },
-		func() error { return s.ApproveMigrationBatch(ctx, batch.BatchID, "approver-1", now) },
+		func() error { _, err := s.ApproveMigrationBatch(ctx, batch, "approver-1", uuid.NewString(), testRequestHash, now); return err },
 		func() error { return s.MarkMigrationBatchPosted(ctx, batch.BatchID, "journal-migration", now) },
 		func() error {
 			return s.QuarantineMigrationBatch(ctx, batch.BatchID, domain.MigrationBatchStatusPosted, "reconciliation mismatch")

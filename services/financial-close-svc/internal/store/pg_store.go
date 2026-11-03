@@ -2153,9 +2153,69 @@ func (s *PgStore) QuarantineMigrationBatch(ctx context.Context, batchID, fromSta
 		`, quarantine_reason = $4`, reason)
 }
 
-func (s *PgStore) ApproveMigrationBatch(ctx context.Context, batchID, principalID string, at time.Time) error {
-	return s.transitionMigrationBatch(ctx, batchID, domain.MigrationBatchStatusValidated, domain.MigrationBatchStatusApproved,
-		`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+// loadMigrationBatch reads one batch and its crosswalk entries inside tx —
+// the tx-scoped counterpart of GetMigrationBatch, for use as a
+// transitionWithClaim load callback.
+func loadMigrationBatch(ctx context.Context, tx pgx.Tx, batchID string) (*domain.MigrationBatch, error) {
+	b, err := scanMigrationBatch(tx.QueryRow(ctx, `SELECT `+migrationBatchColumns+` FROM migration_batches WHERE batch_id = $1`, batchID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrMigrationBatchNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT entry_id, batch_id, source_reference_id, source_account_code, target_account_code,
+		       debit_amount, credit_amount, source_reference_type, party_id
+		FROM migration_crosswalk_entries WHERE batch_id = $1 ORDER BY source_reference_id
+	`, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e domain.MigrationCrosswalkEntry
+		if err := rows.Scan(&e.EntryID, &e.BatchID, &e.SourceReferenceID, &e.SourceAccountCode, &e.TargetAccountCode,
+			&e.DebitAmount, &e.CreditAmount, &e.SourceReferenceType, &e.PartyID); err != nil {
+			return nil, err
+		}
+		b.Entries = append(b.Entries, e)
+	}
+	return b, rows.Err()
+}
+
+// ApproveMigrationBatch moves batch from VALIDATED to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApproveMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApproveMigrationBatch, requestHash, targetMigrationBatch, batch.BatchID,
+		func(tx pgx.Tx) error {
+			query := fmt.Sprintf(`UPDATE migration_batches SET status = $3%s WHERE batch_id = $1 AND status = $2`,
+				`, approved_at = $4, approved_by_principal_id = $5`)
+			tag, err := tx.Exec(ctx, query, transitionArgs(batch.BatchID, domain.MigrationBatchStatusValidated,
+				domain.MigrationBatchStatusApproved, []any{at, principalID})...)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM migration_batches WHERE batch_id = $1)`, batch.BatchID).Scan(&exists); err != nil {
+					return mapPgError(err)
+				}
+				if !exists {
+					return domain.ErrMigrationBatchNotFound
+				}
+				return domain.ErrInvalidMigrationBatchTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error {
+			existing, err := loadMigrationBatch(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			*batch = *existing
+			return nil
+		})
 }
 
 func (s *PgStore) MarkMigrationBatchPosted(ctx context.Context, batchID, journalID string, at time.Time) error {
@@ -2168,9 +2228,38 @@ func (s *PgStore) MarkMigrationBatchReconciled(ctx context.Context, batchID stri
 		`, reconciled_at = $4`, at)
 }
 
-func (s *PgStore) CertifyMigrationBatch(ctx context.Context, batchID, principalID, reason string, at time.Time) error {
-	return s.transitionMigrationBatch(ctx, batchID, domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified,
-		`, certified_at = $4, certified_by_principal_id = $5, certification_reason = $6`, at, principalID, reason)
+// CertifyMigrationBatch moves batch from RECONCILED to CERTIFIED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) CertifyMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, reason, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandCertifyMigrationBatch, requestHash, targetMigrationBatch, batch.BatchID,
+		func(tx pgx.Tx) error {
+			query := fmt.Sprintf(`UPDATE migration_batches SET status = $3%s WHERE batch_id = $1 AND status = $2`,
+				`, certified_at = $4, certified_by_principal_id = $5, certification_reason = $6`)
+			tag, err := tx.Exec(ctx, query, transitionArgs(batch.BatchID, domain.MigrationBatchStatusReconciled,
+				domain.MigrationBatchStatusCertified, []any{at, principalID, reason})...)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM migration_batches WHERE batch_id = $1)`, batch.BatchID).Scan(&exists); err != nil {
+					return mapPgError(err)
+				}
+				if !exists {
+					return domain.ErrMigrationBatchNotFound
+				}
+				return domain.ErrInvalidMigrationBatchTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error {
+			existing, err := loadMigrationBatch(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			*batch = *existing
+			return nil
+		})
 }
 
 // ListQuarantinedMigrationBatches answers ACC-17's own
