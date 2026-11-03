@@ -83,8 +83,12 @@ const (
 // the name the service's original specification (03-microservices.md s8.2)
 // reserved for this signal.
 const (
-	EventCalendarChanged         = "jurisdiction.calendar.changed"
-	EventObligationRulePublished = "regulatory-obligation-rule.published"
+	EventCalendarChanged = "jurisdiction.calendar.changed"
+	// REF-10: a calendar version was published, and each holiday occurrence it
+	// adds, removes or changes.
+	EventBusinessCalendarUpdated  = "business-calendar.updated"
+	EventHolidayOccurrenceChanged = "holiday-occurrence.changed"
+	EventObligationRulePublished  = "regulatory-obligation-rule.published"
 )
 
 // ZS-JUR-001 s26 events for Waves 4, 5 and 8. jurisdiction.support-changed is

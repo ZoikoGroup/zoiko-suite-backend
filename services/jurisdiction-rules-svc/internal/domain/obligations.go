@@ -59,6 +59,12 @@ const dateLayout = "2006-01-02"
 type Holiday struct {
 	Date string `json:"date"`
 	Name string `json:"name"`
+	// ObservedRule says how a holiday on a weekend is observed (REF-10), and
+	// ObservedDate is the weekday it is observed on, worked out from the rule and
+	// the calendar's weekend. Both are empty for a holiday observed on its own
+	// date, so a calendar without them reads exactly as it always did.
+	ObservedRule string `json:"observed_rule,omitempty"`
+	ObservedDate string `json:"observed_date,omitempty"`
 }
 
 // CalendarVersion is one immutable, effective-dated version of an authority
@@ -191,6 +197,14 @@ func ValidateCalendarVersion(cv CalendarVersion) error {
 		}
 		if strings.TrimSpace(h.Name) == "" {
 			return oblBad("holiday %s needs a name", h.Date)
+		}
+		if h.ObservedRule != "" && !ValidObservedRule(h.ObservedRule) {
+			return oblBad("holiday %s has an unknown observed_rule %q", h.Date, h.ObservedRule)
+		}
+		if h.ObservedDate != "" {
+			if _, err := time.Parse(dateLayout, h.ObservedDate); err != nil {
+				return oblBad("holiday %s observed_date %q must be YYYY-MM-DD", h.Date, h.ObservedDate)
+			}
 		}
 		if dates[h.Date] {
 			return oblBad("holiday %s is listed twice", h.Date)
@@ -357,11 +371,20 @@ func (c CalendarVersion) isWeekend(d time.Time) bool {
 func (c CalendarVersion) holidayOn(d time.Time) (string, bool) {
 	key := d.Format(dateLayout)
 	for _, h := range c.Holidays {
-		if h.Date == key {
+		if h.observedOn() == key {
 			return h.Name, true
 		}
 	}
 	return "", false
+}
+
+// observedOn is the date a holiday is observed: its observed date when the rule
+// moved it, otherwise its own date.
+func (h Holiday) observedOn() string {
+	if h.ObservedDate != "" {
+		return h.ObservedDate
+	}
+	return h.Date
 }
 
 // pickCalendar chooses the calendar version in force for a date: among

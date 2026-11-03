@@ -1989,11 +1989,100 @@ paths:
       description: |
         Action REGULATORY_CALENDAR_VERSION_PUBLISH. The publisher must differ from the author (403 segregation_of_duties,
         also a database check); the version must cite at least one reviewed, non-superseded source (409 source_not_ready).
-        Emits jurisdiction.calendar.changed. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
+        Emits jurisdiction.calendar.changed, business-calendar.updated and a holiday-occurrence.changed for each holiday it adds, removes or changes against the previous published version. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
       operationId: publishCalendarVersion
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
+  /v1/admin/calendars/{calendar_code}/imports:
+    post:
+      tags: [Admin, Calendar]
+      summary: ImportHolidayCalendar, import an authority's holiday list as a draft version (REF-10)
+      description: |
+        Action REGULATORY_CALENDAR_VERSION_CREATE. Drafts the next version of the calendar from a holiday list, with the
+        evidence of where it came from: `source_authority`, `source_reference` and the authority's own `source_version`
+        (all required), and a content hash computed here. Body also as for a calendar version (`effective_from`,
+        `timezone`, `weekend_days`, `cutoff_time?`, `holidays`) and optional `source_ids` citing registered regulatory
+        sources, which publishing requires.
+
+        Each holiday may carry an `observed_rule` (`NONE`, `WEEKEND_TO_NEXT_WEEKDAY`, `WEEKEND_TO_PREVIOUS_WEEKDAY`,
+        `WEEKEND_TO_NEAREST_WEEKDAY`) saying how it is observed when it falls on a weekend. Its observed date is worked out
+        here from the rule and the calendar's own weekend, never taken from the caller, and business-day arithmetic uses it.
+
+        One source version is imported once per calendar: the same edition with the same content again answers `200` with
+        the first version; the same edition with different content is `409 calendar_import_conflict`. The draft is then
+        published by a different principal, as any calendar version is.
+      operationId: importHolidayCalendar
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportCalendarRequest' }
+      responses:
+        "201": { description: Drafted as the next version. }
+        "200": { description: This source version was already imported with the same content. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: This source version was already imported with different content (calendar_import_conflict)., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/calendars/{calendar_code}/is-business-day:
+    get:
+      tags: [Calendar]
+      summary: IsBusinessDay (REF-10)
+      description: |
+        Whether `date` is a business day of the calendar, and if not why (`WEEKEND`, or `HOLIDAY` with its name; a holiday
+        is non-business on the date it is observed). Deterministic, and it says which calendar version answered, with its
+        content digest and the evidence of its import.
+
+        Only published versions answer. Without `calendar_version` it is the highest version effective on or before the date
+        and published at `known_at` (default now), so a correction published later does not change what a past date was
+        answered with as it was known then. With `calendar_version` it is that version exactly, to reproduce an earlier answer.
+      operationId: isBusinessDay
+      parameters:
+        - { name: calendar_code, in: path, required: true, schema: { type: string } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The answer and the calendar version that gave it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BusinessDayCheck' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/calendars/{calendar_code}/add-business-days:
+    get:
+      tags: [Calendar]
+      summary: AddBusinessDays (REF-10)
+      description: |
+        Moves `days` business days from `date` (negative moves back, at most 1000). The start date is never counted, so one
+        business day from a Friday or from a Saturday is the Monday. The days passed over are returned with their reasons.
+
+        One calendar version, the one governing the start date, answers the whole calculation: a shift that crosses the
+        start of a later version does not change calendars halfway. `known_at` and `calendar_version` are as for
+        `is-business-day`.
+      operationId: addBusinessDays
+      parameters:
+        - { name: calendar_code, in: path, required: true, schema: { type: string } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: days, in: query, required: true, schema: { type: integer, minimum: -1000, maximum: 1000 } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The result date, what was skipped, and the calendar version that gave it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AddBusinessDaysResult' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
   /v1/admin/obligation-rules:
     post:
       tags: [Admin, Obligations]
@@ -2810,6 +2899,74 @@ components:
           format: uuid
           description: The active jurisdiction that takes over. Must be a different, active jurisdiction.
 
+
+    ImportCalendarRequest:
+      type: object
+      required: [source_authority, source_reference, source_version, effective_from, timezone, weekend_days, holidays]
+      properties:
+        source_authority: { type: string, maxLength: 512, description: "The holiday authority, for example UK Government." }
+        source_reference: { type: string, maxLength: 512, description: "Where the list came from." }
+        source_version: { type: string, maxLength: 64, description: "The authority's own identifier for this edition. One edition is imported once per calendar." }
+        effective_from: { type: string, format: date }
+        timezone: { type: string, description: IANA time zone. }
+        weekend_days: { type: array, items: { type: integer, minimum: 0, maximum: 6 }, description: "0=Sunday .. 6=Saturday. Required: it differs between authorities." }
+        cutoff_time: { type: string, nullable: true, description: "HH:MM authority-local." }
+        holidays:
+          type: array
+          minItems: 1
+          maxItems: 400
+          items:
+            type: object
+            required: [date, name]
+            properties:
+              date: { type: string, format: date }
+              name: { type: string }
+              observed_rule: { type: string, enum: [NONE, WEEKEND_TO_NEXT_WEEKDAY, WEEKEND_TO_PREVIOUS_WEEKDAY, WEEKEND_TO_NEAREST_WEEKDAY], description: "How the holiday is observed when it falls on a weekend." }
+        source_ids: { type: array, items: { type: string, format: uuid }, description: "Registered regulatory sources cited, which publishing requires." }
+
+    CalendarProvenance:
+      type: object
+      description: Which calendar version answered, so the answer can be reproduced.
+      required: [calendar_code, calendar_version, calendar_version_id, content_digest, timezone, effective_from, pinned]
+      properties:
+        calendar_code: { type: string }
+        calendar_version: { type: integer }
+        calendar_version_id: { type: string, format: uuid }
+        content_digest: { type: string, description: "Digest of what the version says; two versions with the same digest give the same answers." }
+        timezone: { type: string }
+        effective_from: { type: string, format: date }
+        source_authority: { type: string }
+        source_version: { type: string }
+        import_hash: { type: string }
+        pinned: { type: boolean, description: "True when the caller named the version rather than asking for the one in force." }
+
+    BusinessDayCheck:
+      type: object
+      required: [date, is_business_day, calendar]
+      properties:
+        date: { type: string, format: date }
+        is_business_day: { type: boolean }
+        reason: { type: string, enum: [WEEKEND, HOLIDAY] }
+        holiday_name: { type: string }
+        calendar: { $ref: '#/components/schemas/CalendarProvenance' }
+
+    AddBusinessDaysResult:
+      type: object
+      required: [start_date, days, result_date, skipped, calendar]
+      properties:
+        start_date: { type: string, format: date }
+        days: { type: integer }
+        result_date: { type: string, format: date }
+        skipped:
+          type: array
+          items:
+            type: object
+            required: [date, reason]
+            properties:
+              date: { type: string, format: date }
+              reason: { type: string, enum: [WEEKEND, HOLIDAY] }
+              name: { type: string }
+        calendar: { $ref: '#/components/schemas/CalendarProvenance' }
     JurisdictionAlias:
       type: object
       required: [alias_id, jurisdiction_id, alias_system, alias_code, source_standard, source_version, mapping_rationale, valid_from, created_by, created_at]
