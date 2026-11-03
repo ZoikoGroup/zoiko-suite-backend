@@ -80,6 +80,12 @@ const (
 	// generic policy ones: drafting, approving, activating (the designated
 	// accounting authority) and the emergency suspension are different acts.
 	ActionAccountingPolicyDraft = "ACCOUNTING_POLICY_DRAFT"
+	// Approving is a checker's act. Activating and superseding are the designated
+	// accounting authority's. The emergency suspension is its own, and is honoured
+	// only under a live break-glass session.
+	ActionAccountingPolicyApprove          = "ACCOUNTING_POLICY_APPROVE"
+	ActionAccountingPolicyActivate         = "ACCOUNTING_POLICY_ACTIVATE"
+	ActionAccountingPolicyEmergencySuspend = "ACCOUNTING_POLICY_EMERGENCY_SUSPEND"
 
 	ActionPolicyRead     = "POLICY_READ"
 	ActionPolicyEvaluate = "POLICY_EVALUATE"
@@ -159,6 +165,8 @@ type authorizeRequest struct {
 	// ResourceOwnerPrincipalID is who prepared the object acted on, so
 	// authorization-svc's own-object SoD rules (§10.2) apply centrally too.
 	ResourceOwnerPrincipalID string `json:"resource_owner_principal_id,omitempty"`
+	// BreakGlassSessionID names the emergency session the request is made under.
+	BreakGlassSessionID string `json:"break_glass_session_id,omitempty"`
 }
 
 type resourceOwnerKey struct{}
@@ -242,7 +250,22 @@ func (c *HTTPClient) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
+// checkAllowedLive asks without a session; decideLive is the call itself.
 func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error {
+	_, err := c.decideLive(ctx, principalID, legalEntityID, actionType, tenantID, "")
+	return err
+}
+
+// CheckEmergency asks whether principalID may perform actionType under the named
+// break-glass session (ZS-IAM-001 s14), and returns the decision basis, which
+// names the session when the grant came through it. It is never cached: a
+// session can end between two calls, and an emergency act must be decided on
+// the session as it is now.
+func (c *HTTPClient) CheckEmergency(ctx context.Context, principalID, legalEntityID, actionType, tenantID, breakGlassSessionID string) (string, error) {
+	return c.decideLive(ctx, principalID, legalEntityID, actionType, tenantID, breakGlassSessionID)
+}
+
+func (c *HTTPClient) decideLive(ctx context.Context, principalID, legalEntityID, actionType, tenantID, breakGlassSessionID string) (string, error) {
 	body, err := json.Marshal(authorizeRequest{
 		PrincipalID:   principalID,
 		LegalEntityID: legalEntityID,
@@ -250,14 +273,15 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 		TenantID:      tenantID,
 
 		ResourceOwnerPrincipalID: resourceOwner(ctx),
+		BreakGlassSessionID:      breakGlassSessionID,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal authorize request: %w", err)
+		return "", fmt.Errorf("marshal authorize request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize", bytes.NewReader(body))
 	if err != nil {
-		return domain.ErrAuthorizationServiceUnavailable
+		return "", domain.ErrAuthorizationServiceUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -297,9 +321,13 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	}
 	req.Header.Set("X-Request-Id", authzRequestID)
 	req.Header.Set("X-Source-Channel", authzSourceChannel)
-	// One decision per (request, action): an inbound request may authorize
-	// several actions, and each is its own decision to record.
-	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
+	// One decision per (request, action, session): an inbound request may
+	// authorize several actions, and each is its own decision to record.
+	idempotencyKey := authzRequestID + ":" + actionType
+	if breakGlassSessionID != "" {
+		idempotencyKey += ":bg:" + breakGlassSessionID
+	}
+	req.Header.Set("Idempotency-Key", idempotencyKey)
 	// The verified identity envelope, for authorization-svc's identity
 	// assertion check (AUTHZ_IDENTITY_ASSERTION).
 	idenv.Forward(ctx, req)
@@ -310,7 +338,7 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 			zap.String("action_type", actionType),
 			zap.Error(err),
 		)
-		return domain.ErrAuthorizationServiceUnavailable
+		return "", domain.ErrAuthorizationServiceUnavailable
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -321,7 +349,7 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 			zap.String("action_type", actionType),
 			zap.ByteString("body", respBody),
 		)
-		return domain.ErrAuthorizationServiceUnavailable
+		return "", domain.ErrAuthorizationServiceUnavailable
 	}
 
 	var out authorizeResponse
@@ -330,7 +358,7 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 			zap.String("action_type", actionType),
 			zap.Error(err),
 		)
-		return domain.ErrAuthorizationServiceUnavailable
+		return "", domain.ErrAuthorizationServiceUnavailable
 	}
 	if out.DecisionOutcome != "GRANTED" {
 		c.log.Info("authorization denied",
@@ -339,9 +367,9 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 			zap.String("decision_basis", out.DecisionBasis),
 			zap.String("access_decision_id", out.AccessDecisionID),
 		)
-		return domain.ErrAuthorizationDenied
+		return out.DecisionBasis, domain.ErrAuthorizationDenied
 	}
-	return nil
+	return out.DecisionBasis, nil
 }
 
 // PermitAllClient is the local-development stub. NewClient refuses to build

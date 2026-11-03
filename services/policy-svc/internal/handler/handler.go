@@ -371,6 +371,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/accounting-policies/resolve", h.ResolveAccountingPolicy)
 	r.Get("/v1/accounting-policies/explain", h.ExplainAccountingResolution)
 	r.Get("/v1/accounting-policies/versions/{version_id}", h.GetAccountingPolicyVersion)
+	r.Get("/v1/accounting-policies/versions/{version_id}/impact", h.GetAccountingPolicyImpact)
+	for _, route := range []string{"submit-review", "approve", "activate", "supersede", "emergency-suspend", "review-suspension"} {
+		r.Post("/v1/accounting-policies/versions/{version_id}/"+route, h.accountingCommand(route))
+	}
 
 	r.Get("/v1/policy-versions/compare", h.ComparePolicyVersions)
 	r.Get("/v1/policy-versions/{version_id}", h.GetPolicyVersionByID)
@@ -913,6 +917,10 @@ func (h *Handler) writeTransitionError(w http.ResponseWriter, r *http.Request, v
 			"the maker cannot be the checker: the author cannot approve or activate, and the suspender cannot review the suspension", extra)
 	case errors.Is(err, domain.ErrPolicyConflicted):
 		writeError(w, r, http.StatusConflict, codePolicyConflicted, "policy_overlap", err.Error(), extra)
+	case errors.Is(err, domain.ErrSupersessionRequired):
+		writeError(w, r, http.StatusConflict, codeSupersessionRequired, "supersession_required", err.Error(), extra)
+	case errors.Is(err, domain.ErrInvalidSupersedes):
+		writeError(w, r, http.StatusConflict, codeSupersessionRequired, "invalid_supersedes", err.Error(), extra)
 	case errors.Is(err, domain.ErrConcurrencyConflict):
 		writeError(w, r, http.StatusConflict, codeConcurrency, "concurrency_conflict", err.Error(), extra)
 	case errors.Is(err, domain.ErrInvalidTransition):

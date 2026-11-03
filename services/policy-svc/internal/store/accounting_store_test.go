@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"zoiko.io/policy-svc/internal/domain"
 	"zoiko.io/policy-svc/internal/resolve"
 )
@@ -78,7 +80,7 @@ func period(from time.Time, to *time.Time) func(*domain.DraftAccountingPolicyPar
 func (e *testEnv) released(t *testing.T, tenant string, mutate ...func(*domain.DraftAccountingPolicyParams)) *domain.AccountingPolicyVersion {
 	t.Helper()
 	v := e.acctDraft(t, tenant, mutate...)
-	e.release(t, tenant, &v.PolicyVersion)
+	e.releaseOver(t, tenant, v, e.activeOf(t, v))
 	got, err := e.s.GetAccountingPolicyVersion(as(tenant), v.PolicyVersionID)
 	if err != nil {
 		t.Fatal(err)
@@ -727,4 +729,39 @@ func TestMigration000009_DownIsRefusedWhileAccountingPoliciesExist(t *testing.T)
 	if _, err := e.admin.Exec(ctx, up); err != nil {
 		t.Fatalf("up again: %v", err)
 	}
+}
+
+// activeOf is the id of the active version of v's policy and scope, or "".
+func (e *testEnv) activeOf(t *testing.T, v *domain.AccountingPolicyVersion) string {
+	t.Helper()
+	var id string
+	err := e.admin.QueryRow(context.Background(), `
+		SELECT COALESCE(MAX(policy_version_id::text), '') FROM policy_versions
+		WHERE policy_id = $1 AND tenant_id IS NOT DISTINCT FROM $2::uuid AND legal_entity_id IS NOT DISTINCT FROM $3::uuid
+		  AND version_status = 'ACTIVE' AND policy_version_id <> $4`, v.PolicyID, v.TenantID, v.LegalEntityID, v.PolicyVersionID).Scan(&id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// releaseOver takes a draft through review, approval and activation, naming the
+// version it replaces, if any.
+func (e *testEnv) releaseOver(t *testing.T, tenant string, v *domain.AccountingPolicyVersion, supersedes string) {
+	t.Helper()
+	for _, step := range []struct{ cmd, actor string }{{domain.CommandSubmitReview, "author"}, {domain.CommandApprove, "approver"}} {
+		if _, err := e.cmd(t, tenant, &v.PolicyVersion, step.cmd, step.actor); err != nil {
+			t.Fatalf("%s: %v", step.cmd, err)
+		}
+	}
+	if _, err := e.activate(tenant, v, "activator", supersedes); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+}
+
+func (e *testEnv) activate(tenant string, v *domain.AccountingPolicyVersion, actor, supersedes string) (*domain.TransitionResult, error) {
+	return e.s.Transition(as(tenant), domain.TransitionCommand{
+		PolicyVersionID: v.PolicyVersionID, Command: domain.CommandActivate, ActorID: actor, Reason: "test",
+		SupersedesVersionID: supersedes, Meta: domain.EventMeta{CorrelationID: "corr", IdempotencyKey: uuid.NewString()},
+	})
 }

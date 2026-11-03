@@ -377,3 +377,65 @@ func (c *AccountingCandidate) Rank() []int {
 	}
 	return []int{n, c.Precedence}
 }
+
+var (
+	// ErrSupersessionRequired: an accounting version cannot be activated over an
+	// active predecessor without naming it. Replacing the policy that governs
+	// calculations is an act to be stated, not a side effect.
+	ErrSupersessionRequired = errorString("an active version governs this scope: supersede it by naming it")
+	// ErrInvalidSupersedes: the version named is not the active version of this
+	// version's own policy and scope.
+	ErrInvalidSupersedes = errorString("supersedes_version_id must be the active version of this policy and scope")
+)
+
+// Events produced by accounting policy lifecycle changes (REF-07).
+const (
+	EventAccountingPolicyApproved   = "accounting.policy.approved"
+	EventAccountingPolicyActivated  = "accounting.policy.activated"
+	EventAccountingPolicySuperseded = "accounting.policy.superseded"
+	EventAccountingPolicySuspended  = "accounting.policy.suspended"
+)
+
+// ImpactVersionRef is a version named in an impact report.
+type ImpactVersionRef struct {
+	PolicyVersionID string     `json:"policy_version_id"`
+	PolicyID        string     `json:"policy_id"`
+	PolicyDomain    string     `json:"policy_domain"`
+	SemanticVersion string     `json:"semantic_version"`
+	VersionStatus   string     `json:"version_status"`
+	Precedence      int        `json:"precedence"`
+	BookID          *string    `json:"book_id"`
+	JurisdictionID  *string    `json:"jurisdiction_id"`
+	LegalEntityID   *string    `json:"legal_entity_id"`
+	EffectiveFrom   time.Time  `json:"effective_from"`
+	EffectiveTo     *time.Time `json:"effective_to"`
+}
+
+// AccountingImpact is what activating a version would do, worked out from the
+// policies that exist: "Policy change includes impact analysis for future/open
+// periods and does not mutate closed-history treatment." The author's own
+// analysis is on the version; this is the system's, so a reviewer need not take
+// the author's word for what it touches.
+type AccountingImpact struct {
+	Version *AccountingPolicyVersion `json:"version"`
+	// Retroactive is true when the version takes effect before it was drafted.
+	Retroactive bool `json:"retroactive"`
+	// WouldSupersede is the active version it must replace (activation then needs
+	// the supersede command naming it).
+	WouldSupersede *ImpactVersionRef `json:"would_supersede,omitempty"`
+	// PredecessorGovernsUntil is when the superseded version stops governing:
+	// this version's effective_from. Before it, the predecessor's treatment, and
+	// so every closed period's, is untouched.
+	PredecessorGovernsUntil *time.Time `json:"predecessor_governs_until,omitempty"`
+	// PendingSchedule is a version already scheduled in this scope, which
+	// activation would race.
+	PendingSchedule *ImpactVersionRef `json:"pending_schedule,omitempty"`
+	// AmbiguousWith are the policies that could apply to the same requests over
+	// the same period with the same specificity and precedence. Activation is
+	// refused while there are any.
+	AmbiguousWith []ImpactVersionRef `json:"ambiguous_with"`
+	// DependedOnBy are the versions whose rule mappings depend on this one.
+	DependedOnBy []ImpactVersionRef `json:"depended_on_by"`
+	// ActivationBlockers says, in words, what would stop activation today.
+	ActivationBlockers []string `json:"activation_blockers"`
+}

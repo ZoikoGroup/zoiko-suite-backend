@@ -35,6 +35,11 @@ var registeredActionMigrations = []struct {
 	{"000039_register_accounting_policy_actions", "policy-svc", map[string]string{
 		"ACCOUNTING_POLICY_DRAFT": "STANDARD",
 	}},
+	{"000040_register_accounting_policy_lifecycle_actions", "policy-svc", map[string]string{
+		"ACCOUNTING_POLICY_APPROVE":           "HIGH",
+		"ACCOUNTING_POLICY_ACTIVATE":          "HIGH",
+		"ACCOUNTING_POLICY_EMERGENCY_SUSPEND": "CRITICAL",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

@@ -425,3 +425,184 @@ func (s *PgStore) guardAccountingOverlap(ctx context.Context, tx pgx.Tx, v *doma
 	}
 	return nil
 }
+
+// enqueueAccounting announces an accounting policy lifecycle change beside the
+// generic version event, in the same transaction. A version that is not an
+// accounting policy version announces nothing here. The payload says where the
+// policy applies and what it is, so a consumer (a ledger, a close, a report)
+// can tell which of its calculations the change touches without a read.
+func (s *PgStore) enqueueAccounting(ctx context.Context, tx pgx.Tx, eventType string, v *domain.PolicyVersion, actor string, meta domain.EventMeta, extra map[string]any) error {
+	fam, err := s.accountingApplicability(ctx, tx, v.PolicyID)
+	if err != nil || fam == nil {
+		return err
+	}
+	var semver string
+	var precedence int
+	if err := tx.QueryRow(ctx, `SELECT semantic_version, precedence FROM accounting_policy_version_details WHERE policy_version_id = $1;`,
+		v.PolicyVersionID).Scan(&semver, &precedence); err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"policy_domain": fam.PolicyDomain, "framework": fam.Framework, "book_id": fam.BookID, "jurisdiction_id": fam.JurisdictionID,
+		"semantic_version": semver, "precedence": precedence,
+	}
+	for k, val := range extra {
+		payload[k] = val
+	}
+	return s.enqueue(ctx, tx, versionEvent(eventType, v, actor, meta, payload))
+}
+
+// guardSupersession makes replacing an accounting policy explicit. If an active
+// version already governs the version's policy and scope, activating over it
+// must name it (ErrSupersessionRequired otherwise), and a version named must be
+// that active version (ErrInvalidSupersedes). It applies to accounting
+// policies only; naming a version for any other policy is refused.
+func (s *PgStore) guardSupersession(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion, supersedes string) error {
+	fam, err := s.accountingApplicability(ctx, tx, v.PolicyID)
+	if err != nil {
+		return err
+	}
+	if fam == nil {
+		if supersedes != "" {
+			return domain.ErrInvalidSupersedes
+		}
+		return nil
+	}
+	var active string
+	err = tx.QueryRow(ctx, `
+		SELECT policy_version_id FROM policy_versions
+		WHERE policy_id = $1
+		  AND tenant_id IS NOT DISTINCT FROM $2::uuid
+		  AND legal_entity_id IS NOT DISTINCT FROM $3::uuid
+		  AND version_status = 'ACTIVE'
+		  AND policy_version_id <> $4
+		LIMIT 1;`, v.PolicyID, v.TenantID, v.LegalEntityID, v.PolicyVersionID).Scan(&active)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	switch {
+	case active != "" && !strings.EqualFold(supersedes, active):
+		if supersedes == "" {
+			return fmt.Errorf("%w: version %s is active", domain.ErrSupersessionRequired, active)
+		}
+		return domain.ErrInvalidSupersedes
+	case active == "" && supersedes != "":
+		return domain.ErrInvalidSupersedes
+	}
+	return nil
+}
+
+const impactRefColumns = `pv.policy_version_id, pv.policy_id, a.policy_domain, d.semantic_version, pv.version_status, d.precedence,
+	a.book_id, a.jurisdiction_id, pv.legal_entity_id, pv.effective_from, pv.effective_to`
+
+const impactRefFrom = `
+	FROM policy_versions pv
+	JOIN accounting_policy_applicability a ON a.policy_id = pv.policy_id
+	JOIN accounting_policy_version_details d ON d.policy_version_id = pv.policy_version_id`
+
+func scanImpactRefs(rows pgx.Rows) ([]domain.ImpactVersionRef, error) {
+	defer rows.Close()
+	out := []domain.ImpactVersionRef{}
+	for rows.Next() {
+		var r domain.ImpactVersionRef
+		if err := rows.Scan(&r.PolicyVersionID, &r.PolicyID, &r.PolicyDomain, &r.SemanticVersion, &r.VersionStatus, &r.Precedence,
+			&r.BookID, &r.JurisdictionID, &r.LegalEntityID, &r.EffectiveFrom, &r.EffectiveTo); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// AccountingImpactOf reports what activating a version would do to the policies
+// that exist. It changes nothing.
+func (s *PgStore) AccountingImpactOf(ctx context.Context, versionID string) (*domain.AccountingImpact, error) {
+	var out *domain.AccountingImpact
+	err := s.withRLS(ctx, contextTenantID(ctx), func(tx pgx.Tx) error {
+		v, err := loadAccountingVersion(ctx, tx, versionID)
+		if err != nil {
+			return err
+		}
+		out = &domain.AccountingImpact{Version: v, Retroactive: v.EffectiveFrom.Before(v.CreatedAt),
+			AmbiguousWith: []domain.ImpactVersionRef{}, DependedOnBy: []domain.ImpactVersionRef{}, ActivationBlockers: []string{}}
+
+		// The active and the scheduled version of this very policy and scope.
+		rows, err := tx.Query(ctx, `SELECT `+impactRefColumns+impactRefFrom+`
+			WHERE pv.policy_id = $1
+			  AND pv.tenant_id IS NOT DISTINCT FROM $2::uuid
+			  AND pv.legal_entity_id IS NOT DISTINCT FROM $3::uuid
+			  AND pv.version_status IN ('ACTIVE', 'SCHEDULED')
+			  AND pv.policy_version_id <> $4;`, v.PolicyID, v.TenantID, v.LegalEntityID, v.PolicyVersionID)
+		if err != nil {
+			return err
+		}
+		same, err := scanImpactRefs(rows)
+		if err != nil {
+			return err
+		}
+		for i := range same {
+			switch same[i].VersionStatus {
+			case domain.StatusActive:
+				out.WouldSupersede, out.PredecessorGovernsUntil = &same[i], &v.EffectiveFrom
+			case domain.StatusScheduled:
+				out.PendingSchedule = &same[i]
+			}
+		}
+
+		// Policies that would be ambiguous with it: the guard's own condition.
+		rows, err = tx.Query(ctx, `SELECT `+impactRefColumns+impactRefFrom+`
+			WHERE pv.policy_id <> $1
+			  AND a.policy_domain = $2
+			  AND pv.tenant_id IS NOT DISTINCT FROM $3::uuid
+			  AND pv.legal_entity_id IS NOT DISTINCT FROM $4::uuid
+			  AND pv.version_status IN ('ACTIVE', 'SCHEDULED')
+			  AND pv.withdrawn_at IS NULL
+			  AND pv.effective_from < COALESCE($6::timestamptz, 'infinity'::timestamptz)
+			  AND COALESCE(pv.effective_to, 'infinity'::timestamptz) > $5
+			  AND d.precedence = $7
+			  AND (a.book_id IS NULL)::int + (a.jurisdiction_id IS NULL)::int = $8
+			  AND (a.book_id IS NULL OR $9::uuid IS NULL OR a.book_id = $9::uuid)
+			  AND (a.jurisdiction_id IS NULL OR $10::uuid IS NULL OR a.jurisdiction_id = $10::uuid)
+			ORDER BY pv.policy_version_id;`,
+			v.PolicyID, v.Applicability.PolicyDomain, v.TenantID, v.LegalEntityID, v.EffectiveFrom, v.EffectiveTo,
+			v.Details.Precedence, 2-v.Applicability.Specificity(), v.Applicability.BookID, v.Applicability.JurisdictionID)
+		if err != nil {
+			return err
+		}
+		if out.AmbiguousWith, err = scanImpactRefs(rows); err != nil {
+			return err
+		}
+
+		rows, err = tx.Query(ctx, `SELECT DISTINCT `+impactRefColumns+impactRefFrom+`
+			JOIN accounting_policy_rule_mappings m ON m.policy_version_id = pv.policy_version_id
+			WHERE m.depends_on_version_id = $1
+			ORDER BY pv.policy_version_id;`, v.PolicyVersionID)
+		if err != nil {
+			return err
+		}
+		if out.DependedOnBy, err = scanImpactRefs(rows); err != nil {
+			return err
+		}
+
+		if out.WouldSupersede != nil {
+			out.ActivationBlockers = append(out.ActivationBlockers,
+				"version "+out.WouldSupersede.PolicyVersionID+" is active: activate by superseding it, naming it")
+		}
+		if out.PendingSchedule != nil {
+			out.ActivationBlockers = append(out.ActivationBlockers,
+				"version "+out.PendingSchedule.PolicyVersionID+" is already scheduled in this scope")
+		}
+		for _, a := range out.AmbiguousWith {
+			out.ActivationBlockers = append(out.ActivationBlockers,
+				"version "+a.PolicyVersionID+" would be ambiguous with it: give one an explicit higher precedence")
+		}
+		return nil
+	})
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
+		return nil, domain.ErrPolicyVersionNotFound
+	}
+	if err != nil {
+		return nil, s.domainError("AccountingImpactOf", err)
+	}
+	return out, nil
+}

@@ -86,6 +86,7 @@ func (s *PgStore) domainError(op string, err error) error {
 		domain.ErrConflict, domain.ErrApprovalRequired, domain.ErrSoDConflict,
 		domain.ErrConcurrencyConflict, domain.ErrPolicyConflicted, domain.ErrIdempotencyMismatch,
 		domain.ErrInvalidScope, domain.ErrEvaluationNotFound, domain.ErrAccountingDependencyNotFound,
+		domain.ErrSupersessionRequired, domain.ErrInvalidSupersedes,
 		domain.ErrControlTestDefinitionNotFound, domain.ErrAttestationNotFound,
 		domain.ErrInvalidAttestationTransition,
 	} {
@@ -651,7 +652,13 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 		if err != nil {
 			return nil, err
 		}
-		return &domain.TransitionResult{Version: next, Transitioned: true}, record(next, "policy.version.approved", nil)
+		if err := record(next, "policy.version.approved", nil); err != nil {
+			return nil, err
+		}
+		if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicyApproved, next, cmd.ActorID, cmd.Meta, nil); err != nil {
+			return nil, err
+		}
+		return &domain.TransitionResult{Version: next, Transitioned: true}, nil
 
 	case domain.CommandActivate, domain.CommandSchedule:
 		future := v.EffectiveFrom.After(now)
@@ -675,6 +682,11 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 		}
 		if err := expected(); err != nil {
 			return nil, err
+		}
+		if from == domain.StatusApproved {
+			if err := s.guardSupersession(ctx, tx, v, cmd.SupersedesVersionID); err != nil {
+				return nil, err
+			}
 		}
 		if from == domain.StatusApproved {
 			if err := s.guardActivation(ctx, tx, v, policyType); err != nil {
@@ -712,8 +724,14 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 		if _, err := tx.Exec(ctx, `DELETE FROM policy_activation_schedule WHERE policy_version_id = $1;`, v.PolicyVersionID); err != nil {
 			return nil, err
 		}
-		return &domain.TransitionResult{Version: next, Transitioned: true},
-			record(next, "policy.version.suspended", map[string]any{"reason": cmd.Reason})
+		if err := record(next, "policy.version.suspended", map[string]any{"reason": cmd.Reason}); err != nil {
+			return nil, err
+		}
+		if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicySuspended, next, cmd.ActorID, cmd.Meta,
+			map[string]any{"reason": cmd.Reason, "break_glass_session_id": nilIfEmpty(cmd.BreakGlassSessionID)}); err != nil {
+			return nil, err
+		}
+		return &domain.TransitionResult{Version: next, Transitioned: true}, nil
 
 	case domain.CommandReviewSuspension:
 		if v.SuspensionReviewedAt != nil {
@@ -902,6 +920,11 @@ func (s *PgStore) activateNow(ctx context.Context, tx pgx.Tx, v *domain.PolicyVe
 	})); err != nil {
 		return nil, err
 	}
+	if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicyActivated, next, actor, meta, map[string]any{
+		"superseded_version_ids": versionIDs(superseded),
+	}); err != nil {
+		return nil, err
+	}
 	active := domain.StatusActive
 	for _, old := range superseded {
 		if err := s.insertTransition(ctx, tx, old, &active, domain.StatusSuperseded, actor, "superseded by "+next.PolicyVersionID, "", meta.CorrelationID); err != nil {
@@ -911,6 +934,11 @@ func (s *PgStore) activateNow(ctx context.Context, tx pgx.Tx, v *domain.PolicyVe
 			"superseded_by_version_id": next.PolicyVersionID,
 			"previous_status":          domain.StatusActive,
 		})); err != nil {
+			return nil, err
+		}
+		if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicySuperseded, old, actor, meta, map[string]any{
+			"superseded_by_version_id": next.PolicyVersionID,
+		}); err != nil {
 			return nil, err
 		}
 	}

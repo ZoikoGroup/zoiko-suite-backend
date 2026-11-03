@@ -46,6 +46,9 @@ type acctStub struct {
 	candErr    error
 	gotQuery   domain.AccountingCandidateQuery
 
+	impact    *domain.AccountingImpact
+	impactErr error
+
 	isAccounting    bool
 	isAccountingErr error
 	checkedPolicy   string
@@ -78,6 +81,10 @@ func (s *acctStub) AccountingCandidates(_ context.Context, q domain.AccountingCa
 	return s.candidates, s.candErr
 }
 
+func (s *acctStub) AccountingImpactOf(_ context.Context, _ string) (*domain.AccountingImpact, error) {
+	return s.impact, s.impactErr
+}
+
 func (s *acctStub) IsAccountingPolicy(_ context.Context, policyID string) (bool, error) {
 	s.checkedPolicy = policyID
 	return s.isAccounting, s.isAccountingErr
@@ -90,14 +97,22 @@ type acctRig struct {
 }
 
 func newAcctRig(st *acctStub, az *stubAuthz, opts ...rigOption) *acctRig {
+	if az == nil {
+		az = &stubAuthz{}
+	}
+	rig := newAcctRigClient(st, az, opts...)
+	rig.az = az
+	return rig
+}
+
+// newAcctRigClient is newAcctRig with any authorization client, for the tests
+// that need one with more than CheckAllowed.
+func newAcctRigClient(st *acctStub, client authz.Client, opts ...rigOption) *acctRig {
 	if st == nil {
 		st = &acctStub{}
 	}
 	if st.stubStore == nil {
 		st.stubStore = &stubStore{}
-	}
-	if az == nil {
-		az = &stubAuthz{}
 	}
 	o := handler.Options{PlatformScopeID: testAuthzScopeID, Now: func() time.Time { return fixedNow }}
 	for _, f := range opts {
@@ -106,8 +121,8 @@ func newAcctRig(st *acctStub, az *stubAuthz, opts ...rigOption) *acctRig {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
-	handler.RegisterRoutes(r, handler.New(st, &stubCandidates{}, az, o, zap.NewNop()))
-	return &acctRig{st: st, az: az, r: r}
+	handler.RegisterRoutes(r, handler.New(st, &stubCandidates{}, client, o, zap.NewNop()))
+	return &acctRig{st: st, r: r}
 }
 
 // do sends a request; the first string after the path is the body, any reqOpt
