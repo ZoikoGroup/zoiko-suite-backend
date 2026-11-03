@@ -197,11 +197,11 @@ func TestOpenAPI_NamesEveryORGOperation(t *testing.T) {
 		"getTenantDefaults",          // GetTenantDefaults
 
 		// ORG-03 commands and reads.
-		"createEntity",           // CreateLegalEntity
+		"createLegalEntity",       // CreateLegalEntity
 		"amendLegalProfile",      // AmendLegalProfile
 		"changeRegisteredOffice", // ChangeRegisteredOffice
 		"changeLegalName",        // ChangeLegalName
-		"transitionEntityStatus", // DeactivateLegalEntity
+		"deactivateLegalEntity",   // DeactivateLegalEntity: POST /v1/entities/{id}/status
 		"getEntity",              // GetLegalEntity
 		"findByRegistryNumber",   // FindByRegistryNumber
 		"listEntityVersions",     // ListEntityVersions

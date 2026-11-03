@@ -157,8 +157,8 @@ paths:
 
   /v1/entities:
     post:
-      operationId: createEntity
-      summary: Create a new legal entity
+      operationId: createLegalEntity
+      summary: CreateLegalEntity - create a new legal entity
       description: |
         `primary_jurisdiction_id` is validated synchronously against the
         Jurisdiction Rules Service before the entity is persisted (fail-closed).
@@ -269,8 +269,8 @@ paths:
                 $ref: "#/components/schemas/EntityStatusResponse"
         "404": { $ref: "#/components/responses/NotFound" }
     post:
-      operationId: transitionEntityStatus
-      summary: Transition an entity's status
+      operationId: deactivateLegalEntity
+      summary: DeactivateLegalEntity - transition an entity status (also reactivates, suspends and marks dormant)
       description: |
         Valid transitions: ACTIVE→DORMANT, ACTIVE→SUSPENDED, ACTIVE→DISSOLVED,
         DORMANT→ACTIVE, DORMANT→DISSOLVED, SUSPENDED→ACTIVE, SUSPENDED→DISSOLVED.
