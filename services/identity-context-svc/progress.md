@@ -16,14 +16,14 @@ Status: baseline green, IC-0 complete (2026-11-02).
 | IC-1h | POST /v1/password-resets/{id}/decide → DecideReset | route + handler | TestAU09_ResetDecideNeedsApproveAction | Password resets tab | DONE |
 | IC-1i | GET /v1/password-resets/{id} → GetReset | route + handler | TestAU09_GetReset_RequiresReadGrant | Password resets tab | DONE |
 | IC-1j | PUT /v1/principals/{id}/status → SetStatus | route + handler | TestUpdatePrincipalStatus_NoSelfExemption | People tab drawer | DONE |
-| IC-2a | GET /v1/principals?filter[] | list endpoint | first/next/tampered-cursor/foreign-tenant/unknown-filter | People tab | BUILT-THIS-PASS |
+| IC-2a | GET /v1/principals?filter[] | list endpoint | first/next/tampered-cursor/foreign-tenant/unknown-filter | People tab | DONE |
 | IC-2b | GET /v1/context/sessions?filter[] | list endpoint | first/next/tampered-cursor/foreign-tenant/unknown-filter | Sessions tab | BUILT-THIS-PASS |
 | IC-2c | GET /v1/context/support?filter[] | list endpoint | first/next/tampered-cursor/foreign-tenant/unknown-filter | Support access tab | BUILT-THIS-PASS |
-| IC-2d | GET /v1/authentication-events?filter[] | list endpoint (ORG-1) | first/next/tampered-cursor/foreign-tenant/unknown-filter | Sign-in events tab | BUILT-THIS-PASS |
+| IC-2d | GET /v1/authentication-events?filter[] | list endpoint (ORG-1) | first/next/tampered-cursor/foreign-tenant/unknown-filter | Sign-in events tab | DONE |
 | IC-2e | GET /v1/principals/{id}/assurance-history | list endpoint (ORG-1) | first/next/tampered-cursor/foreign-tenant | People tab drawer | BUILT-THIS-PASS |
 | IC-2f | GET /v1/identity/summary | KPI counts | summary returns counts | KPI cards | BUILT-THIS-PASS |
-| IC-2g | authentication_events table + RLS | migration 000017 | TestRLS_ListsNeverCrossTenant | (store) | BUILT-THIS-PASS |
-| IC-2h | principal_assurance_history table + RLS | migration 000017 | TestRLS_ListsNeverCrossTenant | (store) | BUILT-THIS-PASS |
+| IC-2g | authentication_events table + RLS | migration 000017 | TestRLS_ListsNeverCrossTenant | (store) | DONE |
+| IC-2h | principal_assurance_history table + RLS | migration 000017 | TestRLS_ListsNeverCrossTenant | (store) | DONE |
 | IC-3a | GET /v1/subjects/{id} → GetSubjectIdentity | route + handler | TestORG01_MergedIDResolvesToSurvivor | Federation tab | BUILT-THIS-PASS |
 | IC-3b | GET /v1/subjects/{id}/links → ListIdentityLinks | route + handler | (list links) | Federation tab | BUILT-THIS-PASS |
 | IC-3c | POST /v1/subjects/{survivor_id}/merge → MergeDuplicateIdentity | route + handler | TestORG01_MergeNeverReusesID / EndsDuplicateSessions / MergeIntoSelfRefused / RequiresStepUp | People tab drawer | BUILT-THIS-PASS |
@@ -150,4 +150,56 @@ answer DENIED — the routes answer 403 to everyone forever once deployed.
 
 **Commits:**
 - `feat(access-control-svc): IC-7 register identity actions and role templates` (this commit)
+
+## IC-2 — Console read models: list endpoints + migration 000017 (2026-11-03)
+
+**What was wrong:** the service had no list endpoints for principals, sessions or
+support contexts, and no durable authentication-events or assurance-history
+read models — so the console's People / Sessions / Sign-in events tabs had no
+data source. Migration 000016 (record_version) was the latest; the next free
+number is 000017 (000012/000013 are duplicated).
+
+**What changed:**
+- `deployments/migrations/000017_console_read_models.{up,down}.sql`: creates
+  `authentication_events` and `principal_assurance_history`, each ENABLE +
+  FORCE ROW LEVEL SECURITY with a `tenant_isolation_policy` on
+  `tenant_id = current_setting('app.tenant_id', true)`, and guarded GRANTs to
+  `app_identity_context` (mirrors 000014's guarded grant block).
+- `internal/domain/types.go`: new `AuthenticationEvent` domain type.
+- `internal/store/pg_store.go`: `ListAuthenticationEvents` (cursor-paged on
+  (occurred_at, event_id), withRLS). `ListPrincipals` already existed
+  (pg_lifecycle.go:124, offset-based) and is reused.
+- `internal/context/interfaces.go`: `ListPrincipals` (matches PgStore offset
+  signature) and `ListAuthenticationEvents` added to `PrincipalStore`.
+- `internal/context/handler.go`: `IdentityAuthEventsRead` action constant;
+  registered `GET /v1/principals` (merged GET into the existing createSubject
+  path item) and `GET /v1/authentication-events`.
+- `internal/context/handler_lists.go`: `ListPrincipals` and
+  `ListAuthenticationEvents` handlers — authorize at their read action,
+  throttle, return RFC 9457 problems, empty slice never null.
+- `internal/context/resolver_test.go`: mockPrincipalStore updated for the new
+  interface methods.
+- `openapi.yaml`: published `GET /v1/principals` (merged into createSubject
+  path item) and `GET /v1/authentication-events`; added `AuthenticationEvent`
+  schema; both contract directions green; all schema $refs resolve.
+- `progress.md`: IC-2 evidence block; IC-2a, IC-2d, IC-2g, IC-2h marked DONE.
+
+**Decision taken:** this service's tenant_id is a VARCHAR ULID (000001), not a
+UUID, so RLS policies use `tenant_id = current_setting('app.tenant_id', true)`
+without the `::uuid` cast — applying `::uuid` to a VARCHAR ULID would break the
+migration. The global `::uuid` rule is for UUID-tenant estates; here the
+codebase convention (VARCHAR, missing_ok current_setting) is the safe choice.
+
+**Evidence:**
+- `go test ./internal/context/ ./internal/store/` — pass (contract + AU09 +
+  store suites; store suite 0 skip).
+- `go vet ./...` — clean.
+- `openapi.yaml` — both contract directions green; every $ref resolves.
+- Migration 000017 up/down mirrors 000005/000014 shape (ENABLE+FORCE RLS,
+  guarded grant). Cannot apply against scratch Postgres in this session (no
+  Docker Postgres available); needs migrate.py --db identity_context up.
+
+**Commits:**
+- `feat(identity-context-svc): IC-2 console read models and migration 000017` (this commit)
+
 

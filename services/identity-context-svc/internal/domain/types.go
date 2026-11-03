@@ -752,3 +752,24 @@ var ErrAuthorizationServiceUnavailable = errors.New("authorization service unava
 // foreign key to principals; such a principal cannot hold a session here, so
 // there is nothing for the projection to serve and the event is skipped.
 var ErrUnknownPrincipal = errors.New("principal not known to identity-context-svc")
+
+// ---------------------------------------------------------------------------
+// AuthenticationEvent  (data-model §06.2 — IC-2 console read model)
+//
+// Append-only log of every authentication outcome in the tenant. Backs
+// GET /v1/authentication-events (Sign-in events tab).
+// ---------------------------------------------------------------------------
+
+type AuthenticationEvent struct {
+	EventID        string    `json:"event_id"`
+	TenantID       string    `json:"tenant_id"`
+	PrincipalID    string    `json:"principal_id"`
+	EventType      string    `json:"event_type"`
+	Outcome        string    `json:"outcome"`
+	AssuranceLevel string    `json:"assurance_level,omitempty"`
+	SourceIP       string    `json:"source_ip,omitempty"`
+	UserAgent      string    `json:"user_agent,omitempty"`
+	OccurredAt     time.Time `json:"occurred_at"`
+	CorrelationID  string    `json:"correlation_id,omitempty"`
+}
+

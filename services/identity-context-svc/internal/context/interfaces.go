@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/store"
 )
 
 // PrincipalStore is the data-access contract for Principal records.
@@ -18,6 +19,13 @@ type PrincipalStore interface {
 	FindActiveRoleAssignments(ctx context.Context, principalID, tenantID string, legalEntityID *string) ([]domain.PrincipalRoleAssignment, error)
 	FindActiveDelegations(ctx context.Context, principalID, tenantID string) ([]domain.DelegatedAuthority, error)
 	UpdateStatus(ctx context.Context, principalID, tenantID string, newStatus domain.PrincipalStatus, actorID, correlationID string) error
+	// ListPrincipals pages through a tenant's subjects (SCIM list, admin list).
+	// filterField is "", "email" or "external_id". Offset-based pagination.
+	ListPrincipals(ctx context.Context, tenantID, filterField, filterValue string, offset, limit int) ([]store.PrincipalDetail, int, error)
+	// ListAuthenticationEvents returns a page of the caller's tenant's
+	// authentication events, newest first, cursor-paged on (occurred_at,
+	// event_id).
+	ListAuthenticationEvents(ctx context.Context, tenantID, cursor string, limit int) ([]domain.AuthenticationEvent, string, error)
 }
 
 // SessionCache manages the Redis-backed session envelope store.

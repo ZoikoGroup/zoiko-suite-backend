@@ -15,6 +15,7 @@ import (
 	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/siem"
+	"zoiko.io/identity-context-svc/internal/store"
 )
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -72,6 +73,12 @@ func (m *mockPrincipalStore) FindActiveDelegations(_ context.Context, _, _ strin
 }
 func (m *mockPrincipalStore) UpdateStatus(_ context.Context, _, _ string, _ domain.PrincipalStatus, _, _ string) error {
 	return nil
+}
+func (m *mockPrincipalStore) ListPrincipals(_ context.Context, _, _, _ string, _, _ int) ([]store.PrincipalDetail, int, error) {
+	return nil, 0, nil
+}
+func (m *mockPrincipalStore) ListAuthenticationEvents(_ context.Context, _ string, _ string, _ int) ([]domain.AuthenticationEvent, string, error) {
+	return nil, "", nil
 }
 
 // mockSessionCache

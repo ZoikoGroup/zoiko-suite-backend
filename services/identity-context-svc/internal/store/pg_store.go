@@ -310,3 +310,58 @@ func (s *PgStore) UpdateStatus(
 
 	return tx.Commit(ctx)
 }
+
+// ListAuthenticationEvents returns a page of authentication events for the
+// caller's tenant, newest first, cursor-paged on (occurred_at, event_id).
+// An empty cursor starts at the most recent event. The returned nextCursor is
+// empty when there are no more rows. Runs inside withRLS so the tenant
+// isolation policy on authentication_events has a scope to enforce.
+func (s *PgStore) ListAuthenticationEvents(
+	ctx context.Context,
+	tenantID, cursor string,
+	limit int,
+) ([]domain.AuthenticationEvent, string, error) {
+	s.log.Debug("store.ListAuthenticationEvents",
+		zap.String("tenant_id", tenantID),
+		zap.String("cursor", cursor),
+		zap.Int("limit", limit))
+
+	const query = `
+		SELECT event_id, tenant_id, principal_id, event_type, outcome,
+		       assurance_level, source_ip, user_agent, occurred_at, correlation_id
+		FROM authentication_events
+		WHERE tenant_id = $1
+		  AND ($2 = '' OR (occurred_at, event_id) < (
+		         split_part($2, '|', 1)::timestamptz,
+		         split_part($2, '|', 2)
+		       ))
+		ORDER BY occurred_at DESC, event_id DESC
+		LIMIT $3
+	`
+	var (
+		events     []domain.AuthenticationEvent
+		nextCursor string
+	)
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, tenantID, cursor, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		events = []domain.AuthenticationEvent{}
+		for rows.Next() {
+			var e domain.AuthenticationEvent
+			if err := rows.Scan(
+				&e.EventID, &e.TenantID, &e.PrincipalID, &e.EventType, &e.Outcome,
+				&e.AssuranceLevel, &e.SourceIP, &e.UserAgent, &e.OccurredAt, &e.CorrelationID,
+			); err != nil {
+				return err
+			}
+			events = append(events, e)
+			nextCursor = e.OccurredAt.Format(time.RFC3339Nano) + "|" + e.EventID
+		}
+		return rows.Err()
+	})
+	return events, nextCursor, err
+}

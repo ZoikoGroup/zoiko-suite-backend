@@ -389,6 +389,38 @@ components:
           type: string
           format: date-time
 
+    AuthenticationEvent:
+      type: object
+      required:
+        - event_id
+        - tenant_id
+        - principal_id
+        - event_type
+        - outcome
+        - occurred_at
+      properties:
+        event_id:
+          type: string
+        tenant_id:
+          type: string
+        principal_id:
+          type: string
+        event_type:
+          type: string
+        outcome:
+          type: string
+        assurance_level:
+          type: string
+        source_ip:
+          type: string
+        user_agent:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        correlation_id:
+          type: string
+
     # -- GOV-01 completion schemas ----------------------------------------------
     #
     # NOTE: this replaces an earlier ErrorResponse that declared `statusCode`
@@ -1367,6 +1399,63 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
           description: Subject creation is not configured in this deployment
+    get:
+      summary: List the tenant's principals
+      operationId: listPrincipals
+      description: |
+        Page of the caller's tenant's principals, newest first. Offset-paged
+        via limit; filter by email or external_id through the store.
+        Authorized at IDENTITY_PRINCIPAL_READ.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: A page of principals
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [principals]
+                properties:
+                  principals:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Principal"
+                  next_cursor:
+                    type: string
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: The caller lacks IDENTITY_PRINCIPAL_READ
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Principal listing is not configured in this deployment
 
   /v1/principals/{principalId}/invite:
     post:
@@ -1702,6 +1791,76 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
           description: Reset requests are not configured in this deployment
+
+  # -- IC-2 console read models -----------------------------------------------
+  #
+  # List endpoints behind the console tabs. Cursor- or offset-paged, tenant
+  # scoped, authorised at the read action for the domain. Lists are reads of a
+  # collection, not of a single aggregate, so they carry no ETag/If-Match.
+
+  /v1/authentication-events:
+    get:
+      summary: List the tenant's authentication events
+      operationId: listAuthenticationEvents
+      description: |
+        Page of the caller's tenant's authentication events, newest first,
+        cursor-paged on (occurred_at, event_id). Answers "unavailable" is not
+        applicable here: an empty page is a real answer, never a synthesized
+        count. Authorized at IDENTITY_AUTH_EVENTS_READ.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: A page of authentication events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AuthenticationEvent"
+                  next_cursor:
+                    type: string
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: The caller lacks IDENTITY_AUTH_EVENTS_READ
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Authentication-event listing is not configured in this deployment
 
   # -- GOV-01 contract operations ---------------------------------------------
   #
