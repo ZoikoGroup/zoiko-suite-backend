@@ -53,6 +53,13 @@ var registeredActionMigrations = []struct {
 	{"000043_register_identity_merge_action", "identity-context-svc", map[string]string{
 		"IDENTITY_MERGE": "CRITICAL",
 	}},
+	{"000044_register_party_actions", "tenant-entity-registry-svc", map[string]string{
+		"PARTY_CREATE":            "STANDARD",
+		"PARTY_AMEND":             "STANDARD",
+		"PARTY_ROLE_MANAGE":       "STANDARD",
+		"PARTY_IDENTIFIER_LINK":   "STANDARD",
+		"PARTY_IDENTIFIER_REVEAL": "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

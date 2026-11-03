@@ -53,6 +53,7 @@ var errorCodes = []struct {
 	{registry.ErrVersionConflict, CodeVersionConflict},
 	{registry.ErrApprovalFingerprintMismatch, CodeVersionConflict},
 	{registry.ErrOnboardingKeyMismatch, CodeIdempotencyMismatch},
+	{registry.ErrCreateRequestMismatch, CodeIdempotencyMismatch},
 	{registry.ErrRegistryConflict, CodeDuplicateCandidate},
 	{registry.ErrApprovalPending, CodeDuplicateCandidate},
 	{registry.ErrJurisdictionRestricted, CodeJurisdictionRestricted},

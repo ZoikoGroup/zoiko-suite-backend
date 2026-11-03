@@ -115,3 +115,30 @@ All refused at boot in staging and production.
 | `ONBOARDING_KEY_OPTIONAL` | provisioning without `external_customer_key` |
 | `LEGACY_PROVISIONING_INPUTS` | provisioning without the §4.2 inputs (000013), and entity creation without `registered_office` / `source_evidence_ref` (§4.3) |
 | `EXPECTED_VERSION_OPTIONAL` | substitution of the read version for a missing `expected_version` |
+
+## Master data lives here, not in separate MDM services (R15, ORG-07 and MDM-01 / MDM-05)
+
+ZS-SVC-U-001 describes MDM-01 to MDM-05 as services. They are built as modules of this service, with their own
+tables, so a legal entity (ORG-03), its parties (ORG-07) and its ownership (ORG-04) commit in one database. A
+consumer that follows the spec's `/v1/parties` surface finds it here.
+
+Party kinds, the match ladder, the create flow and the non-destructive merge are as ZS-SVC-U-001 s9, s10 and s18.
+Where the spec leaves a choice, the code chooses the safer reading:
+
+- **No automatic link below tier A.** Tier A (a verified identifier in the right scheme and scope that names one
+  active party) may return the existing party. An identifier the tenant only asserted is tier B, and a name match
+  is tier B or C: all of them answer `REVIEW_REQUIRED` and open a case. The spec allows a governed threshold to link
+  tier B for low-impact object types; none is configured, so none links.
+- **An authority source verifies on arrival; nothing else does.** `AUTHORITY_REGISTRY` and `AUTHORITY_DOCUMENT`
+  verify a fact or identifier when it is recorded. A tenant's own assertion is held `PROPOSED`. A fact that
+  contradicts a verified one is held beside it and opens a FACT_CONFLICT case, even from an authority: replacing a
+  verified fact is a steward's decision (s19), not a side effect of a write.
+- **Scheme-proven needs a verified identifier.** The one exception is the source-system reference
+  (`SOURCE_SYSTEM`, scope = the system), which exists to make an ingest replay-safe.
+- **Sensitive identifiers** (`TAX_ID`, `NATIONAL_ID`) are masked in every read and answer; unmasking is
+  `PARTY_IDENTIFIER_REVEAL` and is refused, not silently masked, when asked for without it. No event carries an
+  identifier value, a name or evidence text.
+- **Identifier verification through XIC** (`POST /v1/identifiers/{id}:verify`) is not built here; the verification
+  state comes from the source class of the link until it is.
+- **Search reads the authoritative tables.** The spec expects a search projection; a projection lags a write, and
+  the answer to "does this party already exist" must not.
