@@ -365,3 +365,111 @@ func (s *PgStore) ListAuthenticationEvents(
 	})
 	return events, nextCursor, err
 }
+
+// GetIdentityLinks returns every external-IdP link bound to a principal in the
+// caller's tenant. Used by GET /v1/subjects/{id}/links.
+func (s *PgStore) GetIdentityLinks(
+	ctx context.Context,
+	tenantID, principalID string,
+) ([]domain.IdentityLink, error) {
+	s.log.Debug("store.GetIdentityLinks",
+		zap.String("tenant_id", tenantID),
+		zap.String("principal_id", principalID))
+
+	const query = `
+		SELECT link_id, tenant_id, principal_id, identity_provider,
+		       provider_subject, provider_type, created_at
+		FROM identity_links
+		WHERE tenant_id = $1
+		  AND principal_id = $2
+		ORDER BY created_at DESC
+	`
+	links := []domain.IdentityLink{}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, tenantID, principalID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var l domain.IdentityLink
+			if err := rows.Scan(
+				&l.LinkID, &l.TenantID, &l.PrincipalID, &l.IdentityProvider,
+				&l.ProviderSubject, &l.ProviderType, &l.CreatedAt,
+			); err != nil {
+				return err
+			}
+			links = append(links, l)
+		}
+		return rows.Err()
+	})
+	return links, err
+}
+
+// MergeDuplicateIdentity retires `retiredID` into `survivorID` within the
+// caller's tenant. Every identity link that named the retired principal is
+// repointed at the survivor, the retired principal is disabled (its ID is
+// never reissued), its live sessions are ended, and the merge is recorded.
+// Caller must hold IDENTITY_SUBJECT_MERGE and a step-up grant; this method
+// assumes the caller is neither survivor nor retired (checked at the handler).
+func (s *PgStore) MergeDuplicateIdentity(
+	ctx context.Context,
+	tenantID, survivorID, retiredID, approvedBy, stepUpEvidence, correlationID string,
+) error {
+	s.log.Info("store.MergeDuplicateIdentity",
+		zap.String("tenant_id", tenantID),
+		zap.String("survivor_id", survivorID),
+		zap.String("retired_id", retiredID))
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+
+	// Repoint every link that named the retired principal at the survivor.
+	if _, err := tx.Exec(ctx, `
+		UPDATE identity_links
+		SET principal_id = $1
+		WHERE principal_id = $2 AND tenant_id = $3
+	`, survivorID, retiredID, tenantID); err != nil {
+		return err
+	}
+
+	// Disable the retired principal (idempotent: no-op if already disabled).
+	var disabled bool
+	err = tx.QueryRow(ctx, `
+		UPDATE principals
+		SET status = $1, updated_at = $2, record_version = record_version + 1
+		WHERE principal_id = $3 AND tenant_id = $4 AND status <> $1
+		RETURNING principal_id
+	`, domain.PrincipalStatusDisabled, time.Now().UTC(), retiredID, tenantID).Scan(&disabled)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+
+	// End the retired principal's live sessions.
+	if _, err := tx.Exec(ctx, `
+		UPDATE session_contexts
+		SET invalidated_at = $1, invalidation_reason = $2
+		WHERE principal_id = $3 AND tenant_id = $4 AND invalidated_at IS NULL
+	`, time.Now().UTC(), string(domain.InvalidationReasonAdminRevoke), retiredID, tenantID); err != nil {
+		return err
+	}
+
+	// Record the merge for audit.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO identity_merges
+			(merge_id, tenant_id, survivor_id, retired_id, approved_by, step_up_evidence, approved_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, ulid.Make().String(), tenantID, survivorID, retiredID, approvedBy, stepUpEvidence, time.Now().UTC()); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}

@@ -80,6 +80,12 @@ func (m *mockPrincipalStore) ListPrincipals(_ context.Context, _, _, _ string, _
 func (m *mockPrincipalStore) ListAuthenticationEvents(_ context.Context, _ string, _ string, _ int) ([]domain.AuthenticationEvent, string, error) {
 	return nil, "", nil
 }
+func (m *mockPrincipalStore) GetIdentityLinks(_ context.Context, _, _ string) ([]domain.IdentityLink, error) {
+	return nil, nil
+}
+func (m *mockPrincipalStore) MergeDuplicateIdentity(_ context.Context, _, _, _, _, _, _ string) error {
+	return nil
+}
 
 // mockSessionCache
 //

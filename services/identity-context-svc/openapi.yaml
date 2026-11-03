@@ -421,6 +421,33 @@ components:
         correlation_id:
           type: string
 
+    IdentityLink:
+      type: object
+      required:
+        - link_id
+        - tenant_id
+        - principal_id
+        - identity_provider
+        - provider_subject
+        - provider_type
+        - created_at
+      properties:
+        link_id:
+          type: string
+        tenant_id:
+          type: string
+        principal_id:
+          type: string
+        identity_provider:
+          type: string
+        provider_subject:
+          type: string
+        provider_type:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
     # -- GOV-01 completion schemas ----------------------------------------------
     #
     # NOTE: this replaces an earlier ErrorResponse that declared `statusCode`
@@ -1861,6 +1888,248 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
           description: Authentication-event listing is not configured in this deployment
+
+  # -- IC-3 subject identity and merge ----------------------------------------
+  #
+  # GET /v1/subjects/{id} reads a principal plus its IdP links; GET
+  # /v1/subjects/{id}/links lists those links; POST /v1/subjects/{survivorId}/merge
+  # retires one subject into another (step-up required, independent approval,
+  # If-Match on the retired subject's aggregate).
+
+  /v1/subjects/{principalId}:
+    get:
+      summary: Read a subject's identity and links
+      operationId: getSubjectIdentity
+      description: |
+        Returns the principal record and every external-IdP link bound to it.
+        Authorized at IDENTITY_PRINCIPAL_READ; a principal may read their own.
+        Returns ETag on the subject record.
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Subject identity and links
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [principal]
+                properties:
+                  principal:
+                    $ref: "#/components/schemas/Principal"
+                  links:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/IdentityLink"
+          headers:
+            ETag:
+              schema:
+                type: string
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: The caller lacks IDENTITY_PRINCIPAL_READ
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Subject not found
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Subject lookup is not configured in this deployment
+
+  /v1/subjects/{principalId}/links:
+    get:
+      summary: List a subject's IdP links
+      operationId: listIdentityLinks
+      description: |
+        Returns every external-IdP link bound to the subject.
+        Authorized at IDENTITY_PRINCIPAL_READ; a principal may list their own.
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The subject's IdP links
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [links]
+                properties:
+                  links:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/IdentityLink"
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: The caller lacks IDENTITY_PRINCIPAL_READ
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Subject not found
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Identity links are not configured in this deployment
+
+  /v1/subjects/{survivorId}/merge:
+    post:
+      summary: Merge a retired subject into a survivor
+      operationId: mergeDuplicateIdentity
+      description: |
+        Retires `retired_id` into `survivor_id`: every link naming the retired
+        principal is repointed at the survivor, the retired principal is
+        disabled (its ID is never reissued), its live sessions end, and the
+        merge is recorded. Authorized at IDENTITY_SUBJECT_MERGE and a recent
+        step-up; the actor must be neither survivor nor retired.
+        Requires If-Match on the retired subject's record version.
+      parameters:
+        - name: survivorId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [retired_id, step_up_evidence]
+              properties:
+                retired_id:
+                  type: string
+                step_up_evidence:
+                  type: string
+      responses:
+        "200":
+          description: Merge recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [survivor_id, retired_id, status]
+                properties:
+                  survivor_id:
+                    type: string
+                  retired_id:
+                    type: string
+                  status:
+                    type: string
+        "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Malformed body, or survivor == retired
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: |
+            The caller lacks IDENTITY_SUBJECT_MERGE, step-up is required or
+            stale, or the actor is the survivor/retired principal
+        "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Retired subject not found
+        "428":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: If-Match header is required
+        "412":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: If-Match does not match the current record version
+        "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+          description: Subject merge is not configured in this deployment
 
   # -- GOV-01 contract operations ---------------------------------------------
   #

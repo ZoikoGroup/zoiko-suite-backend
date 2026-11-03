@@ -36,6 +36,7 @@ const (
 	IdentitySessionInvalidate = "IDENTITY_SESSION_INVALIDATE"
 	IdentityPrincipalRead     = "IDENTITY_PRINCIPAL_READ"
 	IdentityAuthEventsRead    = "IDENTITY_AUTH_EVENTS_READ"
+	IdentitySubjectMerge      = "IDENTITY_SUBJECT_MERGE"
 	IdentityPrincipalStatus   = "IDENTITY_PRINCIPAL_STATUS_SET"
 	// Subject lifecycle (IC-1).
 	IdentityPrincipalCreate     = "IDENTITY_PRINCIPAL_CREATE"
@@ -412,6 +413,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		// ── Console read models (IC-2) ─────────────────────────────────────────
 		r.Get("/principals", h.ListPrincipals)
 		r.Get("/authentication-events", h.ListAuthenticationEvents)
+
+		// ── Subject identity and merge (IC-3) ──────────────────────────────────
+		r.Get("/subjects/{principalID}", h.GetSubjectIdentity)
+		r.Get("/subjects/{principalID}/links", h.ListIdentityLinks)
+		r.Post("/subjects/{survivorID}/merge", h.MergeDuplicateIdentity)
 
 		// ── Subject lifecycle (IC-1) ─────────────────────────────────────────
 		// CreateSubject / Invite: an administrator creates a subject.

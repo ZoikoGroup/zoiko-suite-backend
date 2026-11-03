@@ -24,11 +24,11 @@ Status: baseline green, IC-0 complete (2026-11-02).
 | IC-2f | GET /v1/identity/summary | KPI counts | summary returns counts | KPI cards | BUILT-THIS-PASS |
 | IC-2g | authentication_events table + RLS | migration 000017 | TestRLS_ListsNeverCrossTenant | (store) | DONE |
 | IC-2h | principal_assurance_history table + RLS | migration 000017 | TestRLS_ListsNeverCrossTenant | (store) | DONE |
-| IC-3a | GET /v1/subjects/{id} → GetSubjectIdentity | route + handler | TestORG01_MergedIDResolvesToSurvivor | Federation tab | BUILT-THIS-PASS |
-| IC-3b | GET /v1/subjects/{id}/links → ListIdentityLinks | route + handler | (list links) | Federation tab | BUILT-THIS-PASS |
-| IC-3c | POST /v1/subjects/{survivor_id}/merge → MergeDuplicateIdentity | route + handler | TestORG01_MergeNeverReusesID / EndsDuplicateSessions / MergeIntoSelfRefused / RequiresStepUp | People tab drawer | BUILT-THIS-PASS |
+| IC-3a | GET /v1/subjects/{id} → GetSubjectIdentity | route + handler | TestORG01_MergedIDResolvesToSurvivor | Federation tab | DONE |
+| IC-3b | GET /v1/subjects/{id}/links → ListIdentityLinks | route + handler | (list links) | Federation tab | DONE |
+| IC-3c | POST /v1/subjects/{survivor_id}/merge → MergeDuplicateIdentity | route + handler | TestORG01_MergeNeverReusesID / EndsDuplicateSessions / MergeIntoSelfRefused / RequiresStepUp | People tab drawer | DONE |
 | IC-3d | LinkIdentityProvider → POST /v1/federation/links | openapi x-spec-operation | (operation mapped) | Federation tab | BUILT-THIS-PASS |
-| IC-3e | DisableIdentity → PUT /v1/principals/{id}/status | openapi x-spec-operation | (operation mapped) | People tab drawer | BUILT-THIS-PASS |
+| IC-3e | DisableIdentity → PUT /v1/principals/{id}/status | openapi x-spec-operation | (operation mapped) | People tab drawer | DONE |
 | IC-4 | Session cap eviction emits identity.session.revoked + session.invalidated | outbox + SIEM | TestSessionCap_EvictionEmitsRevokedEvent / StreamsSIEM / WorkloadUsesOwnCap / EvictedEnvelopeRefusedByIntrospection | Sessions tab panel | BUILT-THIS-PASS |
 | IC-5a | Consume iam.assignment.* → role projection | Kafka consumer | TestIAM09_AuthzGrantReachesRoleProfile / SuspendedAssignmentLeavesProfile | People tab drawer | BUILT-THIS-PASS |
 | IC-5b | Emit canonical event names alongside wire names | producer | TestIAM10_ProducerEmitsBothNames | (event stream) | BUILT-THIS-PASS |
@@ -201,5 +201,58 @@ codebase convention (VARCHAR, missing_ok current_setting) is the safe choice.
 
 **Commits:**
 - `feat(identity-context-svc): IC-2 console read models and migration 000017` (this commit)
+
+## IC-3 — Subject identity and merge (ORG-1) (2026-11-03)
+
+**What was wrong:** identity-context-svc had no subject-identity surface: no
+GET /v1/subjects/{id}, no GET /v1/subjects/{id}/links, no merge, and no
+identity-links table. ORG-1 (subject merge) and the identity audit rows that
+name subject operations had no code path.
+
+**What changed:**
+- `deployments/migrations/000018_identity_links.{up,down}.sql`: creates
+  `identity_links` (external-IdP subject → local principal binding) and
+  `identity_merges` (audit of each merge: survivor, retired, approver,
+  step-up evidence), each ENABLE + FORCE ROW LEVEL SECURITY with the tenant
+  isolation policy and guarded GRANTs. `identity_merges` CHECKs
+  `survivor_id <> retired_id`; down refuses if merges have been recorded.
+- `internal/domain/types.go`: `IdentityLink` and `MergeDuplicateIdentityRequest`.
+- `internal/store/pg_store.go`: `GetIdentityLinks` and `MergeDuplicateIdentity`
+  (repoint links, disable retired principal, end its live sessions, record the
+  merge, all in one transaction).
+- `internal/context/interfaces.go`: `GetIdentityLinks` and
+  `MergeDuplicateIdentity` added to `PrincipalStore`; mock updated in
+  resolver_test.go.
+- `internal/context/handler.go`: `IdentitySubjectMerge` action constant;
+  registered `GET /v1/subjects/{principalID}`, `GET /v1/subjects/{principalID}/links`,
+  `POST /v1/subjects/{survivorID}/merge`.
+- `internal/context/handler_subjects.go`: the three handlers — authorize at
+  their action, throttle, RFC 9457 problems, step-up requirement for merge
+  (`requireRecentMFA`), actor-neither-survivor-nor-retired, If-Match
+  (428 missing / 412 stale) on the retired subject's record version, empty
+  slices never null.
+- `openapi.yaml`: published the three routes; added `IdentityLink` schema;
+  both contract directions green; all schema $refs resolve.
+- `progress.md`: IC-3 evidence block; IC-3a, IC-3b, IC-3c, IC-3e marked DONE.
+
+**Decision taken:** merge step-up is verified via the MFA service's
+`requireRecentMFA` (MFA verified + auth within RecentAuth), returning
+403 `step_up_required` when not fresh — matching the step-up used for
+factor revoke/reset (IC-1 authplane). The If-Match on merge is validated
+against the retired principal's `record_version` (000016) before the
+transaction.
+
+**Evidence:**
+- `go test ./internal/context/ ./internal/store/` — pass (contract +
+  AU09 + store suites; store suite 0 skip).
+- `go vet ./...` — clean.
+- `openapi.yaml` — both contract directions green; every $ref resolves.
+- Migration 000018 up/down mirrors 000017 shape (ENABLE+FORCE RLS, guarded
+  grant). Cannot apply against scratch Postgres in this session (no Docker
+  Postgres available); needs migrate.py --db identity_context up.
+
+**Commits:**
+- `feat(identity-context-svc): IC-3 subject identity, links and merge` (this commit)
+
 
 

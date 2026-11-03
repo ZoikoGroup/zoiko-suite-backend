@@ -773,3 +773,33 @@ type AuthenticationEvent struct {
 	CorrelationID  string    `json:"correlation_id,omitempty"`
 }
 
+// ---------------------------------------------------------------------------
+// IdentityLink  (data-model §06.2 — IC-3 subject merge / federation links)
+//
+// Binds an external IdP subject (OIDC sub, SAML NameID) to a local principal
+// within a tenant. Backs GET /v1/subjects/{id}/links and the merge path.
+// ---------------------------------------------------------------------------
+
+type IdentityLink struct {
+	LinkID          string    `json:"link_id"`
+	TenantID        string    `json:"tenant_id"`
+	PrincipalID     string    `json:"principal_id"`
+	IdentityProvider string   `json:"identity_provider"`
+	ProviderSubject string    `json:"provider_subject"`
+	ProviderType    string    `json:"provider_type"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// ---------------------------------------------------------------------------
+// MergeDuplicateIdentityRequest  (IC-3 subject merge)
+//
+// POST /v1/subjects/{survivor_id}/merge retires the named principal into the
+// survivor. step_up_evidence is the step-up token the caller obtained from
+// POST /v1/authenticate/step-up.
+// ---------------------------------------------------------------------------
+
+type MergeDuplicateIdentityRequest struct {
+	RetiredID       string `json:"retired_id"`
+	StepUpEvidence  string `json:"step_up_evidence"`
+}
+
