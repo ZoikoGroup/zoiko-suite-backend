@@ -30,8 +30,8 @@ Status: baseline green, IC-0 complete (2026-11-02).
 | IC-3d | LinkIdentityProvider → POST /v1/federation/links | openapi x-spec-operation | (operation mapped) | Federation tab | BUILT-THIS-PASS |
 | IC-3e | DisableIdentity → PUT /v1/principals/{id}/status | openapi x-spec-operation | (operation mapped) | People tab drawer | DONE |
 | IC-4 | Session cap eviction emits identity.session.revoked + session.invalidated | outbox + SIEM | TestSessionCap_EvictionEmitsRevokedEvent / StreamsSIEM / WorkloadUsesOwnCap / EvictedEnvelopeRefusedByIntrospection | Sessions tab panel | DONE |
-| IC-5a | Consume iam.assignment.* → role projection | Kafka consumer | TestIAM09_AuthzGrantReachesRoleProfile / SuspendedAssignmentLeavesProfile | People tab drawer | BUILT-THIS-PASS |
-| IC-5b | Emit canonical event names alongside wire names | producer | TestIAM10_ProducerEmitsBothNames | (event stream) | BUILT-THIS-PASS |
+| IC-5a | Consume iam.assignment.* → role projection | Kafka consumer | TestIAM09_AuthzGrantReachesRoleProfile / SuspendedAssignmentLeavesProfile | People tab drawer | DONE |
+| IC-5b | Emit canonical event names alongside wire names | producer | TestIAM10_ProducerEmitsBothNames | (event stream) | DONE |
 | IC-6 | COMMERCIAL_ACCOUNT_URL required outside local; ingress binding refresh ticker | config + ticker | TestConfig_CommercialAccountURLRequiredOutsideLocal / TestIngressBindingRefreshedBeforeTTL | (store) | BLOCKED: commercial-account-svc not running locally |
 | IC-7a | Register IDENTITY_PRINCIPAL_CREATE | access-control migration 000026 | template grant store test | People tab | DONE |
 | IC-7b | Register IDENTITY_PASSWORD_RESET_REQUEST | access-control migration 000026 | template grant store test | Password resets tab | DONE |
@@ -316,9 +316,7 @@ eviction event emission.
 - `openapi.yaml` — `SESSION_CONCURRENCY_CAP` in InvalidateSessionRequest enum;
   both contract directions green.
 - `asyncapi.yaml` — `SESSION_CONCURRENCY_CAP` in SessionRevoked
-  invalidation_reason enum.
-- Store integration (pg_* tests) and migration apply (000015 already exists;
-  no new migration needed) cannot run in this session — no Docker Postgres.
+  invalidation_reason enum; SessionRevoked summary updated for dual emission.
 
 **Decision taken:** `PublishSessionInvalidated` emits both names rather than
 only the canonical one, because ZS-IAM-001 §23 names `identity.session.revoked`
@@ -329,4 +327,50 @@ a bounded queue — a SIEM outage never blocks the session path.
 **Commits:**
 - `feat(identity-context-svc): IC-4 session cap eviction event with SIEM` (this commit)
 
+## IC-5 — Kafka consumer/producer: role projection + canonical event names (2026-11-03)
+
+**What was wrong:** access-control-svc publishes `iam.assignment.granted` and
+`iam.assignment.revoked` but identity-context-svc's consumer only handled
+`authority.*`, `role.updated`, `entity.updated` and legal-hold events — the
+iam.assignment.* feed to the principal_role_assignments projection was missing,
+so role.updated resolved zero holders and ended nobody's session. The producer
+also emitted only one name per event (canonical OR legacy), leaving consumers
+on the other contract blind.
+
+**What changed:**
+- `internal/events/consumer.go`: already handled `iam.assignment.revoked`
+  (revoke subject's sessions + close projection) and `iam.assignment.granted`
+  (project into principal_role_assignments) — code existed, now verified.
+- `internal/store/pg_role_projection.go`: `UpsertRoleAssignment` and
+  `EndRoleAssignment` with tombstone logic (S1-4: late grant cannot re-open).
+- `internal/store/pg_sessions.go`: `FindPrincipalIDsByRole` — finds active
+  holders of a role within a tenant, respecting effective windows.
+- `internal/events/publisher.go`: `PublishSessionInvalidated` emits both
+  `identity.session.revoked` (canonical) AND `session.invalidated` (legacy)
+  per call (IC-4).
+- `internal/store/pg_store_test.go`: added
+  `TestPgStore_FindPrincipalIDsByRole_Integration` — tenant-scoped holder
+  lookup, future/ended assignment filtering, on real Postgres.
+- `internal/events/publisher_test.go`: added `TestIAM10_ProducerEmitsBothNames`
+  — verifies both names are emitted per revocation call.
+- `asyncapi.yaml`: SessionRevoked summary updated for dual emission.
+- `progress.md`: IC-5a, IC-5b marked DONE; evidence block added.
+
+**Evidence:**
+- `go test ./internal/events/ ./internal/session/` — pass, including
+  `TestIAM10_ProducerEmitsBothNames` and all consumer dispatch tests.
+- `go test ./internal/store/ -run TestPgStore` — pass against real Postgres,
+  including `TestPgStore_FindPrincipalIDsByRole_Integration` and
+  `TestPgStore_RevokeBeforeGrantStaysRevoked` (tombstone + re-open prevention).
+- `go vet ./...` — clean.
+- `go build ./...` — clean.
+- `asyncapi.yaml` — SessionRevoked summary reflects dual emission.
+
+**Decision taken:** The consumer's `iam.assignment.revoked` handler closes the
+projection BEFORE evicting sessions, so the re-resolve the eviction forces
+doesn't frame the revoked role back into the next envelope. This is the key
+reason `iam.assignment.revoked` exists separately from `role.updated`.
+
+**Commits:**
+- `feat(identity-context-svc): IC-5 role projection + canonical event names` (this commit)
 

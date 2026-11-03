@@ -105,3 +105,27 @@ func TestPublishSessionInvalidated_RepeatEventsOnSameSession_GetDistinctEventIDs
 	assert.Contains(t, eventTypes, "identity.session.revoked")
 	assert.Contains(t, eventTypes, "session.invalidated")
 }
+
+// TestIAM10_ProducerEmitsBothNames (IC-5b): the producer emits the ZS-IAM-001
+// canonical name AND the legacy wire name for every revocation, so consumers
+// on either contract see every revocation.
+func TestIAM10_ProducerEmitsBothNames(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.identity-context.events", w)
+
+	err := p.PublishSessionInvalidated(context.Background(), "session-1", "principal-1", domain.InvalidationReasonAdminRevoke, "corr-1")
+	require.NoError(t, err)
+
+	require.Len(t, w.msgs, 2, "one PublishSessionInvalidated call emits two events")
+	types := make(map[string]bool)
+	for _, msg := range w.msgs {
+		env := decode(t, msg)
+		types[env.EventType] = true
+		assert.Equal(t, "identity-context-svc", env.SourceService)
+		assert.Contains(t, string(msg.Value), "session-1")
+		assert.Contains(t, string(msg.Value), "principal-1")
+		assert.Contains(t, string(msg.Value), "ADMIN_REVOKE")
+	}
+	assert.Contains(t, types, "identity.session.revoked", "ZS-IAM-001 §23 canonical name")
+	assert.Contains(t, types, "session.invalidated", "legacy wire name")
+}

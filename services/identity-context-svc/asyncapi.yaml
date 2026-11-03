@@ -256,7 +256,8 @@ components:
       title: One session was revoked
       summary: |
         ZS-IAM-001 §23's name. Emitted as `session.invalidated` until 16 Oct
-        2026; no service consumed the old name, so it was retired outright.
+        2026; IC-4 now emits BOTH names per revocation so consumers on either
+        contract see every revocation including session-concurrency-cap evictions.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
