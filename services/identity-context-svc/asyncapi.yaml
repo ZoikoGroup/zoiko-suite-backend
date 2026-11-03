@@ -73,6 +73,7 @@ channels:
           - $ref: "#/components/messages/PrincipalStatusChanged"
           - $ref: "#/components/messages/SubjectDisabled"
           - $ref: "#/components/messages/SubjectEnabled"
+          - $ref: "#/components/messages/SubjectMerged"
           - $ref: "#/components/messages/LoginSessionStarted"
           - $ref: "#/components/messages/LoginSessionEnded"
           - $ref: "#/components/messages/RefreshTokenReuseDetected"
@@ -332,6 +333,39 @@ components:
         allOf:
           - $ref: "#/components/schemas/Envelope"
           - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    SubjectMerged:
+      name: identity.subject.merged
+      title: A duplicate identity was merged into a surviving one
+      summary: |
+        Written in the same transaction as the merge (POST /v1/identities/{id}/merge). The duplicate is disabled and
+        its id never reused. authorization-svc re-points the role assignments and delegations it holds for
+        duplicate_id to survivor_id; this service re-points its own provider links and reports what it did in
+        link_outcomes. Every session the duplicate held is ended after the commit.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  merge_id: { type: string }
+                  tenant_id: { type: string }
+                  survivor_id: { type: string }
+                  duplicate_id: { type: string }
+                  actor: { type: string }
+                  reason: { type: string }
+                  merged_at: { type: string, format: date-time }
+                  correlation_id: { type: string }
+                  link_outcomes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        link_id: { type: string }
+                        issuer: { type: string }
+                        action: { type: string, enum: [MOVED, RETIRED] }
 
     LoginSessionStarted:
       name: identity.login_session.started

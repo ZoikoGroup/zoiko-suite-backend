@@ -646,7 +646,8 @@ func main() {
 		}).
 		WithDPoP(provider.DPoPVerifier()).
 		WithStatusChanger(statusChanger{svc: lifecycleSvc}).
-		WithIdentityReader(principalRepo)
+		WithIdentityReader(principalRepo).
+		WithIdentityMerger(identityMerger{svc: lifecycleSvc})
 	provider.RegisterRoutes(r)
 	identityctx.RegisterRoutes(r, h)
 	rootHandler, stopFederation := mountFederation(r, config.LoadFederation(), config.LoadProvisioning(), cfg, principalRepo, idpIssuer, authzClient, siemClient, sessionEvictor{cache: sessionCache}, log)

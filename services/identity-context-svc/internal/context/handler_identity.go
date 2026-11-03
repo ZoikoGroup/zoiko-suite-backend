@@ -2,8 +2,11 @@ package context
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -11,6 +14,7 @@ import (
 
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/federation"
+	"zoiko.io/identity-context-svc/internal/lifecycle"
 	"zoiko.io/identity-context-svc/internal/store"
 )
 
@@ -209,4 +213,77 @@ func (h *Handler) ListAuthenticationEvents(w http.ResponseWriter, r *http.Reques
 		items = []store.AuthenticationEvent{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": next})
+}
+
+// ── MergeDuplicateIdentity ───────────────────────────────────────────────────
+
+// ActionIdentityMerge guards the merge. It decides which of two records is the person, so it is CRITICAL and
+// never self-exempt.
+const ActionIdentityMerge = "IDENTITY_MERGE"
+
+// IdentityMerger is the merge command (internal/lifecycle.Service.MergeDuplicate).
+type IdentityMerger interface {
+	MergeDuplicate(ctx context.Context, tenantID, actorID, survivorID, duplicateID, reason, correlationID string) (*store.IdentityMerge, bool, error)
+}
+
+// WithIdentityMerger wires the merge command. Nil answers 501.
+func (h *Handler) WithIdentityMerger(m IdentityMerger) *Handler {
+	h.merger = m
+	return h
+}
+
+type mergeRequest struct {
+	DuplicateID string `json:"duplicate_id"`
+	Reason      string `json:"reason"`
+}
+
+// MergeDuplicateIdentity answers POST /v1/identities/{survivorID}/merge: 201 when the merge is made, 200 when the
+// same merge had already been made (idempotent by tenant and duplicate), 409 when the duplicate was merged into
+// someone else or the merge would chain.
+func (h *Handler) MergeDuplicateIdentity(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	caller, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, caller, tenantID, ActionIdentityMerge) {
+		return
+	}
+	if h.merger == nil {
+		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable, "identity merge is not configured in this deployment")
+		return
+	}
+	var req mergeRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeCoded(w, r, http.StatusBadRequest, "invalid_request", "invalid request body")
+		return
+	}
+	m, created, err := h.merger.MergeDuplicate(r.Context(), tenantID, caller, chi.URLParam(r, "principalID"),
+		req.DuplicateID, req.Reason, strings.TrimSpace(r.Header.Get("X-Correlation-ID")))
+	if err != nil {
+		switch {
+		case errors.Is(err, lifecycle.ErrInvalid):
+			writeCoded(w, r, http.StatusBadRequest, "invalid_request", err.Error())
+		case errors.Is(err, lifecycle.ErrForbidden):
+			writeCoded(w, r, http.StatusForbidden, "self_merge", err.Error())
+		case errors.Is(err, lifecycle.ErrNotFound):
+			writeCoded(w, r, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, lifecycle.ErrConflict):
+			writeCoded(w, r, http.StatusConflict, "merge_conflict", err.Error())
+		default:
+			h.log.Error("identity merge failed", zap.Error(err))
+			writeCoded(w, r, http.StatusInternalServerError, "internal_error", "failed to merge the identity")
+		}
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, m)
 }

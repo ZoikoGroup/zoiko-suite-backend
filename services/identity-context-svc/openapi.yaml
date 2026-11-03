@@ -382,6 +382,7 @@ components:
         active_link_count: { type: integer }
         live_sessions: { type: integer }
         current_assurance: { $ref: '#/components/schemas/AssuranceObservation' }
+        merged_into: { type: string, description: "Set when this id is a merged-away duplicate: the survivor it resolves to." }
 
     IdentityLink:
       type: object
@@ -421,6 +422,35 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/AuthenticationEvent' } }
         next_cursor: { type: string, description: "Empty on the last page." }
+
+    MergeIdentityRequest:
+      type: object
+      required: [duplicate_id, reason]
+      additionalProperties: false
+      properties:
+        duplicate_id: { type: string }
+        reason: { type: string }
+
+    IdentityMerge:
+      type: object
+      required: [merge_id, survivor_id, duplicate_id, reason, merged_by, merged_at, link_outcomes]
+      properties:
+        merge_id: { type: string }
+        tenant_id: { type: string }
+        survivor_id: { type: string }
+        duplicate_id: { type: string, description: "The alias: it resolves to survivor_id and is never reused." }
+        reason: { type: string }
+        merged_by: { type: string }
+        correlation_id: { type: string }
+        merged_at: { type: string, format: date-time }
+        link_outcomes:
+          type: array
+          items:
+            type: object
+            properties:
+              link_id: { type: string }
+              issuer: { type: string }
+              action: { type: string, enum: [MOVED, RETIRED] }
 
     ResolveResponseV2:
       type: object
@@ -2806,6 +2836,43 @@ paths:
         "400": { description: "Invalid filter, limit or cursor", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "403": { description: Not permitted, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "404": { description: Not found in this tenant, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/identities/{principalId}/merge:
+    parameters:
+      - name: principalId
+        in: path
+        required: true
+        schema: { type: string }
+        description: The survivor. It keeps its id.
+    post:
+      summary: MergeDuplicateIdentity - merge a duplicate identity into this one
+      operationId: mergeDuplicateIdentity
+      description: |
+        IDENTITY_MERGE (CRITICAL), never self-exempt, and refused when the caller is the survivor or the duplicate.
+        In one transaction the duplicate is disabled and keeps its row, so its id is never issued again and
+        resolves to the survivor; its provider links move to the survivor, or are retired where the survivor
+        already holds a link at that issuer; the decision is recorded on both identities; and
+        identity.subject.merged is written for authorization-svc to re-point role assignments and delegations.
+        Every session the duplicate held then ends. Nothing is deleted.
+
+        Idempotent by tenant and duplicate: repeating the same merge answers 200 with the recorded merge and ends
+        nothing. A merge does not chain: the survivor must not have been merged away and the duplicate must not
+        have absorbed another identity.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/MergeIdentityRequest' } } }
+      responses:
+        "201":
+          description: Merged
+          content: { application/json: { schema: { $ref: '#/components/schemas/IdentityMerge' } } }
+        "200":
+          description: This merge had already been made
+          content: { application/json: { schema: { $ref: '#/components/schemas/IdentityMerge' } } }
+        "400": { description: "Missing duplicate or reason, or merging an identity into itself", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": { description: "Not permitted, or the caller is one of the two identities", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { description: Either identity is not in this tenant, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": { description: "The duplicate was merged into another identity, the survivor is disabled or merged away, or the merge would chain", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "501": { description: Merge is not configured, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /health:
     get:

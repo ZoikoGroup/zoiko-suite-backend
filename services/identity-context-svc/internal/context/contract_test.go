@@ -299,6 +299,7 @@ func TestOrg01OperationIdsArePublished(t *testing.T) {
 		"authenticate",         // Authenticate
 		"stepUp",               // StepUp
 		"disableIdentity",      // DisableIdentity: PUT /v1/principals/{id}/status
+		"mergeDuplicateIdentity", // MergeDuplicateIdentity
 		"revokeSession",        // RevokeSession
 		// Queries
 		"getSubjectIdentity",       // GetSubjectIdentity

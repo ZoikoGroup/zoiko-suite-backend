@@ -35,6 +35,8 @@ type SubjectIdentity struct {
 	ActiveLinkCount  int                   `json:"active_link_count"`
 	LiveSessions     int                   `json:"live_sessions"`
 	CurrentAssurance *AssuranceObservation `json:"current_assurance,omitempty"`
+	// MergedInto is the survivor this id was merged into; empty unless it is a merged-away duplicate.
+	MergedInto string `json:"merged_into,omitempty"`
 }
 
 // GetSubjectIdentity reads one subject with its link and session counts and its latest assurance; nil when the
@@ -65,6 +67,10 @@ func (s *PgStore) GetSubjectIdentity(ctx context.Context, tenantID, principalID 
 			return err
 		}
 		out.CurrentAssurance = cur
+		if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT survivor_id FROM principal_merges WHERE tenant_id = $1 AND duplicate_id = $2), '')`,
+			tenantID, principalID).Scan(&out.MergedInto); err != nil {
+			return err
+		}
 		return nil
 	})
 	return out, err

@@ -50,6 +50,9 @@ var registeredActionMigrations = []struct {
 		"IDENTITY_SUBJECT_READ":    "STANDARD",
 		"IDENTITY_AUTH_EVENT_READ": "HIGH",
 	}},
+	{"000043_register_identity_merge_action", "identity-context-svc", map[string]string{
+		"IDENTITY_MERGE": "CRITICAL",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

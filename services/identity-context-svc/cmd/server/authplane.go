@@ -192,3 +192,13 @@ func (s statusChanger) ChangeStatus(ctx context.Context, tenantID, actorID, prin
 }
 
 var _ identityctx.StatusChanger = statusChanger{}
+
+// identityMerger adapts lifecycle.Service to the handler's IdentityMerger.
+type identityMerger struct{ svc *lifecycle.Service }
+
+func (m identityMerger) MergeDuplicate(ctx context.Context, tenantID, actorID, survivorID, duplicateID, reason, correlationID string) (*store.IdentityMerge, bool, error) {
+	return m.svc.MergeDuplicate(ctx, lifecycle.Actor{PrincipalID: actorID, TenantID: tenantID, CorrelationID: correlationID},
+		survivorID, duplicateID, reason)
+}
+
+var _ identityctx.IdentityMerger = identityMerger{}
