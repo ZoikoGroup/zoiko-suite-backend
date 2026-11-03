@@ -49,9 +49,12 @@ Status: baseline green, IC-0 complete (2026-11-02).
 | IC-9a | Mock OIDC IdP discovery/JWKS/signed id_token | test mock | scenario A20 test | Federation tab (off) | BUILT-THIS-PASS |
 | IC-9b | Mock SAML IdP (if code path exists) | test mock | scenario A21 test | Federation tab (off) | BUILT-THIS-PASS |
 | IC-9c | SCIM create/PATCH active=false/DELETE | test client | scenarios A20/A21 §17 | Federation tab (off) | BUILT-THIS-PASS |
-| IC-9d | Passkey begin/finish (WebAuthn) | test | §17 test | Federation tab (off) | BUILT-THIS-PASS |
-| IC-9e | FEDERATION_ENABLED=true RUNBOOK; default false | RUNBOOK | live probe recorded | Federation tab | BLOCKED: live probe needs federation enabled on dev stack |
-| AU-01..AU-11 | identity audit 1/9 rows | per-route | TestAU09_* | per-console screen | IN PROGRESS |
+| IC-9d | Passkey register/step-up/login/revoke (WebAuthn, AU-11) | /v1/mfa/passkeys/*, /v1/authenticate/step-up/passkey/*, /oauth2/login/passkey/* | TestAU11_* (webauthn, context, oidc, store) + E2E | Account › Sign-in security; step-up dialog "Use a passkey" | DONE (3 Nov) |
+| IC-9e | FEDERATION_ENABLED=true RUNBOOK; default false | RUNBOOK §12 | live probe 3 Nov (below) | Federation tab (honest "not enabled") | DONE (3 Nov) |
+| IC-9f | Federation admin routes authorize at the legal entity; FEDERATION_* registered | internal/federation require; access-control 000027 | TestAdminRoutesAuthorizeAtTheLegalEntityNotTheTenant; 000027 guards | Federation tab | DONE (3 Nov) |
+| IC-2i | GET /v1/password-resets (Password resets register); decision reason | list endpoint; decide body `reason` | TestIC2_PasswordResetsRegisterPagesAndNamesTheRequester, TestIC2_PasswordResetsPage, TestRLS_ResetsAndPasskeysNeverCrossTenant | Password resets tab (maker never sees approve) | DONE (3 Nov) |
+| IC-FE-1b | IDP_CLIENT_AUTH=required; every caller presents zoiko-console | compose; E2E, audit.sh, verify.ps1 | E2E "login without the console client is refused" | (login) | DONE (3 Nov) |
+| AU-01..AU-11 | identity audit 1/9 rows | per-route | TestAU09_*, TestAU11_* | per-console screen | RE-SCORED 3 Nov (Auth-Service-audit, last section) |
 | AU-19 | observability metrics | /metrics | metrics test | KPI cards | BUILT-THIS-PASS |
 | AU-22 | role-profile drift | IC-5a consumer | TestIAM09_* | People tab drawer | BUILT-THIS-PASS |
 | AU-25 | canonical event names | IC-5b producer | TestIAM10_* | (event stream) | BUILT-THIS-PASS |
@@ -497,3 +500,63 @@ and reopened. What the matrix above marked DONE but was not:
 - IC-FE-3: Federation and Diagnostics tabs, and a password-resets register (the service has no list
   route for resets yet).
 - IC-10 docs: RELEASE_CERTIFICATE re-certification and the AU-01..AU-11 re-score.
+
+## Completion pass — 3 Nov 2026 (afternoon): AU-11 passkeys, federation, resets register, client auth
+
+The "Still open" list above, re-checked against the code and the running stack, plus what that
+turned up.
+
+**What was wrong**
+
+| Area | Found | Fixed in |
+|---|---|---|
+| AU-11 passkeys | IC-9 said passkeys were "already present". Only the table (000014), store methods and the hosted-login hooks were: no WebAuthn implementation existed (`internal/webauthn` was referenced, never written), `oidc.Options.Passkeys` was never set, and there was no registration route, so no one could ever hold or use a passkey | `internal/webauthn` (go-webauthn v0.17.4), routes in `handler_passkeys.go`, wired in `main.go` |
+| MFA gate | A TOTP enrolment beside a passkey needed only a fresh login (it checked for TOTP only): a stolen password could add the thief's app | `Enrol` checks any factor |
+| IC-8 metric | `identity_mfa_verifications_total{outcome="failure"}` never moved: every refusal returned before the counter | counted on each refusal path |
+| Hosted login | The passkey finish step did not check a passkey had been offered, and did not bound failed tries | same rule as begin; `maxSecondFails` |
+| Resets | No list route (the console's register could not exist); the KPI counted expired pending resets; decisions carried no reason | `GET /v1/password-resets`, KPI `expires_at > NOW()`, optional `reason` on decide |
+| Federation | With `FEDERATION_ENABLED=true` every admin route answered 503: `require` passed the tenant id as the legal entity (the defect `internal/context` fixed earlier), and the six FEDERATION_* actions were not registered (R5) | `legalEntityOf` in `internal/federation`; access-control `000027_register_federation_actions` (+ demo grants in `seed-demo-rbac.ps1`) |
+| IC-FE-1 | `IDP_CLIENT_AUTH=optional`; the E2E scripts, `audit.sh` and `verify.ps1` sent no client | compose `required`; every caller presents `zoiko-console` |
+| audit.sh | Fixed Idempotency-Keys (`au6`, `np3`…) replayed by the next run with a new body: 409; NP4 revoke sent no If-Match (428 since API-3); Prometheus on `localhost` | per-run keys, ETag read + If-Match, `$PROM` on 127.0.0.1 |
+| Console | No Password resets, Federation or Diagnostics tab; `/admin/account/security`, linked from the step-up dialog, did not exist, so nobody could enrol a factor from the UI; account actions matched problem codes against the message text only | tabs built; Sign-in security page (factors, sign-ins, add passkey, set up app); "Use a passkey instead" in the step-up dialog; matching reads the problem `code` |
+| RUNBOOK | No federation section (IC-9 asks for one) | §11.6 passkeys, §12 federation and SCIM |
+
+**Evidence**
+- Full suite in a golang:1.26-alpine container against the gdl-test-pg scratch DB
+  (`REQUIRE_DB_TESTS=1`): 813 pass / 0 fail / 0 skip; `go vet` clean. New tests: 12 in `internal/webauthn`
+  (real P-256 assertions and CBOR attestation through the library), 8 `TestAU11_*` in
+  `internal/context`, 3 in `internal/oidc` (hosted login), 4 store tests on Postgres including
+  `TestRLS_ResetsAndPasskeysNeverCrossTenant` as a NOBYPASSRLS role, reset-register list tests and
+  `TestAdminRoutesAuthorizeAtTheLegalEntityNotTheTenant`.
+- Live (image 3 Nov 16:34): `e2e-identity-context-deps.py` **61/61 PASS** (was 47): login without
+  the client 401 `invalid_client`; the reset register lists the request with its requester; passkey
+  beside TOTP needs a step-up; registration verified; an assertion from another origin 401
+  `passkey_rejected`; passkey step-up gives an envelope with `assurance_level: PHISHING_RESISTANT`
+  and `mfa_verified`; a spent ceremony 400 `ceremony_invalid`; the step-up is a sign-in event at
+  `PASSKEY`; `identity.mfa_factor.enrolled` and `identity.step_up.succeeded` in the outbox; undo
+  revokes the passkey.
+- `scripts/audit.sh` live with Prometheus up: 37/38; the one failure is section 2 (host `go test`,
+  blocked by Windows Application Control — verified; the container run above is the suite).
+- Federation live probe (`FEDERATION_ENABLED=true`, then back off): before the fix every admin read
+  503 (`tenant_scope_mismatch` from authorization-svc); after it `GET /v1/federation/connections`
+  and `/links` 200 `[]` for the demo admin, 403 for a principal without a grant, a forged id_token
+  401 `invalid credentials`, `/scim/v2/*` 404 with provisioning off.
+- access-control 000027: up/down/up on a scratch DB, then applied to `access_control` (31/31);
+  the migration refuses a template that both configures and approves federation.
+- authorization E2E's changed login step (with the client) passes; its full 33-check run needs
+  jurisdiction, delegated-authority and SIEM, not started this pass.
+- Console: `tsc --noEmit` clean in source, eslint clean on touched files; rendered against the live
+  service: Password resets (the requester's own request shows no approve/reject), Federation (the
+  "not enabled" state), Diagnostics (health, JWKS, OIDC metadata, explain a session), Sign-in
+  security (factors and sign-ins tabs).
+
+**Still open**
+- IC-6 live entitlement: commercial-account-svc does not run locally (BLOCKED, unchanged).
+- A passkey ceremony in a real browser with a platform authenticator (the live proof used a software
+  authenticator; headless Chrome has none).
+- Passkeys are a second factor only; a passkey-first (usernameless) login is not built.
+- Live SCIM (provisioning off locally); SAML (D-4, SPEC_DEVIATIONS).
+- `deployments/scripts/e2e-authorization-deps.py` (untracked since 2 Nov) is committed in
+  `d8e1a895`; its login now sends the client.
+
+**Commits** (`shashi-changes`): backend `a374c56b` (access-control 000025), `8049bd5c` (000027), `13299a0c` (federation), `8e7cbc19` (passkeys, resets, MFA), `d8e1a895` (client auth, E2E, audit), `feec479b` (override); frontend `9dbf896` (identity tabs), `5ee180d` (Sign-in security).

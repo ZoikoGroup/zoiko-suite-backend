@@ -34,7 +34,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | IAM-9 | AU-22 role-profile drift | TODO | | |
 | IAM-10 | AU-25 canonical event names | TODO | | after G-08 |
 | IAM-11 | AU-26 /v1/iam aliases | TODO | | |
-| IAM-12 | Federation / SCIM / passkey acceptance | TODO | | |
+| IAM-12 | Federation / SCIM / passkey acceptance | DONE (identity-context-svc) | 8e7cbc19, 13299a0c, 8049bd5c (3 Nov) | Passkeys built and wired (internal/webauthn), TestAU11_* + live E2E 61/61; federation live probe with FEDERATION_ENABLED=true; FEDERATION_* registered (access-control 000027). Live SCIM not exercised (provisioning off locally). See services/identity-context-svc/progress.md |
 | IAM-13 | ORG-06 remaining operations | TODO | | |
 | WF-1 | WFC-01..03 open rows | TODO | | |
 | WF-2 | WFC-04 cases | TODO | | |
@@ -43,7 +43,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | ST-1 | State-machine definition registry | TODO | | |
 | ST-2 | Available actions + transition history | TODO | | |
 | ST-3 | No generic status writes | TODO | | |
-| ORG-1 | ORG-01 identity | TODO | | |
+| ORG-1 | ORG-01 identity | DONE (identity-context-svc) | 1fda0bb1, 0174312a | GetSubjectIdentity, ListIdentityLinks, MergeDuplicateIdentity, ListAuthenticationEvents, GetAssuranceHistory; authorization-svc re-points merged assignments; live E2E |
 | ORG-2 | ORG-03 name parity | TODO | | |
 | ORG-3 | ORG-04 ownership and control | TODO | | |
 | ORG-4 | ORG-05 org units + org graphs | TODO | | |
