@@ -82,7 +82,10 @@ type DurableCache struct {
 	store                   ContextStore
 	log                     *zap.Logger
 	maxSessionsPerPrincipal int
-	onRevoke                RevocationHook
+	// maxSessionsPerWorkload is the cap for service-account and API-client
+	// sessions (SESSION_CAP_WORKLOAD). Zero leaves workloads uncapped.
+	maxSessionsPerWorkload int
+	onRevoke               RevocationHook
 }
 
 // RevocationHook is told about every session the concurrency cap ends, so the
@@ -93,6 +96,15 @@ type RevocationHook func(ctx context.Context, sessionContextID, principalID, ten
 // NewDurableCache wraps a Redis cache with a durable evidence store.
 func NewDurableCache(cache HotCache, store ContextStore, log *zap.Logger, maxSessionsPerPrincipal int) *DurableCache {
 	return &DurableCache{cache: cache, store: store, log: log, maxSessionsPerPrincipal: maxSessionsPerPrincipal}
+}
+
+// WithWorkloadCap sets the separate cap for workload sessions (service
+// accounts and API clients), which legitimately hold more concurrent sessions
+// than a person but are not unbounded: a leaked client credential minting
+// sessions in a loop is stopped at the cap like anyone else.
+func (d *DurableCache) WithWorkloadCap(n int) *DurableCache {
+	d.maxSessionsPerWorkload = n
+	return d
 }
 
 // WithRevocationHook sets the hook the concurrency cap calls.
@@ -206,13 +218,18 @@ func (d *DurableCache) PersistSessionContextWithEvent(
 
 	// ZS-IAM-001 §15 session-concurrency cap: invalidate the principal's
 	// oldest live sessions when the new one would exceed the configured limit.
-	// Machine principals are exempt (see SessionContext.ConcurrencyExempt).
-	if d.maxSessionsPerPrincipal > 0 && !sc.ConcurrencyExempt {
-		if err := d.enforcePrincipalSessionCap(ctx, sc); err != nil {
+	// Machine principals (SessionContext.ConcurrencyExempt) draw on their own
+	// workload cap, never the human one.
+	limit := d.maxSessionsPerPrincipal
+	if sc.ConcurrencyExempt {
+		limit = d.maxSessionsPerWorkload
+	}
+	if limit > 0 {
+		if err := d.enforcePrincipalSessionCap(ctx, sc, limit); err != nil {
 			d.log.Warn("session-concurrency cap enforcement failed — new session still issued",
 				zap.String("principal_id", sc.PrincipalID),
 				zap.String("tenant_id", sc.TenantID),
-				zap.Int("max_sessions", d.maxSessionsPerPrincipal),
+				zap.Int("max_sessions", limit),
 				zap.Error(err))
 		}
 	}
@@ -228,7 +245,7 @@ func (d *DurableCache) PersistSessionContextWithEvent(
 // creation order, and revoking the session the caller is about to receive
 // would hand it a dead credential. The Redis principal index is left alone:
 // it still lists the surviving sessions, and a revoked id in it is harmless.
-func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, sc domain.SessionContext) error {
+func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, sc domain.SessionContext, limit int) error {
 	principalID, tenantID := sc.PrincipalID, sc.TenantID
 	now := time.Now().UTC()
 	ids, err := d.store.FindLiveSessionIDsForPrincipal(ctx, principalID, tenantID, now)
@@ -236,7 +253,7 @@ func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, sc domain
 		return fmt.Errorf("find live sessions: %w", err)
 	}
 	others := slices.DeleteFunc(slices.Clone(ids), func(id string) bool { return id == sc.SessionContextID })
-	keep := d.maxSessionsPerPrincipal - 1 // the new session takes one place
+	keep := limit - 1 // the new session takes one place
 	if len(others) <= keep {
 		return nil
 	}
@@ -267,7 +284,7 @@ func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, sc domain
 		d.log.Info("session-concurrency cap enforced",
 			zap.String("principal_id", principalID),
 			zap.String("tenant_id", tenantID),
-			zap.Int("max_sessions", d.maxSessionsPerPrincipal),
+			zap.Int("max_sessions", limit),
 			zap.Int("revoked", revoked),
 		)
 	}

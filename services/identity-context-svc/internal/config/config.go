@@ -186,6 +186,11 @@ type Config struct {
 	// live session is invalidated first.
 	MaxSessionsPerPrincipal int
 
+	// SessionCapWorkload caps concurrent sessions of a service account or API
+	// client (SESSION_CAP_WORKLOAD, default 20; 0 = uncapped). Workloads never
+	// draw on MaxSessionsPerPrincipal.
+	SessionCapWorkload int
+
 	// RetentionSweepIntervalMinutes is how often the disposition sweep runs.
 	RetentionSweepIntervalMinutes int
 
@@ -435,6 +440,7 @@ func Load() (*Config, error) {
 
 		SessionEvidenceRetentionDays:  envInt("SESSION_EVIDENCE_RETENTION_DAYS", 0),
 		MaxSessionsPerPrincipal:       envInt("MAX_SESSIONS_PER_PRINCIPAL", 5),
+		SessionCapWorkload:            envInt("SESSION_CAP_WORKLOAD", 20),
 		RetentionSweepIntervalMinutes: envInt("RETENTION_SWEEP_INTERVAL_MINUTES", 360),
 		OutboxRetentionDays:           envInt("OUTBOX_RETENTION_DAYS", 7),
 		OutboxRelayBatchSize:          envInt("OUTBOX_RELAY_BATCH_SIZE", 100),

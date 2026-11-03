@@ -324,13 +324,8 @@ func main() {
 	// A session the concurrency cap ends leaves the service as
 	// identity.session.revoked, like every other revocation, and is streamed
 	// to SIEM as a security signal.
-	sessionCache.WithRevocationHook(func(ctx context.Context, sessionContextID, principalID, tenantID string, reason domain.InvalidationReason, correlationID string) {
-		if err := publisher.PublishSessionInvalidated(ctx, sessionContextID, principalID, reason, correlationID); err != nil {
-			log.Error("session revocation event not recorded", zap.String("session_context_id", sessionContextID), zap.Error(err))
-		}
-		siemClient.Stream(ctx, tenantID, "identity.session.revoked", siem.SeverityHigh,
-			fmt.Sprintf("session %s revoked: %s", sessionContextID, reason))
-	})
+	sessionCache.WithRevocationHook(capRevocationHook(publisher, siemClient, log)).
+		WithWorkloadCap(cfg.SessionCapWorkload)
 
 	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
 	// so without this a SIGTERM would discard security events already accepted.

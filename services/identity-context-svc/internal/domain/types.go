@@ -99,11 +99,11 @@ type SessionContext struct {
 	// resolved under; ending it ends this session (AU-01). Empty for a
 	// session resolved from a token minted before login sessions existed.
 	AuthSessionID string `json:"auth_session_id,omitempty"`
-	// ConcurrencyExempt keeps the session-concurrency cap (ZS-IAM-001 §15,
-	// MAX_SESSIONS_PER_PRINCIPAL) off this session. Set by the resolver for
-	// service accounts and API clients: a workload may legitimately hold many
-	// concurrent sessions, and with session status now checked by relying
-	// parties a capped workload session would fail mid-flight. Not persisted.
+	// ConcurrencyExempt keeps the human session-concurrency cap (ZS-IAM-001
+	// §15, MAX_SESSIONS_PER_PRINCIPAL) off this session. Set by the resolver
+	// for service accounts and API clients, which draw on their own, larger
+	// SESSION_CAP_WORKLOAD instead: a workload may legitimately hold many
+	// concurrent sessions, but not an unbounded number. Not persisted.
 	ConcurrencyExempt bool      `json:"-"`
 	IssuedAt          time.Time `json:"issued_at"`
 	ExpiresAt         time.Time `json:"expires_at"`

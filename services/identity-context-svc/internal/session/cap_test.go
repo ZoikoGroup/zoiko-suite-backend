@@ -88,27 +88,36 @@ func TestCap_UnderTheLimitRevokesNothing(t *testing.T) {
 	assert.Empty(t, *got)
 }
 
-func TestCap_MachinePrincipalsAreExempt(t *testing.T) {
+// With no workload cap configured, a workload session is not capped at all.
+func TestCap_MachinePrincipalsAreExemptFromTheHumanCap(t *testing.T) {
 	store, dc, got := capFixture(1, "01A", "01B", "01C")
 	issue(t, store, dc, "01D", true, "01A", "01B", "01C")
 	assert.Empty(t, store.invalidated)
 	assert.Empty(t, *got)
 }
 
-// TestCap_WorkloadUsesOwnCap pins that workload principals (API clients and
-// service accounts, ConcurrencyExempt=true) do not draw on the human session
-// cap: issuing a workload session never evicts the principal's live sessions,
-// and a workload session itself is never evicted for another principal's cap.
-func TestCap_WorkloadUsesOwnCap(t *testing.T) {
-	// A workload session over the human cap: no human session evicted.
-	store, dc, got := capFixture(2, "01A", "01B")
-	issue(t, store, dc, "01W", true, "01A", "01B")
-	assert.Empty(t, store.invalidated, "a workload session never evicts human sessions")
-	assert.Empty(t, *got, "no revocation hook call for a workload session")
+// TestSessionCap_WorkloadUsesOwnCap: service accounts and API clients are
+// capped by SESSION_CAP_WORKLOAD, not by the human cap and not unbounded.
+func TestSessionCap_WorkloadUsesOwnCap(t *testing.T) {
+	// Human cap 1, workload cap 3: a third workload session revokes nothing,
+	// although the human cap alone would have revoked two.
+	store, dc, got := capFixture(1, "01W1", "01W2")
+	dc.WithWorkloadCap(3)
+	issue(t, store, dc, "01W3", true, "01W1", "01W2")
+	assert.Empty(t, store.invalidated, "under its own cap a workload keeps its sessions")
+	assert.Empty(t, *got)
 
-	// Two workload sessions under their own implicit cap: no revocation either.
-	store2, dc2, got2 := capFixture(10, "01W1", "01W2")
-	issue(t, store2, dc2, "01W3", true, "01W1", "01W2")
-	assert.Empty(t, store2.invalidated)
-	assert.Empty(t, *got2)
+	// The fourth goes over the workload cap: the oldest is revoked and announced.
+	store2, dc2, got2 := capFixture(1, "01W1", "01W2", "01W3")
+	dc2.WithWorkloadCap(3)
+	issue(t, store2, dc2, "01W4", true, "01W1", "01W2", "01W3")
+	assert.Equal(t, []string{"01W1"}, store2.invalidated)
+	require.Len(t, *got2, 1)
+	assert.Equal(t, domain.InvalidationReasonSessionConcurrencyCap, (*got2)[0].reason)
+
+	// A human session is still capped by the human cap.
+	store3, dc3, _ := capFixture(1, "01H1")
+	dc3.WithWorkloadCap(3)
+	issue(t, store3, dc3, "01H2", false, "01H1")
+	assert.Equal(t, []string{"01H1"}, store3.invalidated)
 }

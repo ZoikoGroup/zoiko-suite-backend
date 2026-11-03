@@ -303,7 +303,7 @@ func TestGet_OwnTenantSucceeds(t *testing.T) {
 // EvictedEnvelopeRefusedByIntrospection: once a session is invalidated (cap
 // eviction or any other reason), GET /v1/context/session/{id} must refuse it —
 // the envelope JWT is gone from cache and the record carries invalidated_at.
-func TestGet_EvictedSessionRefusesTheEnvelope(t *testing.T) {
+func TestSessionCap_EvictedEnvelopeRefusedByIntrospection(t *testing.T) {
 	f := newFixture()
 	f.seed("sc-1", "tenant-a", "p-1")
 
