@@ -47,6 +47,8 @@ type mockLifecycleStore struct {
 
 	findCredErr error
 
+	created []domain.NewPrincipal
+
 	mergeRes     *store.MergeResult
 	mergeErr     error
 	mergeVersion int64
@@ -64,7 +66,8 @@ func (m *mockLifecycleStore) MergeSubjects(_ context.Context, _, survivorID, dup
 	return &store.MergeResult{SurvivorID: survivorID, DuplicateID: duplicateID}, nil
 }
 
-func (m *mockLifecycleStore) CreatePrincipal(_ context.Context, _ domain.NewPrincipal, _ ...outbox.Record) error {
+func (m *mockLifecycleStore) CreatePrincipal(_ context.Context, np domain.NewPrincipal, _ ...outbox.Record) error {
+	m.created = append(m.created, np)
 	return m.createErr
 }
 func (m *mockLifecycleStore) GetPrincipalDetail(_ context.Context, _, _ string) (*store.PrincipalDetail, error) {

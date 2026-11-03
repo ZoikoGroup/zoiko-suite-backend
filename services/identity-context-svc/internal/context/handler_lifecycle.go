@@ -193,7 +193,12 @@ func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := h.throttle(w, r, "forgot_password", tenantID); !ok {
+	// ip is the throttle's client address: the right-most X-Forwarded-For
+	// hop only when the peer is a trusted proxy, otherwise the peer itself.
+	// A raw X-Forwarded-For is the caller's to write, and keying the
+	// per-address budget on it let one client mint a fresh budget per request.
+	ip, ok := h.throttle(w, r, "forgot_password", tenantID)
+	if !ok {
 		return
 	}
 
@@ -203,8 +208,7 @@ func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIP := clientIP(r)
-	h.lifecycle.ForgotPassword(r.Context(), tenantID, req.Email, clientIP, r.Header.Get("X-Correlation-ID"))
+	h.lifecycle.ForgotPassword(r.Context(), tenantID, req.Email, ip, r.Header.Get("X-Correlation-ID"))
 	// Always 202: never confirm or deny that an account exists.
 	writeCoded(w, r, http.StatusAccepted, "", "reset requested")
 }
@@ -401,21 +405,4 @@ func (h *Handler) lifecycleError(w http.ResponseWriter, r *http.Request, err err
 		h.log.Error("lifecycle command failed", zap.Error(err))
 		writeError(w, r, http.StatusInternalServerError, "lifecycle command failed")
 	}
-}
-
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return fwd
-	}
-	host, _, _ := splitHostPort(r.RemoteAddr)
-	return host
-}
-
-func splitHostPort(addr string) (string, string, error) {
-	for i := len(addr) - 1; i >= 0; i-- {
-		if addr[i] == ':' {
-			return addr[:i], addr[i+1:], nil
-		}
-	}
-	return addr, "", nil
 }
