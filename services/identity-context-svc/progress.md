@@ -297,8 +297,22 @@ eviction event emission.
 - `go test ./internal/session/ ./internal/events/ ./internal/siem/` — pass,
   including the four IC-4 tests.
 - `go test ./internal/context/` — pass (resolver contract tests unaffected).
+- `go test ./internal/store/ -run TestPgStore` — pass against real Postgres
+  (gdl-test-pg:55432, TEST_DATABASE_URL set), including
+  `TestPgStore_FindByIDPSubject_Integration`, `TestPgStore_FindByID_Integration`,
+  `TestPgStore_TenantIsolation_FindByID`, `TestPgStore_FindActiveRoleAssignments_Integration`,
+  `TestPgStore_TenantIsolation_FindActiveRoleAssignments`,
+  `TestPgStore_FindActiveDelegations_Integration`,
+  `TestPgStore_TenantIsolation_FindActiveDelegations`,
+  `TestPgStore_UpdateStatus_Integration`,
+  `TestPgStore_TenantIsolation_UpdateStatus`,
+  `TestPgStore_SupportRequestIsLiveOnlyAfterTheNamedApproverApproves`,
+  plus all credential/TOTP/OAuth/session store suites.
 - `go vet ./...` — clean.
 - `go build ./...` — clean.
+- Migrations 000017 and 000018 applied to `identity_context` on `zoiko-postgres`
+  via migrate.py (000017 baselined — tables pre-existed from a partial apply;
+  000018 applied normally).
 - `openapi.yaml` — `SESSION_CONCURRENCY_CAP` in InvalidateSessionRequest enum;
   both contract directions green.
 - `asyncapi.yaml` — `SESSION_CONCURRENCY_CAP` in SessionRevoked
