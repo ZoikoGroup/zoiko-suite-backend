@@ -366,6 +366,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/policies/{policy_id}/versions/{version_id}/retire", h.lifecycle(domain.CommandRetire))
 	r.Post("/v1/policies/{policy_id}/versions/{version_id}/review-suspension", h.lifecycle(domain.CommandReviewSuspension))
 
+	r.Post("/v1/accounting-policies", h.DraftAccountingPolicy)
+	r.Get("/v1/accounting-policies", h.ListApplicableAccountingPolicies)
+	r.Get("/v1/accounting-policies/resolve", h.ResolveAccountingPolicy)
+	r.Get("/v1/accounting-policies/explain", h.ExplainAccountingResolution)
+	r.Get("/v1/accounting-policies/versions/{version_id}", h.GetAccountingPolicyVersion)
+
 	r.Get("/v1/policy-versions/compare", h.ComparePolicyVersions)
 	r.Get("/v1/policy-versions/{version_id}", h.GetPolicyVersionByID)
 	r.Get("/v1/policy-versions/{version_id}/transitions", h.ListTransitions)
@@ -438,6 +444,12 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.PolicyID != "" && !requireUUID(w, r, "policy_id", req.PolicyID) {
+		return
+	}
+	// An accounting policy family is made by DraftAccountingPolicy, from its
+	// applicability; one made here would have none.
+	if strings.EqualFold(req.PolicyType, domain.PolicyTypeAccounting) {
+		refuseAccountingEndpoint(w, r)
 		return
 	}
 
@@ -618,6 +630,10 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.storeUnavailable(w, r, "CreatePolicyVersion", err)
+		return
+	}
+	if family.PolicyType == domain.PolicyTypeAccounting {
+		refuseAccountingEndpoint(w, r)
 		return
 	}
 	// A tenant-owned family's versions live in its owner's scope; an omitted
@@ -828,6 +844,12 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 		if existing.PolicyID != policyID {
 			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "",
 				map[string]any{"policy_id": policyID, "policy_version_id": versionID})
+			return
+		}
+
+		// An accounting policy is moved through its lifecycle by the accounting
+		// commands, which ask for the accounting permissions.
+		if h.refuseAccountingFamily(w, r, existing.PolicyID) {
 			return
 		}
 

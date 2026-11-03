@@ -76,6 +76,11 @@ const (
 
 	// Reads and evaluation (GCP §2 invariant #1; V-001 §14.1 step 1
 	// "authenticate/authorize caller").
+	// REF-07 accounting policy. Its commands are separate permissions from the
+	// generic policy ones: drafting, approving, activating (the designated
+	// accounting authority) and the emergency suspension are different acts.
+	ActionAccountingPolicyDraft = "ACCOUNTING_POLICY_DRAFT"
+
 	ActionPolicyRead     = "POLICY_READ"
 	ActionPolicyEvaluate = "POLICY_EVALUATE"
 

@@ -12,36 +12,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// REF-01 (ZS-SVC-I-001 s4.11) actions enforced by jurisdiction-rules-svc. Until a
-// permission is registered no bundle can name it, so its check is permanently
-// denied; these prove migrations 000037 (aliases) and 000038 (imports) made the
-// actions grantable, and that each down migration refuses while one is granted.
+// Actions enforced by other services (REF-01 jurisdiction-rules-svc, REF-07
+// policy-svc). Until a permission is registered no bundle can name it, so its
+// check is permanently denied; these prove each migration made its actions
+// grantable, and that each down migration refuses while one is granted.
 
-var jurisdictionActionMigrations = []struct {
+var registeredActionMigrations = []struct {
 	migration string
-	risk      map[string]string
+	// owner is the service named in each action's description.
+	owner string
+	risk  map[string]string
 }{
-	{"000037_register_jurisdiction_alias_actions", map[string]string{
+	{"000037_register_jurisdiction_alias_actions", "jurisdiction-rules-svc", map[string]string{
 		"JURISDICTION_ALIAS_AMEND": "HIGH",
 		"JURISDICTION_ALIAS_END":   "HIGH",
 	}},
-	{"000038_register_jurisdiction_import_actions", map[string]string{
+	{"000038_register_jurisdiction_import_actions", "jurisdiction-rules-svc", map[string]string{
 		"JURISDICTION_IMPORT_PROPOSE": "HIGH",
 		"JURISDICTION_IMPORT_APPROVE": "HIGH",
 		"JURISDICTION_IMPORT_VIEW":    "STANDARD",
 	}},
+	{"000039_register_accounting_policy_actions", "policy-svc", map[string]string{
+		"ACCOUNTING_POLICY_DRAFT": "STANDARD",
+	}},
 }
 
-func TestJurisdictionPermissionDefinitionsRegistered(t *testing.T) {
+func TestRegisteredPermissionDefinitions(t *testing.T) {
 	ctx := context.Background()
-	for _, m := range jurisdictionActionMigrations {
+	for _, m := range registeredActionMigrations {
 		for action, risk := range m.risk {
 			var gotRisk, description string
 			err := ownerPool.QueryRow(ctx,
 				`SELECT risk_tier, description FROM permission_definitions WHERE action_name = $1`, action).Scan(&gotRisk, &description)
 			require.NoError(t, err, "%s: action %s was not registered", m.migration, action)
 			require.Equal(t, risk, gotRisk, "action %s risk tier", action)
-			require.Contains(t, description, "jurisdiction-rules-svc", "action %s description", action)
+			require.Contains(t, description, m.owner, "action %s description", action)
 		}
 	}
 }
@@ -49,9 +54,9 @@ func TestJurisdictionPermissionDefinitionsRegistered(t *testing.T) {
 // The down migration refuses while a bundle grants one of its actions, and
 // otherwise removes exactly its own actions. Both run in a transaction that is
 // rolled back, so the shared test schema keeps the registered actions.
-func TestJurisdictionPermissionDownRefusesWhileGrantedAndOtherwiseRemovesOwnActions(t *testing.T) {
+func TestRegisteredPermissionDownRefusesWhileGrantedAndOtherwiseRemovesOwnActions(t *testing.T) {
 	ctx := context.Background()
-	for _, m := range jurisdictionActionMigrations {
+	for _, m := range registeredActionMigrations {
 		down, err := os.ReadFile("../../deployments/migrations/" + m.migration + ".down.sql")
 		require.NoError(t, err)
 
@@ -66,7 +71,7 @@ func TestJurisdictionPermissionDownRefusesWhileGrantedAndOtherwiseRemovesOwnActi
 		require.NoError(t, err)
 		_, err = tx.Exec(ctx, string(down))
 		require.NoError(t, err, "%s down with nothing granted", m.migration)
-		for _, other := range jurisdictionActionMigrations {
+		for _, other := range registeredActionMigrations {
 			for action := range other.risk {
 				var n int
 				require.NoError(t, tx.QueryRow(ctx, `SELECT count(*) FROM permission_definitions WHERE action_name = $1`, action).Scan(&n))

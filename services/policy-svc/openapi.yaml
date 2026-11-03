@@ -376,6 +376,181 @@ paths:
         '428': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /v1/accounting-policies:
+    post:
+      tags: [accounting-policy]
+      operationId: draftAccountingPolicy
+      summary: DraftAccountingPolicy, draft a version of an accounting policy (REF-07)
+      description: |
+        Drafts a version of the accounting policy for `(policy_domain, book_id, jurisdiction_id)` in
+        the caller's tenant, optionally narrowed to one `legal_entity_id`. The policy family is found
+        or created from that applicability, so two drafts for the same applicability are versions of
+        one policy. A draft is always `DRAFT`: it takes effect only through review, approval and
+        activation by others.
+
+        The draft carries what the policy rests on: its `semantic_version`, the `framework_source`,
+        the approved `policy_text_ref`, `rule_mappings` (each dependency pinned to a version) and an
+        `impact_analysis` for future and open periods. A version that takes effect before it is
+        drafted must say so (`affected_periods` `OPEN_PERIODS` and a `retroactive_justification`).
+        `closed_history_unchanged` must be true: a policy change never restates a closed period.
+
+        The same semantic version for the same applicability and scope is the same draft: an
+        identical repeat answers `200`, different content is `409`. A `POLICY_VERSION` rule mapping
+        must name a version that exists (`404`). Needs `ACCOUNTING_POLICY_DRAFT`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DraftAccountingPolicyRequest'}
+      responses:
+        '201':
+          description: Drafted; its row_version is the ETag
+          headers:
+            ETag: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccountingPolicyVersion'}
+        '200':
+          description: An identical draft of this semantic version already exists
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccountingPolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [accounting-policy]
+      operationId: listApplicableAccountingPolicies
+      summary: ListApplicablePolicies, the accounting policies that apply (REF-07)
+      description: |
+        For the entity, book, jurisdiction and date, the resolution of every policy domain that has
+        a policy bound to the request, or of one domain with `policy_domain`. A domain whose policies
+        are ambiguous is listed as `CONFLICTED`, not dropped, and every entry says whether it
+        `blocks_calculation`.
+      parameters:
+        - $ref: '#/components/parameters/AccountingDomainOptional'
+        - $ref: '#/components/parameters/BookID'
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/LegalEntityIDQuery'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/KnownAt'
+      responses:
+        '200':
+          description: One resolution per domain
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [as_of, known_at, policies]
+                properties:
+                  as_of: {type: string, format: date-time}
+                  known_at: {type: string, format: date-time}
+                  policies:
+                    type: array
+                    items: {$ref: '#/components/schemas/AccountingResolution'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/accounting-policies/resolve:
+    get:
+      tags: [accounting-policy]
+      operationId: resolveAccountingPolicy
+      summary: ResolveAccountingPolicy, the one policy that governs (REF-07)
+      description: |
+        Resolves by `policy_domain`, `book_id`, `jurisdiction_id`, `legal_entity_id` and the
+        effective date (`as_of`, with `known_at` for what the platform knew then). A family narrowed
+        to a book or jurisdiction applies only to a request that names it. The narrower scope wins
+        (tenant, legal entity, book and jurisdiction each narrow), then the higher `precedence`.
+
+        **A request that exactly one version does not answer is not guessed at.** `200` only with the
+        governing version; `404 NO_APPLICABLE_POLICY` when none governs; `409 POLICY_CONFLICTED`
+        when more than one applies equally (the versions are listed). Both refusals carry
+        `blocks_calculation: true` and a `resolution_status` (`status` is the problem document's HTTP
+        status): a consumer must not calculate or post on them, and there is no
+        UI fallback. Whatever is calculated or posted on a `200` should persist the `pin`.
+      parameters:
+        - $ref: '#/components/parameters/AccountingDomain'
+        - $ref: '#/components/parameters/BookID'
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/LegalEntityIDQuery'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/KnownAt'
+      responses:
+        '200':
+          description: Exactly one version governs
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ResolvedAccountingPolicy'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/accounting-policies/explain:
+    get:
+      tags: [accounting-policy]
+      operationId: explainAccountingResolution
+      summary: ExplainPolicyResolution for an accounting policy (REF-07)
+      description: |
+        The resolution for one domain and, for every candidate version, whether it governs and why
+        not when it does not (`never_activated`, `not_yet_effective`, `superseded_by_later_version`,
+        `suspended_or_retired`, `effective_to_passed`, `overridden_by_more_specific_scope`,
+        `overridden_by_higher_precedence`, `conflicts_with_another_policy`). The explanation is the
+        executed trace itself. Always `200`: the status is the answer.
+      parameters:
+        - $ref: '#/components/parameters/AccountingDomain'
+        - $ref: '#/components/parameters/BookID'
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/LegalEntityIDQuery'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/KnownAt'
+      responses:
+        '200':
+          description: The resolution and its trace
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccountingResolution'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/accounting-policies/versions/{version_id}:
+    get:
+      tags: [accounting-policy]
+      operationId: getAccountingPolicyVersion
+      summary: GetPolicyVersion for an accounting policy (REF-07)
+      description: |
+        The version with its applicability, what it rests on (framework source, approved policy
+        text, impact analysis) and its rule mappings. A version that is not an accounting policy
+        version is `404`.
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      responses:
+        '200':
+          description: The version; its row_version is the ETag
+          headers:
+            ETag: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccountingPolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policy-versions/compare:
     get:
       tags: [versions]
@@ -643,6 +818,10 @@ components:
     LegalEntityIDQuery: {name: legal_entity_id, in: query, required: false, schema: {type: string, format: uuid}}
     AsOf: {name: as_of, in: query, required: false, schema: {type: string, format: date-time}, description: 'Effective-time cut (default now).'}
     KnownAt: {name: known_at, in: query, required: false, schema: {type: string, format: date-time}, description: 'Knowledge cut (default as_of if past, else now).'}
+    AccountingDomain: {name: policy_domain, in: query, required: true, schema: {type: string, maxLength: 64}, description: 'The accounting subject, for example REVENUE_RECOGNITION.'}
+    AccountingDomainOptional: {name: policy_domain, in: query, required: false, schema: {type: string, maxLength: 64}}
+    BookID: {name: book_id, in: query, required: false, schema: {type: string, format: uuid}, description: 'The accounting book. Omit for a request that names none: only policies for every book apply.'}
+    JurisdictionID: {name: jurisdiction_id, in: query, required: false, schema: {type: string, format: uuid}, description: 'Omit for a request that names none: only policies for every jurisdiction apply.'}
 
   requestBodies:
     Lifecycle:
@@ -1002,3 +1181,152 @@ components:
         revocation_reason: {type: string}
         created_at: {type: string, format: date-time}
         created_by_principal_id: {type: string}
+
+    ImpactAnalysis:
+      type: object
+      required: [summary, affected_periods, closed_history_unchanged]
+      properties:
+        summary: {type: string}
+        affected_periods: {type: string, enum: [FUTURE_ONLY, OPEN_PERIODS]}
+        closed_history_unchanged: {type: boolean, description: 'Must be true: a policy change never restates a closed period.'}
+        retroactive_justification: {type: string, description: 'Required when the version takes effect before it is drafted.'}
+        notes: {type: string}
+
+    RuleMapping:
+      type: object
+      required: [ref_kind, ref, ref_version, rationale]
+      properties:
+        mapping_no: {type: integer, minimum: 1}
+        ref_kind: {type: string, description: 'What is depended on: JURISDICTION_PACK, ACCOUNTING_RULE, POLICY_VERSION, ...'}
+        ref: {type: string, description: 'For POLICY_VERSION, the id of a version that exists.'}
+        ref_version: {type: string, description: 'The version depended on, pinned.'}
+        rationale: {type: string}
+        maps_to: {type: string}
+        depends_on_version_id: {type: string, format: uuid}
+
+    DraftAccountingPolicyRequest:
+      type: object
+      required: [policy_domain, framework, semantic_version, framework_source, policy_text_ref, impact_analysis, effective_from, rationale]
+      properties:
+        policy_domain: {type: string, pattern: '^[A-Z][A-Z0-9_]{1,63}$'}
+        framework: {type: string, description: 'For example IFRS or US_GAAP.'}
+        book_id: {type: string, format: uuid, nullable: true, description: 'Omit for every book.'}
+        jurisdiction_id: {type: string, format: uuid, nullable: true, description: 'Omit for every jurisdiction.'}
+        legal_entity_id: {type: string, format: uuid, nullable: true}
+        semantic_version: {type: string, example: 2.1.0}
+        precedence: {type: integer, minimum: 0, maximum: 1000, default: 0, description: 'Between equally specific policies that could both apply. Without it such a pair is ambiguous.'}
+        framework_source: {type: string, description: 'The standard and paragraph the policy comes from.'}
+        policy_text_ref: {type: string, description: 'The approved policy text or rule reference.'}
+        rule_mappings:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/RuleMapping'}
+        impact_analysis: {$ref: '#/components/schemas/ImpactAnalysis'}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: string, format: date-time, nullable: true}
+        rationale: {type: string}
+
+    AccountingApplicability:
+      type: object
+      properties:
+        policy_id: {type: string, format: uuid}
+        policy_domain: {type: string}
+        framework: {type: string}
+        book_id: {type: string, format: uuid, nullable: true}
+        jurisdiction_id: {type: string, format: uuid, nullable: true}
+        created_at: {type: string, format: date-time}
+
+    AccountingVersionDetails:
+      type: object
+      properties:
+        semantic_version: {type: string}
+        precedence: {type: integer}
+        framework_source: {type: string}
+        policy_text_ref: {type: string}
+        impact_analysis: {$ref: '#/components/schemas/ImpactAnalysis'}
+
+    AccountingPolicyVersion:
+      description: A policy version with its accounting content. Every PolicyVersion field is present.
+      allOf:
+        - $ref: '#/components/schemas/PolicyVersion'
+        - type: object
+          required: [policy_code, applicability, details, rule_mappings]
+          properties:
+            policy_code: {type: string}
+            applicability: {$ref: '#/components/schemas/AccountingApplicability'}
+            details: {$ref: '#/components/schemas/AccountingVersionDetails'}
+            rule_mappings:
+              type: array
+              items: {$ref: '#/components/schemas/RuleMapping'}
+
+    AccountingPin:
+      type: object
+      description: What a consumer persists with a calculation or posting, so it can be explained and reproduced.
+      required: [policy_id, policy_version_id, version_number, semantic_version, artifact_digest, row_version]
+      properties:
+        policy_id: {type: string, format: uuid}
+        policy_version_id: {type: string, format: uuid}
+        version_number: {type: integer}
+        semantic_version: {type: string}
+        artifact_digest: {type: string, description: 'Digest of the version content, covering applicability, details and mappings.'}
+        row_version: {type: integer}
+
+    AccountingVersionSummary:
+      type: object
+      properties:
+        pin: {$ref: '#/components/schemas/AccountingPin'}
+        policy_domain: {type: string}
+        framework: {type: string}
+        book_id: {type: string, format: uuid, nullable: true}
+        jurisdiction_id: {type: string, format: uuid, nullable: true}
+        legal_entity_id: {type: string, format: uuid, nullable: true}
+        scope_type: {type: string}
+        precedence: {type: integer}
+        version_status: {type: string}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: string, format: date-time, nullable: true}
+
+    ResolvedAccountingPolicy:
+      type: object
+      required: [status, blocks_calculation, policy_domain, as_of, known_at, pin, policy]
+      properties:
+        status: {type: string, enum: [RESOLVED]}
+        blocks_calculation: {type: boolean, enum: [false]}
+        policy_domain: {type: string}
+        as_of: {type: string, format: date-time}
+        known_at: {type: string, format: date-time}
+        pin: {$ref: '#/components/schemas/AccountingPin'}
+        policy: {$ref: '#/components/schemas/AccountingPolicyVersion'}
+
+    AccountingResolution:
+      type: object
+      required: [status, blocks_calculation, policy_domain, as_of, known_at]
+      properties:
+        status: {type: string, enum: [RESOLVED, NOT_APPLICABLE, CONFLICTED]}
+        blocks_calculation: {type: boolean, description: 'True unless exactly one version governs.'}
+        policy_domain: {type: string}
+        as_of: {type: string, format: date-time}
+        known_at: {type: string, format: date-time}
+        pin: {$ref: '#/components/schemas/AccountingPin'}
+        selected: {$ref: '#/components/schemas/AccountingVersionSummary'}
+        conflicting:
+          type: array
+          items: {$ref: '#/components/schemas/AccountingVersionSummary'}
+        trace:
+          type: array
+          items:
+            type: object
+            properties:
+              policy_version_id: {type: string}
+              policy_id: {type: string}
+              policy_code: {type: string}
+              version_number: {type: integer}
+              scope_type: {type: string}
+              version_status: {type: string}
+              governs: {type: boolean}
+              reason: {type: string}
+              policy_domain: {type: string}
+              book_id: {type: string, nullable: true}
+              jurisdiction_id: {type: string, nullable: true}
+              semantic_version: {type: string}
+              precedence: {type: integer}
