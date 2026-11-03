@@ -3,6 +3,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -771,6 +772,8 @@ type AuthenticationEvent struct {
 	UserAgent      string    `json:"user_agent,omitempty"`
 	OccurredAt     time.Time `json:"occurred_at"`
 	CorrelationID  string    `json:"correlation_id,omitempty"`
+	// Details carries the decision basis (e.g. {"basis":"bad_password"}).
+	Details json.RawMessage `json:"details,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -781,25 +784,32 @@ type AuthenticationEvent struct {
 // ---------------------------------------------------------------------------
 
 type IdentityLink struct {
-	LinkID          string    `json:"link_id"`
-	TenantID        string    `json:"tenant_id"`
-	PrincipalID     string    `json:"principal_id"`
-	IdentityProvider string   `json:"identity_provider"`
-	ProviderSubject string    `json:"provider_subject"`
-	ProviderType    string    `json:"provider_type"`
-	CreatedAt       time.Time `json:"created_at"`
+	LinkID      string `json:"link_id"`
+	TenantID    string `json:"tenant_id"`
+	PrincipalID string `json:"principal_id"`
+	// Source is the store the binding lives in: "federation_link" (INT-10
+	// connection, SCIM / JIT / admin) or "federated_identity" (auth-plane
+	// identity provider login).
+	Source string `json:"source"`
+	// IdentityProvider is the federation connection or identity provider id.
+	IdentityProvider string     `json:"identity_provider"`
+	Issuer           string     `json:"issuer,omitempty"`
+	ProviderSubject  string     `json:"provider_subject"`
+	Status           string     `json:"status"`
+	LinkedBy         string     `json:"linked_by,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	LastLoginAt      *time.Time `json:"last_login_at,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
-// MergeDuplicateIdentityRequest  (IC-3 subject merge)
+// MergeDuplicateIdentityRequest  (ORG-1 subject merge)
 //
-// POST /v1/subjects/{survivor_id}/merge retires the named principal into the
-// survivor. step_up_evidence is the step-up token the caller obtained from
-// POST /v1/authenticate/step-up.
+// POST /v1/subjects/{survivor_id}/merge retires duplicate_id into the
+// survivor. The caller's step-up comes from its verified envelope, never from
+// the body; If-Match carries the duplicate's record version.
 // ---------------------------------------------------------------------------
 
 type MergeDuplicateIdentityRequest struct {
-	RetiredID       string `json:"retired_id"`
-	StepUpEvidence  string `json:"step_up_evidence"`
+	DuplicateID string `json:"duplicate_id"`
+	Reason      string `json:"reason"`
 }
-

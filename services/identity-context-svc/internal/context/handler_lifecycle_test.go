@@ -46,6 +46,22 @@ type mockLifecycleStore struct {
 	decideOut      *domain.PasswordResetRequest
 
 	findCredErr error
+
+	mergeRes     *store.MergeResult
+	mergeErr     error
+	mergeVersion int64
+}
+
+func (m *mockLifecycleStore) MergeSubjects(_ context.Context, _, survivorID, duplicateID, _, _, _ string,
+	duplicateVersion int64, _ ...outbox.Record) (*store.MergeResult, error) {
+	m.mergeVersion = duplicateVersion
+	if m.mergeErr != nil {
+		return nil, m.mergeErr
+	}
+	if m.mergeRes != nil {
+		return m.mergeRes, nil
+	}
+	return &store.MergeResult{SurvivorID: survivorID, DuplicateID: duplicateID}, nil
 }
 
 func (m *mockLifecycleStore) CreatePrincipal(_ context.Context, _ domain.NewPrincipal, _ ...outbox.Record) error {
@@ -57,7 +73,9 @@ func (m *mockLifecycleStore) GetPrincipalDetail(_ context.Context, _, _ string) 
 func (m *mockLifecycleStore) FindPrincipalBy(_ context.Context, _, _, _ string) (*store.PrincipalDetail, error) {
 	return m.findBy, m.findByErr
 }
-func (m *mockLifecycleStore) IssueCredentialToken(_ context.Context, _ domain.CredentialToken) error { return nil }
+func (m *mockLifecycleStore) IssueCredentialToken(_ context.Context, _ domain.CredentialToken) error {
+	return nil
+}
 func (m *mockLifecycleStore) ConsumeCredentialToken(_ context.Context, _ string, _ string, _ time.Time,
 	apply func(context.Context, pgx.Tx, domain.CredentialToken) ([]outbox.Record, error)) (*domain.CredentialToken, error) {
 	if m.consumeErr != nil {
@@ -70,10 +88,18 @@ func (m *mockLifecycleStore) ConsumeCredentialToken(_ context.Context, _ string,
 	}
 	return m.consumeTok, nil
 }
-func (m *mockLifecycleStore) SetPasswordTx(_ context.Context, _ pgx.Tx, _, _, _ string) error                         { return nil }
-func (m *mockLifecycleStore) ActivatePrincipalTx(_ context.Context, _ pgx.Tx, _, _ string) error                      { return nil }
-func (m *mockLifecycleStore) ChangePassword(_ context.Context, _, _, _ string, _ ...outbox.Record) error             { return nil }
-func (m *mockLifecycleStore) RecentPasswordHashes(_ context.Context, _, _ string, _ int) ([]string, error)            { return nil, nil }
+func (m *mockLifecycleStore) SetPasswordTx(_ context.Context, _ pgx.Tx, _, _, _ string) error {
+	return nil
+}
+func (m *mockLifecycleStore) ActivatePrincipalTx(_ context.Context, _ pgx.Tx, _, _ string) error {
+	return nil
+}
+func (m *mockLifecycleStore) ChangePassword(_ context.Context, _, _, _ string, _ ...outbox.Record) error {
+	return nil
+}
+func (m *mockLifecycleStore) RecentPasswordHashes(_ context.Context, _, _ string, _ int) ([]string, error) {
+	return nil, nil
+}
 func (m *mockLifecycleStore) CreateResetRequest(_ context.Context, _ domain.PasswordResetRequest, _ ...outbox.Record) error {
 	return m.createResetErr
 }
@@ -87,7 +113,9 @@ func (m *mockLifecycleStore) DecideResetRequest(_ context.Context, _, _ string, 
 	}
 	return m.decideOut, m.decideErr
 }
-func (m *mockLifecycleStore) CompleteResetRequestTx(_ context.Context, _ pgx.Tx, _ string) error { return nil }
+func (m *mockLifecycleStore) CompleteResetRequestTx(_ context.Context, _ pgx.Tx, _ string) error {
+	return nil
+}
 func (m *mockLifecycleStore) InsertCredentialTokenTx(_ context.Context, _ pgx.Tx, _ domain.CredentialToken) error {
 	return nil
 }
@@ -200,14 +228,30 @@ func TestAU09_ActivationLinkSingleUse(t *testing.T) {
 }
 
 func TestAU09_ResetRequesterCannotApprove(t *testing.T) {
+	fx := newMFAFixture(t)
 	st := &mockLifecycleStore{getResetReq: &domain.PasswordResetRequest{
-		RequestID:   "rr-1", RequestedBy: "requester-1", PrincipalID: "subject-1", Status: "PENDING_APPROVAL"}}
-	r := lifecycleRouter(newLifecycleService(st), &permittingAuthz{})
+		RequestID: "rr-1", RequestedBy: admin, PrincipalID: alice, Status: "PENDING_APPROVAL"}}
+	r := steppedUpRouter(newLifecycleService(st), &permittingAuthz{}, fx)
 
-	w := postLifecycle(t, r, "/v1/password-resets/rr-1/decide", "tenant-a", "requester-1",
+	w := postAs(t, r, "/v1/password-resets/rr-1/decide", admin, fx.session(admin, 10*time.Second, true), "",
 		map[string]any{"decision": "APPROVE"})
 
 	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String(), "the requester cannot approve their own reset")
+}
+
+func TestAU09_ResetDecideRequiresTheApproversOwnStepUp(t *testing.T) {
+	fx := newMFAFixture(t)
+	st := &mockLifecycleStore{getResetReq: &domain.PasswordResetRequest{
+		RequestID: "rr-1", RequestedBy: "P-OTHER", PrincipalID: alice, Status: "PENDING_APPROVAL"}}
+	r := steppedUpRouter(newLifecycleService(st), &permittingAuthz{}, fx)
+
+	// A password-only session: the approval needs a second factor the
+	// session itself proves, not one the handler assumes.
+	w := postAs(t, r, "/v1/password-resets/rr-1/decide", admin, fx.session(admin, 10*time.Second, false), "",
+		map[string]any{"decision": "APPROVE"})
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "step_up_required")
 }
 
 func TestAU09_ResetDecideNeedsApproveAction(t *testing.T) {

@@ -16,8 +16,8 @@ BEGIN
 END
 $$;
 
-ALTER TABLE identity_links DROP POLICY IF EXISTS tenant_isolation_policy;
-ALTER TABLE identity_merges DROP POLICY IF EXISTS tenant_isolation_policy;
+DROP POLICY IF EXISTS tenant_isolation_policy ON identity_links;
+DROP POLICY IF EXISTS tenant_isolation_policy ON identity_merges;
 
 DROP TABLE IF EXISTS identity_merges;
 DROP TABLE IF EXISTS identity_links;

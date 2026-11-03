@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -299,9 +298,8 @@ type decideResetRequest struct {
 }
 
 // DecideReset records an approver's decision (APPROVE or REJECT). The
-// authorization-svc IDENTITY_PASSWORD_RESET_APPROVE grant carries the
-// step-up/MFA requirement, so the handler trusts that decision and passes a
-// verified actor to the lifecycle service.
+// approver's second factor is read from their verified envelope
+// (steppedUpActor); the lifecycle service refuses a stale or missing one.
 func (h *Handler) DecideReset(w http.ResponseWriter, r *http.Request) {
 	if h.lifecycle == nil {
 		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
@@ -327,13 +325,11 @@ func (h *Handler) DecideReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rr, err := h.lifecycle.DecideReset(r.Context(), lifecycle.Actor{
-		PrincipalID:   callerPrincipalID,
-		TenantID:      tenantID,
-		MFAVerified:   true,
-		AuthTime:      time.Now().UTC(),
-		CorrelationID: r.Header.Get("X-Correlation-ID"),
-	}, resetID, req.Decision)
+	actor, ok := h.steppedUpActor(w, r, tenantID, callerPrincipalID)
+	if !ok {
+		return
+	}
+	rr, err := h.lifecycle.DecideReset(r.Context(), actor, resetID, req.Decision)
 	if err != nil {
 		h.lifecycleError(w, r, err)
 		return
@@ -389,7 +385,9 @@ func (h *Handler) lifecycleError(w http.ResponseWriter, r *http.Request, err err
 	case errors.Is(err, lifecycle.ErrForbidden):
 		writeCoded(w, r, http.StatusForbidden, "forbidden", err.Error())
 	case errors.Is(err, lifecycle.ErrStepUp):
-		writeCoded(w, r, http.StatusForbidden, "step_up_required", err.Error())
+		writeCoded(w, r, http.StatusUnauthorized, "step_up_required", err.Error())
+	case errors.Is(err, lifecycle.ErrStale):
+		writeCoded(w, r, http.StatusPreconditionFailed, "stale_version", err.Error())
 	case errors.Is(err, lifecycle.ErrBadCredential):
 		writeCoded(w, r, http.StatusUnauthorized, "bad_credential", err.Error())
 	case errors.Is(err, lifecycle.ErrLinkInvalid):

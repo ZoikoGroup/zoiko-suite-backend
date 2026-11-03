@@ -640,6 +640,11 @@ func main() {
 		log,
 	)
 
+	cursorSigner, err := apicontract.NewCursorSigner(cfg.CursorSigningKey)
+	if err != nil {
+		log.Fatal("cursor signer", zap.Error(err))
+	}
+
 	// Domain routes (all under /v1/)
 	h := identityctx.NewHandler(resolver, authenticator, sessionCache, principalRepo, authzClient, log).
 		WithEnvironment(domain.Environment(cfg.Environment)).
@@ -654,7 +659,8 @@ func main() {
 		}).
 		WithDPoP(provider.DPoPVerifier()).
 		WithStatusChanger(statusChanger{svc: lifecycleSvc}).
-		WithLifecycle(lifecycleSvc)
+		WithLifecycle(lifecycleSvc).
+		WithConsole(principalRepo, cursorSigner)
 	provider.RegisterRoutes(r)
 	identityctx.RegisterRoutes(r, h)
 	rootHandler, stopFederation := mountFederation(r, config.LoadFederation(), config.LoadProvisioning(), cfg, principalRepo, idpIssuer, authzClient, siemClient, sessionEvictor{cache: sessionCache}, log)

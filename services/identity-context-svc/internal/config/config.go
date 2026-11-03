@@ -2,7 +2,9 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -74,6 +76,13 @@ type Config struct {
 	// this service's identity there (platform COMMERCIAL_RESTRICTION_READ).
 	CommercialAccountURL string
 	ServicePrincipalID   string
+
+	// CursorSigningKey signs the next_cursor of every console list (API-4) so
+	// a cursor is bound to the tenant, route and filter that minted it.
+	// CURSOR_SIGNING_KEY_HEX, at least 32 bytes; required in staging and
+	// production. Local and development generate one per process, which only
+	// means a cursor does not survive a restart.
+	CursorSigningKey []byte
 
 	// IDPClientChannels maps a verified IdP client id (azp) to its §4 source
 	// channel: IDP_CLIENT_CHANNELS="zoiko-console=web,zoiko-mobile=mobile".
@@ -576,6 +585,12 @@ func Load() (*Config, error) {
 	if err := loadAuthPlane(cfg); err != nil {
 		return nil, err
 	}
+	key, err := cursorSigningKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), cfg.Environment)
+	if err != nil {
+		return nil, err
+	}
+	cfg.CursorSigningKey = key
+
 	return cfg, nil
 }
 
@@ -695,4 +710,27 @@ func envPairs(key string) map[string]string {
 		}
 	}
 	return out
+}
+
+// cursorSigningKey decodes CURSOR_SIGNING_KEY_HEX. Staging and production must
+// set it, so every replica verifies the cursors the others mint.
+func cursorSigningKey(raw, environment string) ([]byte, error) {
+	if raw == "" {
+		if environment == "staging" || environment == "production" {
+			return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is required in %s: replicas must share the key that signs list cursors", environment)
+		}
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("generate cursor signing key: %w", err)
+		}
+		return key, nil
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be hex-encoded: %w", err)
+	}
+	if len(key) < 32 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be at least 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }

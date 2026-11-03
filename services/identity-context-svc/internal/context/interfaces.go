@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"zoiko.io/identity-context-svc/internal/domain"
-	"zoiko.io/identity-context-svc/internal/store"
 )
 
 // PrincipalStore is the data-access contract for Principal records.
@@ -19,20 +18,12 @@ type PrincipalStore interface {
 	FindActiveRoleAssignments(ctx context.Context, principalID, tenantID string, legalEntityID *string) ([]domain.PrincipalRoleAssignment, error)
 	FindActiveDelegations(ctx context.Context, principalID, tenantID string) ([]domain.DelegatedAuthority, error)
 	UpdateStatus(ctx context.Context, principalID, tenantID string, newStatus domain.PrincipalStatus, actorID, correlationID string) error
-	// ListPrincipals pages through a tenant's subjects (SCIM list, admin list).
-	// filterField is "", "email" or "external_id". Offset-based pagination.
-	ListPrincipals(ctx context.Context, tenantID, filterField, filterValue string, offset, limit int) ([]store.PrincipalDetail, int, error)
-	// ListAuthenticationEvents returns a page of the caller's tenant's
-	// authentication events, newest first, cursor-paged on (occurred_at,
-	// event_id).
-	ListAuthenticationEvents(ctx context.Context, tenantID, cursor string, limit int) ([]domain.AuthenticationEvent, string, error)
 	// GetIdentityLinks returns every external-IdP link bound to a principal in
 	// the caller's tenant (GET /v1/subjects/{id}/links).
 	GetIdentityLinks(ctx context.Context, tenantID, principalID string) ([]domain.IdentityLink, error)
-	// MergeDuplicateIdentity retires retiredID into survivorID within the
-	// caller's tenant: links repointed, retired principal disabled, its live
-	// sessions ended, merge recorded. IC-3 subject merge.
-	MergeDuplicateIdentity(ctx context.Context, tenantID, survivorID, retiredID, approvedBy, stepUpEvidence, correlationID string) error
+	// ResolveSubjectID follows merge aliases to the subject that answers for
+	// id (ORG-1); merged reports whether id itself was retired.
+	ResolveSubjectID(ctx context.Context, tenantID, id string) (survivor string, merged bool, err error)
 }
 
 // SessionCache manages the Redis-backed session envelope store.

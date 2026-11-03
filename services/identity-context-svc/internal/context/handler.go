@@ -20,8 +20,8 @@ import (
 	"zoiko.io/identity-context-svc/internal/ratelimit"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
-	"zoiko.io/identity-envelope/apicontract"
 	idenv "zoiko.io/identity-envelope"
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // Action constants passed to authorization-svc as action_type.
@@ -39,7 +39,7 @@ const (
 	IdentitySubjectMerge      = "IDENTITY_SUBJECT_MERGE"
 	IdentityPrincipalStatus   = "IDENTITY_PRINCIPAL_STATUS_SET"
 	// Subject lifecycle (IC-1).
-	IdentityPrincipalCreate     = "IDENTITY_PRINCIPAL_CREATE"
+	IdentityPrincipalCreate      = "IDENTITY_PRINCIPAL_CREATE"
 	IdentityPasswordResetRequest = "IDENTITY_PASSWORD_RESET_REQUEST"
 	IdentityPasswordResetApprove = "IDENTITY_PASSWORD_RESET_APPROVE"
 )
@@ -99,6 +99,11 @@ type Handler struct {
 	// Activate, ChangePassword, ForgotPassword, RequestReset, DecideReset,
 	// CompleteReset). Nil answers 501 for those routes.
 	lifecycle *lifecycle.Service
+
+	// console backs the IC-2 read models; cursors signs their next_cursor.
+	// Nil answers 501 for those routes.
+	console ConsoleReader
+	cursors *apicontract.CursorSigner
 }
 
 // StatusChanger changes a principal's status as one governed command: the
@@ -412,7 +417,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		// ── Console read models (IC-2) ─────────────────────────────────────────
 		r.Get("/principals", h.ListPrincipals)
+		r.Get("/principals/{principalID}/assurance-history", h.GetAssuranceHistory)
+		r.Get("/context/sessions", h.ListSessions)
+		r.Get("/context/support", h.ListSupportContexts)
 		r.Get("/authentication-events", h.ListAuthenticationEvents)
+		r.Get("/identity/summary", h.GetIdentitySummary)
 
 		// ── Subject identity and merge (IC-3) ──────────────────────────────────
 		r.Get("/subjects/{principalID}", h.GetSubjectIdentity)

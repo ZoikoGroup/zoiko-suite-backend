@@ -340,7 +340,7 @@ func (s *PgStore) appendDecision(
 	`, ulid.Make().String(), principalID, tenantID, actionType, outcome, basis, correlationID, at); err != nil {
 		return fmt.Errorf("append access decision: %w", err)
 	}
-	return nil
+	return s.projectDecision(ctx, tx, principalID, tenantID, actionType, outcome, basis, correlationID, at)
 }
 
 func deref(s *string) string {

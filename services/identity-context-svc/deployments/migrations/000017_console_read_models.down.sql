@@ -14,8 +14,8 @@ BEGIN
 END
 $$;
 
-ALTER TABLE authentication_events DROP POLICY IF EXISTS tenant_isolation_policy;
-ALTER TABLE principal_assurance_history DROP POLICY IF EXISTS tenant_isolation_policy;
+DROP POLICY IF EXISTS tenant_isolation_policy ON authentication_events;
+DROP POLICY IF EXISTS tenant_isolation_policy ON principal_assurance_history;
 
 DROP TABLE IF EXISTS authentication_events;
 DROP TABLE IF EXISTS principal_assurance_history;

@@ -100,10 +100,13 @@ const (
 	// consume those. Both are now emitted: the legacy name for existing
 	// consumers, the canonical one for every new consumer. The legacy names
 	// retire when the consumer register shows no subscriber.
-	EventSessionRevoked    = "identity.session.revoked"
-	EventSubjectCreated    = "identity.subject.created"
-	EventSubjectDisabled   = "identity.subject.disabled"
-	EventSubjectEnabled    = "identity.subject.enabled"
+	EventSessionRevoked  = "identity.session.revoked"
+	EventSubjectCreated  = "identity.subject.created"
+	EventSubjectDisabled = "identity.subject.disabled"
+	EventSubjectEnabled  = "identity.subject.enabled"
+	// EventSubjectMerged: a duplicate subject was retired into its survivor
+	// (ORG-1). authorization-svc re-points the duplicate's assignments.
+	EventSubjectMerged     = "identity.subject.merged"
 	EventSCIMSyncCompleted = "identity.scim_sync.completed"
 
 	// ── Auth plane closure (15 Oct 2026) ─────────────────────────────────────
