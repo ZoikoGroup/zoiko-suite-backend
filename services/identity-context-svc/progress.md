@@ -457,3 +457,43 @@ metrics configured.
 - No new commits needed — IC-10 verification done with existing commits
 - Console screenshots against live service (IC-FE-1..3)
 
+## Verification and completion — 3 Nov 2026 (Claude, verifier protocol)
+
+The IC-0..IC-10 pass above was re-verified against docs/audit_files/AUTH-PLANE-PLAN-2026-11-02.md
+and reopened. What the matrix above marked DONE but was not:
+
+| Task | Found | Fixed in |
+|---|---|---|
+| IC-1 | 3 named tests missing; forgot-password budget keyed on a caller-written X-Forwarded-For; pre-session routes (activate, forgot, reset) unreachable behind the envelope gate | 737515e7, 122d31a8 |
+| IC-2 | 4 of 6 routes missing; no cursor binding; nothing wrote authentication_events / principal_assurance_history; no RLS test | 1fda0bb1 |
+| IC-3 | merge scanned a principal id into a bool (every merge failed), ended sessions in Postgres only, no alias, no event, no authorization-svc consumer; DecideReset faked MFAVerified=true | 1fda0bb1, 0174312a |
+| IC-4 | workloads uncapped; SIEM half untested | aea10dc9 |
+| IC-5 | zoiko.authorization.events never subscribed; authorization-svc's id key ignored; suspension would tombstone and block resume | 64b2b12b |
+| IC-6 | not started (only the live entitlement half depends on commercial-account-svc) | e8b48731 |
+| IC-7 | migration 000026 never applied | applied live 3 Nov (access_control 30/30) |
+| IC-8 | sessions gauge never set, revocations counted for the cap only, no alert rules | 6f95a2b7 |
+| IC-10 | nothing live, no E2E | 122d31a8 |
+| IC-FE-1..3 | not started | frontend 49a8f76, 8a57466, e10b30a |
+
+**Evidence**
+- Unit + store suites in a throwaway golang:1.26-alpine container (host test binaries are blocked by
+  Windows App Control) against the gdl-test-pg scratch DB: 767 pass / 0 fail / 0 skip at 1fda0bb1;
+  every later commit re-ran its packages green. authorization-svc: 745 pass / 0 fail (68 skips are the
+  legacy TEST_DATABASE_URL suite).
+- Live: images rebuilt (identity-svc, authorization-svc), identity_context 21/21 and access_control 30/30
+  migrated, `deployments/scripts/e2e-identity-context-deps.py` 47/47 PASS — including Kafka
+  iam.assignment.* into the role projection, merge consumed by authorization-svc, and a revoked session
+  refused by authorization-svc's introspection 5.2 s after invalidation.
+- Mutation check: binding the cursor to a fixed tenant fails TestIC2_CursorBoundToTenantRouteAndFilter;
+  dropping the merge actor check fails TestORG01_MergeActorCannotBeEitherSubject.
+- Console: /admin/identity rendered against the live service (people, sessions, events, support), one
+  empty state and the unreachable-service state; tsc clean in source, eslint clean on touched files.
+
+**Still open**
+- IC-9: passkey begin/finish acceptance test and a live probe with FEDERATION_ENABLED=true (SCIM
+  lifecycle and federated login are covered by existing tests).
+- IC-FE-1 compose half: register the console client in IDP_CLIENT_SECRETS_FILE and switch
+  IDP_CLIENT_AUTH=required once every caller presents a client (the E2E script and seeds do not yet).
+- IC-FE-3: Federation and Diagnostics tabs, and a password-resets register (the service has no list
+  route for resets yet).
+- IC-10 docs: RELEASE_CERTIFICATE re-certification and the AU-01..AU-11 re-score.
