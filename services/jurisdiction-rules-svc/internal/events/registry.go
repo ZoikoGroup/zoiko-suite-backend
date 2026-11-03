@@ -88,7 +88,11 @@ const (
 	// adds, removes or changes.
 	EventBusinessCalendarUpdated  = "business-calendar.updated"
 	EventHolidayOccurrenceChanged = "holiday-occurrence.changed"
-	EventObligationRulePublished  = "regulatory-obligation-rule.published"
+	// REF-10 payment terms.
+	EventPaymentTermActivated    = "payment-term.activated"
+	EventPaymentTermSuperseded   = "payment-term.superseded"
+	EventPaymentTermRetired      = "payment-term.retired"
+	EventObligationRulePublished = "regulatory-obligation-rule.published"
 )
 
 // ZS-JUR-001 s26 events for Waves 4, 5 and 8. jurisdiction.support-changed is

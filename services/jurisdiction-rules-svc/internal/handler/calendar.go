@@ -39,6 +39,7 @@ func registerCalendarRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/calendars/{calendar_code}/imports", h.ImportHolidayCalendar)
 	r.Get("/v1/calendars/{calendar_code}/is-business-day", h.IsBusinessDay)
 	r.Get("/v1/calendars/{calendar_code}/add-business-days", h.AddBusinessDays)
+	registerPaymentTermRoutes(r, h)
 	r.Post("/v1/admin/obligation-rules", h.CreateObligationRule)
 	r.Put("/v1/admin/obligation-rules/{obligation_rule_id}/provenance", h.SetObligationProvenance)
 	r.Post("/v1/admin/obligation-rules/{obligation_rule_id}/publish", h.PublishObligationRule)

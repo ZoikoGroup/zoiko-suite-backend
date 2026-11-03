@@ -40,6 +40,12 @@ var registeredActionMigrations = []struct {
 		"ACCOUNTING_POLICY_ACTIVATE":          "HIGH",
 		"ACCOUNTING_POLICY_EMERGENCY_SUSPEND": "CRITICAL",
 	}},
+	{"000041_register_payment_term_actions", "jurisdiction-rules-svc", map[string]string{
+		"PAYMENT_TERM_CREATE":    "STANDARD",
+		"PAYMENT_TERM_APPROVE":   "HIGH",
+		"PAYMENT_TERM_SUPERSEDE": "HIGH",
+		"PAYMENT_TERM_RETIRE":    "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {
