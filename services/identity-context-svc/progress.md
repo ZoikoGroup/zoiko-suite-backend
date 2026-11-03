@@ -417,3 +417,17 @@ metrics configured.
 
 **Commits:**
 - `feat(identity-context-svc): IC-8 observability metrics` (this commit)
+
+## IC-9 — Federation/SCIM/passkey (already implemented, verified) (2026-11-03)
+
+**Already present:**
+- `POST /v1/federation/links`, `GET /v1/federation/links`, `GET /v1/federation/links/{linkID}` (handler.go:70-72)
+- SCIM provisioning (internal/federation/handler_scim.go, pg_scim.go)
+- Passkey/WebAuthn (webauthn_credentials table, /oauth2/login/passkey/begin/finish)
+
+**Evidence:**
+- `go test ./internal/federation/` — pass (18 tests)
+- `go test ./internal/store/ -run TestPgStore` — pass against real Postgres, including pg_provisioning_test.go (SCIM + federation links)
+
+**Commits:**
+- Pre-existing work (no new commits needed for IC-9)
