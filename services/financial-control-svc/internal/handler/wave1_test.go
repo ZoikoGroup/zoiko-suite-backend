@@ -66,6 +66,13 @@ func (f *fakeStore) AssignException(_ context.Context, _, _, _, _ string, expect
 func (f *fakeStore) GetLatestEvidence(context.Context, string, string) (*domain.EvidencePackage, error) {
 	return f.w1.evidence, f.w1.evidenceErr
 }
+func (f *fakeStore) CreateManualMatch(context.Context, string, string, string, domain.CreateManualMatchRequest) (*domain.ManualMatch, error) {
+	f.calls = append(f.calls, "CreateManualMatch")
+	return &domain.ManualMatch{}, f.manualMatchErr
+}
+func (f *fakeStore) ListManualMatches(context.Context, string, string) ([]domain.ManualMatch, error) {
+	return nil, nil
+}
 
 type fakeExecutor struct {
 	result *domain.ControlRun

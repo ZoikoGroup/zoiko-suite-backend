@@ -21,16 +21,17 @@ import (
 
 // fakeStore implements handler.Store; only what a test sets is exercised.
 type fakeStore struct {
-	run       *domain.ControlRun
-	created   bool
-	runErr    error
-	def       *domain.ControlDefinition
-	approveEr error
-	calls     []string
-	w1        wave1State
-	w5        wave5State
-	w7        wave7State
-	rv        revokeState
+	run            *domain.ControlRun
+	created        bool
+	runErr         error
+	def            *domain.ControlDefinition
+	approveEr      error
+	manualMatchErr error
+	calls          []string
+	w1             wave1State
+	w5             wave5State
+	w7             wave7State
+	rv             revokeState
 
 	// idemKey is the Idempotency-Key the last replayable command received;
 	// idemReplay makes the fake report that command as a replay.
@@ -318,6 +319,29 @@ func TestCreateTolerance_IsCreatedPendingThenApprovedBySomeoneElse(t *testing.T)
 	distinctApprover := &fakeStore{}
 	rr = do(newServer(distinctApprover, &fakeAuthz{}), "POST", "/controls/v1/tolerance-policies/t1/approve?legal_entity_id=e1", "", auth)
 	assert.Equal(t, 200, rr.Code, rr.Body.String())
+}
+
+// SPEC_DEVIATIONS A5: validation (missing reason/evidence/record ids) is
+// refused before the run is even looked up, let alone the store touched —
+// same convention as every other create endpoint in this file.
+func TestCreateManualMatch_RequiresReasonEvidenceAndRecordIDs(t *testing.T) {
+	s := &fakeStore{run: sampleRun()}
+	cases := []string{
+		`{"side_a_record_ids":["a1"],"side_b_record_ids":["b1"],"evidence_ref":"e"}`,          // no reason
+		`{"side_a_record_ids":["a1"],"side_b_record_ids":["b1"],"reason":"explained"}`,        // no evidence_ref
+		`{"side_a_record_ids":[],"side_b_record_ids":["b1"],"reason":"r","evidence_ref":"e"}`, // no side A
+		`{"side_a_record_ids":["a1"],"side_b_record_ids":[],"reason":"r","evidence_ref":"e"}`, // no side B
+	}
+	for _, body := range cases {
+		rr := do(newServer(s, &fakeAuthz{}), "POST", "/controls/v1/runs/r1/manual-matches", body, auth)
+		assert.Equal(t, 400, rr.Code, body)
+	}
+	assert.Empty(t, s.calls, "an invalid request must never reach GetRun or the store")
+
+	good := `{"side_a_record_ids":["a1"],"side_b_record_ids":["b1"],"reason":"explained by ops","evidence_ref":"ticket-123"}`
+	rr := do(newServer(s, &fakeAuthz{}), "POST", "/controls/v1/runs/r1/manual-matches", good, auth)
+	assert.Equal(t, 201, rr.Code, rr.Body.String())
+	assert.Contains(t, s.calls, "CreateManualMatch")
 }
 
 func TestCreateDefinition_ValidatesInvariantOne(t *testing.T) {

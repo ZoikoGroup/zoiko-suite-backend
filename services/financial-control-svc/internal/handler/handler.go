@@ -52,6 +52,8 @@ type Store interface {
 	GetException(ctx context.Context, tenantID, exceptionID string) (*domain.ControlException, error)
 	AssignException(ctx context.Context, tenantID, exceptionID, actor, correlationID string, expectedVersion int, req domain.AssignExceptionRequest) (*domain.ControlException, error)
 	GetLatestEvidence(ctx context.Context, tenantID, runID string) (*domain.EvidencePackage, error)
+	CreateManualMatch(ctx context.Context, tenantID, runID, actor string, req domain.CreateManualMatchRequest) (*domain.ManualMatch, error)
+	ListManualMatches(ctx context.Context, tenantID, runID string) ([]domain.ManualMatch, error)
 
 	// Wave 5.
 	CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, bool, error)
@@ -88,6 +90,7 @@ const (
 	ActionApproveRule   = "FINCTRL_APPROVE_RULE"
 	ActionPolicyManage  = "FINCTRL_POLICY_MANAGE"
 	ActionApprovePolicy = "FINCTRL_APPROVE_POLICY"
+	ActionManualMatch   = "FINCTRL_MANUAL_MATCH"
 	ActionRunCreate    = "FINCTRL_RUN_CREATE"
 	ActionRead         = "FINCTRL_READ"
 	ActionExecute      = "FINCTRL_EXECUTE"
@@ -139,6 +142,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 			r.Post("/{run_id}/execute", h.ExecuteRun)
 			r.Get("/{run_id}/population", h.GetPopulation)
 			r.Get("/{run_id}/exceptions", h.ListExceptions)
+			r.Post("/{run_id}/manual-matches", h.CreateManualMatch)
+			r.Get("/{run_id}/manual-matches", h.ListManualMatches)
 			r.Get("/{run_id}/evidence", h.GetEvidence)
 			r.Post("/{run_id}/certification", h.CertifyRun)
 			r.Post("/{run_id}/revoke-certification", h.RevokeCertification)

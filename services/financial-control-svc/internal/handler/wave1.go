@@ -175,6 +175,59 @@ func effectiveExceptionLimit(l int) int {
 	return l
 }
 
+// CreateManualMatch — POST /controls/v1/runs/{run_id}/manual-matches
+// (SPEC_DEVIATIONS A5; §10/§27). Authority is re-evaluated against the run's
+// own legal entity, same as ExecuteRun/CertifyRun.
+func (h *Handler) CreateManualMatch(w http.ResponseWriter, r *http.Request) {
+	tenantID, principal, ok := h.caller(w, r)
+	if !ok {
+		return
+	}
+	var req domain.CreateManualMatchRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.writeErr(w, "create manual match", err)
+		return
+	}
+	run, err := h.store.GetRun(r.Context(), tenantID, chi.URLParam(r, "run_id"))
+	if err != nil {
+		h.writeErr(w, "create manual match", err)
+		return
+	}
+	if !h.authorize(w, r, principal, run.LegalEntityID, ActionManualMatch) {
+		return
+	}
+	m, err := h.store.CreateManualMatch(r.Context(), tenantID, run.RunID, principal, req)
+	if err != nil {
+		h.writeErr(w, "create manual match", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, m)
+}
+
+func (h *Handler) ListManualMatches(w http.ResponseWriter, r *http.Request) {
+	tenantID, principal, ok := h.caller(w, r)
+	if !ok {
+		return
+	}
+	run, err := h.store.GetRun(r.Context(), tenantID, chi.URLParam(r, "run_id"))
+	if err != nil {
+		h.writeErr(w, "list manual matches", err)
+		return
+	}
+	if !h.authorize(w, r, principal, run.LegalEntityID, ActionRead) {
+		return
+	}
+	list, err := h.store.ListManualMatches(r.Context(), tenantID, run.RunID)
+	if err != nil {
+		h.writeErr(w, "list manual matches", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": nonNil(list)})
+}
+
 // AssignException — POST /controls/v1/exceptions/{exception_id}/assign.
 // If-Match (the exception's ETag) is REQUIRED: ownership changes use
 // expected-version semantics (§25).

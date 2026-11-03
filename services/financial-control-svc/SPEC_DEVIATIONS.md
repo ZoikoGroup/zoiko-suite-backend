@@ -76,16 +76,30 @@ policies a run pins.
   same condition the rule-version resolution already enforced; a pending
   policy is never pinned to a run, named or not. `ListMaterialityPolicies`
   (`GET /controls/v1/materiality-policies`) closes the missing read endpoint.
-- **A5. No manual match (§10).** Matching is fully automatic; there is no
-  command to pair two records manually with permission, reason and evidence.
-  Consequences: an unmatched pair that a human can explain can only be
-  resolved through remediation + reperformance, waiver or carry-forward;
-  reconciliation-intelligence-svc's suggestions have no command here to act
-  through; and the §28 manual-match-rate metric is reported as unavailable
-  (`internal/domain/monitoring.go`). Scope: `POST /controls/v1/runs/{id}/manual-matches`
-  with the §10/§27 rules — explicit permission, reason, evidence reference,
-  amounts must agree within the run's pinned tolerance (scenario 06), blocked
-  where an own-transaction rule applies.
+- **A5. No manual match (§10). — Closed (B11), one sub-item not enforced.**
+  `POST /controls/v1/runs/{run_id}/manual-matches` (`FINCTRL_MANUAL_MATCH`,
+  access-control-svc migration 000024) records a human-asserted pairing of
+  records a run's automatic matching left unmatched: explicit permission,
+  mandatory `reason` and `evidence_ref`, amounts summed from the run's own
+  frozen side A/B populations and compared against the run's pinned
+  tolerance exactly as the engine does (absolute only — the engine itself
+  does not yet combine a percentage tolerance into execution, a pre-existing
+  gap this does not invent a fix for). A difference beyond that tolerance is
+  refused outright, never recorded (§10 "cannot hide amount difference"), a
+  different currency on each side is refused (no FX without an approved
+  basis), an unknown record id is refused, and a certified run's manual
+  matches are refused (Invariant 2/9: sealed evidence). Rows live in their
+  own `manual_matches` table, not `match_results` — a manual match has no
+  algorithm version to record (Invariant 16), and conflating the two would
+  misrepresent a human decision as an algorithmic one. `GET
+  .../manual-matches` lists them. The §28 `manual_match_rate` signal is now
+  computed (`internal/domain/monitoring.go`), not reported unavailable.
+  **Not enforced:** §27's "blocked if own-transaction rule applies" — no
+  population record this service receives carries who created or posted it
+  (`control-population-contract.md` defines no such field, confirmed by
+  re-reading it for this change), so there is no input to enforce that rule
+  against. This is the same class of gap as A8 (cross-currency, blocked on
+  an FX-rate capability this service lacks), not an oversight.
 - **A6. Run-level reperformance is not implemented.** The `REMEDIATION` and
   `REPERFORMANCE` lifecycle states exist but nothing enters them, and §25's
   `POST /runs/{id}:reperform` has no equivalent. Reperformance is recorded per
