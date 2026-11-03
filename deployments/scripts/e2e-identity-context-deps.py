@@ -14,11 +14,19 @@ local compose stack, so a failure names the edge that is broken:
   mtls-management-svc         authorization-svc's server identity
   kafka outbox                identity.subject.merged and principal.status.changed
 
+It also proves, live, that every login presents the console's confidential
+client (IDP_CLIENT_AUTH=required), that the Password resets register lists a
+reset with its requester, and that a passkey (WebAuthn, AU-11) registers,
+steps a session up to PHISHING_RESISTANT, and is revoked. The passkey is a
+software authenticator (P-256, "none" attestation) built on the `cryptography`
+package.
+
     python deployments/scripts/e2e-identity-context-deps.py
 
 Run seed-demo-rbac.ps1 and seed-demo-registry.ps1 first; the demo admin needs
 their grants. Writes are undone where they can be: the TOTP factor enrolled for
-the step-up is revoked, the person created for the reset check is disabled.
+the step-up and the passkey are revoked, the person created for the reset
+check is disabled.
 Merged service accounts stay merged (a merge is final by design).
 
 Exit status is the number of failed checks.
@@ -33,6 +41,11 @@ ADMIN = "33333333-3333-3333-3333-333333333333"
 
 H = "http://127.0.0.1"
 IDENTITY, AUTHZ, REGISTRY, ACCESS, MTLS = f"{H}:8080", f"{H}:8089", f"{H}:8081", f"{H}:8137", f"{H}:8140"
+
+# The console's confidential client (deployments/identity/idp-clients.local.json
+# holds the SHA-256 of this local-only secret).
+CONSOLE_CLIENT_ID = os.environ.get("IDENTITY_CONSOLE_CLIENT_ID", "zoiko-console")
+CONSOLE_CLIENT_SECRET = os.environ.get("IDENTITY_CONSOLE_CLIENT_SECRET", "local-dev-console-client-secret")
 
 results = []
 
@@ -95,10 +108,75 @@ def totp(secret_b32, at=None, step=30, digits=6):
     return str(code).zfill(digits)
 
 
-def login(password):
-    s, _, b = call("POST", f"{IDENTITY}/v1/authenticate", {"Content-Type": "application/json"},
-                   {"tenant_id": TENANT, "email": "admin@zoikosuite.com", "password": password})
+def login(password, client=True):
+    body = {"tenant_id": TENANT, "email": "admin@zoikosuite.com", "password": password}
+    if client:
+        body.update(client_id=CONSOLE_CLIENT_ID, client_secret=CONSOLE_CLIENT_SECRET)
+    s, _, b = call("POST", f"{IDENTITY}/v1/authenticate", {"Content-Type": "application/json"}, body)
     return s, b
+
+
+def claims(jwt):
+    part = jwt.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+
+
+# ── a software passkey: P-256, "none" attestation ────────────────────────────
+
+def b64u(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def cbor(v):
+    """The CBOR subset WebAuthn needs: ints, bytes, text, maps."""
+    def head(major, n):
+        if n < 24:
+            return bytes([major << 5 | n])
+        for size, code in ((1, 24), (2, 25), (4, 26), (8, 27)):
+            if n < 1 << (8 * size):
+                return bytes([major << 5 | code]) + n.to_bytes(size, "big")
+    if isinstance(v, int):
+        return head(0, v) if v >= 0 else head(1, -1 - v)
+    if isinstance(v, bytes):
+        return head(2, len(v)) + v
+    if isinstance(v, str):
+        return head(3, len(v.encode())) + v.encode()
+    if isinstance(v, dict):
+        return head(5, len(v)) + b"".join(cbor(k) + cbor(x) for k, x in v.items())
+    raise TypeError(type(v))
+
+
+class Passkey:
+    def __init__(self, rp_id, origin):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        self.key, self.cred_id, self.counter = ec.generate_private_key(ec.SECP256R1()), os.urandom(16), 0
+        self.rp_id, self.origin = rp_id, origin
+
+    def _auth_data(self, flags, attested=b""):
+        return hashlib.sha256(self.rp_id.encode()).digest() + bytes([flags]) + self.counter.to_bytes(4, "big") + attested
+
+    def _client_data(self, typ, options):
+        return json.dumps({"type": typ, "challenge": options["publicKey"]["challenge"], "origin": self.origin,
+                           "crossOrigin": False}).encode()
+
+    def create(self, options):
+        n = self.key.public_key().public_numbers()
+        cose = cbor({1: 2, 3: -7, -1: 1, -2: n.x.to_bytes(32, "big"), -3: n.y.to_bytes(32, "big")})
+        attested = bytes(16) + len(self.cred_id).to_bytes(2, "big") + self.cred_id + cose
+        att = cbor({"fmt": "none", "attStmt": {}, "authData": self._auth_data(0x45, attested)})  # UP|UV|AT
+        return {"id": b64u(self.cred_id), "rawId": b64u(self.cred_id), "type": "public-key",
+                "response": {"clientDataJSON": b64u(self._client_data("webauthn.create", options)),
+                             "attestationObject": b64u(att), "transports": ["internal"]}}
+
+    def get(self, options, user_handle):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        self.counter += 1
+        cdj, ad = self._client_data("webauthn.get", options), self._auth_data(0x05)  # UP|UV
+        sig = self.key.sign(ad + hashlib.sha256(cdj).digest(), ec.ECDSA(hashes.SHA256()))
+        return {"id": b64u(self.cred_id), "rawId": b64u(self.cred_id), "type": "public-key",
+                "response": {"authenticatorData": b64u(ad), "clientDataJSON": b64u(cdj), "signature": b64u(sig),
+                             "userHandle": b64u(user_handle.encode())}}
 
 
 def resolve(access_token):
@@ -124,8 +202,12 @@ def health():
 # ── 1. login and resolve: postgres, redis, registry, authorization ───────────
 
 def session(password):
+    s, b = login(password, client=False)
+    check("login without the console client is refused (IDP_CLIENT_AUTH=required)",
+          s == 401 and b.get("code") == "invalid_client", f"HTTP {s} {b.get('code')}")
     s, b = login(password)
-    if not check("login: password authentication", s == 200 and b.get("access_token"), f"HTTP {s} {brief(b)}" if s != 200 else ""):
+    if not check("login: password authentication with the console client", s == 200 and b.get("access_token"),
+                 f"HTTP {s} {brief(b)}" if s != 200 else ""):
         return None
     s, b = resolve(b["access_token"])
     jwt, sid = b.get("envelope_jwt"), b.get("session_context_id")
@@ -207,6 +289,11 @@ def lifecycle(sess):
             s, _, b = call("POST", f"{IDENTITY}/v1/password-resets/{rr['request_id']}/decide", hdrs(sess["jwt"], write=True),
                            {"decision": "APPROVE"})
             check("reset requester cannot approve their own request", s in (401, 403), f"HTTP {s} {b.get('code')}")
+            s, _, b = call("GET", f"{IDENTITY}/v1/password-resets?filter[principal_id]={created['person']}&filter[status]=PENDING_APPROVAL",
+                           hdrs(sess["jwt"]))
+            rows = [x for x in b.get("items", []) if x.get("request_id") == rr["request_id"]]
+            check("password resets register lists the request with its requester",
+                  s == 200 and rows and rows[0].get("requested_by") == ADMIN, f"HTTP {s} {brief(b)}")
     s, _, b = call("POST", f"{IDENTITY}/v1/account/password/forgot", {"X-Tenant-Id": TENANT}, {"email": "nobody-" + email})
     s2, _, b2 = call("POST", f"{IDENTITY}/v1/account/password/forgot", {"X-Tenant-Id": TENANT}, {"email": "admin@zoikosuite.com"})
     check("forgot-password answers unknown and known accounts identically", s == s2 == 202 and b.get("detail") == b2.get("detail"), f"HTTP {s}/{s2}")
@@ -269,7 +356,62 @@ def merge(sess, created, password):
     return enr
 
 
-# ── 6. revocation reaches authorization-svc's introspection ──────────────────
+# ── 6. passkeys (WebAuthn, AU-11) ─────────────────────────────────────────────
+
+def passkeys(sess):
+    jwt = sess.get("mfa_jwt")
+    if not jwt:
+        check("passkey: preconditions", False, "no stepped-up session")
+        return None
+    s, _, b = call("POST", f"{IDENTITY}/v1/mfa/passkeys/register/begin", hdrs(sess["jwt"], write=True), {})
+    check("passkey beside TOTP needs a step-up", s == 403 and b.get("code") == "step_up_required", f"HTTP {s} {b.get('code')}")
+    s, _, b = call("POST", f"{IDENTITY}/v1/mfa/passkeys/register/begin", hdrs(jwt, write=True), {})
+    pkopts = (b.get("options") or {}).get("publicKey", {})
+    if not check("passkey registration begins (user verification required)",
+                 s == 200 and b.get("ceremony") and pkopts.get("authenticatorSelection", {}).get("userVerification") == "required",
+                 f"HTTP {s} {brief(b)}"):
+        return None
+    rp_id = pkopts["rp"]["id"]
+    pk = Passkey(rp_id, f"http://{rp_id}:8080")
+    s, _, cred = call("POST", f"{IDENTITY}/v1/mfa/passkeys/register/finish", hdrs(jwt, write=True),
+                      {"ceremony": b["ceremony"], "nickname": "e2e software key", "credential": pk.create(b["options"])})
+    if not check("passkey registered (attestation verified)", s == 201 and cred.get("credential_id") == b64u(pk.cred_id),
+                 f"HTTP {s} {brief(cred)}"):
+        return None
+
+    s, _, b = call("POST", f"{IDENTITY}/v1/authenticate/step-up/passkey/begin", hdrs(sess["jwt"], write=True), {})
+    if check("passkey step-up begins", s == 200 and b.get("ceremony"), f"HTTP {s} {brief(b)}"):
+        pk.origin = "https://phish.example"
+        s, _, r = call("POST", f"{IDENTITY}/v1/authenticate/step-up/passkey/finish", hdrs(sess["jwt"], write=True),
+                       {"ceremony": b["ceremony"], "credential": pk.get(b["options"], ADMIN)})
+        pk.origin = f"http://{rp_id}:8080"
+        check("an assertion from another origin is refused", s == 401 and r.get("code") == "passkey_rejected", f"HTTP {s} {r.get('code')}")
+    s, _, b = call("POST", f"{IDENTITY}/v1/authenticate/step-up/passkey/begin", hdrs(sess["jwt"], write=True), {})
+    opts = b.get("options") or {"publicKey": {"challenge": ""}}
+    s, _, su = call("POST", f"{IDENTITY}/v1/authenticate/step-up/passkey/finish", hdrs(sess["jwt"], write=True),
+                    {"ceremony": b.get("ceremony", ""), "credential": pk.get(opts, ADMIN)})
+    if check("passkey step-up mints a login token with amr pwd,hwk", s == 200 and su.get("amr") == ["pwd", "hwk"], f"HTTP {s} {brief(su)}"):
+        s, r = resolve(su["access_token"])
+        posture = claims(r["envelope_jwt"]).get("session_trust_posture", {}) if r.get("envelope_jwt") else {}
+        check("resolve after a passkey step-up: PHISHING_RESISTANT, MFA-verified envelope",
+              posture.get("assurance_level") == "PHISHING_RESISTANT" and posture.get("mfa_verified"), f"HTTP {s} {brief(posture)}")
+        s, _, again = call("POST", f"{IDENTITY}/v1/authenticate/step-up/passkey/finish", hdrs(sess["jwt"], write=True),
+                           {"ceremony": b.get("ceremony", ""), "credential": pk.get(opts, ADMIN)})
+        check("a spent ceremony is refused", s == 400 and again.get("code") == "ceremony_invalid", f"HTTP {s} {again.get('code')}")
+    s, _, ev = call("GET", f"{IDENTITY}/v1/authentication-events?filter[principal_id]={ADMIN}&page_size=10", hdrs(sess["jwt"]))
+    check("sign-in events: the passkey step-up recorded at PASSKEY",
+          any(e.get("event_type") == "STEP_UP" and e.get("assurance_level") == "PASSKEY" for e in ev.get("items", [])),
+          f"HTTP {s} {len(ev.get('items', []))} events")
+    out = psql("SELECT string_agg(DISTINCT event_type, ',') FROM event_outbox "
+               f"WHERE partition_key = '{ADMIN}' AND payload::text LIKE '%{b64u(pk.cred_id)}%'")
+    check("outbox: passkey enrolled + step-up events written with their rows",
+          "identity.mfa_factor.enrolled" in out and "identity.step_up.succeeded" in out, out)
+    s, _, lst = call("GET", f"{IDENTITY}/v1/mfa/factors", hdrs(sess["jwt"]))
+    check("factor list shows the passkey", any(f.get("type") == "WEBAUTHN" for f in lst.get("factors", [])), f"HTTP {s}")
+    return pk
+
+
+# ── 7. revocation reaches authorization-svc's introspection ──────────────────
 
 def revocation(password):
     s, b = login(password)
@@ -291,7 +433,11 @@ def revocation(password):
     check("authz refuses the revoked envelope within the revocation TTL", s == 401, f"HTTP {s} after {time.time() - t0:.1f}s")
 
 
-def undo(sess, enr, created):
+def undo(sess, enr, created, pk=None):
+    if pk and sess.get("mfa_jwt"):
+        s, _, b = call("POST", f"{IDENTITY}/v1/mfa/passkeys/revoke", hdrs(sess["mfa_jwt"], write=True),
+                       {"credential_id": b64u(pk.cred_id), "reason_code": "E2E_CLEANUP"})
+        check("undo: passkey revoked", s == 200, f"HTTP {s} {brief(b)}")
     if enr and sess.get("mfa_jwt"):
         s, _, b = call("POST", f"{IDENTITY}/v1/mfa/totp/revoke", hdrs(sess["mfa_jwt"], write=True),
                        {"factor_id": enr["factor_id"], "reason_code": "E2E_CLEANUP"})
@@ -316,8 +462,9 @@ def main():
     authz_edge(sess)
     created = lifecycle(sess)
     enr = merge(sess, created, a.password)
+    pk = passkeys(sess)
     revocation(a.password)
-    undo(sess, enr, created)
+    undo(sess, enr, created, pk)
     failed = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
     return len(failed)
