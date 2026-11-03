@@ -46,6 +46,10 @@ var registeredActionMigrations = []struct {
 		"PAYMENT_TERM_SUPERSEDE": "HIGH",
 		"PAYMENT_TERM_RETIRE":    "HIGH",
 	}},
+	{"000042_register_identity_read_actions", "identity-context-svc", map[string]string{
+		"IDENTITY_SUBJECT_READ":    "STANDARD",
+		"IDENTITY_AUTH_EVENT_READ": "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

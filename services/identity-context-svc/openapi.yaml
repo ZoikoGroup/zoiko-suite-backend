@@ -344,6 +344,84 @@ components:
               detail: { type: string }
         current_version: { type: integer, format: int64 }
 
+    AssuranceObservation:
+      type: object
+      required: [observation_id, principal_id, observed_at, assurance_level, change_kind, auth_methods]
+      properties:
+        observation_id: { type: string }
+        principal_id: { type: string }
+        session_id: { type: string }
+        observed_at: { type: string, format: date-time }
+        assurance_level: { type: string, enum: [SINGLE_FACTOR, MFA, PHISHING_RESISTANT] }
+        previous_level: { type: string, enum: [SINGLE_FACTOR, MFA, PHISHING_RESISTANT], description: "Absent on the first observation of a session." }
+        change_kind: { type: string, enum: [ESTABLISHED, STEP_UP, DOWNGRADE, METHODS_CHANGED] }
+        auth_methods: { type: array, items: { type: string }, description: "Authentication method references such as pwd, otp, fed." }
+        idp_id: { type: string }
+        correlation_id: { type: string }
+
+    AssuranceHistoryPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/AssuranceObservation' } }
+        next_cursor: { type: string, description: "Empty on the last page." }
+
+    SubjectIdentity:
+      type: object
+      required: [principal_id, tenant_id, status, link_count, active_link_count, live_sessions]
+      properties:
+        principal_id: { type: string }
+        tenant_id: { type: string }
+        principal_type: { type: string }
+        status: { type: string }
+        display_name: { type: string }
+        email: { type: string }
+        external_id: { type: string }
+        source: { type: string }
+        link_count: { type: integer }
+        active_link_count: { type: integer }
+        live_sessions: { type: integer }
+        current_assurance: { $ref: '#/components/schemas/AssuranceObservation' }
+
+    IdentityLink:
+      type: object
+      required: [link_id, issuer, subject, principal_id, status]
+      properties:
+        link_id: { type: string }
+        connection_id: { type: string }
+        issuer: { type: string }
+        subject: { type: string }
+        principal_id: { type: string }
+        status: { type: string, enum: [ACTIVE, SUSPENDED, DEPROVISIONED] }
+        link_source: { type: string, enum: [SCIM, JIT, ADMIN] }
+        linked_by: { type: string }
+        created_at: { type: string, format: date-time }
+        last_login_at: { type: string, format: date-time }
+        deprovisioned_at: { type: string, format: date-time }
+
+    AuthenticationEvent:
+      type: object
+      required: [event_id, event_type, outcome, source, occurred_at]
+      properties:
+        event_id: { type: string }
+        event_type: { type: string }
+        outcome: { type: string }
+        reason: { type: string }
+        source: { type: string, enum: [DECISION_LOG, FEDERATION_LOGIN_LOG, AUTH_SESSION] }
+        occurred_at: { type: string, format: date-time }
+        correlation_id: { type: string }
+        session_id: { type: string }
+        issuer: { type: string }
+        connection_id: { type: string }
+        mfa_asserted: { type: boolean }
+
+    AuthenticationEventPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/AuthenticationEvent' } }
+        next_cursor: { type: string, description: "Empty on the last page." }
+
     ResolveResponseV2:
       type: object
       description: |
@@ -817,8 +895,8 @@ paths:
 
   /v1/context/session/{sessionContextId}/invalidate:
     post:
-      summary: Invalidate a session
-      operationId: invalidateSession
+      summary: RevokeSession - invalidate a session
+      operationId: revokeSession
       description: |
         Appends invalidated_at to the SessionContext record and evicts from cache.
         **Idempotent** — re-submitting against an already-invalidated session is a no-op.
@@ -909,8 +987,8 @@ paths:
 
   /v1/principals/{principalId}/status:
     put:
-      summary: Transition principal status
-      operationId: updatePrincipalStatus
+      summary: Transition principal status (ORG-01 DisableIdentity when the status is DISABLED)
+      operationId: disableIdentity
       description: |
         Status transitions only (ACTIVE, SUSPENDED, DISABLED).
         No soft-delete per doctrine (data-model §2.11).
@@ -2288,8 +2366,8 @@ paths:
 
   /v1/federation/links:
     post:
-      summary: Link an external subject to an existing principal (administrator's decision)
-      operationId: linkExternalSubject
+      summary: LinkIdentityProvider - link an external subject to an existing principal (administrator's decision)
+      operationId: linkIdentityProvider
       responses:
         "201": { description: Linked }
         "409": { description: The external subject or the principal is already linked, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
@@ -2633,6 +2711,101 @@ paths:
       responses:
         "204": { description: Deprovisioned }
         "404": { description: No such user }
+
+  # -- ORG-01 (ZS-SVC-I-001 s4.1) reads. operationId is the spec's own name. -----
+
+  /v1/identities/{principalId}:
+    parameters:
+      - name: principalId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: GetSubjectIdentity - a subject with its link and session counts and its latest assurance
+      operationId: getSubjectIdentity
+      description: |
+        Reading your own identity needs no grant; reading another's needs IDENTITY_SUBJECT_READ. A subject of another
+        tenant is 404, never 403, so the id is not confirmed to exist elsewhere.
+      responses:
+        "200":
+          description: The subject identity
+          content: { application/json: { schema: { $ref: '#/components/schemas/SubjectIdentity' } } }
+        "401": { description: No verified tenant or principal, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": { description: Not permitted, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { description: Not found in this tenant, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "501": { description: Identity reads are not configured, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/identities/{principalId}/links:
+    parameters:
+      - name: principalId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: ListIdentityLinks - the external identities linked to a subject
+      operationId: listIdentityLinks
+      description: IDENTITY_SUBJECT_READ unless the subject is the caller. An unknown subject is 404, not an empty list.
+      parameters:
+        - { name: issuer, in: query, required: false, schema: { type: string }, description: Only links at this issuer }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+      responses:
+        "200":
+          description: The links, newest first
+          content: { application/json: { schema: { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/IdentityLink' } } } } } }
+        "400": { description: Invalid limit, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": { description: Not permitted, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { description: Not found in this tenant, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/identities/{principalId}/assurance-history:
+    parameters:
+      - name: principalId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: GetAssuranceHistory - every recorded assurance level of a subject
+      operationId: getAssuranceHistory
+      description: |
+        IDENTITY_SUBJECT_READ unless the subject is the caller. Each login, step-up and change of a session's level
+        or methods is one append-only observation, captured by the database so no sign-in path can omit it. An
+        observation holds levels and methods, never a code, token or secret.
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: The next_cursor of the previous page }
+      responses:
+        "200":
+          description: A page, newest first
+          content: { application/json: { schema: { $ref: '#/components/schemas/AssuranceHistoryPage' } } }
+        "400": { description: "Invalid limit or cursor", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": { description: Not permitted, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { description: Not found in this tenant, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/identities/{principalId}/authentication-events:
+    parameters:
+      - name: principalId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: ListAuthenticationEvents - the sign-in and second-factor events of a subject
+      operationId: listAuthenticationEvents
+      description: |
+        IDENTITY_AUTH_EVENT_READ unless the subject is the caller. One read model over the decision log (password
+        and second-factor outcomes), the federated login log and the ending of login sessions.
+      parameters:
+        - { name: event_type, in: query, required: false, schema: { type: string, enum: [AUTHENTICATE, MFA_LOGIN, MFA_STEP_UP, MFA_ENROL, MFA_ACTIVATE, MFA_REVOKE, MFA_RESET, FEDERATED_LOGIN, SESSION_ENDED] } }
+        - { name: outcome, in: query, required: false, schema: { type: string } }
+        - { name: since, in: query, required: false, schema: { type: string, format: date-time }, description: Inclusive }
+        - { name: until, in: query, required: false, schema: { type: string, format: date-time }, description: Exclusive }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: A page, newest first
+          content: { application/json: { schema: { $ref: '#/components/schemas/AuthenticationEventPage' } } }
+        "400": { description: "Invalid filter, limit or cursor", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": { description: Not permitted, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { description: Not found in this tenant, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /health:
     get:
