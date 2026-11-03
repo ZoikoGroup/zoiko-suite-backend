@@ -27,6 +27,12 @@ const (
 	CommandApproveAccrual = "ApproveAccrual"
 	CommandAmendAccrual  = "AmendFutureSchedule"
 	CommandCancelAccrual = "CancelAccrual"
+
+	// ACC-08 prepayment lifecycle commands (SPEC_DEVIATIONS A11), the mirror
+	// of the ACC-07 set above; each claims targetPrepaymentSchedule.
+	CommandApprovePrepayment  = "ApprovePrepayment"
+	CommandModifyPrepayment   = "ModifyPrepayment"
+	CommandTerminatePrepayment = "TerminatePrepayment"
 )
 
 // claimTarget is the command_idempotency column naming what a command

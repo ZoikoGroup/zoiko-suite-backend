@@ -1062,34 +1062,62 @@ func (s *PgStore) ListPrepaymentSchedules(ctx context.Context, legalEntityID str
 	return out, nil
 }
 
+// transitionPrepaymentStatusTx is transitionPrepaymentStatus's body, taking
+// an already-open transaction so a claim-protected caller
+// (ApprovePrepaymentSchedule) can run the guarded UPDATE and the
+// command_idempotency claim in one transaction.
+func (s *PgStore) transitionPrepaymentStatusTx(ctx context.Context, tx pgx.Tx, scheduleID, fromStatus, toStatus, setClause string, args ...any) error {
+	query := fmt.Sprintf(`UPDATE prepayment_schedules SET status = $3%s WHERE schedule_id = $1 AND status = $2`, setClause)
+	tag, err := tx.Exec(ctx, query, transitionArgs(scheduleID, fromStatus, toStatus, args)...)
+	if err != nil {
+		return mapPgError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM prepayment_schedules WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
+			return mapPgError(err)
+		}
+		if !exists {
+			return domain.ErrPrepaymentNotFound
+		}
+		return domain.ErrInvalidPrepaymentTransition
+	}
+	return nil
+}
+
+// transitionPrepaymentStatus is used by the internal, non-claim-protected
+// transitions (Activate, Complete).
 func (s *PgStore) transitionPrepaymentStatus(ctx context.Context, scheduleID, fromStatus, toStatus, setClause string, args ...any) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := fmt.Sprintf(`UPDATE prepayment_schedules SET status = $3%s WHERE schedule_id = $1 AND status = $2`, setClause)
-		tag, err := tx.Exec(ctx, query, transitionArgs(scheduleID, fromStatus, toStatus, args)...)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM prepayment_schedules WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
-				return mapPgError(err)
-			}
-			if !exists {
-				return domain.ErrPrepaymentNotFound
-			}
-			return domain.ErrInvalidPrepaymentTransition
-		}
-		return nil
+		return s.transitionPrepaymentStatusTx(ctx, tx, scheduleID, fromStatus, toStatus, setClause, args...)
 	})
 }
 
-func (s *PgStore) ApprovePrepaymentSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error {
-	return s.transitionPrepaymentStatus(ctx, scheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved,
-		`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+// loadPrepaymentSchedule is the transitionWithClaim load callback shared by
+// Approve/Modify/Terminate: on a replay, *sch is overwritten with the
+// schedule as it now stands, the same contract CreatePrepaymentSchedule gives.
+func loadPrepaymentSchedule(ctx context.Context, tx pgx.Tx, sch *domain.PrepaymentSchedule, id string) error {
+	existing, err := scanPrepaymentSchedule(tx.QueryRow(ctx, `SELECT `+prepaymentScheduleColumns+` FROM prepayment_schedules WHERE schedule_id = $1`, id))
+	if err != nil {
+		return err
+	}
+	*sch = *existing
+	return nil
+}
+
+// ApprovePrepaymentSchedule moves sch from DRAFT to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApprovePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApprovePrepayment, requestHash, targetPrepaymentSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			return s.transitionPrepaymentStatusTx(ctx, tx, sch.ScheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved,
+				`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+		},
+		func(tx pgx.Tx, id string) error { return loadPrepaymentSchedule(ctx, tx, sch, id) })
 }
 
 // ActivatePrepaymentSchedule moves APPROVED -> ACTIVE on the first
@@ -1107,35 +1135,66 @@ func (s *PgStore) CompletePrepaymentSchedule(ctx context.Context, scheduleID str
 	return s.transitionPrepaymentStatus(ctx, scheduleID, domain.PrepaymentStatusActive, domain.PrepaymentStatusCompleted, "")
 }
 
-func (s *PgStore) TerminatePrepaymentSchedule(ctx context.Context, scheduleID, fromStatus, principalID, reason, treatment string, at time.Time) error {
-	return s.transitionPrepaymentStatus(ctx, scheduleID, fromStatus, domain.PrepaymentStatusTerminated,
-		`, terminated_at = $4, terminated_by_principal_id = $5, termination_reason = $6, termination_final_treatment = $7`,
-		at, principalID, reason, treatment)
+// TerminatePrepaymentSchedule moves sch to TERMINATED from any status except
+// COMPLETED or TERMINATED, claiming idempotencyKey in the same transaction
+// (SPEC_DEVIATIONS A11).
+//
+// The guard is a fixed disallowed set, not "= fromStatus" — see
+// CancelAccrualSchedule's doc comment for why a caller-supplied fromStatus
+// (the schedule's status at GET time) is unsafe as the sole guard: on an
+// already-committed replay it would read TERMINATED, and comparing against
+// that value would let the UPDATE re-terminate (or, on a stale read, wrongly
+// terminate a COMPLETED schedule).
+func (s *PgStore) TerminatePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, principalID, reason, treatment, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandTerminatePrepayment, requestHash, targetPrepaymentSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE prepayment_schedules
+				SET status = $2, terminated_at = $3, terminated_by_principal_id = $4,
+				    termination_reason = $5, termination_final_treatment = $6
+				WHERE schedule_id = $1 AND status NOT IN ($7, $8)
+			`, sch.ScheduleID, domain.PrepaymentStatusTerminated, at, principalID, reason, treatment,
+				domain.PrepaymentStatusCompleted, domain.PrepaymentStatusTerminated)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM prepayment_schedules WHERE schedule_id = $1)`, sch.ScheduleID).Scan(&exists); err != nil {
+					return mapPgError(err)
+				}
+				if !exists {
+					return domain.ErrPrepaymentNotFound
+				}
+				return domain.ErrInvalidPrepaymentTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return loadPrepaymentSchedule(ctx, tx, sch, id) })
 }
 
-// ModifyFutureSchedule updates the FUTURE shape of an APPROVED/ACTIVE
-// schedule. The handler is responsible for verifying periodCount does not
-// drop below the number of periods already recognized before calling this
-// (ErrModifyWouldDropRecognizedPeriods) — only it has counted recognition
-// instances.
-func (s *PgStore) ModifyFuturePrepaymentSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE prepayment_schedules SET total_amount = $1, period_count = $2
-			WHERE schedule_id = $3 AND status IN ($4, $5)
-		`, totalAmount, periodCount, scheduleID, domain.PrepaymentStatusApproved, domain.PrepaymentStatusActive)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidPrepaymentTransition
-		}
-		return nil
-	})
+// ModifyFuturePrepaymentSchedule updates the FUTURE shape of an
+// APPROVED/ACTIVE schedule, claiming idempotencyKey in the same transaction
+// (SPEC_DEVIATIONS A11). The handler is responsible for verifying
+// periodCount does not drop below the number of periods already recognized
+// before calling this (ErrModifyWouldDropRecognizedPeriods) — only it has
+// counted recognition instances.
+func (s *PgStore) ModifyFuturePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, totalAmount float64, periodCount int, idempotencyKey, requestHash string) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandModifyPrepayment, requestHash, targetPrepaymentSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE prepayment_schedules SET total_amount = $1, period_count = $2
+				WHERE schedule_id = $3 AND status IN ($4, $5)
+			`, totalAmount, periodCount, sch.ScheduleID, domain.PrepaymentStatusApproved, domain.PrepaymentStatusActive)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return domain.ErrInvalidPrepaymentTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return loadPrepaymentSchedule(ctx, tx, sch, id) })
 }
 
 const prepaymentRecognitionColumns = `

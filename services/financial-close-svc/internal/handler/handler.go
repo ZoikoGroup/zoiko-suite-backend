@@ -84,11 +84,13 @@ type Store interface {
 	CreatePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, idempotencyKey, requestHash string) (replay bool, err error)
 	GetPrepaymentSchedule(ctx context.Context, scheduleID string) (*domain.PrepaymentSchedule, error)
 	ListPrepaymentSchedules(ctx context.Context, legalEntityID string) ([]domain.PrepaymentSchedule, error)
-	ApprovePrepaymentSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error
+	// Approve/Modify/Terminate claim the caller's Idempotency-Key the same
+	// way the ACC-07 accrual lifecycle does (SPEC_DEVIATIONS A11).
+	ApprovePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	ActivatePrepaymentSchedule(ctx context.Context, scheduleID string) error
 	CompletePrepaymentSchedule(ctx context.Context, scheduleID string) error
-	TerminatePrepaymentSchedule(ctx context.Context, scheduleID, fromStatus, principalID, reason, treatment string, at time.Time) error
-	ModifyFuturePrepaymentSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error
+	TerminatePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, principalID, reason, treatment, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
+	ModifyFuturePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, totalAmount float64, periodCount int, idempotencyKey, requestHash string) (replay bool, err error)
 	CreatePrepaymentRecognition(ctx context.Context, inst *domain.PrepaymentRecognitionInstance) (created bool, err error)
 	ListPrepaymentRecognitions(ctx context.Context, scheduleID string) ([]domain.PrepaymentRecognitionInstance, error)
 
@@ -2340,6 +2342,10 @@ func (h *Handler) ListPrepayments(w http.ResponseWriter, r *http.Request) {
 // (also migration 000021's sod_prepayment_approver_independent).
 func (h *Handler) ApprovePrepayment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -2361,12 +2367,11 @@ func (h *Handler) ApprovePrepayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.ApprovePrepaymentSchedule(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ ScheduleID string }{id})
+	if _, err := h.store.ApprovePrepaymentSchedule(r.Context(), sch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writePrepaymentStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.PrepaymentStatusApproved
-	sch.ApprovedAt, sch.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -2377,6 +2382,10 @@ func (h *Handler) ApprovePrepayment(w http.ResponseWriter, r *http.Request) {
 // refused, since recognized history is permanent evidence.
 func (h *Handler) ModifyPrepayment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.ModifyFutureScheduleRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -2414,11 +2423,14 @@ func (h *Handler) ModifyPrepayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.ModifyFuturePrepaymentSchedule(r.Context(), id, req.TotalAmount, req.PeriodCount); err != nil {
+	requestHash := requestFingerprint(struct {
+		ScheduleID string
+		Req        domain.ModifyFutureScheduleRequest
+	}{id, req})
+	if _, err := h.store.ModifyFuturePrepaymentSchedule(r.Context(), sch, req.TotalAmount, req.PeriodCount, idempotencyKey, requestHash); err != nil {
 		h.writePrepaymentStoreErr(w, err)
 		return
 	}
-	sch.TotalAmount, sch.PeriodCount = req.TotalAmount, req.PeriodCount
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -2627,6 +2639,10 @@ func (h *Handler) GetPrepaymentRemainingBalance(w http.ResponseWriter, r *http.R
 // silence.
 func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.TerminatePrepaymentRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -2661,11 +2677,15 @@ func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	if sch.Status == domain.PrepaymentStatusCompleted || sch.Status == domain.PrepaymentStatusTerminated {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidPrepaymentTransition))
-		return
-	}
-
+	// The COMPLETED/TERMINATED refusal is enforced by the store's own fixed
+	// guard now, not here: sch.Status is this GET's snapshot, so checking it
+	// here would reject a legitimate replay of an already-terminated schedule
+	// before the Idempotency-Key claim lookup ever runs (the same ordering
+	// bug CancelFutureAccrual had). A replay's RECOGNIZE_REMAINING branch
+	// below still runs, harmlessly: general-ledger-svc dedups on the
+	// schedule:period correlation id, and CreatePrepaymentRecognition dedups
+	// on its own (schedule_id, fiscal_period) constraint, so re-running it
+	// re-reads the existing journal/evidence rather than duplicating them.
 	if req.FinalBalanceTreatment == domain.TerminationTreatmentRecognizeRemaining {
 		recognized, err := h.store.ListPrepaymentRecognitions(r.Context(), id)
 		if err != nil {
@@ -2728,13 +2748,14 @@ func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	if err := h.store.TerminatePrepaymentSchedule(r.Context(), id, sch.Status, principalID, req.Reason, req.FinalBalanceTreatment, now); err != nil {
+	requestHash := requestFingerprint(struct {
+		ScheduleID string
+		Req        domain.TerminatePrepaymentRequest
+	}{id, req})
+	if _, err := h.store.TerminatePrepaymentSchedule(r.Context(), sch, principalID, req.Reason, req.FinalBalanceTreatment, idempotencyKey, requestHash, now); err != nil {
 		h.writePrepaymentStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.PrepaymentStatusTerminated
-	sch.TerminatedAt, sch.TerminatedByPrincipalID = &now, &principalID
-	sch.TerminationReason, sch.TerminationFinalTreatment = &req.Reason, &req.FinalBalanceTreatment
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -2748,6 +2769,8 @@ func (h *Handler) writePrepaymentStoreErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("prepayment store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

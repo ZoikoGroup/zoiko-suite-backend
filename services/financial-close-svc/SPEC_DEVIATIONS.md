@@ -443,16 +443,17 @@ recorded under that id in the tenant.
 
 Every command row of the §9–§21 wireframes carries "Idempotency-Key;
 expected_version where stateful". B3 adds claims to the four creates that
-mint an aggregate with no natural key. B13 closes the accrual lifecycle slice
-below (Submit/Approve/Amend/Cancel). The remaining commands rely on natural
+mint an aggregate with no natural key. B10 closes the accrual lifecycle slice
+(Submit/Approve/Amend/Cancel); B11 closes the mirror prepayment slice below
+(Approve/Modify/Terminate). The remaining commands rely on natural
 keys or status guards, so a retry after a lost response returns a 4xx
 instead of the original result, or a duplicate append-only row:
 
 | Command | Replay today |
 |---|---|
-| Accrual submit/approve/amend/cancel | original result (B13, claimed) |
+| Accrual submit/approve/amend/cancel | original result (B10, claimed) |
 | Accrual recognize / reverse | original result (natural key) |
-| Prepayment approve/modify/terminate | 422 |
+| Prepayment approve/modify/terminate | original result (B11, claimed) |
 | Prepayment recognize | original result (natural key) |
 | Allocation approve/supersede | 422 |
 | Allocation execute / reprocess | original run (natural key / status) |
@@ -836,3 +837,32 @@ currency, and the platform has nothing to backfill it from.
     the new signatures and now also prove a *second, newly-keyed* cancel
     attempt on an already-cancelled schedule is still refused (as distinct
     from a replay of the same key).
+- **B11. The prepayment lifecycle claims an Idempotency-Key (closes A11's
+  prepayment row), mirroring B10.** `ApprovePrepayment`, `ModifyPrepayment`
+  and `TerminatePrepayment` now require `Idempotency-Key` and claim it via the
+  same `transitionWithClaim`, targeting `targetPrepaymentSchedule`.
+  - *Terminate's guard, not its journal path, is what changed.*
+    `TerminatePrepaymentSchedule` no longer takes a caller-supplied
+    `fromStatus`; like `CancelAccrualSchedule` it now refuses COMPLETED and
+    TERMINATED unconditionally in the UPDATE's own WHERE clause. The
+    handler's `COMPLETED/TERMINATED` pre-check (reading the GET's stale
+    `sch.Status`) was removed for the same reason B10 removed
+    `CancelFutureAccrual`'s: it would have rejected a legitimate replay
+    before the claim lookup ran. The RECOGNIZE_REMAINING branch above the
+    store call is unaffected and was not made claim-aware itself — it is
+    already replay-safe without one: general-ledger-svc dedups the final
+    settlement journal on the `schedule:TerminationPseudoPeriod` correlation
+    id, and `CreatePrepaymentRecognition` dedups the evidence row on its own
+    `UNIQUE(schedule_id, fiscal_period)` constraint, so a retried Terminate
+    re-reads both instead of duplicating either, exactly as the handler's own
+    pre-existing doc comment on that branch describes.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestApprovePrepayment_RetryUnderSameKeyReplays`,
+    `TestTerminatePrepayment_RetryAfterSuccess_Replays`) and
+    `internal/store/prepayment_lifecycle_idempotency_integration_test.go`
+    (replay for approve/modify/terminate, and a freshly-keyed terminate
+    attempt on an already-terminated schedule still refused), run against a
+    real, disposable Postgres container. The existing
+    `TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB` and
+    `TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB` were updated
+    for the new signatures.

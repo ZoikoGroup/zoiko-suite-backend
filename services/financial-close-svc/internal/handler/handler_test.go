@@ -661,12 +661,20 @@ func (s *stubStore) transitionPrepayment(scheduleID, fromStatus, toStatus string
 	return nil
 }
 
-func (s *stubStore) ApprovePrepaymentSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionPrepayment(scheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved); err != nil {
-		return err
+func (s *stubStore) ApprovePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApprovePrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
 	}
-	s.prepaymentSchedules[scheduleID].ApprovedAt, s.prepaymentSchedules[scheduleID].ApprovedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionPrepayment(sch.ScheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved); err != nil {
+		return false, err
+	}
+	s.prepaymentSchedules[sch.ScheduleID].ApprovedAt, s.prepaymentSchedules[sch.ScheduleID].ApprovedByPrincipalID = &at, &principalID
+	*sch = *s.prepaymentSchedules[sch.ScheduleID]
+	s.recordClaim(key, "ApprovePrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) ActivatePrepaymentSchedule(_ context.Context, scheduleID string) error {
@@ -687,29 +695,49 @@ func (s *stubStore) CompletePrepaymentSchedule(_ context.Context, scheduleID str
 	return s.transitionPrepayment(scheduleID, domain.PrepaymentStatusActive, domain.PrepaymentStatusCompleted)
 }
 
-func (s *stubStore) TerminatePrepaymentSchedule(_ context.Context, scheduleID, fromStatus, principalID, reason, treatment string, at time.Time) error {
-	if err := s.transitionPrepayment(scheduleID, fromStatus, domain.PrepaymentStatusTerminated); err != nil {
-		return err
+func (s *stubStore) TerminatePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, principalID, reason, treatment, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "TerminatePrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
 	}
-	sch := s.prepaymentSchedules[scheduleID]
-	sch.TerminatedAt, sch.TerminatedByPrincipalID = &at, &principalID
-	sch.TerminationReason, sch.TerminationFinalTreatment = &reason, &treatment
-	return nil
+	existing, ok := s.prepaymentSchedules[sch.ScheduleID]
+	if !ok {
+		return false, domain.ErrPrepaymentNotFound
+	}
+	if existing.Status == domain.PrepaymentStatusCompleted || existing.Status == domain.PrepaymentStatusTerminated {
+		return false, domain.ErrInvalidPrepaymentTransition
+	}
+	existing.Status = domain.PrepaymentStatusTerminated
+	existing.TerminatedAt, existing.TerminatedByPrincipalID = &at, &principalID
+	existing.TerminationReason, existing.TerminationFinalTreatment = &reason, &treatment
+	*sch = *existing
+	s.recordClaim(key, "TerminatePrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) ModifyFuturePrepaymentSchedule(_ context.Context, scheduleID string, totalAmount float64, periodCount int) error {
+func (s *stubStore) ModifyFuturePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, totalAmount float64, periodCount int, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ModifyPrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
+	}
 	if s.modifyPrepaymentErr != nil {
-		return s.modifyPrepaymentErr
+		return false, s.modifyPrepaymentErr
 	}
-	sch, ok := s.prepaymentSchedules[scheduleID]
+	existing, ok := s.prepaymentSchedules[sch.ScheduleID]
 	if !ok {
-		return domain.ErrPrepaymentNotFound
+		return false, domain.ErrPrepaymentNotFound
 	}
-	if sch.Status != domain.PrepaymentStatusApproved && sch.Status != domain.PrepaymentStatusActive {
-		return domain.ErrInvalidPrepaymentTransition
+	if existing.Status != domain.PrepaymentStatusApproved && existing.Status != domain.PrepaymentStatusActive {
+		return false, domain.ErrInvalidPrepaymentTransition
 	}
-	sch.TotalAmount, sch.PeriodCount = totalAmount, periodCount
-	return nil
+	existing.TotalAmount, existing.PeriodCount = totalAmount, periodCount
+	*sch = *existing
+	s.recordClaim(key, "ModifyPrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) CreatePrepaymentRecognition(_ context.Context, inst *domain.PrepaymentRecognitionInstance) (bool, error) {
@@ -2979,6 +3007,63 @@ func TestPrepaymentLifecycle_CreateApprove(t *testing.T) {
 	}
 	if sch.Status != domain.PrepaymentStatusApproved {
 		t.Errorf("expected APPROVED, got %q", sch.Status)
+	}
+}
+
+// TestApprovePrepayment_RetryUnderSameKeyReplays and
+// TestTerminatePrepayment_RetryAfterSuccess_Replays are the ACC-08 mirror of
+// the ACC-07 accrual tests above (SPEC_DEVIATIONS A11).
+func TestApprovePrepayment_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	req := domain.CreatePrepaymentRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Description: "x",
+		TotalAmount: 1200, StartFiscalPeriod: "2026-01", PeriodCount: 12,
+		DebitAccountCode: "6200-Insurance", CreditAccountCode: "1400-PrepaidInsurance",
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/prepayments/", req, "preparer-1")
+	var sch domain.PrepaymentSchedule
+	_ = json.NewDecoder(createRR.Body).Decode(&sch)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/prepayments/"+sch.ScheduleID+"/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/prepayments/"+sch.ScheduleID+"/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.PrepaymentSchedule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.PrepaymentStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
+func TestTerminatePrepayment_RetryAfterSuccess_Replays(t *testing.T) {
+	s := newStubStore()
+	s.prepaymentSchedules["ppy-1"] = &domain.PrepaymentSchedule{ScheduleID: "ppy-1", LegalEntityID: "le-1", Status: domain.PrepaymentStatusActive}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	termReq := domain.TerminatePrepaymentRequest{Reason: "contract ended", FinalBalanceTreatment: domain.TerminationTreatmentWriteOff}
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first terminate: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried terminate under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+
+	// A genuinely new attempt (a different key) against the now-TERMINATED
+	// schedule must still be refused.
+	again := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, uuid.NewString())
+	if again.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("new terminate attempt on an already-terminated schedule: want 422, got %d %s", again.Code, again.Body.String())
 	}
 }
 

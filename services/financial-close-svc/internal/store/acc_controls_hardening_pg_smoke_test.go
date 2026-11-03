@@ -80,7 +80,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreatePrepaymentSchedule(ctx, ppy, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreatePrepaymentSchedule: %v", err)
 	}
-	if err := s.ApprovePrepaymentSchedule(ctx, ppy.ScheduleID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApprovePrepaymentSchedule(ctx, ppy, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("prepayment self-approval: want ErrSelfApproval, got %v", err)
 	}
 
@@ -177,8 +177,8 @@ func TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB(t *testing.T) {
 	if _, err := s.CreatePrepaymentSchedule(ctx, ppy, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreatePrepaymentSchedule: %v", err)
 	}
-	if err := s.TerminatePrepaymentSchedule(ctx, ppy.ScheduleID, domain.PrepaymentStatusDraft, "terminator-1", "contract ended",
-		domain.TerminationTreatmentWriteOff, now); err != nil {
+	if _, err := s.TerminatePrepaymentSchedule(ctx, ppy, "terminator-1", "contract ended",
+		domain.TerminationTreatmentWriteOff, uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("TerminatePrepaymentSchedule: %v", err)
 	}
 	gotP, err := s.GetPrepaymentSchedule(ctx, ppy.ScheduleID)
