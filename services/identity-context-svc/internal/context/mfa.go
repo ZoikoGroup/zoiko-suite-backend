@@ -14,6 +14,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/mfa"
+	"zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/siem"
 )
@@ -578,6 +579,9 @@ func (s *MFAService) verifyCode(ctx context.Context, c *MFACaller, f *domain.TOT
 		}
 		reason, sev := "totp_mismatch", siem.SeverityMedium
 		if locked {
+			if ic8 := metrics.Default(); ic8 != nil {
+				ic8.LoginLockouts.Inc()
+			}
 			reason, sev = "totp_mismatch_factor_locked", siem.SeverityHigh
 		}
 		s.log.Warn("totp code rejected", zap.String("principal_id", pid), zap.String("action", action),
@@ -592,11 +596,21 @@ func (s *MFAService) verifyCode(ctx context.Context, c *MFACaller, f *domain.TOT
 	}, rec)
 	switch {
 	case errors.Is(err, domain.ErrTOTPReplayed):
+		if ic8 := metrics.Default(); ic8 != nil {
+			ic8.TOTPReplay.Inc()
+		}
 		s.evidence(ctx, c, action, "DENIED", "totp_replayed", correlationID)
 		s.refused(ctx, c, action, "totp_replayed", siem.SeverityHigh, correlationID)
 		return ErrInvalidCode
 	case err != nil:
 		return fmt.Errorf("%w: accept code: %v", ErrAuthUnavailable, err)
+	}
+	if ic8 := metrics.Default(); ic8 != nil {
+		if err == nil {
+			ic8.MFAVerifications.WithLabelValues("success").Inc()
+		} else {
+			ic8.MFAVerifications.WithLabelValues("failure").Inc()
+		}
 	}
 	return nil
 }

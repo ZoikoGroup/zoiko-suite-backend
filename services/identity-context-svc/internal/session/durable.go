@@ -10,6 +10,7 @@ import (
 
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/events"
+	"zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/outbox"
 )
 
@@ -256,6 +257,9 @@ func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, sc domain
 		}
 		if d.onRevoke != nil {
 			d.onRevoke(ctx, id, principalID, tenantID, domain.InvalidationReasonSessionConcurrencyCap, sc.CorrelationID)
+		}
+		if ic8 := metrics.Default(); ic8 != nil {
+			ic8.SessionRevoc.WithLabelValues(string(domain.InvalidationReasonSessionConcurrencyCap)).Inc()
 		}
 		revoked++
 	}

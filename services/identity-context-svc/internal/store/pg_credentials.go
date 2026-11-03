@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/metrics"
 )
 
 // Credential lookup and lockout bookkeeping.
@@ -230,6 +231,9 @@ func (s *PgStore) RecordAuthFailure(
 
 		outcome, basis := "DENIED", "password_mismatch"
 		if locked {
+			if ic8 := metrics.Default(); ic8 != nil {
+				ic8.LoginLockouts.Inc()
+			}
 			basis = "password_mismatch_account_locked"
 		}
 		return s.appendDecision(ctx, tx, principalID, tenantID, "AUTHENTICATE", outcome, basis, correlationID, now)

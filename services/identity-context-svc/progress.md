@@ -374,3 +374,46 @@ reason `iam.assignment.revoked` exists separately from `role.updated`.
 **Commits:**
 - `feat(identity-context-svc): IC-5 role projection + canonical event names` (this commit)
 
+## IC-8 — Observability metrics (2026-11-03)
+
+**What was wrong:** only `identity_login_throttled_total` existed (in
+internal/oidc/metrics.go, labelled by "reason" not "route"). The IC-8 golden
+signal counters — MFA verifications, login lockouts, TOTP replay refusals,
+session revocations by reason, password resets by decision — and the
+`identity_sessions_active` gauge did not exist.
+
+**What changed:**
+- `internal/metrics/metrics.go`: new `IC8` struct with all IC-8 instruments,
+  registered with Prometheus; `Default()`/`SetDefault()` for process-wide
+  access without threading through every constructor.
+- `internal/context/mfa.go`: `identity_mfa_verifications_total{outcome}`
+  incremented on VerifyCode success/failure; `identity_totp_replay_refusals_total`
+  incremented on replayed code; `identity_login_lockouts_total` incremented
+  when a TOTP factor locks.
+- `internal/store/pg_credentials.go`: `identity_login_lockouts_total`
+  incremented when `RecordAuthFailure` engages a lock.
+- `internal/ratelimit/ratelimit.go`: `identity_login_throttled_total{route}`
+  incremented on every 429 throttle decision.
+- `internal/session/durable.go`: `identity_session_revocations_total{reason}`
+  incremented on cap-eviction revocations.
+- `internal/lifecycle/service.go`: `identity_password_resets_total{decision}`
+  incremented on APPROVE/REJECT in DecideReset.
+- `cmd/server/main.go`: IC8 metrics created and set as default; import aliased
+  as `ic8metrics` to avoid shadowing the `metrics` variable from telemetry.
+
+**Evidence:**
+- `go test ./internal/...` — all non-store tests pass, including context,
+  session, lifecycle, ratelimit, oidc.
+- `go test ./internal/store/ -run TestPgStore` — pass against real Postgres
+  (gdl-test-pg:55432), including `TestPgStore_RecordAuthFailure_LocksAtThreshold`.
+- `go vet ./...` — clean.
+- `go build ./...` — clean.
+
+**Decision taken:** IC-8 metrics use a package-level `Default()` accessor
+rather than constructor injection, because the metrics are incremented from 6+
+packages and threading a handle through every constructor would touch ~15
+constructor signatures. The accessor is nil-safe, so the service works without
+metrics configured.
+
+**Commits:**
+- `feat(identity-context-svc): IC-8 observability metrics` (this commit)

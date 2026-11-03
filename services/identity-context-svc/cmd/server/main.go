@@ -36,6 +36,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/idempotency"
+	ic8metrics "zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/mfa"
 	"zoiko.io/identity-context-svc/internal/mtlslistener"
 	"zoiko.io/identity-context-svc/internal/oidc"
@@ -131,6 +132,10 @@ func main() {
 	// because a stopped relay produces no errors and no latency while every
 	// governance event this service emits piles up in a table.
 	govMetrics := telemetry.NewGovMetrics("identity-context-svc")
+
+	// IC-8 observability instruments.
+	ic8Metrics := ic8metrics.New(prometheus.DefaultRegisterer)
+	ic8metrics.SetDefault(ic8Metrics)
 
 	// ── Postgres pool ─────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())

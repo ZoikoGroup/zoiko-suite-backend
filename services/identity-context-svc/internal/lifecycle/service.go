@@ -19,6 +19,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/credential"
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/events"
+	"zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/store"
 )
@@ -447,6 +448,9 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision 
 		map[string]any{"request_id": requestID, "principal_id": r.PrincipalID, "decided_by": a.PrincipalID, "decision": decision})
 	if err != nil {
 		return nil, err
+	}
+	if ic8 := metrics.Default(); ic8 != nil {
+		ic8.PasswordResets.WithLabelValues(decision).Inc()
 	}
 	out, err := s.store.DecideResetRequest(ctx, a.TenantID, requestID,
 		domain.ResetApproval{ApproverID: a.PrincipalID, At: s.now(), Decision: decision},
