@@ -443,13 +443,14 @@ recorded under that id in the tenant.
 
 Every command row of the §9–§21 wireframes carries "Idempotency-Key;
 expected_version where stateful". B3 adds claims to the four creates that
-mint an aggregate with no natural key. The remaining commands rely on natural
+mint an aggregate with no natural key. B13 closes the accrual lifecycle slice
+below (Submit/Approve/Amend/Cancel). The remaining commands rely on natural
 keys or status guards, so a retry after a lost response returns a 4xx
 instead of the original result, or a duplicate append-only row:
 
 | Command | Replay today |
 |---|---|
-| Accrual submit/approve/amend/cancel | 422 `invalid_transition` |
+| Accrual submit/approve/amend/cancel | original result (B13, claimed) |
 | Accrual recognize / reverse | original result (natural key) |
 | Prepayment approve/modify/terminate | 422 |
 | Prepayment recognize | original result (natural key) |
@@ -790,3 +791,48 @@ currency, and the platform has nothing to backfill it from.
 - **B9. Housekeeping.** The duplicated `/v1/close/workflow-refs/{ref}` route
   registration was removed. gofmt corrected three small pre-existing
   misalignments in code this pass edited.
+- **B10. The accrual lifecycle claims an Idempotency-Key (closes A11's
+  accrual row).** `SubmitAccrual`, `ApproveAccrual`, `AmendFutureSchedule`
+  and `CancelFutureAccrual` now require `Idempotency-Key` and claim it in
+  `command_idempotency` (the same table B3 added) in the same transaction as
+  the guarded status UPDATE, via a new `transitionWithClaim` — `createWithClaim`
+  applied to a command that moves an existing resource instead of minting
+  one. A retry returns the schedule as it now stands (200) instead of 422
+  `invalid_transition` on a transition that already happened; the same key
+  reused for a different command or a different schedule is 409. The request
+  hash folds in the schedule id (these commands are addressed by URL path,
+  not body, so the id is the only thing distinguishing "the same request" for
+  the bodyless three; Amend's hash also folds in the request body).
+  - *A real bug found while doing this, not assumed:* `CancelFutureAccrual`'s
+    handler-level pre-check (refuse if the schedule is COMPLETED or
+    CANCELLED) read the schedule's status from the GET that preceded the
+    idempotency claim lookup. On a retry of an already-succeeded cancel, that
+    snapshot is CANCELLED, so the pre-check would have rejected a legitimate
+    replay with 422 before the claim lookup ever ran. The store's
+    `CancelAccrualSchedule` no longer trusts a caller-supplied `fromStatus` as
+    its guard (the old signature took one, defeating the point of a fixed
+    disallowed set — a stale `fromStatus` argument equal to the current status
+    would let the UPDATE succeed from any status); it now refuses COMPLETED
+    and CANCELLED unconditionally in the UPDATE's WHERE clause, and the
+    handler's pre-check was removed so the claim lookup runs first.
+  - *What did not change:* `AmendFutureSchedule`'s handler-level
+    `would_drop_recognized_periods` check still reads the *current* count of
+    recognized periods before the claim lookup. A retry made after more
+    periods were recognized since the first (successful) amend can therefore
+    be rejected even though the original call is replayable — a narrower,
+    pre-existing-shape version of the same ordering issue, left open because
+    fixing it needs the claim lookup to run before the recognized-period
+    count is read, which only the store can do and `AmendAccrualSchedule`
+    does not currently expose that count to its own guard.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestSubmitAccrual_RetryUnderSameKeyReplays`,
+    `TestSubmitAccrual_NoIdempotencyKey_Returns400`,
+    `TestCancelFutureAccrual_RetryAfterSuccess_Replays`) and
+    `internal/store/accrual_lifecycle_idempotency_integration_test.go`
+    (replay for submit/amend/cancel, and same-key-different-schedule
+    conflict), run against a real, disposable Postgres container. The
+    existing `TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB` and
+    `TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB` were updated for
+    the new signatures and now also prove a *second, newly-keyed* cancel
+    attempt on an already-cancelled schedule is still refused (as distinct
+    from a replay of the same key).

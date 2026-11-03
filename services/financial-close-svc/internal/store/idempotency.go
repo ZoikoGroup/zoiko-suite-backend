@@ -19,6 +19,14 @@ const (
 	CommandCreatePrepayment     = "CreateRecognitionSchedule"
 	CommandCreateAllocationRule = "CreateAllocationRule"
 	CommandStartRevaluation     = "StartRevaluation"
+
+	// ACC-07 accrual lifecycle commands (SPEC_DEVIATIONS A11). Each claims
+	// the same targetAccrualSchedule column CreateAccrual does; the command
+	// name is what disambiguates a key reused for the wrong lifecycle step.
+	CommandSubmitAccrual = "SubmitAccrual"
+	CommandApproveAccrual = "ApproveAccrual"
+	CommandAmendAccrual  = "AmendFutureSchedule"
+	CommandCancelAccrual = "CancelAccrual"
 )
 
 // claimTarget is the command_idempotency column naming what a command
@@ -107,6 +115,21 @@ func (s *PgStore) createWithClaim(ctx context.Context, idempotencyKey, command, 
 		replay, err = attempt()
 	}
 	return replay, mapPgError(err)
+}
+
+// transitionWithClaim is createWithClaim applied to a command that moves an
+// EXISTING resource instead of minting one: targetID is already known (the
+// caller supplies it, e.g. from the URL), and perform is the guarded status
+// transition rather than an INSERT. The same rules apply: a refused
+// transition rolls the whole attempt back and never claims the key; a
+// replay loads what the first application left rather than re-running the
+// transition. Because the resource id is caller-supplied, not generated,
+// requestHash must fold the id in (the handler does this) so the same key
+// reused against a different resource is a conflict rather than a silent
+// replay of the first one.
+func (s *PgStore) transitionWithClaim(ctx context.Context, idempotencyKey, command, requestHash string, target claimTarget, targetID string,
+	perform func(tx pgx.Tx) error, load func(tx pgx.Tx, id string) error) (replay bool, err error) {
+	return s.createWithClaim(ctx, idempotencyKey, command, requestHash, target, targetID, perform, load)
 }
 
 // isUniqueViolation reports PostgreSQL's unique-constraint error (23505) on

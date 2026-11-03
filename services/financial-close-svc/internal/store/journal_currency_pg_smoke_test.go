@@ -111,7 +111,7 @@ func TestPgStore_JournalCurrency_ImmutableOnceSet_RealDB(t *testing.T) {
 	other := draftAccrual("legacy, status change")
 	other.CurrencyCode = ""
 	insertLegacyAccrual(ctx, t, pool, tenantID, other)
-	if err := s.SubmitAccrualSchedule(ctx, other.ScheduleID, "submitter-1", time.Now().UTC()); err != nil {
+	if _, err := s.SubmitAccrualSchedule(ctx, other, "submitter-1", uuid.NewString(), testRequestHash, time.Now().UTC()); err != nil {
 		t.Fatalf("submitting a legacy row without touching currency: %v", err)
 	}
 }

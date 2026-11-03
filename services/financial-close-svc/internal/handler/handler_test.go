@@ -460,20 +460,36 @@ func (s *stubStore) transitionAccrual(scheduleID, fromStatus, toStatus string) e
 	return nil
 }
 
-func (s *stubStore) SubmitAccrualSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval); err != nil {
-		return err
+func (s *stubStore) SubmitAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "SubmitAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].SubmittedAt, s.schedules[scheduleID].SubmittedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionAccrual(sch.ScheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval); err != nil {
+		return false, err
+	}
+	s.schedules[sch.ScheduleID].SubmittedAt, s.schedules[sch.ScheduleID].SubmittedByPrincipalID = &at, &principalID
+	*sch = *s.schedules[sch.ScheduleID]
+	s.recordClaim(key, "SubmitAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) ApproveAccrualSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved); err != nil {
-		return err
+func (s *stubStore) ApproveAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].ApprovedAt, s.schedules[scheduleID].ApprovedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionAccrual(sch.ScheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved); err != nil {
+		return false, err
+	}
+	s.schedules[sch.ScheduleID].ApprovedAt, s.schedules[sch.ScheduleID].ApprovedByPrincipalID = &at, &principalID
+	*sch = *s.schedules[sch.ScheduleID]
+	s.recordClaim(key, "ApproveAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) ActivateAccrualSchedule(_ context.Context, scheduleID string) error {
@@ -494,27 +510,48 @@ func (s *stubStore) CompleteAccrualSchedule(_ context.Context, scheduleID string
 	return s.transitionAccrual(scheduleID, domain.AccrualStatusActive, domain.AccrualStatusCompleted)
 }
 
-func (s *stubStore) CancelAccrualSchedule(_ context.Context, scheduleID, fromStatus, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, fromStatus, domain.AccrualStatusCancelled); err != nil {
-		return err
+func (s *stubStore) CancelAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "CancelAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].CancelledAt, s.schedules[scheduleID].CancelledByPrincipalID = &at, &principalID
-	return nil
+	existing, ok := s.schedules[sch.ScheduleID]
+	if !ok {
+		return false, domain.ErrAccrualNotFound
+	}
+	if existing.Status == domain.AccrualStatusCompleted || existing.Status == domain.AccrualStatusCancelled {
+		return false, domain.ErrInvalidAccrualTransition
+	}
+	existing.Status = domain.AccrualStatusCancelled
+	existing.CancelledAt, existing.CancelledByPrincipalID = &at, &principalID
+	*sch = *existing
+	s.recordClaim(key, "CancelAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) AmendAccrualSchedule(_ context.Context, scheduleID string, totalAmount float64, periodCount int) error {
+func (s *stubStore) AmendAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, totalAmount float64, periodCount int, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "AmendFutureSchedule", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
+	}
 	if s.amendAccrualErr != nil {
-		return s.amendAccrualErr
+		return false, s.amendAccrualErr
 	}
-	sch, ok := s.schedules[scheduleID]
+	existing, ok := s.schedules[sch.ScheduleID]
 	if !ok {
-		return domain.ErrAccrualNotFound
+		return false, domain.ErrAccrualNotFound
 	}
-	if sch.Status != domain.AccrualStatusApproved && sch.Status != domain.AccrualStatusActive {
-		return domain.ErrInvalidAccrualTransition
+	if existing.Status != domain.AccrualStatusApproved && existing.Status != domain.AccrualStatusActive {
+		return false, domain.ErrInvalidAccrualTransition
 	}
-	sch.TotalAmount, sch.PeriodCount = totalAmount, periodCount
-	return nil
+	existing.TotalAmount, existing.PeriodCount = totalAmount, periodCount
+	*sch = *existing
+	s.recordClaim(key, "AmendFutureSchedule", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) CreateRecognitionInstance(_ context.Context, inst *domain.RecognitionInstance) (bool, error) {
@@ -2623,6 +2660,82 @@ func TestAccrualLifecycle_CreateSubmitApprove(t *testing.T) {
 	}
 	if sch.Status != domain.AccrualStatusApproved {
 		t.Errorf("expected APPROVED, got %q", sch.Status)
+	}
+}
+
+// TestSubmitAccrual_RetryUnderSameKeyReplays proves SPEC_DEVIATIONS A11 for
+// the accrual lifecycle: a lost-response retry of Submit (or Approve, Amend,
+// Cancel) must return the schedule as it now stands, not a second attempt at
+// a transition that already happened (which would 422 since the schedule is
+// no longer DRAFT).
+func TestSubmitAccrual_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	req := domain.CreateAccrualRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Description: "x", PolicyVersion: "v1",
+		TotalAmount: 100, StartFiscalPeriod: "2026-01", PeriodCount: 2,
+		DebitAccountCode: "6100", CreditAccountCode: "2100",
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/accruals/", req, "preparer-1")
+	var sch domain.AccrualSchedule
+	_ = json.NewDecoder(createRR.Body).Decode(&sch)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/accruals/"+sch.ScheduleID+"/submit", nil, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first submit: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/accruals/"+sch.ScheduleID+"/submit", nil, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried submit under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AccrualSchedule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.AccrualStatusPendingApproval {
+		t.Fatalf("replay status = %q, want PENDING_APPROVAL (not a failed re-transition)", replayed.Status)
+	}
+}
+
+// TestSubmitAccrual_NoIdempotencyKey_Returns400 proves the command is
+// mandatory, per ZS-SVC-B-001 §22.
+func TestSubmitAccrual_NoIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	s.schedules["sch-1"] = &domain.AccrualSchedule{ScheduleID: "sch-1", LegalEntityID: "le-1", Status: domain.AccrualStatusDraft}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	rr := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/submit", nil, "preparer-1", testTenantID, "")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestCancelFutureAccrual_RetryAfterSuccess_Replays is the A11 regression
+// this pass's CancelAccrualSchedule rewrite exists for: before it, a retried
+// cancel under the same key would have reached a handler-side
+// COMPLETED/CANCELLED pre-check using the GET's stale snapshot and only then
+// the store, and either path risked 422ing a legitimate replay. The claim
+// lookup must short-circuit before either guard runs.
+func TestCancelFutureAccrual_RetryAfterSuccess_Replays(t *testing.T) {
+	s := newStubStore()
+	s.schedules["sch-1"] = &domain.AccrualSchedule{ScheduleID: "sch-1", LegalEntityID: "le-1", Status: domain.AccrualStatusApproved}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first cancel: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried cancel under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+
+	// A genuinely new attempt (a different key) against the now-CANCELLED
+	// schedule must still be refused.
+	again := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, uuid.NewString())
+	if again.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("new cancel attempt on an already-cancelled schedule: want 422, got %d %s", again.Code, again.Body.String())
 	}
 }
 

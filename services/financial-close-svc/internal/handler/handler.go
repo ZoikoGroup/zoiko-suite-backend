@@ -63,12 +63,16 @@ type Store interface {
 	CreateAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, idempotencyKey, requestHash string) (replay bool, err error)
 	GetAccrualSchedule(ctx context.Context, scheduleID string) (*domain.AccrualSchedule, error)
 	ListAccrualSchedules(ctx context.Context, legalEntityID string) ([]domain.AccrualSchedule, error)
-	SubmitAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error
-	ApproveAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error
+	// Submit/Approve/Cancel/Amend claim the caller's Idempotency-Key the same
+	// way the four creates do (SPEC_DEVIATIONS A11): replay=true means *sch
+	// now holds the schedule as it stands, not necessarily the state this
+	// call itself would have produced.
+	SubmitAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
+	ApproveAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	ActivateAccrualSchedule(ctx context.Context, scheduleID string) error
 	CompleteAccrualSchedule(ctx context.Context, scheduleID string) error
-	CancelAccrualSchedule(ctx context.Context, scheduleID, fromStatus, principalID string, at time.Time) error
-	AmendAccrualSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error
+	CancelAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
+	AmendAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, totalAmount float64, periodCount int, idempotencyKey, requestHash string) (replay bool, err error)
 	CreateRecognitionInstance(ctx context.Context, inst *domain.RecognitionInstance) (created bool, err error)
 	ListRecognitionInstances(ctx context.Context, scheduleID string) ([]domain.RecognitionInstance, error)
 	GetRecognitionInstanceByPeriod(ctx context.Context, scheduleID, fiscalPeriod string) (*domain.RecognitionInstance, error)
@@ -1745,6 +1749,10 @@ func (h *Handler) ListAccruals(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) SubmitAccrual(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -1762,12 +1770,11 @@ func (h *Handler) SubmitAccrual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.SubmitAccrualSchedule(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ ScheduleID string }{id})
+	if _, err := h.store.SubmitAccrualSchedule(r.Context(), sch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeAccrualStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.AccrualStatusPendingApproval
-	sch.SubmittedAt, sch.SubmittedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -1779,6 +1786,10 @@ func (h *Handler) SubmitAccrual(w http.ResponseWriter, r *http.Request) {
 // sod_accrual_approver_independent makes the row refuse it too.
 func (h *Handler) ApproveAccrual(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -1800,12 +1811,11 @@ func (h *Handler) ApproveAccrual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.ApproveAccrualSchedule(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ ScheduleID string }{id})
+	if _, err := h.store.ApproveAccrualSchedule(r.Context(), sch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeAccrualStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.AccrualStatusApproved
-	sch.ApprovedAt, sch.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -1817,6 +1827,10 @@ func (h *Handler) ApproveAccrual(w http.ResponseWriter, r *http.Request) {
 // or duplicate accounting consequence).
 func (h *Handler) AmendFutureSchedule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.AmendFutureScheduleRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -1854,16 +1868,23 @@ func (h *Handler) AmendFutureSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.AmendAccrualSchedule(r.Context(), id, req.TotalAmount, req.PeriodCount); err != nil {
+	requestHash := requestFingerprint(struct {
+		ScheduleID string
+		Req        domain.AmendFutureScheduleRequest
+	}{id, req})
+	if _, err := h.store.AmendAccrualSchedule(r.Context(), sch, req.TotalAmount, req.PeriodCount, idempotencyKey, requestHash); err != nil {
 		h.writeAccrualStoreErr(w, err)
 		return
 	}
-	sch.TotalAmount, sch.PeriodCount = req.TotalAmount, req.PeriodCount
 	writeJSON(w, http.StatusOK, sch)
 }
 
 func (h *Handler) CancelFutureAccrual(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -1880,17 +1901,17 @@ func (h *Handler) CancelFutureAccrual(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	if sch.Status == domain.AccrualStatusCompleted || sch.Status == domain.AccrualStatusCancelled {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAccrualTransition))
-		return
-	}
+	// The COMPLETED/CANCELLED refusal is enforced by the store's own fixed
+	// guard now, not here: sch.Status is this GET's snapshot, so checking it
+	// here would reject a legitimate replay of an already-cancelled schedule
+	// (its status having since become CANCELLED) before the Idempotency-Key
+	// claim lookup ever runs.
 	now := time.Now().UTC()
-	if err := h.store.CancelAccrualSchedule(r.Context(), id, sch.Status, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ ScheduleID string }{id})
+	if _, err := h.store.CancelAccrualSchedule(r.Context(), sch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeAccrualStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.AccrualStatusCancelled
-	sch.CancelledAt, sch.CancelledByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -2178,6 +2199,8 @@ func (h *Handler) writeAccrualStoreErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("accrual store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

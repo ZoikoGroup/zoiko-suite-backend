@@ -58,15 +58,15 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateAccrualSchedule(ctx, sch, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAccrualSchedule: %v", err)
 	}
-	if err := s.SubmitAccrualSchedule(ctx, sch.ScheduleID, "submitter-1", now); err != nil {
+	if _, err := s.SubmitAccrualSchedule(ctx, sch, "submitter-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("SubmitAccrualSchedule: %v", err)
 	}
 	for _, self := range []string{"preparer-1", "submitter-1"} {
-		if err := s.ApproveAccrualSchedule(ctx, sch.ScheduleID, self, now); !errors.Is(err, domain.ErrSelfApproval) {
+		if _, err := s.ApproveAccrualSchedule(ctx, sch, self, uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 			t.Fatalf("accrual approved by its %s: want ErrSelfApproval, got %v", self, err)
 		}
 	}
-	if err := s.ApproveAccrualSchedule(ctx, sch.ScheduleID, "approver-1", now); err != nil {
+	if _, err := s.ApproveAccrualSchedule(ctx, sch, "approver-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("independent accrual approval refused: %v", err)
 	}
 
@@ -155,15 +155,17 @@ func TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB(t *testing.T) {
 	if _, err := s.CreateAccrualSchedule(ctx, sch, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAccrualSchedule: %v", err)
 	}
-	if err := s.CancelAccrualSchedule(ctx, sch.ScheduleID, domain.AccrualStatusDraft, "canceller-1", now); err != nil {
+	if _, err := s.CancelAccrualSchedule(ctx, sch, "canceller-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("CancelAccrualSchedule: %v", err)
 	}
 	got, err := s.GetAccrualSchedule(ctx, sch.ScheduleID)
 	if err != nil || got.Status != domain.AccrualStatusCancelled || derefStr(got.CancelledByPrincipalID) != "canceller-1" {
 		t.Fatalf("cancel did not land: %+v (err %v)", got, err)
 	}
-	if err := s.CancelAccrualSchedule(ctx, sch.ScheduleID, domain.AccrualStatusDraft, "canceller-1", now); !errors.Is(err, domain.ErrInvalidAccrualTransition) {
-		t.Fatalf("second cancel from DRAFT: want ErrInvalidAccrualTransition, got %v", err)
+	// A second cancel attempt under a NEW key (not a replay of the first) must
+	// still be refused: the schedule is already CANCELLED.
+	if _, err := s.CancelAccrualSchedule(ctx, sch, "canceller-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrInvalidAccrualTransition) {
+		t.Fatalf("second cancel of an already-cancelled schedule: want ErrInvalidAccrualTransition, got %v", err)
 	}
 
 	ppy := &domain.PrepaymentSchedule{

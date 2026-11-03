@@ -619,46 +619,82 @@ func transitionArgs(id, fromStatus, toStatus string, setArgs []any) []any {
 	return append([]any{id, fromStatus, toStatus}, setArgs...)
 }
 
+// transitionAccrualStatusTx is transitionAccrualStatus's body, taking an
+// already-open transaction so a claim-protected caller (SubmitAccrualSchedule,
+// ApproveAccrualSchedule, CancelAccrualSchedule) can run the guarded UPDATE
+// and the command_idempotency claim in one transaction.
+func (s *PgStore) transitionAccrualStatusTx(ctx context.Context, tx pgx.Tx, scheduleID, fromStatus, toStatus, setClause string, args ...any) error {
+	query := fmt.Sprintf(`UPDATE accrual_schedules SET status = $3%s WHERE schedule_id = $1 AND status = $2`, setClause)
+	tag, err := tx.Exec(ctx, query, transitionArgs(scheduleID, fromStatus, toStatus, args)...)
+	if err != nil {
+		return mapPgError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Either the schedule does not exist, or it exists but is not in
+		// fromStatus. Distinguished so the handler can tell "not found"
+		// from "wrong state" rather than reporting both the same way.
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accrual_schedules WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
+			return mapPgError(err)
+		}
+		if !exists {
+			return domain.ErrAccrualNotFound
+		}
+		return domain.ErrInvalidAccrualTransition
+	}
+	return nil
+}
+
 // transitionAccrualStatus moves a schedule from fromStatus to toStatus,
 // atomically guarded by a WHERE status = fromStatus clause — the same
 // posture as LockFiscalPeriod's OPEN-only guard. setClause supplies any
-// additional columns (timestamps/actor) the specific transition sets.
+// additional columns (timestamps/actor) the specific transition sets. Used
+// by the internal, non-claim-protected transitions (Activate, Complete).
 func (s *PgStore) transitionAccrualStatus(ctx context.Context, scheduleID, fromStatus, toStatus, setClause string, args ...any) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := fmt.Sprintf(`UPDATE accrual_schedules SET status = $3%s WHERE schedule_id = $1 AND status = $2`, setClause)
-		tag, err := tx.Exec(ctx, query, transitionArgs(scheduleID, fromStatus, toStatus, args)...)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			// Either the schedule does not exist, or it exists but is not in
-			// fromStatus. Distinguished so the handler can tell "not found"
-			// from "wrong state" rather than reporting both the same way.
-			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accrual_schedules WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
-				return mapPgError(err)
-			}
-			if !exists {
-				return domain.ErrAccrualNotFound
-			}
-			return domain.ErrInvalidAccrualTransition
-		}
-		return nil
+		return s.transitionAccrualStatusTx(ctx, tx, scheduleID, fromStatus, toStatus, setClause, args...)
 	})
 }
 
-func (s *PgStore) SubmitAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error {
-	return s.transitionAccrualStatus(ctx, scheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval,
-		`, submitted_at = $4, submitted_by_principal_id = $5`, at, principalID)
+// loadAccrualSchedule is the transitionWithClaim load callback shared by
+// Submit/Approve/Cancel/Amend: on a replay, *sch is overwritten with the
+// schedule as it now stands, the same contract CreateAccrualSchedule gives.
+func loadAccrualSchedule(ctx context.Context, tx pgx.Tx, sch *domain.AccrualSchedule, id string) error {
+	existing, err := scanAccrualSchedule(tx.QueryRow(ctx, `SELECT `+accrualScheduleColumns+` FROM accrual_schedules WHERE schedule_id = $1`, id))
+	if err != nil {
+		return err
+	}
+	*sch = *existing
+	return nil
 }
 
-func (s *PgStore) ApproveAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error {
-	return s.transitionAccrualStatus(ctx, scheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved,
-		`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+// SubmitAccrualSchedule moves sch from DRAFT to PENDING_APPROVAL, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11: a retry after
+// a lost response previously got 422 instead of the schedule it already
+// submitted). On replay=true, *sch holds the schedule as it now stands —
+// which may be past PENDING_APPROVAL if it was since approved.
+func (s *PgStore) SubmitAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandSubmitAccrual, requestHash, targetAccrualSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			return s.transitionAccrualStatusTx(ctx, tx, sch.ScheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval,
+				`, submitted_at = $4, submitted_by_principal_id = $5`, at, principalID)
+		},
+		func(tx pgx.Tx, id string) error { return loadAccrualSchedule(ctx, tx, sch, id) })
+}
+
+// ApproveAccrualSchedule moves sch from PENDING_APPROVAL to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApproveAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApproveAccrual, requestHash, targetAccrualSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			return s.transitionAccrualStatusTx(ctx, tx, sch.ScheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved,
+				`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+		},
+		func(tx pgx.Tx, id string) error { return loadAccrualSchedule(ctx, tx, sch, id) })
 }
 
 // ActivateAccrualSchedule moves APPROVED -> ACTIVE, on the first
@@ -677,34 +713,67 @@ func (s *PgStore) CompleteAccrualSchedule(ctx context.Context, scheduleID string
 	return s.transitionAccrualStatus(ctx, scheduleID, domain.AccrualStatusActive, domain.AccrualStatusCompleted, "")
 }
 
-func (s *PgStore) CancelAccrualSchedule(ctx context.Context, scheduleID, fromStatus, principalID string, at time.Time) error {
-	return s.transitionAccrualStatus(ctx, scheduleID, fromStatus, domain.AccrualStatusCancelled,
-		`, cancelled_at = $4, cancelled_by_principal_id = $5`, at, principalID)
+// CancelAccrualSchedule moves sch from fromStatus to CANCELLED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+// CancelAccrualSchedule moves sch to CANCELLED from any status except
+// COMPLETED or CANCELLED, claiming idempotencyKey in the same transaction
+// (SPEC_DEVIATIONS A11).
+//
+// The guard is a fixed disallowed set, not "= fromStatus": fromStatus is the
+// schedule's status at GET time, so on an already-committed replay it would
+// already read CANCELLED, and a WHERE on that value would let the call
+// cancel a CANCELLED row a second time, or (on a stale fromStatus from a
+// racing request) a COMPLETED one. transitionWithClaim's own claim lookup
+// runs first, so a genuine retry under the same key never reaches this
+// guard at all — it replays from the claim instead.
+func (s *PgStore) CancelAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandCancelAccrual, requestHash, targetAccrualSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE accrual_schedules SET status = $2, cancelled_at = $3, cancelled_by_principal_id = $4
+				WHERE schedule_id = $1 AND status NOT IN ($5, $6)
+			`, sch.ScheduleID, domain.AccrualStatusCancelled, at, principalID,
+				domain.AccrualStatusCompleted, domain.AccrualStatusCancelled)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accrual_schedules WHERE schedule_id = $1)`, sch.ScheduleID).Scan(&exists); err != nil {
+					return mapPgError(err)
+				}
+				if !exists {
+					return domain.ErrAccrualNotFound
+				}
+				return domain.ErrInvalidAccrualTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return loadAccrualSchedule(ctx, tx, sch, id) })
 }
 
 // AmendAccrualSchedule updates the FUTURE shape of an APPROVED/ACTIVE
-// schedule. Callers must have already verified periodCount does not drop
-// below the number of periods already recognized (ErrAmendWouldDropRecognizedPeriods)
+// schedule, claiming idempotencyKey in the same transaction (SPEC_DEVIATIONS
+// A11). Callers must have already verified periodCount does not drop below
+// the number of periods already recognized (ErrAmendWouldDropRecognizedPeriods)
 // — enforced by the handler, not here, since only the handler has counted
 // recognition instances.
-func (s *PgStore) AmendAccrualSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE accrual_schedules SET total_amount = $1, period_count = $2
-			WHERE schedule_id = $3 AND status IN ($4, $5)
-		`, totalAmount, periodCount, scheduleID, domain.AccrualStatusApproved, domain.AccrualStatusActive)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidAccrualTransition
-		}
-		return nil
-	})
+func (s *PgStore) AmendAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, totalAmount float64, periodCount int, idempotencyKey, requestHash string) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandAmendAccrual, requestHash, targetAccrualSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE accrual_schedules SET total_amount = $1, period_count = $2
+				WHERE schedule_id = $3 AND status IN ($4, $5)
+			`, totalAmount, periodCount, sch.ScheduleID, domain.AccrualStatusApproved, domain.AccrualStatusActive)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return domain.ErrInvalidAccrualTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return loadAccrualSchedule(ctx, tx, sch, id) })
 }
 
 const recognitionInstanceColumns = `
