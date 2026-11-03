@@ -24,7 +24,7 @@ type IC8 struct {
 }
 
 var (
-	defaultMu sync.Mutex
+	defaultMu  sync.Mutex
 	defaultIC8 *IC8
 )
 
@@ -71,7 +71,7 @@ func New(reg prometheus.Registerer) *IC8 {
 		}, []string{"decision"}),
 	}
 
-	prometheus.MustRegister(
+	reg.MustRegister(
 		m.MFAVerifications, m.LoginLockouts, m.TOTPReplay,
 		m.SessionsActive, m.SessionRevoc, m.PasswordResets,
 	)

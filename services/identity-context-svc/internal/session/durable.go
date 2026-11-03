@@ -291,6 +291,13 @@ func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, sc domain
 	return firstErr
 }
 
+// countRevocation feeds identity_session_revocations_total{reason}.
+func countRevocation(reason domain.InvalidationReason, n int) {
+	if ic8 := metrics.Default(); ic8 != nil && n > 0 {
+		ic8.SessionRevoc.WithLabelValues(string(reason)).Add(float64(n))
+	}
+}
+
 // EvictAllForTenant revokes every live session in a tenant.
 //
 // Backs InvalidateTenantContext. Unlike the per-principal case there is no
@@ -322,6 +329,7 @@ func (d *DurableCache) EvictAllForTenant(
 		}
 		revoked++
 	}
+	countRevocation(reason, revoked)
 	return revoked, firstErr
 }
 
@@ -444,6 +452,7 @@ func (d *DurableCache) EvictAllForPrincipal(
 	if err := d.cache.ClearPrincipalIndex(ctx, principalID); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	countRevocation(reason, revoked)
 	return revoked, firstErr
 }
 
@@ -487,5 +496,6 @@ func (d *DurableCache) EvictAllForEntity(
 	if err := d.cache.ClearEntityIndex(ctx, legalEntityID); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	countRevocation(reason, revoked)
 	return revoked, firstErr
 }

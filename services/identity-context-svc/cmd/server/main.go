@@ -693,6 +693,29 @@ func main() {
 	defer stopRetention()
 	go retentionWorker.Run(retentionCtx)
 
+	// IAM-6: identity_sessions_active is sampled from the durable store once
+	// a minute — the complete source, unlike a per-replica counter.
+	gaugeCtx, stopGauge := context.WithCancel(context.Background())
+	defer stopGauge()
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			sampleCtx, cancel := context.WithTimeout(context.WithoutCancel(gaugeCtx), 10*time.Second)
+			if n, err := principalRepo.CountActiveSessions(sampleCtx); err == nil {
+				ic8Metrics.SessionsActive.Set(float64(n))
+			} else {
+				log.Warn("identity_sessions_active not sampled", zap.Error(err))
+			}
+			cancel()
+			select {
+			case <-gaugeCtx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
+
 	// S1-B3: ingress bindings are re-read from tenant-entity-registry-svc at
 	// half their TTL, so a binding is STALE only while the registry is down.
 	if cfg.IngressBindingTTLSeconds > 0 && cfg.TenantRegistryURL != "" {

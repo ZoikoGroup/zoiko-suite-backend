@@ -253,6 +253,18 @@ func (s *PgStore) UpsertIngressBinding(ctx context.Context, b domain.TenantIngre
 	return nil
 }
 
+// CountActiveSessions counts live session contexts across every tenant, for
+// the identity_sessions_active gauge (IAM-6). Runs under the retention
+// worker's named sweep capability, which session_contexts' policy admits.
+func (s *PgStore) CountActiveSessions(ctx context.Context) (int, error) {
+	var n int
+	err := s.withSweepScope(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM session_contexts
+			WHERE invalidated_at IS NULL AND expires_at > NOW()`).Scan(&n)
+	})
+	return n, err
+}
+
 // ListIngressBindingTenants lists every tenant with a local ingress binding,
 // for the registry refresher (S1-B3).
 func (s *PgStore) ListIngressBindingTenants(ctx context.Context) ([]string, error) {

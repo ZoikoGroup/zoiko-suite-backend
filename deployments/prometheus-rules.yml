@@ -965,3 +965,37 @@ groups:
           description: >-
             Dead-lettered events are replayed only with an operator, a different approver, an approval reference and a
             reason, and only into a region this deployment serves. Review them rather than letting them age.
+
+  # IAM-6: identity-context-svc authentication signals (IC-8).
+  - name: identity-context-auth
+    rules:
+      - alert: IdentityLoginLockoutBurst
+        expr: sum(increase(identity_login_lockouts_total[10m])) > 5
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "More than 5 credential lockouts in 10m — likely password spraying"
+      - alert: IdentityTOTPReplayBurst
+        expr: sum(increase(identity_totp_replay_refusals_total[10m])) > 3
+        labels:
+          severity: page
+        annotations:
+          summary: "Replayed TOTP codes refused — a second factor may be intercepted"
+      - alert: IdentityLoginThrottleSpike
+        expr: sum(rate(identity_login_throttled_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Login throttling above 1/s for 5m"
+      - alert: IdentityStepUpFailureRatio
+        expr: |
+          sum(rate(identity_mfa_verifications_total{outcome="failure"}[15m]))
+          /
+          clamp_min(sum(rate(identity_mfa_verifications_total[15m])), 1e-9) > 0.3
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "More than 30% of second-factor verifications failing"
