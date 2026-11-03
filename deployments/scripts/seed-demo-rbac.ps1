@@ -812,6 +812,38 @@ $BUNDLES = @(
         )
     },
     @{
+        # identity-context-svc's principal and session administration, which it
+        # authorizes against the legal entity in the caller's envelope. Its own
+        # seed (scripts/seed-local-verification.sh) granted the retired
+        # PRINCIPAL_STATUS_MANAGE until 2 Nov 2026, so every suspend / reactivate
+        # from the console answered 403. IDENTITY_PRINCIPAL_STATUS_SET is HIGH
+        # (access-control 000021): suspending a principal denies them every
+        # action at authorization-svc's layer 0.
+        Code    = "IDENTITY_ADMIN_FULL"
+        Service = "identity-context-svc"
+        # The rest (3 Nov 2026) are what the rebuilt /admin/identity console
+        # calls: lifecycle (AU-09), maker-checker resets, sign-in events,
+        # support access, MFA reset and merge (ORG-1). The demo principal
+        # holds both reset halves; the service itself refuses a self-approval.
+        Actions = @("IDENTITY_SESSION_READ", "IDENTITY_SESSION_INVALIDATE",
+                    "IDENTITY_PRINCIPAL_READ", "IDENTITY_PRINCIPAL_STATUS_SET",
+                    "IDENTITY_PRINCIPAL_CREATE", "IDENTITY_PASSWORD_RESET_REQUEST",
+                    "IDENTITY_PASSWORD_RESET_APPROVE", "IDENTITY_AUTH_EVENTS_READ",
+                    "IDENTITY_SUBJECT_MERGE", "IDENTITY_MFA_RESET",
+                    "IDENTITY_SUPPORT_CONTEXT_ATTACH", "IDENTITY_SUPPORT_CONTEXT_REVIEW",
+                    "IDENTITY_SUPPORT_CONTEXT_APPROVE", "IDENTITY_SUPPORT_CONTEXT_REVOKE",
+                    "IDENTITY_CONTEXT_EXPLAIN", "IDENTITY_CONTEXT_CACHE_REFRESH",
+                    "IDENTITY_CONTEXT_TENANT_INVALIDATE")
+    },
+    @{
+        # siem-integration-svc (access-control 000024): configuring where the
+        # tenant's security telemetry goes, and reading the stream
+        # authorization-svc and the auth plane send it.
+        Code    = "SIEM_FULL"
+        Service = "siem-integration-svc"
+        Actions = @("SIEM_EXPORTER_CREATE", "SIEM_EXPORTER_READ", "SIEM_EVENT_READ")
+    },
+    @{
         # retention-registry-svc. LEGAL_HOLD_RELEASE is deliberately in the same
         # bundle as LEGAL_HOLD_CREATE for the demo principal only because this
         # seeds a DEVELOPMENT stack -- in a real deployment engaging a freeze and
