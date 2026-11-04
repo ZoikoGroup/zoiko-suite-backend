@@ -17,6 +17,7 @@ import (
 
 	"zoiko.io/gateway-auth-svc/internal/admission"
 	"zoiko.io/gateway-auth-svc/internal/carta"
+	"zoiko.io/gateway-auth-svc/internal/commercial"
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
 	"zoiko.io/gateway-auth-svc/internal/siem"
@@ -24,12 +25,13 @@ import (
 )
 
 type Handler struct {
-	cfg    *config.Config
-	jwks   *jwks.Client
-	carta  *carta.Client
-	siem   *siem.Client
-	tenant *tenantctx.Resolver
-	log    *zap.Logger
+	cfg      *config.Config
+	jwks     *jwks.Client
+	carta    *carta.Client
+	siem     *siem.Client
+	tenant   *tenantctx.Resolver
+	commercial *commercial.Client
+	log      *zap.Logger
 
 	// adm and rec are the INT-01 admission controls and the bounded record of
 	// refusals. rec is never nil; adm is the zero value (admit everything)
@@ -94,14 +96,15 @@ func New(
 	log *zap.Logger,
 ) *Handler {
 	return &Handler{
-		cfg:     cfg,
-		jwks:    jwksClient,
-		carta:   cartaClient,
-		siem:    siemClient,
-		tenant:  tenantResolver,
-		log:     log,
-		metrics: nopMetrics{},
-		rec:     admission.NewRecorder(1024, 0, nil),
+		cfg:         cfg,
+		jwks:        jwksClient,
+		carta:       cartaClient,
+		siem:        siemClient,
+		tenant:      tenantResolver,
+		commercial:  commercial.New(cfg.CommercialAccountServiceURL),
+		log:         log,
+		metrics:     nopMetrics{},
+		rec:         admission.NewRecorder(1024, 0, nil),
 	}
 }
 
@@ -417,6 +420,20 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		if !h.checkResidency(ctx, w, r, rc, claims, &resolved) {
 			return
 		}
+	}
+
+	// S3-D1 / GW-3: commercial plan and org unit lookup.
+	// Best-effort call to commercial-account-svc; failure omits the headers
+	// rather than failing the request. The headers are stripped from clients
+	// at the edge (GTRM strip lists, compose authResponseHeaders).
+	if h.commercial.Enabled() {
+		plan, orgUnit, err := h.commercial.GetCommercialPlan(ctx, claims.TenantID)
+		if err == nil {
+			setIfPresent(w, "X-Commercial-Plan", plan)
+			setIfPresent(w, "X-Org-Unit-Id", orgUnit)
+		}
+		// On ErrNotFound or ErrUnavailable we simply omit the headers —
+		// the spec says "an unknown commercial plan omits the header".
 	}
 
 	w.Header().Set("X-Principal-Id", claims.Principal.PrincipalID)

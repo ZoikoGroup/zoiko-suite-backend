@@ -55,6 +55,13 @@ type Config struct {
 	// never affect whether a request is let through.
 	SIEMServiceURL string
 
+	// CommercialAccountServiceURL is commercial-account-svc — the service that
+	// resolves the commercial plan and org unit for a tenant. Empty disables
+	// the lookup: the gateway then omits X-Commercial-Plan and X-Org-Unit-Id
+	// headers rather than failing the request. The lookup is best-effort and
+	// cached; a missing or unreachable service never affects admission.
+	CommercialAccountServiceURL string
+
 	// IdentityJWKSMTLSEnabled/IdentityJWKSMTLSURL wire the JWKS client into
 	// the mTLS pilot for calling identity-context-svc. Disabled by default —
 	// plain HTTP JWKSURL keeps being used unless explicitly turned on.
@@ -189,6 +196,7 @@ func Load() (*Config, error) {
 		RevocationFail:            strings.ToLower(strEnv("IDENTITY_REVOCATION_FAIL", "closed")),
 		CartaServiceURL:           strEnv("CARTA_SERVICE_URL", ""),
 		SIEMServiceURL:            strEnv("SIEM_SERVICE_URL", ""),
+		CommercialAccountServiceURL: strEnv("COMMERCIAL_ACCOUNT_SERVICE_URL", ""),
 		IdentityJWKSMTLSEnabled:   strEnv("IDENTITY_JWKS_MTLS_ENABLED", "false") == "true",
 		IdentityJWKSMTLSURL:       strEnv("IDENTITY_JWKS_MTLS_URL", "https://identity-svc:8449/.well-known/jwks.json"),
 		TenantRegistryMTLSEnabled: strEnv("TENANT_REGISTRY_MTLS_ENABLED", "false") == "true",

@@ -52,7 +52,7 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 | D1-5f | mTLS to identity-context + tenant registry (SEC-INV-05) | :8449 + mtls clients | TestLoad_MTLSEnabledSwitchesPeerURLs | Versions & policy tab | DONE |
 | AU-04 | Source-level login throttling; 25 failed logins → 429 before the 25th | login-rate bucket (GW-2) | TestAU04_LoginRoutesUseStricterBucket, TestAU04_ThrottleKeyedOnRealClientIP; live 25-login probe | Rate limits tab | DONE (GW-2) |
 | S5-D3 | Client IP behind the GCP LB: trusted-hop design | clientIP + trusted CIDRs (GW-2) | TestClientIP_TrustedProxyCIDRs, TestClientIP_TrustedProxyDepth | Versions & policy tab | DONE (GW-2) |
-| S3-D1 | X-Commercial-Plan / X-Org-Unit-Id edge-set, stripped from clients | plan lookup (GW-3) + strip lists | TestS3D1_* | Trusted-header policy panel | PENDING → GW-3 |
+| S3-D1 | X-Commercial-Plan / X-Org-Unit-Id edge-set, stripped from clients | plan lookup (GW-3) + strip lists | TestS3D1_* | Trusted-header policy panel | DONE (GW-3) |
 | AU-12 | Per-service audience; token exchange at the gateway (IAM-1) | GW-5 exchange | TestVerify_ExchangesForRouteAudience, TestIAM01_EnvelopeForPolicyRefusedByWorkflow | Overview | PENDING → GW-5 |
 | AU-27 | Sender-constrained envelopes (DPoP/mTLS binding) | — | — | — | BLOCKED: Security sign-off (D-7); interface note in SPEC_DEVIATIONS |
 | S5-B2 | Console → service calls bypass ForwardAuth | audience exchange + per-service gates (GW-5) | TestVerify_UnknownRouteFailsClosed | — | PENDING → GW-5 (exchange half); console routing stays frontend follow-up |
@@ -140,3 +140,27 @@ Default 5 req/s, burst 10 (configurable via `GATEWAY_LOGIN_RATE_PER_SECOND`,
 `TrustedProxyDepth` to `internal/config/config.go` with safe defaults.
 
 **Suite:** 8 packages ok, 0 fail. All new tests pass.
+
+## GW-3 — Commercial plan and org unit headers (S3-D1) (2026-11-04)
+
+**Commercial account client:** added `internal/commercial/client.go` with a
+best-effort client that calls commercial-account-svc:
+- `GET /v1/commercial-accounts/by-organization/{tenantID}` to find the
+  commercial account for the verified tenant.
+- `GET /v1/commercial-accounts/{commercialAccountID}/subscription` to get the
+  active subscription and extract the product ID as the commercial plan.
+- On success, sets `X-Commercial-Plan` (the product ID) and `X-Org-Unit-Id`
+  (the organization/tenant ID).
+- On 404 (no commercial account or no active subscription) or service
+  unavailable, omits the headers — "an unknown commercial plan omits the
+  header. It never guesses one."
+
+**Headers stripped at edge:** both headers must appear in GTRM strip lists
+(`gtrm-edge-strip`), compose `authResponseHeaders`, and GTRM
+`authResponseHeaders`. The gateway sets them; the edge strips client copies.
+
+**Tests:** `TestClient_GetCommercialPlan_Success`, `TestClient_GetCommercialPlan_AccountNotFound`,
+`TestClient_GetCommercialPlan_ServiceUnavailable`, `TestClient_GetCommercialPlan_NoSubscription`,
+`TestClient_Disabled`, `TestClient_Enabled`.
+
+**Suite:** 9 packages ok (added internal/commercial), 0 fail.
