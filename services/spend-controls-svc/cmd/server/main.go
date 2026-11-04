@@ -31,6 +31,7 @@ import (
 	"zoiko.io/spend-controls-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/spend-controls-svc/internal/middleware"
 	"zoiko.io/spend-controls-svc/internal/mtls"
+	"zoiko.io/spend-controls-svc/internal/outbox"
 	"zoiko.io/spend-controls-svc/internal/store"
 	"zoiko.io/spend-controls-svc/internal/telemetry"
 )
@@ -306,6 +307,14 @@ func main() {
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
+	// Transactional outbox: EvaluateSpend writes spend.threshold.breached /
+	// spend.block.applied in the decision's own transaction; the relay
+	// delivers them with retry and marks each row published. It reads across
+	// tenants by declaring app.outbox_relay (migration 000004).
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, log).Start(relayCtx)
+
 	var httpClientForAuthz *http.Client
 	if cfg.AuthzMTLSEnabled {
 		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "spend-controls-svc", platformScopeID)
@@ -346,7 +355,7 @@ func main() {
 	// the envelope middleware, which guarantees the key and tenant are present.
 	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), log))
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	h := handler.New(pgStore, authzClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

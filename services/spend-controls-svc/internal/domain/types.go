@@ -106,6 +106,10 @@ type SpendEvaluation struct {
 	SourceReference string
 	CorrelationID   string
 	PrincipalID     string
+	// EventCorrelationID is the request's X-Correlation-ID, carried on the
+	// events a BLOCKED decision writes to the outbox (CorrelationID above is
+	// the spend check's own idempotency key).
+	EventCorrelationID string
 }
 
 // SpendDecision is the outcome of an atomic evaluation.
