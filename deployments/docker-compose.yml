@@ -801,6 +801,14 @@ services:
       # unreachable. Writes are never served from a stale context.
       TENANT_CONTEXT_STALE_GRACE_SECONDS: "120"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Commercial account lookup (GW-3): best-effort call to get commercial
+      # plan and org unit for the verified tenant. Empty disables the lookup.
+      COMMERCIAL_ACCOUNT_SERVICE_URL: "http://commercial-account-svc:8080"
+      # Admin read surface (GW-4): second port :8192 on the same container,
+      # token from a file so no secret in env. Off by default; enable with
+      # both variables set. The token file is provisioned by the deploy script.
+      GATEWAY_ADMIN_ADDR: ":8192"
+      GATEWAY_ADMIN_TOKEN_FILE: "/run/secrets/gateway_admin_token"
       # SEC-INV-05 mTLS to identity-context-svc (JWKS) and the tenant registry:
       # each peer is called at its https:// *_MTLS_URL with a 1-day
       # certificate from mtls-management-svc, renewed at half-life. Both peers
@@ -826,6 +834,11 @@ services:
         read_only: true
         volume:
           subpath: gateway-auth-svc
+      # Admin token secret (GW-4): read-only file, never in environment.
+      - type: volume
+        source: gateway_admin_token
+        target: /run/secrets/gateway_admin_token
+        read_only: true
     depends_on:
       identity-svc:
         condition: service_healthy
@@ -5625,4 +5638,5 @@ volumes:
   document_vault_storage:
   mtls_ca_data:
   mtls_bootstrap_token:
+  gateway_admin_token:
   traefik-certs:

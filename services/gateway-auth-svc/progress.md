@@ -58,7 +58,7 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 | S5-B2 | Console → service calls bypass ForwardAuth | audience exchange + per-service gates (GW-5) | TestVerify_UnknownRouteFailsClosed | — | PENDING → GW-5 (exchange half); console routing stays frontend follow-up |
 | S4-B1 | Traefik serversTransport client certs for edge → service hop | — | — | — | BLOCKED: infrastructure (mtls-management-svc enrolment) |
 | R-1 console | Human login gets a verified channel | console client at login (done 3 Nov) | E2E-identity-context | — | DONE (IC-FE-1) |
-| GW-4 | Admin read surface enabled in compose | GATEWAY_ADMIN_ADDR :8192 | admin_test + compose probe | all tabs | PENDING → GW-4 |
+| GW-4 | Admin read surface enabled in compose | GATEWAY_ADMIN_ADDR :8192 | admin_test + compose probe | all tabs | DONE (GW-4) |
 | GW-5 | Audience exchange + rollout mode | ForwardTo/Exchanger | TestVerify_ExchangeFailureIs503NotPassThrough | Overview | PENDING → GW-5 |
 
 ## Decisions taken
@@ -164,3 +164,16 @@ best-effort client that calls commercial-account-svc:
 `TestClient_Disabled`, `TestClient_Enabled`.
 
 **Suite:** 9 packages ok (added internal/commercial), 0 fail.
+
+## GW-4 — Admin read surface in compose (2026-11-04)
+
+**Compose:** added `GATEWAY_ADMIN_ADDR=:8192` and
+`GATEWAY_ADMIN_TOKEN_FILE=/run/secrets/gateway_admin_token` to
+gateway-auth-svc in `deployments/docker-compose.yml`. The token is sourced
+from a Docker secret (volume `gateway_admin_token`), never from environment
+variables. The admin listener is on a second port of the same container,
+never published through Traefik.
+
+**GTRM:** compile check clean (`gtrm-compiler --check`).
+
+**Suite:** 9 packages ok, 0 fail.
