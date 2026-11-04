@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -222,6 +223,56 @@ func TestPostAccountingEvent_ResolvesMappingKeyThroughACC02(t *testing.T) {
 	if !strings.Contains(exec.CalculationTrace, "mapping_key:EXPENSE_CATEGORY:MEALS -\\u003e account_code:6200-Meals") &&
 		!strings.Contains(exec.CalculationTrace, "mapping_key:EXPENSE_CATEGORY:MEALS -> account_code:6200-Meals") {
 		t.Errorf("expected the calculation trace to record the rule resolution, got %q", exec.CalculationTrace)
+	}
+}
+
+// TestPostAccountingEvent_DraftOrApprovedMapping_Returns422 proves the
+// governed lifecycle actually gates posting, not just the API surface that
+// creates a mapping: a mapping that is DRAFT, or APPROVED but not yet
+// ACTIVE, must not be resolvable by the posting path at all — it is not in
+// s.currentMappings (the stub's ACTIVE-only index, mirroring
+// GetCurrentAccountMapping's status = 'ACTIVE' filter), so it fails closed
+// exactly like an unmapped key.
+func TestPostAccountingEvent_DraftOrApprovedMapping_Returns422(t *testing.T) {
+	s := newStubStore()
+	s.accountsByCode["t1|6200-Meals"] = &domain.Account{AccountCode: "6200-Meals", Status: "ACTIVE"}
+	draft := &domain.AccountMapping{
+		AccountMappingID: "m-1", TenantID: "t1", MappingKey: "EXPENSE_CATEGORY:MEALS",
+		AccountCode: "6200-Meals", CreatedByPrincipalID: "author-1",
+	}
+	if err := s.CreateMapping(context.Background(), draft); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	req := validPostEventReq()
+	key := "EXPENSE_CATEGORY:MEALS"
+	req.Lines[0].MappingKey = &key
+
+	rec := doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("a DRAFT mapping must not be postable: expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if _, err := s.ApproveMapping(context.Background(), "t1", "m-1", "approver-2"); err != nil {
+		t.Fatalf("ApproveMapping: %v", err)
+	}
+	rec = doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("an APPROVED-but-not-ACTIVE mapping must not be postable either: expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	activated, err := s.ActivateMapping(context.Background(), "t1", "m-1", time.Time{})
+	if err != nil {
+		t.Fatalf("ActivateMapping: %v", err)
+	}
+	rec = doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("an ACTIVE mapping must now be postable: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var exec domain.PostingExecution
+	_ = json.Unmarshal(rec.Body.Bytes(), &exec)
+	if !strings.Contains(exec.CalculationTrace, "account_mapping_id:"+activated.AccountMappingID) {
+		t.Errorf("expected the calculation trace to evidence the specific mapping VERSION used, got %q", exec.CalculationTrace)
 	}
 }
 

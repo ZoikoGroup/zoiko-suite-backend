@@ -2719,7 +2719,13 @@ func (h *Handler) resolvePostingLines(ctx context.Context, tenantID string, line
 			return nil, nil, domain.ErrPostingRuleAmbiguous
 		}
 		accountCode := m.AccountCode
-		trace[fmt.Sprintf("line_%d", i)] = "mapping_key:" + *l.MappingKey + " -> account_code:" + accountCode
+		// ACC-02's evidence requirement is "persist mapping version and
+		// resolution path on every posting" — account_mapping_id is the
+		// version (the specific ACTIVE row GetCurrentAccountMapping matched),
+		// distinct from account_code, which can be shared by a later,
+		// different mapping version pointing at the same account.
+		trace[fmt.Sprintf("line_%d", i)] = "mapping_key:" + *l.MappingKey + " -> account_code:" + accountCode +
+			" (account_mapping_id:" + m.AccountMappingID + ")"
 		if !exactlyOneNonZero(l.DebitAmount, l.CreditAmount) {
 			return nil, nil, domain.ErrInvalidLine
 		}
