@@ -406,6 +406,18 @@ components:
         The support elevation identity-context-svc verified when it issued the
         session. Only ever from the envelope; a client copy is stripped.
       schema: { type: string }
+    CommercialPlan:
+      description: |
+        The tenant's commercial plan (product ID from active subscription),
+        resolved from commercial-account-svc. Best-effort; omitted when no
+        commercial account exists or the service is unavailable. Traefik strips
+        any client copy.
+      schema: { type: string }
+    OrgUnitId:
+      description: |
+        The tenant's organization unit ID (from commercial-account-svc),
+        same provenance as CommercialPlan. Traefik strips any client copy.
+      schema: { type: string }
     DenialReason:
       description: |
         Why the request was refused, on every refusal. Traefik returns an
@@ -422,6 +434,16 @@ components:
           - carta_blocked
           - tenant_context_denied
           - tenant_context_unresolved
+          - residency_denied
+          - residency_unresolved
+          - rate_limited
+          - step_up_required
+          - carta_unavailable
+          - overloaded
+          - version_unsupported
+          - request_too_large
+          - request_encoding_refused
+          - malformed_request
     CartaDecision:
       description: |
         The continuous-risk decision, set **only** when carta-svc actually made

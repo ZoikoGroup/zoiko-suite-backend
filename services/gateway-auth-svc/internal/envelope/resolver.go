@@ -85,6 +85,22 @@ var ErrTenantNotResolvable = errors.New("tenant context not resolvable")
 // tenant, or is not in an active state.
 var ErrEntityNotResolvable = errors.New("legal entity context not resolvable")
 
+// ErrResidencyUnknown means the registry holds no such residency policy, or the
+// policy names no region it can state: the tenant's residency posture cannot be
+// determined. Distinct from ErrResolverUnavailable, which is "could not ask" —
+// this is "asked, and the answer was nothing". A material write treats it as an
+// unknown side and fails closed.
+var ErrResidencyUnknown = errors.New("residency policy not resolvable")
+
+// ResidencyPolicyView is the subset of the registry's DataResidencyPolicy the
+// residency gate needs: how strict the policy is, and which region it pins.
+// Declared narrowly for the same reason as tenantView above.
+type ResidencyPolicyView struct {
+	PolicyID string
+	Mode     string
+	RegionID string
+}
+
 // Resolver reads authoritative context from tenant-entity-registry-svc.
 type Resolver struct {
 	registryBaseURL string
@@ -131,6 +147,22 @@ type entityView struct {
 	PrimaryJurisdictionID string `json:"primary_jurisdiction_id"`
 	FiscalCalendarID      string `json:"fiscal_calendar_id"`
 	DataResidencyPolicyID string `json:"data_residency_policy_id"`
+}
+
+// residencyPolicyView and residencyRegionView mirror the registry's
+// DataResidencyPolicy and ResidencyRegion reads. ResidencyRegionID is a
+// pointer because a policy may legitimately name no region yet (an
+// onboarding-policy placeholder): nil means "the policy pins nothing", which is
+// an unknown side for the gate, not an error.
+type residencyPolicyView struct {
+	DataResidencyPolicyID string   `json:"data_residency_policy_id"`
+	ResidencyMode         string   `json:"residency_mode"`
+	ResidencyRegionID     *string  `json:"residency_region_id"`
+}
+
+type residencyRegionView struct {
+	ResidencyRegionID string `json:"residency_region_id"`
+	RegionCode        string `json:"region_code"`
 }
 
 // Resolve fills the server-resolved half of the envelope for e.
@@ -256,27 +288,80 @@ func conflicts(e Envelope, r ResolvedContext) []Conflict {
 	return out
 }
 
+// ResolveResidencyPolicy reads one residency policy by id, so the gateway's
+// residency gate can compare the edge-resolved region against the policy the
+// GOV-01 context named. A 404 is ErrResidencyUnknown — asked, and the answer
+// was nothing; everything else that is not 200 is ErrResolverUnavailable.
+func (rs *Resolver) ResolveResidencyPolicy(ctx context.Context, tenantID, policyID string) (ResidencyPolicyView, error) {
+	if policyID == "" {
+		return ResidencyPolicyView{}, ErrResidencyUnknown
+	}
+	var v residencyPolicyView
+	if err := rs.fetch(ctx, tenantID, "/v1/residency-policies/"+policyID, &v, nil); err != nil {
+		if errors.Is(err, errNotFound) {
+			return ResidencyPolicyView{}, ErrResidencyUnknown
+		}
+		return ResidencyPolicyView{}, err
+	}
+	out := ResidencyPolicyView{PolicyID: v.DataResidencyPolicyID, Mode: v.ResidencyMode}
+	if v.ResidencyRegionID != nil {
+		out.RegionID = *v.ResidencyRegionID
+	}
+	return out, nil
+}
+
+// ResolveResidencyRegion reads one residency region's code by id. Region codes
+// are the vocabulary GTRM's regions.yaml serves into X-Zoiko-Resolved-Region
+// (eu/us/uk today), so this read is what makes the two sides comparable.
+func (rs *Resolver) ResolveResidencyRegion(ctx context.Context, tenantID, regionID string) (string, error) {
+	if regionID == "" {
+		return "", ErrResidencyUnknown
+	}
+	var v residencyRegionView
+	if err := rs.fetch(ctx, tenantID, "/v1/residency-regions/"+regionID, &v, nil); err != nil {
+		if errors.Is(err, errNotFound) {
+			return "", ErrResidencyUnknown
+		}
+		return "", err
+	}
+	return v.RegionCode, nil
+}
+
 var errNotFound = errors.New("not found")
 
 func (rs *Resolver) get(ctx context.Context, e Envelope, path string, into any) error {
+	return rs.fetch(ctx, e.TenantID, path, into, func(req *http.Request) {
+		// The envelope propagates onto the resolver call itself. Without this the
+		// registry's own row-level security has no tenant to scope by, and the
+		// resulting read would be attributed to nothing in the audit trail —
+		// a governed write whose validation step is invisible.
+		if actor := e.Actor(); actor != "" {
+			req.Header.Set(HeaderActorSubjectID, actor)
+		}
+		if e.CorrelationID != "" {
+			req.Header.Set(HeaderCorrelationID, e.CorrelationID)
+		}
+		if e.RequestID != "" {
+			req.Header.Set(HeaderRequestID, e.RequestID)
+		}
+	})
+}
+
+// fetch performs one registry read. The residency lookups reuse it with no
+// envelope in hand: they are configuration reads addressed by policy/region id,
+// stamped with the tenant header alone so any tenant scoping on the registry
+// side still applies.
+func (rs *Resolver) fetch(ctx context.Context, tenantID, path string, into any, extra func(*http.Request)) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rs.registryBaseURL+path, nil)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrResolverUnavailable, err)
 	}
 
-	// The envelope propagates onto the resolver call itself. Without this the
-	// registry's own row-level security has no tenant to scope by, and the
-	// resulting read would be attributed to nothing in the audit trail —
-	// a governed write whose validation step is invisible.
-	req.Header.Set(HeaderTenantID, e.TenantID)
-	if actor := e.Actor(); actor != "" {
-		req.Header.Set(HeaderActorSubjectID, actor)
+	if tenantID != "" {
+		req.Header.Set(HeaderTenantID, tenantID)
 	}
-	if e.CorrelationID != "" {
-		req.Header.Set(HeaderCorrelationID, e.CorrelationID)
-	}
-	if e.RequestID != "" {
-		req.Header.Set(HeaderRequestID, e.RequestID)
+	if extra != nil {
+		extra(req)
 	}
 	req.Header.Set(HeaderSourceChannel, string(ChannelSystem))
 	req.Header.Set("Accept", "application/json")
