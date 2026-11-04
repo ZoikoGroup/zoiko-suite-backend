@@ -27,6 +27,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"zoiko.io/reconciliation-intelligence-svc/internal/problem"
 
 	"go.uber.org/zap"
@@ -60,16 +61,33 @@ const (
 	maxBodyBytes    = 1 << 20
 )
 
-// Middleware deduplicates material writes that carry an Idempotency-Key. A
-// write without a key is refused earlier by the envelope middleware, so the
-// key's presence is not enforced again here.
+// RequireKey refuses a material write that carries no Idempotency-Key with
+// 400 idempotency_key_required. The envelope middleware refuses it too, but
+// only when enforcing: ZS_ENVELOPE_ENFORCEMENT=observe admits it. This holds
+// the requirement in every mode, with or without a replay store wired.
+func RequireKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isMaterialWrite(r.Method) && strings.TrimSpace(r.Header.Get(headerKey)) == "" {
+			writeError(w, http.StatusBadRequest, "idempotency_key_required",
+				"Idempotency-Key header is required for this write")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Middleware deduplicates material writes. A material write without an
+// Idempotency-Key is refused (400), whatever the envelope enforcement mode.
 func Middleware(store Store, log *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
+		required := RequireKey(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := r.Header.Get(headerKey)
+			key := strings.TrimSpace(r.Header.Get(headerKey))
 			tenantID := r.Header.Get(headerTenant)
 			if !isMaterialWrite(r.Method) || key == "" || tenantID == "" {
-				next.ServeHTTP(w, r)
+				// Reads pass; a key-less write is refused by RequireKey; a
+				// write with no tenant is answered 401 by the tenant gate.
+				required.ServeHTTP(w, r)
 				return
 			}
 
