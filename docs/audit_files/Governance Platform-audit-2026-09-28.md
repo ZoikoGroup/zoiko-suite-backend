@@ -3774,3 +3774,46 @@ tree, so row status is now verified.
   handler layer, and identity-gate override do not have dedicated handler tests (the store
   and consumer paths are covered).
 - X3 (real brokers), X5 (signed identity everywhere), X9 (RFC 9457), C1, C3, C4, C8 remain.
+
+---
+
+# identity-context-svc items in this audit, status at 4 November 2026
+
+identity-context-svc is a Group 1 service. This audit tracks the parts of it that authorization-svc
+depends on: the 14 Oct sign-off and dependency register, and N-05. The service was re-audited on 4 Nov.
+The findings (K-1 … K-7) and its full gap register are in
+`Identity, Scope & Foundation-audit-2026-09-23.md`, in the sections "identity-context-svc re-audit,
+4 November 2026" and "identity-context-svc gap register, 4 November 2026".
+
+**No Group 2 score changes.** K-1 and K-2 leave a revoked or suspended role in the envelope's
+`role_profile`. authorization-svc decides from its own assignments, not from that claim, so its
+85 rows stand.
+
+## The 14 Oct sign-off and dependency register: identity-context rows
+
+| ID | 14 Oct item | 4 Nov status |
+|---|---|---|
+| F-2 | MFA UI: enrolment, step-up prompt, admin reset | **Closed 3 Nov.** The console has a Sign-in security page (passkey and authenticator app) and offers a passkey in the step-up dialog (Identity audit N-9) |
+| F-3 | The console logs in with its client; then `IDP_CLIENT_AUTH=required` | **Half done.** Compose has been `required` since 3 Nov (N-5). The console sends its client only when `IDENTITY_CONSOLE_CLIENT_ID` / `_SECRET` are set, and its `.env.example` leaves them empty (K-5). If identity-context-svc then refuses the login, the console signs the person in from its own credential list (K-4) |
+| F-1 | The console forwards the envelope on every authorization-svc call; then compose → `AUTHZ_IDENTITY_ASSERTION=require` | **Open.** Compose is still `warn`. Until it is `require`, a console-only session from K-4, which sends `X-Principal-Id` / `X-Tenant-Id` and no envelope, is admitted by authorization-svc in compose |
+| SO-1 | Security approves TOTP as the interim high-assurance factor; WebAuthn follows | **Open, wider.** WebAuthn passkeys exist since 3 Nov: a passkey step-up gives `assurance_level: PHISHING_RESISTANT`. The approval now also covers passkey attestation `none`, with no authenticator allow-list (Identity register S1-D2) |
+| P-1 | Delete the stale `docker-compose.override.yml` | **Closed.** `feec479b` (3 Nov) removed it |
+| R-3 | Every other service verifies the envelope | **Open.** 20 of 122 service folders reference `zoiko.io/identity-envelope`, and a reference is not proof of a mounted gate |
+| X-3 | PEPs forward `X-Authn-Age-Seconds`; then `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up` | **Open.** Compose is still `permit`. identity-context-svc already puts `auth_time` on every envelope |
+
+## N-05: principal status ordering
+
+**Holds.** identity-context-svc sends `principal.status.changed` (with `identity.subject.*`) from
+the status transaction, stamped with envelope `emitted_at` and no payload `status_changed_at`.
+authorization-svc orders by `emitted_at` when the payload has no timestamp
+(`internal/events/lifecycle_consumer.go:557-566`).
+
+## New since 14 Oct, for authorization-svc to know
+
+- **Suspension in the role projection.** identity-context-svc consumes authorization-svc's
+  `iam.assignment.suspended` / `.resumed` (000037 / 000041), ends the subject's sessions, and
+  holds the role out of the envelope. The two defects K-1 and K-2 are on the identity side. No
+  authorization-svc change is needed, except that a projection resync (the fix for S1-9) would
+  read authorization-svc's assignments.
+- **Live proof.** The suspension handling has not run against a real broker. The 3 Nov live E2E
+  used an image built before the merge.

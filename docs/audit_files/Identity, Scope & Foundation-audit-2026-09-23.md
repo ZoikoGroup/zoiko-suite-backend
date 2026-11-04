@@ -1,6 +1,6 @@
 # Group 1 — Identity, Scope & Foundation: documentation-compliance audit
 
-**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026, in-service gaps closed and full matrix scored 6 October 2026; delegated-authority-svc independently re-audited in two passes and seven defects fixed 6 October 2026; access-control-svc re-audited, two regressions and five gaps fixed 6 October 2026, and its unbuilt §5/§9/§24 scope built the same day; all nine re-audited 7 October 2026, six findings, fixed 8 October: see "Group 1 re-audit, 7 October 2026"; every gap open then, grouped by what it waits on, is in "07/10 re-audit gaps" after it; **all nine re-audited again 19 October 2026: eight new findings (F-1 … F-8), none fixed yet, including a delegated-authority-svc create that fails on every call and an image identity-context-svc can no longer build: see "Group 1 re-audit, 19 October 2026" at the end**)
+**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026, in-service gaps closed and full matrix scored 6 October 2026; delegated-authority-svc independently re-audited in two passes and seven defects fixed 6 October 2026; access-control-svc re-audited, two regressions and five gaps fixed 6 October 2026, and its unbuilt §5/§9/§24 scope built the same day; all nine re-audited 7 October 2026, six findings, fixed 8 October: see "Group 1 re-audit, 7 October 2026"; every gap open then, grouped by what it waits on, is in "07/10 re-audit gaps" after it; **all nine re-audited again 19 October 2026: eight new findings (F-1 … F-8), none fixed yet, including a delegated-authority-svc create that fails on every call and an image identity-context-svc can no longer build: see "Group 1 re-audit, 19 October 2026" at the end**; **identity-context-svc re-audited 4 November 2026: seven findings (K-1 … K-7), none fixed yet, NP4 ✅ → ⚠️, and every open identity-context-svc gap in one register: see "identity-context-svc re-audit, 4 November 2026" and "identity-context-svc gap register, 4 November 2026" at the end**)
 **Scope:** all nine services of Group 1, audited one at a time.
 **Source of truth:** the original `.docx` specifications in `docs/architecture/`, **not** the
 per-service `openapi.yaml` / `asyncapi.yaml` artefacts. This is deliberate: auditing code
@@ -16,7 +16,7 @@ diff the two → report. Anything ambiguous in the documents is flagged **needs 
 
 | # | Service | Port | Spec audited against | Full match | Weighted |
 |---|---|---|---|---|---|
-| 1 | identity-context-svc | 8080 | GOV-01 §4 | **93%** on 19 Oct re-audit, 41 of 44 (95% after the 8 Oct fixes; 86% on 7 Oct; 95% on 28 Sep; was 73%) | **95.5%** (96.6% on 8 Oct, published as 98%; 92% on 7 Oct; was 82%) |
+| 1 | identity-context-svc | 8080 | GOV-01 §4 | **93%** on 4 Nov re-audit, 41 of 44: NP4 ⚠️ (K-1) (95.5% after the 19 Oct fixes; 93% on 19 Oct; 95% after the 8 Oct fixes; 86% on 7 Oct; 95% on 28 Sep; was 73%) | **95.5%** (96.6% after the 19 Oct fixes; 96.6% on 8 Oct, published as 98%; 92% on 7 Oct; was 82%) |
 | 2 | tenant-entity-registry-svc | 8081 | ORG-02 + ORG-03 | **94%** on 19 Oct re-audit, 45 of 48 (98% on 29 Sep; was 75%) | **97%** (99% on 29 Sep; was 80%) |
 | 3 | configuration-feature-flag-svc | 8086 | ZS-SVC-AA-001 (CFG-01…05) | **96%**, unchanged on 19 Oct (94% on 7 Oct, 96% after the 8 Oct fixes; was 12%) | **98%** (97% on 7 Oct; was 19%) |
 | 4 | secret-vault-integration-svc | 8087 | Security Standard §13, §9, §3.1 | **86%**, unchanged on 19 Oct (was 40%) | **93%** (was 52%) |
@@ -41,6 +41,10 @@ Negative-Path Acceptance — plus §1–§2 invariants.
 > closed and verified; the two ❓ items are ruled. What remains open depends on other services
 > — see *Remaining cross-service dependencies* below. Each row keeps the original 23 Sep finding
 > so the history stays readable.
+>
+> **Current state (4 November 2026):** 41 of 44. NP4 is ⚠️ again (K-1). The open gaps are in
+> "identity-context-svc gap register, 4 November 2026" at the end of this file, which replaces
+> the dependency list below.
 
 ## Named operation surface
 
@@ -2333,6 +2337,10 @@ Where a gap came from the 7 Oct re-audit, its R-number is given too.
 
 > **19 Oct:** eight new group A gaps (S8-1, S2-1, S1-5 … S1-8, S6-3, S0-1), S1-C1 moved to
 > group B, and S5-B1 closed. See "Register changes, 19 October" at the end of this document.
+>
+> **4 Nov:** the identity-context-svc (S1) rows are replaced by "identity-context-svc gap
+> register, 4 November 2026" at the end: S1-B2 and S1-B3 closed, and S1-9 … S1-13, S1-B4,
+> S1-B5 and S1-D1 … S1-D3 added.
 
 **Summary**
 
@@ -3134,3 +3142,287 @@ scored GOV-01 rows (as F-5 was): **no Group 1 score changes** (identity 42/44, a
 | SAML | Decision D-4 |
 
 **Commits** (`shashi-changes`, 3 Nov): backend `a374c56b` (access-control 000025), `8049bd5c` (000027), `13299a0c` (federation), `8e7cbc19` (passkeys, resets, MFA), `d8e1a895` (client auth, E2E, audit), `feec479b` (override); frontend `9dbf896` (identity tabs), `5ee180d` (Sign-in security). The docs commit that follows them records this list.
+
+---
+
+# identity-context-svc re-audit, 4 November 2026: issues found and every open gap
+
+**Why.** Three commits reached identity-context-svc after the 3 Nov pass, and none of them was
+audited:
+- `15a9c581` (3 Nov), the merge of `origin/main`. It brought main's ORG-06 assignment
+  suspension into the role projection: `internal/events/assignment_suspension.go`,
+  `internal/store/pg_role_suspension.go` and migration `000016_role_assignment_suspension`. The
+  merge message calls the projection "reorder-safe".
+- `5fb1a36e`: the grants in 000017 and 000018 are guarded on the role existing.
+- `3d0c3a49`: two test-fixture passwords allowlisted for the secret scan.
+
+This pass re-reads that code against GOV-01 §4 and re-checks every identity-context-svc gap
+still open in this file. It then lists all of them in one register (below), so this section is
+the current state of the service.
+
+**How.** The method of the 19 Oct re-audit: no credit from earlier passes, and the code checked
+for the defect shapes this group keeps producing. Each finding marked *confirmed* was reproduced
+by a throwaway test, which was deleted after the run. **Nothing was fixed in this pass.**
+
+**Test evidence.** `shashi-changes` at `3d0c3a49`.
+
+| Check | Result |
+|---|---|
+| `go build` / `go vet` (golang:1.26-alpine) | clean |
+| Full suite against Postgres 16 (`REQUIRE_DB_TESTS=1`, scratch database) | **828 pass / 0 fail / 0 skip** (813 on 3 Nov), plus the two throwaway probes |
+| CI on `3d0c3a49` (public Actions API) | **success**, 4 Nov 05:20 UTC. The merge commit `15a9c581` failed; the next four commits fixed it |
+| Not run | the live compose stack, `e2e-identity-context-deps.py`, `audit.sh`, Kafka, and mutants. The 3 Nov live run (61/61) used an image built at 16:34, before the merge, so the suspension handling has never run against a real broker |
+
+## Score
+
+| Service | Before (19 Oct, after fixes) | **4 Nov** | What changed |
+|---|---|---|---|
+| identity-context-svc | 42/44: 95.5% (96.6% weighted) | **41/44: 93.2% (95.5%)** | NP4 ✅ → ⚠️ (K-1) |
+| **Group 1** | 291/303: 96.0% (97.9%) | **290/303: 95.7% (296.0 weighted, 97.7%)** | No other service was re-scored |
+
+The other two rows that fall short of full are unchanged:
+- **Entitlement context reference (❌).** `COMMERCIAL_ACCOUNT_URL` is still unset in compose,
+  and commercial-account-svc does not run locally.
+- **Source channel (⚠️).** Compose now requires the console's client. The console sends it only
+  when its client environment variables are set, and its `.env.example` leaves them empty (K-5).
+
+## Findings, ranked by risk
+
+### K-1 · identity-context-svc: a late revocation or suspension is skipped whole, so the projection keeps framing the role (auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| NP4 · cache invalidation removes stale privilege promptly | GOV-01 §4 NP4; invariant 10 (at-least-once) | `Consumer.Handle` drops `iam.assignment.revoked`, `.expired` and `.suspended` before dispatch when they are older than the revocation horizon: the envelope TTL + 1 min, so 6 min by default (`internal/events/consumer.go:371-377`). `iam.assignment.granted` is not gated | ⚠️ (was ✅) | **Confirmed in a throwaway consumer test.** At the default horizon, three 10-minute-old events for one assignment were handled. The grant was projected. The revoke and the suspend were skipped: no `EndRoleAssignment`, no tombstone, no `SuspendRoleAssignment`. The horizon was written on 28 Sep (R1) for session eviction only. The projection writes were added later, inside the same handlers: the close and tombstone (S1-4, 8 Oct) and the suspension (merge, 3 Nov). The resolver frames roles from this projection (`internal/context/resolver.go:399`). So every later envelope's `role_profile` names the revoked or suspended role and its permission bundles. This lasts until the assignment's own end date, which is `infinity` for an open-ended grant |
+
+**When it happens.**
+- **Consumer lag over 6 minutes.** A pod is down, the broker is down, or one event retries
+  through its budget (25 attempts, about 10 minutes) and holds the partition behind it.
+- **The topics are replayed** (a consumer-group reset or a new environment). Every historic
+  grant is projected and every historic revocation is skipped.
+- **An event runs out of retries.** The consumer commits past it, logged at ERROR. A projection
+  change lost that way stays lost: there is no resync from authorization-svc and no dead-letter
+  record.
+
+**Impact.** authorization-svc decides from its own assignments, so `/v1/authorize` is not
+affected. The stale role reaches every relying party that reads `role_profile`, and the console.
+
+### K-2 · identity-context-svc: a suspension that arrives before its grant is lost (auth, latent)
+
+`SuspendRoleAssignment` (`internal/store/pg_role_suspension.go:18-30`) is an `UPDATE`. When the
+projection holds no row, it changes nothing and records nothing. A revocation in the same case
+leaves a tombstone (S1-4); a suspension leaves no trace.
+
+**Confirmed on Postgres 16 (throwaway store test).** Suspend `a-9`, then project its grant:
+`FindActiveRoleAssignments` frames `a-9`.
+
+authorization-svc keys the grant, suspend and resume events by the assignment id on one topic,
+so they normally arrive in order. The gap opens in two cases:
+- the first grant was not projected, because the principal did not exist here yet
+  (`ErrUnknownPrincipal`);
+- the row is created later by a grant from the other producer, access-control-svc, on another
+  topic.
+
+The merge's order test (`TestPgStore_SuspensionIsOrderIndependentAndIdempotent`) starts from a
+projected row. It proves that suspend and resume commute; it does not cover a suspension that
+arrives before the grant.
+
+### K-3 · identity-context-svc: five emitted events are not in asyncapi.yaml, and the contract test cannot see them (contract)
+
+**Undeclared events.** These go to the outbox and are not declared in `asyncapi.yaml`:
+- the lifecycle service writes `identity.subject.created`, `identity.password.changed`,
+  `identity.password_reset.requested` and `identity.password_reset.decided`
+  (`internal/lifecycle/service.go:167`, `:358`, `:416`, `:453`);
+- every session invalidation also writes the legacy `session.invalidated` beside
+  `identity.session.revoked` (`internal/events/publisher.go:281`).
+
+**Why the test passes.** `TestEveryProducedEventIsPublishedInTheContract` checks a hand-written
+list, `producedEventTypes` (`internal/events/contract_test.go:78`), and that list omits all five.
+
+**Unused constants.** Nine `Event*` constants in `publisher.go` have no emitter. A reader of the
+package can take them for live events:
+- `identity.subject.invited`;
+- `identity.idp.registered`, `identity.idp.status_changed`;
+- `identity.federation.login`;
+- `identity.group_role_mapping.proposed`, `.decided`;
+- `identity.group.membership_changed`;
+- `identity.scim_connection.created`, `identity.scim_sync.completed`.
+
+### K-4 · zoiko-suite-frontend-platform: the console signs people in without identity-context-svc (auth, cross-service)
+
+**The path.** `app/api/auth/login/route.ts:66-126` creates a console-only session from
+`lib/auth.ts` `findUserByCredentials` in any of these cases:
+- `/v1/authenticate` is unreachable or fails;
+- it answers 401 for an account the console's own list knows;
+- authentication succeeds but resolve fails.
+
+**Who can sign in that way.** The demo accounts. In production, the `ZOIKO_ADMIN_EMAIL` /
+`ZOIKO_ADMIN_PASSWORD` account, or every demo account when `ALLOW_DEMO_CREDENTIALS` is set.
+
+**What it skips.** The session carries no envelope and passed none of identity-context-svc's
+controls: lockout, login throttle, client authentication, MFA, the session register and
+sign-in events.
+
+**What it contradicts.** The 28 Sep ruling says `/v1/authenticate` is the console's only login
+path until an external identity provider is connected.
+
+**Reach (code, not driven).** The session holds the configured account's `principalId` and
+`tenantId`. The console's `envelopeHeaders` (`lib/api/envelope.ts:125-133`) sends those as
+`X-Principal-Id` / `X-Tenant-Id`, with no `Authorization` header, because the session has no
+envelope. The calls are accepted wherever headers are trusted:
+- by every service that does not verify the envelope (register R-3);
+- by authorization-svc in compose, which runs `AUTHZ_IDENTITY_ASSERTION: "warn"`.
+
+A backend in `require` mode (authorization-svc's default outside `ENV=local`) refuses them.
+
+### K-5 · console: its login client is not configured by default (auth, R-1 remainder)
+
+Compose requires a login client (`IDP_CLIENT_AUTH: "required"`, `deployments/docker-compose.yml:675`).
+The console sends `client_id` / `client_secret` only when `IDENTITY_CONSOLE_CLIENT_ID` and
+`IDENTITY_CONSOLE_CLIENT_SECRET` are set. Its `.env.example` leaves both empty, and the checkout
+has no local env file. A console started from the example therefore gets 401 `invalid_client`
+from identity-context-svc, and then falls back to a console-only session (K-4). The client is
+registered on the service side (`deployments/identity/idp-clients.local.json`, `zoiko-console`).
+This is why the source-channel row stays ⚠️.
+
+### K-6 · identity-context-svc: bulk session revocations emit no session event, and the ones that do carry no tenant (evidence)
+
+**Bulk evictions are silent.** `DurableCache.EvictAllForPrincipal`, `EvictAllForEntity` and
+`EvictAllForTenant` (`internal/session/durable.go`) record each invalidation in
+`session_contexts`, but emit no `identity.session.revoked`. Only two paths emit it: the
+single-session route (`internal/context/resolver.go:768`) and the concurrency cap
+(`cmd/server/revocation.go`). These ends of a session therefore leave no session event and no
+per-session SIEM signal:
+- a status change;
+- an assignment revocation or suspension;
+- a role change or an entity change;
+- the end of a delegation.
+
+**The events that are emitted** have three defects:
+- `tenant_id` is empty;
+- `actor_id` is the subject, not whoever revoked the session (`internal/events/publisher.go:278-281`);
+- the single-session route publishes from a detached goroutine after the invalidation commits,
+  not in its transaction.
+
+**Exposure is low.** `identity-envelope`'s revocation cache holds a live answer for 5 s, so
+relying parties are not left holding an ended session.
+
+### K-7 · identity-context-svc: password-reset decisions, five smaller defects (evidence / availability)
+
+- **The metric counts refusals.** `identity_password_resets_total{decision}` is incremented
+  before the store decides (`internal/lifecycle/service.go:458-460`). A decision that is then
+  refused (already decided, expired, not pending) is still counted.
+- **A database outage reads as a conflict.** Every store failure, including an outage, comes back
+  as `ErrConflict`, so the route answers 409, never 503 (`service.go:470-471`).
+- **The expiry write is rolled back.** `DecideResetRequest` sets `EXPIRED` and then returns an
+  error in the same transaction (`internal/store/pg_lifecycle.go:397-399`). The row stays
+  `PENDING_APPROVAL`; reads show `EXPIRED` only because they compute it (N-7).
+- **Intermediate approvals leave no event.** With `PASSWORD_RESET_APPROVALS` of 2 or more, no
+  event is written until the last decision (`pg_lifecycle.go:427-429`), and that event names
+  only the last approver. Earlier approvers and their reasons never reach the event stream. The
+  default is 1.
+- **A failed delivery strands the reset.** If delivering an approved link fails, the call still
+  answers 200 `ISSUED` and logs a WARN (`service.go:479-481`). The link is stored only as a
+  hash, so it cannot be re-sent, and the request waits out its TTL.
+
+### Also noted (not scored)
+
+- **Duplicate migration numbers.** 000012, 000013 and 000016 each have two files.
+  `deployments/migrate.py` and the Kubernetes Postgres init track migrations by filename and apply
+  them in filename order, so both work today. A runner keyed on version numbers (golang-migrate)
+  would refuse the directory. The merge message records the decision to leave them.
+- **A disable whose session end fails still answers 200.** `lifecycle.SetStatus` commits the
+  status and its events, then ends the sessions outside the transaction. A failure there is
+  logged and not retried (`internal/lifecycle/service.go:523-526`). The exposure is bounded:
+  resolve refuses a principal that is not ACTIVE, so live envelopes run out within the envelope
+  TTL (300 s).
+- **The local compose stack.** On 4 Nov the `identity-context-svc` container was restarting in a
+  loop because the Redis container was stopped. That is the Tier 0 fail-fast working as designed,
+  not a defect.
+
+## Claims checked
+
+| Claim | Where | Holds? |
+|---|---|---|
+| "identity-context-svc keeps main's reorder-safe suspension projection" | merge `15a9c581` | **Partly.** Suspend and resume of a projected row commute. A suspension before the row exists is lost (K-2), and one past the horizon is skipped (K-1) |
+| `/v1/authenticate` is the console's only login path | 28 Sep ruling, this file | **No** (K-4) |
+| 813 pass / 0 fail / 0 skip | 3 Nov pass | **Superseded.** 828 pass / 0 fail / 0 skip on `3d0c3a49` |
+| S1-1 to S1-8 fixed | 8 and 19 Oct | **Yes**, re-read in the code. Approval is a separate route (`internal/context/handler.go:420`). The consumer uses `FetchMessage` and commits after apply (`consumer.go:249-291`). Resolve requires correlation (`handler.go:508`). Tombstones are carried over (`pg_role_projection.go:46-57`). A status change emits both event names (`internal/lifecycle/service.go:534-536`). The auth plane is constructed (`cmd/server/main.go:462-497`, `:678`). The verifier refusal tests exist (`internal/auth/verifier_refusals_test.go`). CI built the image |
+| S1-B3 closed (IC-6) | 3 Nov progress | **Yes.** The ingress refresher runs at half the binding TTL whenever a registry URL is set (`cmd/server/main.go:738-745`) |
+
+# identity-context-svc gap register, 4 November 2026: every open gap
+
+This register replaces the identity-context-svc (S1) rows in "07/10 re-audit gaps" and in the
+19 Oct register changes. It lists every gap still open for the service, whatever owns the fix.
+Groups as before: **A** fixable now inside the service; **B** needs a change in a service or
+client that exists; **C** needs something that does not exist yet; **D** waits on a decision.
+A last table lists proof still owed where the code is done.
+
+**Summary**
+
+| Group | What it waits on | Gaps |
+|---|---|---|
+| A | Nothing: fixable now inside the service | 6 |
+| B | A service or client that exists | 5 |
+| C | Something that does not exist yet | 0 |
+| D | A decision | 3 |
+| | **Total** | **14** (plus 5 proof items) |
+
+## A · Fixable now, inside identity-context-svc
+
+| Id | Gap | Spec | Fix | Re-check |
+|---|---|---|---|---|
+| S1-9 (K-1) | A revocation, expiry or suspension older than the horizon is skipped whole, so the role projection keeps framing it. A projection change given up after its retries is lost for good | GOV-01 §4 NP4; invariant 10 | Apply the horizon to the eviction only. Always write the projection (`EndRoleAssignment`, `SuspendRoleAssignment`), then skip the eviction when the event is too old. Add a projection resync from authorization-svc's assignments, and a dead-letter record for an event given up on | Revoke and suspend 10 minutes old → projection closed / held, no eviction. Replay from the earliest offset → no revoked assignment is framed. Rescore NP4 |
+| S1-10 (K-2) | A suspension consumed before its grant leaves no trace; the late grant frames the suspended role | GOV-01 §4 NP4 | Record the suspension without a row (keyed by tenant + assignment, like the tombstone), and have `UpsertRoleAssignment` apply it on insert | Suspend, then grant → not framed. Suspend, grant, resume → framed |
+| S1-11 (K-3) | Five emitted events are not in `asyncapi.yaml`; the contract test checks a hand-written list that omits them; nine event constants have no emitter | Event Catalogue; GOV-01 §17 | Declare the five, add them to `producedEventTypes`, and delete (or wire) the nine unused constants | Contract test fails when an emitted name is undeclared (mutant: drop one declaration) |
+| S1-12 (K-6) | Bulk session evictions emit no `identity.session.revoked`. The events that are emitted carry no tenant and name the subject as the actor, and the single-session one is published after its commit | ZS-IAM-001 §23; invariant 10 | Emit per session through the outbox in the invalidation's transaction, with the tenant and the real actor (or the event that caused it) | A status change ending 2 sessions → 2 `identity.session.revoked` with `tenant_id` set |
+| S1-13 (K-7) | Password-reset decisions: the metric counts refusals; an outage answers 409; the expiry write rolls back; intermediate approvals leave no event; an undelivered link strands the request | IAM §3; plan Console rule | Count after commit. Map store outages to 503. Commit the expiry before refusing. Emit an event for every decision. Answer 502/503 (or allow a re-issue) when delivery fails | One test per point |
+| S1-14 (PR #249 merge, `abc2c226`) | Two merge routes, two strengths. `POST /v1/identities/{id}/merge` (main's ORG-01 merge: `MergeIdentity` → `lifecycle.MergeDuplicate`) asks for no step-up, and it writes only `identity.subject.merged`. The duplicate is disabled without `principal.status.changed` / `identity.subject.disabled`, so authorization-svc's status projection keeps it ACTIVE. `POST /v1/subjects/{id}/merge` requires a step-up and writes all three. Deferred from the merge because closing it changes main's tested behaviour (`handler_merge_test.go`; `lifecycle/merge_test.go` asserts the merge writes only `identity.subject.merged`) | IAM §3 (identity recovery is sensitive); F-3 (a disable must be emitted) | In a follow-up PR agreed with the author of main's ORG-01 waves: require `steppedUpActor` on `MergeIdentity`; add the two status events to `MergeDuplicate`'s build function; update both tests | `/v1/identities` merge without a recent second factor → 401 `step_up_required`. A merge writes `identity.subject.merged`, `principal.status.changed` and `identity.subject.disabled`. authorization-svc's projection reads the duplicate as DISABLED |
+
+## B · Needs a change in a service or client that exists
+
+| Id | Gap | Spec | Depends on | What closing it takes |
+|---|---|---|---|---|
+| S1-B4 (K-4) | The console signs people in from its own credential list when identity-context-svc refuses, fails or is down | GOV-01 §4 (authenticated subject); 28 Sep ruling | **zoiko-suite-frontend-platform** | No fallback outside local development, and never after a 401 or `invalid_client`. Bootstrap the production administrator through identity-context-svc |
+| S1-B1 / R-1 console (K-5) | The console sends its login client only when `IDENTITY_CONSOLE_CLIENT_ID` / `_SECRET` are set, and the example env leaves them empty. The source-channel row stays ⚠️ | GOV-01 §4 server-resolved source channel | **zoiko-suite-frontend-platform** | Document the local client in the console's env setup, and refuse to start the console server without it outside development. Then rescore source channel |
+| S1-C1 | Entitlement context reference is never resolved (❌). The client and config are done; compose does not set `COMMERCIAL_ACCOUNT_URL` | GOV-01 §4 server-resolved context | **commercial-account-svc** (COM-03) | Run it on the stack, set the URL, and verify a resolve records the entitlement reference |
+| R-3 estate | Services still take `X-Principal-Id` / `X-Tenant-Id` on trust when called directly. 20 of 122 service folders (identity-context-svc included) reference `zoiko.io/identity-envelope`, and a reference is not proof of a mounted gate | Security §8; A-01 | **each consuming service** | Mount the envelope gate (authorization-svc's `internal/identity`, workflow-svc's gate) service by service |
+| S1-B5 | Live SCIM provisioning is off locally, and the service principal holds no operator grant | AU-08; INT-10 | **access-control-svc** grant + deployment config | `FEDERATION_PROVISIONING_ENABLED=true` and an operator grant for `IDENTITY_SERVICE_PRINCIPAL_ID`, then a live SCIM create / disable |
+
+## D · Waiting on a decision
+
+| Id | Question | Who decides | Affects |
+|---|---|---|---|
+| S1-D1 (D-4) | SAML federation: build it, or record OIDC only (SPEC_DEVIATIONS) | Security / platform owners | INT-10 SAML |
+| S1-D2 (SO-1) | Approve TOTP as the interim high-assurance factor, now that passkeys exist, and approve passkey attestation `none` with no authenticator allow-list (SPEC_DEVIATIONS) | Security | ZS-IAM-001 §13, §31; AU-11 |
+| S1-D3 | Is a passkey-first (usernameless) login required, or are passkeys a second factor only? | Security / product | AU-11 scope |
+
+## Proof still owed (code done)
+
+| Item | What is missing |
+|---|---|
+| Assignment suspension, live | The merge's suspend and resume handling has not run against Kafka. Re-run `e2e-identity-context-deps.py` on an image built after `15a9c581`, with a suspend and a resume step |
+| AU-05 key rotation, live | A rotation exercised with two published keys (JWKS publishes one locally) |
+| Passkey in a real browser | A ceremony with a platform authenticator (the live proof used a software P-256 authenticator) |
+| S1-C1, live | As in group B, once commercial-account-svc runs |
+| Mutants | Not re-run since 3 Nov (3/3 killed then) |
+
+## Closed since the 7 Oct register
+
+| Id | Closed by |
+|---|---|
+| S1-1 … S1-4 | 8 Oct gap closure |
+| S1-5 … S1-8 | 19 Oct fixes |
+| S1-B2 (no service grants the `IDENTITY_*` actions) | access-control 000026 role templates (IC-7) and 000027 (`FEDERATION_*`, N-4) |
+| S1-B3 (ingress bindings never refreshed) | IC-6 refresher (`cmd/server/main.go:738-745`) |
+| R-2 (`auth_time`, MFA) | 14 Oct auth plane closure; passkeys 3 Nov (N-1) |
+| MFA UI | 3 Nov (N-9) |
+
+## Where to start
+
+1. **S1-9 (K-1).** It is the only finding that rescored a row, and the fix is local. Then
+   **S1-10 (K-2)**: the same projection, the same tombstone pattern.
+2. **S1-B4 (K-4) and S1-B1 (K-5)**, together in the console: remove the fallback and configure
+   the client.
+3. **S1-11 (K-3)** and **S1-12 (K-6)**: contract and evidence.
+4. **S1-13 (K-7).**
+5. Run the live E2E on a post-merge image, then rescore NP4 and source channel.
