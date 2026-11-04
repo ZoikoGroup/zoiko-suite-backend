@@ -1027,11 +1027,11 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check If-Match for optimistic concurrency (API-3).
-	if !h.requireIfMatch(w, r, notification.RecordVersion) {
-		return
-	}
-
+	// No If-Match here (API-3): marking read is not an edit of the notification
+	// that a concurrent writer could lose. Only the recipient may do it, it keeps
+	// the first read_at, and repeating it changes nothing. The delivery worker
+	// updates the same row, so a required ETag would refuse a recipient's click
+	// whenever a delivery attempt landed after their last fetch.
 	readAt := time.Now().UTC()
 	if err := h.store.MarkRead(r.Context(), id, principalID, readAt); err != nil {
 		if errors.Is(err, domain.ErrNotificationNotFound) {
@@ -1622,8 +1622,9 @@ func (h *Handler) CompareVersions(w http.ResponseWriter, r *http.Request) {
 		h.handleTemplateError(w, r, err)
 		return
 	}
-	// ETag based on versionA's record_version (arbitrary choice for comparison result)
-	writeJSONWithETag(w, http.StatusOK, result, 0)
+	// No ETag: a comparison of two versions is not an aggregate a caller can
+	// mutate, and "v0" is not a version If-Match accepts.
+	writeJSON(w, http.StatusOK, result)
 }
 
 // ListLocales — BIZ-03's own ListLocales query.

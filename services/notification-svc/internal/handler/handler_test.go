@@ -582,7 +582,11 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
 	}
-	// Add If-Match header for mutating requests (required by API-3)
+	// Add If-Match header for mutating requests (required by API-3). It is "*"
+	// (any current version), not a fixed "v1": each mutation bumps the
+	// version, so a fixed ETag goes stale after the first step of a
+	// validate → approve → publish flow. The TestIfMatch_* tests set exact
+	// ETags themselves to prove 428, 412 and the matching case.
 	if method == http.MethodPost || method == http.MethodPatch || method == http.MethodDelete {
 		// Check if this is a mutation of an existing aggregate (not a create)
 		// Create operations don't need If-Match; mutations of existing aggregates do
@@ -590,15 +594,14 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 		// - /v1/notifications/{id}/cancel
 		// - /v1/notifications/{id}/resend
 		// - /v1/notifications/{id}/resolve-delivery-outcome
-		// - /v1/notifications/{id}/read
 		// - /v1/templates/{templateID} (retire)
 		// - /v1/templates/{templateID}/versions/{versionID} (validate, approve, publish)
 		// Note: POST /v1/templates/{templateID}/versions is a CREATE, not a mutation
 		if strings.Contains(path, "/cancel") || strings.Contains(path, "/resend") ||
-			strings.Contains(path, "/resolve-delivery-outcome") || strings.Contains(path, "/read") ||
+			strings.Contains(path, "/resolve-delivery-outcome") ||
 			strings.Contains(path, "/retire") ||
 			(strings.Contains(path, "/versions/") && !strings.HasSuffix(path, "/versions")) {
-			req.Header.Set("If-Match", `"v1"`)
+			req.Header.Set("If-Match", "*")
 		}
 	}
 	rr := httptest.NewRecorder()
@@ -2078,5 +2081,63 @@ func TestIfMatch_PublishTemplateVersion_CorrectReturns200(t *testing.T) {
 	etag := rr.Header().Get("ETag")
 	if etag != `"v2"` {
 		t.Fatalf("response ETag = %q, want %q", etag, `"v2"`)
+	}
+}
+
+// TestIfMatch_DeniedCallerGets403BeforeAnyPrecondition: cancel and resend
+// authorize before they read If-Match. A caller without the grant gets 403
+// whether the header is missing, stale or current, and never a 428/412 or an
+// ETag that would tell them the notification exists and at which version.
+func TestIfMatch_DeniedCallerGets403BeforeAnyPrecondition(t *testing.T) {
+	for _, path := range []string{"/v1/notifications/n1/cancel", "/v1/notifications/n1/resend"} {
+		for _, ifMatch := range []string{"", `"v999"`, `"v3"`} {
+			store := newStubStore()
+			store.byID["n1"] = &domain.Notification{
+				NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+				RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "FAILED",
+				RecordVersion: 3,
+			}
+			r := newRouter(store, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied})
+
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(`{"reason":"test"}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Principal-Id", "ops-1")
+			if ifMatch != "" {
+				req.Header.Set("If-Match", ifMatch)
+			}
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusForbidden {
+				t.Fatalf("%s If-Match=%q: expected 403, got %d: %s", path, ifMatch, rr.Code, rr.Body.String())
+			}
+			if etag := rr.Header().Get("ETag"); etag != "" {
+				t.Fatalf("%s If-Match=%q: a denied caller was sent ETag %q", path, ifMatch, etag)
+			}
+		}
+	}
+}
+
+// TestMarkRead_NeedsNoIfMatch: the console marks a notice read with a bare
+// POST. Marking read is recipient-only and idempotent, so it is not gated on
+// If-Match, and a delivery update that bumped the version in between does not
+// refuse it.
+func TestMarkRead_NeedsNoIfMatch(t *testing.T) {
+	store := newStubStore()
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: domain.ChannelInApp, Status: "SENT",
+		RecordVersion: 7,
+	}
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/n1/read", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-2")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 without If-Match, got %d: %s", rr.Code, rr.Body.String())
 	}
 }

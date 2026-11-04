@@ -65,13 +65,14 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check If-Match for optimistic concurrency (API-3).
-	if !h.requireIfMatch(w, r, existing.RecordVersion) {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionSend); err != nil {
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
-	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionSend); err != nil {
-		h.writeAuthzErr(w, r, err)
+	// Check If-Match for optimistic concurrency (API-3), after authorization so
+	// an unauthorized caller never learns the notification's version.
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
 		return
 	}
 
