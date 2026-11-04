@@ -65,10 +65,10 @@ type Store interface {
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
 	GetCurrentAccountMapping(ctx context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error)
 	ListAccountMappings(ctx context.Context, tenantID string) ([]domain.AccountMapping, error)
-	CreateMapping(ctx context.Context, m *domain.AccountMapping) error
-	ApproveMapping(ctx context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error)
-	ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time) (*domain.AccountMapping, error)
-	SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error)
+	CreateMapping(ctx context.Context, m *domain.AccountMapping, idempotencyKey string) (replay bool, err error)
+	ApproveMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey string) (*domain.AccountMapping, bool, error)
+	ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time, idempotencyKey string) (*domain.AccountMapping, bool, error)
+	SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey string) (*domain.AccountMapping, bool, error)
 	GetMappingByID(ctx context.Context, tenantID, mappingID string) (*domain.AccountMapping, error)
 	GetMappingAsOf(ctx context.Context, tenantID, mappingKey string, asOf time.Time) (*domain.AccountMapping, error)
 	ListMappingAmbiguities(ctx context.Context, tenantID string) ([]string, error)
@@ -1494,6 +1494,19 @@ func (h *Handler) SetAccountMapping(w http.ResponseWriter, r *http.Request) {
 // ── ACC-02 governed lifecycle: CreateMapping / ApproveMapping /
 // ActivateMapping / SupersedeMapping ─────────────────────────────────────────
 
+// requireMappingIdempotencyKey is the Engineering Interaction Wireframe's own
+// "Mandatory controls" for every ACC-02 command: Idempotency-Key. Mirrors
+// AmendAccountVersion/ReparentAccount's identical requirement in this same
+// file (SPEC_DEVIATIONS A6/B12).
+func requireMappingIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := strings.TrimSpace(r.Header.Get(svcenvelope.HeaderIdempotencyKey))
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required for this command")
+		return "", false
+	}
+	return key, true
+}
+
 // CreateMapping drafts a new mapping version (status DRAFT). It is not
 // resolvable by GetCurrentAccountMapping until ApproveMapping and
 // ActivateMapping have both run.
@@ -1504,6 +1517,10 @@ func (h *Handler) CreateMapping(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MappingKey == "" || req.AccountCode == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "mapping_key and account_code are required")
+		return
+	}
+	idempotencyKey, ok := requireMappingIdempotencyKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -1529,14 +1546,21 @@ func (h *Handler) CreateMapping(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateMapping(r.Context(), m); err != nil {
+	replay, err := h.store.CreateMapping(r.Context(), m, idempotencyKey)
+	if err != nil {
 		if errors.Is(err, domain.ErrMappingTargetAccountInvalid) {
 			writeError(w, http.StatusBadRequest, "invalid_target_account", err.Error())
+			return
+		}
+		if h.writeMappingErr(w, err) {
 			return
 		}
 		h.log.Error("CreateMapping: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusCreated, m)
 }
@@ -1553,6 +1577,8 @@ func (h *Handler) writeMappingErr(w http.ResponseWriter, err error) bool {
 		writeError(w, http.StatusConflict, "mapping_not_active", err.Error())
 	case errors.Is(err, domain.ErrMappingSelfApproval):
 		writeError(w, http.StatusForbidden, "mapping_self_approval", err.Error())
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		return false
 	}
@@ -1564,6 +1590,10 @@ func (h *Handler) writeMappingErr(w http.ResponseWriter, err error) bool {
 // own author — ACC-02's maker-checker SoD requirement.
 func (h *Handler) ApproveMapping(w http.ResponseWriter, r *http.Request) {
 	mappingID := chi.URLParam(r, "mapping_id")
+	idempotencyKey, ok := requireMappingIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -1578,7 +1608,7 @@ func (h *Handler) ApproveMapping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m, err := h.store.ApproveMapping(r.Context(), tenantID, mappingID, principalID)
+	m, replay, err := h.store.ApproveMapping(r.Context(), tenantID, mappingID, principalID, idempotencyKey)
 	if err != nil {
 		if h.writeMappingErr(w, err) {
 			return
@@ -1586,6 +1616,9 @@ func (h *Handler) ApproveMapping(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("ApproveMapping: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusOK, m)
 }
@@ -1596,6 +1629,10 @@ func (h *Handler) ActivateMapping(w http.ResponseWriter, r *http.Request) {
 	mappingID := chi.URLParam(r, "mapping_id")
 	var req domain.ActivateMappingRequest
 	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
+	idempotencyKey, ok := requireMappingIdempotencyKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -1616,7 +1653,7 @@ func (h *Handler) ActivateMapping(w http.ResponseWriter, r *http.Request) {
 	if req.EffectiveFrom != nil {
 		effectiveFrom = req.EffectiveFrom.Time
 	}
-	m, err := h.store.ActivateMapping(r.Context(), tenantID, mappingID, effectiveFrom)
+	m, replay, err := h.store.ActivateMapping(r.Context(), tenantID, mappingID, effectiveFrom, idempotencyKey)
 	if err != nil {
 		if h.writeMappingErr(w, err) {
 			return
@@ -1625,6 +1662,9 @@ func (h *Handler) ActivateMapping(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
 	writeJSON(w, http.StatusOK, m)
 }
 
@@ -1632,6 +1672,10 @@ func (h *Handler) ActivateMapping(w http.ResponseWriter, r *http.Request) {
 // yet approved to take its place.
 func (h *Handler) SupersedeMapping(w http.ResponseWriter, r *http.Request) {
 	mappingID := chi.URLParam(r, "mapping_id")
+	idempotencyKey, ok := requireMappingIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -1646,7 +1690,7 @@ func (h *Handler) SupersedeMapping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m, err := h.store.SupersedeMapping(r.Context(), tenantID, mappingID, principalID)
+	m, replay, err := h.store.SupersedeMapping(r.Context(), tenantID, mappingID, principalID, idempotencyKey)
 	if err != nil {
 		if h.writeMappingErr(w, err) {
 			return
@@ -1654,6 +1698,9 @@ func (h *Handler) SupersedeMapping(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("SupersedeMapping: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusOK, m)
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -591,10 +592,15 @@ func (s *stubStore) ListAccountMappings(_ context.Context, tenantID string) ([]d
 // and its maker-checker rule, against the stub's own accounts/mappings
 // rather than trusting the caller — same rationale as SetAccountMapping's
 // stub above.
-func (s *stubStore) CreateMapping(_ context.Context, m *domain.AccountMapping) error {
+// Idempotency replay itself is verified against real Postgres
+// (acc02_account_mapping_governance_integration_test.go); these stubs take
+// and ignore idempotencyKey (always behaving as a fresh call) so the
+// handler's own plumbing (mandatory header, passing it through) is still
+// exercised without duplicating that coverage here.
+func (s *stubStore) CreateMapping(_ context.Context, m *domain.AccountMapping, _ string) (bool, error) {
 	a, ok := s.accountsByCode[m.TenantID+"|"+m.AccountCode]
 	if !ok || a.Status != "ACTIVE" {
-		return domain.ErrMappingTargetAccountInvalid
+		return false, domain.ErrMappingTargetAccountInvalid
 	}
 	m.Status = domain.AccountMappingStatusDraft
 	m.IsHighRisk = a.IsControlAccount
@@ -602,34 +608,34 @@ func (s *stubStore) CreateMapping(_ context.Context, m *domain.AccountMapping) e
 		s.mappingsByID = map[string]*domain.AccountMapping{}
 	}
 	s.mappingsByID[m.AccountMappingID] = m
-	return nil
+	return false, nil
 }
 
-func (s *stubStore) ApproveMapping(_ context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error) {
+func (s *stubStore) ApproveMapping(_ context.Context, tenantID, mappingID, principalID, _ string) (*domain.AccountMapping, bool, error) {
 	m, ok := s.mappingsByID[mappingID]
 	if !ok || m.TenantID != tenantID {
-		return nil, domain.ErrMappingNotFoundByID
+		return nil, false, domain.ErrMappingNotFoundByID
 	}
 	if m.Status != domain.AccountMappingStatusDraft {
-		return nil, domain.ErrMappingNotDraft
+		return nil, false, domain.ErrMappingNotDraft
 	}
 	if m.IsHighRisk && m.CreatedByPrincipalID == principalID {
-		return nil, domain.ErrMappingSelfApproval
+		return nil, false, domain.ErrMappingSelfApproval
 	}
 	now := time.Now().UTC()
 	m.Status = domain.AccountMappingStatusApproved
 	m.ApprovedAt = &now
 	m.ApprovedByPrincipalID = principalID
-	return m, nil
+	return m, false, nil
 }
 
-func (s *stubStore) ActivateMapping(_ context.Context, tenantID, mappingID string, effectiveFrom time.Time) (*domain.AccountMapping, error) {
+func (s *stubStore) ActivateMapping(_ context.Context, tenantID, mappingID string, effectiveFrom time.Time, _ string) (*domain.AccountMapping, bool, error) {
 	m, ok := s.mappingsByID[mappingID]
 	if !ok || m.TenantID != tenantID {
-		return nil, domain.ErrMappingNotFoundByID
+		return nil, false, domain.ErrMappingNotFoundByID
 	}
 	if m.Status != domain.AccountMappingStatusApproved {
-		return nil, domain.ErrMappingNotApproved
+		return nil, false, domain.ErrMappingNotApproved
 	}
 	at := effectiveFrom
 	if at.IsZero() {
@@ -647,23 +653,23 @@ func (s *stubStore) ActivateMapping(_ context.Context, tenantID, mappingID strin
 	m.ActivatedAt = &at
 	m.EffectiveFrom = at
 	s.currentMappings[key] = m
-	return m, nil
+	return m, false, nil
 }
 
-func (s *stubStore) SupersedeMapping(_ context.Context, tenantID, mappingID, _ string) (*domain.AccountMapping, error) {
+func (s *stubStore) SupersedeMapping(_ context.Context, tenantID, mappingID, _, _ string) (*domain.AccountMapping, bool, error) {
 	m, ok := s.mappingsByID[mappingID]
 	if !ok || m.TenantID != tenantID {
-		return nil, domain.ErrMappingNotFoundByID
+		return nil, false, domain.ErrMappingNotFoundByID
 	}
 	if m.Status != domain.AccountMappingStatusActive {
-		return nil, domain.ErrMappingNotActive
+		return nil, false, domain.ErrMappingNotActive
 	}
 	now := time.Now().UTC()
 	m.Status = domain.AccountMappingStatusSuperseded
 	m.EffectiveTo = &now
 	m.SupersededAt = &now
 	delete(s.currentMappings, tenantID+"|"+m.MappingKey)
-	return m, nil
+	return m, false, nil
 }
 
 func (s *stubStore) GetMappingByID(_ context.Context, tenantID, mappingID string) (*domain.AccountMapping, error) {
@@ -2391,6 +2397,110 @@ func TestGetAccountMapping_NotFound_Returns404(t *testing.T) {
 	rec := doRequest(r, http.MethodGet, "/v1/account-mappings/does-not-exist", nil, "principal-1")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
+// ── ACC-02 governed lifecycle over real HTTP ────────────────────────────────
+//
+// posting_engine_test.go already proves the governance gate holds on the
+// posting path by calling the stub store directly; these drive the actual
+// HTTP commands, including the Engineering Interaction Wireframe's mandatory
+// Idempotency-Key control — mirroring the ACC-01 Idempotency-Key tests
+// below exactly, since both commands live in the same file under the same
+// convention (SPEC_DEVIATIONS A6/B12).
+
+func TestCreateMapping_MissingIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "6100-Meals", AccountName: "Meals Expense", AccountType: domain.AccountTypeExpense})
+
+	rec := doRequest(r, http.MethodPost, "/v1/account-mappings/draft", domain.CreateMappingRequest{
+		MappingKey: "EXPENSE_CATEGORY:MEALS", AccountCode: "6100-Meals",
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without an Idempotency-Key, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.mappingsByID) != 0 {
+		t.Fatalf("a request without a key must not draft a mapping, got %d", len(s.mappingsByID))
+	}
+}
+
+func TestApproveActivateSupersedeMapping_MissingIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "6100-Meals", AccountName: "Meals Expense", AccountType: domain.AccountTypeExpense})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/account-mappings/draft", domain.CreateMappingRequest{
+		MappingKey: "EXPENSE_CATEGORY:MEALS", AccountCode: "6100-Meals",
+	}, "principal-1", "create-key-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("CreateMapping: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var m domain.AccountMapping
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for _, path := range []string{"approve", "activate", "supersede"} {
+		rec := doRequest(r, http.MethodPost, "/v1/account-mappings/by-id/"+m.AccountMappingID+"/"+path, nil, "approver-2")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s without an Idempotency-Key: expected 400, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+	if s.mappingsByID[m.AccountMappingID].Status != domain.AccountMappingStatusDraft {
+		t.Fatalf("the mapping must still be DRAFT — no command without a key may have executed, got %s", s.mappingsByID[m.AccountMappingID].Status)
+	}
+}
+
+// TestAccountMappingLifecycle_FullHTTPRoundTrip drives CreateMapping ->
+// ApproveMapping -> ActivateMapping -> SupersedeMapping entirely over HTTP
+// (not the stub directly), proving the routes, the Idempotency-Key plumbing,
+// and the self-approval SoD check all wire together correctly end to end.
+func TestAccountMappingLifecycle_FullHTTPRoundTrip(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	control := domain.CreateAccountRequest{AccountCode: "1100", AccountName: "AR Control", AccountType: domain.AccountTypeAsset, IsControlAccount: true}
+	createAccount(t, r, control)
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/account-mappings/draft", domain.CreateMappingRequest{
+		MappingKey: "SUBLEDGER:AR", AccountCode: "1100",
+	}, "author-1", "create-key-2")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("CreateMapping: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var m domain.AccountMapping
+	_ = json.Unmarshal(rec.Body.Bytes(), &m)
+	if !m.IsHighRisk {
+		t.Fatalf("expected IsHighRisk=true for a control-account mapping")
+	}
+
+	// The author cannot approve their own high-risk mapping.
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/account-mappings/by-id/"+m.AccountMappingID+"/approve", nil, "author-1", "approve-key-2")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("self-approval of a high-risk mapping: expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/account-mappings/by-id/"+m.AccountMappingID+"/approve", nil, "approver-2", "approve-key-2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ApproveMapping by a different principal: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/account-mappings/by-id/"+m.AccountMappingID+"/activate", nil, "approver-2", "activate-key-2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ActivateMapping: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	resolved, err := s.GetCurrentAccountMapping(context.Background(), "t1", "SUBLEDGER:AR")
+	if err != nil || resolved.AccountCode != "1100" {
+		t.Fatalf("expected SUBLEDGER:AR to resolve to 1100 after activation, got %+v (err %v)", resolved, err)
+	}
+
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/account-mappings/by-id/"+m.AccountMappingID+"/supersede", nil, "approver-2", "supersede-key-2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("SupersedeMapping: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := s.GetCurrentAccountMapping(context.Background(), "t1", "SUBLEDGER:AR"); !errors.Is(err, domain.ErrAccountMappingNotFound) {
+		t.Fatalf("expected ErrAccountMappingNotFound after supersede, got %v", err)
 	}
 }
 

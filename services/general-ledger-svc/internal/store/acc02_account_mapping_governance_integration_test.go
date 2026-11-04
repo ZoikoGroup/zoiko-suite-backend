@@ -16,6 +16,11 @@ import (
 	"zoiko.io/general-ledger-svc/internal/store"
 )
 
+// idemKey returns a fresh Idempotency-Key for a call that isn't itself
+// testing replay behavior — a distinct key per call means it never
+// interferes with that call succeeding.
+func idemKey() string { return uuid.NewString() }
+
 func newMappingDraft(tenantID, mappingKey, accountCode, creator string) *domain.AccountMapping {
 	return &domain.AccountMapping{
 		AccountMappingID:     uuid.NewString(),
@@ -50,7 +55,7 @@ func TestPgStore_AccountMappingLifecycle_DraftApproveActivate(t *testing.T) {
 	}
 
 	m1 := newMappingDraft(tenantID, "REVENUE:WIDGETS", "4000", "author-1")
-	if err := s.CreateMapping(ctx, m1); err != nil {
+	if _, err := s.CreateMapping(ctx, m1, idemKey()); err != nil {
 		t.Fatalf("CreateMapping: %v", err)
 	}
 	if m1.Status != domain.AccountMappingStatusDraft {
@@ -61,7 +66,7 @@ func TestPgStore_AccountMappingLifecycle_DraftApproveActivate(t *testing.T) {
 		t.Fatalf("a DRAFT mapping must not resolve, got %v", err)
 	}
 
-	approved, err := s.ApproveMapping(ctx, tenantID, m1.AccountMappingID, "approver-1")
+	approved, _, err := s.ApproveMapping(ctx, tenantID, m1.AccountMappingID, "approver-1", idemKey())
 	if err != nil {
 		t.Fatalf("ApproveMapping: %v", err)
 	}
@@ -73,7 +78,7 @@ func TestPgStore_AccountMappingLifecycle_DraftApproveActivate(t *testing.T) {
 		t.Fatalf("an APPROVED mapping must not resolve either, got %v", err)
 	}
 
-	activated, err := s.ActivateMapping(ctx, tenantID, m1.AccountMappingID, time.Time{})
+	activated, _, err := s.ActivateMapping(ctx, tenantID, m1.AccountMappingID, time.Time{}, idemKey())
 	if err != nil {
 		t.Fatalf("ActivateMapping: %v", err)
 	}
@@ -93,13 +98,13 @@ func TestPgStore_AccountMappingLifecycle_DraftApproveActivate(t *testing.T) {
 	// idx_account_mappings_active permits only one ACTIVE row per key, so
 	// this also proves the index doesn't block the legitimate replacement.
 	m2 := newMappingDraft(tenantID, "REVENUE:WIDGETS", "4001", "author-1")
-	if err := s.CreateMapping(ctx, m2); err != nil {
+	if _, err := s.CreateMapping(ctx, m2, idemKey()); err != nil {
 		t.Fatalf("CreateMapping m2: %v", err)
 	}
-	if _, err := s.ApproveMapping(ctx, tenantID, m2.AccountMappingID, "approver-1"); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m2.AccountMappingID, "approver-1", idemKey()); err != nil {
 		t.Fatalf("ApproveMapping m2: %v", err)
 	}
-	if _, err := s.ActivateMapping(ctx, tenantID, m2.AccountMappingID, time.Time{}); err != nil {
+	if _, _, err := s.ActivateMapping(ctx, tenantID, m2.AccountMappingID, time.Time{}, idemKey()); err != nil {
 		t.Fatalf("ActivateMapping m2: %v", err)
 	}
 
@@ -151,18 +156,18 @@ func TestPgStore_AccountMappingLifecycle_HighRiskMakerChecker(t *testing.T) {
 	}
 
 	m := newMappingDraft(tenantID, "SUBLEDGER:AR", "1100", "author-1")
-	if err := s.CreateMapping(ctx, m); err != nil {
+	if _, err := s.CreateMapping(ctx, m, idemKey()); err != nil {
 		t.Fatalf("CreateMapping: %v", err)
 	}
 	if !m.IsHighRisk {
 		t.Fatalf("expected IsHighRisk=true for a control-account mapping")
 	}
 
-	if _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "author-1"); !errors.Is(err, domain.ErrMappingSelfApproval) {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "author-1", idemKey()); !errors.Is(err, domain.ErrMappingSelfApproval) {
 		t.Fatalf("expected ErrMappingSelfApproval for self-approval of a high-risk mapping, got %v", err)
 	}
 
-	approved, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-2")
+	approved, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-2", idemKey())
 	if err != nil {
 		t.Fatalf("ApproveMapping by a different principal: %v", err)
 	}
@@ -187,17 +192,17 @@ func TestPgStore_AccountMappingLifecycle_SupersedeWithoutReplacement(t *testing.
 	}
 
 	m := newMappingDraft(tenantID, "EXPENSE:TRAVEL", "5000", "author-1")
-	if err := s.CreateMapping(ctx, m); err != nil {
+	if _, err := s.CreateMapping(ctx, m, idemKey()); err != nil {
 		t.Fatalf("CreateMapping: %v", err)
 	}
-	if _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-1"); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey()); err != nil {
 		t.Fatalf("ApproveMapping: %v", err)
 	}
-	if _, err := s.ActivateMapping(ctx, tenantID, m.AccountMappingID, time.Time{}); err != nil {
+	if _, _, err := s.ActivateMapping(ctx, tenantID, m.AccountMappingID, time.Time{}, idemKey()); err != nil {
 		t.Fatalf("ActivateMapping: %v", err)
 	}
 
-	if _, err := s.SupersedeMapping(ctx, tenantID, m.AccountMappingID, "approver-1"); err != nil {
+	if _, _, err := s.SupersedeMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey()); err != nil {
 		t.Fatalf("SupersedeMapping: %v", err)
 	}
 	if _, err := s.GetCurrentAccountMapping(ctx, tenantID, "EXPENSE:TRAVEL"); !errors.Is(err, domain.ErrAccountMappingNotFound) {
@@ -205,7 +210,7 @@ func TestPgStore_AccountMappingLifecycle_SupersedeWithoutReplacement(t *testing.
 	}
 
 	// A second supersede must be refused — it is no longer ACTIVE.
-	if _, err := s.SupersedeMapping(ctx, tenantID, m.AccountMappingID, "approver-1"); !errors.Is(err, domain.ErrMappingNotActive) {
+	if _, _, err := s.SupersedeMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey()); !errors.Is(err, domain.ErrMappingNotActive) {
 		t.Fatalf("expected ErrMappingNotActive on a repeat supersede, got %v", err)
 	}
 }
@@ -233,28 +238,28 @@ func TestPgStore_GetMappingAsOf_ReconstructsHistory(t *testing.T) {
 	before := time.Now().UTC().Add(-time.Hour)
 
 	m1 := newMappingDraft(tenantID, "COGS:MAIN", "6000", "author-1")
-	if err := s.CreateMapping(ctx, m1); err != nil {
+	if _, err := s.CreateMapping(ctx, m1, idemKey()); err != nil {
 		t.Fatalf("CreateMapping m1: %v", err)
 	}
-	if _, err := s.ApproveMapping(ctx, tenantID, m1.AccountMappingID, "approver-1"); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m1.AccountMappingID, "approver-1", idemKey()); err != nil {
 		t.Fatalf("ApproveMapping m1: %v", err)
 	}
 	t1 := time.Now().UTC()
-	if _, err := s.ActivateMapping(ctx, tenantID, m1.AccountMappingID, t1); err != nil {
+	if _, _, err := s.ActivateMapping(ctx, tenantID, m1.AccountMappingID, t1, idemKey()); err != nil {
 		t.Fatalf("ActivateMapping m1: %v", err)
 	}
 
 	mid := time.Now().UTC()
 
 	m2 := newMappingDraft(tenantID, "COGS:MAIN", "6001", "author-1")
-	if err := s.CreateMapping(ctx, m2); err != nil {
+	if _, err := s.CreateMapping(ctx, m2, idemKey()); err != nil {
 		t.Fatalf("CreateMapping m2: %v", err)
 	}
-	if _, err := s.ApproveMapping(ctx, tenantID, m2.AccountMappingID, "approver-1"); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m2.AccountMappingID, "approver-1", idemKey()); err != nil {
 		t.Fatalf("ApproveMapping m2: %v", err)
 	}
 	t2 := time.Now().UTC()
-	if _, err := s.ActivateMapping(ctx, tenantID, m2.AccountMappingID, t2); err != nil {
+	if _, _, err := s.ActivateMapping(ctx, tenantID, m2.AccountMappingID, t2, idemKey()); err != nil {
 		t.Fatalf("ActivateMapping m2: %v", err)
 	}
 
@@ -270,5 +275,91 @@ func TestPgStore_GetMappingAsOf_ReconstructsHistory(t *testing.T) {
 	atAfter, err := s.GetMappingAsOf(ctx, tenantID, "COGS:MAIN", after)
 	if err != nil || atAfter.AccountCode != "6001" {
 		t.Fatalf("expected 6001 to be in force after the replacement, got %+v (err %v)", atAfter, err)
+	}
+}
+
+// TestPgStore_AccountMappingLifecycle_IdempotencyKeyReplay proves the
+// Engineering Interaction Wireframe's own "Mandatory controls" for all four
+// ACC-02 commands: a retry with the same Idempotency-Key replays the
+// original result rather than either duplicating the write (CreateMapping)
+// or erroring on a state the retry itself already produced (Approve/
+// Activate/Supersede) — and a key reused for a DIFFERENT mapping or command
+// is refused as a genuine conflict, not silently honored.
+func TestPgStore_AccountMappingLifecycle_IdempotencyKeyReplay(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	acct := newTestAccount(tenantID, "7000", "Other Income")
+	if err := s.CreateAccount(ctx, acct); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	createKey := idemKey()
+	m := newMappingDraft(tenantID, "OTHER_INCOME:MISC", "7000", "author-1")
+	if replay, err := s.CreateMapping(ctx, m, createKey); err != nil || replay {
+		t.Fatalf("first CreateMapping: replay=%v err=%v", replay, err)
+	}
+	firstID := m.AccountMappingID
+
+	retry := newMappingDraft(tenantID, "OTHER_INCOME:MISC", "7000", "author-1")
+	if replay, err := s.CreateMapping(ctx, retry, createKey); err != nil || !replay {
+		t.Fatalf("retried CreateMapping must replay: replay=%v err=%v", replay, err)
+	}
+	if retry.AccountMappingID != firstID {
+		t.Fatalf("a replayed CreateMapping must return the ORIGINAL mapping, not draft a second one: got %s want %s", retry.AccountMappingID, firstID)
+	}
+	var mappingCount int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM account_mappings WHERE tenant_id = $1 AND mapping_key = $2`, tenantID, "OTHER_INCOME:MISC").Scan(&mappingCount); err != nil {
+		t.Fatalf("count mappings: %v", err)
+	}
+	if mappingCount != 1 {
+		t.Fatalf("a retried CreateMapping must not draft a second row, got %d rows", mappingCount)
+	}
+
+	// Reusing createKey for a DIFFERENT mapping is a genuine conflict, not a replay.
+	other := newMappingDraft(tenantID, "OTHER_INCOME:DIFFERENT", "7000", "author-1")
+	if _, err := s.CreateMapping(ctx, other, createKey); !errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+		t.Fatalf("expected ErrIdempotencyKeyConflict reusing a key for a different mapping, got %v", err)
+	}
+
+	approveKey := idemKey()
+	approved1, replay, err := s.ApproveMapping(ctx, tenantID, firstID, "approver-2", approveKey)
+	if err != nil || replay {
+		t.Fatalf("first ApproveMapping: replay=%v err=%v", replay, err)
+	}
+	approved2, replay, err := s.ApproveMapping(ctx, tenantID, firstID, "approver-2", approveKey)
+	if err != nil || !replay {
+		t.Fatalf("retried ApproveMapping must replay: replay=%v err=%v", replay, err)
+	}
+	if approved1.Status != domain.AccountMappingStatusApproved || approved2.Status != domain.AccountMappingStatusApproved {
+		t.Fatalf("both the original and the replay must report APPROVED, got %s and %s", approved1.Status, approved2.Status)
+	}
+
+	activateKey := idemKey()
+	activated1, replay, err := s.ActivateMapping(ctx, tenantID, firstID, time.Time{}, activateKey)
+	if err != nil || replay {
+		t.Fatalf("first ActivateMapping: replay=%v err=%v", replay, err)
+	}
+	activated2, replay, err := s.ActivateMapping(ctx, tenantID, firstID, time.Time{}, activateKey)
+	if err != nil || !replay {
+		t.Fatalf("retried ActivateMapping must replay: replay=%v err=%v", replay, err)
+	}
+	if activated1.Status != domain.AccountMappingStatusActive || activated2.Status != domain.AccountMappingStatusActive {
+		t.Fatalf("both the original and the replay must report ACTIVE, got %s and %s", activated1.Status, activated2.Status)
+	}
+
+	supersedeKey := idemKey()
+	superseded1, replay, err := s.SupersedeMapping(ctx, tenantID, firstID, "approver-2", supersedeKey)
+	if err != nil || replay {
+		t.Fatalf("first SupersedeMapping: replay=%v err=%v", replay, err)
+	}
+	superseded2, replay, err := s.SupersedeMapping(ctx, tenantID, firstID, "approver-2", supersedeKey)
+	if err != nil || !replay {
+		t.Fatalf("retried SupersedeMapping must replay: replay=%v err=%v", replay, err)
+	}
+	if superseded1.Status != domain.AccountMappingStatusSuperseded || superseded2.Status != domain.AccountMappingStatusSuperseded {
+		t.Fatalf("both the original and the replay must report SUPERSEDED, got %s and %s", superseded1.Status, superseded2.Status)
 	}
 }

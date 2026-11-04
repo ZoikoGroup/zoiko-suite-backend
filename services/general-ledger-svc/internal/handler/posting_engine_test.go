@@ -240,7 +240,7 @@ func TestPostAccountingEvent_DraftOrApprovedMapping_Returns422(t *testing.T) {
 		AccountMappingID: "m-1", TenantID: "t1", MappingKey: "EXPENSE_CATEGORY:MEALS",
 		AccountCode: "6200-Meals", CreatedByPrincipalID: "author-1",
 	}
-	if err := s.CreateMapping(context.Background(), draft); err != nil {
+	if _, err := s.CreateMapping(context.Background(), draft, "idem-create-1"); err != nil {
 		t.Fatalf("CreateMapping: %v", err)
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
@@ -253,7 +253,7 @@ func TestPostAccountingEvent_DraftOrApprovedMapping_Returns422(t *testing.T) {
 		t.Fatalf("a DRAFT mapping must not be postable: expected 422, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	if _, err := s.ApproveMapping(context.Background(), "t1", "m-1", "approver-2"); err != nil {
+	if _, _, err := s.ApproveMapping(context.Background(), "t1", "m-1", "approver-2", "idem-approve-1"); err != nil {
 		t.Fatalf("ApproveMapping: %v", err)
 	}
 	rec = doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
@@ -261,7 +261,7 @@ func TestPostAccountingEvent_DraftOrApprovedMapping_Returns422(t *testing.T) {
 		t.Fatalf("an APPROVED-but-not-ACTIVE mapping must not be postable either: expected 422, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	activated, err := s.ActivateMapping(context.Background(), "t1", "m-1", time.Time{})
+	activated, _, err := s.ActivateMapping(context.Background(), "t1", "m-1", time.Time{}, "idem-activate-1")
 	if err != nil {
 		t.Fatalf("ActivateMapping: %v", err)
 	}

@@ -1359,6 +1359,15 @@ func currentAccountVersionEffectiveFrom(ctx context.Context, tx pgx.Tx, tenantID
 const (
 	commandAmendAccount    = "AMEND_ACCOUNT_VERSION"
 	commandReparentAccount = "REPARENT_ACCOUNT"
+
+	// ACC-02 commands reuse this same table and the same lookup/record
+	// helpers. command_idempotency.account_code is a generic claimed-identity
+	// column keyed to whichever entity the claiming command operates on — for
+	// these four it holds account_mapping_id, not an account_code.
+	commandCreateMapping    = "CREATE_MAPPING"
+	commandApproveMapping   = "APPROVE_MAPPING"
+	commandActivateMapping  = "ACTIVATE_MAPPING"
+	commandSupersedeMapping = "SUPERSEDE_MAPPING"
 )
 
 // commandIdempotencyRecord is the identity a claimed key was recorded under.
@@ -1833,15 +1842,70 @@ func (s *PgStore) ListAccountMappings(ctx context.Context, tenantID string) ([]d
 // ── ACC-02 governed lifecycle: CreateMapping / ApproveMapping /
 // ActivateMapping / SupersedeMapping ─────────────────────────────────────────
 
+// mappingIdempotencyRecord looks up idempotencyKey against command_idempotency,
+// refusing it (ErrIdempotencyKeyConflict) if it was already claimed by a
+// different command or a different mapping, and otherwise reporting whether
+// it was already claimed by THIS command and mapping (a replay).
+func mappingIdempotencyRecord(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey, command, mappingID string) (replay bool, err error) {
+	claimed, ok, err := lookupCommandIdempotency(ctx, tx, tenantID, idempotencyKey)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	if claimed.Command != command || claimed.AccountCode != mappingID {
+		return false, fmt.Errorf("%w: key was claimed by %s on mapping %s", domain.ErrIdempotencyKeyConflict, claimed.Command, claimed.AccountCode)
+	}
+	return true, nil
+}
+
 // CreateMapping drafts a new mapping version. It is never itself eligible
 // for resolution (GetCurrentAccountMapping only ever sees status ACTIVE) —
 // ApproveMapping and ActivateMapping must both still run.
-func (s *PgStore) CreateMapping(ctx context.Context, m *domain.AccountMapping) error {
+//
+// idempotencyKey is mandatory (ZS-ACC-KERNEL-001's own wireframe: "Mandatory
+// controls: Idempotency-Key" on every ACC-02 command) because, unlike
+// CreateAccount, nothing about this insert is itself naturally deduplicated —
+// several DRAFT rows for the same mapping_key are allowed, so a retried call
+// with no idempotency guard would draft a second, distinct mapping rather
+// than report the first.
+func (s *PgStore) CreateMapping(ctx context.Context, m *domain.AccountMapping, idempotencyKey string) (replay bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claimed, claimedOK, err := lookupCommandIdempotency(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claimedOK {
+			if claimed.Command != commandCreateMapping {
+				return fmt.Errorf("%w: key was claimed by %s", domain.ErrIdempotencyKeyConflict, claimed.Command)
+			}
+			replayed, err := scanAccountMapping(tx.QueryRow(ctx, `
+				SELECT `+accountMappingColumns+` FROM account_mappings
+				WHERE tenant_id = $1 AND account_mapping_id = $2
+			`, tenantID, claimed.AccountCode))
+			if err != nil {
+				return mapPgError(err)
+			}
+			// CreateMapping has no caller-supplied resource identity to compare
+			// against the way AmendAccountVersion compares accountCode (the new
+			// mapping_id is freshly generated every call, retry or not) — so a
+			// genuine retry is recognised by content instead: same mapping_key
+			// and account_code as what this key originally created. A reuse
+			// naming something else is a real conflict, not a replay.
+			if replayed.MappingKey != m.MappingKey || replayed.AccountCode != m.AccountCode {
+				return fmt.Errorf("%w: key was already used to draft mapping %s (%s -> %s)",
+					domain.ErrIdempotencyKeyConflict, replayed.AccountMappingID, replayed.MappingKey, replayed.AccountCode)
+			}
+			*m = *replayed
+			replay = true
+			return nil
+		}
+
 		isHighRisk, err := targetAccountHighRisk(ctx, tx, tenantID, m.AccountCode)
 		if err != nil {
 			return err
@@ -1859,18 +1923,37 @@ func (s *PgStore) CreateMapping(ctx context.Context, m *domain.AccountMapping) e
 		if err != nil {
 			return mapPgError(err)
 		}
+		if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandCreateMapping, m.AccountMappingID); err != nil {
+			return err
+		}
 		return s.enqueueMappingEvent(ctx, tx, "created", tenantID, m.AccountMappingID, m.CreatedByPrincipalID, "", map[string]any{
 			"mapping_key": m.MappingKey, "account_code": m.AccountCode, "is_high_risk": m.IsHighRisk,
 		})
 	})
+	return replay, err
 }
 
 // ApproveMapping advances DRAFT -> APPROVED. For a high-risk mapping, the
 // approver must not be the mapping's own author — ACC-02's maker-checker
 // requirement for cash/tax/control-account mappings.
-func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error) {
+//
+// idempotencyKey makes a retry safe: without it, a caller whose first
+// request succeeded but whose response was lost on the wire would retry
+// into ErrMappingNotDraft (the mapping is now APPROVED) and could never
+// distinguish "my own retry" from "someone else already approved it".
+func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey string) (_ *domain.AccountMapping, replay bool, err error) {
 	var out *domain.AccountMapping
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claimedReplay, err := mappingIdempotencyRecord(ctx, tx, tenantID, idempotencyKey, commandApproveMapping, mappingID)
+		if err != nil {
+			return err
+		}
+		if claimedReplay {
+			replay = true
+			out, err = scanAccountMapping(tx.QueryRow(ctx, `SELECT `+accountMappingColumns+` FROM account_mappings WHERE tenant_id = $1 AND account_mapping_id = $2`, tenantID, mappingID))
+			return mapPgError(err)
+		}
+
 		m, err := scanAccountMapping(tx.QueryRow(ctx, `
 			SELECT `+accountMappingColumns+` FROM account_mappings
 			WHERE tenant_id = $1 AND account_mapping_id = $2 FOR UPDATE
@@ -1900,6 +1983,9 @@ func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, princ
 		if tag.RowsAffected() == 0 {
 			return domain.ErrMappingNotDraft
 		}
+		if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandApproveMapping, mappingID); err != nil {
+			return err
+		}
 		m.Status = domain.AccountMappingStatusApproved
 		m.ApprovedAt = &now
 		m.ApprovedByPrincipalID = principalID
@@ -1907,18 +1993,29 @@ func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, princ
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out, nil
+	return out, replay, nil
 }
 
 // ActivateMapping advances APPROVED -> ACTIVE, atomically superseding
 // whatever mapping was previously ACTIVE for the same key (if any) in the
-// same transaction — see supersedeActiveMapping's ordering note.
-func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time) (*domain.AccountMapping, error) {
+// same transaction — see supersedeActiveMapping's ordering note. See
+// ApproveMapping's doc comment for why idempotencyKey is required.
+func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time, idempotencyKey string) (_ *domain.AccountMapping, replay bool, err error) {
 	var out *domain.AccountMapping
 	var supersededID string
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claimedReplay, err := mappingIdempotencyRecord(ctx, tx, tenantID, idempotencyKey, commandActivateMapping, mappingID)
+		if err != nil {
+			return err
+		}
+		if claimedReplay {
+			replay = true
+			out, err = scanAccountMapping(tx.QueryRow(ctx, `SELECT `+accountMappingColumns+` FROM account_mappings WHERE tenant_id = $1 AND account_mapping_id = $2`, tenantID, mappingID))
+			return mapPgError(err)
+		}
+
 		m, err := scanAccountMapping(tx.QueryRow(ctx, `
 			SELECT `+accountMappingColumns+` FROM account_mappings
 			WHERE tenant_id = $1 AND account_mapping_id = $2 FOR UPDATE
@@ -1964,6 +2061,9 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 		if tag.RowsAffected() == 0 {
 			return domain.ErrMappingNotApproved
 		}
+		if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandActivateMapping, mappingID); err != nil {
+			return err
+		}
 		m.Status = domain.AccountMappingStatusActive
 		m.ActivatedAt = &at
 		m.EffectiveFrom = at
@@ -1984,18 +2084,29 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out, nil
+	return out, replay, nil
 }
 
 // SupersedeMapping retires an ACTIVE mapping directly, with no replacement —
 // e.g. a business concept that no longer posts anywhere. ActivateMapping
 // handles supersession-by-replacement inline; this is the other negative
-// path, retiring one with nothing yet approved to take its place.
-func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error) {
+// path, retiring one with nothing yet approved to take its place. See
+// ApproveMapping's doc comment for why idempotencyKey is required.
+func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey string) (_ *domain.AccountMapping, replay bool, err error) {
 	var out *domain.AccountMapping
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claimedReplay, err := mappingIdempotencyRecord(ctx, tx, tenantID, idempotencyKey, commandSupersedeMapping, mappingID)
+		if err != nil {
+			return err
+		}
+		if claimedReplay {
+			replay = true
+			out, err = scanAccountMapping(tx.QueryRow(ctx, `SELECT `+accountMappingColumns+` FROM account_mappings WHERE tenant_id = $1 AND account_mapping_id = $2`, tenantID, mappingID))
+			return mapPgError(err)
+		}
+
 		m, err := scanAccountMapping(tx.QueryRow(ctx, `
 			SELECT `+accountMappingColumns+` FROM account_mappings
 			WHERE tenant_id = $1 AND account_mapping_id = $2 FOR UPDATE
@@ -2022,6 +2133,9 @@ func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, pri
 		if tag.RowsAffected() == 0 {
 			return domain.ErrMappingNotActive
 		}
+		if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandSupersedeMapping, mappingID); err != nil {
+			return err
+		}
 		m.Status = domain.AccountMappingStatusSuperseded
 		m.EffectiveTo = &now
 		m.SupersededAt = &now
@@ -2032,9 +2146,9 @@ func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, pri
 		})
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out, nil
+	return out, replay, nil
 }
 
 // enqueueMappingEvent writes one ACC-02 mapping lifecycle event to the
