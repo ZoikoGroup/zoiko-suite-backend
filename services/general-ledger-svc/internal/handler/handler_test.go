@@ -99,7 +99,7 @@ const (
 )
 
 func newStubStore() *stubStore {
-	return &stubStore{
+	s := &stubStore{
 		journals:           map[string]*domain.JournalHeader{},
 		lines:              map[string][]domain.JournalLine{},
 		byCorrelation:      map[string]string{},
@@ -113,6 +113,15 @@ func newStubStore() *stubStore {
 		claimedAt:          map[string]time.Time{},
 		commandIdempotency: map[string]commandIdempotencyEntry{},
 	}
+	// ACC-02 is the only way a posting names an account, so every posting
+	// test starts with the two mappings validPostEventReq uses. Individual
+	// tests override these when they need a different resolution.
+	for code, key := range map[string]string{"1000": "GL_TEST_DEBIT", "4000": "GL_TEST_CREDIT"} {
+		s.currentMappings[testTenantID+"|"+key] = &domain.AccountMapping{
+			TenantID: testTenantID, MappingKey: key, AccountCode: code,
+		}
+	}
+	return s
 }
 
 func (s *stubStore) CreateJournal(_ context.Context, h *domain.JournalHeader, lines []domain.JournalLine) ([]domain.JournalLine, bool, error) {

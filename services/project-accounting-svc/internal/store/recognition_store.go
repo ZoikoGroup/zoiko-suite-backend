@@ -90,19 +90,21 @@ const recognitionRunColumns = `
 	run_id, legal_entity_id, project_id, fiscal_period, status,
 	contract_value, billed_to_date, estimate_to_complete, itd_cost_incurred,
 	percent_complete, cumulative_recognized_revenue, period_recognized_revenue, recognized_cost, margin,
-	balance_type, balance_amount, revenue_account_code, wip_account_code, journal_id,
+	balance_type, balance_amount, revenue_account_code, wip_account_code,
+	revenue_mapping_key, wip_mapping_key, journal_id,
 	supersedes_run_id, superseded_by_run_id,
 	created_at, created_by_principal_id, frozen_at, calculated_at, validated_at,
 	approved_at, approved_by_principal_id, emitted_at, superseded_at, superseded_by_principal_id`
 
 func scanRecognitionRun(row pgx.Row) (*domain.RecognitionRun, error) {
 	var r domain.RecognitionRun
-	var revenueAccountCode, wipAccountCode *string
+	var revenueAccountCode, wipAccountCode, revenueMappingKey, wipMappingKey *string
 	if err := row.Scan(
 		&r.RunID, &r.LegalEntityID, &r.ProjectID, &r.FiscalPeriod, &r.Status,
 		&r.ContractValue, &r.BilledToDate, &r.EstimateToComplete, &r.ITDCostIncurred,
 		&r.PercentComplete, &r.CumulativeRecognizedRevenue, &r.PeriodRecognizedRevenue, &r.RecognizedCost, &r.Margin,
-		&r.BalanceType, &r.BalanceAmount, &revenueAccountCode, &wipAccountCode, &r.JournalID,
+		&r.BalanceType, &r.BalanceAmount, &revenueAccountCode, &wipAccountCode,
+		&revenueMappingKey, &wipMappingKey, &r.JournalID,
 		&r.SupersedesRunID, &r.SupersededByRunID,
 		&r.CreatedAt, &r.CreatedByPrincipalID, &r.FrozenAt, &r.CalculatedAt, &r.ValidatedAt,
 		&r.ApprovedAt, &r.ApprovedByPrincipalID, &r.EmittedAt, &r.SupersededAt, &r.SupersededByPrincipalID,
@@ -114,6 +116,12 @@ func scanRecognitionRun(row pgx.Row) (*domain.RecognitionRun, error) {
 	}
 	if wipAccountCode != nil {
 		r.WIPAccountCode = *wipAccountCode
+	}
+	if revenueMappingKey != nil {
+		r.RevenueMappingKey = *revenueMappingKey
+	}
+	if wipMappingKey != nil {
+		r.WIPMappingKey = *wipMappingKey
 	}
 	return &r, nil
 }
@@ -131,10 +139,12 @@ func (s *PgStore) CreateRecognitionRun(ctx context.Context, r *domain.Recognitio
 			INSERT INTO project_recognition_runs (
 				run_id, tenant_id, legal_entity_id, project_id, fiscal_period, status,
 				contract_value, billed_to_date, revenue_account_code, wip_account_code,
+				revenue_mapping_key, wip_mapping_key,
 				created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		`, r.RunID, tenantID, r.LegalEntityID, r.ProjectID, r.FiscalPeriod, r.Status,
 			r.ContractValue, r.BilledToDate, nullIfEmpty(r.RevenueAccountCode), nullIfEmpty(r.WIPAccountCode),
+			nullIfEmpty(r.RevenueMappingKey), nullIfEmpty(r.WIPMappingKey),
 			r.CreatedAt, r.CreatedByPrincipalID)
 		if err != nil {
 			if isUniqueViolation(err) {

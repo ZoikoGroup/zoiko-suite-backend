@@ -2383,31 +2383,26 @@ func derefString(s *string) string {
 // only decides HOW that gets committed, atomically, exactly once.
 
 // resolvePostingLines turns caller-declared PostingEventLineInput lines
-// into real journal lines, resolving any mapping_key via ACC-02. The
+// into real journal lines, resolving every mapping_key via ACC-02. The
 // spec's own negative path, "Posting rule ambiguity," is enforced here: a
-// line naming neither or both of account_code/mapping_key, or a
-// mapping_key with no current mapping, is refused rather than guessed.
+// line naming no mapping_key, or a mapping_key with no current mapping, is
+// refused rather than guessed. A caller-supplied account code is not part of
+// this contract at all — ACC-02 is the only account-resolution authority on
+// this path, so the resolution (and its version) is always evidenced in the
+// trace.
 func (h *Handler) resolvePostingLines(ctx context.Context, tenantID string, lines []domain.PostingEventLineInput) ([]domain.CreateJournalLineInput, map[string]string, error) {
 	resolved := make([]domain.CreateJournalLineInput, len(lines))
 	trace := make(map[string]string, len(lines))
 	for i, l := range lines {
-		hasCode := l.AccountCode != nil && *l.AccountCode != ""
-		hasMapping := l.MappingKey != nil && *l.MappingKey != ""
-		if hasCode == hasMapping { // both or neither
+		if l.MappingKey == nil || *l.MappingKey == "" {
 			return nil, nil, domain.ErrPostingRuleAmbiguous
 		}
-		accountCode := ""
-		if hasCode {
-			accountCode = *l.AccountCode
-			trace[fmt.Sprintf("line_%d", i)] = "account_code:" + accountCode
-		} else {
-			m, err := h.store.GetCurrentAccountMapping(ctx, tenantID, *l.MappingKey)
-			if err != nil {
-				return nil, nil, domain.ErrPostingRuleAmbiguous
-			}
-			accountCode = m.AccountCode
-			trace[fmt.Sprintf("line_%d", i)] = "mapping_key:" + *l.MappingKey + " -> account_code:" + accountCode
+		m, err := h.store.GetCurrentAccountMapping(ctx, tenantID, *l.MappingKey)
+		if err != nil {
+			return nil, nil, domain.ErrPostingRuleAmbiguous
 		}
+		accountCode := m.AccountCode
+		trace[fmt.Sprintf("line_%d", i)] = "mapping_key:" + *l.MappingKey + " -> account_code:" + accountCode
 		if !exactlyOneNonZero(l.DebitAmount, l.CreditAmount) {
 			return nil, nil, domain.ErrInvalidLine
 		}

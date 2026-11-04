@@ -491,13 +491,13 @@ var (
 
 	ErrInvalidNegativeStockPolicy = errorString("negative_stock_policy must be PROHIBITED or ALLOWED")
 
-	ErrLandedCostNotFound         = errorString("landed cost allocation not found")
-	ErrNoCostLayerForMovement     = errorString("this movement has no cost layer — only a valued RECEIPT can take landed cost")
-	ErrLandedCostNotApplicable    = errorString("landed cost cannot be allocated to an item valued at STANDARD_COST (it is a variance, not a layer cost)")
-	ErrLandedCostKeyConflict      = errorString("this idempotency key was already used for a different landed cost allocation")
+	ErrLandedCostNotFound      = errorString("landed cost allocation not found")
+	ErrNoCostLayerForMovement  = errorString("this movement has no cost layer — only a valued RECEIPT can take landed cost")
+	ErrLandedCostNotApplicable = errorString("landed cost cannot be allocated to an item valued at STANDARD_COST (it is a variance, not a layer cost)")
+	ErrLandedCostKeyConflict   = errorString("this idempotency key was already used for a different landed cost allocation")
 
-	ErrReceiptLinkConflict       = errorString("this movement is already linked to a different AP receipt")
-	ErrAPReceiptOnlyForReceipt   = errorString("ap_receipt_id is only valid on a RECEIPT movement")
+	ErrReceiptLinkConflict     = errorString("this movement is already linked to a different AP receipt")
+	ErrAPReceiptOnlyForReceipt = errorString("ap_receipt_id is only valid on a RECEIPT movement")
 
 	ErrPeriodCheckUnavailable = errorString("financial-close-svc unavailable")
 	ErrLedgerUnavailable      = errorString("general-ledger-svc unavailable")
@@ -569,15 +569,20 @@ type LayerConsumption struct {
 // ValuationRun mirrors AST-02's own DepreciationRun — one batch GL
 // posting per (legal_entity, fiscal_period).
 type ValuationRun struct {
-	RunID                 string     `json:"run_id"`
-	LegalEntityID         string     `json:"legal_entity_id"`
-	FiscalPeriod          string     `json:"fiscal_period"`
-	InventoryAccountCode  string     `json:"inventory_account_code"`
-	COGSAccountCode       string     `json:"cogs_account_code"`
-	Status                string     `json:"status"`
-	JournalID             *string    `json:"journal_id,omitempty"`
+	RunID         string `json:"run_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
+	// Legacy raw account codes are retained only so runs created before the
+	// ACC-02 migration remain readable. New runs never write or post them.
+	InventoryAccountCode string `json:"inventory_account_code,omitempty"`
+	COGSAccountCode      string `json:"cogs_account_code,omitempty"`
+	// ACC-02 mapping keys are the only account-resolution path for new runs.
+	InventoryMappingKey string  `json:"inventory_mapping_key,omitempty"`
+	COGSMappingKey      string  `json:"cogs_mapping_key,omitempty"`
+	Status              string  `json:"status"`
+	JournalID           *string `json:"journal_id,omitempty"`
 	// LedgerJournalIDs lists every journal the run posted when it went through the kernel (per location and item type); JournalID is the first.
-	LedgerJournalIDs []string `json:"ledger_journal_ids,omitempty"`
+	LedgerJournalIDs      []string   `json:"ledger_journal_ids,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`
 	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
 	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
@@ -591,14 +596,21 @@ type ValuationRun struct {
 // ValuationEvidenceRef is required — negative path #3, "NRV write-down
 // lacks evidence."
 type WriteDown struct {
-	WriteDownID           string     `json:"write_down_id"`
-	LegalEntityID         string     `json:"legal_entity_id"`
-	ItemID                string     `json:"item_id"`
-	LocationID            string     `json:"location_id"`
-	Amount                float64    `json:"amount"`
-	ValuationEvidenceRef  string     `json:"valuation_evidence_ref"`
-	ExpenseAccountCode    string     `json:"expense_account_code"`
-	InventoryAccountCode  string     `json:"inventory_account_code"`
+	WriteDownID          string  `json:"write_down_id"`
+	LegalEntityID        string  `json:"legal_entity_id"`
+	ItemID               string  `json:"item_id"`
+	LocationID           string  `json:"location_id"`
+	Amount               float64 `json:"amount"`
+	ValuationEvidenceRef string  `json:"valuation_evidence_ref"`
+	// Legacy raw account codes are retained only so write-downs created
+	// before the ACC-02 migration remain readable. New ones never write or
+	// post them.
+	ExpenseAccountCode   string `json:"expense_account_code,omitempty"`
+	InventoryAccountCode string `json:"inventory_account_code,omitempty"`
+	// ACC-02 mapping keys are the only account-resolution path for new
+	// write-downs.
+	ExpenseMappingKey     string     `json:"expense_mapping_key,omitempty"`
+	InventoryMappingKey   string     `json:"inventory_mapping_key,omitempty"`
 	JournalID             *string    `json:"journal_id,omitempty"`
 	Status                string     `json:"status"`
 	CreatedAt             time.Time  `json:"created_at"`
@@ -622,10 +634,8 @@ type ValueMovementRequest struct {
 }
 
 type CreateValuationRunRequest struct {
-	LegalEntityID        string `json:"legal_entity_id"`
-	FiscalPeriod         string `json:"fiscal_period"`
-	InventoryAccountCode string `json:"inventory_account_code"`
-	COGSAccountCode      string `json:"cogs_account_code"`
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
 }
 
 type RecordWriteDownRequest struct {
@@ -633,8 +643,6 @@ type RecordWriteDownRequest struct {
 	LocationID           string  `json:"location_id"`
 	Amount               float64 `json:"amount"`
 	ValuationEvidenceRef string  `json:"valuation_evidence_ref"`
-	ExpenseAccountCode   string  `json:"expense_account_code"`
-	InventoryAccountCode string  `json:"inventory_account_code"`
 	FiscalPeriod         string  `json:"fiscal_period"`
 }
 
@@ -643,7 +651,7 @@ type ReverseWriteDownRequest struct {
 }
 
 const (
-	LandedCostStatusPendingPosting        = "PENDING_POSTING"
+	LandedCostStatusPendingPosting         = "PENDING_POSTING"
 	LandedCostStatusAccountingEventEmitted = "ACCOUNTING_EVENT_EMITTED"
 )
 
@@ -651,28 +659,36 @@ const (
 // 000009. InventoryShare raises the layer's remaining units' cost;
 // COGSShare trues up cost of the units already consumed.
 type LandedCostAllocation struct {
-	AllocationID                  string     `json:"allocation_id"`
-	LegalEntityID                 string     `json:"legal_entity_id"`
-	ItemID                        string     `json:"item_id"`
-	LocationID                    string     `json:"location_id"`
-	MovementID                    string     `json:"movement_id"`
-	LayerID                       string     `json:"layer_id"`
-	IdempotencyKey                string     `json:"idempotency_key"`
-	Amount                        float64    `json:"amount"`
-	InventoryShare                float64    `json:"inventory_share"`
-	COGSShare                     float64    `json:"cogs_share"`
-	RemainingQuantityAtAllocation float64    `json:"remaining_quantity_at_allocation"`
-	UnitUplift                    float64    `json:"unit_uplift"`
-	ValuationEvidenceRef          string     `json:"valuation_evidence_ref"`
-	FiscalPeriod                  string     `json:"fiscal_period"`
-	InventoryAccountCode          string     `json:"inventory_account_code"`
-	COGSAccountCode               string     `json:"cogs_account_code"`
-	OffsetAccountCode             string     `json:"offset_account_code"`
-	Status                        string     `json:"status"`
-	JournalID                     *string    `json:"journal_id,omitempty"`
-	CreatedAt                     time.Time  `json:"created_at"`
-	CreatedByPrincipalID          string     `json:"created_by_principal_id"`
-	EmittedAt                     *time.Time `json:"emitted_at,omitempty"`
+	AllocationID                  string  `json:"allocation_id"`
+	LegalEntityID                 string  `json:"legal_entity_id"`
+	ItemID                        string  `json:"item_id"`
+	LocationID                    string  `json:"location_id"`
+	MovementID                    string  `json:"movement_id"`
+	LayerID                       string  `json:"layer_id"`
+	IdempotencyKey                string  `json:"idempotency_key"`
+	Amount                        float64 `json:"amount"`
+	InventoryShare                float64 `json:"inventory_share"`
+	COGSShare                     float64 `json:"cogs_share"`
+	RemainingQuantityAtAllocation float64 `json:"remaining_quantity_at_allocation"`
+	UnitUplift                    float64 `json:"unit_uplift"`
+	ValuationEvidenceRef          string  `json:"valuation_evidence_ref"`
+	FiscalPeriod                  string  `json:"fiscal_period"`
+	// Legacy raw account codes are retained only so allocations created
+	// before the ACC-02 migration remain readable. New allocations never
+	// write or post them.
+	InventoryAccountCode string `json:"inventory_account_code,omitempty"`
+	COGSAccountCode      string `json:"cogs_account_code,omitempty"`
+	OffsetAccountCode    string `json:"offset_account_code,omitempty"`
+	// ACC-02 mapping keys are the only account-resolution path for new
+	// allocations.
+	InventoryMappingKey  string     `json:"inventory_mapping_key,omitempty"`
+	COGSMappingKey       string     `json:"cogs_mapping_key,omitempty"`
+	OffsetMappingKey     string     `json:"offset_mapping_key,omitempty"`
+	Status               string     `json:"status"`
+	JournalID            *string    `json:"journal_id,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	EmittedAt            *time.Time `json:"emitted_at,omitempty"`
 }
 
 type AllocateLandedCostRequest struct {
@@ -681,9 +697,6 @@ type AllocateLandedCostRequest struct {
 	Amount               float64 `json:"amount"`
 	ValuationEvidenceRef string  `json:"valuation_evidence_ref"`
 	FiscalPeriod         string  `json:"fiscal_period"` // the CURRENT open period the correction posts in
-	InventoryAccountCode string  `json:"inventory_account_code"`
-	COGSAccountCode      string  `json:"cogs_account_code"`
-	OffsetAccountCode    string  `json:"offset_account_code"` // credited with the full amount (e.g. freight payable/accrual)
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────
@@ -1036,16 +1049,16 @@ var (
 // recomputed purely from immutable evidence (original quantity, layer
 // consumptions, the INBOUND valuation entry, landed-cost allocations).
 type LayerRecalcRow struct {
-	LayerID            string  `json:"layer_id"`
-	SourceMovementID   string  `json:"source_movement_id"`
-	OriginalQuantity   float64 `json:"original_quantity"`
-	RemainingQuantity  float64 `json:"remaining_quantity"`
-	ExpectedRemaining  float64 `json:"expected_remaining_quantity"`
-	UnitCost           float64 `json:"unit_cost"`
-	ExpectedUnitCost   float64 `json:"expected_unit_cost"`
-	QuantityDrift      bool    `json:"quantity_drift"`
-	CostDrift          bool    `json:"cost_drift"`
-	OverConsumed       bool    `json:"over_consumed"`
+	LayerID           string  `json:"layer_id"`
+	SourceMovementID  string  `json:"source_movement_id"`
+	OriginalQuantity  float64 `json:"original_quantity"`
+	RemainingQuantity float64 `json:"remaining_quantity"`
+	ExpectedRemaining float64 `json:"expected_remaining_quantity"`
+	UnitCost          float64 `json:"unit_cost"`
+	ExpectedUnitCost  float64 `json:"expected_unit_cost"`
+	QuantityDrift     bool    `json:"quantity_drift"`
+	CostDrift         bool    `json:"cost_drift"`
+	OverConsumed      bool    `json:"over_consumed"`
 }
 
 // ValuationRecalculation is the read-only RecalculateValuation result.
@@ -1084,13 +1097,13 @@ type LayerRebuild struct {
 // before/after is reported so a reconciliation owner can see any effect on
 // inventory value; nothing is posted to the GL by this command.
 type CostLayerRebuildResult struct {
-	ItemID              string         `json:"item_id"`
-	LocationID          string         `json:"location_id"`
-	Rebuilt             int            `json:"rebuilt"`
-	Rebuilds            []LayerRebuild `json:"rebuilds"`
-	ValueBefore         float64        `json:"value_before"`
-	ValueAfter          float64        `json:"value_after"`
-	CostDriftLayerIDs   []string       `json:"cost_drift_layer_ids"`
-	CostDriftNotFixed   bool           `json:"cost_drift_not_fixed"`
-	GLNotPosted         bool           `json:"gl_not_posted"`
+	ItemID            string         `json:"item_id"`
+	LocationID        string         `json:"location_id"`
+	Rebuilt           int            `json:"rebuilt"`
+	Rebuilds          []LayerRebuild `json:"rebuilds"`
+	ValueBefore       float64        `json:"value_before"`
+	ValueAfter        float64        `json:"value_after"`
+	CostDriftLayerIDs []string       `json:"cost_drift_layer_ids"`
+	CostDriftNotFixed bool           `json:"cost_drift_not_fixed"`
+	GLNotPosted       bool           `json:"gl_not_posted"`
 }

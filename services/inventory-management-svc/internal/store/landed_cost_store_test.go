@@ -17,7 +17,7 @@ func newLandedCost(movementID, key string, amount float64, at time.Time) *domain
 	return &domain.LandedCostAllocation{
 		AllocationID: uuid.New().String(), MovementID: movementID, IdempotencyKey: key, Amount: amount,
 		ValuationEvidenceRef: "FREIGHT-INV-77", FiscalPeriod: "2026-10",
-		InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS", OffsetAccountCode: "FREIGHT-PAYABLE",
+		InventoryMappingKey: "INV-ASSET", COGSMappingKey: "COGS", OffsetMappingKey: "FREIGHT-PAYABLE",
 		CreatedAt: at, CreatedByPrincipalID: "approver-2",
 	}
 }

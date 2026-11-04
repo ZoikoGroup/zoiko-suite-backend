@@ -16,7 +16,7 @@ const assetEventColumns = `
 	event_id, tenant_id, legal_entity_id, asset_id, component_id, event_type, status,
 	source_document_ref, valuation_evidence_ref, amount, currency, effective_date, fiscal_period,
 	proceeds_amount, destination_custodian_id, destination_location_id, destination_legal_entity_id,
-	debit_account_code, credit_account_code, journal_id, correction_of_event_id,
+	debit_account_code, credit_account_code, debit_mapping_key, credit_mapping_key, journal_id, correction_of_event_id,
 	created_at, created_by_principal_id, validated_at,
 	approved_at, approved_by_principal_id, applied_at, emitted_at,
 	reversed_at, reversed_by_principal_id, reversal_reason,
@@ -28,7 +28,7 @@ func scanAssetEvent(row pgx.Row) (*domain.AssetEvent, error) {
 		&e.EventID, &e.TenantID, &e.LegalEntityID, &e.AssetID, &e.ComponentID, &e.EventType, &e.Status,
 		&e.SourceDocumentRef, &e.ValuationEvidenceRef, &e.Amount, &e.Currency, &e.EffectiveDate, &e.FiscalPeriod,
 		&e.ProceedsAmount, &e.DestinationCustodianID, &e.DestinationLocationID, &e.DestinationLegalEntityID,
-		&e.DebitAccountCode, &e.CreditAccountCode, &e.JournalID, &e.CorrectionOfEventID,
+		&e.DebitAccountCode, &e.CreditAccountCode, &e.DebitMappingKey, &e.CreditMappingKey, &e.JournalID, &e.CorrectionOfEventID,
 		&e.CreatedAt, &e.CreatedByPrincipalID, &e.ValidatedAt,
 		&e.ApprovedAt, &e.ApprovedByPrincipalID, &e.AppliedAt, &e.EmittedAt,
 		&e.ReversedAt, &e.ReversedByPrincipalID, &e.ReversalReason,
@@ -54,13 +54,13 @@ func (s *PgStore) CreateAssetEvent(ctx context.Context, e *domain.AssetEvent) er
 				event_id, tenant_id, legal_entity_id, asset_id, component_id, event_type, status,
 				source_document_ref, valuation_evidence_ref, amount, currency, effective_date, fiscal_period,
 				proceeds_amount, destination_custodian_id, destination_location_id, destination_legal_entity_id,
-				debit_account_code, credit_account_code, correction_of_event_id,
+				debit_mapping_key, credit_mapping_key, correction_of_event_id,
 				created_at, created_by_principal_id, book_id
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		`, e.EventID, tenantID, e.LegalEntityID, e.AssetID, e.ComponentID, e.EventType, e.Status,
 			e.SourceDocumentRef, e.ValuationEvidenceRef, e.Amount, e.Currency, e.EffectiveDate, e.FiscalPeriod,
 			e.ProceedsAmount, e.DestinationCustodianID, e.DestinationLocationID, e.DestinationLegalEntityID,
-			e.DebitAccountCode, e.CreditAccountCode, e.CorrectionOfEventID,
+			e.DebitMappingKey, e.CreditMappingKey, e.CorrectionOfEventID,
 			e.CreatedAt, e.CreatedByPrincipalID, e.BookID)
 		return mapAssetEventPgError(err)
 	})

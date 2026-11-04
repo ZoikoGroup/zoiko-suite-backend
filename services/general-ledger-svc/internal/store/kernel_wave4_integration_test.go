@@ -286,8 +286,9 @@ func TestSchedulePostingsNameTheirLineAndTheRemainingBalance(t *testing.T) {
 	}
 }
 
-// Subledger services still post through the legacy posting command, with the lines they computed and no book. The control accounts
-// they post to stay open to that command until the operator moves them to events, and a reconciliation can count those entries.
+// Subledger services still post through the legacy posting command, with the lines they computed and no book — now naming
+// ACC-02 mapping keys rather than raw accounts. The control accounts they resolve to stay open to that command until the
+// operator moves them to events, and a reconciliation can count those entries.
 func TestLegacySubledgerPostingsAreCountedWhenAskedFor(t *testing.T) {
 	w := w4Setup(t)
 	veh := map[string]string{"asset_class": "VEHICLES"}
@@ -296,7 +297,7 @@ func TestLegacySubledgerPostingsAreCountedWhenAskedFor(t *testing.T) {
 	legacy := func(src string) map[string]any {
 		return map[string]any{"legal_entity_id": w.entity, "fiscal_period": "2026-03", "description": "asset acquisition from the register", "source_event_id": src, "correlation_id": "c-" + src,
 			"transaction_currency": "GBP", "document_date": "2026-03-12", "posting_date": "2026-03-12",
-			"lines": []any{map[string]any{"account_code": "1500", "debit_amount": 500}, map[string]any{"account_code": "2060", "credit_amount": 500}}}
+			"lines": []any{map[string]any{"mapping_key": "FIXED_ASSET_COST", "debit_amount": 500}, map[string]any{"mapping_key": "ASSET_CLEARING", "credit_amount": 500}}}
 	}
 	// the control accounts are restricted by default, so the legacy command is refused until the operator opens them
 	if st, b := w.call("POST", "/v1/postings/events", w.tenant, "asset-svc", legacy("leg-1")); st < 400 {

@@ -31,6 +31,13 @@ type Config struct {
 	// accrues a receipt (its GRNI_DEBIT_MAPPING_KEY); INV-04 credits it
 	// when it reclasses that cost into inventory. Must match AP-03.
 	GRNIReclassMappingKey string
+	// ACC-02 mapping keys for the legacy (non-kernel) posting path. The
+	// ledger owns account resolution; this service never sends a raw GL
+	// account code on the posting path.
+	InventoryMappingKey        string
+	COGSMappingKey             string
+	WriteDownExpenseMappingKey string
+	LandedCostOffsetMappingKey string
 
 	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
 	// OFF by default — when false, nothing about the existing authz call
@@ -90,13 +97,18 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "inventory-management-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.inventory.events"),
 		},
-		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		CloseServiceURL:  env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
-		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		CloseServiceURL:      env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
+		LedgerServiceURL:     env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
 		LedgerKernelBookID:   env("LEDGER_KERNEL_BOOK_ID", ""),
 		LedgerKernelCurrency: env("LEDGER_KERNEL_CURRENCY", ""),
 
 		GRNIReclassMappingKey: env("GRNI_RECLASS_MAPPING_KEY", "AP_GRNI_EXPENSE"),
+
+		InventoryMappingKey:        env("INVENTORY_MAPPING_KEY", "INVENTORY"),
+		COGSMappingKey:             env("COGS_MAPPING_KEY", "COGS"),
+		WriteDownExpenseMappingKey: env("WRITE_DOWN_EXPENSE_MAPPING_KEY", "INVENTORY_WRITE_DOWN_EXPENSE"),
+		LandedCostOffsetMappingKey: env("LANDED_COST_OFFSET_MAPPING_KEY", "LANDED_COST_PAYABLE"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

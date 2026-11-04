@@ -73,7 +73,7 @@ func TestPgStore_GetRunInboundValue_SplitsLinkedAndUnlinked(t *testing.T) {
 
 	run := &domain.ValuationRun{
 		RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: linked.FiscalPeriod,
-		InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS",
+		InventoryMappingKey: "INV-ASSET", COGSMappingKey: "COGS",
 		CreatedAt: now, CreatedByPrincipalID: "preparer-1",
 	}
 	if frozen, err := s.CreateValuationRun(ctx, run); err != nil || frozen != 2 {
@@ -111,7 +111,7 @@ func TestPgStore_ValuationRun_KernelPosting_SplitsInboundByStockAndRecordsEveryJ
 	if _, _, err := s.ValueMovement(ctx, unlinked.MovementID, "preparer-1", &costB, now); err != nil {
 		t.Fatal(err)
 	}
-	run := &domain.ValuationRun{RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: linked.FiscalPeriod, InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS",
+	run := &domain.ValuationRun{RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: linked.FiscalPeriod, InventoryMappingKey: "INV-ASSET", COGSMappingKey: "COGS",
 		CreatedAt: now, CreatedByPrincipalID: "preparer-1"}
 	if _, err := s.CreateValuationRun(ctx, run); err != nil {
 		t.Fatal(err)

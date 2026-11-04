@@ -60,7 +60,7 @@ func newRouterWithRecordingAuthZ(s *stubStore, p *stubPublisher, a *recordingAut
 }
 
 func validPostEventReq() domain.PostAccountingEventRequest {
-	code1, code2 := "1000", "4000"
+	debitKey, creditKey := "GL_TEST_DEBIT", "GL_TEST_CREDIT"
 	return domain.PostAccountingEventRequest{
 		LegalEntityID:       "e1",
 		FiscalPeriod:        "2026-07",
@@ -70,8 +70,8 @@ func validPostEventReq() domain.PostAccountingEventRequest {
 		TransactionCurrency: "USD",
 		DocumentDate:        domain.NewDate(2026, 7, 1),
 		Lines: []domain.PostingEventLineInput{
-			{AccountCode: &code1, DebitAmount: 100},
-			{AccountCode: &code2, CreditAmount: 100},
+			{MappingKey: &debitKey, DebitAmount: 100},
+			{MappingKey: &creditKey, CreditAmount: 100},
 		},
 	}
 }
@@ -135,32 +135,44 @@ func TestPostAccountingEvent_DuplicateSourceEvent_ReturnsPriorResultAndPostsOnce
 	}
 }
 
-// Negative path #2 (verbatim): "Posting rule ambiguity."
-func TestPostAccountingEvent_LineNamingBothAccountCodeAndMappingKey_Returns422(t *testing.T) {
-	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
-
+// Negative path #2 (verbatim): "Posting rule ambiguity." ACC-02 is the only
+// account-resolution authority, so a line with no mapping key is ambiguous
+// even if it names an account code.
+func TestPostAccountingEvent_LineNamingNoMappingKey_Returns422(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 	req := validPostEventReq()
-	key := "EXPENSE_CATEGORY:MEALS"
-	req.Lines[0].MappingKey = &key // names BOTH — which rule wins is not for this service to guess
+	req.Lines[0].MappingKey = nil
 
 	rec := doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if len(s.journals) != 0 {
-		t.Errorf("an ambiguous posting rule must post nothing, got %d journals", len(s.journals))
 	}
 }
 
-func TestPostAccountingEvent_LineNamingNeitherAccountCodeNorMappingKey_Returns422(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
-	req := validPostEventReq()
-	req.Lines[0].AccountCode = nil
+// Regression: the pre-ACC-02 contract accepted a raw account_code. It must
+// now fail closed — the unknown field is ignored, leaving no mapping key, so
+// nothing resolves and nothing posts.
+func TestPostAccountingEvent_LegacyAccountCodeOnly_Returns422AndPostsNothing(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	body := map[string]any{
+		"legal_entity_id": "e1", "fiscal_period": "2026-07",
+		"description": "raw account code bypass", "source_event_id": "src-legacy-codes",
+		"correlation_id": "corr-legacy-codes", "transaction_currency": "USD",
+		"document_date": "2026-07-01",
+		"lines": []any{
+			map[string]any{"account_code": "1000", "debit_amount": 100},
+			map[string]any{"account_code": "4000", "credit_amount": 100},
+		},
+	}
 
-	rec := doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
+	rec := doRequest(r, http.MethodPost, "/v1/postings/events", body, "svc-ap")
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.journals) != 0 || len(s.postingExecutions) != 0 {
+		t.Errorf("a raw-account-code posting must post nothing, got %d journals / %d executions",
+			len(s.journals), len(s.postingExecutions))
 	}
 }
 
@@ -169,7 +181,6 @@ func TestPostAccountingEvent_UnresolvableMappingKey_Returns422(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	req := validPostEventReq()
 	key := "EXPENSE_CATEGORY:NEVER_MAPPED"
-	req.Lines[0].AccountCode = nil
 	req.Lines[0].MappingKey = &key
 
 	rec := doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
@@ -194,7 +205,6 @@ func TestPostAccountingEvent_ResolvesMappingKeyThroughACC02(t *testing.T) {
 
 	req := validPostEventReq()
 	key := "EXPENSE_CATEGORY:MEALS"
-	req.Lines[0].AccountCode = nil
 	req.Lines[0].MappingKey = &key
 
 	rec := doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")

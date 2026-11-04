@@ -324,7 +324,7 @@ func TestPgStore_ValuationRun_FullLifecycle(t *testing.T) {
 
 	run := &domain.ValuationRun{
 		RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: "2026-09",
-		InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS", CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+		InventoryMappingKey: "INV-ASSET", COGSMappingKey: "COGS", CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
 	frozen, err := s.CreateValuationRun(ctx, run)
 	if err != nil {
@@ -360,7 +360,7 @@ func TestPgStore_WriteDown_CreateAndReverse(t *testing.T) {
 
 	wd := &domain.WriteDown{
 		WriteDownID: uuid.New().String(), LegalEntityID: legalEntityID, ItemID: itemID, LocationID: locID,
-		Amount: 100, ValuationEvidenceRef: "NRV-1", ExpenseAccountCode: "WD-EXP", InventoryAccountCode: "INV-ASSET",
+		Amount: 100, ValuationEvidenceRef: "NRV-1", ExpenseMappingKey: "WD-EXP", InventoryMappingKey: "INV-ASSET",
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
 	if err := s.CreateWriteDown(ctx, wd, "jrnl-wd-1"); err != nil {

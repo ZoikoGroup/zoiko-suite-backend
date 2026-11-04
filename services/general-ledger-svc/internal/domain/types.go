@@ -749,10 +749,12 @@ type PostingExecution struct {
 }
 
 // PostingEventLineInput is one line of a caller-declared accounting event.
-// Exactly one of AccountCode/MappingKey must be set — both or neither is
-// the spec's own negative path, "Posting rule ambiguity."
+// MappingKey is the only way to name an account: ACC-02 is the sole
+// account-mapping authority, so a line naming no mapping key is the spec's
+// own negative path, "Posting rule ambiguity." Account codes are deliberately
+// absent from this contract — a caller-supplied raw account code would bypass
+// ACC-02's mapping version/resolution evidence.
 type PostingEventLineInput struct {
-	AccountCode  *string `json:"account_code,omitempty"`
 	MappingKey   *string `json:"mapping_key,omitempty"`
 	DebitAmount  float64 `json:"debit_amount,omitempty"`
 	CreditAmount float64 `json:"credit_amount,omitempty"`
