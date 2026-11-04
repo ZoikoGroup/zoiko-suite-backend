@@ -54,6 +54,7 @@ const (
 	ReasonWithdrawn             = "suspended_or_retired"
 	ReasonExpired               = "effective_to_passed"
 	ReasonLessSpecific          = "overridden_by_more_specific_scope"
+	ReasonLowerPrecedence       = "overridden_by_higher_precedence"
 	ReasonConflicting           = "conflicts_with_another_policy"
 )
 
@@ -139,10 +140,38 @@ func later(a, b *domain.ApplicablePolicyVersion) bool {
 	return a.VersionNumber > b.VersionNumber
 }
 
+// Rank orders the governing versions of different chains, highest first. It is
+// compared element by element: the first element where two versions differ
+// decides, and two versions equal in every element are tied, which is a
+// conflict. Ranking by scope specificity alone is the default.
+type Rank func(*domain.ApplicablePolicyVersion) []int
+
+func compareRank(a, b []int) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			if a[i] > b[i] {
+				return 1
+			}
+			return -1
+		}
+	}
+	return 0
+}
+
 // Resolve applies the package rules to candidates. Candidates must already be
 // limited to one policy type and to scopes compatible with the request (their
 // tenant and legal entity are either unset or equal to the request's).
 func Resolve(candidates []*domain.ApplicablePolicyVersion, asOf, knownAt time.Time) Result {
+	return ResolveRanked(candidates, asOf, knownAt, func(v *domain.ApplicablePolicyVersion) []int {
+		return []int{specificity(v)}
+	})
+}
+
+// ResolveRanked is Resolve with the ranking across chains given by the caller.
+// The first element of a rank is what the trace calls scope specificity; a
+// version that differs from the best only after the first element lost on
+// precedence.
+func ResolveRanked(candidates []*domain.ApplicablePolicyVersion, asOf, knownAt time.Time, rank Rank) Result {
 	res := Result{Status: NotApplicable, AsOf: asOf, KnownAt: knownAt}
 	reasons := make(map[*domain.ApplicablePolicyVersion]string, len(candidates))
 
@@ -190,19 +219,22 @@ func Resolve(candidates []*domain.ApplicablePolicyVersion, asOf, knownAt time.Ti
 	// Most specific tier; a tie between distinct policies is a conflict.
 	if len(winners) > 0 {
 		sort.SliceStable(winners, func(i, j int) bool {
-			if specificity(winners[i]) != specificity(winners[j]) {
-				return specificity(winners[i]) > specificity(winners[j])
+			if c := compareRank(rank(winners[i]), rank(winners[j])); c != 0 {
+				return c > 0
 			}
 			return winners[i].PolicyVersionID < winners[j].PolicyVersionID
 		})
 		res.Applicable = winners
-		top := specificity(winners[0])
+		top := rank(winners[0])
 		var tied []*domain.ApplicablePolicyVersion
 		for _, w := range winners {
-			if specificity(w) == top {
+			switch {
+			case compareRank(rank(w), top) == 0:
 				tied = append(tied, w)
-			} else {
+			case rank(w)[0] != top[0]:
 				reasons[w] = ReasonLessSpecific
+			default:
+				reasons[w] = ReasonLowerPrecedence
 			}
 		}
 		if len(tied) == 1 {

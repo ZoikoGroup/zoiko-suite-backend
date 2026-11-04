@@ -36,6 +36,10 @@ func registerCalendarRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/calendars/{calendar_code}/versions", h.CreateCalendarVersion)
 	r.Put("/v1/admin/calendars/{calendar_code}/versions/{version}/sources", h.SetCalendarVersionSources)
 	r.Post("/v1/admin/calendars/{calendar_code}/versions/{version}/publish", h.PublishCalendarVersion)
+	r.Post("/v1/admin/calendars/{calendar_code}/imports", h.ImportHolidayCalendar)
+	r.Get("/v1/calendars/{calendar_code}/is-business-day", h.IsBusinessDay)
+	r.Get("/v1/calendars/{calendar_code}/add-business-days", h.AddBusinessDays)
+	registerPaymentTermRoutes(r, h)
 	r.Post("/v1/admin/obligation-rules", h.CreateObligationRule)
 	r.Put("/v1/admin/obligation-rules/{obligation_rule_id}/provenance", h.SetObligationProvenance)
 	r.Post("/v1/admin/obligation-rules/{obligation_rule_id}/publish", h.PublishObligationRule)
@@ -55,6 +59,10 @@ func (h *Handler) writeCalendarError(w http.ResponseWriter, r *http.Request, err
 		writeError(w, r, http.StatusNotFound, "obligation_rule_not_found", err.Error())
 	case errors.Is(err, domain.ErrNotIndependent):
 		writeError(w, r, http.StatusForbidden, "segregation_of_duties", err.Error())
+	case errors.Is(err, domain.ErrCalendarImportConflict):
+		writeError(w, r, http.StatusConflict, "calendar_import_conflict", err.Error())
+	case errors.Is(err, domain.ErrNoCalendarVersion):
+		writeError(w, r, http.StatusNotFound, "no_calendar_version", err.Error())
 	default:
 		h.writeOpsError(w, r, err, corr)
 	}
@@ -228,6 +236,7 @@ func (h *Handler) PublishCalendarVersion(w http.ResponseWriter, r *http.Request)
 		// Named in the service's original specification (03-microservices.md s8.2).
 		h.emitRegistry(r, events.EventCalendarChanged, v.CalendarVersionID, actor, map[string]any{
 			"calendar_code": code, "version": v.Version, "calendar_version_id": v.CalendarVersionID, "effective_from": v.EffectiveFrom})
+		h.emitCalendarPublished(r, code, actor, v)
 	}
 	writeJSON(w, http.StatusOK, v)
 }

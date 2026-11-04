@@ -88,6 +88,12 @@ type Handler struct {
 
 	// status backs PUT /v1/principals/{id}/status. Nil answers 501.
 	status StatusChanger
+
+	// identity backs the ORG-01 reads. Nil answers 501.
+	identity IdentityReader
+
+	// merger backs MergeDuplicateIdentity. Nil answers 501.
+	merger IdentityMerger
 }
 
 // StatusChanger changes a principal's status as one governed command: the
@@ -392,6 +398,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/principals/{principalID}/roles", h.GetPrincipalRoles)
 		r.Get("/principals/{principalID}/delegations", h.GetPrincipalDelegations)
 		r.Put("/principals/{principalID}/status", h.UpdatePrincipalStatus)
+
+		// ── ORG-01 reads (handler_identity.go) ───────────────────────────────
+		r.Get("/identities/{principalID}", h.GetSubjectIdentity)
+		r.Get("/identities/{principalID}/links", h.ListIdentityLinks)
+		r.Get("/identities/{principalID}/assurance-history", h.GetAssuranceHistory)
+		r.Get("/identities/{principalID}/authentication-events", h.ListAuthenticationEvents)
+		r.Post("/identities/{principalID}/merge", h.MergeDuplicateIdentity)
 	})
 }
 

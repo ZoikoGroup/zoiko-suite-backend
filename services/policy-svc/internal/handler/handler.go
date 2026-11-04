@@ -366,6 +366,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/policies/{policy_id}/versions/{version_id}/retire", h.lifecycle(domain.CommandRetire))
 	r.Post("/v1/policies/{policy_id}/versions/{version_id}/review-suspension", h.lifecycle(domain.CommandReviewSuspension))
 
+	r.Post("/v1/accounting-policies", h.DraftAccountingPolicy)
+	r.Get("/v1/accounting-policies", h.ListApplicableAccountingPolicies)
+	r.Get("/v1/accounting-policies/resolve", h.ResolveAccountingPolicy)
+	r.Get("/v1/accounting-policies/explain", h.ExplainAccountingResolution)
+	r.Get("/v1/accounting-policies/versions/{version_id}", h.GetAccountingPolicyVersion)
+	r.Get("/v1/accounting-policies/versions/{version_id}/impact", h.GetAccountingPolicyImpact)
+	for _, route := range []string{"submit-review", "approve", "activate", "supersede", "emergency-suspend", "review-suspension"} {
+		r.Post("/v1/accounting-policies/versions/{version_id}/"+route, h.accountingCommand(route))
+	}
+
 	r.Get("/v1/policy-versions/compare", h.ComparePolicyVersions)
 	r.Get("/v1/policy-versions/{version_id}", h.GetPolicyVersionByID)
 	r.Get("/v1/policy-versions/{version_id}/transitions", h.ListTransitions)
@@ -438,6 +448,12 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.PolicyID != "" && !requireUUID(w, r, "policy_id", req.PolicyID) {
+		return
+	}
+	// An accounting policy family is made by DraftAccountingPolicy, from its
+	// applicability; one made here would have none.
+	if strings.EqualFold(req.PolicyType, domain.PolicyTypeAccounting) {
+		refuseAccountingEndpoint(w, r)
 		return
 	}
 
@@ -618,6 +634,10 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.storeUnavailable(w, r, "CreatePolicyVersion", err)
+		return
+	}
+	if family.PolicyType == domain.PolicyTypeAccounting {
+		refuseAccountingEndpoint(w, r)
 		return
 	}
 	// A tenant-owned family's versions live in its owner's scope; an omitted
@@ -831,6 +851,12 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 			return
 		}
 
+		// An accounting policy is moved through its lifecycle by the accounting
+		// commands, which ask for the accounting permissions.
+		if h.refuseAccountingFamily(w, r, existing.PolicyID) {
+			return
+		}
+
 		// Authorized against the scope the version actually binds, read from
 		// the stored record rather than the request.
 		actions := lifecycleAction[command]
@@ -891,6 +917,10 @@ func (h *Handler) writeTransitionError(w http.ResponseWriter, r *http.Request, v
 			"the maker cannot be the checker: the author cannot approve or activate, and the suspender cannot review the suspension", extra)
 	case errors.Is(err, domain.ErrPolicyConflicted):
 		writeError(w, r, http.StatusConflict, codePolicyConflicted, "policy_overlap", err.Error(), extra)
+	case errors.Is(err, domain.ErrSupersessionRequired):
+		writeError(w, r, http.StatusConflict, codeSupersessionRequired, "supersession_required", err.Error(), extra)
+	case errors.Is(err, domain.ErrInvalidSupersedes):
+		writeError(w, r, http.StatusConflict, codeSupersessionRequired, "invalid_supersedes", err.Error(), extra)
 	case errors.Is(err, domain.ErrConcurrencyConflict):
 		writeError(w, r, http.StatusConflict, codeConcurrency, "concurrency_conflict", err.Error(), extra)
 	case errors.Is(err, domain.ErrInvalidTransition):

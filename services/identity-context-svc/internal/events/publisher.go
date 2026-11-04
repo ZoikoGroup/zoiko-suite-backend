@@ -104,6 +104,9 @@ const (
 	EventSubjectCreated    = "identity.subject.created"
 	EventSubjectDisabled   = "identity.subject.disabled"
 	EventSubjectEnabled    = "identity.subject.enabled"
+	// EventSubjectMerged: a duplicate identity was merged into a survivor. Consumers re-point what they hold for
+	// the duplicate (role assignments, delegations) to the survivor; the duplicate id is never reused.
+	EventSubjectMerged = "identity.subject.merged"
 	EventSCIMSyncCompleted = "identity.scim_sync.completed"
 
 	// ── Auth plane closure (15 Oct 2026) ─────────────────────────────────────
