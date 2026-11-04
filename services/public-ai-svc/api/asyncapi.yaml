@@ -42,8 +42,11 @@ components:
       required: [specversion, id, source, type, time, datacontenttype, data]
       properties:
         specversion: {const: "1.0"}
-        id: {type: string, description: Unique per event; the idempotency key for consumers}
-        source: {const: "urn:zoikosuite:publicai:orchestrator"}
+        id: {type: string, format: uuid, description: Random UUIDv4; unique per event and the idempotency key for consumers}
+        source:
+          type: string
+          description: The producer (orchestrator for chat events, release for KB governance, control for kill switches).
+          enum: ["urn:zoikosuite:publicai:orchestrator", "urn:zoikosuite:publicai:release", "urn:zoikosuite:publicai:control"]
         type: {type: string}
         time: {type: string, format: date-time}
         datacontenttype: {const: application/json}
@@ -104,6 +107,7 @@ components:
                   actor_ref: {type: string}
                   approval_ref: {type: string}
                   environment: {type: string}
+                  control_epoch: {type: integer, description: Change time in Unix nanoseconds; an older event is never replayed (Doc 05 §22).}
     releasePromoted:
       name: kb.release.promoted.v1
       payload:

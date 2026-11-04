@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -86,7 +87,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeValidationError(w, r, err)
 		return
 	}
-	issued, err := s.deps.Sessions.Create(r.Context(), key, hashJSON(req), req.Locale, req.MarketCode, req.PageContext)
+	issued, err := s.deps.Sessions.Create(r.Context(), key, hashJSON(req), req.Locale, req.MarketCode, req.PageContext, r.Header.Get("Origin"))
 	switch {
 	case errors.Is(err, session.ErrMismatch):
 		problem.Write(w, r, problem.IdempotencyMismatch, "")
@@ -144,6 +145,33 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(append(body, '\n'))
 }
 
+// authenticate resolves the session grant and refuses it from any origin
+// other than the one that created it (Doc 05 §08), reported like an expired
+// grant so nothing about the session leaks.
+func (s *Server) authenticate(r *http.Request) (store.Session, error) {
+	sess, err := s.deps.Sessions.Authenticate(r.Context(), r.Header.Get(sessionHeader))
+	if err == nil && !session.FromOrigin(sess, r.Header.Get("Origin")) {
+		return store.Session{}, session.ErrExpired
+	}
+	return sess, err
+}
+
+// sessionBudget is the staged throttle for one session (Doc 06 §13): at 80 %
+// of its token cap answers are shorter with no repair, at the cap only
+// static approved content is served.
+func (s *Server) sessionBudget(sess store.Session) string {
+	limit := s.cfg.SessionTokenCap
+	switch {
+	case limit <= 0:
+		return ""
+	case sess.TokensUsed >= limit:
+		return orchestrator.BudgetStatic
+	case sess.TokensUsed*5 >= limit*4:
+		return orchestrator.BudgetReduced
+	}
+	return ""
+}
+
 func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	rid := rw.Header().Get("X-Request-ID")
@@ -153,7 +181,7 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 	var diag turnDiag
 	defer func() { s.logTurnDiag(rid, w.status, diag) }()
 
-	sess, err := s.deps.Sessions.Authenticate(ctx, r.Header.Get(sessionHeader))
+	sess, err := s.authenticate(r)
 	if errors.Is(err, session.ErrExpired) {
 		problem.Write(w, r, problem.SessionExpired, "")
 		return
@@ -231,6 +259,7 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 		RequestID: rid, SessionID: sess.SessionID, TurnID: turnID, Message: req.Message, Pending: pending,
 		Locale: firstNonEmpty(req.Locale, sess.Locale), MarketCode: firstNonEmpty(req.MarketCode, sess.MarketCode),
 		PageContext: firstNonEmpty(req.PageContext, sess.PageContext),
+		Budget:      s.sessionBudget(sess),
 	})
 
 	env := contract.Envelope{
@@ -286,6 +315,19 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 			s.log.Warn("pending context not saved", zap.String("request_id", rid), zap.Error(err))
 		}
 	}
+	if res.RememberMarket != "" && res.RememberMarket != sess.MarketCode {
+		// Doc 02 §10: a country the visitor named is used for the rest of the session.
+		if err := s.deps.Store.SetSessionMarket(runCtx, sess.SessionID, res.RememberMarket); err != nil {
+			s.log.Warn("session market not saved", zap.String("request_id", rid), zap.Error(err))
+		}
+	}
+	metrics.ObserveTurn(string(env.Status), env.Reason, time.Since(now))
+	for _, a := range env.Actions {
+		metrics.CTAOffered(a.RouteKey) // offers and clicks are separate measures (Doc 09 §20)
+	}
+	if res.SecuritySignal != "" {
+		metrics.SecuritySignal(res.SecuritySignal)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
@@ -294,7 +336,7 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 // postFeedback records "useful / not useful" for one of the caller's own
 // completed turns (Doc 01 FR-09, S09). Enums only; no free text.
 func (s *Server) postFeedback(w http.ResponseWriter, r *http.Request) {
-	sess, err := s.deps.Sessions.Authenticate(r.Context(), r.Header.Get(sessionHeader))
+	sess, err := s.authenticate(r)
 	if err != nil {
 		problem.Write(w, r, problem.SessionExpired, "")
 		return
@@ -319,6 +361,7 @@ func (s *Server) postFeedback(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("feedback failed", zap.String("request_id", w.Header().Get("X-Request-ID")), zap.Error(err))
 		problem.Write(w, r, problem.ServiceUnavailable, "")
 	default:
+		metrics.Feedback(req.Rating, req.Reason)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -327,7 +370,7 @@ func (s *Server) postFeedback(w http.ResponseWriter, r *http.Request) {
 // its approved URL (Doc 05 §21 chat.handoff.clicked.v1). Route-only: no case,
 // ticket, lead or booking is created (Doc 09 §11).
 func (s *Server) postHandoff(w http.ResponseWriter, r *http.Request) {
-	sess, err := s.deps.Sessions.Authenticate(r.Context(), r.Header.Get(sessionHeader))
+	sess, err := s.authenticate(r)
 	if err != nil {
 		problem.Write(w, r, problem.SessionExpired, "")
 		return
@@ -354,6 +397,7 @@ func (s *Server) postHandoff(w http.ResponseWriter, r *http.Request) {
 			s.log.Warn("handoff event not recorded", zap.String("request_id", w.Header().Get("X-Request-ID")), zap.Error(err))
 		}
 	}
+	metrics.HandoffClicked(req.RouteKey) // a click, never a case, lead or booking (Doc 09 §20)
 	writeJSON(w, http.StatusOK, contract.HandoffResponse{RouteKey: req.RouteKey, URL: url})
 }
 

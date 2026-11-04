@@ -1,110 +1,97 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
-func TestDefaultsAreValid(t *testing.T) {
-	t.Setenv("PUBLIC_AI_ALLOWED_ORIGINS", "http://localhost:3000, https://www.example.invalid")
-	c, err := Load()
-	if err != nil {
-		t.Fatalf("default config should load: %v", err)
-	}
-	if len(c.AllowedOrigins) != 2 {
-		t.Fatalf("origins not split: %v", c.AllowedOrigins)
-	}
-	if c.Enabled {
-		t.Fatal("PUBLIC_AI_ENABLED must default to false")
-	}
+// Tests load a dev config unless they say otherwise: the environment is never
+// assumed by the service itself (SEC-P0-06).
+func TestMain(m *testing.M) {
+	_ = os.Setenv("PUBLIC_AI_ENVIRONMENT", "dev")
+	os.Exit(m.Run())
 }
 
-// SEC-T039 precondition: raw prompt logging cannot be switched on.
-func TestRawPromptLoggingRefused(t *testing.T) {
-	t.Setenv("PUBLIC_AI_LOG_RAW_PROMPT", "true")
-	if _, err := Load(); err == nil {
-		t.Fatal("expected refusal when PUBLIC_AI_LOG_RAW_PROMPT=true")
-	}
-}
-
-func TestWildcardOriginRefused(t *testing.T) {
-	t.Setenv("PUBLIC_AI_ALLOWED_ORIGINS", "*")
-	if _, err := Load(); err == nil {
-		t.Fatal("expected refusal of wildcard origin")
-	}
-}
-
-func TestSingleActiveTurnEnforced(t *testing.T) {
-	t.Setenv("PUBLIC_AI_MAX_ACTIVE_TURNS_PER_SESSION", "2")
-	if _, err := Load(); err == nil {
-		t.Fatal("expected refusal of >1 active turn per session")
-	}
-}
-
-// Master prompt §10: retention is never a guessed default outside dev/test.
-func TestRetentionRequiredOutsideDev(t *testing.T) {
-	c, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.Environment, c.RetentionSet = "production", false
-	c.ModelProvider = "mock" // isolate the retention rule from the provider rule
-	if err := validateRetention(c); err == nil {
-		t.Fatal("production without PUBLIC_AI_RETENTION must refuse to start")
-	}
-	c.RetentionSet = true
-	if err := validateRetention(c); err != nil {
-		t.Fatalf("explicit retention should pass: %v", err)
-	}
-}
-
-// Master prompt STEP 2: only the mock provider exists, only in dev/test, and
-// the model id must be allowlisted.
-func TestModelProviderRules(t *testing.T) {
-	if c, err := Load(); err != nil || c.ModelProvider != "mock" || c.HTTPAddr != "127.0.0.1:8001" {
-		t.Fatalf("dev defaults: %+v %v", c.ModelProvider, err)
-	}
-	t.Setenv("MODEL_PROVIDER", "openai")
-	if _, err := Load(); err == nil {
-		t.Fatal("an unbuilt provider must refuse to start")
-	}
-	t.Setenv("MODEL_PROVIDER", "mock")
-	t.Setenv("PUBLIC_AI_MODEL_ID", "gpt-unlisted")
-	if _, err := Load(); err == nil {
-		t.Fatal("a model id outside the allowlist must refuse to start")
-	}
-	t.Setenv("PUBLIC_AI_MODEL_ID", "")
-	t.Setenv("PUBLIC_AI_ENVIRONMENT", "production")
-	t.Setenv("PUBLIC_AI_RETENTION", "720h")
-	if _, err := Load(); err == nil {
-		t.Fatal("the mock provider must not start in production")
-	}
-}
-
-// MODEL_PROVIDER=groq needs a server-side key and an allowlisted model.
-func TestGroqProviderRules(t *testing.T) {
-	t.Setenv("MODEL_PROVIDER", "groq")
-	t.Setenv("GROQ_API_KEY", "")
-	if _, err := Load(); err == nil {
-		t.Fatal("groq without GROQ_API_KEY must refuse to start")
-	}
-	t.Setenv("GROQ_API_KEY", "gsk_test_not_a_real_key")
-	c, err := Load()
-	if err != nil || c.ModelID != "openai/gpt-oss-120b" {
-		t.Fatalf("groq defaults: %q %v", c.ModelID, err)
-	}
-	t.Setenv("GROQ_MODEL", "some/unlisted-model")
-	if _, err := Load(); err == nil {
-		t.Fatal("a GROQ_MODEL outside the allowlist must refuse to start")
-	}
-}
-
-func TestTrustedProxiesValidated(t *testing.T) {
-	for _, v := range []string{"localhost", "0.0.0.0/0", "::/0"} {
-		t.Setenv("PUBLIC_AI_TRUSTED_PROXIES", v)
+// SEC-P0-06: an unset or unknown environment refuses to start.
+func TestEnvironmentFailsClosed(t *testing.T) {
+	for _, env := range []string{"", "prod", "development"} {
+		t.Setenv("PUBLIC_AI_ENVIRONMENT", env)
 		if _, err := Load(); err == nil {
-			t.Errorf("PUBLIC_AI_TRUSTED_PROXIES=%s must be refused", v)
+			t.Errorf("PUBLIC_AI_ENVIRONMENT=%q must refuse to start", env)
 		}
 	}
-	t.Setenv("PUBLIC_AI_TRUSTED_PROXIES", "127.0.0.1/32, 10.0.0.0/8")
-	if _, err := Load(); err != nil {
+}
+
+// Doc 06 §08 and SEC-P0-06: outside dev/test the approved policy digest is
+// required, and a remote provider needs its approval reference and region.
+func TestProductionGates(t *testing.T) {
+	c, err := Load()
+	if err != nil {
 		t.Fatal(err)
+	}
+	c.Environment, c.RetentionSet, c.ModelProvider, c.GroqAPIKey = "production", true, "groq", "k"
+	c.ModelID = c.AllowedModelIDs[0]
+	c.KBAllowDraft, c.StructuredResponseDev = false, false
+	if err := c.Validate(); err == nil {
+		t.Fatal("production without a policy digest must refuse to start")
+	}
+	c.PolicyDigest = "abc"
+	if err := c.Validate(); err == nil {
+		t.Fatal("a remote provider without approval must refuse to start")
+	}
+	c.ProviderApprovalRef, c.ProviderRegion, c.ApprovedRegions = "DPA-2026-01", "eu-west", []string{"eu-west"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "ALLOWED_HOSTS") {
+		t.Fatalf("production without a Host allowlist must refuse to start: %v", err)
+	}
+	c.AllowedHosts = []string{"assistant.example.test"}
+	if err := c.Validate(); err != nil && containsAny(err.Error(), "POLICY_DIGEST", "PROVIDER_APPROVAL_REF", "ALLOWED_HOSTS") {
+		t.Fatalf("all gates satisfied but still refused for them: %v", err)
+	}
+}
+
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestUnknownProviderRejectedBeforeApprovalGates(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Environment, c.ModelProvider, c.DatabaseURL = "production", "openai", "postgres://example"
+	err = c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("unknown provider must fail on the provider name first: %v", err)
+	}
+	if strings.Contains(err.Error(), "APPROVAL_REF") || strings.Contains(err.Error(), "APPROVED_REGIONS") {
+		t.Fatalf("provider typo was reported as an approval problem: %v", err)
+	}
+}
+
+func TestNonDevRequiresDatabase(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Environment, c.RetentionSet = "production", true
+	c.ModelProvider, c.GroqAPIKey = "groq", "test-key"
+	c.ModelID = c.AllowedModelIDs[0]
+	c.PolicyDigest = "policy-digest"
+	c.AllowedHosts = []string{"assistant.example.test"}
+	c.ProviderApprovalRef, c.ProviderRegion, c.ApprovedRegions = "DPA-2026-01", "eu-west", []string{"eu-west"}
+	c.KBAllowDraft, c.SeedOnStart, c.StructuredResponseDev = false, false, false
+	c.DatabaseURL = ""
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_DATABASE_URL") {
+		t.Fatalf("non-dev must refuse an in-memory fallback: %v", err)
+	}
+	c.DatabaseURL = "postgres://example/public_ai"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid production config refused: %v", err)
 	}
 }

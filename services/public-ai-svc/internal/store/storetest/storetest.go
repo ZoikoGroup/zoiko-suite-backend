@@ -21,6 +21,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("Revocations", func(t *testing.T) { testRevocations(t, newStore(t)) })
 	t.Run("FlagsUsageOutbox", func(t *testing.T) { testFlagsUsageOutbox(t, newStore(t)) })
 	t.Run("FeedbackPurge", func(t *testing.T) { testFeedbackPurge(t, newStore(t)) })
+	t.Run("ControlAudit", func(t *testing.T) { testControlAudit(t, newStore(t)) })
+	t.Run("ConflictCases", func(t *testing.T) { testConflictCases(t, newStore(t)) })
 }
 
 var ctx = context.Background()
@@ -69,6 +71,12 @@ func testSessions(t *testing.T, s store.Store) {
 	}
 	if got, _ := s.SessionByGrant(ctx, []byte("grant-2")); string(got.PendingContext) != `{"intent":"I05"}` {
 		t.Fatalf("pending context: %q", got.PendingContext)
+	}
+	if err := s.SetSessionMarket(ctx, sess.SessionID, "GB"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.SessionByGrant(ctx, []byte("grant-2")); got.MarketCode != "GB" {
+		t.Fatalf("session market: %q", got.MarketCode)
 	}
 	if err := s.DeleteSession(ctx, sess.SessionID, time.Now()); err != nil {
 		t.Fatal(err)
@@ -157,6 +165,51 @@ func testTurns(t *testing.T, s store.Store) {
 	}
 	if n, _ := s.Usage(ctx, "day:x"); n != 42 {
 		t.Fatalf("usage = %d", n)
+	}
+}
+
+// Doc 06 §21: every control action is recorded with actor, approval and
+// before/after hashes, newest first; a flag change writes its own entry, and
+// an entry without actor or approval is refused.
+func testControlAudit(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := s.AppendAudit(ctx, store.AuditEntry{Action: "release.promote", Target: "kb", Actor: "", Approval: "CHG-1", At: now}); err == nil {
+		t.Fatal("an audit entry without an actor must be refused")
+	}
+	if err := s.AppendAudit(ctx, store.AuditEntry{Action: "release.promote", Target: "kb", Actor: "sre-1", Approval: "CHG-1",
+		BeforeHash: store.Hash([]byte("kb-1")), AfterHash: store.Hash([]byte("kb-2")), Environment: "test", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFlag(ctx, store.Flag{Name: "public_ai_enabled", Value: []byte("false"), ActorRef: "sre-2", ApprovalRef: "CHG-2", UpdatedAt: now.Add(time.Second)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListAudit(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Action != "flag.set" || got[0].Actor != "sre-2" || got[0].AfterHash != store.Hash([]byte("false")) ||
+		got[1].Action != "release.promote" || got[1].BeforeHash != store.Hash([]byte("kb-1")) {
+		t.Fatalf("audit: %+v", got)
+	}
+	if err := s.SetFlag(ctx, store.Flag{Name: "public_ai_enabled", Value: []byte("true"), UpdatedAt: now}, nil); err == nil {
+		t.Fatal("a flag change without actor and approval must be refused")
+	}
+}
+
+// Doc 03 §16: conflict cases keep their owner and blocked state, once.
+func testConflictCases(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	c := store.Conflict{ConflictID: "kb-conf-1", SubjectKey: "PRICE|P", ClaimIDs: []string{"a", "b"}, DetectionType: "CLAIM_CONFLICT",
+		Severity: "HIGH", ResolutionState: "OPEN", DetectedAt: time.Now().UTC().Truncate(time.Microsecond), BlockedClaim: true, AssignedOwner: "commercial-ops"}
+	for i := 0; i < 2; i++ {
+		if err := s.RecordConflict(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Conflicts(ctx)
+	if err != nil || len(got) != 1 || !got[0].BlockedClaim || got[0].AssignedOwner != "commercial-ops" {
+		t.Fatalf("conflicts: %+v %v", got, err)
 	}
 }
 

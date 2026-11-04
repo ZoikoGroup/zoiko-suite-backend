@@ -84,7 +84,7 @@ func TestT2_UnitedStatesAnswered(t *testing.T) {
 	if e.AnswerClass != contract.StatusQualified || e.StatusLabel != "Available" || e.MarketCode != "US" {
 		t.Fatalf("qualifier %s %s %s", e.AnswerClass, e.StatusLabel, e.MarketCode)
 	}
-	for _, s := range []string{"Starter, Growth and Enterprise plans are available", "[N] days"} {
+	for _, s := range []string{"Starter, Growth and Enterprise plans are available", "14 days"} {
 		if !strings.Contains(e.Text, s) {
 			t.Fatalf("answer lacks %q: %q", s, e.Text)
 		}
@@ -107,7 +107,7 @@ func TestT3_UnitedKingdomExpiredTrialAbstains(t *testing.T) {
 		e.Reason != contract.ReasonExpiredSource || !slices.Equal(routes(e), []string{"pricing"}) {
 		t.Fatalf("got %s %s %v %q", e.Status, e.Reason, routes(e), e.Text)
 	}
-	without(t, e, "[N] days")
+	without(t, e, "14 days")
 }
 
 // T4: Show general overview -> explanation, market-dependent, no figures.
@@ -216,7 +216,7 @@ func TestT9_PlanSwitchRecomputes(t *testing.T) {
 	c, _ := seedConversation(t)
 	us := c.say("How much is the Growth plan in the US?")
 	want(t, us, contract.Answered)
-	if us.MarketCode != "US" || !strings.Contains(us.Text, "The Growth plan is listed at [price]") {
+	if us.MarketCode != "US" || !strings.Contains(us.Text, "The Growth plan is listed at XTS 49.00") {
 		t.Fatalf("US growth: %s %q", us.MarketCode, us.Text)
 	}
 	gb := c.say("How much is the Enterprise plan in the UK?")
@@ -243,7 +243,7 @@ func TestT11_RevokedClaimAbstainsImmediately(t *testing.T) {
 	if e.Reason != contract.ReasonSourceRevoked {
 		t.Fatalf("reason %s: %q", e.Reason, e.Text)
 	}
-	without(t, e, "[price]")
+	without(t, e, "XTS")
 }
 
 // UNAVAILABLE is reserved for infrastructure: a kill switch is UNAVAILABLE,

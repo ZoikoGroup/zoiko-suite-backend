@@ -304,6 +304,10 @@ func TestCT011_TurnConflict(t *testing.T) {
 	if w.Code != http.StatusConflict || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("got %d (Retry-After=%q)", w.Code, w.Header().Get("Retry-After"))
 	}
+	p := decodeProblem(t, w)
+	if p.Code != "publicai.turn_conflict" || !p.Retryable || p.Title == "" {
+		t.Fatalf("problem = %+v", p)
+	}
 }
 
 // The body's session_id must equal the grant subject.

@@ -56,7 +56,7 @@ Status values:
 | CT | Doc 05 expectation | Tests | Status |
 |---|---|---|---|
 | CT-025 | P1 price missing → ABSTAIN | `acceptance.TestT3_UnitedKingdomExpiredTrialAbstains`, `TestG04`, `orchestrator.TestExpiredEvidenceAbstains` | Covered |
-| CT-026 | Contradicted price → claim block and governance case | `orchestrator.TestConflictingPricesAbstain`, `acceptance.TestG30` | Partial: blocked and abstained; no governance case is opened (no case system in R0) |
+| CT-026 | Contradicted price → claim block and governance case | `orchestrator.TestConflictingPricesAbstain`, `acceptance.TestG30`, `acceptance.TestKB005_TwoActiveClaimsDisagree`, `acceptance.TestKB003_PublicPageContradictsSignedPrice` | Covered: blocked and abstained; an owned case is recorded at release load and on the turn |
 | CT-027 | Expired trust attestation → no certified claim | `orchestrator.TestSOC2NeverClaimedCertified`, `acceptance.TestG10`, `TestG24`, `TestK6` | Covered |
 | CT-028 | Market unavailable → clarify/abstain | `acceptance.TestG06`, `TestT4b_OtherCountryNotCovered`, `TestS01` | Covered |
 | CT-029 | Trial gate false → CTA hidden | `orchestrator.TestTrialRouteOnlyWhereVerified`, `claims.TestTrialRouteGatedByClaim` | Covered |
@@ -72,7 +72,7 @@ Status values:
 | CT-039 | Route resolution fails → CTA hidden | `release.TestRouteResolutionFailsClosed` (unknown key, URL as key, outside effective window), `orchestrator.TestDemoIsRouteOnly`, `release.TestRoutesRejectUnsafeURLs` | Covered |
 | CT-040 | Duplicate event → effect once | `events.TestRelayDeliversOnceAndDivertsToDLQ` (producer side) | Partial: R0 has no consumer, so consumer dedupe is untested |
 | CT-041 | Out-of-order events: older release not applied | `release.TestRevocationSurvivesRollback` | Partial |
-| CT-042 | DLQ replay rechecks auth and freshness | None. R0 has no DLQ replay tool | Gap |
+| CT-042 | DLQ replay rechecks auth and freshness | `events.TestDLQReplayRechecks` (`kbctl dlq-replay`: schema and freshness rechecked, audited) | Covered |
 | CT-043 | Unsigned KB release rejected | `release.TestSignatureEnforced` | Covered |
 | CT-044 | Revocation with stale cache → claims denied | `release.TestRevokedSinceAtCommit`, `acceptance.TestT11`, `TestK8` | Covered |
 | CT-045 | Event with raw chat text rejected | `events.TestEnvelopeShapeAndRedaction` (exactly 5 allowlisted fields), `TestOnlySixEventTypes`, `acceptance.TestT7` | Covered by construction: payloads are typed, so raw text cannot be added. No DLP alert exists |
@@ -88,10 +88,9 @@ Status values:
 
 | Status | Count | CTs |
 |---|---|---|
-| Covered | 45 | All CTs not listed in the other rows (CT-046 at the gateway) |
-| Partial | 3 | 026, 040, 041 |
+| Covered | 47 | All CTs not listed in the other rows (CT-046 at the gateway) |
+| Partial | 2 | 040, 041 |
 | N/A in R0 | 3 | 020, 037, 051 |
-| Gap | 1 | 042 |
+| Gap | 0 | |
 
-Most Partial items need a part of the system that R0 does not have: an event consumer, a case
-system, a DLQ tool, or broker ACLs.
+The Partial items need a part of the system that R0 does not have: an event consumer or broker ACLs.

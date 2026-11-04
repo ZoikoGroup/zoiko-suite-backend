@@ -327,7 +327,7 @@ func TestA32_RateLimit429(t *testing.T) {
 
 func TestA33_CostCircuitThrottles(t *testing.T) {
 	x := newH(t)
-	in := orchestrator.Input{RequestID: "req_a33", Message: "Which finance modules does ZoikoSuite include?", Locale: "en-US", SpendCeiling: true}
+	in := orchestrator.Input{RequestID: "req_a33", Message: "Which finance modules does ZoikoSuite include?", Locale: "en-US", Budget: orchestrator.BudgetStatic}
 	r := x.env.Pipeline.Answer(ctx, in)
 	status(t, r, contract.Unavailable)
 	reasonIs(t, r, contract.ReasonSpendCeiling)

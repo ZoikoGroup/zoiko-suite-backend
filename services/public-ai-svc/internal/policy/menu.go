@@ -1,5 +1,7 @@
 package policy
 
+import "zoiko.io/public-ai-svc/internal/contract"
+
 // Guided topic menu and follow-ups for the structured widget (ADR-008).
 //
 // Nothing here is invented: categories are the Doc 02 §22 public page
@@ -89,7 +91,32 @@ var IntentCTA = map[string]string{
 // points at a route rather than a knowledge source.
 var RouteTitles = map[string]string{
 	"pricing": "Pricing and plans", "signup_or_trial": "Start a trial", "demo": "Book a demo",
-	"support": "Support center", "trust": "Trust Center", "core_modules": "Core modules", "integrations": "Integrations",
+	"support": "Support center", "trust": "Trust Center", "trust-center": "Trust Center",
+	"core_modules": "Core modules", "integrations": "Integrations",
+	"platform-overview": "Platform overview",
+	"sign-in": "Sign in",
+}
+
+// FallbackRoute maps a citation url_key to the published route that best
+// covers it. Exact route keys and tool pages use themselves; a knowledge
+// source falls back to the intent's default route. It returns "" when no
+// route applies, so a citation is never pointed at an unrelated page.
+func FallbackRoute(urlKey string) string {
+	if _, ok := RouteTitles[urlKey]; ok {
+		return urlKey
+	}
+	if urlKey == "core-modules" {
+		return "core_modules"
+	}
+	for intent, it := range Menu {
+		_ = intent
+		for _, item := range it.Items {
+			if item.ID == urlKey || item.IntentID == urlKey {
+				return DefaultRoute[item.IntentID]
+			}
+		}
+	}
+	return ""
 }
 
 // itemFor returns the first menu item for an intent.
@@ -135,4 +162,27 @@ func FollowUps(intent string) []MenuItem {
 		}
 	}
 	return out
+}
+
+// topicChips cover Doc 02 §06 topics that have no menu item. Each message
+// classifies to its intent like a typed question (menu_test.go).
+var topicChips = map[string]contract.Chip{
+	"I01": {Label: "Platform overview", Message: "What is ZoikoSuite?"},
+	"I02": {Label: "Explore modules", Message: "What modules does ZoikoSuite include?"},
+	"I04": {Label: "Countries", Message: "Which countries do you support?"},
+	"I11": {Label: "Migration", Message: "How do we migrate to ZoikoSuite?"},
+	"I17": {Label: "Tax", Message: "How does ZoikoSuite handle tax?"},
+	"I18": {Label: "Workforce", Message: "How does ZoikoSuite support payroll and workforce?"},
+	"I19": {Label: "Legal", Message: "How does ZoikoSuite handle contracts?"},
+	"I20": {Label: "Reporting", Message: "What reporting and dashboards does ZoikoSuite offer?"},
+}
+
+// ChipFor is the chip for an intent: its first menu item, else its topic
+// chip (a secondary topic offered after an answer, Doc 02 §08).
+func ChipFor(intent string) (contract.Chip, bool) {
+	if it, ok := itemFor(intent); ok {
+		return contract.Chip{Label: it.Label, Message: it.Message}, true
+	}
+	c, ok := topicChips[intent]
+	return c, ok
 }

@@ -1,5 +1,5 @@
 {
-  "dataset_version": "golden-dev-v2",
+  "dataset_version": "golden-dev-v3",
   "note": "TEST-ONLY synthetic golden set over testdata/fixtures. Not the Doc 07 holdout (partition E must be authored independently by Product/Legal/QA).",
   "cases": [
     {
@@ -697,6 +697,79 @@
         "application_outcome": "ABSTAIN",
         "allowed_actions": [
           "core_modules"
+        ]
+      }
+    },
+    {
+      "id": "GD-M01",
+      "partition": "C",
+      "priority": "P0",
+      "requirement_refs": [
+        "ZS-SUIVO-ENG-002:S04",
+        "QA-T040"
+      ],
+      "input": {
+        "before": [
+          "Check my overdue invoices and send reminders."
+        ],
+        "message": "My company is ACME and the invoice is 4519."
+      },
+      "assert": {
+        "application_outcome": "REFUSED_ACTION",
+        "intent": "X01",
+        "must_not_contain": [
+          "4519",
+          "acme"
+        ],
+        "max_citations": 0
+      }
+    },
+    {
+      "id": "GD-M02",
+      "partition": "A",
+      "priority": "P0",
+      "requirement_refs": [
+        "ZS-SUIVO-ENG-002:S10",
+        "ZS-SUIVO-ENG-010:\u00a708"
+      ],
+      "input": {
+        "before": [
+          "Can someone show me approvals and audit evidence?"
+        ],
+        "message": "Yes."
+      },
+      "assert": {
+        "application_outcome": "HANDOFF",
+        "allowed_actions": [
+          "demo"
+        ],
+        "must_not_contain": [
+          "booked",
+          "scheduled",
+          "submitted your request"
+        ]
+      }
+    },
+    {
+      "id": "GD-M03",
+      "partition": "A",
+      "priority": "P1",
+      "requirement_refs": [
+        "ZS-SUIVO-ENG-002:\u00a710"
+      ],
+      "input": {
+        "before": [
+          "We are evaluating ZoikoSuite for the United States."
+        ],
+        "message": "How much is the Starter plan per month?"
+      },
+      "assert": {
+        "application_outcome": "ANSWERED",
+        "must_contain": [
+          "19.00"
+        ],
+        "must_not_contain": [
+          "which country"
         ]
       }
     }

@@ -180,6 +180,27 @@ jobs:
             echo "No packages to test"
           fi
 
+      # Suivo Doc 07 release gates for the public assistant: no test skipped
+      # without an allowlisted reason (§10), and the golden set must PASS
+      # (P0 failure, flaky P0 or high-risk false permit = BLOCK_RELEASE;
+      # unwaived P1 failure = NO_GO). The eval report is the evidence.
+      - name: Doc 07 gates (public-ai-svc)
+        if: matrix.service == 'public-ai-svc'
+        working-directory: services/${{ matrix.service }}
+        env:
+          TEST_DATABASE_URL: postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable
+        run: |
+          go test -json -count=1 ./... | go run ./cmd/skipcheck -allowlist testdata/skip-allowlist.txt
+          go run ./cmd/evalrun -repeats 3 -sha "${{ github.sha }}" -out eval-report.json
+
+      - name: Upload eval report (public-ai-svc)
+        if: always() && matrix.service == 'public-ai-svc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-ai-eval-report
+          path: services/public-ai-svc/eval-report.json
+          if-no-files-found: ignore
+
       - name: Integration test — health probes with embedded Postgres
         if: matrix.service == 'audit-event-store-svc' || matrix.service == 'workflow-history-svc'
         working-directory: services/${{ matrix.service }}
@@ -215,6 +236,62 @@ jobs:
 
           go test -v -tags=integration -count=1 -timeout=600s ./internal/store/
 
+
+  # ─── Suivo public assistant: supply chain (Doc 06 §12, §24; Doc 08 §07) ────
+  # Reachable dependency and standard-library vulnerabilities fail the build
+  # (govulncheck); the module SBOM (CycloneDX) is kept as evidence; the image
+  # is scanned and fails on fixable HIGH/CRITICAL findings. Image signing and
+  # provenance need a registry and a signing key (not configured yet).
+  public-ai-supply-chain:
+    name: "public-ai-svc — vulnerabilities · SBOM · image scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/public-ai-svc/go.mod
+          cache-dependency-path: services/public-ai-svc/go.sum
+
+      - name: govulncheck
+        working-directory: services/public-ai-svc
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: CycloneDX SBOM
+        working-directory: services/public-ai-svc
+        run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.9.0 app -json -main cmd/server -output sbom.cdx.json
+
+      - name: Build image
+        run: docker build --build-arg GIT_SHA=${{ github.sha }} -t public-ai-svc:ci services/public-ai-svc
+
+      # Trivy is installed from a pinned release and checked against a pinned
+      # SHA-256. trivy-action fetches its install script from Trivy's main
+      # branch at run time, so a change there broke the scan without any change here.
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: "0.76.1"
+          TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+        run: |
+          cd "$RUNNER_TEMP"
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tarball}"
+          echo "${TRIVY_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" trivy
+          sudo install -m 0755 trivy /usr/local/bin/trivy
+          trivy --version
+
+      - name: Trivy image scan
+        run: trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress public-ai-svc:ci
+
+      - name: Upload SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-ai-sbom
+          path: services/public-ai-svc/sbom.cdx.json
+          if-no-files-found: ignore
 
   # ─── INT certification (ZS-SVC-M-001) ────────────────────────────────────────
   # The ledger is checked against the tree on every change (a cited test that is renamed or deleted fails here), and

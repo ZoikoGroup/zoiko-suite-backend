@@ -42,6 +42,22 @@ func (s *Snapshot) SourceRevoked(sourceID, sourceVersionID string) bool {
 	return s.rev.sources[sourceID] || s.rev.sources[sourceVersionID]
 }
 
+// EvidenceRevoked reports whether a claim's evidence was withdrawn, by its
+// version or by its whole source (KB-030): a claim citing it is never stated.
+func (s *Snapshot) EvidenceRevoked(sourceVersionID string) bool {
+	if s.rev.sources[sourceVersionID] {
+		return true
+	}
+	if s.kbManifest != nil {
+		for _, src := range s.kbManifest.Sources {
+			if src.SourceVersionID == sourceVersionID && s.rev.sources[src.SourceID] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ClaimRevoked implements claims.RevocationSet.
 func (s *Snapshot) ClaimRevoked(claimID string) bool { return s.rev.claims[claimID] }
 
@@ -84,12 +100,23 @@ type Runtime struct {
 	// DRAFT_PENDING_REVIEW content. Anywhere else such a release is refused
 	// and the service stays not-ready (fail closed).
 	AllowDraft bool
+	// AllowSynthetic lets a local/dev runtime serve a release containing
+	// synthetic test data (synthetic sources, synthetic routes, or synthetic
+	// claims). Anywhere else such a release is refused and the service stays
+	// not-ready (fail closed).
+	AllowSynthetic bool
 	// Embedder, when set, adds vector recall (knowledge.Hybrid) to each KB
 	// release. Nil (the R0 default: no approved model) keeps retrieval
 	// lexical. If embedding a release fails, that release is served
 	// lexically and VectorError reports why.
 	Embedder knowledge.Embedder
 	vecErr   error
+	// PolicyVersion is the running prompt/policy version. A release whose
+	// compatible_policy_versions does not include it is refused at load
+	// (Doc 08 OPR-004). RequireCompatibility also refuses a release that
+	// declares no range: set outside dev/test, where nothing is assumed.
+	PolicyVersion        string
+	RequireCompatibility bool
 
 	mu          sync.RWMutex
 	snap        *Snapshot
@@ -97,6 +124,9 @@ type Runtime struct {
 	claimsID    string
 	lastRefresh time.Time
 	lastErr     error
+	// scanPending: a release changed and its conflict cases are not yet
+	// all recorded; the next refresh retries.
+	scanPending bool
 }
 
 // New creates a Runtime. pubKey is the base64 Ed25519 verification key.
@@ -146,6 +176,21 @@ func (r *Runtime) refresh(ctx context.Context) error {
 			r.invalidate()
 			return fmt.Errorf("release %s: %w", newKB, ErrDraftInRelease)
 		}
+		if m.HasSynthetic() && !r.AllowSynthetic {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease)
+		}
+		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, err)
+		}
+		// additionally, gate synthetic routes
+		for _, rt := range m.Routes {
+			if rt.Synthetic && !r.AllowSynthetic {
+				r.invalidate()
+				return fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease)
+			}
+		}
 		next.KB, next.Routes, next.kbManifest = knowledge.NewIndex(m), m.Routes, &m
 		next.Retriever = next.KB
 		var vecErr error
@@ -169,6 +214,10 @@ func (r *Runtime) refresh(ctx context.Context) error {
 		if err := r.load(ctx, newClaims, claims.KindClaims, &m); err != nil {
 			r.invalidate()
 			return err
+		}
+		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newClaims, err)
 		}
 		next.Claims = claims.NewResolver(m)
 		next.claimsChanged = true
@@ -198,8 +247,46 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	}
 	r.mu.Lock()
 	r.snap, r.kbID, r.claimsID = &next, newKB, newClaims
+	if newKB != kbID || newClaims != claimsID {
+		r.scanPending = true
+	}
+	scan := r.scanPending
 	r.mu.Unlock()
+	if scan && next.Claims != nil {
+		// Doc 03 §16, KB-005: every conflict in the new releases becomes an
+		// owned case at load, before any visitor asks about it.
+		for _, c := range ScanConflicts(next.kbManifest, next.Claims.Manifest(), time.Now().UTC()) {
+			if err := r.store.RecordConflict(ctx, c); err != nil {
+				return fmt.Errorf("record conflict %s: %w", c.ConflictID, err)
+			}
+		}
+		r.mu.Lock()
+		r.scanPending = false
+		r.mu.Unlock()
+	}
 	return nil
+}
+
+// ErrIncompatibleRelease means a release was not evaluated with the running
+// policy version (Doc 08 OPR-004); the runtime stays not-ready.
+var ErrIncompatibleRelease = errors.New("release is not compatible with the running policy version")
+
+func (r *Runtime) compatible(versions []string) error {
+	if len(versions) == 0 {
+		if r.RequireCompatibility {
+			return fmt.Errorf("%w: no compatible_policy_versions declared", ErrIncompatibleRelease)
+		}
+		return nil
+	}
+	if r.PolicyVersion == "" {
+		return nil
+	}
+	for _, v := range versions {
+		if v == r.PolicyVersion {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s not in %v", ErrIncompatibleRelease, r.PolicyVersion, versions)
 }
 
 func (r *Runtime) invalidate() {
