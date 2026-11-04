@@ -5,6 +5,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -78,6 +79,12 @@ func (s *Server) Router() http.Handler {
 	r.Get("/health/live", func(w http.ResponseWriter, _ *http.Request) { writeStatus(w, true) })
 	r.Get("/health/startup", func(w http.ResponseWriter, _ *http.Request) { writeStatus(w, true) })
 	r.Get("/health/ready", func(w http.ResponseWriter, _ *http.Request) { writeStatus(w, s.deps.Ready()) })
+	// Doc 08 §14: Prometheus metrics, outside the public API (never under
+	// /public-ai/v1) and with low-cardinality labels only.
+	r.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		metrics.SetReleaseReady(s.deps.Ready())
+		metrics.Handler().ServeHTTP(w, req)
+	})
 
 	r.Route("/public-ai/v1", func(api chi.Router) {
 		api.Use(middleware.Host(s.cfg.AllowedHosts))

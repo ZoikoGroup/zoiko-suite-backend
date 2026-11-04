@@ -94,6 +94,7 @@ const (
 	ReasonToolInstruction      = "TOOL_INSTRUCTION"
 	ReasonPricingDisabled      = "PRICING_DISABLED"
 	ReasonKillSwitch           = "KILL_SWITCH"
+	ReasonSpendCeiling         = "SPEND_CEILING" // Doc 06 §13 stage 2: static content only
 	ReasonIntentDisabled       = "INTENT_DISABLED"
 	ReasonGenerationDisabled   = "GENERATION_DISABLED"
 	ReasonModelUnavailable     = "MODEL_UNAVAILABLE"
@@ -101,6 +102,8 @@ const (
 	ReasonKnowledgeUnavailable = "KNOWLEDGE_UNAVAILABLE"
 	ReasonLivePlatformData     = "LIVE_PLATFORM_DATA"
 	ReasonNoApprovedInfo       = "NO_APPROVED_INFO"
+	ReasonGlossary             = "GLOSSARY"      // Doc 02 §23: a general definition, no ZoikoSuite claim
+	ReasonContextNoted         = "CONTEXT_NOTED" // Doc 02 §10: the visitor's market is kept for the session
 )
 
 // Pipeline stages named in diagnostics (Master prompt STEP 1).
@@ -124,13 +127,14 @@ var reasonStage = map[string]string{
 	ReasonRegulatedAdvice: StagePolicy, ReasonSecurityReport: StagePolicy, ReasonPromptInjection: StagePolicy,
 	ReasonCrossProduct: StagePolicy, ReasonUnsupportedClaim: StagePolicy, ReasonValidationFailed: StageValidate,
 	ReasonToolInstruction: StageValidate, ReasonPricingDisabled: StageEdge, ReasonKillSwitch: StageEdge,
-	ReasonIntentDisabled: StageEdge, ReasonGenerationDisabled: StageCompose, ReasonModelUnavailable: StageCompose,
+	ReasonIntentDisabled: StageEdge, ReasonSpendCeiling: StageEdge, ReasonGenerationDisabled: StageCompose, ReasonModelUnavailable: StageCompose,
 	ReasonModelTimeout: StageCompose, ReasonKnowledgeUnavailable: StageRetrieve,
 	ReasonLivePlatformData: StagePolicy, ReasonNoApprovedInfo: StageRetrieve,
+	ReasonGlossary: StageDone, ReasonContextNoted: StageDone,
 }
 
 // infraReason are the only reasons an UNAVAILABLE turn may carry.
-var infraReason = map[string]bool{ReasonKillSwitch: true, ReasonIntentDisabled: true, ReasonGenerationDisabled: true,
+var infraReason = map[string]bool{ReasonKillSwitch: true, ReasonIntentDisabled: true, ReasonGenerationDisabled: true, ReasonSpendCeiling: true,
 	ReasonModelUnavailable: true, ReasonModelTimeout: true, ReasonKnowledgeUnavailable: true}
 
 // StageFor names the pipeline stage a reason comes from ("" if unknown).

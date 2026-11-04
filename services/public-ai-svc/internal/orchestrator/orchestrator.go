@@ -20,6 +20,24 @@ type Input struct {
 	PageContext string
 	// Pending is the carry-over from a previous clarifying question.
 	Pending *Pending
+	// Budget is the staged spend throttle (Doc 06 §13): "" normal,
+	// BudgetReduced (half output, no repair) or BudgetStatic (no model).
+	Budget string
+}
+
+// Spend stages (Doc 06 §13, SEC-P0-09).
+const (
+	BudgetReduced = "REDUCED"
+	BudgetStatic  = "STATIC"
+)
+
+// TighterBudget returns the stricter of two stages.
+func TighterBudget(a, b string) string {
+	rank := map[string]int{"": 0, BudgetReduced: 1, BudgetStatic: 2}
+	if rank[b] > rank[a] {
+		return b
+	}
+	return a
 }
 
 // Pending is what a clarifying question needs remembered: intent and slot
@@ -35,6 +53,12 @@ type Pending struct {
 	// follow-up that names another market, plan or billing asks it again
 	// with only the new slots (Doc 02 G05: old slots and price are dropped).
 	Answered bool `json:"answered,omitempty"`
+	// Offer is the route the last reply offered ("demo"): a bare "yes" next
+	// opens it (Doc 02 S10). Nothing is booked.
+	Offer string `json:"offer,omitempty"`
+	// Refused: the last reply refused to act on the visitor's records. Record
+	// identifiers sent next are refused again, never repeated (Doc 02 S04).
+	Refused bool `json:"refused,omitempty"`
 }
 
 // Result is the orchestrator outcome. The HTTP layer adds turn identifiers.
@@ -67,6 +91,9 @@ type Result struct {
 	SecuritySignal string
 	// Pending, when set, must be stored for the next turn; nil clears it.
 	Pending *Pending
+	// RememberMarket is a country the visitor named this turn; the session
+	// keeps it for later turns (Doc 02 §10).
+	RememberMarket string
 }
 
 // Diag records how a turn was decided: slots, claim verdict, retrieval

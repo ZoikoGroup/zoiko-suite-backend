@@ -69,6 +69,8 @@ var (
 	// TplAbstainTrialStale: trial terms for the named market cannot be
 	// verified (expired or revoked claim). {{market}} is a display name.
 	TplAbstainTrialStale = Template{contract.Abstain, "I can't verify the current trial terms for {{market}} right now. The official pricing page has the current information.", "pricing", false, ""}
+	TplPriceIncomplete   = Template{contract.Abstain, "I can't confirm exact pricing from an approved price book in this chat. The official pricing page has the current terms.", "pricing", false, ""}
+	TplTrialIncomplete   = Template{contract.Abstain, "Trial availability depends on plan and market. The official pricing page has the current terms.", "pricing", false, ""}
 	// TplLivePlatform: live platform state, tenant data or dashboard counts.
 	TplLivePlatform = Template{contract.RefusedAction, "I can't see live platform data or account information. I can explain what ZoikoSuite's services and modules do, using public information.", "", false, ""}
 	// TplNoApprovedInfo: a public question with no approved content yet.
@@ -85,7 +87,8 @@ func init() {
 		&TplOutOfScope: contract.ReasonOutOfScope, &TplClarifyGiveUp: contract.ReasonClarifyExhausted,
 		&TplAbstainCoverage: contract.ReasonMarketNotCovered, &TplWelcome: contract.ReasonGreeting,
 		&TplAbstainTrialStale: contract.ReasonExpiredSource, &TplLivePlatform: contract.ReasonLivePlatformData,
-		&TplNoApprovedInfo: contract.ReasonNoApprovedInfo,
+		&TplNoApprovedInfo: contract.ReasonNoApprovedInfo, &TplPriceIncomplete: contract.ReasonNoEvidence,
+		&TplTrialIncomplete: contract.ReasonNoEvidence,
 	} {
 		p.Reason = r
 	}
@@ -104,6 +107,10 @@ func init() {
 		RouteTemplates[id] = t
 	}
 }
+
+// TplDataRights answers access, export or erasure requests route-only
+// (Doc 09 §12): nothing is recorded, exported or deleted from the chat.
+var TplDataRights = Template{contract.Handoff, "I can't act on data requests in this chat. To ask for access to, a copy of, or deletion of your personal data, please use ZoikoSuite's official privacy request route. Nothing has been recorded, exported or deleted from here.", "trust", false, contract.ReasonRouteOnly}
 
 // Suggestion chips offered when the assistant cannot answer.
 var (
@@ -162,6 +169,10 @@ var TplEvidenceAssurance = Template{contract.Abstain, "ZoikoSuite describes evid
 // TplAbstainCertification answers a certification question that has no
 // verified trust claim: T10's due-diligence guidance, never a status.
 var TplAbstainCertification = Template{contract.Abstain, "I can't confirm a certification status from an approved trust claim in this chat. For due diligence, please review the current Trust Center or request scoped evidence.", "trust", false, contract.ReasonNoEvidence}
+
+// TplDemoAccepted follows "yes" to a demo offer (Doc 02 S10): the official
+// form is opened; nothing is booked, scheduled or submitted from the chat.
+var TplDemoAccepted = Template{contract.Handoff, "Here is ZoikoSuite's official demo request form. Nothing has been arranged from this chat: the team receives your request only when you complete and send the form yourself.", "demo", false, contract.ReasonRouteOnly}
 
 // RouteTemplates are route-only intents: the assistant offers an official
 // link and never claims a booking, ticket or callback exists (Doc 09 §11).

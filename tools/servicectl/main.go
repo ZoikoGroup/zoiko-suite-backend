@@ -8,7 +8,7 @@
 // the third. What is left is process supervision, which is this program.
 //
 // The point of it being a server rather than a script is laziness in the useful
-// sense: 86 services is far more than a laptop should run, and the console knows
+// sense: 87 services is far more than a laptop should run, and the console knows
 // which handful any given page actually reads. It asks for those on navigation,
 // and they are stopped again once nothing has asked for a while.
 //

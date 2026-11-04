@@ -30,7 +30,24 @@ const (
 	TypeSecuritySignal    = "chat.security.signal.v1"
 )
 
-const source = "urn:zoikosuite:publicai:orchestrator"
+// Sources per producer (Doc 05 §20): a consumer can tell who emitted an
+// event, and replay accepts only an event from the producer of its type.
+const (
+	sourceOrchestrator = "urn:zoikosuite:publicai:orchestrator"
+	sourceRelease      = "urn:zoikosuite:publicai:release"
+	sourceControl      = "urn:zoikosuite:publicai:control"
+)
+
+// sourceOf is the producer that emits an event type.
+func sourceOf(typ string) string {
+	switch typ {
+	case TypeReleasePromoted, TypeSourceRevoked:
+		return sourceRelease
+	case TypeKillSwitchChanged:
+		return sourceControl
+	}
+	return sourceOrchestrator
+}
 
 // Envelope is CloudEvents 1.0 structured JSON.
 type Envelope struct {
@@ -43,14 +60,31 @@ type Envelope struct {
 	Data            any    `json:"data"`
 }
 
+// newID is a random UUIDv4 (RFC 9562), the CloudEvents id consumers dedupe on.
 func newID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// Backoff is the wait before relay attempt n (1-based): doubling from base,
+// capped at two minutes.
+func Backoff(base time.Duration, attempt int) time.Duration {
+	d := base
+	for i := 1; i < attempt && d < 2*time.Minute; i++ {
+		d *= 2
+	}
+	if d > 2*time.Minute {
+		d = 2 * time.Minute
+	}
+	return d
 }
 
 func build(topic, typ string, data any, at time.Time) (store.OutboxEvent, error) {
-	env := Envelope{SpecVersion: "1.0", ID: newID(), Source: source, Type: typ,
+	env := Envelope{SpecVersion: "1.0", ID: newID(), Source: sourceOf(typ), Type: typ,
 		Time: at.UTC().Format(time.RFC3339Nano), DataContentType: "application/json", Data: data}
 	b, err := json.Marshal(env)
 	if err != nil {
@@ -124,10 +158,13 @@ type killSwitchChanged struct {
 	ActorRef    string `json:"actor_ref"`
 	ApprovalRef string `json:"approval_ref"`
 	Environment string `json:"environment"`
+	// ControlEpoch orders control changes: replay never re-announces an
+	// event older than the flag's current change (Doc 05 §22).
+	ControlEpoch int64 `json:"control_epoch"`
 }
 
 func KillSwitchChanged(flag, actor, approval, environment string, at time.Time) (store.OutboxEvent, error) {
-	return build(TopicControl, TypeKillSwitchChanged, killSwitchChanged{flag, actor, approval, environment}, at)
+	return build(TopicControl, TypeKillSwitchChanged, killSwitchChanged{flag, actor, approval, environment, at.UTC().UnixNano()}, at)
 }
 
 type securitySignal struct {

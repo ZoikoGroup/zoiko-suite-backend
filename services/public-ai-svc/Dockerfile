@@ -2,7 +2,10 @@
 #   docker build -t public-ai-svc services/public-ai-svc
 # The image contains the server, the healthcheck probe and the kbctl operator
 # tool. It contains no fixtures, keys or secrets.
-FROM golang:1.25-alpine AS builder
+FROM golang:1.27-alpine AS builder
+# go.mod pins toolchain go1.27.3 (standard-library security fixes); an older
+# patch release in the image fetches it.
+ENV GOTOOLCHAIN=auto
 
 WORKDIR /app
 
@@ -16,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w -X main.gitSHA=$
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/healthcheck ./cmd/healthcheck && \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/kbctl ./cmd/kbctl
 
-FROM alpine:3.19
+FROM alpine:3.22
 
 RUN apk --no-cache add ca-certificates && adduser -D -H -u 10001 publicai
 

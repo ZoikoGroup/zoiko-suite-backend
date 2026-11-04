@@ -64,6 +64,8 @@ var exceptionRules = map[string][]*regexp.Regexp{
 			"should i deduct", "can i deduct", "should i claim", "can i claim", "should i file", "how much tax should", "how much tax do i",
 			"how do i avoid tax", "reduce my tax", "is it legal", "am i compliant", "are we compliant", "should i invest", "can i fire",
 			"tax liability", "how much tax do i owe", "legal guarantee",
+			// Doc 02 S05: pay or rate advice is advice, whatever else is asked.
+			"what should i pay", "how much should i pay", "how much should we pay", "what should we pay", "what rate should i",
 			// Spanish (G33): regulated-advice requests are refused whatever the language.
 			"asesor*", "despedir", "despido", "consejo legal", "consejo fiscal", "impuestos debo"),
 	},
@@ -90,7 +92,7 @@ var intentRules = map[string]*regexp.Regexp{
 	"I05": pattern("price*", "pricing", "cost*", "how much", "per user", "per month", "per year", "plans", "plan cost", "fees", "quote", "expensive", "cheap*"),
 	"I06": pattern("trial", "free trial", "try it", "try for free", "test drive", "sandbox account"),
 	"I07": pattern("upgrade*", "downgrade*", "switch plan", "change plan", "change my plan", "move to the growth", "add users", "remove users"),
-	"I08": pattern("demo", "book a demo", "schedule a demo", "see it in action", "walkthrough", "product tour"),
+	"I08": pattern("demo", "book a demo", "can someone show me", "could someone show me", "someone show me", "show me how it works", "walk me through", "schedule a demo", "see it in action", "walkthrough", "product tour"),
 	"I09": pattern("enterprise quote", "custom quote", "enterprise pricing", "enterprise", "large organization", "large organisation", "sso", "scim", "solutions architect", "custom contract", "volume discount", "procurement team"),
 	"I10": pattern("integrat*", "connector*", "connect to", "connect with", "api", "apis", "webhook*", "quickbooks", "salesforce", "sync with", "bank feeds"),
 	"I11": pattern("migrat*", "switch from", "move from", "moving from", "import our data", "import data", "data import", "onboarding data"),
@@ -100,7 +102,7 @@ var intentRules = map[string]*regexp.Regexp{
 	"I15": pattern("governance", "approval workflow*", "approvals", "run approvals", "approve automatically", "approvals automatically", "automatic approval*", "auto-approv*", "approve on behalf", "on behalf of", "who can approve", "approval limit*", "act for", "audit trail", "segregation of duties", "controls", "policy engine"),
 	"I16": pattern("evidence", "audit evidence", "audit-ready", "audit ready", "auditor*", "audit log*", "audit trail evidence", "admissib*", "assurance"),
 	"I17": pattern("tax", "taxes", "taxation", "file tax*", "tax filing*", "tax return*", "vat", "gst", "sales tax", "tax compliance", "corporate tax", "withholding"),
-	"I18": pattern("payroll", "workforce", "human resources", "hr", "paye", "benefits", "leave management", "employee onboarding"),
+	"I18": pattern("payroll tax*", "payroll", "workforce", "human resources", "hr", "paye", "benefits", "leave management", "employee onboarding"),
 	"I19": pattern("contract*", "legal workflow*", "clause*", "board resolution*", "legal module", "obligations"),
 	"I20": pattern("report*", "dashboard*", "analytics", "forecast*", "insights", "kpi*"),
 	// "how do i" / "how to" are openers, not a topic: they no longer outscore
@@ -174,6 +176,12 @@ func IsModuleQuestion(text string) bool {
 // in answer to a clarifying question (Master prompt §4 step 6).
 func IsGeneralOverview(text string) bool { return overviewRe.MatchString(text) }
 
+var dataRightsRe = regexp.MustCompile(`(?i)\b(?:delete|erase|remove|export|download|access|see|get a copy of)\s+(?:all\s+)?(?:my|our)\s+(?:personal\s+)?(?:data|information|details|records)\b|\b(?:right to (?:be forgotten|erasure|access)|data subject (?:access )?request|dsar|subject access request)\b`)
+
+// IsDataRightsRequest reports an access, export or erasure request for the
+// visitor's own data (Doc 09 §12).
+func IsDataRightsRequest(text string) bool { return dataRightsRe.MatchString(text) }
+
 // AsksPrice reports whether the message asks for a price (as opposed to,
 // say, which plans exist). Only price questions need a market (Doc 02 I05).
 func AsksPrice(text string) bool { return priceRe.MatchString(text) }
@@ -203,11 +211,79 @@ func capabilityQuestion(text string) bool {
 	return capabilityRe.MatchString(text) && !personalRe.MatchString(text)
 }
 
+// capabilityLeadRe ends in "can ZoikoSuite", "does it" or "do you": the
+// words just before an action verb that make it a product question.
+var capabilityLeadRe = regexp.MustCompile(`(?i)\b(?:can|could|does|do|is)\s+(?:zoikosuite|zoiko suite|it|you|the platform)\s+(?:\w+\s+){0,1}$`)
+
+// capabilityClause reports whether every match of an action rule is asked as
+// a capability ("Can ZoikoSuite file payroll taxes in France, and what should
+// I pay…" asks what the product does; the rest of the sentence is judged on
+// its own, Doc 02 S05).
+func capabilityClause(text string, re *regexp.Regexp) bool {
+	locs := re.FindAllStringIndex(text, -1)
+	for _, l := range locs {
+		if personalRe.MatchString(text[l[0]:l[1]]) || !capabilityLeadRe.MatchString(text[:l[0]]) {
+			return false
+		}
+	}
+	return len(locs) > 0
+}
+
+// injectionLeadRe is an "ignore your instructions" opener in front of an
+// otherwise ordinary question.
+var injectionLeadRe = regexp.MustCompile(`(?i)^\s*(?:please\s+)?(?:ignore|disregard|forget)\s+(?:all\s+)?(?:(?:of\s+)?(?:your|the|my|any)\s+)?(?:previous|prior|above|earlier|old)?\s*(?:instructions?|prompts?|rules|messages?)?\s*(?:and\s+(?:just\s+)?|then\s+|[,.:;-]\s*)`)
+
+// infoRequestRe opens a request for public information.
+var infoRequestRe = regexp.MustCompile(`(?i)^(?:tell me|explain|describe|what|which|how|does|do you|is|are|where|who|can you tell|could you tell|give me an overview)\b`)
+
+// InjectionRemainder strips an injection opener from a message whose rest
+// is a permitted ZoikoSuite question (Doc 02 S07: the instruction is ignored
+// and recorded, the question is still answered). ok is false when the rest
+// is itself an injection, an exception, or not a ZoikoSuite question:
+// prompt-extraction attempts are never continued.
+func InjectionRemainder(msg string) (string, bool) {
+	if Classify(msg).Exception != X06PromptInjection {
+		return "", false
+	}
+	loc := injectionLeadRe.FindStringIndex(msg)
+	if loc == nil {
+		return "", false
+	}
+	rest := strings.TrimSpace(msg[loc[1]:])
+	// Only a request for information continues; "call the payments API for
+	// me" is an instruction to act and stays refused (A19).
+	if rest == "" || !infoRequestRe.MatchString(rest) || personalRe.MatchString(rest) || LooksLikeInjection(rest) || encodedInstruction(rest) {
+		return "", false
+	}
+	d := Classify(rest)
+	if d.Exception != "" || (d.Primary == "I29" && !IsModuleQuestion(rest)) {
+		return "", false
+	}
+	return rest, true
+}
+
+// recordIDRe names a business record by its number or the visitor's company
+// ("the invoice is 4519", "my company is ACME").
+var recordIDRe = regexp.MustCompile(`(?i)\b(?:invoice|bill|account|customer|vendor|supplier|order|po|payment|transaction|employee|reference|ref|case|ticket)\s*(?:number|no\.?|#|id)?\s*(?:is\s+|:\s*)?#?\d{3,}\b|\b(?:my|our)\s+(?:company|business|firm|organi[sz]ation)(?:'s)?\s+(?:name\s+)?is\b`)
+
+// HasRecordIdentifiers reports whether a message supplies identifiers of the
+// visitor's own records. After a records refusal they are refused again and
+// never repeated (Doc 02 S04).
+func HasRecordIdentifiers(text string) bool { return recordIDRe.MatchString(text) }
+
+var affirmativeRe = regexp.MustCompile(`(?i)^\s*(?:yes|yeah|yep|yup|sure|ok|okay|please|yes please|please do|sounds good|go ahead|let's do it|i'd like that|that would be great)[\s!.,]*$`)
+
+// IsAffirmative reports a bare "yes" to an offer.
+func IsAffirmative(text string) bool { return affirmativeRe.MatchString(text) }
+
 func Classify(msg string) Decision {
 	d := Decision{Redaction: Redact(msg)}
 	text := d.Redaction.Text
 	if d.Redaction.Found() {
 		d.Exception = X03SensitiveInput
+	} else if encodedInstruction(text) {
+		// An instruction hidden in base64 is still an injection (Doc 06 §08).
+		d.Exception = X06PromptInjection
 	}
 	if d.Exception == "" {
 		for _, x := range exceptionOrder {
@@ -215,7 +291,7 @@ func Classify(msg string) Decision {
 				continue
 			}
 			for _, re := range exceptionRules[x] {
-				if re.MatchString(text) && !(x == X02ActionDenied && capabilityQuestion(text)) {
+				if re.MatchString(text) && !(x == X02ActionDenied && (capabilityQuestion(text) || capabilityClause(text, re))) {
 					d.Exception = x
 					break
 				}

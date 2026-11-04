@@ -1,6 +1,6 @@
 # servicectl
 
-Runs the backend's 86 Go services as OS processes, on demand, with no Docker.
+Runs the backend's 87 Go services as OS processes, on demand, with no Docker.
 
 ## Why this exists
 
@@ -15,7 +15,7 @@ that:
 | a per-service environment block | one global env file at the backend root |
 
 What is left is process supervision, which is this program. It is a **server**
-rather than a script because 86 services is far more than a laptop should run,
+rather than a script because 87 services is far more than a laptop should run,
 and the console knows which handful any given page actually reads. It asks for
 those on navigation and they are stopped again once nothing has asked for a
 while.
@@ -29,7 +29,7 @@ The compose files still work. Switching back is still
 # build the launcher itself
 cd tools/servicectl && go build -o ../../.servicectl/servicectl.exe .
 
-# one-time: compile all 86 services into the binary cache (a few minutes)
+# one-time: compile all 87 services into the binary cache (a few minutes)
 .servicectl/servicectl.exe build
 
 # run the daemon the console talks to

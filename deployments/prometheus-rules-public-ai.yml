@@ -1,0 +1,230 @@
+# Alerting rules for the ZoikoSuite Assistant (public-ai-svc), Doc 08 §13–15.
+#
+# Kept apart from prometheus-rules.yml on purpose: the assistant runs in its
+# own isolated stack (docker-compose.public-ai.yml, INV-01) and is scraped by
+# a Prometheus on that network (prometheus-public-ai.yml), never by the main
+# stack's. Every metric used here is exported by internal/metrics, and
+# internal/metrics.TestAlertRulesUseExportedMetrics fails if one is renamed.
+#
+# Thresholds are dev defaults pending SRE approval (Doc 08 D08-*, DEC-08).
+# Runbook: services/public-ai-svc/RUNBOOK.md
+groups:
+  - name: public-ai-assistant
+    rules:
+      # Availability: turns answered with UNAVAILABLE (model down, kill
+      # switch, no verified release). Doc 04 target: 99.9 % turn availability.
+      - alert: PublicAIUnavailableTurns
+        expr: |
+          sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[10m]))
+          /
+          sum(rate(public_ai_turns_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Assistant: more than 5% of turns UNAVAILABLE for 10m"
+
+      - alert: PublicAIServerErrors
+        expr: |
+          sum(rate(public_ai_http_requests_total{code=~"5.."}[5m]))
+          /
+          sum(rate(public_ai_http_requests_total[5m])) > 0.02
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Assistant: 5xx rate above 2% for 5m"
+
+      # Latency: Doc 04 targets gate p95 <= 0.5 s and answer p95 <= 8 s.
+      - alert: PublicAIAnswerLatencyP95High
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(public_ai_turn_duration_seconds_bucket{status="ANSWERED"}[10m]))) > 8
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Assistant: answered-turn p95 above 8 s for 10m"
+
+      - alert: PublicAIGateLatencyP95High
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(public_ai_http_request_duration_seconds_bucket{route!="/public-ai/v1/turns"}[10m]))) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Assistant: non-turn request p95 above 0.5 s for 10m"
+
+      # Safety signals: no 5xx and no latency, so the golden signals miss them.
+      - alert: PublicAIValidationRejectionsSpike
+        expr: sum(rate(public_ai_turns_total{reason="VALIDATION_FAILED"}[15m])) > 0.05
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Assistant: drafts rejected by output validation (possible model or prompt drift)"
+
+      - alert: PublicAIModelErrors
+        expr: |
+          sum(rate(public_ai_model_requests_total{result!="ok"}[10m]))
+          /
+          sum(rate(public_ai_model_requests_total[10m])) > 0.2
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Assistant: more than 20% of model calls failing for 10m"
+
+      - alert: PublicAIReleaseNotReady
+        expr: public_ai_release_ready == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Assistant: no verified knowledge/claim release active (serving fallbacks)"
+
+      # Event integrity (Doc 05 §20, CT-047): dead letters need a replay
+      # decision (kbctl dlq-replay, CT-042).
+      - alert: PublicAIEventsDeadLettered
+        expr: increase(public_ai_events_dead_lettered_total[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Assistant: outbox events moved to a .dlq topic; review and replay with kbctl dlq-replay"
+
+      # Abuse and cost (Doc 06 §13): sustained 429s or token burn.
+      - alert: PublicAIRateLimitingSurge
+        expr: sum(rate(public_ai_rate_limited_total[5m])) > 5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Assistant: sustained 429s (possible abuse); check edge limits"
+
+      - alert: PublicAITokenBurnHigh
+        expr: sum(increase(public_ai_model_tokens_total[1h])) > 500000
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Assistant: more than 500k model tokens in 1h (daily ceiling is 2M by default)"
+
+  # Doc 08 §13: multi-window, multi-burn-rate alerting on the proposed 99.9 %
+  # turn-availability objective (error budget 0.1 %), plus no-data alerts so
+  # silence is never read as health. Objective and windows are PROPOSED
+  # (SRE approval pending, D08-*).
+  - name: public-ai-assistant-slo
+    rules:
+      - record: public_ai:turn_error_ratio:rate5m
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[5m])) / clamp_min(sum(rate(public_ai_turns_total[5m])), 1e-9)
+      - record: public_ai:turn_error_ratio:rate30m
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[30m])) / clamp_min(sum(rate(public_ai_turns_total[30m])), 1e-9)
+      - record: public_ai:turn_error_ratio:rate1h
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[1h])) / clamp_min(sum(rate(public_ai_turns_total[1h])), 1e-9)
+      - record: public_ai:turn_error_ratio:rate6h
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[6h])) / clamp_min(sum(rate(public_ai_turns_total[6h])), 1e-9)
+
+      # Fast burn: 2 % of a 30-day budget in 1 h (14.4x), confirmed over 5 m.
+      # Spend: Doc 04 §25 bill-shock control, three thresholds; at 1.0
+      # the guard has already throttled generation (SPEND_CEILING).
+      - alert: PublicAISpendHalf
+        expr: max(public_ai_spend_ratio) >= 0.5
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Assistant: model spend at 50% of the daily or monthly ceiling"
+          description: "At 100% the spend guard serves static content only (reason SPEND_CEILING). Doc 04 §25: three thresholds and auto-throttle."
+
+      - alert: PublicAISpendHigh
+        expr: max(public_ai_spend_ratio) >= 0.8
+        labels:
+          severity: warn
+        annotations:
+          summary: "Assistant: model spend at 80% of the daily or monthly ceiling"
+          description: "At 100% the spend guard serves static content only (reason SPEND_CEILING). Doc 04 §25: three thresholds and auto-throttle."
+
+      - alert: PublicAISpendCeilingReached
+        expr: max(public_ai_spend_ratio) >= 1
+        labels:
+          severity: page
+        annotations:
+          summary: "Assistant: model spend at 100% of the daily or monthly ceiling"
+          description: "At 100% the spend guard serves static content only (reason SPEND_CEILING). Doc 04 §25: three thresholds and auto-throttle."
+
+      # Security (Doc 06 §27, SEC-T055): denied attempts are monitored, not
+      # only counted. Reason classes only; never message content.
+      - alert: PublicAISecuritySignalSurge
+        expr: sum by (reason_class) (increase(public_ai_security_signals_total[10m])) > 20
+        labels:
+          severity: warn
+        annotations:
+          summary: "Assistant: more than 20 {{ $labels.reason_class }} signals in 10m (possible probing)"
+
+      - alert: PublicAIDeniedRequests
+        expr: sum(increase(public_ai_http_requests_total{code=~"401|403"}[10m])) > 100
+        labels:
+          severity: warn
+        annotations:
+          summary: "Assistant: more than 100 denied (401/403) requests in 10m: origin, host or session probing"
+
+      - alert: PublicAIOutboxLag
+        expr: max(public_ai_outbox_oldest_pending_seconds) > 600
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Assistant: outbox events waiting more than 10 minutes (publisher or relay breaker open)"
+
+      # Knowledge integrity: contradictory claims or expired sources reaching
+      # visitors means an owner case is open (Doc 03 §16, Doc 04 §23).
+      - alert: PublicAIClaimConflictTurns
+        expr: sum(increase(public_ai_turns_total{reason="CLAIM_CONFLICT"}[15m])) > 0
+        labels:
+          severity: warn
+        annotations:
+          summary: "Assistant: answers withheld for a CLAIM_CONFLICT in the last 15m"
+          description: "Check the conflict cases (public_ai.conflicts) and route to the assigned owner."
+
+      - alert: PublicAIExpiredSourceTurns
+        expr: sum(increase(public_ai_turns_total{reason="EXPIRED_SOURCE"}[1h])) > 5
+        labels:
+          severity: warn
+        annotations:
+          summary: "Assistant: more than 5 answers withheld for EXPIRED_SOURCE in 1h"
+          description: "A source or claim validity window has lapsed; renew or retire it."
+
+      - alert: PublicAIErrorBudgetFastBurn
+        expr: |
+          public_ai:turn_error_ratio:rate1h > (14.4 * 0.001)
+          and public_ai:turn_error_ratio:rate5m > (14.4 * 0.001)
+          and sum(rate(public_ai_turns_total[1h])) > 0.01
+        labels:
+          severity: page
+        annotations:
+          summary: "Assistant: error budget burning 14.4x (1h and 5m windows)"
+
+      # Slow burn: 5 % of the budget in 6 h (6x), confirmed over 30 m.
+      - alert: PublicAIErrorBudgetSlowBurn
+        expr: |
+          public_ai:turn_error_ratio:rate6h > (6 * 0.001)
+          and public_ai:turn_error_ratio:rate30m > (6 * 0.001)
+          and sum(rate(public_ai_turns_total[6h])) > 0.01
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Assistant: error budget burning 6x (6h and 30m windows)"
+
+      # No-data: a missing target or missing series is an alert, not health.
+      - alert: PublicAIScrapeDown
+        expr: up{job="public-ai-svc"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Assistant: /metrics not scrapeable for 5m"
+
+      - alert: PublicAIMetricsAbsent
+        expr: absent(public_ai_build_info)
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Assistant: no build_info series for 10m (service down or not scraped)"

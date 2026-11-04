@@ -30,7 +30,18 @@ type Config struct {
 	TokenBudgetPerTurn       int
 	MaxActiveTurnsPerSession int
 	SessionTTL               time.Duration
-	IdempotencyTTL           time.Duration
+	// PolicyDigest is the approved policy fingerprint (required outside
+	// dev/test, Doc 06 §08). ProviderApprovalRef and ProviderRegion record
+	// the DPA/transfer approval for a remote model provider (SEC-P0-06).
+	PolicyDigest        string
+	ProviderApprovalRef string
+	ProviderRegion      string
+	ApprovedRegions     []string // DPA/transfer-approved regions (DEC-05)
+	// SessionIdleTTL ends a session with no completed turn before SessionTTL
+	// (Doc 06 §17); SessionTokenCap is the per-session token cap (§13).
+	SessionIdleTTL  time.Duration
+	SessionTokenCap int64
+	IdempotencyTTL  time.Duration
 	// Retention is how long expired/deleted sessions and their turns are
 	// kept before purge. Dev default pending DPO approval (DEC-06).
 	Retention time.Duration
@@ -91,20 +102,28 @@ func Load() (Config, error) {
 		// Dev listens where the console expects it (ZOIKO_PUBLIC_AI_URL default)
 		// and off :8080, which local Docker stacks commonly hold. Containers set
 		// PUBLIC_AI_HTTP_ADDR explicitly.
-		HTTPAddr:                  env("PUBLIC_AI_HTTP_ADDR", devDefault(env("PUBLIC_AI_ENVIRONMENT", "dev"), "127.0.0.1:8001", ":8080")),
-		DatabaseURL:               os.Getenv("PUBLIC_AI_DATABASE_URL"),
-		KafkaBrokers:              splitList(os.Getenv("PUBLIC_AI_KAFKA_BROKERS")),
-		AllowedOrigins:            splitList(env("PUBLIC_AI_ALLOWED_ORIGINS", "http://localhost:3000")),
-		AllowedHosts:              splitList(os.Getenv("PUBLIC_AI_ALLOWED_HOSTS")),
-		ModelProfile:              env("PUBLIC_AI_MODEL_PROFILE", "fake-v0"),
-		PolicyVersion:             env("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
-		Region:                    os.Getenv("PUBLIC_AI_REGION"),
-		TokenBudgetPerTurn:        envInt("PUBLIC_AI_TOKEN_BUDGET_PER_TURN", 2000),
-		MaxActiveTurnsPerSession:  envInt("PUBLIC_AI_MAX_ACTIVE_TURNS_PER_SESSION", 1),
-		SessionTTL:                envDuration("PUBLIC_AI_SESSION_TTL", 30*time.Minute),
-		IdempotencyTTL:            envDuration("PUBLIC_AI_IDEMPOTENCY_TTL", 24*time.Hour),
-		Retention:                 envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
-		Environment:               env("PUBLIC_AI_ENVIRONMENT", "dev"),
+		HTTPAddr:                 env("PUBLIC_AI_HTTP_ADDR", devDefault(os.Getenv("PUBLIC_AI_ENVIRONMENT"), "127.0.0.1:8001", ":8080")),
+		DatabaseURL:              os.Getenv("PUBLIC_AI_DATABASE_URL"),
+		KafkaBrokers:             splitList(os.Getenv("PUBLIC_AI_KAFKA_BROKERS")),
+		AllowedOrigins:           splitList(env("PUBLIC_AI_ALLOWED_ORIGINS", "http://localhost:3000")),
+		AllowedHosts:             splitList(os.Getenv("PUBLIC_AI_ALLOWED_HOSTS")),
+		ModelProfile:             env("PUBLIC_AI_MODEL_PROFILE", "fake-v0"),
+		PolicyVersion:            env("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
+		Region:                   os.Getenv("PUBLIC_AI_REGION"),
+		TokenBudgetPerTurn:       envInt("PUBLIC_AI_TOKEN_BUDGET_PER_TURN", 2000),
+		MaxActiveTurnsPerSession: envInt("PUBLIC_AI_MAX_ACTIVE_TURNS_PER_SESSION", 1),
+		SessionTTL:               envDuration("PUBLIC_AI_SESSION_TTL", 30*time.Minute),
+		SessionIdleTTL:           envDuration("PUBLIC_AI_SESSION_IDLE_TTL", 15*time.Minute),
+		SessionTokenCap:          int64(envInt("PUBLIC_AI_SESSION_TOKEN_CAP", 20000)),
+		IdempotencyTTL:           envDuration("PUBLIC_AI_IDEMPOTENCY_TTL", 24*time.Hour),
+		Retention:                envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
+		// Required and never assumed (SEC-P0-06): an unset value used to
+		// mean dev and switch the production gates off.
+		Environment:               os.Getenv("PUBLIC_AI_ENVIRONMENT"),
+		PolicyDigest:              os.Getenv("PUBLIC_AI_POLICY_DIGEST"),
+		ProviderApprovalRef:       os.Getenv("PUBLIC_AI_PROVIDER_APPROVAL_REF"),
+		ProviderRegion:            os.Getenv("PUBLIC_AI_REGION"),
+		ApprovedRegions:           splitList(os.Getenv("PUBLIC_AI_APPROVED_REGIONS")),
 		RetentionSet:              os.Getenv("PUBLIC_AI_RETENTION") != "",
 		ModelProvider:             env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock")),
 		ModelID:                   modelIDFor(env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock"))),
@@ -113,7 +132,7 @@ func Load() (Config, error) {
 		Dataset:                   env("PUBLIC_AI_DATASET", "public-kb"),
 		KBAllowDraft:              envBool("KB_ALLOW_DRAFT", envDefaultDev()),
 		SeedOnStart:               envBool("PUBLIC_AI_SEED_ON_START", false),
-		StructuredResponseDev:     envBool("PUBLIC_AI_STRUCTURED_RESPONSE", false),
+		StructuredResponseDev:     envBool("PUBLIC_AI_STRUCTURED_RESPONSE", envDefaultDev()),
 		MaxBodyBytes:              int64(envInt("PUBLIC_AI_MAX_BODY_BYTES", 16*1024)),
 		ModelTimeout:              envDuration("PUBLIC_AI_MODEL_TIMEOUT", 6*time.Second),
 		RateLimitPerIPPerMinute:   envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
@@ -155,13 +174,27 @@ func (c Config) Validate() error {
 		}
 	}
 	devLike := c.Environment == "dev" || c.Environment == "test"
-	switch {
-	case c.ModelProvider != "mock" && c.ModelProvider != "groq":
+	if !knownEnvironments[c.Environment] {
+		return fmt.Errorf("PUBLIC_AI_ENVIRONMENT is required: dev, test, staging or production (got %q)", c.Environment)
+	}
+	// Reject an unknown provider before the provider approval gates: otherwise a
+	// typo reads as a missing DPA or region instead of the real mistake.
+	if c.ModelProvider != "mock" && c.ModelProvider != "groq" {
 		return fmt.Errorf("model provider %q is not available in this build (mock or groq)", c.ModelProvider)
+	}
+	switch {
 	case c.ModelProvider == "mock" && !devLike:
 		return fmt.Errorf("the mock model provider is dev/test only (PUBLIC_AI_ENVIRONMENT=%s)", c.Environment)
 	case c.ModelProvider == "groq" && c.GroqAPIKey == "":
 		return fmt.Errorf("MODEL_PROVIDER=groq needs GROQ_API_KEY in the server environment")
+	case c.ModelProvider != "mock" && !devLike && c.ProviderApprovalRef == "":
+		return fmt.Errorf("a remote model provider outside dev/test needs PUBLIC_AI_PROVIDER_APPROVAL_REF (DPA/transfer approval, SEC-P0-06)")
+	case c.ModelProvider != "mock" && !devLike && (c.ProviderRegion == "" || !contains(c.ApprovedRegions, c.ProviderRegion)):
+		return fmt.Errorf("PUBLIC_AI_REGION %q is not in PUBLIC_AI_APPROVED_REGIONS: no provider request without an approved region (SEC-P0-06)", c.ProviderRegion)
+	case !devLike && c.PolicyDigest == "":
+		return fmt.Errorf("PUBLIC_AI_POLICY_DIGEST is required outside dev/test: the service runs only the approved policy (Doc 06 A08)")
+	case !devLike && len(c.AllowedHosts) == 0:
+		return fmt.Errorf("PUBLIC_AI_ALLOWED_HOSTS is required outside dev/test: requests for any other Host are refused (Doc 06 A11)")
 	case !contains(c.AllowedModelIDs, c.ModelID):
 		return fmt.Errorf("model id %q is not allowlisted (PUBLIC_AI_ALLOWED_MODEL_IDS)", c.ModelID)
 	case c.Dataset != "public-kb" && c.Dataset != "seed" && c.Dataset != "fixtures":
@@ -172,6 +205,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("PUBLIC_AI_SEED_ON_START is dev/test only")
 	case c.StructuredResponseDev && !devLike:
 		return fmt.Errorf("PUBLIC_AI_STRUCTURED_RESPONSE is dev/test only: elsewhere set structured_response_enabled with an approval")
+	case !devLike && c.DatabaseURL == "":
+		return fmt.Errorf("PUBLIC_AI_DATABASE_URL is required outside dev/test: refusing to fall back to in-memory storage")
 	}
 	if err := validateRetention(c); err != nil {
 		return err
@@ -182,6 +217,8 @@ func (c Config) Validate() error {
 	return nil
 }
 
+var knownEnvironments = map[string]bool{"dev": true, "test": true, "staging": true, "production": true}
+
 // validateRetention: outside dev/test the retention period must come from the
 // signed policy, never from a default (Master prompt §10).
 func validateRetention(c Config) error {
@@ -191,9 +228,10 @@ func validateRetention(c Config) error {
 	return nil
 }
 
-// envDefaultDev is true when PUBLIC_AI_ENVIRONMENT is dev or test (unset = dev).
+// envDefaultDev is true when PUBLIC_AI_ENVIRONMENT is dev or test; unset is
+// not dev, so dev-only defaults stay off.
 func envDefaultDev() bool {
-	e := env("PUBLIC_AI_ENVIRONMENT", "dev")
+	e := os.Getenv("PUBLIC_AI_ENVIRONMENT")
 	return e == "dev" || e == "test"
 }
 

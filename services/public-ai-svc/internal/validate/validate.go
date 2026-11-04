@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	claimreg "zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/model"
 )
 
@@ -22,6 +23,7 @@ var (
 	ErrUnsupportedFact  = errors.New("number not present in verified claims or evidence")
 	ErrInstructionLeak  = errors.New("output discusses instructions")
 	ErrToolInstruction  = errors.New("output contains a tool or function instruction")
+	ErrPlaceholder      = errors.New("output contains an unfilled placeholder")
 )
 
 var (
@@ -43,6 +45,22 @@ var prohibited = []string{"guarantee", "guaranteed", "fully compliant", "100%", 
 	// Master prompt §4 step 10: banned absolutes and claims of having acted.
 	"100% compliant", "24/7", "round-the-clock", "works with every", "works with all", "i've booked", "i've submitted",
 	"i have submitted", "i've created", "i have created", "i've sent", "i have sent", "i've scheduled", "i have scheduled"}
+
+// ErrFalseConfirmation: the draft confirms an action or promises a response
+// that no receiving system has confirmed (Doc 09 §11, §13; ADM-T008/T010).
+var ErrFalseConfirmation = errors.New("validate: unconfirmed action or response promise")
+
+// falseConfirmationRe matches confirmed bookings, forwarding or escalation,
+// "the team will contact you", response-time promises, case or ticket
+// numbers, and "your data was deleted".
+var falseConfirmationRe = regexp.MustCompile(`(?i)\b(?:` +
+	`(?:i|we)(?:'ve| have)? (?:booked|scheduled|forwarded|escalated|passed on|sent|created|logged|opened|submitted|deleted|erased|removed)\b|` +
+	`(?:your|the) (?:request|enquiry|inquiry|ticket|case|demo|meeting|message|details) (?:has|have) been (?:booked|scheduled|forwarded|escalated|passed on|sent|created|logged|submitted|received)|` +
+	`(?:someone|the team|a specialist|an agent|sales|support|our team) will (?:contact|call|email|reach out to|get back to|be in touch with) you|` +
+	`(?:will|should) (?:respond|reply|get back to you|hear back) within\b|within \d+ (?:minutes|hours|business days|working days|days)\b|` +
+	`(?:case|ticket|reference|ref) (?:number|no\.?|id|#)\s*(?:is\s*)?[:#]?\s*[A-Z0-9-]{4,}|` +
+	`(?:your|the) (?:personal )?data (?:has been|was|is now) (?:deleted|erased|removed|exported)` +
+	`)`)
 
 // Check validates a draft against the claims and evidence actually supplied.
 // It returns the cleaned text: model-produced URLs, emails and phone numbers
@@ -80,6 +98,9 @@ func Check(d model.Draft, claims []model.ClaimCard, evidence []model.Evidence) (
 	if markupRe.MatchString(text) {
 		return "", ErrMarkup
 	}
+	if claimreg.HasPlaceholder(text) {
+		return "", ErrPlaceholder // Doc 02 §17: never show "[price]" or "{{x}}"
+	}
 	text = emailRe.ReplaceAllString(text, "") // before URLs, or the domain part is stripped first
 	text = urlRe.ReplaceAllString(text, "")
 	text = phoneRe.ReplaceAllString(text, "")
@@ -97,6 +118,12 @@ func Check(d model.Draft, claims []model.ClaimCard, evidence []model.Evidence) (
 		if strings.Contains(lowerText, p) && !claimAllows(claims, p) {
 			return "", ErrProhibitedPhrase
 		}
+	}
+	if falseConfirmationRe.MatchString(text) {
+		// Doc 09 §11/§13: no case, booking, forwarding, contact or deletion
+		// is confirmed, and no response time promised, unless a receiving
+		// system returned it, which a public chat answer never has.
+		return "", ErrFalseConfirmation
 	}
 	for _, n := range numberRe.FindAllString(text, -1) {
 		if !strings.Contains(lowerGround, strings.ToLower(n)) {

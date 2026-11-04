@@ -6,7 +6,9 @@ package limits
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"zoiko.io/public-ai-svc/internal/config"
 	"zoiko.io/public-ai-svc/internal/contract"
@@ -142,15 +145,32 @@ func (g *Guard) clientIP(r *http.Request) net.IP {
 	return peer
 }
 
-// clientKey coarsens the client address: IPv4 as is, IPv6 to /64.
+// keySalt is random per process: bucket keys cannot be reversed to an
+// address or linked across restarts (Doc 06 §15, SEC-T046).
+var keySalt = func() []byte {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic("limits: no randomness for the key salt: " + err.Error())
+	}
+	return b
+}()
+
+// clientKey coarsens the client address (IPv4 as is, IPv6 to /64) and
+// returns a salted hash of it, never the address itself.
 func clientKey(ip net.IP) string {
 	if ip == nil {
 		return "ip:unknown"
 	}
+	addr := ""
 	if v4 := ip.To4(); v4 != nil {
-		return "ip:" + v4.String()
+		addr = v4.String()
+	} else {
+		addr = ip.Mask(net.CIDRMask(64, 128)).String()
 	}
-	return "ip6:" + ip.Mask(net.CIDRMask(64, 128)).String()
+	h := sha256.New()
+	h.Write(keySalt)
+	h.Write([]byte(addr))
+	return "ip:" + hex.EncodeToString(h.Sum(nil)[:12])
 }
 
 func tooMany(w http.ResponseWriter, r *http.Request, wait time.Duration) {
@@ -168,12 +188,14 @@ func (g *Guard) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		now := g.now()
 		if ok, wait := g.ip.allow(clientKey(g.clientIP(r)), now); !ok {
+			metrics.RateLimited("ip")
 			tooMany(w, r, wait)
 			return
 		}
 		if grant := r.Header.Get("X-Public-Chat-Session"); grant != "" {
 			sum := sha256.Sum256([]byte(grant)) // never keep the grant itself
 			if ok, wait := g.sess.allow("s:"+string(sum[:12]), now); !ok {
+				metrics.RateLimited("session")
 				tooMany(w, r, wait)
 				return
 			}
@@ -182,6 +204,7 @@ func (g *Guard) Middleware(next http.Handler) http.Handler {
 			max := int64(g.flags.Values().MaxConcurrentTurns)
 			if n := g.inFlight.Add(1); max > 0 && n > max {
 				g.inFlight.Add(-1)
+				metrics.RateLimited("inflight")
 				tooMany(w, r, time.Second)
 				return
 			}
@@ -196,21 +219,6 @@ func UsageBuckets(now time.Time) (day, month string) {
 	return "tokens:day:" + now.Format("2006-01-02"), "tokens:month:" + now.Format("2006-01")
 }
 
-// overCeiling reports whether either spend ceiling is reached. Errors fail
-// closed: if usage cannot be read, the model is not called.
-func (g *Guard) overCeiling(ctx context.Context) bool {
-	day, month := UsageBuckets(g.now().UTC())
-	d, err := g.store.Usage(ctx, day)
-	if err != nil {
-		return true
-	}
-	m, err := g.store.Usage(ctx, month)
-	if err != nil {
-		return true
-	}
-	return (g.daily > 0 && d >= g.daily) || (g.monthly > 0 && m >= g.monthly)
-}
-
 type guarded struct {
 	g    *Guard
 	next orchestrator.Answerer
@@ -221,10 +229,37 @@ type guarded struct {
 func (g *Guard) Wrap(next orchestrator.Answerer) orchestrator.Answerer { return guarded{g, next} }
 
 func (a guarded) Answer(ctx context.Context, in orchestrator.Input) orchestrator.Result {
-	if a.g.overCeiling(ctx) {
+	stage, failed := a.g.spendStage(ctx)
+	if failed || stage == orchestrator.BudgetStatic {
+		// Ceiling reached or usage unreadable: fail closed, nothing runs
+		// (Doc 06 §13 automatic throttle).
 		t := policy.TplUnavailable
 		return orchestrator.Result{Status: t.Status, IntentID: "UNKNOWN", Text: t.Text, Citations: []contract.Citation{},
-			Actions: []contract.Action{}, KnowledgeReleaseID: "none"}
+			Actions: []contract.Action{}, KnowledgeReleaseID: "none", Reason: contract.ReasonKillSwitch}
 	}
+	in.Budget = orchestrator.TighterBudget(in.Budget, stage)
 	return a.next.Answer(ctx, in)
+}
+
+// spendStage is the staged throttle on the daily and monthly ceilings
+// (Doc 06 §13): at 80 % answers are shorter with no repair, at 100 % only
+// static approved content is served. failed: usage could not be read.
+func (g *Guard) spendStage(ctx context.Context) (stage string, failed bool) {
+	day, month := UsageBuckets(g.now().UTC())
+	d, err := g.store.Usage(ctx, day)
+	if err != nil {
+		return "", true
+	}
+	m, err := g.store.Usage(ctx, month)
+	if err != nil {
+		return "", true
+	}
+	at := func(used, limit int64, num, den int64) bool { return limit > 0 && used*den >= limit*num }
+	switch {
+	case at(d, g.daily, 1, 1) || at(m, g.monthly, 1, 1):
+		return orchestrator.BudgetStatic, false
+	case at(d, g.daily, 4, 5) || at(m, g.monthly, 4, 5):
+		return orchestrator.BudgetReduced, false
+	}
+	return "", false
 }

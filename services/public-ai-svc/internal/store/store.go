@@ -7,12 +7,15 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"time"
 )
 
 var (
 	ErrNotFound            = errors.New("not found")
+	ErrAuditIncomplete     = errors.New("a control action needs an actor and an approval reference")
 	ErrTurnConflict        = errors.New("a turn is already in progress for this session")
 	ErrIdempotencyMismatch = errors.New("idempotency key reused with a different request")
 )
@@ -28,6 +31,14 @@ type Session struct {
 	MarketCode  string
 	PageContext string
 	DeletedAt   *time.Time
+	// LastSeenAt is the last completed turn (CreatedAt until one completes):
+	// idle expiry runs from it (Doc 06 §17). TokensUsed is the session's
+	// running total for the per-session cap (Doc 06 §13). Origin is the
+	// site origin that created the session; its grant works only there
+	// (Doc 05 §08). Counts and an origin only, never content.
+	LastSeenAt time.Time
+	TokensUsed int64
+	Origin     string
 	// PendingContext is the JSON carry-over after a clarifying question:
 	// intent and slots only, never visitor text.
 	PendingContext []byte
@@ -85,6 +96,10 @@ type Conflict struct {
 	Severity        string
 	ResolutionState string
 	DetectedAt      time.Time
+	// Doc 03 §16 minimum record: whether the claim is blocked until the case
+	// is resolved, and the accountable owner (migration 005).
+	BlockedClaim  bool
+	AssignedOwner string
 }
 
 // Flag is one feature flag / kill-switch value.
@@ -94,6 +109,35 @@ type Flag struct {
 	ActorRef    string
 	ApprovalRef string
 	UpdatedAt   time.Time
+	// Environment is recorded with the change in the control audit.
+	Environment string
+}
+
+// AuditEntry is one operator control action (Doc 06 §21, Doc 09 §05/§22):
+// flag and kill-switch changes, promotion and rollback, revocation and
+// dead-letter replay, with actor, approval, reason and before/after hashes.
+// The ledger is append-only (migration 004 rejects UPDATE and DELETE).
+type AuditEntry struct {
+	AuditID     int64
+	Action      string
+	Target      string
+	Actor       string
+	Approval    string
+	Reason      string
+	BeforeHash  string
+	AfterHash   string
+	Environment string
+	At          time.Time
+}
+
+// Hash is the before/after fingerprint recorded in the control audit: the
+// value itself is never stored there.
+func Hash(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // OutboxEvent is a serialized event awaiting publication.
@@ -122,6 +166,9 @@ type Store interface {
 	DeleteSession(ctx context.Context, sessionID string, at time.Time) error
 	// SetPendingContext replaces (nil clears) the session's carry-over.
 	SetPendingContext(ctx context.Context, sessionID string, data []byte) error
+	// SetSessionMarket keeps the market the visitor named for the rest of
+	// the session (Doc 02 §10). It is never inferred from the IP address.
+	SetSessionMarket(ctx context.Context, sessionID, market string) error
 
 	// BeginTurn atomically either replays a completed turn with the same
 	// (session, client_turn_id) and request hash, rejects a mismatched
@@ -155,6 +202,12 @@ type Store interface {
 	RecordConflict(ctx context.Context, c Conflict) error
 
 	SetFlag(ctx context.Context, f Flag, events []OutboxEvent) error
+	// Conflicts lists recorded conflict cases, oldest first.
+	Conflicts(ctx context.Context) ([]Conflict, error)
+	// AppendAudit records a control action; it fails if actor or approval
+	// is missing. ListAudit returns the newest entries first.
+	AppendAudit(ctx context.Context, e AuditEntry) error
+	ListAudit(ctx context.Context, limit int) ([]AuditEntry, error)
 	Flags(ctx context.Context) ([]Flag, error)
 
 	Usage(ctx context.Context, bucket string) (int64, error)

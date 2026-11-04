@@ -64,6 +64,8 @@ type IngestConfig struct {
 	// (Doc 03 §05). Unmapped or inconsistent entries block publication.
 	Crosswalk []CrosswalkEntry `json:"capability_crosswalk,omitempty"`
 	Synthetic bool             `json:"synthetic,omitempty"`
+	// CompatiblePolicyVersions is copied into the signed manifest (OPR-004).
+	CompatiblePolicyVersions []string `json:"compatible_policy_versions,omitempty"`
 }
 
 // CrosswalkEntry is one module in the capability crosswalk.
@@ -119,9 +121,12 @@ var liveStatusMarkers = regexp.MustCompile(`(?i)\b\d+\s*/\s*\d+\s+(?:services?|t
 const ApprovalDraft = "DRAFT_PENDING_REVIEW"
 
 // IngestOptions adjust the pipeline. AllowDraft admits DRAFT_PENDING_REVIEW
-// sources (marked Draft) and is for local/dev only.
+// sources (marked Draft) and is for local/dev only. AllowSynthetic admits a
+// release whose config, sources, routes or crosswalk are synthetic: local/dev
+// only.
 type IngestOptions struct {
-	AllowDraft bool
+	AllowDraft     bool
+	AllowSynthetic bool
 }
 
 // publicLicences may be published and indexed (KB-017).
@@ -202,13 +207,15 @@ func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now ti
 		ReleaseID: releaseID, Kind: KindKB, IndexSchemaVersion: SchemaVersion, CreatedAt: now.UTC(),
 		ApprovedBy: cfg.ApprovedBy, EvalRunID: cfg.EvalRunID, ChunkPolicy: fmt.Sprintf("section-boundaries; tokens<=%d overlap=%d min=%d; tokenizer=estimate(%.2f words/token)", chunkMaxTokens, chunkOverlapTokens, chunkMinTokens, wordsPerToken),
 		RedactionPolicy: "public-only-v1", AllowedHosts: cfg.AllowedHosts, Routes: validRoutes(cfg),
-		Sources: []Source{}, Chunks: []Chunk{}, Synonyms: cfg.Synonyms,
+		Sources: []Source{}, Chunks: []Chunk{}, Synonyms: screenSynonyms(cfg.Synonyms), Synthetic: cfg.Synthetic,
+		CompatiblePolicyVersions: cfg.CompatiblePolicyVersions,
 	}
 	caps := map[string]bool{}
 	for _, c := range cfg.CapabilityIDs {
 		caps[c] = true
 	}
 	seenHash := map[string]string{}
+	stagedAt := map[string]int{} // source_version_id -> its report index
 	var reports []Report
 	for _, in := range inputs {
 		src, body := in.sf.Source, in.sf.Body
@@ -221,6 +228,10 @@ func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now ti
 				state, reason = StateQuarantineSchema, "content_sha256 does not match body"
 			} else if other, dup := seenHash[h]; dup {
 				state, reason = StateReviewConflict, "duplicate content of "+other
+			} else if _, again := stagedAt[src.SourceVersionID]; again {
+				// KB-020: one version is published once; a second delivery
+				// with other content is a conflict for review.
+				state, reason = StateReviewConflict, "version "+src.SourceVersionID+" already published"
 			} else {
 				seenHash[h] = src.SourceID
 				src.ContentSHA256 = h
@@ -231,13 +242,55 @@ func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now ti
 				} else {
 					m.Sources = append(m.Sources, src)
 					m.Chunks = append(m.Chunks, chunks...)
+					stagedAt[src.SourceVersionID] = len(reports)
 				}
 			}
 		}
 		rep.State, rep.Reason = state, reason
 		reports = append(reports, rep)
 	}
-	return m, reports
+	return withoutOverlaps(m, reports, stagedAt), reports
+}
+
+// withoutOverlaps removes versions of one source whose validity windows
+// overlap: two versions true at once are a conflict for review, not two
+// truths (KB-023). Back-to-back versions (one ends as the next starts)
+// both stay.
+func withoutOverlaps(m Manifest, reports []Report, stagedAt map[string]int) Manifest {
+	bySource := map[string][]Source{}
+	for _, s := range m.Sources {
+		bySource[s.SourceID] = append(bySource[s.SourceID], s)
+	}
+	drop := map[string]bool{}
+	for _, vs := range bySource {
+		for i := range vs {
+			for j := i + 1; j < len(vs); j++ {
+				a, b := vs[i], vs[j]
+				if a.EffectiveFrom.Before(validUntil(b)) && b.EffectiveFrom.Before(validUntil(a)) {
+					drop[a.SourceVersionID], drop[b.SourceVersionID] = true, true
+				}
+			}
+		}
+	}
+	if len(drop) == 0 {
+		return m
+	}
+	sources, chunks := []Source{}, []Chunk{}
+	for _, s := range m.Sources {
+		if drop[s.SourceVersionID] {
+			reports[stagedAt[s.SourceVersionID]].State = StateReviewConflict
+			reports[stagedAt[s.SourceVersionID]].Reason = "validity window overlaps another version of " + s.SourceID
+			continue
+		}
+		sources = append(sources, s)
+	}
+	for _, c := range m.Chunks {
+		if !drop[c.SourceVersionID] {
+			chunks = append(chunks, c)
+		}
+	}
+	m.Sources, m.Chunks = sources, chunks
+	return m
 }
 
 // check runs REGISTER → ACQUIRE → SENSITIVE SCAN → TAXONOMY MAP → REVIEW →
@@ -305,13 +358,56 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 	if !draft && s.AuthorityTier == "P1" && len(s.ApproverIDs) < 2 {
 		return StateHoldApproval, "P1 sources need two approvers"
 	}
-	if !draft && (s.AuthorityTier == "P1" || highImpactSubjects[s.SubjectType]) && s.ReviewDueAt != nil && s.ReviewDueAt.Before(now) {
-		return StateHoldApproval, "high-impact review overdue"
+	if !draft && (s.AuthorityTier == "P1" || highImpactSubjects[s.SubjectType]) && (s.ReviewDueAt == nil || s.ReviewDueAt.Before(now)) {
+		// KB-028: high-impact content needs a review deadline, and is held
+		// once it passes.
+		return StateHoldApproval, "high-impact review missing or overdue"
 	}
-	if hiddenContent.MatchString(body) || policy.LooksLikeInjection(body) {
-		return StateQuarantineIndex, "hidden content or instruction injection"
+	// KB-012: an instruction in the title or a heading counts as much as one
+	// in the body; keyword stuffing that games retrieval is quarantined too.
+	if hiddenContent.MatchString(body) || policy.LooksLikeInjection(s.Title+"\n"+body) || keywordStuffed(body) {
+		return StateQuarantineIndex, "hidden content, instruction injection or keyword stuffing"
 	}
 	return StateStaged, ""
+}
+
+// screenSynonyms drops any synonym entry that carries an instruction: they
+// are query expansions, so a smuggled instruction must never reach the
+// release (KB-012).
+func screenSynonyms(in map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for k, vs := range in {
+		ok := !policy.LooksLikeInjection(k)
+		for _, v := range vs {
+			ok = ok && !policy.LooksLikeInjection(v)
+		}
+		if ok {
+			out[k] = vs
+		}
+	}
+	return out
+}
+
+// keywordStuffed reports text dominated by one repeated word (at least 20
+// repeats making up a fifth of 40+ words): written to rank, not to read.
+func keywordStuffed(text string) bool {
+	words := strings.Fields(strings.ToLower(text))
+	if len(words) < 40 {
+		return false
+	}
+	counts := map[string]int{}
+	for _, w := range words {
+		w = strings.Trim(w, ".,;:!?\"'()")
+		if len(w) > 3 {
+			counts[w]++
+		}
+	}
+	for _, n := range counts {
+		if n >= 20 && n*5 >= len(words) {
+			return true
+		}
+	}
+	return false
 }
 
 func hostAllowed(hosts []string, h string) bool {

@@ -29,7 +29,19 @@ const (
 	// fields (outcome, followups, cta, resolved citations). Off by default
 	// so existing clients see the unchanged contract (ADR-008).
 	StructuredResponseEnabled = "structured_response_enabled"
+	// Doc 10 App. B commercial-extension gates: secure lead intake, CRM and
+	// booking sync, and third-party tracking. They exist so the decision is
+	// recorded, and stay off in R0: turning one on is refused until the
+	// receiving-service contract, consent model and approval exist (Doc 10).
+	SecureLeadIntakeEnabled   = "secure_lead_intake_enabled"
+	CRMSyncEnabled            = "crm_sync_enabled"
+	BookingSyncEnabled        = "booking_sync_enabled"
+	ThirdPartyTrackingEnabled = "third_party_tracking_enabled"
 )
+
+// hardOff are the gates that may only be recorded as false in R0.
+var hardOff = map[string]bool{StreamEnabled: true, SecureLeadIntakeEnabled: true, CRMSyncEnabled: true,
+	BookingSyncEnabled: true, ThirdPartyTrackingEnabled: true}
 
 // Values is the effective flag set.
 type Values struct {
@@ -63,13 +75,13 @@ func apply(v *Values, name string, raw []byte) error {
 		return json.Unmarshal(raw, &v.PublicAIEnabled)
 	case ModelGenerationEnabled:
 		return json.Unmarshal(raw, &v.ModelGenerationEnabled)
-	case StreamEnabled:
+	case StreamEnabled, SecureLeadIntakeEnabled, CRMSyncEnabled, BookingSyncEnabled, ThirdPartyTrackingEnabled:
 		var b bool
 		if err := json.Unmarshal(raw, &b); err != nil {
 			return err
 		}
-		if b {
-			return fmt.Errorf("stream_enabled cannot be turned on in R0")
+		if b && hardOff[name] {
+			return fmt.Errorf("%s cannot be turned on in R0", name)
 		}
 		return nil
 	case PricingClaimsEnabled:
@@ -129,7 +141,7 @@ func Set(ctx context.Context, st store.Store, name string, value []byte, actor, 
 	if err != nil {
 		return err
 	}
-	return st.SetFlag(ctx, store.Flag{Name: name, Value: compact.Bytes(), ActorRef: actor, ApprovalRef: approval, UpdatedAt: now}, []store.OutboxEvent{ev})
+	return st.SetFlag(ctx, store.Flag{Name: name, Value: compact.Bytes(), ActorRef: actor, ApprovalRef: approval, UpdatedAt: now, Environment: environment}, []store.OutboxEvent{ev})
 }
 
 // Loader caches the effective values and refreshes them.

@@ -52,6 +52,9 @@ var detectors = []detector{
 type Redaction struct {
 	Text  string   // message with every detected value replaced
 	Kinds []string // distinct kinds found, sorted
+	// Contacts: emails or phone numbers were masked (Doc 10 §21). They are
+	// not secrets, so the question is still answered, without them.
+	Contacts bool
 }
 
 // Found reports whether any sensitive value was detected.
@@ -61,7 +64,9 @@ func (r Redaction) Found() bool { return len(r.Kinds) > 0 }
 // message that may be passed on (to a model, never to logs).
 func Redact(msg string) Redaction {
 	kinds := map[string]bool{}
-	out := msg
+	// Every detector reads the folded text, so fullwidth digits, zero-width
+	// characters or look-alike letters cannot hide a value (SEC-T016).
+	out := SafetyFold(msg)
 	for _, d := range detectors {
 		out = d.re.ReplaceAllStringFunc(out, func(m string) string {
 			if d.check != nil && !d.check(m) {
@@ -71,7 +76,8 @@ func Redact(msg string) Redaction {
 			return "[REDACTED:" + d.kind + "]"
 		})
 	}
-	r := Redaction{Text: out}
+	out, contacts := maskContacts(out)
+	r := Redaction{Text: out, Contacts: contacts}
 	for k := range kinds {
 		r.Kinds = append(r.Kinds, k)
 	}

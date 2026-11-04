@@ -16,7 +16,7 @@ func TestIdleExpiry(t *testing.T) {
 	clock := time.Now().UTC()
 	s := New(st, time.Hour).WithIdleTTL(10 * time.Minute)
 	s.now = func() time.Time { return clock }
-	issued, err := s.Create(ctx, "idle-test-key-01", []byte("h"), "en-US", "", "")
+	issued, err := s.Create(ctx, "idle-test-key-01", []byte("h"), "en-US", "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

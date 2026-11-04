@@ -1,88 +1,188 @@
 {
-  "allowed_hosts": [
-    "pending-review.invalid"
-  ],
-  "capability_ids": [],
-  "approved_by": [
-    "approver-a",
-    "approver-b"
-  ],
-  "eval_run_id": "eval-public-kb-0",
-  "routes": [],
-  "synonyms": {
-    "ar": [
-      "accounts",
-      "receivable"
-    ],
-    "ap": [
-      "accounts",
-      "payable"
-    ],
-    "gl": [
-      "general",
-      "ledger"
-    ],
-    "vat": [
-      "indirect",
-      "tax"
-    ],
-    "gst": [
-      "indirect",
-      "tax"
-    ],
-    "siem": [
-      "security",
-      "information",
-      "event"
-    ],
-    "hris": [
-      "human",
-      "resources",
-      "integrations"
-    ],
-    "esignature": [
-      "electronic",
-      "signature",
-      "integrations"
-    ],
-    "mtls": [
-      "mutual",
-      "tls",
-      "certificates"
-    ],
-    "delegation": [
-      "delegated",
-      "authority"
-    ],
-    "resolutions": [
-      "board",
-      "legal"
-    ],
-    "requisition": [
-      "purchase",
-      "request"
-    ],
-    "order": [
-      "purchase",
-      "request"
-    ],
-    "connectors": [
-      "integrations"
-    ],
-    "banking": [
-      "integrations",
-      "connectors"
-    ],
-    "hr": [
-      "human",
-      "resources"
-    ],
-    "admissible": [
-      "admissibility"
-    ],
-    "logs": [
-      "evidence",
-      "records"
-    ]
-  }
+    "allowed_hosts":  [
+                          "pending-review.invalid"
+                      ],
+    "capability_ids":  [
+
+                       ],
+    "approved_by":  [
+                        "approver-a",
+                        "approver-b"
+                    ],
+    "eval_run_id":  "eval-public-kb-0",
+    "routes":  [
+                   {
+                       "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL",
+                       "url":  "https://example.invalid/pricing",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "route_key":  "pricing",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "locale":  "en-US",
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "synthetic":  true
+                   },
+                   {
+                       "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL",
+                       "url":  "https://example.invalid/demo",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "route_key":  "demo",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "locale":  "en-US",
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "synthetic":  true
+                   },
+                   {
+                       "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL",
+                       "url":  "https://example.invalid/support",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "route_key":  "support",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "locale":  "en-US",
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "synthetic":  true
+                   },
+                   {
+                       "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL",
+                       "url":  "https://example.invalid/core-modules",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "route_key":  "core_modules",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "locale":  "en-US",
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "synthetic":  true
+                   },
+                   {
+                       "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL",
+                       "url":  "https://example.invalid/trust-center",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "route_key":  "trust",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "locale":  "en-US",
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "synthetic":  true
+                   },
+                   {
+                       "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL",
+                       "url":  "https://example.invalid/platform-overview",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "route_key":  "platform-overview",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "locale":  "en-US",
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "synthetic":  true
+                   },
+                   {
+                       "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL",
+                       "url":  "https://example.invalid/sign-in",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "route_key":  "sign-in",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "locale":  "en-US",
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "synthetic":  true
+                   },
+                   {
+                       "url":  "https://example.invalid/trial",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "route_key":  "signup_or_trial",
+                       "requires_claim":  "TRIAL",
+                       "locale":  "en-US",
+                       "synthetic":  true,
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL"
+                   }
+               ],
+    "synonyms":  {
+                     "ar":  [
+                                "accounts",
+                                "receivable"
+                            ],
+                     "ap":  [
+                                "accounts",
+                                "payable"
+                            ],
+                     "gl":  [
+                                "general",
+                                "ledger"
+                            ],
+                     "vat":  [
+                                 "indirect",
+                                 "tax"
+                             ],
+                     "gst":  [
+                                 "indirect",
+                                 "tax"
+                             ],
+                     "siem":  [
+                                  "security",
+                                  "information",
+                                  "event"
+                              ],
+                     "hris":  [
+                                  "human",
+                                  "resources",
+                                  "integrations"
+                              ],
+                     "esignature":  [
+                                        "electronic",
+                                        "signature",
+                                        "integrations"
+                                    ],
+                     "mtls":  [
+                                  "mutual",
+                                  "tls",
+                                  "certificates"
+                              ],
+                     "delegation":  [
+                                        "delegated",
+                                        "authority"
+                                    ],
+                     "resolutions":  [
+                                         "board",
+                                         "legal"
+                                     ],
+                     "requisition":  [
+                                         "purchase",
+                                         "request"
+                                     ],
+                     "order":  [
+                                   "purchase",
+                                   "request"
+                               ],
+                     "connectors":  [
+                                        "integrations"
+                                    ],
+                     "banking":  [
+                                     "integrations",
+                                     "connectors"
+                                 ],
+                     "hr":  [
+                                "human",
+                                "resources"
+                            ],
+                     "admissible":  [
+                                        "admissibility"
+                                    ],
+                     "logs":  [
+                                  "evidence",
+                                  "records"
+                              ]
+                 }
 }

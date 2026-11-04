@@ -46,7 +46,7 @@ approved for production.** Status values: **Built**, **Partial**, **Blocked** (n
 | Prompt layers L0–L5; evidence wrapped as non-instructional data | Built | `model.BuildPrompt`; escaping test |
 | Response envelope / answer classes | Deviation | Doc 05 envelope is master; Doc 02 answer classes mapped (ADR-005) |
 | Tone: no superlatives/guarantees without a scoped source | Built | Prohibited-phrase validator |
-| Templates T01–T30, no unresolved placeholders | Partial | Exception, route-only, welcome, comparison, abstain/clarify templates; wording is a dev draft pending Legal/Product |
+| Templates T01–T30, no unresolved placeholders | Partial | Exception, route-only, welcome, comparison, abstain/clarify templates; wording is a dev draft pending Legal/Product. A claim worded with a blank (`[price]`, `[N]`, `{{x}}`) is incomplete and abstains to the pricing page, and the validator rejects any blank (`claims.TestResolveRejectsIncompleteHighImpactClaims`, `validate.TestUnfilledPlaceholdersRejected`) |
 | Escalation matrix: verified route IDs only | Built | Routes only from the signed registry; unknown routes hidden |
 | Microcopy, page chips | Partial | Microcopy built; page-aware chips not used in the console (no public pages) |
 | i18n en-US, no currency conversion, no inferred jurisdiction | Built | Locale filter; market only from the visitor |
@@ -108,7 +108,7 @@ approved for production.** Status values: **Built**, **Partial**, **Blocked** (n
 | **AsyncAPI 3.0 channel document** | Built | `api/asyncapi.yaml` |
 | No arbitrary inbound webhooks in v1 | Built | None exist |
 | Retention / deletion contract | Built (dev default) | DELETE wipes session context and turns; **purge of expired sessions** every 10 min, `PUBLIC_AI_RETENTION` 24 h pending DEC-06 |
-| Contract tests CT-001–052 | Partial | Mapped 1:1 in `contract-test-map.md`: 45 covered, 3 partial, 3 N/A in R0, 1 gap (CT-042) |
+| Contract tests CT-001–052 | Partial | Mapped 1:1 in `contract-test-map.md`: 47 covered, 2 partial, 3 N/A in R0, no gaps |
 | Gates G0–G5 | Blocked | All PENDING |
 
 ## What still blocks production (cannot be solved in code)

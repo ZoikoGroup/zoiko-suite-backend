@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -92,18 +93,23 @@ func (g Gateway) Generate(ctx context.Context, req Request) (Draft, error) {
 	defer span.End()
 	span.SetAttributes(attribute.String("gen_ai.operation.name", "chat"), attribute.String("gen_ai.request.model", g.ModelID))
 	d, err := g.generate(ctx, req)
+	result := "ok"
 	switch {
 	case err == nil:
 		span.SetAttributes(attribute.Int("gen_ai.usage.input_tokens", d.InputTokens), attribute.Int("gen_ai.usage.output_tokens", d.OutputTokens))
 	case errors.Is(err, ErrCircuitOpen):
-		telemetry.Fail(span, "circuit_open")
+		result = "circuit_open"
 	case errors.Is(err, context.DeadlineExceeded):
-		telemetry.Fail(span, "timeout")
+		result = "timeout"
 	case errors.Is(err, ErrTransient):
-		telemetry.Fail(span, "transient")
+		result = "transient"
 	default:
-		telemetry.Fail(span, "provider")
+		result = "provider"
 	}
+	if err != nil {
+		telemetry.Fail(span, result)
+	}
+	metrics.ObserveModel(result, d.InputTokens, d.OutputTokens)
 	return d, err
 }
 

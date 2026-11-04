@@ -1,0 +1,25 @@
+# Suivo public assistant (public-ai-svc): changes to policy, prompts, claims
+# and security boundaries need review by their accountable owners (Doc 06 §08,
+# Doc 11 §08 RACI).
+#
+# PENDING (Doc 11 H23): no reviewer handles have been named yet. Replace each
+# placeholder below with the real GitHub team, then uncomment the line. Until
+# then these paths have no required reviewer.
+#
+# Policy, templates and classification rules       -> Security Lead + AI Product Owner
+# /services/public-ai-svc/internal/policy/          @<security-team> @<ai-product-team>
+# Model prompt and output validation               -> AI / RAG Lead
+# /services/public-ai-svc/internal/model/           @<ai-rag-team>
+# /services/public-ai-svc/internal/validate/        @<ai-rag-team>
+# Commercial claims                                 -> Commercial Owner
+# /services/public-ai-svc/data/public-kb/claims.json @<commercial-team>
+# Knowledge releases and signing                    -> Knowledge Owner
+# /services/public-ai-svc/internal/release/         @<knowledge-team>
+# /services/public-ai-svc/internal/signing/         @<knowledge-team> @<security-team>
+# Config gates, limits and API contract             -> Security Lead + Backend Lead
+# /services/public-ai-svc/internal/config/          @<security-team>
+# /services/public-ai-svc/internal/limits/          @<security-team>
+# /services/public-ai-svc/api/                      @<backend-team>
+# Migrations and deployment                         -> SRE Lead
+# /services/public-ai-svc/deployments/migrations/   @<sre-team>
+# /deployments/*public-ai*                          @<sre-team>

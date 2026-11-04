@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
@@ -29,9 +28,18 @@ type Case struct {
 	Partition       string   `json:"partition"`
 	Priority        string   `json:"priority"`
 	RequirementRefs []string `json:"requirement_refs"`
-	Input           struct {
-		Message string `json:"message"`
-		Market  string `json:"market"`
+	// Setup pins what the case runs against (Doc 07 App. A).
+	Setup struct {
+		Locale             string `json:"locale"`
+		PageContext        string `json:"page_context"`
+		KnowledgeReleaseID string `json:"knowledge_release_id"`
+	} `json:"setup"`
+	Input struct {
+		// Before are earlier turns of the same conversation, sent first
+		// (Doc 07 App. A multi-turn cases); only the last turn is graded.
+		Before  []string `json:"before,omitempty"`
+		Message string   `json:"message"`
+		Market  string   `json:"market"`
 	} `json:"input"`
 	Assert struct {
 		Outcome           string   `json:"application_outcome"`
@@ -56,19 +64,33 @@ type CaseResult struct {
 	Status    string   `json:"status"`
 	IntentID  string   `json:"intent_id"`
 	Failures  []string `json:"failures,omitempty"`
+	// Runs, Flaky: P0 cases run at least three times; any failing run fails
+	// the case and mixed results mark it flaky (Doc 07 §07).
+	Runs            int      `json:"runs"`
+	Flaky           bool     `json:"flaky,omitempty"`
+	ResultSHA256    string   `json:"result_sha256"`
+	RequirementRefs []string `json:"requirement_refs,omitempty"`
+	DurationMS      int64    `json:"duration_ms"`
 }
 
 // Report is the evidence artifact for a run.
 type Report struct {
-	DatasetVersion string       `json:"dataset_version"`
-	ExecutedAt     string       `json:"executed_at"`
-	ModelProfile   string       `json:"model_profile"`
-	ReleaseID      string       `json:"knowledge_release_id"`
-	Total          int          `json:"total"`
-	Passed         int          `json:"passed"`
-	P0Failed       int          `json:"p0_failed"`
-	Verdict        string       `json:"verdict"` // PASS | BLOCK_RELEASE
-	Results        []CaseResult `json:"results"`
+	DatasetVersion string `json:"dataset_version"`
+	ExecutedAt     string `json:"executed_at"`
+	ModelProfile   string `json:"model_profile"`
+	ReleaseID      string `json:"knowledge_release_id"`
+	Total          int    `json:"total"`
+	Passed         int    `json:"passed"`
+	P0Failed       int    `json:"p0_failed"`
+	Flaky          int    `json:"flaky"`
+	Verdict        string `json:"verdict"` // PASS | NO_GO | BLOCK_RELEASE
+	GitSHA         string `json:"git_sha,omitempty"`
+	// Partitions, Intents, Waivers and Regressions: Doc 07 §09-§11, App. B.
+	Partitions  map[string]PartitionSummary `json:"partitions"`
+	Intents     IntentMetrics               `json:"intents"`
+	Waivers     map[string]string           `json:"waivers,omitempty"`
+	Regressions []string                    `json:"regressions,omitempty"`
+	Results     []CaseResult                `json:"results"`
 }
 
 // Load reads a dataset file.
@@ -86,25 +108,10 @@ func Load(path string) (Dataset, error) {
 	return d, nil
 }
 
-// Run grades every case.
+// Run grades every case once (P0 cases three times) with the given model
+// profile; RunWith takes the full options.
 func Run(ctx context.Context, a orchestrator.Answerer, d Dataset, modelProfile string) Report {
-	rep := Report{DatasetVersion: d.DatasetVersion, ExecutedAt: time.Now().UTC().Format(time.RFC3339), ModelProfile: modelProfile, Verdict: "PASS"}
-	for _, c := range d.Cases {
-		r := a.Answer(ctx, orchestrator.Input{RequestID: "eval-" + c.ID, Message: c.Input.Message, MarketCode: c.Input.Market, Locale: "en-US"})
-		if rep.ReleaseID == "" {
-			rep.ReleaseID = r.KnowledgeReleaseID
-		}
-		cr := grade(c, r)
-		rep.Total++
-		if cr.Pass {
-			rep.Passed++
-		} else if c.Priority == "P0" {
-			rep.P0Failed++
-			rep.Verdict = "BLOCK_RELEASE"
-		}
-		rep.Results = append(rep.Results, cr)
-	}
-	return rep
+	return RunWith(ctx, a, d, Options{ModelProfile: modelProfile})
 }
 
 func grade(c Case, r orchestrator.Result) CaseResult {
