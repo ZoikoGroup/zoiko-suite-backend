@@ -25,6 +25,7 @@ import (
 	"zoiko.io/contract-lifecycle-svc/internal/idempotency"
 	"zoiko.io/contract-lifecycle-svc/internal/middleware"
 	"zoiko.io/contract-lifecycle-svc/internal/mtls"
+	"zoiko.io/contract-lifecycle-svc/internal/outbox"
 	"zoiko.io/contract-lifecycle-svc/internal/store"
 	"zoiko.io/contract-lifecycle-svc/internal/telemetry"
 )
@@ -77,7 +78,15 @@ func main() {
 	}
 	governanceLogClient := governancelog.NewClient(cfg.GovernanceLogURL)
 
-	h := handler.New(pgStore, publisher, authzClient, governanceLogClient, logger)
+	h := handler.New(pgStore, authzClient, governanceLogClient, logger)
+
+	// Transactional outbox relay: delivers the events each store write
+	// committed into outbox_events, retrying until Kafka accepts them.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -122,6 +131,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down contract-lifecycle-svc gracefully...")
+	stopRelay()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
