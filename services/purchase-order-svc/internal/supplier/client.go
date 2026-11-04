@@ -21,6 +21,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/purchase-order-svc/internal/domain"
+	"zoiko.io/purchase-order-svc/internal/outbound"
 )
 
 // Eligibility is AP-01's answer.
@@ -59,10 +60,7 @@ func (c *HTTPClient) Eligibility(ctx context.Context, tenantID, principalID, leg
 	if err != nil {
 		return nil, domain.ErrSupplierServiceUnavailable
 	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-	if principalID != "" {
-		req.Header.Set("X-Principal-Id", principalID)
-	}
+	outbound.SetEnvelope(ctx, req, tenantID, principalID, legalEntityID)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("supplier-financial-profile-svc unreachable — failing closed", zap.Error(err))

@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/purchase-order-svc/internal/domain"
+	"zoiko.io/purchase-order-svc/internal/outbound"
 )
 
 // Case is the subset of procurement-workflow-svc's ProcurementCase used here.
@@ -58,10 +59,7 @@ func (c *HTTPClient) VerifyApproved(ctx context.Context, tenantID, principalID, 
 	if err != nil {
 		return nil, domain.ErrProcurementCaseServiceUnavailable
 	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-	if principalID != "" {
-		req.Header.Set("X-Principal-Id", principalID)
-	}
+	outbound.SetEnvelope(ctx, req, tenantID, principalID, legalEntityID)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("procurement-workflow-svc unreachable — failing closed", zap.Error(err))

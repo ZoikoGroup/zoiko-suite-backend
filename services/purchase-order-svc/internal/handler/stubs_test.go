@@ -656,7 +656,7 @@ func (e *env) issued(t *testing.T) domain.OrderDetail {
 	for _, step := range []struct{ cmd, who string }{{"submit", "maker"}, {"approve", "checker"}, {"issue", "buyer"}} {
 		body := any(nil)
 		if step.cmd == "approve" {
-			cur := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, ""))
+			cur := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "reader"))
 			body = domain.CommandRequest{ExpectedVersion: version(cur)}
 		}
 		rec := e.command(t, o.PurchaseOrderID, step.cmd, step.who, body)

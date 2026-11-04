@@ -133,7 +133,7 @@ func TestIssueOrder_IdempotentReplay_DoesNotRepublish(t *testing.T) {
 
 func TestGetOrder_NotFound(t *testing.T) {
 	e := newEnv()
-	if rec := e.do(http.MethodGet, "/v1/purchase-orders/does-not-exist", nil, ""); rec.Code != http.StatusNotFound {
+	if rec := e.do(http.MethodGet, "/v1/purchase-orders/does-not-exist", nil, "reader"); rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rec.Code)
 	}
 }
@@ -153,21 +153,21 @@ func TestListOrders_NoTenantScope_Refused(t *testing.T) {
 
 func TestListOrders_ForeignTenantQueryParam_Refused(t *testing.T) {
 	e := newEnv()
-	if rec := e.doAs(http.MethodGet, "/v1/purchase-orders/?tenant_id="+tenantB, nil, "", tenantA); rec.Code != http.StatusForbidden {
+	if rec := e.doAs(http.MethodGet, "/v1/purchase-orders/?tenant_id="+tenantB, nil, "reader", tenantA); rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 listing another tenant's register, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
 func TestListOrders_OwnTenantQueryParam_Allowed(t *testing.T) {
 	e := newEnv()
-	if rec := e.doAs(http.MethodGet, "/v1/purchase-orders/?tenant_id="+tenantA, nil, "", tenantA); rec.Code != http.StatusOK {
+	if rec := e.doAs(http.MethodGet, "/v1/purchase-orders/?tenant_id="+tenantA, nil, "reader", tenantA); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 when the query param agrees with the verified scope, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
 func TestListOrders_UnknownStatusFilter_Refused(t *testing.T) {
 	e := newEnv()
-	if rec := e.do(http.MethodGet, "/v1/purchase-orders/?status=ISUSED", nil, ""); rec.Code != http.StatusBadRequest {
+	if rec := e.do(http.MethodGet, "/v1/purchase-orders/?status=ISUSED", nil, "reader"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for an unrecognised status filter, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
@@ -175,7 +175,7 @@ func TestListOrders_UnknownStatusFilter_Refused(t *testing.T) {
 func TestListOrders_AcceptsEveryNewStatus(t *testing.T) {
 	e := newEnv()
 	for _, s := range []string{"DRAFT", "PENDING_APPROVAL", "APPROVED", "ISSUED", "ON_HOLD", "CANCELLED", "CLOSED"} {
-		if rec := e.do(http.MethodGet, "/v1/purchase-orders/?status="+s, nil, ""); rec.Code != http.StatusOK {
+		if rec := e.do(http.MethodGet, "/v1/purchase-orders/?status="+s, nil, "reader"); rec.Code != http.StatusOK {
 			t.Errorf("status filter %s refused: %d", s, rec.Code)
 		}
 	}
@@ -183,7 +183,7 @@ func TestListOrders_AcceptsEveryNewStatus(t *testing.T) {
 
 func TestListOrders_MalformedLegalEntityFilter_Refused(t *testing.T) {
 	e := newEnv()
-	if rec := e.do(http.MethodGet, "/v1/purchase-orders/?legal_entity_id=not-a-uuid", nil, ""); rec.Code != http.StatusBadRequest {
+	if rec := e.do(http.MethodGet, "/v1/purchase-orders/?legal_entity_id=not-a-uuid", nil, "reader"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a malformed legal_entity_id filter, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
