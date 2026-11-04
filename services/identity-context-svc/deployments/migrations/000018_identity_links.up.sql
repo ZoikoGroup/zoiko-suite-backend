@@ -66,12 +66,12 @@ CREATE POLICY tenant_isolation_policy ON identity_merges
     USING (tenant_id = current_setting('app.tenant_id', true))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
+-- Grants are guarded on the role, as 000014 and 000019 are, so a database
+-- without create-app-roles.sh applied (CI, the store tests) still migrates.
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'identity_links') THEN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_identity_context') THEN
         GRANT SELECT, INSERT, UPDATE, DELETE ON identity_links TO app_identity_context;
-    END IF;
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'identity_merges') THEN
         GRANT SELECT, INSERT ON identity_merges TO app_identity_context;
     END IF;
 END

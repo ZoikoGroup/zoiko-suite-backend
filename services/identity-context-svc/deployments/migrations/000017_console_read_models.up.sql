@@ -70,14 +70,12 @@ CREATE POLICY tenant_isolation_policy ON principal_assurance_history
     USING (tenant_id = current_setting('app.tenant_id', true))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 
--- Guarded grants: only apply when the target table actually exists, so a
--- partially applied migration cannot leave a grant on a missing relation.
+-- Grants are guarded on the role, as 000014 and 000019 are, so a database
+-- without create-app-roles.sh applied (CI, the store tests) still migrates.
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'authentication_events') THEN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_identity_context') THEN
         GRANT SELECT ON authentication_events TO app_identity_context;
-    END IF;
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'principal_assurance_history') THEN
         GRANT SELECT ON principal_assurance_history TO app_identity_context;
     END IF;
 END
