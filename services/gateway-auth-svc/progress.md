@@ -1,6 +1,6 @@
 # gateway-auth-svc — progress and feature matrix
 
-Status: baseline green (2026-11-04, GW-0).
+Status: GW-1 complete (2026-11-04). INT-01 minimum acceptance tests implemented and passing.
 
 The ForwardAuth callout behind Traefik (:8092). No database. Every state is
 in-memory on this replica; the admin read surface states its scope.
@@ -18,7 +18,7 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 | INT01-02 | Runtime op: authenticate one request (envelope verify) | Traefik ForwardAuth → /verify | TestVerify_* (handler_test) | Verify my session tab | DONE |
 | INT01-03 | Runtime op: admission (shape + version + in-flight cap) | /verify admission stage | TestPolicy*, TestGate*, TestINT01_RequestSizeAbuse | Overview pipeline | DONE (GW-1 completes) |
 | INT01-04 | Runtime op: throttle by client and tenant, 429 + Retry-After | IPLimiter/TenantLimiter | TestLimiter*, TestRateLimitedResponseIsProblemWithRetryAfter, TestAU04_* (GW-2) | Rate limits tab | DONE (GW-2 adds login bucket) |
-| INT01-05 | Runtime op: route with a resolved version and region | version gate + GTRM headers | TestPolicyVersionAdmission_INT_NP_003, TestINT01_RouteConfigRollback, TestINT01_ResidencyDenied | Versions & policy tab | PARTIAL → GW-1 |
+| INT01-05 | Runtime op: route with a resolved version and region | version gate + GTRM headers | TestPolicyVersionAdmission_INT_NP_003, TestINT01_RouteConfigRollback, TestINT01_ResidencyDenied | Versions & policy tab | DONE (GW-1 completes) |
 | INT01-06 | Server-resolved inputs: tenant, rate limit, routing, authorization, environment | resolver + admission + GTRM headers | TestVerify_* , TestTenantQuotaAppliesAfterAuthentication | Overview | DONE |
 | INT01-07 | Five queries: decision by id, decisions by outcome/tenant, usage, rate-limit state, route version status | admin reads | admin_test suite; GW-4 adds decisions list + policy | Registers (tabs) | DONE (GW-4 adds policy read) |
 | INT01-08 | Request state machine: received → validating → admitted / denied / rate-limited → forwarded | handler pipeline | TestValidCredentialIsAdmittedAndCounted_INT_NP_002, TestEveryAuthRefusalCarriesAProblemBody | Overview pipeline | DONE |
@@ -27,15 +27,15 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 | INT01-11 | Event api_route_version_unavailable | version gate refusal | TestUnsupportedAPIVersionRefusedWithoutFallback_INT_NP_003 | Versions tab | DONE |
 | INT01-12 | Event api_abuse_threshold_exceeded | Recorder abuse detection | TestAbuseThresholdRaisesOneEventPerClientPerWindow | Overview callout | DONE |
 | INT01-13 | Idempotency: decision reads replay identically; decisions retrievable by id | admin GET decisions/{id} | TestDecisionLookupAndList | Denied tab drawer | DONE |
-| INT01-14 | Failure semantics: dependency down distinguishable from caller error | JWKS/registry/CARTA paths | TestVerify_JWKSOutageIsNotReportedAsABadToken, TestVerify_RegistryUnavailableBlocksWriteWith503, TestINT01_DownstreamTimeoutDistinguishable (GW-1) | Overview | PARTIAL → GW-1 |
-| INT01-M1 | MAT forged tenant header refused | /verify stages 1/4 | TestINT01_ForgedTenantHeader (GW-1) | Denied tab | PARTIAL → GW-1 |
-| INT01-M2 | MAT valid token, downstream denied — distinguishable | /verify 200 + backend 403 | TestGatewayAdmitsAndTheDomainRefusesWithBothDecisionsRetained_INT_NP_002, TestINT01_ValidTokenDownstreamDenied (GW-1) | Denied tab | PARTIAL → GW-1 |
-| INT01-M3 | MAT version unsupported, no fallback | version gate | TestINT01_VersionUnsupported (GW-1) | Versions tab | PARTIAL → GW-1 |
-| INT01-M4 | MAT request-size abuse refused before auth | Policy.Check | TestPolicyRequestSize_INT_NP_004, TestINT01_RequestSizeAbuse (GW-1) | Overview | PARTIAL → GW-1 |
-| INT01-M5 | MAT rate-limit race never exceeds burst | IPLimiter concurrent | TestLimiterConcurrentRequestsCannotBypassQuota_INT_NP_005, TestINT01_RateLimitRace (GW-1) | Rate limits tab | PARTIAL → GW-1 |
-| INT01-M6 | MAT route config rollback restores versions | policy reload | TestINT01_RouteConfigRollback (GW-1, new) | Versions tab | PENDING → GW-1 |
-| INT01-M7 | MAT residency mismatch denied on a material request; fail closed on unknown (write) | GOV-01 resolve + GTRM region header | TestINT01_ResidencyDenied (GW-1, new check) | Denied tab | PENDING → GW-1 |
-| INT01-M8 | MAT downstream timeout distinguishable | dependency timeouts | TestINT01_DownstreamTimeoutDistinguishable (GW-1, new) | Overview | PENDING → GW-1 |
+| INT01-14 | Failure semantics: dependency down distinguishable from caller error | JWKS/registry/CARTA paths | TestVerify_JWKSOutageIsNotReportedAsABadToken, TestVerify_RegistryUnavailableBlocksWriteWith503, TestINT01_DownstreamTimeoutDistinguishable (GW-1) | Overview | DONE (GW-1 completes) |
+| INT01-M1 | MAT forged tenant header refused | /verify stages 1/4 | TestINT01_ForgedTenantHeader (GW-1) | Denied tab | DONE (GW-1) |
+| INT01-M2 | MAT valid token, downstream denied — distinguishable | /verify 200 + backend 403 | TestGatewayAdmitsAndTheDomainRefusesWithBothDecisionsRetained_INT_NP_002, TestINT01_ValidTokenDownstreamDenied (GW-1) | Denied tab | DONE (GW-1) |
+| INT01-M3 | MAT version unsupported, no fallback | version gate | TestINT01_VersionUnsupported (GW-1) | Versions tab | DONE (GW-1) |
+| INT01-M4 | MAT request-size abuse refused before auth | Policy.Check | TestPolicyRequestSize_INT_NP_004, TestINT01_RequestSizeAbuse (GW-1) | Overview | DONE (GW-1) |
+| INT01-M5 | MAT rate-limit race never exceeds burst | IPLimiter concurrent | TestLimiterConcurrentRequestsCannotBypassQuota_INT_NP_005, TestINT01_RateLimitRace (GW-1) | Rate limits tab | DONE (GW-1) |
+| INT01-M6 | MAT route config rollback restores versions | policy reload | TestINT01_RouteConfigRollback (GW-1, new) | Versions tab | DONE (GW-1) |
+| INT01-M7 | MAT residency mismatch denied on a material request; fail closed on unknown (write) | GOV-01 resolve + GTRM region header | TestINT01_ResidencyDenied (GW-1, new check) | Denied tab | DONE (GW-1) |
+| INT01-M8 | MAT downstream timeout distinguishable | dependency timeouts | TestINT01_DownstreamTimeoutDistinguishable (GW-1, new) | Overview | DONE (GW-1) |
 | SEC8-E1 | Internet edge: DDoS/WAF/bot/abuse/TLS/request-size | GCP LB + Traefik middlewares (rate limit, buffering) | — | — | BLOCKED: platform decision S5-D1; placement documented in SPEC_DEVIATIONS |
 | SEC8-I1 | Ingress: authenticated routes, hostname/tenant resolution, header sanitation | edge strip + /verify + tenant binding | TestEdgeContract_*, TestVerify_ResolvedTenantMismatch | Trusted-header policy panel | DONE |
 | SEC8-S2 | Service-to-service mTLS, unique workload identity | :8449 listeners + internal/mtls | mtls_test suite, TestLoad_MTLS* | Versions & policy tab | DONE |
@@ -82,3 +82,40 @@ internal/handler/handler.go DomainMetrics.CartaDecision comment — all four sai
 STEP_UP_MFA is not enforced; the code (and
 TestVerify_CartaStepUpMFA_Returns401StepUpRequired +
 TestVerify_CartaStepUpMFA_Returns401AndCounted) answers 401 step_up_required.
+
+## GW-1 — INT-01 minimum acceptance tests (2026-11-04)
+
+**Implemented:** the eight INT-01 MATs as named tests in
+`internal/handler/int01_acceptance_test.go`:
+- `TestINT01_ForgedTenantHeader` (M1): caller-supplied X-Zoiko-Resolved-Tenant-Id
+  that disagrees with the signed envelope is refused 403 tenant_hostname_mismatch.
+- `TestINT01_ValidTokenDownstreamDenied` (M2): gateway admits (200, no
+  X-Auth-Denial-Reason); a backend 403 comes back verbatim without the gateway's
+  refusal headers — the two kinds of refusal stay distinguishable.
+- `TestINT01_VersionUnsupported` (M3): a URI outside SupportedAPIVersions is
+  refused 400 version_unsupported.
+- `TestINT01_RequestSizeAbuse` (M4): Content-Length above MaxBodyBytes is
+  refused 413 request_too_large before authentication.
+- `TestINT01_RateLimitRace` (M5): N concurrent goroutines spending one client
+  key never admit past the burst; every refusal is 429 with honest Retry-After.
+- `TestINT01_RouteConfigRollback` (M6): replacing the admission Policy with a
+  previous version restores the previous supported versions.
+- `TestINT01_ResidencyDenied` (M7): STRICT_REGION policy whose region disagrees
+  with X-Zoiko-Resolved-Region on a material write → 403 residency_denied; reads
+  and PREFERRED_REGION never block; unknown policy on a write fails closed; no
+  region header means no comparison.
+- `TestINT01_DownstreamTimeoutDistinguishable` (M8): three situations produce
+  three mutually distinguishable answers — registry outage (503 unresolved,
+  Retry-After), caller error (401 no_token), registry denial (403 denied).
+
+**Residency gate:** added `checkResidency` in `internal/handler/handler.go`
+after GOV-01 resolution. It reads the tenant's effective residency policy from
+the resolved context, fetches its mode and pinned region from the registry
+(cached under the same TTL), and compares against the edge-resolved region in
+X-Zoiko-Resolved-Region. Unknown policy or registry outage on a write fails
+closed (403/503). Reads are never blocked.
+
+**Telemetry:** added OutcomeResidencyDenied and OutcomeResidencyUnresolved
+counters, pre-initialised at zero in `internal/telemetry/telemetry.go`.
+
+**Suite:** 8 packages ok, 0 fail. All eight MATs pass.

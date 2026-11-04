@@ -406,6 +406,18 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ZS-SEC-001 §8 / D1-5d: residency gate. Compare the tenant's effective
+	// residency policy against the edge-resolved region (X-Zoiko-Resolved-Region
+	// from GTRM's per-tenant middleware). On a material write with a STRICT
+	// policy whose region disagrees, refuse. Unknown policy on a write fails
+	// closed. Reads are never blocked. Unconfigured tenant registry skips the
+	// gate entirely.
+	if h.tenant.Enabled() && materialWrite(originalMethod(r)) {
+		if !h.checkResidency(ctx, w, r, rc, claims, &resolved) {
+			return
+		}
+	}
+
 	w.Header().Set("X-Principal-Id", claims.Principal.PrincipalID)
 	w.Header().Set("X-Tenant-Id", claims.TenantID)
 	w.Header().Set("X-Legal-Entity-Id", claims.LegalEntityID)
@@ -586,6 +598,84 @@ func severityFor(d carta.Decision) siem.Severity {
 	}
 }
 
+// checkResidency enforces the tenant's data residency policy against the
+// edge-resolved region. Returns true if the check passed or was skipped,
+// false if the request was refused.
+func (h *Handler) checkResidency(ctx context.Context, w http.ResponseWriter, r *http.Request, rc *reqCtx, claims *envelopeClaims, resolved *tenantctx.Context) bool {
+	resolvedRegion := r.Header.Get("X-Zoiko-Resolved-Region")
+	if resolvedRegion == "" {
+		// No region header means this route hasn't been onboarded onto
+		// GTRM-resolved routing yet — no comparison is made.
+		return true
+	}
+
+	policyID := resolved.ResidencyPolicyID
+	if policyID == "" {
+		// No policy means nothing to enforce.
+		return true
+	}
+
+	residency, err := h.tenant.Residency(ctx, claims.TenantID, policyID)
+	switch {
+	case err == nil:
+		// Policy found; check mode and region.
+		if residency.Mode == "STRICT_REGION" && residency.RegionCode != "" && residency.RegionCode != resolvedRegion {
+			h.log.Warn("residency policy mismatch — refusing write",
+				zap.String("principal_id", claims.Principal.PrincipalID),
+				zap.String("tenant_id", claims.TenantID),
+				zap.String("policy_id", policyID),
+				zap.String("policy_mode", residency.Mode),
+				zap.String("policy_region", residency.RegionCode),
+				zap.String("edge_region", resolvedRegion),
+			)
+			h.metrics.TenantContext("residency_denied")
+			h.siem.Stream(ctx, claims.TenantID, "residency_denied", siem.SeverityHigh,
+				"residency policy "+policyID+" requires region "+residency.RegionCode+", edge resolved "+resolvedRegion)
+			h.refuse(w, r, rc, refusal{
+				outcome: outcomeResidencyDenied, code: "context_invalid", status: http.StatusForbidden,
+				detail: "data residency policy requires region " + residency.RegionCode,
+				severity: siem.SeverityHigh, dedicated: true,
+				headers: [][2]string{{"X-Residency-Policy-Id", policyID}, {"X-Residency-Required-Region", residency.RegionCode}},
+			})
+			return false
+		}
+		return true
+	case errors.Is(err, tenantctx.ErrResidencyUnknown):
+		// Unknown policy on a write fails closed.
+		h.log.Warn("residency policy unknown — failing write closed",
+			zap.String("principal_id", claims.Principal.PrincipalID),
+			zap.String("tenant_id", claims.TenantID),
+			zap.String("policy_id", policyID),
+		)
+		h.metrics.TenantContext("residency_unknown")
+		h.siem.Stream(ctx, claims.TenantID, "residency_denied", siem.SeverityHigh,
+			"residency policy "+policyID+" not resolvable")
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeResidencyDenied, code: "context_invalid", status: http.StatusForbidden,
+			detail: "residency policy not resolvable",
+			severity: siem.SeverityHigh, dedicated: true,
+			headers: [][2]string{{"X-Residency-Policy-Id", policyID}},
+		})
+		return false
+	default:
+		// Registry unreachable: fail closed on a write.
+		h.log.Error("residency policy lookup unavailable — failing write closed",
+			zap.String("principal_id", claims.Principal.PrincipalID),
+			zap.String("tenant_id", claims.TenantID),
+			zap.String("policy_id", policyID),
+			zap.Error(err),
+		)
+		h.metrics.TenantContext("residency_unresolved")
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeResidencyUnresolved, code: "context_invalid", status: http.StatusServiceUnavailable,
+			detail: "residency policy could not be resolved",
+			retryable: true, retryAfter: 5,
+			headers: [][2]string{{"X-Residency-Policy-Id", policyID}, {"X-Tenant-Context", "unresolved"}},
+		})
+		return false
+	}
+}
+
 // clientIP prefers the value Traefik sets over the raw socket address, which
 // would otherwise always be the gateway container's own address.
 // clientIP is the address CARTA scores. It is the RIGHTMOST X-Forwarded-For
@@ -643,6 +733,8 @@ const (
 	outcomeCartaUnavailable         = "carta_unavailable"
 	outcomeRateLimited              = "rate_limited"
 	outcomeOverloaded               = "overloaded"
+	outcomeResidencyDenied          = "residency_denied"
+	outcomeResidencyUnresolved      = "residency_unresolved"
 )
 
 // denialReasonHeader names why a request was refused, on every refusal.

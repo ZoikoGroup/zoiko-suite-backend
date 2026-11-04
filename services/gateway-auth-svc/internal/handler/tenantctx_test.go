@@ -11,6 +11,7 @@ package handler_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -21,11 +22,20 @@ import (
 // stubRegistry answers the two reads envelope.Resolver makes. Bodies mirror
 // tenant-entity-registry-svc's real Tenant and LegalEntity JSON, including the
 // lifecycle_state value ProvisionTenant actually writes.
+//
+// policyBody/regionBody add the two residency reads the gateway's residency
+// gate makes (ZS-SEC-001 §8 D1-5d): any /v1/residency-policies/{id} and
+// /v1/residency-regions/{id} path is answered with the one body, so tests need
+// no map of ids.
 type stubRegistry struct {
 	tenantBody string
 	entityBody string
 	tenantCode int
 	entityCode int
+	policyBody string
+	policyCode int
+	regionBody string
+	regionCode int
 	calls      atomic.Int32
 }
 
@@ -34,19 +44,31 @@ func (s *stubRegistry) start(t *testing.T) string {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/v1/tenants/tenant-abc":
+		switch {
+		case r.URL.Path == "/v1/tenants/tenant-abc":
 			if s.tenantCode != 0 {
 				w.WriteHeader(s.tenantCode)
 				return
 			}
 			_, _ = w.Write([]byte(s.tenantBody))
-		case "/v1/entities/entity-001":
+		case r.URL.Path == "/v1/entities/entity-001":
 			if s.entityCode != 0 {
 				w.WriteHeader(s.entityCode)
 				return
 			}
 			_, _ = w.Write([]byte(s.entityBody))
+		case strings.HasPrefix(r.URL.Path, "/v1/residency-policies/"):
+			if s.policyCode != 0 {
+				w.WriteHeader(s.policyCode)
+				return
+			}
+			_, _ = w.Write([]byte(s.policyBody))
+		case strings.HasPrefix(r.URL.Path, "/v1/residency-regions/"):
+			if s.regionCode != 0 {
+				w.WriteHeader(s.regionCode)
+				return
+			}
+			_, _ = w.Write([]byte(s.regionBody))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

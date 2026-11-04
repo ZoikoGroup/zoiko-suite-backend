@@ -174,7 +174,7 @@ func NewMetrics(serviceName string) *Metrics {
 		OutcomeTenantContextDenied, OutcomeTenantContextUnresolved,
 		OutcomeSessionRevoked, OutcomeSessionStatusUnavailable, OutcomeStepUpRequired, OutcomeCartaUnavailable,
 		OutcomeRateLimited, OutcomeOverloaded, OutcomeRequestTooLarge, OutcomeRequestEncodingRefused,
-		OutcomeMalformedRequest, OutcomeVersionUnsupported,
+		OutcomeMalformedRequest, OutcomeVersionUnsupported, OutcomeResidencyDenied, OutcomeResidencyUnresolved,
 	} {
 		m.VerifyDecisionsTotal.WithLabelValues(outcome)
 	}
@@ -245,6 +245,12 @@ const (
 	OutcomeMalformedRequest = "malformed_request"
 	// OutcomeVersionUnsupported — an API version that is not routed (INT-VERS-012).
 	OutcomeVersionUnsupported = "version_unsupported"
+	// OutcomeResidencyDenied — a STRICT_REGION residency policy whose region
+	// disagrees with the edge-resolved region, or an unknown policy on a write.
+	OutcomeResidencyDenied = "residency_denied"
+	// OutcomeResidencyUnresolved — the residency policy could not be resolved
+	// (registry unreachable) on a material write.
+	OutcomeResidencyUnresolved = "residency_unresolved"
 )
 
 // ── handler.DomainMetrics implementation ─────────────────────────────────────
