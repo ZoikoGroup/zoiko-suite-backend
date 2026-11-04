@@ -43,6 +43,7 @@ const (
 	entityID   = "22222222-2222-2222-2222-222222222222"
 	wsID       = "33333333-3333-3333-3333-333333333333"
 	hierID     = "44444444-4444-4444-4444-444444444444"
+	relID      = "77777777-7777-4777-8777-777777777777"
 	assignID   = "55555555-5555-5555-5555-555555555555"
 	policyID   = "66666666-6666-6666-6666-666666666666"
 	regionID   = "77777777-7777-7777-7777-777777777777"
@@ -326,6 +327,18 @@ func allRoutes() []route {
 		{"get approval request", http.MethodGet, "/v1/approval-requests/apr-1", "", http.StatusOK, "apr-1"},
 		{"approve request", http.MethodPost, "/v1/approval-requests/apr-1/approve", `{"payload_fingerprint":"f"}`, http.StatusOK, "apr-1"},
 		{"reject request", http.MethodPost, "/v1/approval-requests/apr-1/reject", `{"note":"no"}`, http.StatusOK, "apr-1"},
+
+		// ── ORG-04 §4.4 ──────────────────────────────────────────────────────
+		{"propose ownership relationship", http.MethodPost, "/v1/ownership-relationships", `{"parent_legal_entity_id":"p"}`, http.StatusCreated, ""},
+		{"get ownership relationship", http.MethodGet, "/v1/ownership-relationships/" + relID, "", http.StatusOK, relID},
+		{"approve ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/approval", `{"expected_version":1}`, http.StatusOK, relID},
+		{"reject ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/rejection", `{"expected_version":1}`, http.StatusOK, relID},
+		{"supersede ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/supersession", `{"expected_version":2}`, http.StatusCreated, relID},
+		{"end ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/end", `{"expected_version":2}`, http.StatusOK, relID},
+		{"ownership graph", http.MethodGet, "/v1/ownership-graph?as_of=2026-03-31", "", http.StatusOK, ""},
+		{"entity group as-of", http.MethodGet, "/v1/entities/" + entityID + "/group?as_of=2026-03-31", "", http.StatusOK, entityID},
+		{"list entity parents", http.MethodGet, "/v1/entities/" + entityID + "/parents", "", http.StatusOK, entityID},
+		{"explain control chain", http.MethodGet, "/v1/entities/" + entityID + "/control-chain?as_of=2026-03-31", "", http.StatusOK, entityID},
 	}
 }
 

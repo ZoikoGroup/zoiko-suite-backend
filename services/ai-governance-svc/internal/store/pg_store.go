@@ -62,7 +62,7 @@ type Store interface {
 	ListUseCases(ctx context.Context) ([]domain.AIUseCase, error)
 	CreateExecution(ctx context.Context, req domain.CreateExecutionRequest, idempotencyKey, requestSHA256 string) (*domain.AIExecution, bool, error)
 	GetExecution(ctx context.Context, executionID string) (*domain.AIExecution, error)
-	CreateAIIncident(ctx context.Context, req domain.CreateAIIncidentRequest, idempotencyKey, requestSHA256 string) (*domain.AIIncident, bool, error)
+	CreateAIIncident(ctx context.Context, req domain.CreateAIIncidentRequest, idempotencyKey, requestSHA256 string) (*domain.LegacyAIIncident, bool, error)
 	CreateOutputDisposition(ctx context.Context, req domain.CreateOutputDispositionRequest, idempotencyKey, requestSHA256 string) (*domain.AIOutputDisposition, bool, error)
 	DecideOutputDisposition(ctx context.Context, dispositionID string, req domain.DecideOutputDispositionRequest) (*domain.AIOutputDisposition, error)
 	GetOutputDisposition(ctx context.Context, dispositionID string) (*domain.AIOutputDisposition, error)
@@ -81,6 +81,22 @@ type Store interface {
 	QuarantineRelease(ctx context.Context, modelReleaseID string, req domain.AdvanceReleaseRequest, actor string) (*domain.AIModelRelease, error)
 	RetireRelease(ctx context.Context, modelReleaseID string, req domain.AdvanceReleaseRequest, actor string) (*domain.AIModelRelease, error)
 	ListModelReleases(ctx context.Context) ([]domain.AIModelRelease, error)
+
+	// AIG-04: Human Oversight, Output Disposition & Decision Boundary.
+	CreateDisposition(ctx context.Context, req domain.CreateDispositionRequest, actor string) (*domain.OutputDisposition, error)
+	GetDisposition(ctx context.Context, dispositionID string) (*domain.OutputDisposition, error)
+	DecideDisposition(ctx context.Context, dispositionID string, req domain.DecideDispositionRequest, reviewer string) (*domain.OutputDisposition, error)
+	SupersedeDisposition(ctx context.Context, dispositionID string, req domain.SupersedeDispositionRequest, actor string) (*domain.OutputDisposition, error)
+
+	// AIG-05: Evaluation, Incident & Governance.
+	CreateEvaluation(ctx context.Context, req domain.CreateEvaluationRequest, actor string) (*domain.AIEvaluation, error)
+	GetEvaluation(ctx context.Context, evaluationID string) (*domain.AIEvaluation, error)
+	ReportIncident(ctx context.Context, req domain.ReportIncidentRequest, actor string) (*domain.AIIncident, error)
+	GetIncident(ctx context.Context, incidentID string) (*domain.AIIncident, error)
+	ContainIncident(ctx context.Context, incidentID string, req domain.ContainIncidentRequest) (*domain.AIIncident, error)
+	ResolveIncident(ctx context.Context, incidentID string, req domain.ResolveIncidentRequest) (*domain.AIIncident, error)
+	CloseIncident(ctx context.Context, incidentID string, req domain.CloseIncidentRequest, actor string) (*domain.AIIncident, error)
+	ReactivateRelease(ctx context.Context, modelReleaseID string, req domain.ReactivateReleaseRequest, actor string) (*domain.AIModelRelease, error)
 }
 
 type PgStore struct {
@@ -1350,8 +1366,8 @@ func (s *PgStore) GetExecution(ctx context.Context, executionID string) (*domain
 	return execution, nil
 }
 
-func scanAIIncident(row pgx.Row) (*domain.AIIncident, error) {
-	var incident domain.AIIncident
+func scanAIIncident(row pgx.Row) (*domain.LegacyAIIncident, error) {
+	var incident domain.LegacyAIIncident
 	var evidence []byte
 	err := row.Scan(
 		&incident.IncidentID, &incident.TenantID, &incident.Severity,
@@ -1367,11 +1383,11 @@ func scanAIIncident(row pgx.Row) (*domain.AIIncident, error) {
 	return &incident, nil
 }
 
-const incidentColumns = `incident_id, tenant_id, severity, model_release_id, description,
+const legacyIncidentColumns = `incident_id, tenant_id, severity, model_release_id, description,
 	evidence_references, status, request_sha256, created_at, created_by_principal_id`
 
 func (s *PgStore) CreateAIIncident(ctx context.Context, req domain.CreateAIIncidentRequest,
-	idempotencyKey, requestSHA256 string) (*domain.AIIncident, bool, error) {
+	idempotencyKey, requestSHA256 string) (*domain.LegacyAIIncident, bool, error) {
 	tenantID := middleware.TenantFromContext(ctx)
 	actorID := middleware.PrincipalFromContext(ctx)
 	tx, err := s.pool.Begin(ctx)
@@ -1389,13 +1405,13 @@ func (s *PgStore) CreateAIIncident(ctx context.Context, req domain.CreateAIIncid
 		}
 	}
 
-	loadExisting := func() (*domain.AIIncident, error) {
+	loadExisting := func() (*domain.LegacyAIIncident, error) {
 		return scanAIIncident(tx.QueryRow(ctx, `
-			SELECT `+incidentColumns+` FROM ai_incidents
+			SELECT `+legacyIncidentColumns+` FROM ai_incidents
 			WHERE tenant_id = $1 AND idempotency_key = $2
 		`, tenantID, idempotencyKey))
 	}
-	returnExisting := func(existing *domain.AIIncident) (*domain.AIIncident, bool, error) {
+	returnExisting := func(existing *domain.LegacyAIIncident) (*domain.LegacyAIIncident, bool, error) {
 		if !strings.EqualFold(strings.TrimSpace(existing.RequestSHA256), requestSHA256) {
 			return nil, false, domain.ErrIdempotencyConflict
 		}
@@ -1446,7 +1462,7 @@ func (s *PgStore) CreateAIIncident(ctx context.Context, req domain.CreateAIIncid
 			idempotency_key, request_sha256, created_by_principal_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
-		RETURNING `+incidentColumns,
+		RETURNING `+legacyIncidentColumns,
 		tenantID, req.Severity, req.ModelReleaseID, req.Description, evidence,
 		idempotencyKey, requestSHA256, actorID,
 	))
@@ -1477,7 +1493,7 @@ func (s *PgStore) CreateAIIncident(ctx context.Context, req domain.CreateAIIncid
 	return incident, false, nil
 }
 
-const dispositionColumns = `disposition_id, tenant_id, ai_run_id, oversight_class, status, reason,
+const legacyDispositionColumns = `disposition_id, tenant_id, ai_run_id, oversight_class, status, reason,
 	request_sha256, created_at, created_by_principal_id, decided_at, decided_by_principal_id`
 
 func scanOutputDisposition(row pgx.Row) (*domain.AIOutputDisposition, error) {
@@ -1525,7 +1541,7 @@ func (s *PgStore) CreateOutputDisposition(ctx context.Context, req domain.Create
 
 	loadExisting := func() (*domain.AIOutputDisposition, error) {
 		return scanOutputDisposition(tx.QueryRow(ctx, `
-			SELECT `+dispositionColumns+` FROM ai_output_dispositions
+			SELECT `+legacyDispositionColumns+` FROM ai_output_dispositions
 			WHERE tenant_id = $1 AND idempotency_key = $2
 		`, tenantID, idempotencyKey))
 	}
@@ -1565,7 +1581,7 @@ func (s *PgStore) CreateOutputDisposition(ctx context.Context, req domain.Create
 			tenant_id, ai_run_id, oversight_class, status, idempotency_key, request_sha256, created_by_principal_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
-		RETURNING `+dispositionColumns,
+		RETURNING `+legacyDispositionColumns,
 		tenantID, req.AIRunID, req.OversightClass, status, idempotencyKey, requestSHA256, actorID,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1592,7 +1608,7 @@ func (s *PgStore) GetOutputDisposition(ctx context.Context, dispositionID string
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
 		disposition, err = scanOutputDisposition(tx.QueryRow(ctx, `
-			SELECT `+dispositionColumns+` FROM ai_output_dispositions
+			SELECT `+legacyDispositionColumns+` FROM ai_output_dispositions
 			WHERE disposition_id = $1 AND tenant_id = $2
 		`, dispositionID, middleware.TenantFromContext(ctx)))
 		return err

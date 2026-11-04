@@ -46,6 +46,7 @@ import (
 	"zoiko.io/authorization-svc/internal/mtls"
 	"zoiko.io/authorization-svc/internal/outbox"
 	"zoiko.io/authorization-svc/internal/registry"
+	"zoiko.io/authorization-svc/internal/assignmentexpiry"
 	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
 	"zoiko.io/authorization-svc/internal/store"
@@ -592,6 +593,17 @@ func main() {
 		sweeper.SetPurge(cfg.OutboxRetention, cfg.IdempotencyRetention)
 		go sweeper.Run(retentionCtx)
 	}
+
+	// ── role-assignment expiry (ORG-06 AssignmentExpired) ──────────────────
+	//
+	// Announces, once each, assignments whose window has closed, as
+	// iam.assignment.expired. Enforcement does not wait for this: an assignment
+	// stops granting at its effective_to. This tells consumers that hold their
+	// own projection. Safe on every replica: the database claims rows with
+	// SKIP LOCKED.
+	expiryCtx, stopExpiry := context.WithCancel(context.Background())
+	defer stopExpiry()
+	go assignmentexpiry.New(pgStore, log).Run(expiryCtx)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

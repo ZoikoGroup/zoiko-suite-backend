@@ -37,6 +37,7 @@ func registerResolverRoutes(r chi.Router, h *Handler) {
 	registerPayrollRoute(r, h)
 	registerRecordsRoutes(r, h)
 	registerSubmissionRoutes(r, h)
+	registerRegistrationRoutes(r, h)
 	r.Get("/v1/rule-decisions/{decision_id}", h.GetRuleDecision)
 	r.Get("/v1/pack-coverage", h.PackCoverage)
 	r.Post("/v1/admin/resolver-cache:invalidate", h.InvalidateResolverCache)

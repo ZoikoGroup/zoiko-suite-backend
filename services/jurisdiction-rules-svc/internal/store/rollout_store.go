@@ -29,6 +29,8 @@ type RolloutRecord struct {
 	CreatedBy        string    `json:"created_by"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
+	// PreviousStatus is set only by TransitionRollout, so callers can publish what changed.
+	PreviousStatus string `json:"-"`
 }
 
 // ChecklistState is the current answer for one checklist item.
@@ -385,6 +387,7 @@ func (s *PgStore) TransitionRollout(ctx context.Context, id, to, actor, reason s
 	if err := tx.Commit(ctx); err != nil {
 		return nil, s.registryFail("TransitionRollout commit", err, nil)
 	}
+	out.PreviousStatus = rec.Status
 	return out, nil
 }
 

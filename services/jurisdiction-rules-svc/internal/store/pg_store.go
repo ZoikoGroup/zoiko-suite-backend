@@ -310,6 +310,9 @@ var jurisdictionColumnNames = []string{
 	"updated_at",
 	"updated_by_principal_id",
 	"row_version",
+	"retirement_reason",
+	"retirement_evidence_ref",
+	"superseded_by_jurisdiction_id",
 }
 
 var (
@@ -335,6 +338,9 @@ func jurisdictionScanTargets(j *domain.Jurisdiction) []any {
 		&j.UpdatedAt,
 		&j.UpdatedByPrincipalID,
 		&j.RowVersion,
+		&j.RetirementReason,
+		&j.RetirementEvidenceRef,
+		&j.SupersededByJurisdictionID,
 	}
 }
 

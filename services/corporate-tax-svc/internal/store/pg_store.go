@@ -13,7 +13,7 @@ import (
 	"zoiko.io/corporate-tax-svc/internal/middleware"
 )
 
-// Store defines all persistence operations for corporate tax returns.
+// Store defines all persistence operations for corporate tax returns and nexus records.
 type Store interface {
 	Create(ctx context.Context, r *domain.TaxReturn) error
 	GetByID(ctx context.Context, id string) (*domain.TaxReturn, error)
@@ -21,6 +21,10 @@ type Store interface {
 	Update(ctx context.Context, r *domain.TaxReturn) error
 	Submit(ctx context.Context, id, submittedBy string) (*domain.TaxReturn, error)
 	Assess(ctx context.Context, id string, req *domain.AssessTaxReturnRequest) (*domain.TaxReturn, error)
+
+	CreateNexusRecord(ctx context.Context, r *domain.NexusRecord) error
+	GetNexusRecordByID(ctx context.Context, id string) (*domain.NexusRecord, error)
+	ListNexusRecords(ctx context.Context, legalEntityID, jurisdictionID string) ([]domain.NexusRecord, error)
 }
 
 // PgStore is the PostgreSQL-backed implementation of Store.
@@ -209,8 +213,7 @@ func (s *PgStore) Update(ctx context.Context, r *domain.TaxReturn) error {
 }
 
 // Submit moves DRAFT -> SUBMITTED inside a single transaction with a
-// FOR UPDATE row lock, eliminating the TOCTOU race the previous
-// two-transaction design allowed.
+// FOR UPDATE row lock, eliminating the TOCTOU race.
 func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.TaxReturn, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -275,9 +278,7 @@ func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.T
 	return &r, nil
 }
 
-// Assess records a tax authority assessment inside a single transaction
-// with a FOR UPDATE row lock, eliminating the TOCTOU race and adding the
-// explicit tenant_id predicate.
+// Assess records a tax authority assessment inside a single transaction with a FOR UPDATE row lock.
 func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxReturnRequest) (*domain.TaxReturn, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -339,4 +340,133 @@ func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxRe
 		return nil, err
 	}
 	return &r, nil
+}
+
+func (s *PgStore) CreateNexusRecord(ctx context.Context, r *domain.NexusRecord) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.setRLS(ctx, tx); err != nil {
+		return err
+	}
+
+	if r.NexusRecordID == "" {
+		r.NexusRecordID = "nexus-" + uuid.New().String()
+	}
+	r.TenantID = middleware.GetTenantID(ctx)
+	now := time.Now().UTC()
+	r.CreatedAt = now
+	r.UpdatedAt = now
+	if r.Status == "" {
+		r.Status = "ACTIVE"
+	}
+	if r.Currency == "" {
+		r.Currency = "USD"
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO nexus_records (
+			nexus_record_id, tenant_id, legal_entity_id, jurisdiction_id,
+			nexus_type, threshold_amount, currency, status,
+			effective_from, effective_to, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		r.NexusRecordID, r.TenantID, r.LegalEntityID, r.JurisdictionID,
+		r.NexusType, r.ThresholdAmount, r.Currency, r.Status,
+		r.EffectiveFrom, r.EffectiveTo, r.CreatedBy, r.CreatedAt, r.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("create nexus record: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PgStore) GetNexusRecordByID(ctx context.Context, id string) (*domain.NexusRecord, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.setRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+
+	var r domain.NexusRecord
+	err = tx.QueryRow(ctx, `
+		SELECT nexus_record_id, tenant_id, legal_entity_id, jurisdiction_id,
+		       nexus_type, threshold_amount, currency, status,
+		       effective_from, effective_to, created_by, created_at, updated_at
+		FROM nexus_records
+		WHERE nexus_record_id = $1 AND tenant_id = $2`,
+		id, middleware.GetTenantID(ctx),
+	).Scan(
+		&r.NexusRecordID, &r.TenantID, &r.LegalEntityID, &r.JurisdictionID,
+		&r.NexusType, &r.ThresholdAmount, &r.Currency, &r.Status,
+		&r.EffectiveFrom, &r.EffectiveTo, &r.CreatedBy, &r.CreatedAt, &r.UpdatedAt,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrNexusRecordNotFound
+		}
+		return nil, fmt.Errorf("get nexus record: %w", err)
+	}
+	_ = tx.Commit(ctx)
+	return &r, nil
+}
+
+func (s *PgStore) ListNexusRecords(ctx context.Context, legalEntityID, jurisdictionID string) ([]domain.NexusRecord, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.setRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+
+	query := `
+		SELECT nexus_record_id, tenant_id, legal_entity_id, jurisdiction_id,
+		       nexus_type, threshold_amount, currency, status,
+		       effective_from, effective_to, created_by, created_at, updated_at
+		FROM nexus_records
+		WHERE tenant_id = $1`
+	args := []any{middleware.GetTenantID(ctx)}
+	idx := 2
+
+	if legalEntityID != "" {
+		query += fmt.Sprintf(" AND legal_entity_id = $%d", idx)
+		args = append(args, legalEntityID)
+		idx++
+	}
+	if jurisdictionID != "" {
+		query += fmt.Sprintf(" AND jurisdiction_id = $%d", idx)
+		args = append(args, jurisdictionID)
+		idx++
+	}
+	query += " ORDER BY created_at DESC"
+
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list nexus records: %w", err)
+	}
+	defer rows.Close()
+
+	var records []domain.NexusRecord
+	for rows.Next() {
+		var r domain.NexusRecord
+		if err := rows.Scan(
+			&r.NexusRecordID, &r.TenantID, &r.LegalEntityID, &r.JurisdictionID,
+			&r.NexusType, &r.ThresholdAmount, &r.Currency, &r.Status,
+			&r.EffectiveFrom, &r.EffectiveTo, &r.CreatedBy, &r.CreatedAt, &r.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		records = append(records, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	_ = tx.Commit(ctx)
+	return records, nil
 }

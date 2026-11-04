@@ -214,7 +214,7 @@ func (s *PgStore) FindPrincipalIDsByRole(
 			 WHERE role_id = $1
 			   AND tenant_id = $2
 			   AND effective_from <= $3
-			   AND effective_to   >  $3`,
+			   AND effective_to   >  $3`+notSuspended,
 			roleID, tenantID, now,
 		)
 		if err != nil {

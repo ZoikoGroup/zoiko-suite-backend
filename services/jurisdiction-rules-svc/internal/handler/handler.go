@@ -227,6 +227,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/jurisdictions", h.ListJurisdictions)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}", h.GetJurisdiction)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/ancestors", h.GetAncestors)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/as-of", h.GetJurisdictionAsOf)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/hierarchy", h.GetHierarchy)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/aliases", h.ListJurisdictionAliases)
+	r.Get("/v1/jurisdiction-resolutions", h.ResolveJurisdiction)
+	r.Get("/v1/jurisdiction-code-mappings", h.MapExternalJurisdictionCode)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rules", h.GetRules)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rule-pack", h.GetRulePack)
 	r.Get("/v1/rules/{jurisdiction_rule_id}", h.GetRule)
@@ -236,6 +241,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// ── Admin mutations (AuthZ required on every route) ───────────────────────
 	r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/deactivate", h.DeactivateJurisdiction)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/aliases", h.AmendJurisdictionAlias)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/aliases/{alias_id}/end", h.EndJurisdictionAlias)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/rules", h.CreateRule)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/transition", h.TransitionRuleStatus)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/drift", h.RecordDrift)
@@ -247,6 +254,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// Entity applicability: mounted only when WithEntityApplicability was called.
 	if h.entities != nil {
 		r.Get("/v1/entities/{legal_entity_id}/jurisdictions", h.GetEntityJurisdictions)
+		if h.registry != nil {
+			r.Post(determinationPath, h.ResolveJurisdictionDecision)
+		}
 	}
 
 	if h.registry != nil {
@@ -744,12 +754,16 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	retireReq, ok := readRetireRequest(w, r)
+	if !ok {
+		return
+	}
 	var j *domain.Jurisdiction
 	var changed bool
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
 		ctx := events.WithBatch(r.Context())
 		var err error
-		j, changed, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
+		j, changed, err = h.retire(r.Context(), q, jurisdictionID, principalID, retireReq)
 		if err != nil {
 			return err
 		}
@@ -1250,6 +1264,8 @@ func (h *Handler) writeStoreError(w http.ResponseWriter, r *http.Request, err er
 		status, code = http.StatusForbidden, "self_approval_forbidden"
 	case errors.Is(err, domain.ErrInvalidEffectivePeriod):
 		status, code = http.StatusBadRequest, "invalid_effective_period"
+	case errors.Is(err, domain.ErrInvalidSuccessor):
+		status, code = http.StatusBadRequest, "invalid_successor"
 	default:
 		h.log.Error("store operation failed",
 			zap.String("correlation_id", correlationID),

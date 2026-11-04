@@ -52,6 +52,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	migrations := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
 
 	// evidence first: it has an FK onto checks.
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_profiles CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_dd_evidence CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_dd_checks CASCADE;`)
 

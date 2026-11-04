@@ -6,9 +6,10 @@ import (
 )
 
 var (
-	ErrTaxReturnNotFound = errors.New("corporate tax return not found")
-	ErrAlreadySubmitted  = errors.New("corporate tax return is already submitted")
-	ErrInvalidTaxYear    = errors.New("invalid tax year")
+	ErrTaxReturnNotFound   = errors.New("corporate tax return not found")
+	ErrNexusRecordNotFound = errors.New("nexus record not found")
+	ErrAlreadySubmitted    = errors.New("corporate tax return is already submitted")
+	ErrInvalidTaxYear      = errors.New("invalid tax year")
 
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".
@@ -30,35 +31,35 @@ const (
 // All jurisdiction-specific rates and rules are consumed at runtime from Tax Rules Service —
 // never hardcoded here (per doctrine.md).
 type TaxReturn struct {
-	ReturnID                string       `json:"return_id"`
-	TenantID                string       `json:"tenant_id"`
-	LegalEntityID           string       `json:"legal_entity_id"`
-	JurisdictionID          string       `json:"jurisdiction_id"`
-	TaxRegistrationNumber   string       `json:"tax_registration_number"`
-	FiscalYear              int          `json:"fiscal_year"`
-	AccountingPeriodStart   string       `json:"accounting_period_start"`
-	AccountingPeriodEnd     string       `json:"accounting_period_end"`
-	GrossRevenue            float64      `json:"gross_revenue"`
-	AllowableDeductions     float64      `json:"allowable_deductions"`
-	TaxableIncome           float64      `json:"taxable_income"`
-	TaxRatePercent          float64      `json:"tax_rate_percent"`
-	GrossTaxLiability       float64      `json:"gross_tax_liability"`
-	TaxCredits              float64      `json:"tax_credits"`
-	NetTaxPayable           float64      `json:"net_tax_payable"`
-	TaxAlreadyPaid          float64      `json:"tax_already_paid"`
-	BalanceDue              float64      `json:"balance_due"`
-	Currency                string       `json:"currency"`
-	Status                  FilingStatus `json:"status"`
-	SubmittedAt             *time.Time   `json:"submitted_at,omitempty"`
-	SubmittedBy             *string      `json:"submitted_by,omitempty"`
-	AssessedTaxAmount       *float64     `json:"assessed_tax_amount,omitempty"`
-	AssessmentReference     *string      `json:"assessment_reference,omitempty"`
-	Notes                   string       `json:"notes,omitempty"`
-	EffectiveFrom           string       `json:"effective_from"`
-	EffectiveTo             *string      `json:"effective_to,omitempty"`
-	CreatedBy               string       `json:"created_by"`
-	CreatedAt               time.Time    `json:"created_at"`
-	UpdatedAt               time.Time    `json:"updated_at"`
+	ReturnID              string       `json:"return_id"`
+	TenantID              string       `json:"tenant_id"`
+	LegalEntityID         string       `json:"legal_entity_id"`
+	JurisdictionID        string       `json:"jurisdiction_id"`
+	TaxRegistrationNumber string       `json:"tax_registration_number"`
+	FiscalYear            int          `json:"fiscal_year"`
+	AccountingPeriodStart string       `json:"accounting_period_start"`
+	AccountingPeriodEnd   string       `json:"accounting_period_end"`
+	GrossRevenue          float64      `json:"gross_revenue"`
+	AllowableDeductions   float64      `json:"allowable_deductions"`
+	TaxableIncome         float64      `json:"taxable_income"`
+	TaxRatePercent        float64      `json:"tax_rate_percent"`
+	GrossTaxLiability     float64      `json:"gross_tax_liability"`
+	TaxCredits            float64      `json:"tax_credits"`
+	NetTaxPayable         float64      `json:"net_tax_payable"`
+	TaxAlreadyPaid        float64      `json:"tax_already_paid"`
+	BalanceDue            float64      `json:"balance_due"`
+	Currency              string       `json:"currency"`
+	Status                FilingStatus `json:"status"`
+	SubmittedAt           *time.Time   `json:"submitted_at,omitempty"`
+	SubmittedBy           *string      `json:"submitted_by,omitempty"`
+	AssessedTaxAmount     *float64     `json:"assessed_tax_amount,omitempty"`
+	AssessmentReference   *string      `json:"assessment_reference,omitempty"`
+	Notes                 string       `json:"notes,omitempty"`
+	EffectiveFrom         string       `json:"effective_from"`
+	EffectiveTo           *string      `json:"effective_to,omitempty"`
+	CreatedBy             string       `json:"created_by"`
+	CreatedAt             time.Time    `json:"created_at"`
+	UpdatedAt             time.Time    `json:"updated_at"`
 }
 
 // CreateTaxReturnRequest is the inbound payload for creating a new draft return.
@@ -104,4 +105,33 @@ func (r *TaxReturn) Compute() {
 		r.NetTaxPayable = 0
 	}
 	r.BalanceDue = r.NetTaxPayable - r.TaxAlreadyPaid
+}
+
+// NexusRecord represents a jurisdictional nexus established by an entity per Doc 04 §13.
+type NexusRecord struct {
+	NexusRecordID   string     `json:"nexus_record_id"`
+	TenantID        string     `json:"tenant_id"`
+	LegalEntityID   string     `json:"legal_entity_id"`
+	JurisdictionID  string     `json:"jurisdiction_id"`
+	NexusType       string     `json:"nexus_type"`
+	ThresholdAmount float64    `json:"threshold_amount"`
+	Currency        string     `json:"currency"`
+	Status          string     `json:"status"`
+	EffectiveFrom   string     `json:"effective_from"`
+	EffectiveTo     *string    `json:"effective_to,omitempty"`
+	CreatedBy       string     `json:"created_by"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+// CreateNexusRecordRequest is the inbound payload to establish a nexus record.
+type CreateNexusRecordRequest struct {
+	LegalEntityID   string  `json:"legal_entity_id"`
+	JurisdictionID  string  `json:"jurisdiction_id"`
+	NexusType       string  `json:"nexus_type"`
+	ThresholdAmount float64 `json:"threshold_amount"`
+	Currency        string  `json:"currency"`
+	EffectiveFrom   string  `json:"effective_from"`
+	EffectiveTo     *string `json:"effective_to,omitempty"`
+	CreatedBy       string  `json:"created_by"`
 }
