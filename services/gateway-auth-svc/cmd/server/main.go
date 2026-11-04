@@ -97,29 +97,12 @@ func main() {
 	}
 
 	jwksClient := jwks.NewClientWithHTTPClient(cfg.JWKSURL, cfg.JWKSCacheTTL, jwksHTTPClient)
-	cartaClient := carta.New(cfg.CartaServiceURL, log)
-	siemClient := siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log)
-
-	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
-	// so without this a SIGTERM would discard security events already accepted.
-	defer siemClient.Close()
-	metrics.RegisterSIEMDrops(siemClient.Dropped, "gateway-auth-svc")
-
-	// GOV-01 tenant context resolution against tenant-entity-registry-svc.
-	// nil when TENANT_REGISTRY_URL is unset, which leaves the gateway behaving
-	// exactly as before rather than failing closed on an unconfigured dependency.
-	tenantResolver := tenantctx.NewWithHTTPClient(cfg.TenantRegistryURL, cfg.TenantContextTTL, cfg.TenantContextStaleGrace, tenantRegistryHTTPClient)
-	if tenantResolver.Enabled() {
-		log.Info("tenant context resolution enabled",
-			zap.String("registry", cfg.TenantRegistryURL),
-			zap.Duration("ttl", cfg.TenantContextTTL),
-			zap.Duration("stale_grace", cfg.TenantContextStaleGrace))
-	} else {
-		log.Warn("tenant context resolution DISABLED — set TENANT_REGISTRY_URL to enable GOV-01 " +
-			"resolution; tenant operability and cross-tenant entity ownership are not checked at the gateway")
-	}
-
-	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics)
+	// Create handler first to get the exchanger (which depends on config)
+	h := handler.New(cfg, jwksClient, nil, siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log), tenantctx.NewWithHTTPClient(cfg.TenantRegistryURL, cfg.TenantContextTTL, cfg.TenantContextStaleGrace, tenantRegistryHTTPClient), log).UseMetrics(metrics)
+	// Now create carta client with the exchanger from handler
+	cartaClient := carta.NewWithExchanger(cfg.CartaServiceURL, log, h.Exchanger())
+	// Update handler with the carta client
+	h = handler.New(cfg, jwksClient, cartaClient, siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log), tenantctx.NewWithHTTPClient(cfg.TenantRegistryURL, cfg.TenantContextTTL, cfg.TenantContextStaleGrace, tenantRegistryHTTPClient), log).UseMetrics(metrics)
 
 	// AU-01: a verified envelope's session is checked at identity-context-svc
 	// (live answers reused for the revocation TTL), so a logout stops passing

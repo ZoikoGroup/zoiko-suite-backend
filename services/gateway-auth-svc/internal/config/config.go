@@ -62,6 +62,15 @@ type Config struct {
 	// cached; a missing or unreachable service never affects admission.
 	CommercialAccountServiceURL string
 
+	// Token exchange (AU-12 / GW-5): the gateway exchanges the incoming
+	// zoiko-internal audience envelope for the target service's audience before
+	// making outbound calls. Controlled by IDENTITY_ACCEPT_LEGACY_AUDIENCE in
+	// the stack (per-service gates); here we configure the exchanger itself.
+	// Enabled when both URL and credentials are set.
+	IdentityTokenExchangeURL      string
+	IdentityTokenExchangeClientID string
+	IdentityTokenExchangeClientSecret string
+
 	// IdentityJWKSMTLSEnabled/IdentityJWKSMTLSURL wire the JWKS client into
 	// the mTLS pilot for calling identity-context-svc. Disabled by default —
 	// plain HTTP JWKSURL keeps being used unless explicitly turned on.
@@ -197,6 +206,9 @@ func Load() (*Config, error) {
 		CartaServiceURL:           strEnv("CARTA_SERVICE_URL", ""),
 		SIEMServiceURL:            strEnv("SIEM_SERVICE_URL", ""),
 		CommercialAccountServiceURL: strEnv("COMMERCIAL_ACCOUNT_SERVICE_URL", ""),
+		IdentityTokenExchangeURL:      strEnv("IDENTITY_TOKEN_EXCHANGE_URL", ""),
+		IdentityTokenExchangeClientID: strEnv("IDENTITY_TOKEN_EXCHANGE_CLIENT_ID", ""),
+		IdentityTokenExchangeClientSecret: strEnv("IDENTITY_TOKEN_EXCHANGE_CLIENT_SECRET", ""),
 		IdentityJWKSMTLSEnabled:   strEnv("IDENTITY_JWKS_MTLS_ENABLED", "false") == "true",
 		IdentityJWKSMTLSURL:       strEnv("IDENTITY_JWKS_MTLS_URL", "https://identity-svc:8449/.well-known/jwks.json"),
 		TenantRegistryMTLSEnabled: strEnv("TENANT_REGISTRY_MTLS_ENABLED", "false") == "true",

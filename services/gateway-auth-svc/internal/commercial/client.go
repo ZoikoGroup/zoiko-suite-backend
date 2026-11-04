@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"time"
+
+	idenv "zoiko.io/identity-envelope"
 )
 
 var (
@@ -14,8 +16,9 @@ var (
 )
 
 type Client struct {
-	baseURL string
-	http    *http.Client
+	baseURL  string
+	http     *http.Client
+	exchanger *idenv.Exchanger
 }
 
 type CommercialAccount struct {
@@ -40,6 +43,14 @@ func New(baseURL string) *Client {
 		baseURL: baseURL,
 		http:    &http.Client{Timeout: 2 * time.Second},
 	}
+}
+
+func NewWithExchanger(baseURL string, ex *idenv.Exchanger) *Client {
+	c := New(baseURL)
+	if c != nil {
+		c.exchanger = ex
+	}
+	return c
 }
 
 func (c *Client) Enabled() bool { return c != nil }
@@ -76,6 +87,11 @@ func (c *Client) getCommercialAccountByOrganization(ctx context.Context, organiz
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if c.exchanger != nil {
+		_ = idenv.ForwardTo(ctx, req, c.exchanger, "commercial-account-svc")
+	} else {
+		idenv.Forward(ctx, req)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -105,6 +121,11 @@ func (c *Client) getActiveSubscription(ctx context.Context, commercialAccountID 
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if c.exchanger != nil {
+		_ = idenv.ForwardTo(ctx, req, c.exchanger, "commercial-account-svc")
+	} else {
+		idenv.Forward(ctx, req)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

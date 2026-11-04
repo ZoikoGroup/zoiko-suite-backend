@@ -31,7 +31,7 @@ import (
 
 	"go.uber.org/zap"
 
-	svcenvelope "zoiko.io/gateway-auth-svc/internal/envelope"
+	idenv "zoiko.io/identity-envelope"
 )
 
 // Decision mirrors carta-svc's domain.Decision.
@@ -87,6 +87,7 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 	log     *zap.Logger
+	exchanger *idenv.Exchanger
 }
 
 func New(baseURL string, log *zap.Logger) *Client {
@@ -95,6 +96,12 @@ func New(baseURL string, log *zap.Logger) *Client {
 		log:     log,
 		http:    &http.Client{Timeout: 2 * time.Second},
 	}
+}
+
+func NewWithExchanger(baseURL string, log *zap.Logger, ex *idenv.Exchanger) *Client {
+	c := New(baseURL, log)
+	c.exchanger = ex
+	return c
 }
 
 // Evaluate asks carta-svc to score this request. principalID, tenantID, and
@@ -142,7 +149,11 @@ func (c *Client) Evaluate(ctx context.Context, principalID, tenantID, legalEntit
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
-	svcenvelope.ForwardTo(ctx, req)
+	if c.exchanger != nil {
+		_ = idenv.ForwardTo(ctx, req, c.exchanger, "carta-svc")
+	} else {
+		idenv.Forward(ctx, req)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

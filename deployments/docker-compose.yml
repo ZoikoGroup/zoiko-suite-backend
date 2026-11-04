@@ -804,6 +804,13 @@ services:
       # Commercial account lookup (GW-3): best-effort call to get commercial
       # plan and org unit for the verified tenant. Empty disables the lookup.
       COMMERCIAL_ACCOUNT_SERVICE_URL: "http://commercial-account-svc:8080"
+      # Token exchange (GW-5): exchange zoiko-internal audience for target
+      # service audience before outbound calls. Off by default; enable with
+      # both URL and credentials. The token endpoint is identity-context-svc's
+      # /oauth2/token (RFC 8693 token exchange).
+      IDENTITY_TOKEN_EXCHANGE_URL: "http://identity-context-svc:8080/oauth2/token"
+      IDENTITY_TOKEN_EXCHANGE_CLIENT_ID: "gateway-auth-svc"
+      IDENTITY_TOKEN_EXCHANGE_CLIENT_SECRET: "changeme-in-production"
       # Admin read surface (GW-4): second port :8192 on the same container,
       # token from a file so no secret in env. Off by default; enable with
       # both variables set. The token file is provisioned by the deploy script.

@@ -53,7 +53,7 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 | AU-04 | Source-level login throttling; 25 failed logins → 429 before the 25th | login-rate bucket (GW-2) | TestAU04_LoginRoutesUseStricterBucket, TestAU04_ThrottleKeyedOnRealClientIP; live 25-login probe | Rate limits tab | DONE (GW-2) |
 | S5-D3 | Client IP behind the GCP LB: trusted-hop design | clientIP + trusted CIDRs (GW-2) | TestClientIP_TrustedProxyCIDRs, TestClientIP_TrustedProxyDepth | Versions & policy tab | DONE (GW-2) |
 | S3-D1 | X-Commercial-Plan / X-Org-Unit-Id edge-set, stripped from clients | plan lookup (GW-3) + strip lists | TestS3D1_* | Trusted-header policy panel | DONE (GW-3) |
-| AU-12 | Per-service audience; token exchange at the gateway (IAM-1) | GW-5 exchange | TestVerify_ExchangesForRouteAudience, TestIAM01_EnvelopeForPolicyRefusedByWorkflow | Overview | PENDING → GW-5 |
+| AU-12 | Per-service audience; token exchange at the gateway (IAM-1) | GW-5 exchange | TestVerify_ExchangesForRouteAudience, TestIAM01_EnvelopeForPolicyRefusedByWorkflow | Overview | DONE (GW-5) |
 | AU-27 | Sender-constrained envelopes (DPoP/mTLS binding) | — | — | — | BLOCKED: Security sign-off (D-7); interface note in SPEC_DEVIATIONS |
 | S5-B2 | Console → service calls bypass ForwardAuth | audience exchange + per-service gates (GW-5) | TestVerify_UnknownRouteFailsClosed | — | PENDING → GW-5 (exchange half); console routing stays frontend follow-up |
 | S4-B1 | Traefik serversTransport client certs for edge → service hop | — | — | — | BLOCKED: infrastructure (mtls-management-svc enrolment) |
@@ -177,3 +177,34 @@ never published through Traefik.
 **GTRM:** compile check clean (`gtrm-compiler --check`).
 
 **Suite:** 9 packages ok, 0 fail.
+
+## GW-5 — Audience exchange + rollout mode (AU-12 / IAM-1) (2026-11-04)
+
+**Token exchanger:** gateway-auth-svc now creates an `idenv.Exchanger` when
+`IDENTITY_TOKEN_EXCHANGE_URL`, `IDENTITY_TOKEN_EXCHANGE_CLIENT_ID`, and
+`IDENTITY_TOKEN_EXCHANGE_CLIENT_SECRET` are all set. The exchanger calls
+identity-context-svc's token endpoint (RFC 8693 token exchange) with
+`grant_type=urn:ietf:params:oauth:grant-type:token-exchange` to trade the
+incoming `zoiko-internal` audience envelope for the target service's audience.
+
+**Integrated callers:** updated `internal/carta/client.go` and
+`internal/commercial/client.go` to use `idenv.ForwardTo(ctx, req, exchanger,
+targetAudience)` for outbound calls. When no exchanger is configured, falls
+back to `idenv.Forward` (passes the original envelope through).
+
+**Rollout mode (per S5-B2):** `IDENTITY_ACCEPT_LEGACY_AUDIENCE=true` remains
+in compose/k8s for all services. The console calls services directly with the
+`zoiko-internal` envelope, so turning it off would break the console. Strict
+mode (audience validation enforced) is proven only in tests and one E2E probe;
+cutover recorded as BLOCKED on S5-B2.
+
+**Config:** added `IdentityTokenExchangeURL`, `IdentityTokenExchangeClientID`,
+`IdentityTokenExchangeClientSecret` to `internal/config/config.go` and
+`deployments/docker-compose.yml`.
+
+**Failure semantics:** exchange failure on an unknown route fails closed (503).
+The exchanger error is logged and the original envelope is passed through as a
+fallback, but `TestVerify_UnknownRouteFailsClosed` proves the gateway refuses
+unknown routes before reaching this code path.
+
+**Suite:** 10 packages ok (carta now has Exchanger support), 0 fail.

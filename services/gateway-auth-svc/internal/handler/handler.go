@@ -31,6 +31,7 @@ type Handler struct {
 	siem     *siem.Client
 	tenant   *tenantctx.Resolver
 	commercial *commercial.Client
+	exchanger  *idenv.Exchanger
 	log      *zap.Logger
 
 	// adm and rec are the INT-01 admission controls and the bounded record of
@@ -95,13 +96,23 @@ func New(
 	tenantResolver *tenantctx.Resolver,
 	log *zap.Logger,
 ) *Handler {
+	var exchanger *idenv.Exchanger
+	if cfg.IdentityTokenExchangeURL != "" && cfg.IdentityTokenExchangeClientID != "" && cfg.IdentityTokenExchangeClientSecret != "" {
+		exchanger = idenv.NewExchanger(
+			cfg.IdentityTokenExchangeURL,
+			cfg.IdentityTokenExchangeClientID,
+			cfg.IdentityTokenExchangeClientSecret,
+			nil, // use default 5s HTTP client
+		)
+	}
 	return &Handler{
 		cfg:         cfg,
 		jwks:        jwksClient,
 		carta:       cartaClient,
 		siem:        siemClient,
 		tenant:      tenantResolver,
-		commercial:  commercial.New(cfg.CommercialAccountServiceURL),
+		commercial:  commercial.NewWithExchanger(cfg.CommercialAccountServiceURL, exchanger),
+		exchanger:   exchanger,
 		log:         log,
 		metrics:     nopMetrics{},
 		rec:         admission.NewRecorder(1024, 0, nil),
@@ -117,6 +128,10 @@ func (h *Handler) UseMetrics(m DomainMetrics) *Handler {
 	}
 	return h
 }
+
+// Exchanger returns the configured token exchanger, for outbound calls that
+// need audience exchange (AU-12 / GW-5). Nil if not configured.
+func (h *Handler) Exchanger() *idenv.Exchanger { return h.exchanger }
 
 // UseRevocation makes /verify refuse an envelope whose session has ended. A
 // logout used to leave the envelope passing the edge until it expired (Auth
