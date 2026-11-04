@@ -119,9 +119,11 @@ components:
                 additionalProperties: false
                 properties:
                   release_id: {type: string}
+                  kind: {type: string, enum: [kb, claims], description: "Which release pointer moved; replay rechecks that pointer (Doc 05 §22)."}
                   signer_refs: {type: array, items: {type: string}}
                   digest: {type: string}
                   effective_at: {type: string, format: date-time}
+                  release_epoch: {type: integer, description: "Promotion time in Unix nanoseconds; consumers ignore an older promotion of the same kind (Doc 05 §22)."}
     sourceRevoked:
       name: kb.source.revoked.v1
       payload:
@@ -135,3 +137,4 @@ components:
                   source_version_id: {type: string}
                   reason_code: {type: string}
                   effective_at: {type: string, format: date-time}
+                  revocation_epoch: {type: integer, description: "Revocation ledger watermark of this entry, assigned in the same transaction (Doc 05 §18, §22)."}

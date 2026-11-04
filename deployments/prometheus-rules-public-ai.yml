@@ -7,7 +7,13 @@
 # internal/metrics.TestAlertRulesUseExportedMetrics fails if one is renamed.
 #
 # Thresholds are dev defaults pending SRE approval (Doc 08 D08-*, DEC-08).
-# Runbook: services/public-ai-svc/RUNBOOK.md
+# Runbook: services/public-ai-svc/RUNBOOK.md. Every alert carries a runbook
+# (RB-xx) and runbook_url annotation; the alert -> runbook map is in the
+# runbook. freeze_promotion="true" means no knowledge, claim or app release
+# is promoted while the alert fires (Doc 08 §13). The kill switch (reason
+# KILL_SWITCH) is an operator decision, not an error, so it is excluded from
+# the error budget (OPR-011).
+# Unit tests: promtool test rules deployments/prometheus-rules-public-ai.test.yml
 groups:
   - name: public-ai-assistant
     rules:
@@ -15,13 +21,15 @@ groups:
       # switch, no verified release). Doc 04 target: 99.9 % turn availability.
       - alert: PublicAIUnavailableTurns
         expr: |
-          sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[10m]))
+          sum(rate(public_ai_turns_total{status="UNAVAILABLE",reason!="KILL_SWITCH"}[10m]))
           /
           sum(rate(public_ai_turns_total[10m])) > 0.05
         for: 10m
         labels:
           severity: page
         annotations:
+          runbook: "RB-01"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-01-model-provider-degraded-doc-08-16"
           summary: "Assistant: more than 5% of turns UNAVAILABLE for 10m"
 
       - alert: PublicAIServerErrors
@@ -33,6 +41,8 @@ groups:
         labels:
           severity: page
         annotations:
+          runbook: "RB-09"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-09-service-health-and-missing-telemetry"
           summary: "Assistant: 5xx rate above 2% for 5m"
 
       # Latency: Doc 04 targets gate p95 <= 0.5 s and answer p95 <= 8 s.
@@ -43,6 +53,8 @@ groups:
         labels:
           severity: ticket
         annotations:
+          runbook: "RB-01"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-01-model-provider-degraded-doc-08-16"
           summary: "Assistant: answered-turn p95 above 8 s for 10m"
 
       - alert: PublicAIGateLatencyP95High
@@ -52,6 +64,8 @@ groups:
         labels:
           severity: ticket
         annotations:
+          runbook: "RB-09"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-09-service-health-and-missing-telemetry"
           summary: "Assistant: non-turn request p95 above 0.5 s for 10m"
 
       # Safety signals: no 5xx and no latency, so the golden signals miss them.
@@ -61,6 +75,8 @@ groups:
         labels:
           severity: ticket
         annotations:
+          runbook: "RB-03"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-03-privacy-leak-or-prompt-injection-doc-08-18"
           summary: "Assistant: drafts rejected by output validation (possible model or prompt drift)"
 
       - alert: PublicAIModelErrors
@@ -72,6 +88,8 @@ groups:
         labels:
           severity: page
         annotations:
+          runbook: "RB-01"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-01-model-provider-degraded-doc-08-16"
           summary: "Assistant: more than 20% of model calls failing for 10m"
 
       - alert: PublicAIReleaseNotReady
@@ -80,6 +98,8 @@ groups:
         labels:
           severity: page
         annotations:
+          runbook: "RB-04"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-04-rollback-and-safe-static-doc-08-19"
           summary: "Assistant: no verified knowledge/claim release active (serving fallbacks)"
 
       # Event integrity (Doc 05 §20, CT-047): dead letters need a replay
@@ -89,6 +109,8 @@ groups:
         labels:
           severity: ticket
         annotations:
+          runbook: "RB-05"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-05-dead-lettered-events"
           summary: "Assistant: outbox events moved to a .dlq topic; review and replay with kbctl dlq-replay"
 
       # Abuse and cost (Doc 06 §13): sustained 429s or token burn.
@@ -98,6 +120,8 @@ groups:
         labels:
           severity: ticket
         annotations:
+          runbook: "RB-08"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-08-security-signals-and-abuse"
           summary: "Assistant: sustained 429s (possible abuse); check edge limits"
 
       - alert: PublicAITokenBurnHigh
@@ -105,24 +129,32 @@ groups:
         labels:
           severity: ticket
         annotations:
+          runbook: "RB-06"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-06-spend-ceiling"
           summary: "Assistant: more than 500k model tokens in 1h (daily ceiling is 2M by default)"
 
-  # Doc 08 §13: multi-window, multi-burn-rate alerting on the proposed 99.9 %
+  # Doc 08 §13: multi-window, multi-burn-rate alerting (14.4x page, 6x page
+  # with freeze_promotion, 1x ticket) on the proposed 99.9 %
   # turn-availability objective (error budget 0.1 %), plus no-data alerts so
   # silence is never read as health. Objective and windows are PROPOSED
   # (SRE approval pending, D08-*).
   - name: public-ai-assistant-slo
     rules:
       - record: public_ai:turn_error_ratio:rate5m
-        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[5m])) / clamp_min(sum(rate(public_ai_turns_total[5m])), 1e-9)
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE",reason!="KILL_SWITCH"}[5m])) / clamp_min(sum(rate(public_ai_turns_total[5m])), 1e-9)
       - record: public_ai:turn_error_ratio:rate30m
-        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[30m])) / clamp_min(sum(rate(public_ai_turns_total[30m])), 1e-9)
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE",reason!="KILL_SWITCH"}[30m])) / clamp_min(sum(rate(public_ai_turns_total[30m])), 1e-9)
       - record: public_ai:turn_error_ratio:rate1h
-        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[1h])) / clamp_min(sum(rate(public_ai_turns_total[1h])), 1e-9)
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE",reason!="KILL_SWITCH"}[1h])) / clamp_min(sum(rate(public_ai_turns_total[1h])), 1e-9)
       - record: public_ai:turn_error_ratio:rate6h
-        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE"}[6h])) / clamp_min(sum(rate(public_ai_turns_total[6h])), 1e-9)
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE",reason!="KILL_SWITCH"}[6h])) / clamp_min(sum(rate(public_ai_turns_total[6h])), 1e-9)
+      - record: public_ai:turn_error_ratio:rate3d
+        expr: sum(rate(public_ai_turns_total{status="UNAVAILABLE",reason!="KILL_SWITCH"}[3d])) / clamp_min(sum(rate(public_ai_turns_total[3d])), 1e-9)
+      - record: public_ai:turn_abstain_ratio:rate1h
+        expr: sum(rate(public_ai_turns_total{status="ABSTAIN"}[1h])) / clamp_min(sum(rate(public_ai_turns_total[1h])), 1e-9)
+      - record: public_ai:turn_abstain_ratio:rate7d
+        expr: sum(rate(public_ai_turns_total{status="ABSTAIN"}[7d])) / clamp_min(sum(rate(public_ai_turns_total[7d])), 1e-9)
 
-      # Fast burn: 2 % of a 30-day budget in 1 h (14.4x), confirmed over 5 m.
       # Spend: Doc 04 §25 bill-shock control, three thresholds; at 1.0
       # the guard has already throttled generation (SPEND_CEILING).
       - alert: PublicAISpendHalf
@@ -130,6 +162,8 @@ groups:
         labels:
           severity: ticket
         annotations:
+          runbook: "RB-06"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-06-spend-ceiling"
           summary: "Assistant: model spend at 50% of the daily or monthly ceiling"
           description: "At 100% the spend guard serves static content only (reason SPEND_CEILING). Doc 04 §25: three thresholds and auto-throttle."
 
@@ -138,6 +172,8 @@ groups:
         labels:
           severity: warn
         annotations:
+          runbook: "RB-06"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-06-spend-ceiling"
           summary: "Assistant: model spend at 80% of the daily or monthly ceiling"
           description: "At 100% the spend guard serves static content only (reason SPEND_CEILING). Doc 04 §25: three thresholds and auto-throttle."
 
@@ -146,6 +182,8 @@ groups:
         labels:
           severity: page
         annotations:
+          runbook: "RB-06"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-06-spend-ceiling"
           summary: "Assistant: model spend at 100% of the daily or monthly ceiling"
           description: "At 100% the spend guard serves static content only (reason SPEND_CEILING). Doc 04 §25: three thresholds and auto-throttle."
 
@@ -156,6 +194,8 @@ groups:
         labels:
           severity: warn
         annotations:
+          runbook: "RB-08"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-08-security-signals-and-abuse"
           summary: "Assistant: more than 20 {{ $labels.reason_class }} signals in 10m (possible probing)"
 
       - alert: PublicAIDeniedRequests
@@ -163,6 +203,8 @@ groups:
         labels:
           severity: warn
         annotations:
+          runbook: "RB-08"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-08-security-signals-and-abuse"
           summary: "Assistant: more than 100 denied (401/403) requests in 10m: origin, host or session probing"
 
       - alert: PublicAIOutboxLag
@@ -171,6 +213,8 @@ groups:
         labels:
           severity: warn
         annotations:
+          runbook: "RB-07"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-07-outbox-lag"
           summary: "Assistant: outbox events waiting more than 10 minutes (publisher or relay breaker open)"
 
       # Knowledge integrity: contradictory claims or expired sources reaching
@@ -180,6 +224,8 @@ groups:
         labels:
           severity: warn
         annotations:
+          runbook: "RB-02"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-02-stale-or-wrong-commercial-claim-doc-08-17--treat-as-p0"
           summary: "Assistant: answers withheld for a CLAIM_CONFLICT in the last 15m"
           description: "Check the conflict cases (public_ai.conflicts) and route to the assigned owner."
 
@@ -188,9 +234,12 @@ groups:
         labels:
           severity: warn
         annotations:
+          runbook: "RB-02"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-02-stale-or-wrong-commercial-claim-doc-08-17--treat-as-p0"
           summary: "Assistant: more than 5 answers withheld for EXPIRED_SOURCE in 1h"
           description: "A source or claim validity window has lapsed; renew or retire it."
 
+      # Fast burn: 2 % of a 30-day budget in 1 h (14.4x), confirmed over 5 m.
       - alert: PublicAIErrorBudgetFastBurn
         expr: |
           public_ai:turn_error_ratio:rate1h > (14.4 * 0.001)
@@ -198,19 +247,80 @@ groups:
           and sum(rate(public_ai_turns_total[1h])) > 0.01
         labels:
           severity: page
+          freeze_promotion: "true"
         annotations:
+          runbook: "RB-01"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-01-model-provider-degraded-doc-08-16"
           summary: "Assistant: error budget burning 14.4x (1h and 5m windows)"
 
-      # Slow burn: 5 % of the budget in 6 h (6x), confirmed over 30 m.
+      # Sustained burn: 5 % of the budget in 6 h (6x), confirmed over 30 m.
+      # Pages and freezes promotion (Doc 08 §13, OPR-020/021): no release is
+      # promoted while the budget is burning this fast.
       - alert: PublicAIErrorBudgetSlowBurn
         expr: |
           public_ai:turn_error_ratio:rate6h > (6 * 0.001)
           and public_ai:turn_error_ratio:rate30m > (6 * 0.001)
           and sum(rate(public_ai_turns_total[6h])) > 0.01
         labels:
+          severity: page
+          freeze_promotion: "true"
+        annotations:
+          runbook: "RB-01"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-01-model-provider-degraded-doc-08-16"
+          summary: "Assistant: error budget burning 6x (6h and 30m windows); promotion frozen"
+
+      # Gradual burn: 10 % of the budget in 3 d (1x), confirmed over 6 h.
+      - alert: PublicAIErrorBudgetGradualBurn
+        expr: |
+          public_ai:turn_error_ratio:rate3d > (1 * 0.001)
+          and public_ai:turn_error_ratio:rate6h > (1 * 0.001)
+          and sum(rate(public_ai_turns_total[3d])) > 0.001
+        labels:
           severity: ticket
         annotations:
-          summary: "Assistant: error budget burning 6x (6h and 30m windows)"
+          runbook: "RB-01"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-01-model-provider-degraded-doc-08-16"
+          summary: "Assistant: error budget burning 1x over 3d (confirmed over 6h)"
+
+      # Answer-quality drift (Doc 08 §13, OPR-022): the abstain share in the
+      # last hour more than doubled versus the previous 7 days. Usually a KB
+      # release, retrieval or claim change rather than an outage.
+      - alert: PublicAIAbstainRateShift
+        expr: |
+          public_ai:turn_abstain_ratio:rate1h > 2 * public_ai:turn_abstain_ratio:rate7d
+          and public_ai:turn_abstain_ratio:rate1h > 0.1
+          and sum(rate(public_ai_turns_total[1h])) > 0.01
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          runbook: "RB-02"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-02-stale-or-wrong-commercial-claim-doc-08-17--treat-as-p0"
+          summary: "Assistant: abstain rate {{ $value | humanizePercentage }} in 1h, more than double the 7d baseline"
+
+      # Synthetic canary (cmd/canary -metrics-file, collected by a node
+      # exporter textfile collector): a failing or silent canary is an alert.
+      - alert: PublicAICanaryFailing
+        expr: min(public_ai_canary_success) == 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          runbook: "RB-10"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-10-synthetic-canary-failing"
+          summary: "Assistant: synthetic canary failing for 10m"
+
+      - alert: PublicAICanaryStale
+        expr: |
+          (time() - max(public_ai_canary_last_run_timestamp_seconds)) > 1800
+          or absent(public_ai_canary_last_run_timestamp_seconds)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          runbook: "RB-10"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-10-synthetic-canary-failing"
+          summary: "Assistant: synthetic canary has not reported for 30m"
 
       # No-data: a missing target or missing series is an alert, not health.
       - alert: PublicAIScrapeDown
@@ -219,6 +329,8 @@ groups:
         labels:
           severity: page
         annotations:
+          runbook: "RB-09"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-09-service-health-and-missing-telemetry"
           summary: "Assistant: /metrics not scrapeable for 5m"
 
       - alert: PublicAIMetricsAbsent
@@ -227,4 +339,6 @@ groups:
         labels:
           severity: page
         annotations:
+          runbook: "RB-09"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-09-service-health-and-missing-telemetry"
           summary: "Assistant: no build_info series for 10m (service down or not scraped)"

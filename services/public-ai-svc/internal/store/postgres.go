@@ -256,6 +256,16 @@ func insertOutbox(ctx context.Context, tx pgx.Tx, events []OutboxEvent) error {
 
 func (p *Postgres) CompleteTurn(ctx context.Context, t Turn, buckets []string, tokens int64, events []OutboxEvent) error {
 	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		// SEC-T057: lock the session row and refuse a turn whose session
+		// expired or was deleted while it ran.
+		var live bool
+		err := tx.QueryRow(ctx, `SELECT deleted_at IS NULL AND expires_at > now() FROM public_ai.sessions WHERE session_id = $1 FOR UPDATE`, t.SessionID).Scan(&live)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !live) {
+			return ErrSessionGone
+		}
+		if err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx, `UPDATE public_ai.turns SET status = $2, intent_id = $3, response = $4, completed = TRUE
 			WHERE turn_id = $1 AND completed = FALSE`, t.TurnID, t.Status, t.IntentID, t.Response)
 		if err != nil {
@@ -304,11 +314,24 @@ func (p *Postgres) SetFeedback(ctx context.Context, sessionID, turnID, rating, r
 }
 
 func (p *Postgres) PurgeSessions(ctx context.Context, cutoff time.Time) (int, error) {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM public_ai.sessions WHERE expires_at < $1 OR (deleted_at IS NOT NULL AND deleted_at < $1)`, cutoff)
-	if err != nil {
-		return 0, err
-	}
-	return int(tag.RowsAffected()), nil
+	var n int
+	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM public_ai.sessions WHERE expires_at < $1 OR (deleted_at IS NOT NULL AND deleted_at < $1)`, cutoff)
+		if err != nil {
+			return err
+		}
+		n = int(tag.RowsAffected())
+		// Doc 06 §17: delivered (or dead-lettered, which the relay also marks
+		// published) events, and usage counters older than the previous month.
+		if _, err := tx.Exec(ctx, `DELETE FROM public_ai.outbox WHERE published_at IS NOT NULL AND published_at < $1`, cutoff); err != nil {
+			return err
+		}
+		day, month := UsageKeepFrom(time.Now().UTC())
+		_, err = tx.Exec(ctx, `DELETE FROM public_ai.usage_counters
+			WHERE (bucket LIKE 'tokens:day:%' AND bucket < $1) OR (bucket LIKE 'tokens:month:%' AND bucket < $2)`, day, month)
+		return err
+	})
+	return n, err
 }
 
 func (p *Postgres) AppendEvents(ctx context.Context, events []OutboxEvent) error {
@@ -365,7 +388,7 @@ func (p *Postgres) AddRevocation(ctx context.Context, r Revocation, events []Out
 			VALUES ($1,$2,$3,$4,$5) RETURNING watermark`, r.TargetKind, r.TargetID, r.ReasonCode, r.EffectiveAt, r.CreatedAt).Scan(&wm); err != nil {
 			return err
 		}
-		return insertOutbox(ctx, tx, events)
+		return insertOutbox(ctx, tx, stampRevocationEpoch(events, wm))
 	})
 	return wm, err
 }

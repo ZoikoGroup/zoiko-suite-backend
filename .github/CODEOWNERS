@@ -23,3 +23,15 @@
 # Migrations and deployment                         -> SRE Lead
 # /services/public-ai-svc/deployments/migrations/   @<sre-team>
 # /deployments/*public-ai*                          @<sre-team>
+# Feature flags, kill switch and dual control         -> SRE Lead + Security Lead
+# /services/public-ai-svc/internal/flags/           @<sre-team> @<security-team>
+# Telemetry (spans, logs, metrics names)            -> SRE Lead
+# /services/public-ai-svc/internal/telemetry/       @<sre-team>
+# Release tooling and manifests                     -> Knowledge Owner + SRE Lead
+# /services/public-ai-svc/cmd/kbctl/                @<knowledge-team> @<sre-team>
+# Container image                                   -> SRE Lead + Security Lead
+# /services/public-ai-svc/Dockerfile                @<sre-team> @<security-team>
+# Public knowledge base content                      -> Knowledge Owner + Commercial Owner
+# /services/public-ai-svc/data/public-kb/           @<knowledge-team> @<commercial-team>
+# CI workflows (release gates, supply chain)        -> SRE Lead + Security Lead
+# /.github/workflows/                               @<sre-team> @<security-team>

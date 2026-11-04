@@ -28,6 +28,7 @@ components:
       additionalProperties: false
       properties:
         streaming: {type: boolean}
+        chat_enabled: {type: boolean, description: "false while the kill switch is on: the widget shows the official routes instead of a composer (Doc 08 §10)."}
         lead_capture: {type: boolean}
         file_upload: {type: boolean}
         authenticated: {type: boolean}

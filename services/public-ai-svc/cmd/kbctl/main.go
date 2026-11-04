@@ -8,7 +8,7 @@
 //	kbctl promote      -kind kb -id kb-dev-1          (also used for rollback)
 //	kbctl revoke       -kind source -id src-x -reason CODE
 //	kbctl flag         -name public_ai_enabled -value false -actor sre-1 -approval CHG-1
-//	kbctl manifest     -id suivo-r0-20261027-01 -git <sha> -image <digest> -eval eval-report.json -out release-manifest.json
+//	kbctl manifest     -id suivo-r0-20261027-01 -git <sha> -image ghcr.io/zoiko/public-ai-svc@sha256:<64 hex> -env staging //	                   -eval eval-report.json -drill drill-report.json -sbom sbom.cdx.json -scan trivy.json -out release-manifest.json
 //
 // Signing keys come from PUBLIC_AI_SIGNING_KEY / PUBLIC_AI_SIGNING_PUBLIC_KEY;
 // the database from PUBLIC_AI_DATABASE_URL.
@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/public-ai-svc/deployments/migrations"
+	"zoiko.io/public-ai-svc/internal/config"
 	"zoiko.io/public-ai-svc/internal/events"
 	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/knowledge"
@@ -240,11 +241,13 @@ func doPromote(ctx context.Context, st store.Store, kind, id string, op release.
 	}
 	// Two distinct approvers, an independent promoter and a passing
 	// evaluation before the pointer moves (Doc 03 §10-11, KB-016, KB-027).
-	if err := release.PromotionGate(kind, id, rel.Manifest, op, ev, rollback); err != nil {
+	// A rollback is accepted only to a release with a prior completed
+	// promotion in the control audit.
+	if err := release.PromotionGateAudited(ctx, st, kind, id, rel.Manifest, op, ev, rollback); err != nil {
 		return err
 	}
 	approvers, _ := release.Approvers(kind, rel.Manifest)
-	event, err := events.ReleasePromoted(id, signing.Digest(rel.Manifest), approvers, time.Now())
+	event, err := events.ReleasePromotedFor(kind, id, signing.Digest(rel.Manifest), approvers, time.Now())
 	if err != nil {
 		return err
 	}
@@ -372,9 +375,17 @@ func manifest(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("manifest", flag.ExitOnError)
 	id := fs.String("id", "", "release id, e.g. suivo-r0-20261027-01")
 	git := fs.String("git", "", "application git commit")
-	image := fs.String("image", "", "container image digest (sha256:...)")
+	image := fs.String("image", "", "immutable image reference name@sha256:<64 hex> (required)")
 	stage := fs.String("stage", "staging", "rollout stage")
-	evalPath := fs.String("eval", "", "eval-report.json from cmd/evalrun")
+	environment := fs.String("env", os.Getenv("PUBLIC_AI_ENVIRONMENT"), "environment (default PUBLIC_AI_ENVIRONMENT)")
+	evalPath := fs.String("eval", "", "eval-report.json from cmd/evalrun (its model profile must match)")
+	drillPath := fs.String("drill", "", "drill-report.json from cmd/drill (sha256 recorded)")
+	sbomPath := fs.String("sbom", "", "SBOM file (sha256 recorded)")
+	scanPath := fs.String("scan", "", "image/vulnerability scan report (sha256 recorded)")
+	a11yPath := fs.String("a11y", "", "accessibility test report (sha256 recorded)")
+	functionalPath := fs.String("functional", "", "functional test run report (sha256 recorded)")
+	prevKB := fs.String("previous-kb", "", "knowledge release id this release replaces")
+	prevClaims := fs.String("previous-claims", "", "claim release id this release replaces")
 	out := fs.String("out", "release-manifest.json", "output file")
 	_ = fs.Parse(args)
 	key, err := privKey()
@@ -386,9 +397,13 @@ func manifest(ctx context.Context, args []string) error {
 		return err
 	}
 	rec, err := release.BuildManifest(ctx, st, release.ManifestInput{
-		ReleaseID: *id, GitCommit: *git, ImageDigest: *image, RolloutStage: *stage,
-		ModelProfile: envOr("PUBLIC_AI_MODEL_PROFILE", "fake-v0"), EvalReportPath: *evalPath,
-		PolicyVersion: envOr("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
+		ReleaseID: *id, GitCommit: *git, ImageDigest: *image, RolloutStage: *stage, Environment: *environment,
+		// Derived from PUBLIC_AI_MODEL_PROVIDER / PUBLIC_AI_MODEL_ID / GROQ_MODEL
+		// exactly as the server derives it.
+		ModelProfile: config.ModelProfileFromEnv(), EvalReportPath: *evalPath,
+		PolicyVersion:   envOr("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
+		DrillReportPath: *drillPath, SBOMPath: *sbomPath, ScanReportPath: *scanPath, A11yReportPath: *a11yPath,
+		FunctionalRunPath: *functionalPath, PreviousKB: *prevKB, PreviousClaims: *prevClaims,
 	})
 	if err != nil {
 		return err

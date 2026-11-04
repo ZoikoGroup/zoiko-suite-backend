@@ -50,7 +50,9 @@ func TestRepliesUseDoc02Copy(t *testing.T) {
 		"T24": {TplUnavailable.Text},
 		"T25": {TplOutOfScope.Text},
 		"T26": {RouteTemplates["I24"].Text},
-		"T30": {BoundaryTemplates["I27"].Text},
+		"T30": {RouteTemplates["I27"].Text},
+		"T27": {TplUptime.Text},
+		"T28": {TplLiveSupport.Text},
 	}
 	for id, texts := range ours {
 		for _, txt := range texts {

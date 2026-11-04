@@ -64,6 +64,9 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		// Doc 06 §11: browsers reach the API only through the console's
+		// same-origin proxy, so no other site may embed or read a response.
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }

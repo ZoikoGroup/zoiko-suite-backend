@@ -190,16 +190,59 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable
         run: |
-          go test -json -count=1 ./... | go run ./cmd/skipcheck -allowlist testdata/skip-allowlist.txt
-          go run ./cmd/evalrun -repeats 3 -sha "${{ github.sha }}" -out eval-report.json
+          go test -json -count=1 ./... | tee test.json | go run ./cmd/skipcheck -allowlist testdata/skip-allowlist.txt
+          # Doc 06 §26, Doc 07 §34: every P0 test ID mapped to Go tests passed.
+          go run ./cmd/traceability -csv ../../docs/suivo/sec-t-traceability.csv -json test.json
+          # Doc 07 §37: a regression against the approved baseline is NO_GO.
+          go run ./cmd/evalrun -repeats 3 -sha "${{ github.sha }}" -baseline testdata/golden/baseline.json -out eval-report.json
 
       - name: Upload eval report (public-ai-svc)
         if: always() && matrix.service == 'public-ai-svc'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: public-ai-eval-report
           path: services/public-ai-svc/eval-report.json
           if-no-files-found: ignore
+
+      # Doc 08 App. C operational drills (DR-01..DR-07) on the in-memory
+      # store; the report is release evidence (kbctl manifest -drill).
+      # cmd/canary needs a running server, so it is not run here.
+      - name: Operational drills (public-ai-svc)
+        if: matrix.service == 'public-ai-svc'
+        working-directory: services/${{ matrix.service }}
+        run: go run ./cmd/drill -out drill-report.json
+
+      - name: Upload drill report (public-ai-svc)
+        if: always() && matrix.service == 'public-ai-svc'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: public-ai-drill-report
+          path: services/public-ai-svc/drill-report.json
+          if-no-files-found: ignore
+
+      # Doc 08 §13: alert rules are validated and unit-tested (burn-rate
+      # replays, absent data). promtool comes from a pinned Prometheus
+      # release checked against a pinned SHA-256, like Trivy below.
+      - name: Install promtool (public-ai-svc)
+        if: matrix.service == 'public-ai-svc'
+        env:
+          PROM_VERSION: "3.15.0"
+          PROM_SHA256: 2a542df32eac02ee17b9d844fb2aa1de00dafa5476579ba8a3ba862e9d572ea0
+        run: |
+          cd "$RUNNER_TEMP"
+          tarball="prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
+          curl -sSfLO "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${tarball}"
+          echo "${PROM_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" "prometheus-${PROM_VERSION}.linux-amd64/promtool"
+          sudo install -m 0755 "prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+
+      - name: Alert rules check and unit tests (public-ai-svc)
+        if: matrix.service == 'public-ai-svc'
+        run: |
+          promtool check rules deployments/prometheus-rules-public-ai.yml
+          promtool check config --syntax-only deployments/prometheus-public-ai.yml
+          promtool test rules deployments/prometheus-rules-public-ai.test.yml
 
       - name: Integration test — health probes with embedded Postgres
         if: matrix.service == 'audit-event-store-svc' || matrix.service == 'workflow-history-svc'
@@ -247,10 +290,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: services/public-ai-svc/go.mod
           cache-dependency-path: services/public-ai-svc/go.sum
@@ -258,6 +301,20 @@ jobs:
       - name: govulncheck
         working-directory: services/public-ai-svc
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      # Static analysis (Doc 08 §07): HIGH-severity findings fail the build.
+      - name: gosec (HIGH)
+        working-directory: services/public-ai-svc
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.29.0 -quiet -severity high -confidence medium -exclude-dir=testdata ./...
+
+      # Dependency licences (Doc 08 §07). Report-only until the allowed
+      # licence policy is approved; the report is kept as evidence.
+      - name: go-licenses report (report-only)
+        working-directory: services/public-ai-svc
+        continue-on-error: true
+        run: |
+          go run github.com/google/go-licenses/v2@v2.0.1 report ./... > licenses.csv
+          go run github.com/google/go-licenses/v2@v2.0.1 check ./... --disallowed_types=forbidden,restricted,unknown
 
       - name: CycloneDX SBOM
         working-directory: services/public-ai-svc
@@ -287,10 +344,12 @@ jobs:
 
       - name: Upload SBOM
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: public-ai-sbom
-          path: services/public-ai-svc/sbom.cdx.json
+          path: |
+            services/public-ai-svc/sbom.cdx.json
+            services/public-ai-svc/licenses.csv
           if-no-files-found: ignore
 
   # ─── INT certification (ZS-SVC-M-001) ────────────────────────────────────────

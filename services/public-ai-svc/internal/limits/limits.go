@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,15 +38,78 @@ type limiter struct {
 	mu      sync.Mutex
 	perMin  float64
 	burst   float64
+	maxKeys int
 	buckets map[string]*bucket
 }
+
+// idleTTL: a bucket untouched this long has refilled completely, so
+// dropping it changes no decision (SEC-T046: keys are not kept longer than
+// the limit needs them).
+const idleTTL = 10 * time.Minute
+
+// DefaultMaxKeys is the hard cap on buckets per limiter, so a flood of
+// distinct addresses cannot grow memory without bound.
+const DefaultMaxKeys = 100_000
+
+// SessionCreatePerIPPerMinute is the tighter per-address limit on
+// POST /sessions (Doc 06 §13, SEC-T055): creating sessions is cheap for an
+// attacker and each one carries a grant, so it is limited separately from
+// the general per-IP limit.
+const SessionCreatePerIPPerMinute = 10
 
 func newLimiter(perMin int) *limiter {
 	b := float64(perMin) / 4
 	if b < 3 {
 		b = 3
 	}
-	return &limiter{perMin: float64(perMin), burst: b, buckets: map[string]*bucket{}}
+	return &limiter{perMin: float64(perMin), burst: b, maxKeys: DefaultMaxKeys, buckets: map[string]*bucket{}}
+}
+
+// sweep drops buckets idle for idleTTL; it returns how many remain.
+func (l *limiter) sweep(now time.Time) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sweepLocked(now)
+	return len(l.buckets)
+}
+
+func (l *limiter) sweepLocked(now time.Time) {
+	for k, b := range l.buckets {
+		if now.Sub(b.last) > idleTTL {
+			delete(l.buckets, k)
+		}
+	}
+}
+
+// makeRoomLocked keeps the map under maxKeys before a new key is added:
+// idle buckets go first; if the map is still full the least recently used
+// tenth is evicted in one pass, so the cost is amortised under a flood.
+// Evicting the oldest (not refusing new keys) keeps a flood of fresh
+// addresses from locking out legitimate new visitors.
+func (l *limiter) makeRoomLocked(now time.Time) {
+	if l.maxKeys <= 0 || len(l.buckets) < l.maxKeys {
+		return
+	}
+	l.sweepLocked(now)
+	if len(l.buckets) < l.maxKeys {
+		return
+	}
+	type entry struct {
+		k    string
+		last time.Time
+	}
+	all := make([]entry, 0, len(l.buckets))
+	for k, b := range l.buckets {
+		all = append(all, entry{k, b.last})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].last.Before(all[j].last) })
+	n := len(all) - l.maxKeys + 1
+	if tenth := l.maxKeys / 10; n < tenth {
+		n = tenth
+	}
+	for _, e := range all[:n] {
+		delete(l.buckets, e.k)
+	}
 }
 
 // allow takes one token for key, or returns the wait until one is available.
@@ -55,15 +119,9 @@ func (l *limiter) allow(key string, now time.Time) (bool, time.Duration) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.buckets) > 100_000 { // bound memory: drop idle buckets
-		for k, b := range l.buckets {
-			if now.Sub(b.last) > 10*time.Minute {
-				delete(l.buckets, k)
-			}
-		}
-	}
 	b, ok := l.buckets[key]
 	if !ok {
+		l.makeRoomLocked(now)
 		b = &bucket{tokens: l.burst, last: now}
 		l.buckets[key] = b
 	}
@@ -82,14 +140,15 @@ func (l *limiter) allow(key string, now time.Time) (bool, time.Duration) {
 
 // Guard holds the limiters.
 type Guard struct {
-	ip, sess *limiter
-	trusted  []*net.IPNet
-	inFlight atomic.Int64
-	store    store.Store
-	flags    interface{ Values() flags.Values }
-	daily    int64
-	monthly  int64
-	now      func() time.Time
+	ip, sess   *limiter
+	sessCreate *limiter // POST /sessions per address (SEC-T055)
+	trusted    []*net.IPNet
+	inFlight   atomic.Int64
+	store      store.Store
+	flags      interface{ Values() flags.Values }
+	daily      int64
+	monthly    int64
+	now        func() time.Time
 }
 
 // New builds a Guard from configuration.
@@ -102,8 +161,35 @@ func New(cfg config.Config, st store.Store, fl interface{ Values() flags.Values 
 	}
 	return &Guard{
 		ip: newLimiter(cfg.RateLimitPerIPPerMinute), sess: newLimiter(cfg.RateLimitPerSessionPerMin), trusted: trusted,
-		store: st, flags: fl, daily: cfg.DailyTokenCeiling, monthly: cfg.MonthlyTokenCeiling,
+		sessCreate: newLimiter(SessionCreatePerIPPerMinute), store: st, flags: fl, daily: cfg.DailyTokenCeiling, monthly: cfg.MonthlyTokenCeiling,
 		now: time.Now,
+	}
+}
+
+// RunSweeper drops idle buckets from every limiter each interval until ctx
+// is done (SEC-T046): without it, keys of visitors who left would stay in
+// memory until the hard cap forced an eviction.
+func (g *Guard) RunSweeper(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		every = time.Minute
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			g.Sweep()
+		}
+	}
+}
+
+// Sweep drops buckets idle for longer than idleTTL from every limiter.
+func (g *Guard) Sweep() {
+	now := g.now()
+	for _, l := range []*limiter{g.ip, g.sess, g.sessCreate} {
+		l.sweep(now)
 	}
 }
 
@@ -187,10 +273,18 @@ func tooMany(w http.ResponseWriter, r *http.Request, wait time.Duration) {
 func (g *Guard) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		now := g.now()
-		if ok, wait := g.ip.allow(clientKey(g.clientIP(r)), now); !ok {
+		ipKey := clientKey(g.clientIP(r))
+		if ok, wait := g.ip.allow(ipKey, now); !ok {
 			metrics.RateLimited("ip")
 			tooMany(w, r, wait)
 			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/public-ai/v1/sessions" {
+			if ok, wait := g.sessCreate.allow(ipKey, now); !ok {
+				metrics.RateLimited("session_create")
+				tooMany(w, r, wait)
+				return
+			}
 		}
 		if grant := r.Header.Get("X-Public-Chat-Session"); grant != "" {
 			sum := sha256.Sum256([]byte(grant)) // never keep the grant itself
@@ -254,6 +348,13 @@ func (g *Guard) spendStage(ctx context.Context) (stage string, failed bool) {
 	if err != nil {
 		return "", true
 	}
+	ratio := func(window string, used, limit int64) {
+		if limit > 0 {
+			metrics.SetSpendRatio(window, float64(used)/float64(limit))
+		}
+	}
+	ratio("day", d, g.daily) // drives the 50/80/100 % spend alerts (SEC-T054)
+	ratio("month", m, g.monthly)
 	at := func(used, limit int64, num, den int64) bool { return limit > 0 && used*den >= limit*num }
 	switch {
 	case at(d, g.daily, 1, 1) || at(m, g.monthly, 1, 1):

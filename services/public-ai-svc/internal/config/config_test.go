@@ -91,7 +91,95 @@ func TestNonDevRequiresDatabase(t *testing.T) {
 		t.Fatalf("non-dev must refuse an in-memory fallback: %v", err)
 	}
 	c.DatabaseURL = "postgres://example/public_ai"
+	c.AllowedOrigins = []string{"https://www.zoikosuite.example"}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("valid production config refused: %v", err)
+	}
+}
+
+// validProduction is a production config that passes every gate.
+func validProduction(t *testing.T) Config {
+	t.Helper()
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Environment, c.RetentionSet = "production", true
+	c.ModelProvider, c.GroqAPIKey = "groq", "test-key"
+	c.ModelID = c.AllowedModelIDs[0]
+	c.PolicyDigest = "policy-digest"
+	c.AllowedHosts = []string{"assistant.example.test"}
+	c.ProviderApprovalRef, c.ProviderRegion, c.ApprovedRegions = "DPA-2026-01", "eu-west", []string{"eu-west"}
+	c.KBAllowDraft, c.SeedOnStart, c.StructuredResponseDev = false, false, false
+	c.DatabaseURL = "postgres://example/public_ai"
+	c.AllowedOrigins = []string{"https://www.zoikosuite.example"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("baseline production config refused: %v", err)
+	}
+	return c
+}
+
+// SEC-P0-09, D06-09: outside dev/test every limit is set (> 0) and every
+// allowed origin is https and not localhost.
+func TestProductionLimitsAndOrigins(t *testing.T) {
+	zero := map[string]func(*Config){
+		"PUBLIC_AI_RATE_LIMIT_IP_PER_MIN":      func(c *Config) { c.RateLimitPerIPPerMinute = 0 },
+		"PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN": func(c *Config) { c.RateLimitPerSessionPerMin = -1 },
+		"PUBLIC_AI_DAILY_TOKEN_CEILING":        func(c *Config) { c.DailyTokenCeiling = 0 },
+		"PUBLIC_AI_MONTHLY_TOKEN_CEILING":      func(c *Config) { c.MonthlyTokenCeiling = 0 },
+		"PUBLIC_AI_SESSION_TOKEN_CAP":          func(c *Config) { c.SessionTokenCap = 0 },
+		"PUBLIC_AI_TOKEN_BUDGET_PER_TURN":      func(c *Config) { c.TokenBudgetPerTurn = 0 },
+	}
+	for name, mut := range zero {
+		c := validProduction(t)
+		mut(&c)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s <= 0 in production: %v", name, err)
+		}
+	}
+	for _, o := range []string{"http://www.zoikosuite.example", "https://localhost:3000", "https://127.0.0.1", "https://app.localhost", "https://x.example/path", "www.zoikosuite.example"} {
+		c := validProduction(t)
+		c.AllowedOrigins = []string{"https://www.zoikosuite.example", o}
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "ALLOWED_ORIGINS") {
+			t.Errorf("origin %q in production: %v", o, err)
+		}
+	}
+	// dev keeps the localhost console origin and the dev defaults.
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.RateLimitPerIPPerMinute = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("dev must keep working with localhost origins and unset limits: %v", err)
+	}
+}
+
+// Doc 08 §11, OPR-012: drain (5 s) + 2 x model timeout + 15 s must fit the
+// 45 s stop grace period, so the model timeout is at most 12.5 s.
+func TestModelTimeoutFitsStopGrace(t *testing.T) {
+	if got := DrainGrace + 2*MaxModelTimeout + ShutdownSlack; got > StopGracePeriod {
+		t.Fatalf("bound is wrong: %s > %s", got, StopGracePeriod)
+	}
+	t.Setenv("PUBLIC_AI_MODEL_TIMEOUT", "12s")
+	if _, err := Load(); err != nil {
+		t.Fatalf("12s timeout refused: %v", err)
+	}
+	t.Setenv("PUBLIC_AI_MODEL_TIMEOUT", "13s")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_MODEL_TIMEOUT") {
+		t.Fatalf("13s timeout must be refused: %v", err)
+	}
+}
+
+// Doc 06 §12: the admin listener is optional and never the public address.
+func TestAdminAddr(t *testing.T) {
+	t.Setenv("PUBLIC_AI_ADMIN_ADDR", "127.0.0.1:9101")
+	c, err := Load()
+	if err != nil || c.AdminAddr != "127.0.0.1:9101" {
+		t.Fatalf("admin addr: %q %v", c.AdminAddr, err)
+	}
+	c.AdminAddr = c.HTTPAddr
+	if err := c.Validate(); err == nil {
+		t.Fatal("admin addr equal to the public addr must be refused")
 	}
 }

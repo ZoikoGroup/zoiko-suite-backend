@@ -14,6 +14,7 @@ import (
 	"os"
 	"time"
 
+	"zoiko.io/public-ai-svc/internal/config"
 	"zoiko.io/public-ai-svc/internal/eval"
 	"zoiko.io/public-ai-svc/internal/fixtureenv"
 )
@@ -38,7 +39,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "evalrun:", err)
 		os.Exit(2)
 	}
-	opts := eval.Options{Repeats: *repeats, ModelProfile: "fake-v0", GitSHA: *sha}
+	// The in-process stack runs the deterministic mock provider; the profile
+	// names it the way the server and the release manifest do, so kbctl
+	// manifest refuses this report for any other model (Doc 08 §06).
+	profile := config.ModelProfile("mock", config.MockModelID)
+	opts := eval.Options{Repeats: *repeats, ModelProfile: profile, ModelID: config.MockModelID, GitSHA: *sha}
 	if *waivers != "" {
 		if err := readJSON(*waivers, &opts.Waivers); err != nil {
 			fmt.Fprintln(os.Stderr, "evalrun: waivers:", err)

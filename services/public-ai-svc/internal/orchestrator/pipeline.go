@@ -2,11 +2,10 @@ package orchestrator
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/metrics"
 	"zoiko.io/public-ai-svc/internal/model"
 	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/release"
@@ -48,6 +48,12 @@ type Pipeline struct {
 	Now      func() time.Time
 	// MaxOutputTokens bounds generation (token budget per turn).
 	MaxOutputTokens int
+	// PolicyVersion is sent with every model request (Doc 05 §19); empty means
+	// the pinned default.
+	PolicyVersion string
+	// ModelID and AppVersion complete the release tuple on each decision
+	// record (Doc 08 §06).
+	ModelID, AppVersion string
 }
 
 // Security signal reason classes (no prompt content).
@@ -63,6 +69,13 @@ func (p *Pipeline) now() time.Time {
 		return p.Now()
 	}
 	return time.Now().UTC()
+}
+
+func (p *Pipeline) policyVersion() string {
+	if p.PolicyVersion != "" {
+		return p.PolicyVersion
+	}
+	return "pub-policy-1.0"
 }
 
 func (p *Pipeline) log() *zap.Logger {
@@ -98,9 +111,17 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	}
 	// Doc 06 §27, Doc 08 §14: one decision record per turn, enums and ids
 	// only; visitor text never reaches logs, traces or metrics (A39).
+	claimIDs, sourceIDs, route := decisionRefs(r)
 	p.log().Info("policy_decision", zap.String("request_id", in.RequestID), zap.String("intent", r.IntentID),
 		zap.String("status", string(r.Status)), zap.String("reason", r.Reason), zap.String("answer_class", r.AnswerClass),
-		zap.String("budget", in.Budget), zap.Int("citations", len(r.Citations)), zap.String("security_signal", r.SecuritySignal))
+		zap.String("budget", in.Budget), zap.Int("citations", len(r.Citations)), zap.String("security_signal", r.SecuritySignal),
+		// Doc 03 §22, Doc 04 §16, Doc 08 §06: the release tuple and the ids the
+		// answer rests on, never text.
+		zap.String("release_kb", r.KnowledgeReleaseID), zap.String("release_claims", p.claimsRelease()),
+		zap.String("policy_version", p.policyVersion()), zap.String("prompt_version", model.PromptVersion),
+		zap.String("model_id", p.ModelID), zap.String("app_version", p.AppVersion),
+		zap.Strings("claim_ids", claimIDs), zap.Strings("source_version_ids", sourceIDs), zap.String("handoff_route", route),
+		zap.Int64("tokens", r.Tokens))
 	if policy.HasContact(in.Message) && r.Status != contract.Unavailable && !strings.Contains(r.Text, policy.ContactNotice) {
 		// Doc 10 §21: contact details were masked, not kept; say so.
 		r.Text = strings.TrimSpace(r.Text + "\n\n" + policy.ContactNotice)
@@ -111,6 +132,10 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		attribute.String("suivo.intent", r.IntentID),
 		attribute.String("suivo.release.kb", r.KnowledgeReleaseID),
 		attribute.String("suivo.release.policy", model.PromptVersion),
+		attribute.String("suivo.release.claims", p.claimsRelease()),
+		attribute.String("suivo.release.policy_version", p.policyVersion()),
+		attribute.String("suivo.release.model", p.ModelID),
+		attribute.String("suivo.release.app", p.AppVersion),
 		attribute.String("suivo.answer_class", r.AnswerClass),
 		attribute.String("suivo.retrieval.mode", r.Diag.RetrievalMode),
 		attribute.Int("suivo.retrieval.count", len(r.Diag.EvidenceIDs)),
@@ -189,6 +214,11 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		case policy.X01PrivateAction, policy.X02ActionDenied:
 			res.Pending = &Pending{Refused: true}
 		}
+		// Doc 02 S05/S09: a fixed second sentence keeps the other part of a
+		// two-part question visible without answering it.
+		if extra := policy.SecondarySentence(dec.Exception, dec.Primary, dec.Redaction.Text); extra != "" {
+			res.Text += " " + extra
+		}
 		switch dec.Exception {
 		case policy.X01PrivateAction, policy.X02ActionDenied, policy.X04RegulatedAdvice, policy.X07CrossProduct, policy.X08ClaimVerification:
 			// Doc 02 S05: the exception leads; the product topic is logged
@@ -208,7 +238,23 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		res.Suggestions = chips
 		return res
 	}
+	if policy.UptimeQuestionRe.MatchString(dec.Redaction.Text) {
+		// Doc 02 T27: an uptime or SLA figure is never inferred.
+		return p.fromTemplate(policy.TplUptime, "I12", snap, market, now, releaseID)
+	}
 	intent := dec.Primary
+	if (intent == "I12" || intent == "I16") && policy.ReadinessRe.MatchString(dec.Redaction.Text) {
+		// Doc 02 S03: readiness is not certification.
+		return p.fromTemplate(policy.TplReadiness, "I12", snap, market, now, releaseID)
+	}
+	if dec.Slots.PlanName != "" && !policy.AsksPrice(dec.Redaction.Text) && policy.EntitlementRe.MatchString(dec.Redaction.Text) {
+		// Doc 01 AT-12: plan and configuration qualifiers, plus the comparison.
+		return p.fromTemplate(policy.TplPlanEntitlement, "I05", snap, market, now, releaseID)
+	}
+	if intent == "I29" && policy.IsNonEnglish(dec.Redaction.Text) {
+		// Doc 02 §23: English fallback where the language has no approved content.
+		return p.fromTemplate(policy.TplNonEnglish, intent, snap, market, now, releaseID)
+	}
 	if intent == "I29" && policy.IsModuleQuestion(dec.Redaction.Text) {
 		// Fallback ladder: rules -> (model classifier, none in R0) -> a named
 		// area, module or alias -> only then out of scope.
@@ -243,7 +289,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			dec.Slots.Integration = pd.Integration
 		}
 	}
-	if intent == "I29" && !carried && dec.Slots.MarketCode != "" {
+	if intent == "I29" && !carried && dec.Slots.MarketCode != "" && !strings.Contains(in.Message, "?") {
 		// Doc 02 §10: "We're evaluating ZoikoSuite for the US." The market
 		// is kept for the session; coverage is never implied.
 		tpl := policy.TplMarketNoted
@@ -281,8 +327,18 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	if fv.DisabledIntents[intent] {
 		return because(p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), contract.ReasonIntentDisabled)
 	}
+	if intent == "I23" || intent == "I24" || intent == "I21" {
+		if tpl, ok := policy.SupportTemplate(dec.Redaction.Text); ok {
+			return p.fromTemplate(tpl, "I23", snap, market, now, releaseID)
+		}
+	}
 	if tpl, ok := policy.RouteTemplates[intent]; ok {
-		return p.fromTemplate(tpl, intent, snap, market, now, releaseID)
+		res := p.fromTemplate(tpl, intent, snap, market, now, releaseID)
+		if intent == "I24" {
+			// Doc 02 T26 asks which team; the three answers are chips.
+			res.Suggestions = policy.SuggestTeams
+		}
+		return res
 	}
 	// P1 claims first (Doc 05 §11 step 3).
 	var verified []claims.Claim
@@ -300,7 +356,9 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			if (req.Subject == claims.Price || req.Subject == claims.Trial) && !fv.PricingClaimsEnabled {
 				return because(p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, "pricing"), intent, snap, market, now, releaseID), contract.ReasonPricingDisabled)
 			}
+			claimStart := time.Now()
 			d := snap.Claims.Resolve(req, snap)
+			metrics.ObserveStage("claims", time.Since(claimStart))
 			diag.ClaimVerdict = d.Decision
 			switch d.Decision {
 			case claims.MarketRequired:
@@ -387,8 +445,16 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			// the fixed general question for the pending intent instead.
 			qtext = overviewQuery[intent]
 		}
-		kq := knowledge.Query{Text: qtext, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4, IntentID: intent}
+		// Doc 03 §14 step 4: a chunk scoped to other plans is not evidence for
+		// the plan the visitor named.
+		plan := ""
+		if dec.Slots.PlanName != "" && snap.Claims != nil {
+			plan = snap.Claims.PlanCode(dec.Slots.PlanName)
+		}
+		kq := knowledge.Query{Text: qtext, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4, IntentID: intent, Plan: plan}
+		searchStart := time.Now()
 		r := snap.Retriever.Retrieve(ctx, kq, snap)
+		metrics.ObserveStage("retrieval", time.Since(searchStart))
 		if r.Answerability == knowledge.NotFound && intent != "I29" {
 			r = snap.Retriever.ByIntent(kq, snap)
 		}
@@ -414,6 +480,11 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		}
 		switch r.Answerability {
 		case knowledge.Answerable:
+			if intent == "I29" {
+				// Doc 02 §16: an off-topic message is not answered from an
+				// article that only shares a word with it (T25).
+				return p.fromTemplate(policy.TplOutOfScope, intent, snap, market, now, releaseID)
+			}
 			hits = withNeighbor(snap.KB, r.Hits, kq, snap)
 			if regionalIntents[intent] && market != "" && !hasMarketEvidence(hits, market) {
 				// G12/G13: a named country needs country-specific evidence; never assume coverage.
@@ -548,7 +619,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 }
 
 func (p *Pipeline) generate(ctx context.Context, intent, msg string, cards []model.ClaimCard, evidence []model.Evidence, reduced bool) (string, model.Draft, error) {
-	req := model.Request{PolicyVersion: "pub-policy-1.0", IntentID: intent, Message: msg, Claims: cards, Evidence: evidence, MaxOutputTokens: p.MaxOutputTokens}
+	req := model.Request{PolicyVersion: p.policyVersion(), IntentID: intent, Message: msg, Claims: cards, Evidence: evidence, MaxOutputTokens: p.MaxOutputTokens}
 	attempts := 2 // one repair attempt within budget
 	if reduced {
 		// Stage 1 of Doc 06 §13: half the output, no repair attempt.
@@ -559,13 +630,17 @@ func (p *Pipeline) generate(ctx context.Context, intent, msg string, cards []mod
 	// they were used and are charged (A24, Doc 06 §13).
 	var spent model.Draft
 	for attempt := 0; attempt < attempts; attempt++ {
+		modelStart := time.Now()
 		d, err := p.Model.Generate(ctx, req)
+		metrics.ObserveStage("model", time.Since(modelStart))
 		if err != nil {
 			return "", spent, providerError{err}
 		}
 		spent.InputTokens += d.InputTokens
 		spent.OutputTokens += d.OutputTokens
+		validateStart := time.Now()
 		text, verr := validate.Check(d, cards, evidence)
+		metrics.ObserveStage("validate", time.Since(validateStart))
 		if verr == nil {
 			d.InputTokens, d.OutputTokens = spent.InputTokens, spent.OutputTokens
 			return text, d, nil
@@ -591,16 +666,57 @@ func isProviderError(err error) bool {
 	return ok
 }
 
+// claimsRelease is the active claim release id, or "" when none is loaded.
+func (p *Pipeline) claimsRelease() string {
+	if p.Releases == nil {
+		return ""
+	}
+	snap, err := p.Releases.Snapshot()
+	if err != nil || snap.Claims == nil {
+		return ""
+	}
+	return snap.Claims.ReleaseID()
+}
+
+// decisionRefs lists the claim ids, cited source versions and offered route
+// of a turn, for the decision record.
+func decisionRefs(r Result) (claimIDs, sourceIDs []string, route string) {
+	claimIDs, sourceIDs = []string{}, []string{}
+	for _, c := range r.Citations {
+		claimIDs = append(claimIDs, c.ClaimIDs...)
+		sourceIDs = append(sourceIDs, c.SourceVersionID)
+	}
+	if len(r.Actions) > 0 {
+		route = r.Actions[0].RouteKey
+	}
+	return claimIDs, sourceIDs, route
+}
+
 // citations returns ≤3 citations backed by what the answer actually used,
 // plus the source ids to re-check at commit.
 func (p *Pipeline) citations(snap *release.Snapshot, verified []claims.Claim, hits []knowledge.Hit, d model.Draft) ([]contract.Citation, []string) {
 	var out []contract.Citation
 	var ids []string
 	bySource := map[string]int{}
+	seenSource := map[string]bool{}
 	add := func(svid, urlKey, claimID string) {
-		if i, ok := bySource[svid]; ok {
-			if claimID != "" {
+		// Doc 03 §14 step 8, KB-026: one link per distinct page. Sources that
+		// share a url_key merge, but every source id is still re-checked for
+		// revocation at commit.
+		key := urlKey
+		if key == "" {
+			key = svid
+		}
+		if i, ok := bySource[key]; ok {
+			if claimID != "" && !slices.Contains(out[i].ClaimIDs, claimID) {
 				out[i].ClaimIDs = append(out[i].ClaimIDs, claimID)
+			}
+			if !seenSource[svid] {
+				seenSource[svid] = true
+				if s, ok := snap.KB.Source(svid); ok {
+					ids = append(ids, s.SourceID)
+				}
+				ids = append(ids, svid)
 			}
 			return
 		}
@@ -611,7 +727,8 @@ func (p *Pipeline) citations(snap *release.Snapshot, verified []claims.Claim, hi
 		if claimID != "" {
 			c.ClaimIDs = append(c.ClaimIDs, claimID)
 		}
-		bySource[svid] = len(out)
+		bySource[key] = len(out)
+		seenSource[svid] = true
 		out = append(out, c)
 		if s, ok := snap.KB.Source(svid); ok {
 			ids = append(ids, s.SourceID)
@@ -643,11 +760,27 @@ func (p *Pipeline) actions(snap *release.Snapshot, routeKey, market string, now 
 	if routeKey == "" || snap == nil {
 		return []contract.Action{}
 	}
+	if commercialRoutes[routeKey] && p.Flags != nil && !p.Flags.Values().CommercialRoutes {
+		// Doc 10 App. B: with commercial_routes_enabled off, demo, pricing and
+		// trial CTAs fall back to the general support route.
+		routeKey = "support"
+	}
 	if _, ok := snap.Route(routeKey, market, now); !ok {
-		return []contract.Action{} // missing/unpublished route → hide the CTA
+		// Sign-in (Doc 02 T17/T21) falls back to the support route where the
+		// release has no sign-in page; any other missing route hides the CTA.
+		if routeKey != "sign-in" {
+			return []contract.Action{}
+		}
+		if _, ok := snap.Route("support", market, now); !ok {
+			return []contract.Action{}
+		}
+		routeKey = "support"
 	}
 	return []contract.Action{{Type: contract.ActionOpenRoute, RouteKey: routeKey}}
 }
+
+// commercialRoutes are the CTAs gated by commercial_routes_enabled.
+var commercialRoutes = map[string]bool{"demo": true, "pricing": true, "signup_or_trial": true}
 
 // qualify derives the answer class and governed status label from the claims
 // that backed an ANSWERED turn (Master prompt §4.1). Labels come only from the
@@ -797,12 +930,38 @@ func (p *Pipeline) recordConflict(ctx context.Context, req claims.Request, d cla
 	if p.Store == nil {
 		return
 	}
-	key := strings.Join([]string{req.Subject, req.SubjectID, req.Market, req.BillingTerm}, "|")
-	sum := sha256.Sum256([]byte(key + "|" + strings.Join(d.ConflictKeys, ",")))
-	// Doc 03 §16: the claim stays blocked and the case has an owner.
+	// Doc 03 §16: the claim stays blocked and the case has an owner. The id
+	// and detection type match the load-time scan (release.ScanConflicts), so
+	// the same problem is one case, not two.
+	kind, key, ids := release.DetectClaimConflict, "", append([]string(nil), d.ConflictKeys...)
+	sort.Strings(ids)
+	var m claims.Manifest
+	if snap, err := p.Releases.Snapshot(); err == nil && snap.Claims != nil {
+		m = snap.Claims.Manifest()
+		if req.Subject == claims.Price && snap.Claims.Disputed(req.SubjectID) {
+			// A published page contradicts the signed price (KB-003).
+			kind, key, ids = release.DetectAuthorityMismatch, "PRICE|"+req.SubjectID, nil
+			for _, c := range m.Claims {
+				if c.ClaimType == claims.Price && c.SubjectID == req.SubjectID && c.Status == claims.StatusActive {
+					ids = append(ids, c.ClaimID)
+				}
+			}
+			sort.Strings(ids)
+		}
+	}
+	if key == "" {
+		for _, c := range m.Conflicts() {
+			if slices.Equal(c.ClaimIDs, ids) {
+				key = c.SubjectKey
+			}
+		}
+	}
+	if key == "" {
+		key = strings.Join([]string{req.Subject, req.SubjectID, req.Market, req.BillingTerm}, "|")
+	}
 	err := p.Store.RecordConflict(ctx, store.Conflict{
-		ConflictID: "conf-" + hex.EncodeToString(sum[:8]), SubjectKey: key, ClaimIDs: d.ConflictKeys,
-		DetectionType: "AUTHORITY_MISMATCH", Severity: "HIGH", ResolutionState: "OPEN", DetectedAt: now,
+		ConflictID: release.ConflictID(kind, key, ids), SubjectKey: key, ClaimIDs: ids,
+		DetectionType: kind, Severity: "HIGH", ResolutionState: "OPEN", DetectedAt: now,
 		BlockedClaim: true, AssignedOwner: release.OwnerFor(req.Subject, ""),
 	})
 	if err != nil {

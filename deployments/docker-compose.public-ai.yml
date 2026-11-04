@@ -15,7 +15,7 @@ name: public-ai
 
 services:
   public-ai-postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
     container_name: public-ai-postgres
     environment:
       POSTGRES_DB: public_ai
@@ -51,7 +51,6 @@ services:
       PUBLIC_AI_HTTP_ADDR: ":8080"
       PUBLIC_AI_DATABASE_URL: postgres://public_ai_app:${PUBLIC_AI_DB_PASSWORD}@public-ai-postgres:5432/public_ai?sslmode=disable
       PUBLIC_AI_ALLOWED_ORIGINS: ${PUBLIC_AI_ALLOWED_ORIGINS:-http://localhost:3000}
-      PUBLIC_AI_MODEL_PROFILE: fake-v0
       PUBLIC_AI_SIGNING_PUBLIC_KEY: ${PUBLIC_AI_SIGNING_PUBLIC_KEY:?set PUBLIC_AI_SIGNING_PUBLIC_KEY}
       PUBLIC_AI_KAFKA_BROKERS: ${PUBLIC_AI_KAFKA_BROKERS:-}
       PUBLIC_AI_LOG_RAW_PROMPT: "false"
@@ -69,6 +68,32 @@ services:
     mem_limit: 256m
     restart: unless-stopped
 
+  # Doc 08 §13-14: Prometheus for this isolated stack only (INV-01). It
+  # scrapes public-ai-svc on the public-ai network and evaluates the
+  # assistant's alert rules (prometheus-rules-public-ai.yml, unit-tested in
+  # CI with promtool). Image pinned by digest (prom/prometheus v3.15.0).
+  public-ai-prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    container_name: public-ai-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus-public-ai.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-rules-public-ai.yml:/etc/prometheus/prometheus-rules-public-ai.yml:ro
+      - public-ai-prometheus-data:/prometheus
+    depends_on:
+      - public-ai-svc
+    ports:
+      - "127.0.0.1:9091:9090"
+    networks: [public-ai]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    restart: unless-stopped
+
 networks:
   public-ai:
     name: public-ai
@@ -76,3 +101,4 @@ networks:
 
 volumes:
   public-ai-pgdata:
+  public-ai-prometheus-data:

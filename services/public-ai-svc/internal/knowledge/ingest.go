@@ -316,6 +316,9 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 		sort.Strings(missing)
 		return StateRejectUnregistered, "missing " + strings.Join(missing, ", ")
 	}
+	if bad := badScope(s); bad != "" {
+		return StateRejectUnregistered, bad
+	}
 	u, err := url.Parse(s.OriginURI)
 	if err != nil || u.Scheme != "https" || !hostAllowed(cfg.AllowedHosts, u.Hostname()) {
 		return StateQuarantineFetch, "origin_uri is not an allowlisted https host"
@@ -355,7 +358,7 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 			return StateHoldApproval, "owner may not approve own source"
 		}
 	}
-	if !draft && s.AuthorityTier == "P1" && len(s.ApproverIDs) < 2 {
+	if !draft && s.AuthorityTier == "P1" && distinctIDs(s.ApproverIDs) < 2 {
 		return StateHoldApproval, "P1 sources need two approvers"
 	}
 	if !draft && (s.AuthorityTier == "P1" || highImpactSubjects[s.SubjectType]) && (s.ReviewDueAt == nil || s.ReviewDueAt.Before(now)) {
@@ -539,4 +542,37 @@ func readJSON(path string, v any) error {
 	dec := json.NewDecoder(strings.NewReader(string(b)))
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
+}
+
+// distinctIDs counts different non-blank approvers: the same person twice
+// is one approval, not two-person control (Doc 03 §10).
+func distinctIDs(ids []string) int {
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if id = strings.ToLower(strings.TrimSpace(id)); id != "" {
+			seen[id] = true
+		}
+	}
+	return len(seen)
+}
+
+var (
+	marketCodeRe = regexp.MustCompile(`^[A-Z]{2}$`)
+	// localeRe is the BCP-47 shape used here: language, optional script,
+	// optional region (en, en-US, zh-Hant-TW, es-419).
+	localeRe = regexp.MustCompile(`^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|\d{3}))?$`)
+)
+
+// badScope rejects scope labels a filter could not match reliably (Doc 03
+// §6): market codes are ISO 3166-1 alpha-2 or ALL, the locale is BCP-47.
+func badScope(s Source) string {
+	for _, m := range s.MarketCodes {
+		if m != MarketAll && !marketCodeRe.MatchString(m) {
+			return "market_codes must be ISO 3166-1 alpha-2 or ALL: " + m
+		}
+	}
+	if !localeRe.MatchString(s.Locale) {
+		return "locale is not a BCP-47 tag: " + s.Locale
+	}
+	return ""
 }

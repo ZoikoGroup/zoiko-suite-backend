@@ -1,12 +1,15 @@
 package release
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/store"
 )
 
 // EvalEvidence is the part of an eval report the promotion gate reads.
@@ -72,6 +75,54 @@ func gate(approvers []string, kind, releaseID string, op Operator, ev *EvalEvide
 	}
 	if kind == knowledge.KindKB && ev.ReleaseID != releaseID {
 		return fmt.Errorf("promotion denied: evaluation ran against %q, not %s", ev.ReleaseID, releaseID)
+	}
+	return nil
+}
+
+// auditScanLimit bounds how far back rollback verification reads the
+// control audit (newest first).
+const auditScanLimit = 100000
+
+// ErrNoPriorPromotion means a rollback names a release the control audit
+// never saw promoted for that kind.
+var ErrNoPriorPromotion = errors.New("rollback denied: no completed promotion of this release in the control audit")
+
+// VerifyRollback checks that releaseID was really promoted for kind before
+// (Doc 03 §11): -rollback is never taken on trust. A promotion followed by
+// its compensating promote-failed entry does not count.
+func VerifyRollback(ctx context.Context, st store.Store, kind, releaseID string) error {
+	entries, err := st.ListAudit(ctx, auditScanLimit)
+	if err != nil {
+		return fmt.Errorf("rollback denied: control audit unavailable: %w", err)
+	}
+	want := store.Hash([]byte(releaseID))
+	failed := 0
+	for _, e := range entries { // newest first: a failure is seen before its promote
+		if e.Target != kind || e.AfterHash != want {
+			continue
+		}
+		switch e.Action {
+		case AuditPromoteFailed:
+			failed++
+		case AuditPromote:
+			if failed > 0 {
+				failed--
+				continue
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s %s", ErrNoPriorPromotion, kind, releaseID)
+}
+
+// PromotionGateAudited is PromotionGate plus, for a rollback, proof from the
+// control audit that the release was promoted before.
+func PromotionGateAudited(ctx context.Context, st store.Store, kind, releaseID string, manifest []byte, op Operator, ev *EvalEvidence, rollback bool) error {
+	if err := PromotionGate(kind, releaseID, manifest, op, ev, rollback); err != nil {
+		return err
+	}
+	if rollback {
+		return VerifyRollback(ctx, st, kind, releaseID)
 	}
 	return nil
 }

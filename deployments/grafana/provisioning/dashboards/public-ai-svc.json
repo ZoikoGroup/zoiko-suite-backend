@@ -1,0 +1,1124 @@
+{
+  "uid": "public-ai-svc-ops",
+  "title": "public-ai-svc (Suivo assistant)",
+  "tags": [
+    "public-ai",
+    "suivo",
+    "slo"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "description": "Doc 08 \u00a715 (H17) operations dashboard for the public assistant. Every panel names its alert and runbook (RB-xx in services/public-ai-svc/RUNBOOK.md). The assistant runs in its own isolated stack (INV-01): choose the Prometheus datasource that scrapes public-ai-svc (public-ai-prometheus in docker-compose.public-ai.yml).",
+  "links": [
+    {
+      "title": "Runbook",
+      "type": "link",
+      "url": "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md",
+      "targetBlank": true
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "prometheus"
+        },
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Health and SLO (RB-09, RB-04, RB-01)",
+      "id": 1,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Scrape up",
+      "id": 2,
+      "description": "Prometheus can scrape /metrics. 0 fires PublicAIScrapeDown (runbook RB-09).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(up{job=\"public-ai-svc\"})",
+          "legendFormat": "targets up",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Release ready",
+      "id": 3,
+      "description": "public_ai_release_ready: verified knowledge and claim releases active and fresh. It reflects releases only; the kill switch does not change it (OPR-011). 0 fires PublicAIReleaseNotReady (runbook RB-04).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "min(public_ai_release_ready)",
+          "legendFormat": "ready",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Canary",
+      "id": 4,
+      "description": "Last synthetic canary run (cmd/canary -metrics-file). 0 fires PublicAICanaryFailing (runbook RB-10).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "min(public_ai_canary_success)",
+          "legendFormat": "canary",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Error ratio 1h",
+      "id": 5,
+      "description": "UNAVAILABLE turns excluding KILL_SWITCH over 1h, against the proposed 99.9% objective (budget 0.1%). Burn-rate alerts: 14.4x and 6x page and freeze promotion, 1x tickets (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "public_ai:turn_error_ratio:rate1h",
+          "legendFormat": "1h",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.006
+              },
+              {
+                "color": "red",
+                "value": 0.0144
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Kill-switch turns 1h",
+      "id": 6,
+      "description": "Turns answered with the typed KILL_SWITCH outcome in the last hour. Operator decision, not an error: excluded from the error budget (Doc 08 \u00a726).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(public_ai_turns_total{reason=\"KILL_SWITCH\"}[1h]))",
+          "legendFormat": "kill switch",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Build",
+      "id": 7,
+      "description": "App version and model profile of the running processes (release tuple, Doc 08 \u00a706). Absent for 10m fires PublicAIMetricsAbsent (runbook RB-09).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "count by (git_sha, model_profile) (public_ai_build_info)",
+          "legendFormat": "{{git_sha}} {{model_profile}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Error-budget burn rate",
+      "id": 8,
+      "description": "Error ratio divided by the 0.1% budget over 5m, 1h, 6h and 3d windows. Lines above 14.4 (fast) or 6 (sustained) page and freeze promotion; above 1 over 3d tickets (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "public_ai:turn_error_ratio:rate5m / 0.001",
+          "legendFormat": "5m",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "public_ai:turn_error_ratio:rate1h / 0.001",
+          "legendFormat": "1h",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "public_ai:turn_error_ratio:rate6h / 0.001",
+          "legendFormat": "6h",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "public_ai:turn_error_ratio:rate3d / 0.001",
+          "legendFormat": "3d",
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP requests by code",
+      "id": 9,
+      "description": "Public API and probe requests by status code. Sustained 5xx above 2% fires PublicAIServerErrors (runbook RB-09).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum by (code) (rate(public_ai_http_requests_total[$__rate_interval]))",
+          "legendFormat": "{{code}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Turns (RB-01, RB-02)",
+      "id": 10,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Turns by status",
+      "id": 11,
+      "description": "Completed turns by envelope status.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(public_ai_turns_total[$__rate_interval]))",
+          "legendFormat": "{{status}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Turns by reason",
+      "id": 12,
+      "description": "Completed turns by reason code (top 10). CLAIM_CONFLICT and EXPIRED_SOURCE route to knowledge owners (runbook RB-02); VALIDATION_FAILED spikes to RB-03.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (reason) (rate(public_ai_turns_total[$__rate_interval])))",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Latency (RB-01, RB-09)",
+      "id": 13,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Turn latency p50/p95/p99",
+      "id": 14,
+      "description": "Answered-turn latency. Target p95 <= 8 s (Doc 04); above fires PublicAIAnswerLatencyP95High (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 23
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(public_ai_turn_duration_seconds_bucket{status=\"ANSWERED\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(public_ai_turn_duration_seconds_bucket{status=\"ANSWERED\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(public_ai_turn_duration_seconds_bucket{status=\"ANSWERED\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Request latency p95 by route",
+      "id": 15,
+      "description": "Non-turn routes target p95 <= 0.5 s; above fires PublicAIGateLatencyP95High (runbook RB-09).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 23
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(public_ai_http_request_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{route}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Pipeline stage p95",
+      "id": 16,
+      "description": "Time per pipeline stage: retrieve, model, postgate (Doc 04 \u00a723). Model stage growth usually means provider degradation (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 23
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(public_ai_stage_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Model calls and spend (RB-01, RB-06)",
+      "id": 17,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Model calls by result",
+      "id": 18,
+      "description": "Model gateway calls: ok, timeout, transient, provider, circuit_open. More than 20% non-ok fires PublicAIModelErrors (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(public_ai_model_requests_total[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Model tokens",
+      "id": 19,
+      "description": "Tokens by direction. More than 500k in 1h fires PublicAITokenBurnHigh (runbook RB-06).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "targets": [
+        {
+          "expr": "sum by (direction) (rate(public_ai_model_tokens_total[$__rate_interval]))",
+          "legendFormat": "{{direction}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Spend vs ceiling",
+      "id": 20,
+      "description": "Token usage as a fraction of the daily and monthly ceiling. Alerts at 0.5, 0.8 and 1.0; at 1.0 generation is throttled to static content (SPEND_CEILING, runbook RB-06).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "targets": [
+        {
+          "expr": "max by (window) (public_ai_spend_ratio)",
+          "legendFormat": "{{window}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Claims and answer quality (RB-02)",
+      "id": 21,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Abstain rate",
+      "id": 22,
+      "description": "ABSTAIN share of turns, 1h versus the 7d baseline. More than double fires PublicAIAbstainRateShift (runbook RB-02).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 41
+      },
+      "targets": [
+        {
+          "expr": "public_ai:turn_abstain_ratio:rate1h",
+          "legendFormat": "1h",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "public_ai:turn_abstain_ratio:rate7d",
+          "legendFormat": "7d baseline",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Claim outcomes withheld",
+      "id": 23,
+      "description": "Answers withheld for claim or source integrity: CLAIM_CONFLICT, EXPIRED_SOURCE, SOURCE_REVOKED, PRICING_DISABLED (runbook RB-02).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 41
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(public_ai_turns_total{reason=~\"CLAIM_CONFLICT|EXPIRED_SOURCE|SOURCE_REVOKED|PRICING_DISABLED|NO_EVIDENCE\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Revoked at commit",
+      "id": 24,
+      "description": "Answers withheld at commit because a cited source or claim was revoked while the turn ran (runbook RB-02).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 41
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(public_ai_commit_revocation_rejections_total[$__rate_interval]))",
+          "legendFormat": "revoked at commit",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Conversion and feedback",
+      "id": 25,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 49
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "CTAs offered vs handoffs clicked",
+      "id": 26,
+      "description": "Official-route CTAs offered in answers and routes opened by visitors (Doc 09 \u00a720). Clicks are never leads, cases or bookings.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "targets": [
+        {
+          "expr": "sum by (route_key) (rate(public_ai_cta_offered_total[$__rate_interval]))",
+          "legendFormat": "offered {{route_key}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum by (route_key) (rate(public_ai_handoff_clicked_total[$__rate_interval]))",
+          "legendFormat": "clicked {{route_key}}",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Feedback",
+      "id": 27,
+      "description": "Answer feedback by rating and reason enum (no free text).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
+      "targets": [
+        {
+          "expr": "sum by (rating, reason) (rate(public_ai_feedback_total[$__rate_interval]))",
+          "legendFormat": "{{rating}} {{reason}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Events: outbox and DLQ (RB-05, RB-07)",
+      "id": 28,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 58
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Events published / dead-lettered",
+      "id": 29,
+      "description": "Outbox delivery. Any dead letter fires PublicAIEventsDeadLettered (runbook RB-05: review, then kbctl dlq-replay).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 59
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(public_ai_events_published_total[$__rate_interval]))",
+          "legendFormat": "published",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(public_ai_events_dead_lettered_total[$__rate_interval]))",
+          "legendFormat": "dead-lettered",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox lag",
+      "id": 30,
+      "description": "Age of the oldest event in the last relay batch. Above 600 s for 10m fires PublicAIOutboxLag (runbook RB-07).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 59
+      },
+      "targets": [
+        {
+          "expr": "max(public_ai_outbox_oldest_pending_seconds)",
+          "legendFormat": "oldest pending",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Security signals and abuse (RB-08, RB-03)",
+      "id": 31,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 67
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Security signals by class",
+      "id": 32,
+      "description": "Prompt injection, sensitive input, tool instruction and security reports by reason class (never content). More than 20 of a class in 10m fires PublicAISecuritySignalSurge (runbook RB-08; a confirmed leak or injection is RB-03).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason_class) (rate(public_ai_security_signals_total[$__rate_interval]))",
+          "legendFormat": "{{reason_class}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate limited (429) by scope",
+      "id": 33,
+      "description": "Requests refused by scope: ip, session, session_create, inflight. Sustained fires PublicAIRateLimitingSurge (runbook RB-08).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "sum by (scope) (rate(public_ai_rate_limited_total[$__rate_interval]))",
+          "legendFormat": "{{scope}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Denied requests (401/403)",
+      "id": 34,
+      "description": "Origin, host or session denials. More than 100 in 10m fires PublicAIDeniedRequests (runbook RB-08).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "sum by (code) (rate(public_ai_http_requests_total{code=~\"401|403\"}[$__rate_interval]))",
+          "legendFormat": "{{code}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

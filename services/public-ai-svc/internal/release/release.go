@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -215,6 +216,16 @@ func (r *Runtime) refresh(ctx context.Context) error {
 			r.invalidate()
 			return err
 		}
+		// Doc 03 §6/§12, CT-043: a claim release is held to the same load
+		// gates as a KB release, not only to the checks it passed at build.
+		if problems := m.StructuralProblems(); len(problems) > 0 {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w: %s", newClaims, ErrInvalidClaims, strings.Join(problems, "; "))
+		}
+		if m.HasSynthetic() && !r.AllowSynthetic {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newClaims, ErrSyntheticInRelease)
+		}
 		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
 			r.invalidate()
 			return fmt.Errorf("release %s: %w", newClaims, err)
@@ -266,6 +277,10 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	}
 	return nil
 }
+
+// ErrInvalidClaims means a signed claim release fails registry validation
+// at load; the runtime stays not-ready.
+var ErrInvalidClaims = errors.New("claim release fails validation")
 
 // ErrIncompatibleRelease means a release was not evaluated with the running
 // policy version (Doc 08 OPR-004); the runtime stays not-ready.
@@ -363,6 +378,54 @@ func (r *Runtime) RevokedSince(ctx context.Context, watermark int64, sourceIDs, 
 	}
 	for _, v := range revs {
 		if want[v.TargetID] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// CitationsRevoked reports whether any cited source version or claim was
+// revoked, by id or (for a version) through its whole source, in the active
+// snapshot or in the ledger since it was refreshed. A stored answer is
+// re-checked with it before replay (Doc 03 §19, Doc 05 §12). Any doubt
+// (no release loaded, ledger unreadable) reports revoked: fail closed.
+func (r *Runtime) CitationsRevoked(ctx context.Context, sourceVersionIDs, claimIDs []string) (bool, error) {
+	snap, err := r.Snapshot()
+	if err != nil {
+		return true, err
+	}
+	for _, v := range sourceVersionIDs {
+		if snap.EvidenceRevoked(v) {
+			return true, nil
+		}
+	}
+	for _, c := range claimIDs {
+		if snap.ClaimRevoked(c) {
+			return true, nil
+		}
+	}
+	revs, err := r.store.Revocations(ctx, snap.Watermark)
+	if err != nil {
+		return true, err
+	}
+	if len(revs) == 0 {
+		return false, nil
+	}
+	newer := &Snapshot{kbManifest: snap.kbManifest, rev: &revocationSet{sources: map[string]bool{}, claims: map[string]bool{}}}
+	for _, v := range revs {
+		if v.TargetKind == "claim" {
+			newer.rev.claims[v.TargetID] = true
+		} else {
+			newer.rev.sources[v.TargetID] = true
+		}
+	}
+	for _, v := range sourceVersionIDs {
+		if newer.EvidenceRevoked(v) {
+			return true, nil
+		}
+	}
+	for _, c := range claimIDs {
+		if newer.ClaimRevoked(c) {
 			return true, nil
 		}
 	}

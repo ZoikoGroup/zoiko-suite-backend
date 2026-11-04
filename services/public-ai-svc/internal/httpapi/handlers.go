@@ -20,6 +20,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/events"
 	"zoiko.io/public-ai-svc/internal/limits"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
+	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/problem"
 	"zoiko.io/public-ai-svc/internal/session"
 	"zoiko.io/public-ai-svc/internal/store"
@@ -237,10 +238,12 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if begun.Replay {
-		// Same key + same payload: the original result, no second model call.
+		// Same key + same payload: the original result, no second model call,
+		// unless what it cites was revoked since (Doc 03 §19, Doc 05 §12).
+		body := s.replayBody(ctx, rid, begun.Turn.Response)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(begun.Turn.Response)
+		_, _ = w.Write(body)
 		return
 	}
 
@@ -294,14 +297,23 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 			env.KnowledgeReleaseID = "none"
 		}
 	}
+	// Doc 05 §10: a security or spend reason is never rendered; the browser
+	// gets a generic one, logs (diag) and metrics keep the detail.
+	internalReason := env.Reason
+	env.Reason = PublicReason(env.Reason)
 	body, _ := json.Marshal(env)
 
 	done := begun.Turn
 	done.Status, done.IntentID, done.Response = string(env.Status), env.IntentID, body
 	evs := s.turnEvents(env, res, now)
 	if err := s.deps.Store.CompleteTurn(runCtx, done, usageBuckets(now), res.Tokens, evs); err != nil {
-		s.log.Error("turn completion failed", zap.String("request_id", rid), zap.Error(err))
 		_ = s.deps.Store.AbortTurn(context.WithoutCancel(ctx), sess.SessionID, turnID)
+		if errors.Is(err, store.ErrSessionGone) {
+			// SEC-T057: the session ended or was deleted mid-turn; nothing is kept.
+			problem.Write(w, r, problem.SessionExpired, "")
+			return
+		}
+		s.log.Error("turn completion failed", zap.String("request_id", rid), zap.Error(err))
 		problem.Write(w, r, problem.ServiceUnavailable, "")
 		return
 	}
@@ -321,7 +333,7 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 			s.log.Warn("session market not saved", zap.String("request_id", rid), zap.Error(err))
 		}
 	}
-	metrics.ObserveTurn(string(env.Status), env.Reason, time.Since(now))
+	metrics.ObserveTurn(string(env.Status), internalReason, time.Since(now))
 	for _, a := range env.Actions {
 		metrics.CTAOffered(a.RouteKey) // offers and clicks are separate measures (Doc 09 §20)
 	}
@@ -444,4 +456,72 @@ func (s *Server) turnEvents(env contract.Envelope, res orchestrator.Result, star
 		}
 	}
 	return out
+}
+
+// publicReasonOverride maps reasons that must never reach the browser (Doc
+// 05 §10: security detections, abuse reports and spend state) to what the
+// visitor may see. "" omits the field; the widget then treats the turn by
+// its status alone. SENSITIVE_INPUT stays: the widget relies on it to hide
+// the visitor's own text (Doc 01 §16).
+var publicReasonOverride = map[string]string{
+	contract.ReasonPromptInjection: "",
+	contract.ReasonSecurityReport:  "",
+	contract.ReasonToolInstruction: contract.ReasonValidationFailed,
+	contract.ReasonSpendCeiling:    "",
+}
+
+// PublicReason is the reason sent to the browser for an internal reason.
+func PublicReason(reason string) string {
+	if pub, ok := publicReasonOverride[reason]; ok {
+		return pub
+	}
+	return reason
+}
+
+// citationRevoker is implemented by the release runtime.
+type citationRevoker interface {
+	CitationsRevoked(ctx context.Context, sourceVersionIDs, claimIDs []string) (bool, error)
+}
+
+// replayBody returns a stored turn response for an idempotent replay. If any
+// source version or claim it cites was revoked since it was stored, or that
+// cannot be checked, the visitor gets a safe ABSTAIN for the same turn
+// instead (Doc 03 §19, Doc 05 §12): a revoked fact is never re-served.
+func (s *Server) replayBody(ctx context.Context, rid string, stored []byte) []byte {
+	var env contract.Envelope
+	if err := json.Unmarshal(stored, &env); err != nil || len(env.Citations) == 0 {
+		return stored
+	}
+	var versions, claimIDs []string
+	for _, c := range env.Citations {
+		versions = append(versions, c.SourceVersionID)
+		claimIDs = append(claimIDs, c.ClaimIDs...)
+	}
+	revoked := true // no checker wired: fail closed
+	if rc, ok := s.deps.Config.(citationRevoker); ok {
+		var err error
+		if revoked, err = rc.CitationsRevoked(ctx, versions, claimIDs); err != nil {
+			s.log.Warn("replay revocation check failed", zap.String("request_id", rid), zap.Error(err))
+			revoked = true
+		}
+	}
+	if !revoked {
+		return stored
+	}
+	safe := contract.Envelope{
+		SchemaVersion: env.SchemaVersion, TurnID: env.TurnID, RequestID: env.RequestID, TurnSequence: env.TurnSequence,
+		Status: contract.Abstain, IntentID: env.IntentID, Text: policy.TplAbstainStale.Text,
+		Citations: []contract.Citation{}, Actions: nonNilA(env.Actions),
+		KnowledgeReleaseID: env.KnowledgeReleaseID, PolicyVersion: env.PolicyVersion,
+		AnswerClass: contract.DefaultClass(contract.Abstain), MarketCode: env.MarketCode, Reason: contract.ReasonSourceRevoked,
+	}
+	if env.Outcome != "" {
+		safe.Outcome = contract.OutcomeFor(contract.Abstain)
+	}
+	if err := safe.Validate(); err != nil {
+		s.log.Error("replay abstain failed schema validation", zap.String("request_id", rid), zap.String("reason", err.Error()))
+		safe.Actions = []contract.Action{}
+	}
+	body, _ := json.Marshal(safe)
+	return body
 }

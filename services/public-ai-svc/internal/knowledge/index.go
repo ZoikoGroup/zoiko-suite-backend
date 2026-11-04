@@ -27,6 +27,9 @@ type Query struct {
 	Locale    string
 	Now       time.Time
 	MaxChunks int
+	// Plan is the plan code the visitor named ("" = none). A chunk scoped to
+	// other plans is never evidence for it (Doc 03 §14 step 4).
+	Plan string
 	// IntentID boosts chunks whose source is tagged for the classified intent.
 	IntentID string
 }
@@ -171,7 +174,8 @@ const (
 )
 
 // eligibilityOf applies the mandatory filters in order: classification →
-// audience → effective/revoked → market → locale (Doc 05 §18).
+// audience → effective/revoked → market → locale → plan (Doc 05 §18,
+// Doc 03 §14).
 func (x *Index) eligibilityOf(c Chunk, q Query, rev Revocations) eligibility {
 	if c.Classification != Classification || c.Audience != Audience || c.ReleaseID != x.releaseID {
 		return denied
@@ -188,12 +192,30 @@ func (x *Index) eligibilityOf(c Chunk, q Query, rev Revocations) eligibility {
 	if q.Locale != "" && c.Locale != "" && !strings.EqualFold(langOf(c.Locale), langOf(q.Locale)) {
 		return denied
 	}
+	if !planOK(c.PlanCodes, q.Plan) {
+		return denied
+	}
 	return eligible
 }
 
 func marketOK(codes []string, market string) bool {
 	for _, m := range codes {
 		if m == MarketAll || (market != "" && m == market) {
+			return true
+		}
+	}
+	return false
+}
+
+// planOK: an unscoped chunk (or one scoped to ALL) serves every plan; a
+// plan-scoped chunk serves only its plans. With no plan named, nothing is
+// filtered, as before plan scope existed.
+func planOK(codes []string, plan string) bool {
+	if plan == "" || len(codes) == 0 {
+		return true
+	}
+	for _, p := range codes {
+		if p == MarketAll || strings.EqualFold(p, plan) {
 			return true
 		}
 	}

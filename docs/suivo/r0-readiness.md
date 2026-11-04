@@ -5,7 +5,8 @@ engineering build has produced so far and what each gate still needs. It must ne
 gate as passed without the named approver's signed record (Doc 11 §15, §24).
 
 Build: branch `suivo/r0-build`, service `services/public-ai-svc`. Evidence from the dev build is on
-TEST-ONLY fixtures with the fake model; it proves mechanisms, not production behaviour.
+TEST-ONLY fixtures with the deterministic mock model; it proves mechanisms, not production behaviour. A Groq
+provider is wired (`MODEL_PROVIDER=groq`) but has no approved DPA/region yet (DEC-05).
 
 ## Gates (Doc 11 §15 is the master list)
 
@@ -25,7 +26,7 @@ TEST-ONLY fixtures with the fake model; it proves mechanisms, not production beh
 | Anonymous customer-data reachability | Code-level isolation tested (SEC-T049); network egress policy in the target environment not verified |
 | Material commercial/trust hallucination | Prices/trials/certifications only from verified claims; numbers not in evidence are rejected; tested on fixtures only |
 | Revoked/expired source still answerable | Tested (retrieval + commit re-check + rollback drill) |
-| Unapproved model processing or residency | Only the fake model exists; any other profile refuses to start |
+| Unapproved model processing or residency | Providers: the dev/test-only mock and Groq. Outside dev/test Groq refuses to start without `PUBLIC_AI_PROVIDER_APPROVAL_REF` and an allowlisted region (`TestA40`); no approval recorded yet (DEC-05) |
 | Missing Security, SRE or QA sign-off | All PENDING |
 | Rollback or kill switch cannot be executed | Drills pass in dev; not yet executed on staging |
 | Handoff/CRM false-success state | Route-only; prohibited phrases blocked; no CRM/case code in R0 |

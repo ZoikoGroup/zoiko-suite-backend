@@ -133,11 +133,7 @@ func (g *Groq) Generate(ctx context.Context, req Request) (Draft, error) {
 	httpReq.Header.Set("Authorization", "Bearer "+g.APIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	client := g.Client
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
-	}
-	resp, err := client.Do(httpReq)
+	resp, err := g.httpClient().Do(httpReq)
 	if err != nil {
 		if ctx.Err() != nil {
 			return Draft{}, ctx.Err() // deadline: the pipeline reports MODEL_TIMEOUT
@@ -151,6 +147,8 @@ func (g *Groq) Generate(ctx context.Context, req Request) (Draft, error) {
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		return Draft{}, fmt.Errorf("%w: status %d", ErrTransient, resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
+		// Includes 3xx: redirects are never followed (egress allowlist,
+		// Doc 06 §12), so a redirect is a provider error, not a new hop.
 		// Never echo the response body: it may quote the request.
 		return Draft{}, fmt.Errorf("%w: status %d", ErrProvider, resp.StatusCode)
 	}
@@ -159,16 +157,47 @@ func (g *Groq) Generate(ctx context.Context, req Request) (Draft, error) {
 		return Draft{}, fmt.Errorf("%w: unexpected response", ErrProvider)
 	}
 	d := Draft{InputTokens: out.Usage.PromptTokens, OutputTokens: out.Usage.CompletionTokens}
-	var parsed struct {
-		Text         string   `json:"text"`
-		ClaimRefs    []string `json:"claim_refs"`
-		EvidenceRefs []string `json:"evidence_refs"`
-	}
-	if err := json.Unmarshal([]byte(out.Choices[0].Message.Content), &parsed); err != nil {
+	parsed, ok := decodeDraft(out.Choices[0].Message.Content)
+	if !ok {
 		// Not the contract: an empty draft fails output validation, which
 		// triggers the single repair attempt and then a safe abstention.
 		return d, nil
 	}
 	d.Text, d.ClaimRefs, d.EvidenceRefs = parsed.Text, parsed.ClaimRefs, parsed.EvidenceRefs
 	return d, nil
+}
+
+type draftReply struct {
+	Text         string   `json:"text"`
+	ClaimRefs    []string `json:"claim_refs"`
+	EvidenceRefs []string `json:"evidence_refs"`
+}
+
+// decodeDraft parses the model's reply strictly against draftSchema: an
+// unknown field (for example a model-invented "actions" or "status") or
+// trailing data rejects the whole reply, so a model can never smuggle a
+// privileged field past the contract (QA-T042, Doc 06 §08).
+func decodeDraft(content string) (draftReply, bool) {
+	var parsed draftReply
+	dec := json.NewDecoder(strings.NewReader(content))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&parsed); err != nil {
+		return draftReply{}, false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return draftReply{}, false
+	}
+	return parsed, true
+}
+
+// httpClient never follows redirects: the provider host is the only
+// approved egress (Doc 06 §12), so a 3xx is returned as is and treated as a
+// provider error. A caller-supplied client is copied, never mutated.
+func (g *Groq) httpClient() *http.Client {
+	c := http.Client{Timeout: 60 * time.Second}
+	if g.Client != nil {
+		c = *g.Client
+	}
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &c
 }

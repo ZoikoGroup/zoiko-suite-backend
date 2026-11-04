@@ -164,7 +164,7 @@ func TestPrivateDataAndActionsRefused(t *testing.T) {
 		"Pay my invoice from Acme now": "X02",
 	} {
 		r := ask(e, msg, "")
-		if r.Status != contract.RefusedAction || r.IntentID != x || len(r.Citations) != 0 || action(r) != "support" {
+		if r.Status != contract.RefusedAction || r.IntentID != x || len(r.Citations) != 0 || action(r) != "sign-in" {
 			t.Errorf("%q: %+v", msg, r)
 		}
 	}
@@ -362,5 +362,18 @@ func TestKillSwitchMidFlightWithholdsAnswer(t *testing.T) {
 	r := ask(e, "Which finance modules does ZoikoSuite include?", "")
 	if r.Status != contract.Unavailable || r.Reason != contract.ReasonKillSwitch || len(r.Citations) != 0 {
 		t.Fatalf("got %s %s %+v", r.Status, r.Reason, r.Citations)
+	}
+}
+
+// Doc 10 App. B: with commercial_routes_enabled off, a demo or pricing CTA
+// falls back to the support route; nothing else changes.
+func TestCommercialRoutesFlag(t *testing.T) {
+	e := newEnv(t)
+	if got := action(ask(e, "I'd like to book a demo", "")); got != "demo" {
+		t.Fatalf("flag on: %q", got)
+	}
+	setFlag(t, e, flags.CommercialRoutesEnabled, "false")
+	if got := action(ask(e, "I'd like to book a demo", "")); got != "support" {
+		t.Fatalf("flag off: %q, want support", got)
 	}
 }
