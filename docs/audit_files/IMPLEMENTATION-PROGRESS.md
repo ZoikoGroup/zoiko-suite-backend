@@ -23,7 +23,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | G-11 | Feature policy and capability exposure | TODO | | |
 | G-02 | GTRM reads + compiler commands | TODO | | |
 | G-05/03/04/12 | Named-operation parity | TODO | | |
-| IAM-1 | AU-12 per-service audience | TODO | | |
+| IAM-1 | AU-12 per-service audience | IN PROGRESS | 370381e8 (partial) | 4 Nov check: gateway-auth-svc wires `idenv.Exchanger` only into its own carta/commercial calls; `/verify` does no route-audience exchange, there is no route→audience map, and the four GW-5 tests named in its progress.md do not exist. Exchange client not registered in identity-context. See Identity audit "gateway-auth-svc status, 4 November 2026" G-1 |
 | IAM-2 | AU-14 entitlement stage | TODO | | |
 | IAM-3 | AU-15 legal-hold negative control | TODO | | after G-10 |
 | IAM-4 | AU-16 relationship / qualification predicates | TODO | | after ORG-4, ORG-5 |

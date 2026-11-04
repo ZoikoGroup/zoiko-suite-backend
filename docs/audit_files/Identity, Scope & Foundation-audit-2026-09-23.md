@@ -1,6 +1,6 @@
 # Group 1 — Identity, Scope & Foundation: documentation-compliance audit
 
-**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026, in-service gaps closed and full matrix scored 6 October 2026; delegated-authority-svc independently re-audited in two passes and seven defects fixed 6 October 2026; access-control-svc re-audited, two regressions and five gaps fixed 6 October 2026, and its unbuilt §5/§9/§24 scope built the same day; all nine re-audited 7 October 2026, six findings, fixed 8 October: see "Group 1 re-audit, 7 October 2026"; every gap open then, grouped by what it waits on, is in "07/10 re-audit gaps" after it; **all nine re-audited again 19 October 2026: eight new findings (F-1 … F-8), none fixed yet, including a delegated-authority-svc create that fails on every call and an image identity-context-svc can no longer build: see "Group 1 re-audit, 19 October 2026" at the end**; **identity-context-svc re-audited 4 November 2026: seven findings (K-1 … K-7), none fixed yet, NP4 ✅ → ⚠️, and every open identity-context-svc gap in one register: see "identity-context-svc re-audit, 4 November 2026" and "identity-context-svc gap register, 4 November 2026" at the end**)
+**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026, in-service gaps closed and full matrix scored 6 October 2026; delegated-authority-svc independently re-audited in two passes and seven defects fixed 6 October 2026; access-control-svc re-audited, two regressions and five gaps fixed 6 October 2026, and its unbuilt §5/§9/§24 scope built the same day; all nine re-audited 7 October 2026, six findings, fixed 8 October: see "Group 1 re-audit, 7 October 2026"; every gap open then, grouped by what it waits on, is in "07/10 re-audit gaps" after it; **all nine re-audited again 19 October 2026: eight new findings (F-1 … F-8), none fixed yet, including a delegated-authority-svc create that fails on every call and an image identity-context-svc can no longer build: see "Group 1 re-audit, 19 October 2026" at the end**; **identity-context-svc re-audited 4 November 2026: seven findings (K-1 … K-7), none fixed yet, NP4 ✅ → ⚠️, and every open identity-context-svc gap in one register: see "identity-context-svc re-audit, 4 November 2026" and "identity-context-svc gap register, 4 November 2026" at the end**; **gateway-auth-svc AUTH-PLANE pass checked 4 November 2026: GW-0/GW-1 hold, GW-2…GW-4 partial, GW-5 not built as specified, GW-6 open, no score change: see "gateway-auth-svc status, 4 November 2026" at the end**)
 **Scope:** all nine services of Group 1, audited one at a time.
 **Source of truth:** the original `.docx` specifications in `docs/architecture/`, **not** the
 per-service `openapi.yaml` / `asyncapi.yaml` artefacts. This is deliberate: auditing code
@@ -3426,3 +3426,64 @@ A last table lists proof still owed where the code is done.
 3. **S1-11 (K-3)** and **S1-12 (K-6)**: contract and evidence.
 4. **S1-13 (K-7).**
 5. Run the live E2E on a post-merge image, then rescore NP4 and source channel.
+
+---
+
+# gateway-auth-svc status, 4 November 2026: AUTH-PLANE GW-0 … GW-6
+
+**Why.** Ten commits on 4 Nov (`b2efeee0` … `f9673bc1`) ran the gateway tasks of
+`AUTH-PLANE-PLAN-2026-11-02.md`. This section records which of them hold up when the code is read,
+and what is still open. Each claim here was checked against the code or a test run on 4 Nov.
+Claims taken only from `services/gateway-auth-svc/progress.md` are marked as such.
+
+**Score: no change.** The Security §8 + GOV-01 ingress rows were not re-scored; they stay at 22/22.
+The AUTH-PLANE tasks add scope beyond those rows (INT-01 minimum acceptance tests, AU-04, S3-D1,
+S5-D3, AU-12/IAM-1).
+
+**Test evidence** (`shashi-changes` at `33ee341d`):
+
+| Check | Result |
+|---|---|
+| `go build ./...` / `go vet ./...` (host, Go 1.26.7) | clean |
+| `go test -count=1 ./...` (host, `GOTMPDIR`) | **9 packages ok, 0 fail**: admin, admission, commercial, config, handler, jwks, mtls, problem, siem. 154 test functions in the module |
+| Not run | image rebuild and live container, `scripts/audit.sh`, `e2e-gateway-auth-deps.py`, mutants |
+
+## Per task
+
+| Task | Commit(s) | 4 Nov status | What was checked |
+|---|---|---|---|
+| GW-0 baseline, matrix, stale STEP_UP_MFA text | `b2efeee0` | ✅ DONE | Matrix in `progress.md`. The stale text is fixed in openapi, `RELEASE_CERTIFICATE.md`, telemetry and handler comments |
+| GW-1 INT-01 minimum acceptance tests + residency gate | `d3cfc988`, `aebdf04e` | ✅ DONE (tests) | All eight `TestINT01_*` exist and pass. The first commit's residency gate lacked its registry reads; `aebdf04e` added them |
+| GW-2 trusted hop (S5-D3) + login throttle (AU-04) | `c7e7dac4` | ⚠️ built, not proven live | `TestClientIP_*` (3) and `TestAU04_*` (3) pass. The live probe the matrix cites ("25 failed logins → 429 before the 25th") was not run. Routing identity-context's public auth routes through Traefik is unverified |
+| GW-3 edge-set `X-Commercial-Plan` / `X-Org-Unit-Id` (S3-D1) | `06afd752` | ⚠️ partial | `internal/commercial` client with six `TestClient_*` tests. The matrix names `TestS3D1_*`; **no such test exists**. Replacing a forged plan header at the edge has no named test. Live half BLOCKED: commercial-account-svc does not run locally |
+| GW-4 admin read surface | `fb2a30c0` | ⚠️ partial | Compose sets `GATEWAY_ADMIN_ADDR=:8192` and a secret token file. The three new reads the plan asked for (decisions of every outcome, usage for all tenants, policy) were **not built**. `admin.go` still serves decision by id, denied, usage per tenant, rate limit and versions. Since the console decision below, the surface is a RUNBOOK tool. Not exercised live |
+| GW-5 per-service audience (AU-12 / IAM-1) | `370381e8` | ❌ not built as specified | See finding G-1 |
+| GW-6 contract, docs, live, E2E | `9bc132f4` (script only) | ❌ open | See findings G-2 and G-3 |
+| GW-FE-1 console admin client | removed | ✅ decision | Removed. Decisions, usage and limiter state are per replica (deviation note in the AUTH-PLANE plan) |
+| GW-FE-2 `/admin/gateway` v2.0 | frontend; `f9673bc1` docs | ✅ DONE, per `progress.md` | Diagnostic page. The render check (down path and mocked up path) and eslint are recorded in `progress.md`; not re-run here |
+
+## Findings
+
+| # | Finding | Evidence | What closes it |
+|---|---|---|---|
+| G-1 | **GW-5 exchanges for the gateway's own calls, not for the target service.** The plan's GW-5: `/verify` exchanges the session envelope for one whose audience is the route's service (`GATEWAY_AUDIENCE_ROUTES`), with an unknown route failing closed. The commit instead wires `idenv.Exchanger` into the gateway's outbound carta-svc and commercial-account-svc calls (`internal/carta/client.go:153`, `internal/commercial/client.go:91,125`). `/verify` never uses it (`handler.go:115,134` only stores it). There is no route → audience map. The four tests the matrix names (`TestVerify_ExchangesForRouteAudience`, `TestVerify_UnknownRouteFailsClosed`, `TestVerify_ExchangeFailureIs503NotPassThrough`, `TestIAM01_EnvelopeForPolicyRefusedByWorkflow`) **exist nowhere** in `services/`. The commit touched no test file. Also, compose sends client `gateway-auth-svc` with secret `changeme-in-production`, a client registered nowhere. The OIDC client registry (`deployments/identity/oidc-clients.local.json`, mounted as `OIDC_CLIENTS_FILE`) holds only `local-dev-cli`, `idp-clients.local.json` holds only `zoiko-console`, and compose sets no `OIDC_EXCHANGE_AUDIENCES`. Every live exchange would therefore fail, and the code then forwards the original envelope silently | `git show --stat 370381e8`; `grep -rn "func TestVerify_ExchangesForRouteAudience"` finds nothing | Build GW-5 as planned, with its four tests. Register the gateway client in identity-context, or read the secret from a compose secret. Count exchange failures in a metric, not a silent pass-through. IAM-1 stays open until then |
+| G-2 | **`e2e-gateway-auth-deps.py` cannot produce a valid run.** (a) `call("GET", url, envelope(jwt), headers={...})` passes `headers` twice, so the script raises `TypeError` at check 5 (and again at checks 12 and 13). (b) `login()` asks `/oauth2/token` for `client_credentials` as `zoiko-console`, which is not an OAuth client with that grant (`oidc-clients.local.json` lists only `local-dev-cli`). The checks that `X-Principal-Id` equals the demo admin could not hold for a client token anyway. (c) `COMMERCIAL` points at `:8080`, which is identity-context. (d) Three checks pass without testing anything: `check(..., True, "skipped")` for the admin surface and audience exchange, and `True` when the forged-header request is not 200. (e) It exits 1, not the failure count its docstring promises. (f) There is no revocation (AU-01), residency, CARTA step-up or Traefik header-replacement check, and no write is undone | Read of the script at `9bc132f4` | Rewrite on the pattern of `e2e-authorization-deps.py`: password login with the confidential client → context resolve → envelope; `skip()` never counted as a pass; one check per edge listed in GW-6; run it live and keep the output |
+| G-3 | **GW-6 deliverables are missing or uncertified.** `progress.md` has no GW-6 section. `SPEC_DEVIATIONS.md` does not exist, yet the matrix cites it for SEC8-E1 and AU-27. `RELEASE_CERTIFICATE.md` was edited only to fix the STEP_UP_MFA text, not re-certified. The image was not rebuilt and `scripts/audit.sh` was not run against this tree | `ls services/gateway-auth-svc` | Do GW-6: SPEC_DEVIATIONS (S5-D1 placement, AU-27, S5-B2), re-certification, image rebuild, live `audit.sh`, live E2E |
+| G-4 | **The feature matrix claims evidence that does not exist.** These rows are marked DONE but name tests that do not exist (G-1, GW-3) or a live probe that was not run (AU-04): INT01-07 (GW-4 reads), S3-D1, AU-12, GW-5 and S5-B2 | as above | Correct the rows to their real status when G-1 … G-3 are worked |
+
+## Register changes
+
+| Id | 4 Nov |
+|---|---|
+| S5-D3 (real client IP behind the GCP LB) | **Built.** Trusted-hop design with `GATEWAY_TRUSTED_PROXY_CIDRS` / `_DEPTH` (defaults RFC 1918, depth 1). The decision on production CIDRs stays with platform |
+| AU-04 edge login throttling | **Built, not proven live** (G-4) |
+| S3-D1 edge-set plan / org unit | **Partial.** Client built; edge tests and the live half are open (GW-3 row) |
+| AU-12 / IAM-1 per-service audience | **Open** (G-1) |
+| S5-B2, S4-B1, S5-D1, AU-27 | Unchanged |
+
+## Where to start
+
+1. G-2: make the E2E honest, then run it. It will show which of the rest is real.
+2. G-1: GW-5 as planned. IAM-1 depends on it.
+3. G-3: GW-6 deliverables and the live run.
+4. G-4: correct the matrix, then hand back for the AUTH-PLANE verifier protocol.

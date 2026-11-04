@@ -538,6 +538,14 @@ ok  zoiko.io/secret-vault-integration-svc/internal/vault
 **Group:** 1 — Identity, Scope & Foundation
 **Status:** ✅ **ALL TESTS PASSING** (9/10 packages; `internal/siem` blocked by Windows Application Control — infra issue, test passes when it runs) · **ZS-QA-001 live audit: 60 pass / 0 fail / 0 blocked / 0 not-run** (run 5, against the compose stack; `scripts/audit.sh` §1–§15)
 **Last Verified:** 2026-10-16 — unit suite: 57 tests pass / 0 fail; `internal/siem` blocked by Windows Application Control policy (same as all services on this host)
+**4 Nov 2026 (AUTH-PLANE GW pass, checked):** 🟡 **IN PROGRESS.**
+- Suite: 9 packages ok, 0 fail (154 test functions, host Go 1.26.7, build and vet clean).
+- Done: GW-0, GW-1 and the console page.
+- Partial: GW-2, GW-3 and GW-4.
+- Not built as specified: GW-5 (per-service audience, IAM-1).
+- Open: GW-6 (live run, E2E, SPEC_DEVIATIONS, re-certification).
+- The new `deployments/scripts/e2e-gateway-auth-deps.py` crashes at check 5 and has never produced a valid run.
+- Details: `Identity, Scope & Foundation-audit-2026-09-23.md` → "gateway-auth-svc status, 4 November 2026". The 60/60 live audit above predates this pass.
 
 ---
 

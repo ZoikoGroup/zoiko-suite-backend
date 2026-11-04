@@ -360,6 +360,19 @@ Every service runs these stages; the task lists below fill them in.
 
 ## Service 2 — gateway-auth-svc (:8092, no database)
 
+> **Status 4 Nov 2026 (verifier check):**
+> - **Hold:** GW-0 and GW-1, and the console revision (GW-FE-1 removed, GW-FE-2 diagnostic page).
+> - **Built but partial:** GW-2 has no live proof. GW-3 is missing its `TestS3D1_*` tests. GW-4
+>   is missing the three new reads.
+> - **Not built as specified:** GW-5. Only the gateway's own calls are exchanged; `/verify`
+>   does not exchange for the route audience, and its four tests are absent.
+> - **Open:** GW-6. The E2E script crashes, there is no SPEC_DEVIATIONS, no re-certification and
+>   no live run.
+>
+> Suite: 9 packages ok, 0 fail. Findings G-1 … G-4 and the order to resume are in
+> `Identity, Scope & Foundation-audit-2026-09-23.md` → "gateway-auth-svc status, 4 November
+> 2026". access-control-svc (Service 3) should wait until GW-5 and GW-6 are closed.
+
 ### GW-0 · Baseline and feature matrix (S0)
 - Suite green, counts recorded. Create `services/gateway-auth-svc/progress.md` with the matrix from
   INT-01 §4.1 (ownership, runtime operations, the five queries, the request state machine, the four
