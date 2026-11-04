@@ -68,9 +68,24 @@ func Open(t *testing.T) *Pools {
 		t.Fatalf("TEST_APP_DATABASE_URL role %q is SUPERUSER or BYPASSRLS; RLS would not apply to it", user)
 	}
 	ident := pgx.Identifier{user}.Sanitize()
-	if _, err := admin.Exec(ctx, `GRANT USAGE ON SCHEMA public TO `+ident+`;
-		GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO `+ident); err != nil {
-		t.Fatalf("grant app role: %v", err)
+	// Under the same advisory lock as the migrations: test packages run in
+	// parallel, and two concurrent GRANTs on the same tables fail with
+	// "tuple concurrently updated".
+	conn, err := admin.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(810810)`); err != nil {
+		t.Fatalf("advisory lock: %v", err)
+	}
+	_, grantErr := conn.Exec(ctx, `GRANT USAGE ON SCHEMA public TO `+ident+`;
+		GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO `+ident)
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock(810810)`); err != nil {
+		t.Fatalf("advisory unlock: %v", err)
+	}
+	if grantErr != nil {
+		t.Fatalf("grant app role: %v", grantErr)
 	}
 	p.App = app
 	p.AppDSN = appDSN

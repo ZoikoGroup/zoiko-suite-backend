@@ -12,7 +12,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/carta-svc/internal/domain"
+	svcenvelope "zoiko.io/carta-svc/internal/envelope"
+	"zoiko.io/carta-svc/internal/outbox"
 )
+
+// SourceService names this service on every event envelope.
+const SourceService = "carta-svc"
+
+// EventAssessmentCreated is emitted, through the transactional outbox, for
+// every decision record written.
+const EventAssessmentCreated = "assessment.created"
 
 // PgStore persists assessments in carta_assessments (migration 000001).
 //
@@ -65,29 +74,51 @@ func (s *PgStore) SaveAssessment(ctx context.Context, tenantID string, asm *doma
 	ts = ts.UTC().Truncate(time.Microsecond)
 	id := uuid.New().String()
 
+	// The returned object is the event payload too, so finalise it first.
+	saved := *asm
+	saved.ID = id
+	saved.TenantID = tenantID
+	saved.AssessmentTimestamp = ts
+	saved.RiskFactors = factors
+
 	err = s.inTenantTx(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO carta_assessments
 			    (id, tenant_id, legal_entity_id, subject_id, context, trust_score,
-			     risk_level, decision, risk_factors, assessment_timestamp)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			     risk_level, decision, risk_factors, assessment_timestamp, evaluated_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''))`,
 			id, tenantID, asm.LegalEntityID, asm.SubjectID, contextJSON, asm.TrustScore,
-			string(asm.RiskLevel), string(asm.Decision), factorsJSON, ts)
-		return err
+			string(asm.RiskLevel), string(asm.Decision), factorsJSON, ts, asm.EvaluatedBy); err != nil {
+			return fmt.Errorf("insert assessment: %w", err)
+		}
+		// Same transaction: the decision record and the notice of it commit
+		// or roll back together.
+		env := svcenvelope.MustFromContext(ctx)
+		if _, err := outbox.Insert(ctx, tx, SourceService, outbox.Event{
+			AggregateType: "carta_assessment",
+			AggregateID:   id,
+			EventType:     EventAssessmentCreated,
+			TenantID:      tenantID,
+			LegalEntityID: asm.LegalEntityID,
+			ActorID:       asm.EvaluatedBy,
+			CorrelationID: env.CorrelationID,
+			Payload:       saved,
+		}); err != nil {
+			return err
+		}
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("insert assessment: %w", err)
+		return fmt.Errorf("save assessment: %w", err)
 	}
-	asm.ID = id
-	asm.TenantID = tenantID
-	asm.AssessmentTimestamp = ts
-	asm.RiskFactors = factors
+	*asm = saved
 	return nil
 }
 
 const selectAssessment = `
 	SELECT id, tenant_id, legal_entity_id, subject_id, context, trust_score,
-	       risk_level, decision, risk_factors, assessment_timestamp
+	       risk_level, decision, risk_factors, assessment_timestamp,
+	       COALESCE(evaluated_by, '')
 	  FROM carta_assessments`
 
 // GetAssessmentByID returns ErrNotFound for an unknown id, a malformed id, and
@@ -158,7 +189,8 @@ func scanAssessment(row pgx.Row) (*domain.CartaAssessment, error) {
 		riskLevel, decision      string
 	)
 	if err := row.Scan(&a.ID, &a.TenantID, &a.LegalEntityID, &a.SubjectID, &contextJSON,
-		&a.TrustScore, &riskLevel, &decision, &factorsJSON, &a.AssessmentTimestamp); err != nil {
+		&a.TrustScore, &riskLevel, &decision, &factorsJSON, &a.AssessmentTimestamp,
+		&a.EvaluatedBy); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal(contextJSON, &a.Context); err != nil {

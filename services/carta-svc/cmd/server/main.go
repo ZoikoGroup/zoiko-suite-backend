@@ -15,8 +15,10 @@ import (
 
 	"zoiko.io/carta-svc/internal/authz"
 	"zoiko.io/carta-svc/internal/config"
+	"zoiko.io/carta-svc/internal/events"
 	"zoiko.io/carta-svc/internal/handler"
 	"zoiko.io/carta-svc/internal/idempotency"
+	"zoiko.io/carta-svc/internal/outbox"
 	"zoiko.io/carta-svc/internal/store"
 )
 
@@ -64,6 +66,19 @@ func main() {
 		WithReadiness(pool)
 	router := handler.NewRouter(h)
 
+	// Transactional outbox relay: every assessment row is written with its
+	// assessment.created event in one transaction; the relay delivers them.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if cfg.KafkaBrokers != "" {
+		publisher, closeKafka := events.NewKafkaPublisher(cfg.KafkaBrokers, cfg.KafkaTopic)
+		defer func() { _ = closeKafka() }()
+		go outbox.NewRelay(pool, publisher, 2*time.Second, 50, logger).Start(relayCtx)
+	} else {
+		logger.Warn("KAFKA_BROKERS is not set: the outbox relay is not running; events are kept in outbox_events and delivered once it is configured",
+			zap.String("topic", cfg.KafkaTopic))
+	}
+
 	// Wrap router with apicontract middleware
 	r := chi.NewRouter()
 	r.Use(apicontract.RequestID)
@@ -83,4 +98,5 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	stopRelay()
 }

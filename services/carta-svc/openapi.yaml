@@ -84,9 +84,14 @@ paths:
       summary: Evaluate an access request
       description: |
         Scores an access request and returns ALLOW / STEP_UP_MFA / ISOLATE / DENY.
-        Exempt from principal requirement — called during authentication.
-        Requires tenant header. The subject being evaluated is passed as
+        Requires the tenant header. The subject being evaluated is passed as
         `context.subject_id` in the request body.
+
+        A principal is not required (gateway-auth-svc calls this during
+        authentication with the tenant header only). When `X-Principal-Id`
+        IS presented, the caller is authorized `CARTA_EVALUATE` on
+        `legal_entity_id` and recorded as `evaluated_by`. Every assessment
+        emits `assessment.created` through the transactional outbox.
       operationId: EvaluateAccess
       requestBody:
         required: true
@@ -110,8 +115,18 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: The presented principal is not authorized CARTA_EVALUATE on that legal entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '500':
           description: Failed to save assessment
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: authorization-svc unreachable while checking a presented principal
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -129,10 +144,10 @@ paths:
         - name: legal_entity_id
           in: query
           required: true
-          schema: { type: string, format: uuid }
+          schema: { type: string }
         - name: subject_id
           in: query
-          schema: { type: string, format: uuid }
+          schema: { type: string }
       responses:
         '200':
           description: List of assessments
@@ -213,34 +228,47 @@ components:
         current_version: { type: integer, format: int64 }
         decision_id: { type: string }
 
+    AccessContext:
+      type: object
+      required: [subject_id, action_requested]
+      properties:
+        subject_id: { type: string }
+        subject_type: { type: string, description: 'USER, SERVICE_ACCOUNT or BOT' }
+        device_trust_level: { type: integer, minimum: 0, maximum: 100 }
+        ip_address: { type: string }
+        is_known_location: { type: boolean }
+        resource_sensitivity: { type: string, description: 'LOW, MEDIUM, HIGH or RESTRICTED' }
+        action_requested: { type: string }
+        time_of_day_hour: { type: integer, minimum: 0, maximum: 23 }
+
     EvaluateRequest:
       type: object
-      required: [context]
+      required: [legal_entity_id, context]
       properties:
-        context:
-          type: object
-          required: [subject_id]
-          properties:
-            subject_id: { type: string, format: uuid }
-            ip: { type: string, format: ipv4 }
-            device_trust_level: { type: integer, minimum: 0, maximum: 100 }
-            user_agent: { type: string }
-            location: { type: string }
-            timestamp: { type: string, format: date-time }
+        legal_entity_id: { type: string }
+        context: { $ref: '#/components/schemas/AccessContext' }
 
     CartaAssessment:
       type: object
+      required: [id, tenant_id, legal_entity_id, subject_id, context, trust_score, risk_level, decision, risk_factors, assessment_timestamp]
       properties:
         id: { type: string, format: uuid }
-        tenant_id: { type: string, format: uuid }
-        legal_entity_id: { type: string, format: uuid }
-        subject_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        subject_id: { type: string }
+        context: { $ref: '#/components/schemas/AccessContext' }
+        trust_score: { type: number, minimum: 0, maximum: 100 }
+        risk_level: { type: string, enum: [LOW, MEDIUM, HIGH, CRITICAL] }
         decision: { type: string, enum: [ALLOW, STEP_UP_MFA, ISOLATE, DENY] }
-        score: { type: integer, minimum: 0, maximum: 100 }
         risk_factors:
           type: array
           items: { type: string }
-        created_at: { type: string, format: date-time }
+        assessment_timestamp: { type: string, format: date-time }
+        evaluated_by:
+          type: string
+          description: |
+            Verified principal (X-Principal-Id) that requested the evaluation.
+            Absent when the caller presented none (gateway-auth-svc).
 
     AssessmentListResponse:
       type: object
