@@ -856,10 +856,18 @@ func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domai
 	if limit <= 0 || limit > MaxListLimit {
 		limit = DefaultListLimit
 	}
+	// debit_amount/credit_amount are cast to ::text here, not scanned as
+	// NUMERIC directly: pgx's NUMERIC codec loses trailing zero scale for a
+	// zero amount when decoding straight into a Go string ('0.00' comes back
+	// as '0'), because a zero big.Int carries no record of how many decimal
+	// places it had. Postgres's own numeric_out (the ::text cast) always
+	// formats with the stored display scale, zero or not, so the cast moves
+	// the exact-decimal-string guarantee LedgerEntry.DebitAmount/CreditAmount
+	// depend on out of pgx's hands entirely.
 	query := `
 		SELECT ledger_entry_id, tenant_id, legal_entity_id, book_id, fiscal_period,
 		       journal_id, journal_line_id, line_number, account_code,
-		       debit_amount, credit_amount, currency_code, dimensions,
+		       debit_amount::text, credit_amount::text, currency_code, dimensions,
 		       transaction_date, posting_date, source_event_id, correlation_id, entry_seq, created_at
 		FROM ledger_entries
 		WHERE tenant_id = $1 AND legal_entity_id = $2`
@@ -945,10 +953,13 @@ func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domai
 func (s *PgStore) QuerySourceEntries(ctx context.Context, tenantID, sourceEventID string) ([]domain.LedgerEntry, error) {
 	var entries []domain.LedgerEntry
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// See QueryLedger's comment on the same ::text cast: pgx's NUMERIC
+		// codec loses display scale for a zero amount when scanned straight
+		// into a Go string.
 		rows, err := tx.Query(ctx, `
 			SELECT ledger_entry_id, tenant_id, legal_entity_id, book_id, fiscal_period,
 			       journal_id, journal_line_id, line_number, account_code,
-			       debit_amount, credit_amount, currency_code, dimensions,
+			       debit_amount::text, credit_amount::text, currency_code, dimensions,
 			       transaction_date, posting_date, source_event_id, correlation_id, entry_seq, created_at
 			FROM ledger_entries
 			WHERE tenant_id = $1 AND source_event_id = $2
