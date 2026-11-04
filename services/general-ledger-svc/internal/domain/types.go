@@ -683,6 +683,15 @@ func (r *AmendAccountVersionRequest) UnmarshalJSON(b []byte) error {
 // declares it; this service never interprets it) to a real, chart-
 // registered AccountCode. Versioned, never mutated in place (see
 // migration 000008's doc comment).
+// Account mapping lifecycle states (ACC-02's state model, verbatim from
+// spec: "Draft -> Approved -> Active -> Superseded").
+const (
+	AccountMappingStatusDraft      = "DRAFT"
+	AccountMappingStatusApproved   = "APPROVED"
+	AccountMappingStatusActive     = "ACTIVE"
+	AccountMappingStatusSuperseded = "SUPERSEDED"
+)
+
 type AccountMapping struct {
 	AccountMappingID     string     `json:"account_mapping_id"`
 	TenantID             string     `json:"tenant_id"`
@@ -692,11 +701,37 @@ type AccountMapping struct {
 	EffectiveTo          *time.Time `json:"effective_to,omitempty"`
 	CreatedAt            time.Time  `json:"created_at"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+
+	// Status and the fields below are migration 000029's governance
+	// lifecycle. IsHighRisk is captured at CreateMapping time from the
+	// target account's is_control_account flag — this is the "where
+	// configured" qualifier for ACC-02's maker-checker requirement.
+	Status                string     `json:"status"`
+	IsHighRisk            bool       `json:"is_high_risk"`
+	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID string     `json:"approved_by_principal_id,omitempty"`
+	ActivatedAt           *time.Time `json:"activated_at,omitempty"`
+	SupersededAt          *time.Time `json:"superseded_at,omitempty"`
+	SupersededByMappingID *string    `json:"superseded_by_mapping_id,omitempty"`
 }
 
 type SetAccountMappingRequest struct {
 	MappingKey  string `json:"mapping_key"`
 	AccountCode string `json:"account_code"`
+}
+
+// CreateMappingRequest is ACC-02's CreateMapping command: it only drafts a
+// mapping — nothing is eligible for resolution until ApproveMapping and
+// ActivateMapping have both run.
+type CreateMappingRequest struct {
+	MappingKey  string `json:"mapping_key"`
+	AccountCode string `json:"account_code"`
+}
+
+// ActivateMappingRequest optionally backdates/forward-dates when the
+// mapping takes effect; omitted means now.
+type ActivateMappingRequest struct {
+	EffectiveFrom *EffectiveDate `json:"effective_from,omitempty"`
 }
 
 // Posting execution lifecycle states (ACC-04's state model, verbatim from
@@ -1189,6 +1224,24 @@ var (
 	// exists but is INACTIVE — ACC-02 must never map a business concept
 	// onto an account that can't legitimately be posted to.
 	ErrMappingTargetAccountInvalid = errorString("account_code does not name an existing ACTIVE account in the Chart of Accounts")
+
+	// ErrMappingNotDraft/ErrMappingNotApproved/ErrMappingNotActive guard the
+	// ACC-02 state model (Draft -> Approved -> Active -> Superseded): each
+	// command only accepts a mapping already in the state it advances from.
+	ErrMappingNotDraft    = errorString("mapping is not in DRAFT status")
+	ErrMappingNotApproved = errorString("mapping is not in APPROVED status")
+	ErrMappingNotActive   = errorString("mapping is not in ACTIVE status")
+	// ErrMappingSelfApproval is ACC-02's maker-checker SoD: "mapping author
+	// cannot approve high-risk mappings to cash/tax/control accounts where
+	// configured" — high-risk here is is_high_risk, captured at CreateMapping
+	// from the target account's is_control_account flag.
+	ErrMappingSelfApproval = errorString("a high-risk mapping cannot be approved by the principal who created it")
+	ErrMappingNotFoundByID = errorString("account mapping not found")
+	// ErrMappingHighRiskRequiresGovernedLifecycle is returned by the legacy
+	// one-step SetAccountMapping when the target account is a control
+	// account: such a mapping must go through CreateMapping/ApproveMapping/
+	// ActivateMapping, where the maker-checker SoD check actually applies.
+	ErrMappingHighRiskRequiresGovernedLifecycle = errorString("mapping onto a control account requires the governed CreateMapping/ApproveMapping/ActivateMapping lifecycle, not SetAccountMapping")
 
 	ErrPostingExecutionNotFound = errorString("posting execution not found")
 

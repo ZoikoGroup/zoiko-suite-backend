@@ -65,6 +65,13 @@ type Store interface {
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
 	GetCurrentAccountMapping(ctx context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error)
 	ListAccountMappings(ctx context.Context, tenantID string) ([]domain.AccountMapping, error)
+	CreateMapping(ctx context.Context, m *domain.AccountMapping) error
+	ApproveMapping(ctx context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error)
+	ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time) (*domain.AccountMapping, error)
+	SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error)
+	GetMappingByID(ctx context.Context, tenantID, mappingID string) (*domain.AccountMapping, error)
+	GetMappingAsOf(ctx context.Context, tenantID, mappingKey string, asOf time.Time) (*domain.AccountMapping, error)
+	ListMappingAmbiguities(ctx context.Context, tenantID string) ([]string, error)
 
 	// ACC-04 Posting Engine — see migration 000009's doc comment.
 	CreatePostingExecution(ctx context.Context, e *domain.PostingExecution) error
@@ -175,6 +182,15 @@ const (
 	// ACC-02 Account Mapping actions.
 	actionSetAccountMapping  = "COA_MAPPING_SET"
 	actionViewAccountMapping = "COA_MAPPING_VIEW"
+	// actionCreateMapping/actionApproveMapping/actionActivateMapping/
+	// actionSupersedeMapping are the governed lifecycle's own actions,
+	// deliberately distinct from actionSetAccountMapping so an authz policy
+	// can grant drafting widely while keeping approval narrow — the whole
+	// point of a maker-checker action separation.
+	actionCreateMapping    = "COA_MAPPING_CREATE"
+	actionApproveMapping   = "COA_MAPPING_APPROVE"
+	actionActivateMapping  = "COA_MAPPING_ACTIVATE"
+	actionSupersedeMapping = "COA_MAPPING_SUPERSEDE"
 
 	// ACC-04 Posting Engine actions. The spec names a single execute action
 	// literally ("accounting.post.execute internal") and requires it never
@@ -377,7 +393,14 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/account-mappings", func(r chi.Router) {
 		r.Post("/", h.SetAccountMapping)
 		r.Get("/", h.ListAccountMappings)
+		r.Get("/ambiguities", h.ListMappingAmbiguities)
+		r.Post("/draft", h.CreateMapping)
 		r.Get("/{mapping_key}", h.GetAccountMapping)
+		r.Get("/{mapping_key}/as-of", h.GetMappingAsOf)
+		r.Get("/{mapping_key}/explain", h.ExplainMapping)
+		r.Post("/by-id/{mapping_id}/approve", h.ApproveMapping)
+		r.Post("/by-id/{mapping_id}/activate", h.ActivateMapping)
+		r.Post("/by-id/{mapping_id}/supersede", h.SupersedeMapping)
 	})
 	r.Route("/v1/postings", func(r chi.Router) {
 		r.Post("/events", h.PostAccountingEvent)
@@ -1457,11 +1480,305 @@ func (h *Handler) SetAccountMapping(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_target_account", err.Error())
 			return
 		}
+		if errors.Is(err, domain.ErrMappingHighRiskRequiresGovernedLifecycle) {
+			writeError(w, http.StatusUnprocessableEntity, "high_risk_mapping_requires_governed_lifecycle", err.Error())
+			return
+		}
 		h.log.Error("SetAccountMapping: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	writeJSON(w, http.StatusCreated, m)
+}
+
+// ── ACC-02 governed lifecycle: CreateMapping / ApproveMapping /
+// ActivateMapping / SupersedeMapping ─────────────────────────────────────────
+
+// CreateMapping drafts a new mapping version (status DRAFT). It is not
+// resolvable by GetCurrentAccountMapping until ApproveMapping and
+// ActivateMapping have both run.
+func (h *Handler) CreateMapping(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateMappingRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.MappingKey == "" || req.AccountCode == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "mapping_key and account_code are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionCreateMapping); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	m := &domain.AccountMapping{
+		AccountMappingID:     uuid.NewString(),
+		TenantID:             tenantID,
+		MappingKey:           req.MappingKey,
+		AccountCode:          req.AccountCode,
+		EffectiveFrom:        time.Now().UTC(),
+		CreatedAt:            time.Now().UTC(),
+		CreatedByPrincipalID: principalID,
+	}
+	if err := h.store.CreateMapping(r.Context(), m); err != nil {
+		if errors.Is(err, domain.ErrMappingTargetAccountInvalid) {
+			writeError(w, http.StatusBadRequest, "invalid_target_account", err.Error())
+			return
+		}
+		h.log.Error("CreateMapping: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusCreated, m)
+}
+
+func (h *Handler) writeMappingErr(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, domain.ErrMappingNotFoundByID):
+		writeError(w, http.StatusNotFound, "mapping_not_found", "")
+	case errors.Is(err, domain.ErrMappingNotDraft):
+		writeError(w, http.StatusConflict, "mapping_not_draft", err.Error())
+	case errors.Is(err, domain.ErrMappingNotApproved):
+		writeError(w, http.StatusConflict, "mapping_not_approved", err.Error())
+	case errors.Is(err, domain.ErrMappingNotActive):
+		writeError(w, http.StatusConflict, "mapping_not_active", err.Error())
+	case errors.Is(err, domain.ErrMappingSelfApproval):
+		writeError(w, http.StatusForbidden, "mapping_self_approval", err.Error())
+	default:
+		return false
+	}
+	return true
+}
+
+// ApproveMapping advances DRAFT -> APPROVED. For a high-risk mapping (onto a
+// control account), the approving principal must differ from the mapping's
+// own author — ACC-02's maker-checker SoD requirement.
+func (h *Handler) ApproveMapping(w http.ResponseWriter, r *http.Request) {
+	mappingID := chi.URLParam(r, "mapping_id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionApproveMapping); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	m, err := h.store.ApproveMapping(r.Context(), tenantID, mappingID, principalID)
+	if err != nil {
+		if h.writeMappingErr(w, err) {
+			return
+		}
+		h.log.Error("ApproveMapping: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+// ActivateMapping advances APPROVED -> ACTIVE, atomically superseding
+// whatever mapping was previously ACTIVE for the same key.
+func (h *Handler) ActivateMapping(w http.ResponseWriter, r *http.Request) {
+	mappingID := chi.URLParam(r, "mapping_id")
+	var req domain.ActivateMappingRequest
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionActivateMapping); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	effectiveFrom := time.Now().UTC()
+	if req.EffectiveFrom != nil {
+		effectiveFrom = req.EffectiveFrom.Time
+	}
+	m, err := h.store.ActivateMapping(r.Context(), tenantID, mappingID, effectiveFrom)
+	if err != nil {
+		if h.writeMappingErr(w, err) {
+			return
+		}
+		h.log.Error("ActivateMapping: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+// SupersedeMapping retires an ACTIVE mapping directly, with no replacement
+// yet approved to take its place.
+func (h *Handler) SupersedeMapping(w http.ResponseWriter, r *http.Request) {
+	mappingID := chi.URLParam(r, "mapping_id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionSupersedeMapping); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	m, err := h.store.SupersedeMapping(r.Context(), tenantID, mappingID, principalID)
+	if err != nil {
+		if h.writeMappingErr(w, err) {
+			return
+		}
+		h.log.Error("SupersedeMapping: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+// mappingAsOf resolves the as_of query/body parameter shared by GetMappingAsOf
+// and ExplainMapping, matching GetAccountAsOf's own parsing.
+func (h *Handler) mappingAsOf(w http.ResponseWriter, r *http.Request) (time.Time, bool) {
+	q := r.URL.Query()
+	for _, key := range []string{"as_of", "at", "effective_at"} {
+		if raw := q.Get(key); raw != "" {
+			var parsed domain.EffectiveDate
+			if err := json.Unmarshal([]byte(strconv.Quote(raw)), &parsed); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrAccountEffectiveDateRequired.Error())
+				return time.Time{}, false
+			}
+			return parsed.Time, true
+		}
+	}
+	return time.Now().UTC(), true
+}
+
+// GetMappingAsOf answers ACC-02's GetMappingAsOf query: which mapping
+// version was in force for mapping_key at as_of (defaulting to now).
+func (h *Handler) GetMappingAsOf(w http.ResponseWriter, r *http.Request) {
+	mappingKey := chi.URLParam(r, "mapping_key")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionViewAccountMapping); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	asOf, ok := h.mappingAsOf(w, r)
+	if !ok {
+		return
+	}
+	m, err := h.store.GetMappingAsOf(r.Context(), tenantID, mappingKey, asOf)
+	if errors.Is(err, domain.ErrAccountMappingNotFound) {
+		writeError(w, http.StatusNotFound, "mapping_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("GetMappingAsOf: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+// ExplainMapping answers ACC-02's ExplainMapping query: the full lineage of
+// whichever mapping version resolves for mapping_key at as_of — every field
+// evidencing its resolution path (who created it, who approved it, when it
+// was activated, what it superseded) is already on domain.AccountMapping.
+func (h *Handler) ExplainMapping(w http.ResponseWriter, r *http.Request) {
+	mappingKey := chi.URLParam(r, "mapping_key")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionViewAccountMapping); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	asOf, ok := h.mappingAsOf(w, r)
+	if !ok {
+		return
+	}
+	m, err := h.store.GetMappingAsOf(r.Context(), tenantID, mappingKey, asOf)
+	if errors.Is(err, domain.ErrAccountMappingNotFound) {
+		writeError(w, http.StatusNotFound, "mapping_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("ExplainMapping: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		*domain.AccountMapping
+		AsOf time.Time `json:"resolved_as_of"`
+	}{AccountMapping: m, AsOf: asOf})
+}
+
+// ListMappingAmbiguities answers ACC-02's ListAmbiguities query. See
+// PgStore.ListMappingAmbiguities's doc comment: idx_account_mappings_active
+// makes a real ambiguity structurally impossible, so this always answers
+// empty — it exists so the query the spec requires has a real answer, not a
+// placeholder.
+func (h *Handler) ListMappingAmbiguities(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionViewAccountMapping); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	keys, err := h.store.ListMappingAmbiguities(r.Context(), tenantID)
+	if err != nil {
+		h.log.Error("ListMappingAmbiguities: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if keys == nil {
+		keys = []string{}
+	}
+	writeJSON(w, http.StatusOK, keys)
 }
 
 func (h *Handler) GetAccountMapping(w http.ResponseWriter, r *http.Request) {

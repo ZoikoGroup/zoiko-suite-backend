@@ -63,6 +63,7 @@ type stubStore struct {
 
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
+	mappingsByID    map[string]*domain.AccountMapping // by account_mapping_id
 
 	ledgerEntries []domain.LedgerEntry
 	// lastLedgerFilter is the filter QueryLedger was last called with.
@@ -583,6 +584,123 @@ func (s *stubStore) ListAccountMappings(_ context.Context, tenantID string) ([]d
 		}
 	}
 	return out, nil
+}
+
+// CreateMapping, ApproveMapping, ActivateMapping and SupersedeMapping mirror
+// the real store's state model (Draft -> Approved -> Active -> Superseded)
+// and its maker-checker rule, against the stub's own accounts/mappings
+// rather than trusting the caller — same rationale as SetAccountMapping's
+// stub above.
+func (s *stubStore) CreateMapping(_ context.Context, m *domain.AccountMapping) error {
+	a, ok := s.accountsByCode[m.TenantID+"|"+m.AccountCode]
+	if !ok || a.Status != "ACTIVE" {
+		return domain.ErrMappingTargetAccountInvalid
+	}
+	m.Status = domain.AccountMappingStatusDraft
+	m.IsHighRisk = a.IsControlAccount
+	if s.mappingsByID == nil {
+		s.mappingsByID = map[string]*domain.AccountMapping{}
+	}
+	s.mappingsByID[m.AccountMappingID] = m
+	return nil
+}
+
+func (s *stubStore) ApproveMapping(_ context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error) {
+	m, ok := s.mappingsByID[mappingID]
+	if !ok || m.TenantID != tenantID {
+		return nil, domain.ErrMappingNotFoundByID
+	}
+	if m.Status != domain.AccountMappingStatusDraft {
+		return nil, domain.ErrMappingNotDraft
+	}
+	if m.IsHighRisk && m.CreatedByPrincipalID == principalID {
+		return nil, domain.ErrMappingSelfApproval
+	}
+	now := time.Now().UTC()
+	m.Status = domain.AccountMappingStatusApproved
+	m.ApprovedAt = &now
+	m.ApprovedByPrincipalID = principalID
+	return m, nil
+}
+
+func (s *stubStore) ActivateMapping(_ context.Context, tenantID, mappingID string, effectiveFrom time.Time) (*domain.AccountMapping, error) {
+	m, ok := s.mappingsByID[mappingID]
+	if !ok || m.TenantID != tenantID {
+		return nil, domain.ErrMappingNotFoundByID
+	}
+	if m.Status != domain.AccountMappingStatusApproved {
+		return nil, domain.ErrMappingNotApproved
+	}
+	at := effectiveFrom
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	key := tenantID + "|" + m.MappingKey
+	if prev, ok := s.currentMappings[key]; ok && prev.Status == domain.AccountMappingStatusActive {
+		prev.Status = domain.AccountMappingStatusSuperseded
+		prev.EffectiveTo = &at
+		prev.SupersededAt = &at
+		id := mappingID
+		prev.SupersededByMappingID = &id
+	}
+	m.Status = domain.AccountMappingStatusActive
+	m.ActivatedAt = &at
+	m.EffectiveFrom = at
+	s.currentMappings[key] = m
+	return m, nil
+}
+
+func (s *stubStore) SupersedeMapping(_ context.Context, tenantID, mappingID, _ string) (*domain.AccountMapping, error) {
+	m, ok := s.mappingsByID[mappingID]
+	if !ok || m.TenantID != tenantID {
+		return nil, domain.ErrMappingNotFoundByID
+	}
+	if m.Status != domain.AccountMappingStatusActive {
+		return nil, domain.ErrMappingNotActive
+	}
+	now := time.Now().UTC()
+	m.Status = domain.AccountMappingStatusSuperseded
+	m.EffectiveTo = &now
+	m.SupersededAt = &now
+	delete(s.currentMappings, tenantID+"|"+m.MappingKey)
+	return m, nil
+}
+
+func (s *stubStore) GetMappingByID(_ context.Context, tenantID, mappingID string) (*domain.AccountMapping, error) {
+	m, ok := s.mappingsByID[mappingID]
+	if !ok || m.TenantID != tenantID {
+		return nil, domain.ErrMappingNotFoundByID
+	}
+	return m, nil
+}
+
+func (s *stubStore) GetMappingAsOf(_ context.Context, tenantID, mappingKey string, asOf time.Time) (*domain.AccountMapping, error) {
+	var best *domain.AccountMapping
+	for _, m := range s.mappingsByID {
+		if m.TenantID != tenantID || m.MappingKey != mappingKey {
+			continue
+		}
+		if m.Status != domain.AccountMappingStatusActive && m.Status != domain.AccountMappingStatusSuperseded {
+			continue
+		}
+		if m.EffectiveFrom.After(asOf) {
+			continue
+		}
+		if m.EffectiveTo != nil && !m.EffectiveTo.After(asOf) {
+			continue
+		}
+		if best == nil || m.EffectiveFrom.After(best.EffectiveFrom) {
+			best = m
+		}
+	}
+	if best == nil {
+		return nil, domain.ErrAccountMappingNotFound
+	}
+	return best, nil
+}
+
+func (s *stubStore) ListMappingAmbiguities(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
 }
 
 func (s *stubStore) CreatePostingExecution(_ context.Context, e *domain.PostingExecution) error {

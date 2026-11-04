@@ -20,6 +20,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -1603,49 +1604,113 @@ func (s *PgStore) SetAccountMapping(ctx context.Context, m *domain.AccountMappin
 	}
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var status string
-		err := tx.QueryRow(ctx, `SELECT status FROM chart_of_accounts WHERE tenant_id = $1 AND account_code = $2`,
-			tenantID, m.AccountCode).Scan(&status)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrMappingTargetAccountInvalid
-		}
+		isHighRisk, err := targetAccountHighRisk(ctx, tx, tenantID, m.AccountCode)
 		if err != nil {
-			return mapPgError(err)
+			return err
 		}
-		if status != "ACTIVE" {
-			return domain.ErrMappingTargetAccountInvalid
+		// SetAccountMapping is the ungoverned one-step path, kept only for
+		// mappings onto ordinary accounts. A mapping onto a control account
+		// must go through CreateMapping/ApproveMapping/ActivateMapping so
+		// the maker-checker requirement below actually applies to it —
+		// returning ErrMappingHighRiskRequiresGovernedLifecycle here (not
+		// silently accepting it) is what makes that requirement real.
+		if isHighRisk {
+			return domain.ErrMappingHighRiskRequiresGovernedLifecycle
 		}
 
-		if _, err := tx.Exec(ctx, `
-			UPDATE account_mappings SET effective_to = $1
-			WHERE tenant_id = $2 AND mapping_key = $3 AND effective_to IS NULL
-		`, m.EffectiveFrom, tenantID, m.MappingKey); err != nil {
-			return mapPgError(err)
+		now := m.EffectiveFrom
+		if err := supersedeActiveMapping(ctx, tx, tenantID, m.MappingKey, m.AccountMappingID, now); err != nil {
+			return err
 		}
 
+		m.Status = domain.AccountMappingStatusActive
+		m.IsHighRisk = false
+		m.ApprovedAt = &now
+		m.ApprovedByPrincipalID = m.CreatedByPrincipalID
+		m.ActivatedAt = &now
 		_, err = tx.Exec(ctx, `
 			INSERT INTO account_mappings (
 				account_mapping_id, tenant_id, mapping_key, account_code,
-				effective_from, effective_to, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, NULL, $6, $7)
+				effective_from, effective_to, created_at, created_by_principal_id,
+				status, is_high_risk, approved_at, approved_by_principal_id, activated_at
+			) VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11, $12)
 		`, m.AccountMappingID, tenantID, m.MappingKey, m.AccountCode,
-			m.EffectiveFrom, m.CreatedAt, m.CreatedByPrincipalID)
+			m.EffectiveFrom, m.CreatedAt, m.CreatedByPrincipalID,
+			m.Status, m.IsHighRisk, m.ApprovedAt, m.ApprovedByPrincipalID, m.ActivatedAt)
 		return mapPgError(err)
 	})
 }
 
-func (s *PgStore) GetCurrentAccountMapping(ctx context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error) {
+// targetAccountHighRisk validates that accountCode names an existing ACTIVE
+// account (ACC-02 must never map onto an account that can't be posted to)
+// and answers whether it is a control account — the "where configured"
+// qualifier for ACC-02's high-risk maker-checker requirement.
+func targetAccountHighRisk(ctx context.Context, tx pgx.Tx, tenantID, accountCode string) (bool, error) {
+	var status string
+	var isControlAccount bool
+	err := tx.QueryRow(ctx, `SELECT status, is_control_account FROM chart_of_accounts WHERE tenant_id = $1 AND account_code = $2`,
+		tenantID, accountCode).Scan(&status, &isControlAccount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, domain.ErrMappingTargetAccountInvalid
+	}
+	if err != nil {
+		return false, mapPgError(err)
+	}
+	if status != "ACTIVE" {
+		return false, domain.ErrMappingTargetAccountInvalid
+	}
+	return isControlAccount, nil
+}
+
+// supersedeActiveMapping marks the current ACTIVE mapping for mappingKey (if
+// any) SUPERSEDED, pointing it at replacementID. It must run, and commit its
+// UPDATE, before the replacement's own row is inserted/updated to ACTIVE in
+// the same transaction — idx_account_mappings_active (migration 000029)
+// allows only one ACTIVE row per (tenant, mapping_key) at a time, so doing
+// this out of order would make the replacement's own activation fail the
+// index instead of cleanly superseding the old row.
+func supersedeActiveMapping(ctx context.Context, tx pgx.Tx, tenantID, mappingKey, replacementID string, at time.Time) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE account_mappings
+		SET status = $1, effective_to = $2, superseded_at = $2, superseded_by_mapping_id = $3
+		WHERE tenant_id = $4 AND mapping_key = $5 AND status = $6
+	`, domain.AccountMappingStatusSuperseded, at, replacementID, tenantID, mappingKey, domain.AccountMappingStatusActive)
+	return mapPgError(err)
+}
+
+const accountMappingColumns = `
+	account_mapping_id, tenant_id, mapping_key, account_code,
+	effective_from, effective_to, created_at, created_by_principal_id,
+	status, is_high_risk, approved_at, approved_by_principal_id,
+	activated_at, superseded_at, superseded_by_mapping_id
+`
+
+func scanAccountMapping(row pgx.Row) (*domain.AccountMapping, error) {
 	var m domain.AccountMapping
+	var approvedBy sql.NullString
+	err := row.Scan(
+		&m.AccountMappingID, &m.TenantID, &m.MappingKey, &m.AccountCode,
+		&m.EffectiveFrom, &m.EffectiveTo, &m.CreatedAt, &m.CreatedByPrincipalID,
+		&m.Status, &m.IsHighRisk, &m.ApprovedAt, &approvedBy,
+		&m.ActivatedAt, &m.SupersededAt, &m.SupersededByMappingID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	m.ApprovedByPrincipalID = approvedBy.String
+	return &m, nil
+}
+
+func (s *PgStore) GetCurrentAccountMapping(ctx context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error) {
+	var m *domain.AccountMapping
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return mapPgError(tx.QueryRow(ctx, `
-			SELECT account_mapping_id, tenant_id, mapping_key, account_code,
-			       effective_from, effective_to, created_at, created_by_principal_id
+		var err error
+		m, err = scanAccountMapping(tx.QueryRow(ctx, `
+			SELECT `+accountMappingColumns+`
 			FROM account_mappings
-			WHERE tenant_id = $1 AND mapping_key = $2 AND effective_to IS NULL
-		`, tenantID, mappingKey).Scan(
-			&m.AccountMappingID, &m.TenantID, &m.MappingKey, &m.AccountCode,
-			&m.EffectiveFrom, &m.EffectiveTo, &m.CreatedAt, &m.CreatedByPrincipalID,
-		))
+			WHERE tenant_id = $1 AND mapping_key = $2 AND status = $3
+		`, tenantID, mappingKey, domain.AccountMappingStatusActive))
+		return mapPgError(err)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrAccountMappingNotFound
@@ -1653,32 +1718,81 @@ func (s *PgStore) GetCurrentAccountMapping(ctx context.Context, tenantID, mappin
 	if err != nil {
 		return nil, err
 	}
-	return &m, nil
+	return m, nil
 }
 
-func (s *PgStore) ListAccountMappings(ctx context.Context, tenantID string) ([]domain.AccountMapping, error) {
-	var out []domain.AccountMapping
+// GetMappingAsOf reconstructs which mapping version was ACTIVE for
+// mappingKey at asOf, reading across both ACTIVE and SUPERSEDED rows (a
+// DRAFT or APPROVED row was never resolvable and never belongs in this
+// answer). The interval is half-open [effective_from, effective_to), the
+// same convention as ACC-01's GetAccountAsOf.
+func (s *PgStore) GetMappingAsOf(ctx context.Context, tenantID, mappingKey string, asOf time.Time) (*domain.AccountMapping, error) {
+	var m *domain.AccountMapping
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		m, err = scanAccountMapping(tx.QueryRow(ctx, `
+			SELECT `+accountMappingColumns+`
+			FROM account_mappings
+			WHERE tenant_id = $1 AND mapping_key = $2
+			  AND status IN ($3, $4)
+			  AND effective_from <= $5
+			  AND (effective_to IS NULL OR effective_to > $5)
+			ORDER BY effective_from DESC
+			LIMIT 1
+		`, tenantID, mappingKey, domain.AccountMappingStatusActive, domain.AccountMappingStatusSuperseded, asOf))
+		return mapPgError(err)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAccountMappingNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (s *PgStore) GetMappingByID(ctx context.Context, tenantID, mappingID string) (*domain.AccountMapping, error) {
+	var m *domain.AccountMapping
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		m, err = scanAccountMapping(tx.QueryRow(ctx, `
+			SELECT `+accountMappingColumns+`
+			FROM account_mappings WHERE tenant_id = $1 AND account_mapping_id = $2
+		`, tenantID, mappingID))
+		return mapPgError(err)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrMappingNotFoundByID
+	}
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ListMappingAmbiguities answers ACC-02's ListAmbiguities query: mapping keys
+// with more than one ACTIVE mapping. idx_account_mappings_active (migration
+// 000029) makes this structurally impossible, so this always returns empty
+// in a database this service created — it exists as the honest answer to
+// the query the spec requires, not a check load-bearing for correctness.
+func (s *PgStore) ListMappingAmbiguities(ctx context.Context, tenantID string) ([]string, error) {
+	var out []string
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT account_mapping_id, tenant_id, mapping_key, account_code,
-			       effective_from, effective_to, created_at, created_by_principal_id
-			FROM account_mappings
-			WHERE tenant_id = $1 AND effective_to IS NULL
-			ORDER BY mapping_key ASC
-		`, tenantID)
+			SELECT mapping_key FROM account_mappings
+			WHERE tenant_id = $1 AND status = $2
+			GROUP BY mapping_key HAVING COUNT(*) > 1
+		`, tenantID, domain.AccountMappingStatusActive)
 		if err != nil {
 			return mapPgError(err)
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var m domain.AccountMapping
-			if err := rows.Scan(
-				&m.AccountMappingID, &m.TenantID, &m.MappingKey, &m.AccountCode,
-				&m.EffectiveFrom, &m.EffectiveTo, &m.CreatedAt, &m.CreatedByPrincipalID,
-			); err != nil {
+			var key string
+			if err := rows.Scan(&key); err != nil {
 				return mapPgError(err)
 			}
-			out = append(out, m)
+			out = append(out, key)
 		}
 		return mapPgError(rows.Err())
 	})
@@ -1686,6 +1800,268 @@ func (s *PgStore) ListAccountMappings(ctx context.Context, tenantID string) ([]d
 		return nil, err
 	}
 	return out, nil
+}
+
+func (s *PgStore) ListAccountMappings(ctx context.Context, tenantID string) ([]domain.AccountMapping, error) {
+	var out []domain.AccountMapping
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+accountMappingColumns+`
+			FROM account_mappings
+			WHERE tenant_id = $1 AND status = $2
+			ORDER BY mapping_key ASC
+		`, tenantID, domain.AccountMappingStatusActive)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			m, err := scanAccountMapping(rows)
+			if err != nil {
+				return mapPgError(err)
+			}
+			out = append(out, *m)
+		}
+		return mapPgError(rows.Err())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ── ACC-02 governed lifecycle: CreateMapping / ApproveMapping /
+// ActivateMapping / SupersedeMapping ─────────────────────────────────────────
+
+// CreateMapping drafts a new mapping version. It is never itself eligible
+// for resolution (GetCurrentAccountMapping only ever sees status ACTIVE) —
+// ApproveMapping and ActivateMapping must both still run.
+func (s *PgStore) CreateMapping(ctx context.Context, m *domain.AccountMapping) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		isHighRisk, err := targetAccountHighRisk(ctx, tx, tenantID, m.AccountCode)
+		if err != nil {
+			return err
+		}
+		m.Status = domain.AccountMappingStatusDraft
+		m.IsHighRisk = isHighRisk
+		_, err = tx.Exec(ctx, `
+			INSERT INTO account_mappings (
+				account_mapping_id, tenant_id, mapping_key, account_code,
+				effective_from, created_at, created_by_principal_id,
+				status, is_high_risk
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`, m.AccountMappingID, tenantID, m.MappingKey, m.AccountCode,
+			m.EffectiveFrom, m.CreatedAt, m.CreatedByPrincipalID, m.Status, m.IsHighRisk)
+		if err != nil {
+			return mapPgError(err)
+		}
+		return s.enqueueMappingEvent(ctx, tx, "created", tenantID, m.AccountMappingID, m.CreatedByPrincipalID, "", map[string]any{
+			"mapping_key": m.MappingKey, "account_code": m.AccountCode, "is_high_risk": m.IsHighRisk,
+		})
+	})
+}
+
+// ApproveMapping advances DRAFT -> APPROVED. For a high-risk mapping, the
+// approver must not be the mapping's own author — ACC-02's maker-checker
+// requirement for cash/tax/control-account mappings.
+func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error) {
+	var out *domain.AccountMapping
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		m, err := scanAccountMapping(tx.QueryRow(ctx, `
+			SELECT `+accountMappingColumns+` FROM account_mappings
+			WHERE tenant_id = $1 AND account_mapping_id = $2 FOR UPDATE
+		`, tenantID, mappingID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrMappingNotFoundByID
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if m.Status != domain.AccountMappingStatusDraft {
+			return domain.ErrMappingNotDraft
+		}
+		if m.IsHighRisk && m.CreatedByPrincipalID == principalID {
+			return domain.ErrMappingSelfApproval
+		}
+
+		now := time.Now().UTC()
+		tag, err := tx.Exec(ctx, `
+			UPDATE account_mappings
+			SET status = $1, approved_at = $2, approved_by_principal_id = $3
+			WHERE tenant_id = $4 AND account_mapping_id = $5 AND status = $6
+		`, domain.AccountMappingStatusApproved, now, principalID, tenantID, mappingID, domain.AccountMappingStatusDraft)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrMappingNotDraft
+		}
+		m.Status = domain.AccountMappingStatusApproved
+		m.ApprovedAt = &now
+		m.ApprovedByPrincipalID = principalID
+		out = m
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ActivateMapping advances APPROVED -> ACTIVE, atomically superseding
+// whatever mapping was previously ACTIVE for the same key (if any) in the
+// same transaction — see supersedeActiveMapping's ordering note.
+func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time) (*domain.AccountMapping, error) {
+	var out *domain.AccountMapping
+	var supersededID string
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		m, err := scanAccountMapping(tx.QueryRow(ctx, `
+			SELECT `+accountMappingColumns+` FROM account_mappings
+			WHERE tenant_id = $1 AND account_mapping_id = $2 FOR UPDATE
+		`, tenantID, mappingID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrMappingNotFoundByID
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if m.Status != domain.AccountMappingStatusApproved {
+			return domain.ErrMappingNotApproved
+		}
+
+		at := effectiveFrom
+		if at.IsZero() {
+			at = time.Now().UTC()
+		}
+
+		var prevID sql.NullString
+		if err := tx.QueryRow(ctx, `
+			SELECT account_mapping_id FROM account_mappings
+			WHERE tenant_id = $1 AND mapping_key = $2 AND status = $3
+			FOR UPDATE
+		`, tenantID, m.MappingKey, domain.AccountMappingStatusActive).Scan(&prevID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return mapPgError(err)
+		}
+		if prevID.Valid {
+			supersededID = prevID.String
+			if err := supersedeActiveMapping(ctx, tx, tenantID, m.MappingKey, mappingID, at); err != nil {
+				return err
+			}
+		}
+
+		tag, err := tx.Exec(ctx, `
+			UPDATE account_mappings
+			SET status = $1, activated_at = $2, effective_from = $2
+			WHERE tenant_id = $3 AND account_mapping_id = $4 AND status = $5
+		`, domain.AccountMappingStatusActive, at, tenantID, mappingID, domain.AccountMappingStatusApproved)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrMappingNotApproved
+		}
+		m.Status = domain.AccountMappingStatusActive
+		m.ActivatedAt = &at
+		m.EffectiveFrom = at
+		out = m
+
+		if err := s.enqueueMappingEvent(ctx, tx, "activated", tenantID, mappingID, "", "", map[string]any{
+			"mapping_key": m.MappingKey, "account_code": m.AccountCode, "superseded_mapping_id": supersededID,
+		}); err != nil {
+			return err
+		}
+		if supersededID != "" {
+			if err := s.enqueueMappingEvent(ctx, tx, "superseded", tenantID, supersededID, "", "", map[string]any{
+				"mapping_key": m.MappingKey, "superseded_by_mapping_id": mappingID,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SupersedeMapping retires an ACTIVE mapping directly, with no replacement —
+// e.g. a business concept that no longer posts anywhere. ActivateMapping
+// handles supersession-by-replacement inline; this is the other negative
+// path, retiring one with nothing yet approved to take its place.
+func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID string) (*domain.AccountMapping, error) {
+	var out *domain.AccountMapping
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		m, err := scanAccountMapping(tx.QueryRow(ctx, `
+			SELECT `+accountMappingColumns+` FROM account_mappings
+			WHERE tenant_id = $1 AND account_mapping_id = $2 FOR UPDATE
+		`, tenantID, mappingID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrMappingNotFoundByID
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if m.Status != domain.AccountMappingStatusActive {
+			return domain.ErrMappingNotActive
+		}
+
+		now := time.Now().UTC()
+		tag, err := tx.Exec(ctx, `
+			UPDATE account_mappings
+			SET status = $1, effective_to = $2, superseded_at = $2
+			WHERE tenant_id = $3 AND account_mapping_id = $4 AND status = $5
+		`, domain.AccountMappingStatusSuperseded, now, tenantID, mappingID, domain.AccountMappingStatusActive)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrMappingNotActive
+		}
+		m.Status = domain.AccountMappingStatusSuperseded
+		m.EffectiveTo = &now
+		m.SupersededAt = &now
+		out = m
+
+		return s.enqueueMappingEvent(ctx, tx, "superseded", tenantID, mappingID, principalID, "", map[string]any{
+			"mapping_key": m.MappingKey, "superseded_by_mapping_id": nil,
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// enqueueMappingEvent writes one ACC-02 mapping lifecycle event to the
+// transactional outbox, mirroring enqueueJournalEvent's shape. Mappings are
+// tenant-scoped, not legal-entity-scoped, so legalEntityID is always "".
+func (s *PgStore) enqueueMappingEvent(ctx context.Context, tx pgx.Tx, fact, tenantID, mappingID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.account-mapping." + fact,
+		Service:         "general-ledger-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		AggregateType:   "account-mapping",
+		AggregateID:     mappingID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build account-mapping.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue account-mapping.%s event: %w", fact, err)
+	}
+	return nil
 }
 
 // changeAccountStatus is the shared implementation of ActivateAccount and
