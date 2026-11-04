@@ -46,6 +46,7 @@ const (
 	CodeManifestRequired      = "MANIFEST_REQUIRED"
 	CodeLegalHoldActive       = "LEGAL_HOLD_ACTIVE"
 	CodeIdempotencyKeyReused  = "IDEMPOTENCY_KEY_REUSED"
+	CodeIdempotencyKeyMissing = "IDEMPOTENCY_KEY_REQUIRED"
 	CodeIdempotencyInFlight   = "IDEMPOTENCY_IN_FLIGHT"
 	CodeVersionMismatch       = "VERSION_MISMATCH"
 	CodeArchiveUnavailable    = "ARCHIVE_UNAVAILABLE"

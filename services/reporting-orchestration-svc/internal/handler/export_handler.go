@@ -116,7 +116,9 @@ func (h *Handler) CreateExport(w http.ResponseWriter, r *http.Request) {
 
 // GetExport handles GET /v1/audit-exports/{id}.
 //
-// Statuses: 200 with ETag; 400 bad id; 401; 404 unknown/another tenant's.
+// Authz: AUDIT_EXPORT_READ on the export's legal entity.
+// Statuses: 200 with ETag; 400 bad id; 401; 403 authz denied; 404
+// unknown/another tenant's; 503 authz unavailable.
 func (h *Handler) GetExport(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -127,9 +129,8 @@ func (h *Handler) GetExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	export, err := h.exports.GetExportRequest(r.Context(), caller.TenantID, exportID)
-	if err != nil {
-		h.writeDomainError(w, r, err)
+	export, ok := h.loadExportForRead(w, r, caller, exportID)
+	if !ok {
 		return
 	}
 	setETag(w, export.Version)
@@ -139,7 +140,10 @@ func (h *Handler) GetExport(w http.ResponseWriter, r *http.Request) {
 // ListExports handles GET /v1/audit-exports.
 //
 // Query: status, legal_entity_id (filters); limit, offset.
-// Statuses: 200 {data, count, limit, offset}; 400 invalid query; 401.
+// Authz: AUDIT_EXPORT_READ on legal_entity_id, else X-Legal-Entity-Id, else
+// the tenant.
+// Statuses: 200 {data, count, limit, offset}; 400 invalid query; 401;
+// 403 authz denied; 503 authz unavailable.
 func (h *Handler) ListExports(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -154,6 +158,9 @@ func (h *Handler) ListExports(w http.ResponseWriter, r *http.Request) {
 	filter := store.ExportFilter{
 		Status:        strings.ToUpper(query.Get("status")),
 		LegalEntityID: query.Get("legal_entity_id"),
+	}
+	if !h.authorizeRead(w, r, caller, readScope(caller, filter.LegalEntityID), actionExportRead) {
+		return
 	}
 	exports, err := h.exports.ListExportRequests(r.Context(), caller.TenantID, filter, page)
 	if err != nil {
@@ -506,7 +513,9 @@ func (h *Handler) RevokeExport(w http.ResponseWriter, r *http.Request) {
 // Returns the manifest entries, the redaction log, the digest recomputed
 // now, and — once sealed — the stored seal digest with integrity_verified
 // (true when the recomputed digest still equals the seal).
-// Statuses: 200; 400 bad id; 401; 404 unknown/another tenant's.
+// Authz: AUDIT_EXPORT_READ on the export's legal entity.
+// Statuses: 200; 400 bad id; 401; 403 authz denied; 404 unknown/another
+// tenant's; 503 authz unavailable.
 func (h *Handler) GetManifest(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -517,6 +526,9 @@ func (h *Handler) GetManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if _, ok := h.loadExportForRead(w, r, caller, exportID); !ok {
+		return
+	}
 	export, entries, redactions, err := h.exports.GetPackageManifest(r.Context(), caller.TenantID, exportID)
 	if err != nil {
 		h.writeDomainError(w, r, err)
@@ -540,7 +552,8 @@ func (h *Handler) GetManifest(w http.ResponseWriter, r *http.Request) {
 
 // ListRedactions handles GET /v1/audit-exports/{id}/redactions (GetRedactionLog).
 //
-// Statuses: 200 {data, count}; 400 bad id; 401; 404.
+// Authz: AUDIT_EXPORT_READ on the export's legal entity.
+// Statuses: 200 {data, count}; 400 bad id; 401; 403; 404; 503.
 func (h *Handler) ListRedactions(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -548,6 +561,9 @@ func (h *Handler) ListRedactions(w http.ResponseWriter, r *http.Request) {
 	}
 	exportID, ok := requireUUIDParam(w, r, "id")
 	if !ok {
+		return
+	}
+	if _, ok := h.loadExportForRead(w, r, caller, exportID); !ok {
 		return
 	}
 	redactions, err := h.exports.ListRedactions(r.Context(), caller.TenantID, exportID)
@@ -560,7 +576,8 @@ func (h *Handler) ListRedactions(w http.ResponseWriter, r *http.Request) {
 
 // ListDeliveries handles GET /v1/audit-exports/{id}/deliveries (GetDeliveryHistory).
 //
-// Statuses: 200 {data, count}; 400 bad id; 401; 404.
+// Authz: AUDIT_EXPORT_READ on the export's legal entity.
+// Statuses: 200 {data, count}; 400 bad id; 401; 403; 404; 503.
 func (h *Handler) ListDeliveries(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -570,12 +587,29 @@ func (h *Handler) ListDeliveries(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, ok := h.loadExportForRead(w, r, caller, exportID); !ok {
+		return
+	}
 	receipts, err := h.exports.ListDeliveries(r.Context(), caller.TenantID, exportID)
 	if err != nil {
 		h.writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"data": receipts, "count": len(receipts)})
+}
+
+// loadExportForRead loads an export in the caller's tenant (404 when unknown
+// or another tenant's) and authorizes AUDIT_EXPORT_READ on its legal entity.
+func (h *Handler) loadExportForRead(w http.ResponseWriter, r *http.Request, caller requestContext, exportID string) (*domain.AuditExportRequest, bool) {
+	export, err := h.exports.GetExportRequest(r.Context(), caller.TenantID, exportID)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return nil, false
+	}
+	if !h.authorizeRead(w, r, caller, export.LegalEntityID, actionExportRead) {
+		return nil, false
+	}
+	return export, true
 }
 
 // loadExportForCommand is the shared prologue of body-less export commands

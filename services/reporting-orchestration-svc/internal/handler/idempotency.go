@@ -41,17 +41,25 @@ const maxIdempotencyKeyLength = 255
 //  4. 2xx -> store the response for replay; otherwise release the key so
 //     the client can fix the request and retry with the same key.
 //
-// The envelope middleware has already refused a write without a key; when
-// enforcement is in observe mode the request passes through undeduplicated.
+// A write without a key is refused here with 400 IDEMPOTENCY_KEY_REQUIRED.
+// The envelope middleware refuses it too, but only in enforce mode
+// (ZS_ENVELOPE_ENFORCEMENT=observe lets it through), so the requirement is
+// held here in every mode.
 func (h *Handler) idempotencyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !isWriteMethod(r.Method) || h.idempotency == nil {
+		if !isWriteMethod(r.Method) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if key == "" {
+			writeProblem(w, r, http.StatusBadRequest, CodeIdempotencyKeyMissing, "Idempotency-Key header is required for this write")
+			return
+		}
 		tenantID := middleware.GetTenantID(r.Context())
-		if key == "" || tenantID == "" {
+		if h.idempotency == nil || tenantID == "" {
+			// No store wired (unit tests) or no tenant (the tenant gate has
+			// already answered 401): nothing to deduplicate against.
 			next.ServeHTTP(w, r)
 			return
 		}

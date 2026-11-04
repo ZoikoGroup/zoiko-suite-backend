@@ -71,8 +71,9 @@ func (h *Handler) CreateDefinition(w http.ResponseWriter, r *http.Request) {
 // GetDefinition handles GET /v1/reports/definitions/{id}.
 //
 // Validation: id must be a UUID.
-// Statuses: 200 with ETag; 400 bad id; 401 no tenant/principal;
-// 404 unknown or another tenant's definition.
+// Authz: REPORT_DEFINITION_READ on the definition's legal entity.
+// Statuses: 200 with ETag; 400 bad id; 401 no tenant/principal; 403 authz
+// denied; 404 unknown or another tenant's definition; 503 authz unavailable.
 func (h *Handler) GetDefinition(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -88,6 +89,9 @@ func (h *Handler) GetDefinition(w http.ResponseWriter, r *http.Request) {
 		h.writeDomainError(w, r, err)
 		return
 	}
+	if !h.authorizeRead(w, r, caller, definition.LegalEntityID, actionDefinitionRead) {
+		return
+	}
 	setETag(w, definition.Version)
 	writeJSON(w, http.StatusOK, definition)
 }
@@ -96,8 +100,10 @@ func (h *Handler) GetDefinition(w http.ResponseWriter, r *http.Request) {
 //
 // Query: legal_entity_id, report_type, status (filters); limit (1-200,
 // default 50), offset (0-100000).
+// Authz: REPORT_DEFINITION_READ on legal_entity_id, else X-Legal-Entity-Id,
+// else the tenant.
 // Statuses: 200 {data, count, limit, offset}; 400 invalid query;
-// 401 no tenant/principal.
+// 401 no tenant/principal; 403 authz denied; 503 authz unavailable.
 func (h *Handler) ListDefinitions(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -120,6 +126,9 @@ func (h *Handler) ListDefinitions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		filter.Status = string(status)
+	}
+	if !h.authorizeRead(w, r, caller, readScope(caller, filter.LegalEntityID), actionDefinitionRead) {
+		return
 	}
 
 	definitions, err := h.definitions.ListDefinitions(r.Context(), caller.TenantID, filter, page)
