@@ -94,9 +94,10 @@ paths:
            verified — this is the spoofing shape GTRM §6.2 names. Streamed to
            SIEM at CRITICAL. → `403 tenant_hostname_mismatch`
         5. **Continuous risk assessment** (carta-svc, optional). `ISOLATE` and
-           `DENY` block. `STEP_UP_MFA` does **not** — there is no step-up flow
-           downstream to redirect to, and hard-blocking with no way to recover
-           would be a silent lockout. → `403 carta_blocked`
+           `DENY` block with `403 carta_blocked`. `STEP_UP_MFA` blocks with
+           `401 step_up_required` — a TOTP step-up flow now exists in
+           identity-context-svc, and the console turns this answer into a
+           step-up prompt and a retry (AU-23, decision 21 Oct 2026).
         6. **GOV-01 tenant context resolution** (tenant-entity-registry-svc,
            optional). A valid token proves who is asking; it does not prove
            the tenant may transact, nor that the legal entity named in it

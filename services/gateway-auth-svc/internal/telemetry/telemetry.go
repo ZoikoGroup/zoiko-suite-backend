@@ -108,9 +108,10 @@ type Metrics struct {
 	TenantContextTotal *prometheus.CounterVec
 
 	// CartaDecisionsTotal counts continuous-risk assessments by decision.
-	// STEP_UP_MFA is counted but deliberately not enforced — there is no
-	// step-up flow downstream to redirect to — so this counter is the only
-	// place that signal is visible at all.
+	// STEP_UP_MFA is both counted and enforced — the answer is 401
+	// step_up_required, which the console turns into a step-up prompt and a
+	// retry (AU-23) — so this counter also tracks how often the step-up flow
+	// is being demanded.
 	CartaDecisionsTotal *prometheus.CounterVec
 }
 

@@ -68,7 +68,8 @@ type DomainMetrics interface {
 	// denied, unavailable or disabled.
 	TenantContext(outcome string)
 	// CartaDecision records a continuous-risk decision, including the ALLOW
-	// and STEP_UP_MFA ones that do not block.
+	// one that does not block and STEP_UP_MFA, which is enforced as 401
+	// step_up_required (AU-23).
 	CartaDecision(decision string)
 }
 

@@ -147,10 +147,11 @@ pin both signals and, explicitly, that they do not render identically.
   presented against another's hostname passes. This is an honest gap in
   coverage, not a bug in the check, and it is stated in `RUNBOOK.md` §4.2 so an
   on-call is not misled about what the alert can see.
-- **`STEP_UP_MFA` is not enforced.** There is no step-up challenge flow
-  anywhere downstream to redirect to, and hard-blocking with no path to recover
-  would be a silent lockout wearing a different name. It is counted and
-  streamed, not enforced.
+- **`STEP_UP_MFA` is enforced as a 401 `step_up_required`, not a redirect.**
+  The gateway cannot send a browser to the step-up flow — it answers Traefik's
+  ForwardAuth call — so it refuses with `401 step_up_required` (RFC 9470
+  `insufficient_user_authentication`) and the console turns that into a step-up
+  prompt and a retry (AU-23, decision 21 Oct 2026). Counted and streamed.
 - **Resource sensitivity for risk scoring is a hardcoded `MEDIUM`.** No
   resource-classification registry exists on this platform yet; the placeholder
   is labelled as one at the call site.
