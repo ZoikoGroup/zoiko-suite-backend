@@ -10,15 +10,48 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/tax-determination-svc/internal/domain"
+	"zoiko.io/tax-determination-svc/internal/events"
 	"zoiko.io/tax-determination-svc/internal/middleware"
+	"zoiko.io/tax-determination-svc/internal/outbox"
 )
 
 type Store interface {
-	CreateDetermination(ctx context.Context, d *domain.TaxDetermination) error
+	CreateDetermination(ctx context.Context, d *domain.TaxDetermination, meta EventMeta) error
 	GetDetermination(ctx context.Context, id string) (*domain.TaxDetermination, error)
 	ListDeterminations(ctx context.Context, transactionID, jurisdictionID, status string) ([]domain.TaxDetermination, error)
 	UpdateDetermination(ctx context.Context, d *domain.TaxDetermination) error
-	OverrideDetermination(ctx context.Context, id string, req *domain.OverrideTaxRequest) (*domain.TaxDetermination, error)
+	OverrideDetermination(ctx context.Context, id string, req *domain.OverrideTaxRequest, meta EventMeta) (*domain.TaxDetermination, error)
+}
+
+// Event types written to the outbox. Unchanged from the former direct publish.
+const (
+	EventTaxDeterminationCalculated = "tax_determination.calculated"
+	EventTaxDeterminationOverridden = "tax_determination.overridden"
+)
+
+// EventMeta is the request context a write's domain event carries: who did it
+// and under which correlation. The store writes the event to outbox_events in
+// the same transaction as the change.
+type EventMeta struct {
+	ActorID       string
+	CorrelationID string
+}
+
+// writeEvent inserts the domain event for d into the outbox using the
+// business transaction tx, so the change and its event commit together.
+func writeEvent(ctx context.Context, tx pgx.Tx, eventType string, d *domain.TaxDetermination, meta EventMeta) error {
+	tenantID := middleware.GetTenantID(ctx)
+	evt := events.NewEvent(events.PublishParams{
+		EventType: eventType, DeterminationID: d.DeterminationID, TenantID: tenantID,
+		LegalEntityID: d.LegalEntityID, Jurisdiction: d.JurisdictionID, ActorID: meta.ActorID,
+		CorrelationID: meta.CorrelationID, Payload: d,
+	})
+	_, err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "tax_determination", AggregateID: d.DeterminationID, EventType: eventType,
+		TenantID: tenantID, LegalEntityID: d.LegalEntityID, ActorID: meta.ActorID,
+		CorrelationID: meta.CorrelationID, Payload: evt,
+	})
+	return err
 }
 
 type PgStore struct {
@@ -74,7 +107,7 @@ func scanDeterminationTargets(d *domain.TaxDetermination, status *string) []any 
 	}
 }
 
-func (s *PgStore) CreateDetermination(ctx context.Context, d *domain.TaxDetermination) error {
+func (s *PgStore) CreateDetermination(ctx context.Context, d *domain.TaxDetermination, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -123,6 +156,9 @@ func (s *PgStore) CreateDetermination(ctx context.Context, d *domain.TaxDetermin
 	)
 	if err != nil {
 		return fmt.Errorf("insert tax determination: %w", err)
+	}
+	if err := writeEvent(ctx, tx, EventTaxDeterminationCalculated, d, meta); err != nil {
+		return err
 	}
 
 	return tx.Commit(ctx)
@@ -227,7 +263,7 @@ func (s *PgStore) UpdateDetermination(ctx context.Context, d *domain.TaxDetermin
 	return tx.Commit(ctx)
 }
 
-func (s *PgStore) OverrideDetermination(ctx context.Context, id string, req *domain.OverrideTaxRequest) (*domain.TaxDetermination, error) {
+func (s *PgStore) OverrideDetermination(ctx context.Context, id string, req *domain.OverrideTaxRequest, meta EventMeta) (*domain.TaxDetermination, error) {
 	d, err := s.GetDetermination(ctx, id)
 	if err != nil {
 		return nil, err
@@ -257,6 +293,9 @@ func (s *PgStore) OverrideDetermination(ctx context.Context, id string, req *dom
 		d.CalculatedTaxAmount, string(d.Status), d.UpdatedAt, id, tenantID,
 	)
 	if err != nil {
+		return nil, err
+	}
+	if err := writeEvent(ctx, tx, EventTaxDeterminationOverridden, d, meta); err != nil {
 		return nil, err
 	}
 

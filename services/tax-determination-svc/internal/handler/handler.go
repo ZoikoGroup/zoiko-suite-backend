@@ -15,7 +15,6 @@ import (
 
 	"zoiko.io/tax-determination-svc/internal/authz"
 	"zoiko.io/tax-determination-svc/internal/domain"
-	"zoiko.io/tax-determination-svc/internal/events"
 	"zoiko.io/tax-determination-svc/internal/middleware"
 	"zoiko.io/tax-determination-svc/internal/registry"
 	"zoiko.io/tax-determination-svc/internal/rules"
@@ -49,6 +48,13 @@ func snapshotTaxRule(rule *rules.TaxRuleDTO) *string {
 const (
 	ActionTaxDeterminationCreate   = "TAX_DETERMINATION_CREATE"
 	ActionTaxDeterminationOverride = "TAX_DETERMINATION_OVERRIDE"
+	ActionTaxDeterminationRead     = "TAX_DETERMINATION_READ"
+)
+
+// Stable error codes for refusals a client must be able to tell apart.
+const (
+	codeActorMismatch       = "actor_mismatch"
+	codeSegregationOfDuties = "segregation_of_duties"
 )
 
 // AuthzChecker is the subset of authz.Client's contract the handler depends
@@ -83,7 +89,6 @@ var _ RulesClient = (*rules.Client)(nil)
 
 type Handler struct {
 	store        store.Store
-	publisher    events.Publisher
 	authz        AuthzChecker
 	rulesClient  RulesClient
 	jurisdiction JurisdictionValidator
@@ -91,9 +96,11 @@ type Handler struct {
 	logger       *zap.Logger
 }
 
+// New builds the handler. Domain events are not published from here: the
+// store writes them to the transactional outbox inside the business
+// transaction and internal/outbox.Relay delivers them.
 func New(
 	st store.Store,
-	pub events.Publisher,
 	az AuthzChecker,
 	rc RulesClient,
 	jv JurisdictionValidator,
@@ -101,7 +108,7 @@ func New(
 	logger *zap.Logger,
 ) *Handler {
 	return &Handler{
-		store: st, publisher: pub, authz: az, rulesClient: rc,
+		store: st, authz: az, rulesClient: rc,
 		jurisdiction: jv, registry: rr, logger: logger,
 	}
 }
@@ -236,6 +243,11 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The evaluator is the authenticated principal. evaluated_by is still
+	// accepted for backward compatibility, but only when it names the caller.
+	if !actorMatches(w, req.EvaluatedBy, principalID, "evaluated_by") {
+		return
+	}
 
 	// Every jurisdiction this determination names must be one
 	// jurisdiction-rules-svc recognises. Unknown is the caller's mistake;
@@ -319,7 +331,7 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		Currency:            req.Currency,
 		Status:              domain.StatusCalculated,
 		EffectiveFrom:       req.EffectiveFrom,
-		EvaluatedBy:         req.EvaluatedBy,
+		EvaluatedBy:         principalID,
 
 		// TAX-03 inputs, preserved so the determination can be reconstructed
 		// from the facts it was given (§9.J retrieval, Appendix B).
@@ -354,21 +366,31 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		det.SellerRegistrationStatus = &status
 	}
 
-	if err := h.store.CreateDetermination(r.Context(), det); err != nil {
+	meta := store.EventMeta{ActorID: principalID, CorrelationID: correlationID}
+	if err := h.store.CreateDetermination(r.Context(), det, meta); err != nil {
 		h.logger.Error("create tax determination failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to record tax determination")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "tax_determination.calculated", DeterminationID: det.DeterminationID, TenantID: tenantID,
-		LegalEntityID: det.LegalEntityID, Jurisdiction: det.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: det,
-	})
 	writeJSON(w, http.StatusCreated, det)
 }
 
+// authorizeRead authorizes a read in scope (the record's legal entity, or the
+// tenant for a tenant-wide list). A read used to need nothing beyond
+// X-Tenant-Id, so any caller could read every determination of the tenant.
+// Now: no principal is 401, a denied principal is 403, an unreachable
+// authorization-svc is 503.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, scope string) bool {
+	_, ok := h.authorize(w, r, scope, ActionTaxDeterminationRead)
+	return ok
+}
+
 func (h *Handler) GetDetermination(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Principal-Id") == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return
+	}
 	id := chi.URLParam(r, "id")
 	det, err := h.store.GetDetermination(r.Context(), id)
 	if err != nil {
@@ -379,10 +401,16 @@ func (h *Handler) GetDetermination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get tax determination")
 		return
 	}
+	if !h.authorizeRead(w, r, det.LegalEntityID) {
+		return
+	}
 	writeJSON(w, http.StatusOK, det)
 }
 
 func (h *Handler) ListDeterminations(w http.ResponseWriter, r *http.Request) {
+	if !h.authorizeRead(w, r, middleware.GetTenantID(r.Context())) {
+		return
+	}
 	transactionID := r.URL.Query().Get("transaction_id")
 	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
 	status := r.URL.Query().Get("status")
@@ -399,7 +427,6 @@ func (h *Handler) ListDeterminations(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) OverrideDetermination(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.OverrideTaxRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -425,8 +452,20 @@ func (h *Handler) OverrideDetermination(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	if !actorMatches(w, req.UpdatedBy, principalID, "updated_by") {
+		return
+	}
+	req.UpdatedBy = principalID
+	// Segregation of duties: an override replaces a computed tax position, so
+	// the principal who evaluated the determination may not override it.
+	if existing.EvaluatedBy == principalID {
+		writeCodedError(w, http.StatusForbidden, codeSegregationOfDuties,
+			"the principal who evaluated a tax determination may not override it")
+		return
+	}
 
-	det, err := h.store.OverrideDetermination(r.Context(), id, &req)
+	meta := store.EventMeta{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")}
+	det, err := h.store.OverrideDetermination(r.Context(), id, &req, meta)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrTaxDeterminationNotFound):
@@ -439,11 +478,6 @@ func (h *Handler) OverrideDetermination(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "tax_determination.overridden", DeterminationID: id, TenantID: tenantID,
-		LegalEntityID: det.LegalEntityID, Jurisdiction: det.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: det,
-	})
 	writeJSON(w, http.StatusOK, det)
 }
 
@@ -455,4 +489,22 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeCodedError is writeError plus a stable machine-readable code.
+func writeCodedError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
+// actorMatches enforces the actor rule for a body field naming who acted: the
+// actor is the authenticated principal. An absent field is filled by the
+// caller from the principal; a present one that names someone else is refused
+// 403 actor_mismatch. It reports whether the request may proceed.
+func actorMatches(w http.ResponseWriter, claimed, principalID, field string) bool {
+	if claimed != "" && claimed != principalID {
+		writeCodedError(w, http.StatusForbidden, codeActorMismatch,
+			field+" must be the authenticated principal (X-Principal-Id)")
+		return false
+	}
+	return true
 }

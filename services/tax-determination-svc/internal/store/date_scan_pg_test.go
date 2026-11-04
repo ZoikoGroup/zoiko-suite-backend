@@ -27,7 +27,7 @@ func TestPgStore_GetAndList_ScanDateColumns(t *testing.T) {
 		PlaceOfSupplyBasis: domain.PlaceOfSupplyCallerAsserted, ProductClassification: "SAAS",
 		SupplyKind: domain.SupplyKindServices, SupplyType: domain.SupplyTypeB2C,
 	}
-	if err := s.CreateDetermination(ctx, d); err != nil {
+	if err := s.CreateDetermination(ctx, d, store.EventMeta{ActorID: "p1"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	got, err := s.GetDetermination(ctx, d.DeterminationID)
@@ -42,7 +42,7 @@ func TestPgStore_GetAndList_ScanDateColumns(t *testing.T) {
 	if err != nil || len(list) != 1 {
 		t.Fatalf("list: %v (n=%d)", err, len(list))
 	}
-	if _, err := s.OverrideDetermination(ctx, d.DeterminationID, &domain.OverrideTaxRequest{OverriddenTaxAmount: 1, Reason: "r"}); err != nil {
+	if _, err := s.OverrideDetermination(ctx, d.DeterminationID, &domain.OverrideTaxRequest{OverriddenTaxAmount: 1, Reason: "r"}, store.EventMeta{ActorID: "p2"}); err != nil {
 		t.Fatalf("override: %v", err)
 	}
 }

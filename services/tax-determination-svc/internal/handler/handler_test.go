@@ -12,13 +12,14 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tax-determination-svc/internal/domain"
-	"zoiko.io/tax-determination-svc/internal/events"
 	"zoiko.io/tax-determination-svc/internal/registry"
 	"zoiko.io/tax-determination-svc/internal/rules"
+	"zoiko.io/tax-determination-svc/internal/store"
 )
 
 type stubStore struct {
 	determinations map[string]*domain.TaxDetermination
+	metas          []store.EventMeta
 }
 
 func newStubStore() *stubStore {
@@ -27,7 +28,8 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateDetermination(_ context.Context, d *domain.TaxDetermination) error {
+func (s *stubStore) CreateDetermination(_ context.Context, d *domain.TaxDetermination, meta store.EventMeta) error {
+	s.metas = append(s.metas, meta)
 	if d.DeterminationID == "" {
 		d.DeterminationID = "tdet-test-001"
 	}
@@ -58,7 +60,8 @@ func (s *stubStore) UpdateDetermination(_ context.Context, d *domain.TaxDetermin
 	return nil
 }
 
-func (s *stubStore) OverrideDetermination(_ context.Context, id string, req *domain.OverrideTaxRequest) (*domain.TaxDetermination, error) {
+func (s *stubStore) OverrideDetermination(_ context.Context, id string, req *domain.OverrideTaxRequest, meta store.EventMeta) (*domain.TaxDetermination, error) {
+	s.metas = append(s.metas, meta)
 	d, ok := s.determinations[id]
 	if !ok {
 		return nil, domain.ErrTaxDeterminationNotFound
@@ -70,14 +73,6 @@ func (s *stubStore) OverrideDetermination(_ context.Context, id string, req *dom
 	d.CalculatedTaxAmount = req.OverriddenTaxAmount
 	return d, nil
 }
-
-type stubPublisher struct{}
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // stubAuthz is a stand-in for authz.Client in tests: it never makes a real
 // HTTP call, and lets tests control the grant/deny/error outcome.
@@ -144,12 +139,12 @@ func newTestHandler() *Handler {
 
 func newTestHandlerWith(jv JurisdictionValidator, rr RegistrationResolver) *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, &stubRulesClient{}, jv, rr, logger)
+	return New(newStubStore(), &stubAuthz{}, &stubRulesClient{}, jv, rr, logger)
 }
 
 func newTestHandlerWithRules(rc RulesClient, jv JurisdictionValidator, rr RegistrationResolver) *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, rc, jv, rr, logger)
+	return New(newStubStore(), &stubAuthz{}, rc, jv, rr, logger)
 }
 
 // withTAX03 fills the TAX-03 required business/source inputs on a request that
@@ -212,7 +207,7 @@ func TestDetermineTax(t *testing.T) {
 		ExemptAmount:   0.0,
 		Currency:       "GBP",
 		EffectiveFrom:  "2026-01-01",
-		EvaluatedBy:    "billing-engine",
+		EvaluatedBy:    "user-test-01",
 	}
 	w := httptest.NewRecorder()
 	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
@@ -238,7 +233,7 @@ func TestDetermineTax_MissingRule_FailsClosed(t *testing.T) {
 	body := domain.DetermineTaxRequest{
 		TransactionID: "tx-inv-1002", SourceModule: "INVOICE", LegalEntityID: "le-001",
 		JurisdictionID: "unknown-jurisdiction", TaxCategory: "VAT", GrossAmount: 1000.0,
-		Currency: "GBP", EffectiveFrom: "2026-01-01", EvaluatedBy: "billing-engine",
+		Currency: "GBP", EffectiveFrom: "2026-01-01", EvaluatedBy: "user-test-01",
 	}
 	w := httptest.NewRecorder()
 	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
@@ -254,7 +249,7 @@ func TestDetermineTax_ServiceUnavailable_FailsClosed(t *testing.T) {
 	body := domain.DetermineTaxRequest{
 		TransactionID: "tx-inv-1003", SourceModule: "INVOICE", LegalEntityID: "le-001",
 		JurisdictionID: "uk-england", TaxCategory: "VAT", GrossAmount: 1000.0,
-		Currency: "GBP", EffectiveFrom: "2026-01-01", EvaluatedBy: "billing-engine",
+		Currency: "GBP", EffectiveFrom: "2026-01-01", EvaluatedBy: "user-test-01",
 	}
 	w := httptest.NewRecorder()
 	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
@@ -300,7 +295,7 @@ func TestOverrideDetermination(t *testing.T) {
 		GrossAmount:    500.0,
 		Currency:       "USD",
 		EffectiveFrom:  "2026-01-01",
-		EvaluatedBy:    "po-engine",
+		EvaluatedBy:    "user-test-01",
 	}
 	wDet := httptest.NewRecorder()
 	r.ServeHTTP(wDet, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
@@ -314,7 +309,9 @@ func TestOverrideDetermination(t *testing.T) {
 		UpdatedBy:           "tax-auditor",
 	}
 	wOvr := httptest.NewRecorder()
-	r.ServeHTTP(wOvr, buildRequest(http.MethodPost, "/v1/tax-determinations/"+created.DeterminationID+"/override", ovrBody))
+	ovrReq := buildRequest(http.MethodPost, "/v1/tax-determinations/"+created.DeterminationID+"/override", ovrBody)
+	ovrReq.Header.Set("X-Principal-Id", "tax-auditor")
+	r.ServeHTTP(wOvr, ovrReq)
 	if wOvr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d — %s", wOvr.Code, wOvr.Body.String())
 	}
