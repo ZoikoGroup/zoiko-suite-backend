@@ -145,3 +145,13 @@ func TestSessionCreateLimit(t *testing.T) {
 		t.Fatal("another address must not be affected")
 	}
 }
+
+// SEC-T055: the session-creation limit is configurable; unset uses the default.
+func TestSessionCreateLimitConfigurable(t *testing.T) {
+	if got := sessionCreateLimit(0); got != SessionCreatePerIPPerMinute {
+		t.Fatalf("unset: %d", got)
+	}
+	if got := sessionCreateLimit(6000); got != 6000 {
+		t.Fatalf("configured: %d", got)
+	}
+}

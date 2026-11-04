@@ -121,7 +121,9 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		zap.String("policy_version", p.policyVersion()), zap.String("prompt_version", model.PromptVersion),
 		zap.String("model_id", p.ModelID), zap.String("app_version", p.AppVersion),
 		zap.Strings("claim_ids", claimIDs), zap.Strings("source_version_ids", sourceIDs), zap.String("handoff_route", route),
-		zap.Int64("tokens", r.Tokens))
+		zap.Int64("tokens", r.Tokens),
+		// Doc 02 App. C: the template a reply came from, by id and locale.
+		zap.String("template_id", policy.TemplateID(r.Text)), zap.String("template_locale", policy.TemplateLocale))
 	if policy.HasContact(in.Message) && r.Status != contract.Unavailable && !strings.Contains(r.Text, policy.ContactNotice) {
 		// Doc 10 §21: contact details were masked, not kept; say so.
 		r.Text = strings.TrimSpace(r.Text + "\n\n" + policy.ContactNotice)
@@ -137,6 +139,7 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		attribute.String("suivo.release.model", p.ModelID),
 		attribute.String("suivo.release.app", p.AppVersion),
 		attribute.String("suivo.answer_class", r.AnswerClass),
+		attribute.String("suivo.template_id", policy.TemplateID(r.Text)),
 		attribute.String("suivo.retrieval.mode", r.Diag.RetrievalMode),
 		attribute.Int("suivo.retrieval.count", len(r.Diag.EvidenceIDs)),
 		attribute.StringSlice("suivo.retrieval.chunk_ids", r.Diag.EvidenceIDs),

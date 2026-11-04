@@ -51,11 +51,20 @@ const idleTTL = 10 * time.Minute
 // distinct addresses cannot grow memory without bound.
 const DefaultMaxKeys = 100_000
 
-// SessionCreatePerIPPerMinute is the tighter per-address limit on
+// SessionCreatePerIPPerMinute is the default tighter per-address limit on
 // POST /sessions (Doc 06 §13, SEC-T055): creating sessions is cheap for an
 // attacker and each one carries a grant, so it is limited separately from
 // the general per-IP limit.
 const SessionCreatePerIPPerMinute = 10
+
+// sessionCreateLimit is the configured limit, or the default when unset
+// (config refuses 0 outside dev/test).
+func sessionCreateLimit(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	return SessionCreatePerIPPerMinute
+}
 
 func newLimiter(perMin int) *limiter {
 	b := float64(perMin) / 4
@@ -161,7 +170,7 @@ func New(cfg config.Config, st store.Store, fl interface{ Values() flags.Values 
 	}
 	return &Guard{
 		ip: newLimiter(cfg.RateLimitPerIPPerMinute), sess: newLimiter(cfg.RateLimitPerSessionPerMin), trusted: trusted,
-		sessCreate: newLimiter(SessionCreatePerIPPerMinute), store: st, flags: fl, daily: cfg.DailyTokenCeiling, monthly: cfg.MonthlyTokenCeiling,
+		sessCreate: newLimiter(sessionCreateLimit(cfg.RateLimitSessionCreatePerMin)), store: st, flags: fl, daily: cfg.DailyTokenCeiling, monthly: cfg.MonthlyTokenCeiling,
 		now: time.Now,
 	}
 }

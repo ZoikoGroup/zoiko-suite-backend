@@ -83,6 +83,9 @@ type Config struct {
 	ModelTimeout              time.Duration
 	RateLimitPerIPPerMinute   int
 	RateLimitPerSessionPerMin int
+	// RateLimitSessionCreatePerMin is the tighter per-IP limit on new
+	// sessions (Doc 06 §13, SEC-T055).
+	RateLimitSessionCreatePerMin int
 	// TrustedProxies are the CIDRs whose X-Forwarded-For is believed when
 	// keying the per-IP limit (the console's same-origin proxy, the edge).
 	TrustedProxies      []string
@@ -125,31 +128,32 @@ func Load() (Config, error) {
 		Retention:                envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
 		// Required and never assumed (SEC-P0-06): an unset value used to
 		// mean dev and switch the production gates off.
-		Environment:               os.Getenv("PUBLIC_AI_ENVIRONMENT"),
-		PolicyDigest:              os.Getenv("PUBLIC_AI_POLICY_DIGEST"),
-		ProviderApprovalRef:       os.Getenv("PUBLIC_AI_PROVIDER_APPROVAL_REF"),
-		ProviderRegion:            os.Getenv("PUBLIC_AI_REGION"),
-		ApprovedRegions:           splitList(os.Getenv("PUBLIC_AI_APPROVED_REGIONS")),
-		RetentionSet:              os.Getenv("PUBLIC_AI_RETENTION") != "",
-		ModelProvider:             env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock")),
-		ModelID:                   modelIDFor(env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock"))),
-		AllowedModelIDs:           splitList(env("PUBLIC_AI_ALLOWED_MODEL_IDS", "mock-extractive-v1,openai/gpt-oss-120b")),
-		GroqAPIKey:                os.Getenv("GROQ_API_KEY"),
-		Dataset:                   env("PUBLIC_AI_DATASET", "public-kb"),
-		KBAllowDraft:              envBool("KB_ALLOW_DRAFT", envDefaultDev()),
-		SeedOnStart:               envBool("PUBLIC_AI_SEED_ON_START", false),
-		StructuredResponseDev:     envBool("PUBLIC_AI_STRUCTURED_RESPONSE", envDefaultDev()),
-		MaxBodyBytes:              int64(envInt("PUBLIC_AI_MAX_BODY_BYTES", 16*1024)),
-		ModelTimeout:              envDuration("PUBLIC_AI_MODEL_TIMEOUT", 6*time.Second),
-		RateLimitPerIPPerMinute:   envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
-		RateLimitPerSessionPerMin: envInt("PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN", 20),
-		TrustedProxies:            splitList(env("PUBLIC_AI_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
-		DailyTokenCeiling:         int64(envInt("PUBLIC_AI_DAILY_TOKEN_CEILING", 2_000_000)),
-		MonthlyTokenCeiling:       int64(envInt("PUBLIC_AI_MONTHLY_TOKEN_CEILING", 40_000_000)),
-		LogRawPrompt:              envBool("PUBLIC_AI_LOG_RAW_PROMPT", false),
-		ProductionChatPIICapture:  envBool("PUBLIC_AI_PRODUCTION_CHAT_PII_CAPTURE", false),
-		SigningPublicKey:          os.Getenv("PUBLIC_AI_SIGNING_PUBLIC_KEY"),
-		SigningKey:                os.Getenv("PUBLIC_AI_SIGNING_KEY"),
+		Environment:                  os.Getenv("PUBLIC_AI_ENVIRONMENT"),
+		PolicyDigest:                 os.Getenv("PUBLIC_AI_POLICY_DIGEST"),
+		ProviderApprovalRef:          os.Getenv("PUBLIC_AI_PROVIDER_APPROVAL_REF"),
+		ProviderRegion:               os.Getenv("PUBLIC_AI_REGION"),
+		ApprovedRegions:              splitList(os.Getenv("PUBLIC_AI_APPROVED_REGIONS")),
+		RetentionSet:                 os.Getenv("PUBLIC_AI_RETENTION") != "",
+		ModelProvider:                env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock")),
+		ModelID:                      modelIDFor(env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock"))),
+		AllowedModelIDs:              splitList(env("PUBLIC_AI_ALLOWED_MODEL_IDS", "mock-extractive-v1,openai/gpt-oss-120b")),
+		GroqAPIKey:                   os.Getenv("GROQ_API_KEY"),
+		Dataset:                      env("PUBLIC_AI_DATASET", "public-kb"),
+		KBAllowDraft:                 envBool("KB_ALLOW_DRAFT", envDefaultDev()),
+		SeedOnStart:                  envBool("PUBLIC_AI_SEED_ON_START", false),
+		StructuredResponseDev:        envBool("PUBLIC_AI_STRUCTURED_RESPONSE", envDefaultDev()),
+		MaxBodyBytes:                 int64(envInt("PUBLIC_AI_MAX_BODY_BYTES", 16*1024)),
+		ModelTimeout:                 envDuration("PUBLIC_AI_MODEL_TIMEOUT", 6*time.Second),
+		RateLimitPerIPPerMinute:      envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
+		RateLimitPerSessionPerMin:    envInt("PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN", 20),
+		RateLimitSessionCreatePerMin: envInt("PUBLIC_AI_RATE_LIMIT_SESSION_CREATE_PER_MIN", 10),
+		TrustedProxies:               splitList(env("PUBLIC_AI_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
+		DailyTokenCeiling:            int64(envInt("PUBLIC_AI_DAILY_TOKEN_CEILING", 2_000_000)),
+		MonthlyTokenCeiling:          int64(envInt("PUBLIC_AI_MONTHLY_TOKEN_CEILING", 40_000_000)),
+		LogRawPrompt:                 envBool("PUBLIC_AI_LOG_RAW_PROMPT", false),
+		ProductionChatPIICapture:     envBool("PUBLIC_AI_PRODUCTION_CHAT_PII_CAPTURE", false),
+		SigningPublicKey:             os.Getenv("PUBLIC_AI_SIGNING_PUBLIC_KEY"),
+		SigningKey:                   os.Getenv("PUBLIC_AI_SIGNING_KEY"),
 	}
 	// The model profile is derived, never configured on its own, so the
 	// manifest, eval report and build_info name the model that actually runs.
@@ -270,12 +274,13 @@ const (
 // real https origin, never localhost (SEC-P0-09, D06-09).
 func validateProductionLimits(c Config) error {
 	for name, v := range map[string]int64{
-		"PUBLIC_AI_RATE_LIMIT_IP_PER_MIN":      int64(c.RateLimitPerIPPerMinute),
-		"PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN": int64(c.RateLimitPerSessionPerMin),
-		"PUBLIC_AI_DAILY_TOKEN_CEILING":        c.DailyTokenCeiling,
-		"PUBLIC_AI_MONTHLY_TOKEN_CEILING":      c.MonthlyTokenCeiling,
-		"PUBLIC_AI_SESSION_TOKEN_CAP":          c.SessionTokenCap,
-		"PUBLIC_AI_TOKEN_BUDGET_PER_TURN":      int64(c.TokenBudgetPerTurn),
+		"PUBLIC_AI_RATE_LIMIT_IP_PER_MIN":             int64(c.RateLimitPerIPPerMinute),
+		"PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN":        int64(c.RateLimitPerSessionPerMin),
+		"PUBLIC_AI_RATE_LIMIT_SESSION_CREATE_PER_MIN": int64(c.RateLimitSessionCreatePerMin),
+		"PUBLIC_AI_DAILY_TOKEN_CEILING":               c.DailyTokenCeiling,
+		"PUBLIC_AI_MONTHLY_TOKEN_CEILING":             c.MonthlyTokenCeiling,
+		"PUBLIC_AI_SESSION_TOKEN_CAP":                 c.SessionTokenCap,
+		"PUBLIC_AI_TOKEN_BUDGET_PER_TURN":             int64(c.TokenBudgetPerTurn),
 	} {
 		if v <= 0 {
 			return fmt.Errorf("%s must be > 0 outside dev/test (SEC-P0-09)", name)
