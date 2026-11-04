@@ -13,6 +13,14 @@ var (
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".
 	ErrTenantMissing = errors.New("tenant scope missing")
+
+	// ErrSegregationOfDuties is a resolve by the principal who logged the
+	// gap: logging and resolving must be done by different principals.
+	ErrSegregationOfDuties = errors.New("the principal who logged the compliance gap may not resolve it")
+
+	// ErrActorRequired is a write that reached the store without the
+	// gateway-verified principal that performs it.
+	ErrActorRequired = errors.New("acting principal is required")
 )
 
 type OverallStatus string
@@ -80,8 +88,12 @@ type ComplianceGap struct {
 	Status          GapStatus   `json:"status"`
 	DetectedAt      time.Time   `json:"detected_at"`
 	ResolvedAt      *time.Time  `json:"resolved_at,omitempty"`
-	CreatedAt       time.Time   `json:"created_at"`
-	UpdatedAt       time.Time   `json:"updated_at"`
+	// CreatedBy / ResolvedBy are the principals that logged and resolved the
+	// gap (nil on gaps logged before they were recorded).
+	CreatedBy  *string   `json:"created_by,omitempty"`
+	ResolvedBy *string   `json:"resolved_by,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // EvaluateComplianceRequest is the payload to evaluate compliance status.
