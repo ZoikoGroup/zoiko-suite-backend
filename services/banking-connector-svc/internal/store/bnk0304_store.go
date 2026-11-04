@@ -551,3 +551,41 @@ func (p *PgStore) GetCanonicalTransaction(ctx context.Context, tenantID, transac
 	}
 	return &t, nil
 }
+
+// TransactionLegalEntity resolves the legal entity of the connection whose
+// statement line a canonical transaction was normalized from.
+func (p *PgStore) TransactionLegalEntity(ctx context.Context, tenantID, transactionID string) (string, error) {
+	var le string
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT c.legal_entity_id
+			FROM bank_transactions_canonical t
+			JOIN bank_statement_lines l ON l.line_id = t.statement_line_id
+			JOIN bank_statements s ON s.statement_id = l.statement_id
+			JOIN bank_connections c ON c.connection_id = s.connection_id
+			WHERE t.transaction_id = $1 AND t.tenant_id = $2`, transactionID, tenantID).Scan(&le)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", domain.ErrTransactionNotFound
+	}
+	return le, err
+}
+
+// MappingExceptionLegalEntity resolves the legal entity of the connection
+// whose statement line a mapping exception was raised against.
+func (p *PgStore) MappingExceptionLegalEntity(ctx context.Context, tenantID, exceptionID string) (string, error) {
+	var le string
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT c.legal_entity_id
+			FROM mapping_exceptions e
+			JOIN bank_statement_lines l ON l.line_id = e.statement_line_id
+			JOIN bank_statements s ON s.statement_id = l.statement_id
+			JOIN bank_connections c ON c.connection_id = s.connection_id
+			WHERE e.exception_id = $1 AND e.tenant_id = $2`, exceptionID, tenantID).Scan(&le)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", domain.ErrMappingExceptionNotFound
+	}
+	return le, err
+}

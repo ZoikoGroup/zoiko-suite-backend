@@ -104,7 +104,9 @@ func TestAuthz_IngestStatement_DeniedAndCrossTenant(t *testing.T) {
 	if w := send(r, http.MethodPost, "/v1/banking/statements", "tenant-b", "maker", stmt); w.Code != http.StatusNotFound {
 		t.Fatalf("cross-tenant ingest: got %d %s, want 404", w.Code, w.Body.String())
 	}
-	if w := send(r, http.MethodGet, "/v1/banking/connections/"+conn.ConnectionID+"/statements", "tenant-b", "maker", nil); w.Code != http.StatusOK || bytes.Contains(w.Body.Bytes(), []byte(conn.ConnectionID)) {
+	// Listing another tenant's statements resolves the connection first, so
+	// it is the same 404 as any unknown connection (no existence leak).
+	if w := send(r, http.MethodGet, "/v1/banking/connections/"+conn.ConnectionID+"/statements", "tenant-b", "maker", nil); w.Code != http.StatusNotFound || bytes.Contains(w.Body.Bytes(), []byte(conn.ConnectionID)) {
 		t.Fatalf("cross-tenant statement list leaked: %d %s", w.Code, w.Body.String())
 	}
 }
