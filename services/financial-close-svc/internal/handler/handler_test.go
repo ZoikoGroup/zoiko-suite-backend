@@ -252,6 +252,38 @@ func (s *stubStore) ApplyPeriodTransition(_ context.Context, id string, allowedF
 	return &out, nil
 }
 
+// startSoftCloseOrCloseReview is the claim-aware shared body behind
+// StartSoftCloseTransition and EnterCloseReviewTransition: look up the
+// claim first (replaying if found), otherwise apply the transition via the
+// same logic ApplyPeriodTransition uses and record the claim.
+func (s *stubStore) startSoftCloseOrCloseReview(ctx context.Context, command string, id string, allowedFrom []string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	if claimedID, replay, err := s.lookupClaim(key, command, hash); err != nil || replay {
+		if replay {
+			if found := s.periods[claimedID]; found != nil {
+				out := *found
+				return &out, true, nil
+			}
+		}
+		return nil, replay, err
+	}
+	fp, err := s.ApplyPeriodTransition(ctx, id, allowedFrom, u, fact, legacyType, correlationID, actorID)
+	if err != nil {
+		return fp, false, err
+	}
+	s.recordClaim(key, command, hash, id)
+	return fp, false, nil
+}
+
+func (s *stubStore) StartSoftCloseTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodSoftClose
+	return s.startSoftCloseOrCloseReview(ctx, "StartSoftClose", id, []string{domain.PeriodOpen}, u, fact, legacyType, correlationID, actorID, key, hash)
+}
+
+func (s *stubStore) EnterCloseReviewTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodCloseReview
+	return s.startSoftCloseOrCloseReview(ctx, "EnterCloseReview", id, []string{domain.PeriodSoftClose}, u, fact, legacyType, correlationID, actorID, key, hash)
+}
+
 func (s *stubStore) CreateReopenRequest(_ context.Context, req *domain.ReopenRequest, correlationID, actorID string) error {
 	fp, ok := s.periods[req.FiscalPeriodID]
 	if !ok {

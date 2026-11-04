@@ -372,6 +372,78 @@ func (s *PgStore) applyPeriodTransition(ctx context.Context, tx pgx.Tx, tenantID
 	return &fp, nil
 }
 
+// loadFiscalPeriodTx reads one period inside tx — the tx-scoped counterpart
+// of GetFiscalPeriod, for use as a transitionWithClaim load callback.
+func loadFiscalPeriodTx(ctx context.Context, tx pgx.Tx, tenantID, id string) (*domain.FiscalPeriod, error) {
+	var fp domain.FiscalPeriod
+	err := tx.QueryRow(ctx, `
+		SELECT `+fiscalPeriodColumns+`
+		FROM fiscal_periods WHERE fiscal_period_id = $1 AND tenant_id = $2
+	`, id, tenantID).Scan(
+		&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd,
+		&fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID, &fp.ReopenedAt, &fp.ReopenExpiresAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrFiscalPeriodNotFound
+	}
+	return &fp, err
+}
+
+// periodTransitionWithClaim is ApplyPeriodTransition with an
+// Idempotency-Key claimed in the same transaction (SPEC_DEVIATIONS A11) —
+// the shared implementation behind StartSoftCloseTransition and
+// EnterCloseReviewTransition below, the two simple, single-UPDATE period
+// transitions this pass closes. HardClosePeriod/ReclosePeriod and the
+// reopen commands keep calling the unclaimed ApplyPeriodTransition — their
+// readiness checks, kernel sealing and evidence signing make a correct
+// idempotency boundary a separate, larger design question.
+//
+// On a refused transition (ErrInvalidPeriodTransition), the period as it
+// actually stands is still returned — same contract ApplyPeriodTransition
+// itself gives — so the caller can report "the period is X, this needs Y"
+// without a second read, and so this method never has to distinguish "no
+// result" from "refused" the way a bare error would.
+func (s *PgStore) periodTransitionWithClaim(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate,
+	fact, legacyType, correlationID, actorID, command, idempotencyKey, requestHash string) (fp *domain.FiscalPeriod, replay bool, err error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, false, domain.ErrIdentityMissing
+	}
+	var result *domain.FiscalPeriod
+	replay, err = s.transitionWithClaim(ctx, idempotencyKey, command, requestHash, targetFiscalPeriod, id,
+		func(tx pgx.Tx) error {
+			out, applyErr := s.applyPeriodTransition(ctx, tx, tenantID, id, allowedFrom, u, fact, legacyType, correlationID, actorID)
+			result = out
+			return applyErr
+		},
+		func(tx pgx.Tx, pid string) error {
+			out, loadErr := loadFiscalPeriodTx(ctx, tx, tenantID, pid)
+			if loadErr != nil {
+				return loadErr
+			}
+			result = out
+			return nil
+		})
+	return result, replay, mapPgError(err)
+}
+
+// StartSoftCloseTransition moves a period OPEN -> SOFT_CLOSE, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11). u.To is set
+// here, not by the caller: this method's whole point is that it is always
+// this one target state.
+func (s *PgStore) StartSoftCloseTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodSoftClose
+	return s.periodTransitionWithClaim(ctx, id, []string{domain.PeriodOpen}, u, fact, legacyType, correlationID, actorID, CommandStartSoftClose, idempotencyKey, requestHash)
+}
+
+// EnterCloseReviewTransition moves a period SOFT_CLOSE -> CLOSE_REVIEW,
+// claiming idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+// u.To is set here, not by the caller, for the same reason as above.
+func (s *PgStore) EnterCloseReviewTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodCloseReview
+	return s.periodTransitionWithClaim(ctx, id, []string{domain.PeriodSoftClose}, u, fact, legacyType, correlationID, actorID, CommandEnterCloseReview, idempotencyKey, requestHash)
+}
+
 // CreateReopenEvent inserts one permanent, append-only reopen record — a
 // database trigger (migration 000003) rejects any UPDATE/DELETE on this
 // table at the schema level, not just in application code.

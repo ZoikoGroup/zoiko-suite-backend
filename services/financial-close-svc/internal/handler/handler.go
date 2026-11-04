@@ -40,6 +40,11 @@ type Store interface {
 	// transactional outbox in the same transaction (e.g. "soft_closed",
 	// "close_review_started", "reopened", "reclosed").
 	ApplyPeriodTransition(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID string) (*domain.FiscalPeriod, error)
+	// StartSoftCloseTransition/EnterCloseReviewTransition claim the caller's
+	// Idempotency-Key (SPEC_DEVIATIONS A11); HardClose/Reclose/Reopen above
+	// keep using the unclaimed ApplyPeriodTransition.
+	StartSoftCloseTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error)
+	EnterCloseReviewTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error)
 	CreateReopenRequest(ctx context.Context, req *domain.ReopenRequest, correlationID, actorID string) error
 	GetReopenRequest(ctx context.Context, requestID string) (*domain.ReopenRequest, error)
 	ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, *domain.FiscalPeriod, error)
@@ -5756,6 +5761,8 @@ func (h *Handler) writeStoreErr(w http.ResponseWriter, err error, notFoundCode s
 		writeError(w, http.StatusNotFound, notFoundCode, "")
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

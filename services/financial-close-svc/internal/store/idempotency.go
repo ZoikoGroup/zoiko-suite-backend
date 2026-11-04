@@ -23,15 +23,15 @@ const (
 	// ACC-07 accrual lifecycle commands (SPEC_DEVIATIONS A11). Each claims
 	// the same targetAccrualSchedule column CreateAccrual does; the command
 	// name is what disambiguates a key reused for the wrong lifecycle step.
-	CommandSubmitAccrual = "SubmitAccrual"
+	CommandSubmitAccrual  = "SubmitAccrual"
 	CommandApproveAccrual = "ApproveAccrual"
-	CommandAmendAccrual  = "AmendFutureSchedule"
-	CommandCancelAccrual = "CancelAccrual"
+	CommandAmendAccrual   = "AmendFutureSchedule"
+	CommandCancelAccrual  = "CancelAccrual"
 
 	// ACC-08 prepayment lifecycle commands (SPEC_DEVIATIONS A11), the mirror
 	// of the ACC-07 set above; each claims targetPrepaymentSchedule.
-	CommandApprovePrepayment  = "ApprovePrepayment"
-	CommandModifyPrepayment   = "ModifyPrepayment"
+	CommandApprovePrepayment   = "ApprovePrepayment"
+	CommandModifyPrepayment    = "ModifyPrepayment"
 	CommandTerminatePrepayment = "TerminatePrepayment"
 
 	// ACC-09 allocation rule lifecycle commands (SPEC_DEVIATIONS A11).
@@ -55,6 +55,12 @@ const (
 	// model).
 	CommandApproveMigrationBatch = "ApproveMigrationBatch"
 	CommandCertifyMigrationBatch = "CertifyMigrationBatch"
+
+	// ACC-14 period transitions (SPEC_DEVIATIONS A11). Only the two simple,
+	// single-UPDATE transitions are claimed; HardClose/Reclose/Reopen are
+	// not — see the SPEC_DEVIATIONS note on why.
+	CommandStartSoftClose   = "StartSoftClose"
+	CommandEnterCloseReview = "EnterCloseReview"
 )
 
 // claimTarget is the command_idempotency column naming what a command
@@ -68,6 +74,7 @@ const (
 	targetAllocationRule     claimTarget = "allocation_rule_version_id"
 	targetFXRevaluationRun   claimTarget = "fx_revaluation_run_id"
 	targetMigrationBatch     claimTarget = "migration_batch_id"
+	targetFiscalPeriod       claimTarget = "fiscal_period_id"
 )
 
 // commandClaim is one command_idempotency row.
@@ -83,7 +90,7 @@ func lookupCommandClaim(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey
 		SELECT command, request_hash,
 		       COALESCE(accrual_schedule_id, prepayment_schedule_id,
 		                allocation_rule_version_id, fx_revaluation_run_id,
-		                migration_batch_id)::text
+		                migration_batch_id, fiscal_period_id)::text
 		FROM command_idempotency
 		WHERE tenant_id = $1 AND idempotency_key = $2
 	`, tenantID, idempotencyKey).Scan(&c.Command, &c.RequestHash, &c.TargetID)

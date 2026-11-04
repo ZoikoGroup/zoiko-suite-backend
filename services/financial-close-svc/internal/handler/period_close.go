@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -23,18 +24,28 @@ import (
 // SOFT_CLOSE. Ordinary posting stops; close journals continue.
 // PERIOD_CLOSE_INITIATE.
 func (h *Handler) StartSoftClose(w http.ResponseWriter, r *http.Request) {
-	h.simpleTransition(w, r, domain.PeriodOpen, domain.PeriodSoftClose, "soft-closed", "period.soft_closed")
+	h.simpleTransition(w, r, domain.PeriodOpen, "soft-closed", "period.soft_closed", h.store.StartSoftCloseTransition)
 }
 
 // EnterCloseReview — POST /v1/close/periods/{id}/close-review: SOFT_CLOSE →
 // CLOSE_REVIEW. Only designated close journals from here; next is hard
 // close. PERIOD_CLOSE_INITIATE.
 func (h *Handler) EnterCloseReview(w http.ResponseWriter, r *http.Request) {
-	h.simpleTransition(w, r, domain.PeriodSoftClose, domain.PeriodCloseReview, "close-review-started", "period.close_review_started")
+	h.simpleTransition(w, r, domain.PeriodSoftClose, "close-review-started", "period.close_review_started", h.store.EnterCloseReviewTransition)
 }
 
-func (h *Handler) simpleTransition(w http.ResponseWriter, r *http.Request, from, to, fact, legacyType string) {
+// simpleTransition claims the caller's Idempotency-Key (SPEC_DEVIATIONS
+// A11): a retry after a lost response returns the period as it now stands
+// instead of 409 invalid_period_transition against a period this same key
+// already moved. apply is one of the two claimed store transitions above —
+// each already knows its own target state and allowed-from set.
+func (h *Handler) simpleTransition(w http.ResponseWriter, r *http.Request, from, fact, legacyType string,
+	apply func(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error)) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.PeriodTransitionRequest
 	if r.ContentLength != 0 && !decodeJSON(w, r, &req) {
 		return
@@ -56,9 +67,13 @@ func (h *Handler) simpleTransition(w http.ResponseWriter, r *http.Request, from,
 		return
 	}
 	correlationID := correlationIDOf(r)
-	updated, err := h.store.ApplyPeriodTransition(r.Context(), id, []string{from}, domain.PeriodUpdate{
-		To: to, PrincipalID: principalID, Reason: strings.TrimSpace(req.Reason), At: time.Now().UTC(),
-	}, fact, legacyType, correlationID, principalID)
+	requestHash := requestFingerprint(struct {
+		PeriodID string
+		Req      domain.PeriodTransitionRequest
+	}{id, req})
+	updated, _, err := apply(r.Context(), id, domain.PeriodUpdate{
+		PrincipalID: principalID, Reason: strings.TrimSpace(req.Reason), At: time.Now().UTC(),
+	}, fact, legacyType, correlationID, principalID, idempotencyKey, requestHash)
 	if err != nil {
 		h.writeTransitionErr(w, err, updated, from)
 		return

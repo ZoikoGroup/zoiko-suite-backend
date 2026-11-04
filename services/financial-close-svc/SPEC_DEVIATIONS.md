@@ -457,9 +457,11 @@ mint an aggregate with no natural key. B10 closes the accrual lifecycle slice
 (Approve/Modify/Terminate); B12 closes the ACC-09 allocation rule slice
 (Approve/Supersede); B13 closes ACC-10's Approve (Post already answers a
 replay with the run's current state via its own status check, not a claim);
-B14 closes ACC-17's Approve and Certify below, and records why Validate is
-left open — it has two possible terminal outcomes (VALIDATED or
-QUARANTINED) that this house pattern does not yet model. The remaining
+B14 closes ACC-17's Approve and Certify, and records why Validate is left
+open — it has two possible terminal outcomes (VALIDATED or QUARANTINED)
+that this house pattern does not yet model; B15 closes ACC-14's two simple
+period transitions below (StartSoftClose, EnterCloseReview) and corrects a
+stale claim this table made about HardClose/Reclose. The remaining
 commands rely on natural
 keys or status guards, so a retry after a lost response returns a 4xx
 instead of the original result, or a duplicate append-only row:
@@ -474,8 +476,8 @@ instead of the original result, or a duplicate append-only row:
 | Allocation execute / reprocess | original run (natural key / status) |
 | FX approve | original result (B13, claimed); post: original (status) |
 | Migration validate/approve/certify | validate: still 422 (A11 residual, see B14); approve/certify: original result (B14, claimed); commit: original (status), now also retries reconciliation |
-| Period soft-close / close-review | 409 `invalid_period_transition` |
-| Period hard-close / reclose | 200 with current state |
+| Period soft-close / close-review | original result (B15, claimed) |
+| Period hard-close / reclose | 422 `period_already_locked` if already at the target state (corrected from this table's prior "200 with current state" claim, which did not match the code; not claimed this pass — see B15) |
 | Reopen request | 409 `reopen_request_pending` |
 | RunSubledgerControl | a second append-only run |
 | VerifyTracePath | a second verification record |
@@ -1016,3 +1018,58 @@ currency, and the platform has nothing to backfill it from.
     verification note above. Migration `000023`'s down/up round-trip was
     also checked by hand against the same running instance, per this
     register's established convention for a schema change (A4, B4).
+- **B15. ACC-14's two simple period transitions claim an Idempotency-Key;
+  HardClose/Reclose/Reopen are deliberately not given one, and this table's
+  prior claim about HardClose/Reclose was wrong (closes A11's period row
+  for StartSoftClose/EnterCloseReview).**
+  - *Schema.* Migration `000024` adds `fiscal_period_id` to
+    `command_idempotency`, widens `chk_command_idempotency_one_target` to
+    six columns, and adds the matching lookup index — same shape as B14's
+    `000023` for migration batches.
+  - *Why only two of the period commands.* `ApplyPeriodTransition` is the
+    one function behind every period transition (soft-close, close-review,
+    hard-close, reclose, and the reopen commands), but StartSoftClose and
+    EnterCloseReview are the only callers that do nothing beyond that one
+    guarded UPDATE. `HardClosePeriod`/`ReclosePeriod` (`closeWithEvidence`)
+    run readiness checks, seal the period in the accounting kernel, and
+    build and sign an evidence manifest before ever calling it; the reopen
+    commands have their own request/approval object. Wrapping either in a
+    claim is a separate, larger design question (where does the claim lookup
+    sit relative to a kernel seal that already happened?), not a drop-in
+    extension of this pass's pattern — so this closes only the two commands
+    that fit the house shape.
+  - *The new store methods.* `StartSoftCloseTransition` and
+    `EnterCloseReviewTransition` each call a shared, unexported
+    `periodTransitionWithClaim` — `transitionWithClaim` wrapping the
+    existing `applyPeriodTransition` — with their own fixed `allowedFrom`
+    and target state (`u.To` is set inside the method, not by the caller:
+    the whole point of having two methods instead of one parameterised by
+    target state). On a refusal (`ErrInvalidPeriodTransition`), the period
+    as it actually stands is still returned, matching
+    `ApplyPeriodTransition`'s own existing contract, so
+    `writeTransitionErr`'s "the period is X, this needs Y" message needs no
+    second read.
+  - *The handler.* `simpleTransition` now takes the claimed store method as
+    a function value (`apply`) instead of the `to` state string, since each
+    of the two store methods already knows its own target; this avoids
+    giving the `handler` package a dependency on the `store` package's
+    exported command-name constants, which nothing else in this codebase
+    does either.
+  - *The stale claim corrected.* This table previously said "Period
+    hard-close / reclose | 200 with current state". Reading
+    `closeWithEvidence` while scoping this pass found that is not what the
+    code does: a hard-close/reclose attempt against a period already at the
+    target state answers 422 `period_already_locked`, not 200. The table
+    now says what the code actually does; the behavior itself is unchanged
+    by this pass.
+  - *Tests:* `internal/handler/period_close_test.go`
+    (`TestStartSoftClose_RetryUnderSameKeyReplays`,
+    `TestEnterCloseReview_RetryUnderSameKeyReplays`, the former also proving
+    a freshly-keyed soft-close attempt on an already-SOFT_CLOSE period is
+    still refused) and
+    `internal/store/period_transition_idempotency_integration_test.go`
+    (replay for both commands; the refusal case also proves the current
+    period is still returned on a real refusal, not just a replay), run
+    against a real, disposable Postgres container per the verification note
+    above. Migration `000024`'s down/up round-trip was also checked by hand
+    against the same running instance.
