@@ -1627,8 +1627,11 @@ func (s *PgStore) SetAccountMapping(ctx context.Context, m *domain.AccountMappin
 			return domain.ErrMappingHighRiskRequiresGovernedLifecycle
 		}
 
+		// SetAccountMapping never accepts a scope — it is the legacy,
+		// ungoverned path kept only for ordinary tenant-wide mappings; a
+		// scoped mapping must go through CreateMapping.
 		now := m.EffectiveFrom
-		if err := supersedeActiveMapping(ctx, tx, tenantID, m.MappingKey, m.AccountMappingID, now); err != nil {
+		if err := supersedeActiveMapping(ctx, tx, tenantID, m.MappingKey, nil, nil, m.AccountMappingID, now); err != nil {
 			return err
 		}
 
@@ -1671,19 +1674,25 @@ func targetAccountHighRisk(ctx context.Context, tx pgx.Tx, tenantID, accountCode
 	return isControlAccount, nil
 }
 
-// supersedeActiveMapping marks the current ACTIVE mapping for mappingKey (if
-// any) SUPERSEDED, pointing it at replacementID. It must run, and commit its
+// supersedeActiveMapping marks the current ACTIVE mapping for this EXACT
+// scope tuple (mappingKey, legalEntityID, bookID — nil/nil is tenant-wide)
+// SUPERSEDED, pointing it at replacementID. It must run, and commit its
 // UPDATE, before the replacement's own row is inserted/updated to ACTIVE in
-// the same transaction — idx_account_mappings_active (migration 000029)
-// allows only one ACTIVE row per (tenant, mapping_key) at a time, so doing
-// this out of order would make the replacement's own activation fail the
-// index instead of cleanly superseding the old row.
-func supersedeActiveMapping(ctx context.Context, tx pgx.Tx, tenantID, mappingKey, replacementID string, at time.Time) error {
+// the same transaction — idx_account_mappings_active_scoped (migration
+// 000030) allows only one ACTIVE row per (tenant, mapping_key, scope) at a
+// time, so doing this out of order would make the replacement's own
+// activation fail the index instead of cleanly superseding the old row.
+// Matching on the exact scope (not just mappingKey) is what lets a
+// tenant-wide and an entity-scoped mapping for the same key coexist ACTIVE
+// deliberately, rather than one superseding the other.
+func supersedeActiveMapping(ctx context.Context, tx pgx.Tx, tenantID, mappingKey string, legalEntityID, bookID *string, replacementID string, at time.Time) error {
 	_, err := tx.Exec(ctx, `
 		UPDATE account_mappings
 		SET status = $1, effective_to = $2, superseded_at = $2, superseded_by_mapping_id = $3
 		WHERE tenant_id = $4 AND mapping_key = $5 AND status = $6
-	`, domain.AccountMappingStatusSuperseded, at, replacementID, tenantID, mappingKey, domain.AccountMappingStatusActive)
+		  AND legal_entity_id IS NOT DISTINCT FROM $7 AND book_id IS NOT DISTINCT FROM $8
+	`, domain.AccountMappingStatusSuperseded, at, replacementID, tenantID, mappingKey, domain.AccountMappingStatusActive,
+		legalEntityID, bookID)
 	return mapPgError(err)
 }
 
@@ -1691,25 +1700,35 @@ const accountMappingColumns = `
 	account_mapping_id, tenant_id, mapping_key, account_code,
 	effective_from, effective_to, created_at, created_by_principal_id,
 	status, is_high_risk, approved_at, approved_by_principal_id,
-	activated_at, superseded_at, superseded_by_mapping_id
+	activated_at, superseded_at, superseded_by_mapping_id,
+	reason, legal_entity_id, book_id
 `
 
 func scanAccountMapping(row pgx.Row) (*domain.AccountMapping, error) {
 	var m domain.AccountMapping
 	var approvedBy sql.NullString
+	var reason sql.NullString
 	err := row.Scan(
 		&m.AccountMappingID, &m.TenantID, &m.MappingKey, &m.AccountCode,
 		&m.EffectiveFrom, &m.EffectiveTo, &m.CreatedAt, &m.CreatedByPrincipalID,
 		&m.Status, &m.IsHighRisk, &m.ApprovedAt, &approvedBy,
 		&m.ActivatedAt, &m.SupersededAt, &m.SupersededByMappingID,
+		&reason, &m.LegalEntityID, &m.BookID,
 	)
 	if err != nil {
 		return nil, err
 	}
 	m.ApprovedByPrincipalID = approvedBy.String
+	m.Reason = reason.String
 	return &m, nil
 }
 
+// GetCurrentAccountMapping resolves the TENANT-WIDE ACTIVE mapping for
+// mappingKey — unchanged in meaning since before migration 000030 added
+// scoping, and every existing caller (the live posting path among them)
+// keeps resolving exactly as it always has. GetCurrentAccountMappingScoped
+// is the scope-aware resolution a caller that actually has a legal entity
+// and book in hand should use instead.
 func (s *PgStore) GetCurrentAccountMapping(ctx context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error) {
 	var m *domain.AccountMapping
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -1718,8 +1737,64 @@ func (s *PgStore) GetCurrentAccountMapping(ctx context.Context, tenantID, mappin
 			SELECT `+accountMappingColumns+`
 			FROM account_mappings
 			WHERE tenant_id = $1 AND mapping_key = $2 AND status = $3
+			  AND legal_entity_id IS NULL AND book_id IS NULL
 		`, tenantID, mappingKey, domain.AccountMappingStatusActive))
 		return mapPgError(err)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAccountMappingNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// GetCurrentAccountMappingScoped is ACC-02's ResolveAccountMapping query,
+// scope-aware: it tries the most specific ACTIVE mapping first and falls
+// back to progressively less specific ones — entity+book, then entity-only,
+// then tenant-wide — rather than requiring an exact scope match. This IS
+// ACC-02's "mapping precedence" (spec: "Server-resolved / derived context:
+// mapping precedence"): precedence is derived from specificity, not a
+// caller-supplied number, so a more specific mapping overrides a more
+// general one for the same key without the general one ever needing to be
+// touched. legalEntityID/bookID empty means "resolve tenant-wide only" —
+// equivalent to GetCurrentAccountMapping.
+func (s *PgStore) GetCurrentAccountMappingScoped(ctx context.Context, tenantID, mappingKey, legalEntityID, bookID string) (*domain.AccountMapping, error) {
+	var m *domain.AccountMapping
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tiers := [][2]string{}
+		if legalEntityID != "" && bookID != "" {
+			tiers = append(tiers, [2]string{legalEntityID, bookID})
+		}
+		if legalEntityID != "" {
+			tiers = append(tiers, [2]string{legalEntityID, ""})
+		}
+		tiers = append(tiers, [2]string{"", ""})
+
+		for _, tier := range tiers {
+			var entityArg, bookArg any
+			if tier[0] != "" {
+				entityArg = tier[0]
+			}
+			if tier[1] != "" {
+				bookArg = tier[1]
+			}
+			row, err := scanAccountMapping(tx.QueryRow(ctx, `
+				SELECT `+accountMappingColumns+`
+				FROM account_mappings
+				WHERE tenant_id = $1 AND mapping_key = $2 AND status = $3
+				  AND legal_entity_id IS NOT DISTINCT FROM $4 AND book_id IS NOT DISTINCT FROM $5
+			`, tenantID, mappingKey, domain.AccountMappingStatusActive, entityArg, bookArg))
+			if err == nil {
+				m = row
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return mapPgError(err)
+			}
+		}
+		return pgx.ErrNoRows
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrAccountMappingNotFound
@@ -1787,10 +1862,14 @@ func (s *PgStore) GetMappingByID(ctx context.Context, tenantID, mappingID string
 func (s *PgStore) ListMappingAmbiguities(ctx context.Context, tenantID string) ([]string, error) {
 	var out []string
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// Grouped by the full scope tuple idx_account_mappings_active_scoped
+		// enforces uniqueness over, not just mapping_key — a tenant-wide and
+		// an entity-scoped ACTIVE mapping for the same key are two
+		// DELIBERATELY coexisting rows, not an ambiguity.
 		rows, err := tx.Query(ctx, `
 			SELECT mapping_key FROM account_mappings
 			WHERE tenant_id = $1 AND status = $2
-			GROUP BY mapping_key HAVING COUNT(*) > 1
+			GROUP BY mapping_key, legal_entity_id, book_id HAVING COUNT(*) > 1
 		`, tenantID, domain.AccountMappingStatusActive)
 		if err != nil {
 			return mapPgError(err)
@@ -1894,10 +1973,11 @@ func (s *PgStore) CreateMapping(ctx context.Context, m *domain.AccountMapping, i
 			// CreateMapping has no caller-supplied resource identity to compare
 			// against the way AmendAccountVersion compares accountCode (the new
 			// mapping_id is freshly generated every call, retry or not) — so a
-			// genuine retry is recognised by content instead: same mapping_key
-			// and account_code as what this key originally created. A reuse
-			// naming something else is a real conflict, not a replay.
-			if replayed.MappingKey != m.MappingKey || replayed.AccountCode != m.AccountCode {
+			// genuine retry is recognised by content instead: same mapping_key,
+			// account_code and scope as what this key originally created. A
+			// reuse naming something else is a real conflict, not a replay.
+			if replayed.MappingKey != m.MappingKey || replayed.AccountCode != m.AccountCode ||
+				!stringPtrEqual(replayed.LegalEntityID, m.LegalEntityID) || !stringPtrEqual(replayed.BookID, m.BookID) {
 				return fmt.Errorf("%w: key was already used to draft mapping %s (%s -> %s)",
 					domain.ErrIdempotencyKeyConflict, replayed.AccountMappingID, replayed.MappingKey, replayed.AccountCode)
 			}
@@ -1906,6 +1986,9 @@ func (s *PgStore) CreateMapping(ctx context.Context, m *domain.AccountMapping, i
 			return nil
 		}
 
+		if m.BookID != nil && m.LegalEntityID == nil {
+			return domain.ErrMappingBookRequiresEntity
+		}
 		isHighRisk, err := targetAccountHighRisk(ctx, tx, tenantID, m.AccountCode)
 		if err != nil {
 			return err
@@ -1916,21 +1999,47 @@ func (s *PgStore) CreateMapping(ctx context.Context, m *domain.AccountMapping, i
 			INSERT INTO account_mappings (
 				account_mapping_id, tenant_id, mapping_key, account_code,
 				effective_from, created_at, created_by_principal_id,
-				status, is_high_risk
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				status, is_high_risk, reason, legal_entity_id, book_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		`, m.AccountMappingID, tenantID, m.MappingKey, m.AccountCode,
-			m.EffectiveFrom, m.CreatedAt, m.CreatedByPrincipalID, m.Status, m.IsHighRisk)
+			m.EffectiveFrom, m.CreatedAt, m.CreatedByPrincipalID, m.Status, m.IsHighRisk,
+			nullIfEmpty(m.Reason), m.LegalEntityID, m.BookID)
 		if err != nil {
 			return mapPgError(err)
 		}
 		if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandCreateMapping, m.AccountMappingID); err != nil {
 			return err
 		}
-		return s.enqueueMappingEvent(ctx, tx, "created", tenantID, m.AccountMappingID, m.CreatedByPrincipalID, "", map[string]any{
+		return s.enqueueMappingEvent(ctx, tx, "created", tenantID, m.AccountMappingID, m.CreatedByPrincipalID, "", ptrToString(m.LegalEntityID), map[string]any{
 			"mapping_key": m.MappingKey, "account_code": m.AccountCode, "is_high_risk": m.IsHighRisk,
 		})
 	})
 	return replay, err
+}
+
+// stringPtrEqual compares two *string, treating nil as equal only to nil.
+func stringPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// nullIfEmpty turns an empty Go string into a SQL NULL rather than storing
+// an empty string for an unset optional text field.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// ptrToString dereferences an optional *string, or "" if nil.
+func ptrToString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // ApproveMapping advances DRAFT -> APPROVED. For a high-risk mapping, the
@@ -1941,7 +2050,7 @@ func (s *PgStore) CreateMapping(ctx context.Context, m *domain.AccountMapping, i
 // request succeeded but whose response was lost on the wire would retry
 // into ErrMappingNotDraft (the mapping is now APPROVED) and could never
 // distinguish "my own retry" from "someone else already approved it".
-func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey string) (_ *domain.AccountMapping, replay bool, err error) {
+func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey, reason string) (_ *domain.AccountMapping, replay bool, err error) {
 	var out *domain.AccountMapping
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		claimedReplay, err := mappingIdempotencyRecord(ctx, tx, tenantID, idempotencyKey, commandApproveMapping, mappingID)
@@ -1974,9 +2083,10 @@ func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, princ
 		now := time.Now().UTC()
 		tag, err := tx.Exec(ctx, `
 			UPDATE account_mappings
-			SET status = $1, approved_at = $2, approved_by_principal_id = $3
+			SET status = $1, approved_at = $2, approved_by_principal_id = $3,
+			    reason = COALESCE(NULLIF($7, ''), reason)
 			WHERE tenant_id = $4 AND account_mapping_id = $5 AND status = $6
-		`, domain.AccountMappingStatusApproved, now, principalID, tenantID, mappingID, domain.AccountMappingStatusDraft)
+		`, domain.AccountMappingStatusApproved, now, principalID, tenantID, mappingID, domain.AccountMappingStatusDraft, reason)
 		if err != nil {
 			return mapPgError(err)
 		}
@@ -1989,6 +2099,9 @@ func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, princ
 		m.Status = domain.AccountMappingStatusApproved
 		m.ApprovedAt = &now
 		m.ApprovedByPrincipalID = principalID
+		if reason != "" {
+			m.Reason = reason
+		}
 		out = m
 		return nil
 	})
@@ -1999,10 +2112,10 @@ func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, princ
 }
 
 // ActivateMapping advances APPROVED -> ACTIVE, atomically superseding
-// whatever mapping was previously ACTIVE for the same key (if any) in the
-// same transaction — see supersedeActiveMapping's ordering note. See
+// whatever mapping was previously ACTIVE for the SAME scope tuple (if any)
+// in the same transaction — see supersedeActiveMapping's ordering note. See
 // ApproveMapping's doc comment for why idempotencyKey is required.
-func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time, idempotencyKey string) (_ *domain.AccountMapping, replay bool, err error) {
+func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time, idempotencyKey, reason string) (_ *domain.AccountMapping, replay bool, err error) {
 	var out *domain.AccountMapping
 	var supersededID string
 	// mappingKeyForEvidence survives the transaction even if it rolls back —
@@ -2044,27 +2157,29 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 		if err := tx.QueryRow(ctx, `
 			SELECT account_mapping_id FROM account_mappings
 			WHERE tenant_id = $1 AND mapping_key = $2 AND status = $3
+			  AND legal_entity_id IS NOT DISTINCT FROM $4 AND book_id IS NOT DISTINCT FROM $5
 			FOR UPDATE
-		`, tenantID, m.MappingKey, domain.AccountMappingStatusActive).Scan(&prevID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		`, tenantID, m.MappingKey, domain.AccountMappingStatusActive, m.LegalEntityID, m.BookID).Scan(&prevID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return mapPgError(err)
 		}
 		if prevID.Valid {
 			supersededID = prevID.String
-			if err := supersedeActiveMapping(ctx, tx, tenantID, m.MappingKey, mappingID, at); err != nil {
+			if err := supersedeActiveMapping(ctx, tx, tenantID, m.MappingKey, m.LegalEntityID, m.BookID, mappingID, at); err != nil {
 				return err
 			}
 		}
 
 		tag, err := tx.Exec(ctx, `
 			UPDATE account_mappings
-			SET status = $1, activated_at = $2, effective_from = $2
+			SET status = $1, activated_at = $2, effective_from = $2,
+			    reason = COALESCE(NULLIF($6, ''), reason)
 			WHERE tenant_id = $3 AND account_mapping_id = $4 AND status = $5
-		`, domain.AccountMappingStatusActive, at, tenantID, mappingID, domain.AccountMappingStatusApproved)
+		`, domain.AccountMappingStatusActive, at, tenantID, mappingID, domain.AccountMappingStatusApproved, reason)
 		if err != nil {
-			// idx_account_mappings_active (migration 000029) is the ONLY
-			// unique index this UPDATE's new row can violate: another
-			// mapping for the same key raced this one to ACTIVE and won.
-			// This is negative path #1 ("two active mappings with same
+			// idx_account_mappings_active_scoped (migration 000030) is the
+			// ONLY unique index this UPDATE's new row can violate: another
+			// mapping for the SAME scope tuple raced this one to ACTIVE and
+			// won. This is negative path #1 ("two active mappings with same
 			// precedence") actually happening — surfaced here as a clean,
 			// named refusal rather than a raw constraint-violation 503.
 			var pgErr *pgconn.PgError
@@ -2082,15 +2197,19 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 		m.Status = domain.AccountMappingStatusActive
 		m.ActivatedAt = &at
 		m.EffectiveFrom = at
+		if reason != "" {
+			m.Reason = reason
+		}
 		out = m
 
-		if err := s.enqueueMappingEvent(ctx, tx, "activated", tenantID, mappingID, "", "", map[string]any{
+		legalEntityID := ptrToString(m.LegalEntityID)
+		if err := s.enqueueMappingEvent(ctx, tx, "activated", tenantID, mappingID, "", legalEntityID, "", map[string]any{
 			"mapping_key": m.MappingKey, "account_code": m.AccountCode, "superseded_mapping_id": supersededID,
 		}); err != nil {
 			return err
 		}
 		if supersededID != "" {
-			if err := s.enqueueMappingEvent(ctx, tx, "superseded", tenantID, supersededID, "", "", map[string]any{
+			if err := s.enqueueMappingEvent(ctx, tx, "superseded", tenantID, supersededID, "", legalEntityID, "", map[string]any{
 				"mapping_key": m.MappingKey, "superseded_by_mapping_id": mappingID,
 			}); err != nil {
 				return err
@@ -2111,7 +2230,7 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 				SELECT account_mapping_id FROM account_mappings
 				WHERE tenant_id = $1 AND mapping_key = $2 AND status = $3
 			`, tenantID, mappingKeyForEvidence, domain.AccountMappingStatusActive).Scan(&winnerID)
-			return s.enqueueMappingEvent(ctx, tx, "ambiguity-detected", tenantID, mappingID, "", "", map[string]any{
+			return s.enqueueMappingEvent(ctx, tx, "ambiguity-detected", tenantID, mappingID, "", "", "", map[string]any{
 				"mapping_key": mappingKeyForEvidence, "losing_mapping_id": mappingID, "winning_mapping_id": winnerID,
 			})
 		})
@@ -2127,7 +2246,7 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 // handles supersession-by-replacement inline; this is the other negative
 // path, retiring one with nothing yet approved to take its place. See
 // ApproveMapping's doc comment for why idempotencyKey is required.
-func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey string) (_ *domain.AccountMapping, replay bool, err error) {
+func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey, reason string) (_ *domain.AccountMapping, replay bool, err error) {
 	var out *domain.AccountMapping
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		claimedReplay, err := mappingIdempotencyRecord(ctx, tx, tenantID, idempotencyKey, commandSupersedeMapping, mappingID)
@@ -2157,9 +2276,10 @@ func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, pri
 		now := time.Now().UTC()
 		tag, err := tx.Exec(ctx, `
 			UPDATE account_mappings
-			SET status = $1, effective_to = $2, superseded_at = $2
+			SET status = $1, effective_to = $2, superseded_at = $2,
+			    reason = COALESCE(NULLIF($6, ''), reason)
 			WHERE tenant_id = $3 AND account_mapping_id = $4 AND status = $5
-		`, domain.AccountMappingStatusSuperseded, now, tenantID, mappingID, domain.AccountMappingStatusActive)
+		`, domain.AccountMappingStatusSuperseded, now, tenantID, mappingID, domain.AccountMappingStatusActive, reason)
 		if err != nil {
 			return mapPgError(err)
 		}
@@ -2172,9 +2292,12 @@ func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, pri
 		m.Status = domain.AccountMappingStatusSuperseded
 		m.EffectiveTo = &now
 		m.SupersededAt = &now
+		if reason != "" {
+			m.Reason = reason
+		}
 		out = m
 
-		return s.enqueueMappingEvent(ctx, tx, "superseded", tenantID, mappingID, principalID, "", map[string]any{
+		return s.enqueueMappingEvent(ctx, tx, "superseded", tenantID, mappingID, principalID, ptrToString(m.LegalEntityID), "", map[string]any{
 			"mapping_key": m.MappingKey, "superseded_by_mapping_id": nil,
 		})
 	})
@@ -2187,13 +2310,14 @@ func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, pri
 // enqueueMappingEvent writes one ACC-02 mapping lifecycle event to the
 // transactional outbox, mirroring enqueueJournalEvent's shape. Mappings are
 // tenant-scoped, not legal-entity-scoped, so legalEntityID is always "".
-func (s *PgStore) enqueueMappingEvent(ctx context.Context, tx pgx.Tx, fact, tenantID, mappingID, actorID, correlationID string, data map[string]any) error {
+func (s *PgStore) enqueueMappingEvent(ctx context.Context, tx pgx.Tx, fact, tenantID, mappingID, actorID, legalEntityID, correlationID string, data map[string]any) error {
 	env, err := envelope.New(envelope.Spec{
 		Type:            "com.zoikosuite.accounting.account-mapping." + fact,
 		Service:         "general-ledger-svc",
 		SchemaVersion:   "1.0.0",
 		OccurredAt:      time.Now().UTC(),
 		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
 		AggregateType:   "account-mapping",
 		AggregateID:     mappingID,
 		CorrelationID:   correlationID,

@@ -577,6 +577,14 @@ func (s *stubStore) GetCurrentAccountMapping(_ context.Context, tenantID, mappin
 	return m, nil
 }
 
+// GetCurrentAccountMappingScoped's tiered entity/book fallback is verified
+// against real Postgres (acc02_account_mapping_governance_integration_test.go);
+// the stub's flat map has no scope dimension, so this simply delegates to the
+// tenant-wide lookup — sufficient for handler tests exercising the plumbing.
+func (s *stubStore) GetCurrentAccountMappingScoped(ctx context.Context, tenantID, mappingKey, _, _ string) (*domain.AccountMapping, error) {
+	return s.GetCurrentAccountMapping(ctx, tenantID, mappingKey)
+}
+
 func (s *stubStore) ListAccountMappings(_ context.Context, tenantID string) ([]domain.AccountMapping, error) {
 	var out []domain.AccountMapping
 	for _, m := range s.currentMappings {
@@ -611,7 +619,7 @@ func (s *stubStore) CreateMapping(_ context.Context, m *domain.AccountMapping, _
 	return false, nil
 }
 
-func (s *stubStore) ApproveMapping(_ context.Context, tenantID, mappingID, principalID, _ string) (*domain.AccountMapping, bool, error) {
+func (s *stubStore) ApproveMapping(_ context.Context, tenantID, mappingID, principalID, _, reason string) (*domain.AccountMapping, bool, error) {
 	m, ok := s.mappingsByID[mappingID]
 	if !ok || m.TenantID != tenantID {
 		return nil, false, domain.ErrMappingNotFoundByID
@@ -626,10 +634,13 @@ func (s *stubStore) ApproveMapping(_ context.Context, tenantID, mappingID, princ
 	m.Status = domain.AccountMappingStatusApproved
 	m.ApprovedAt = &now
 	m.ApprovedByPrincipalID = principalID
+	if reason != "" {
+		m.Reason = reason
+	}
 	return m, false, nil
 }
 
-func (s *stubStore) ActivateMapping(_ context.Context, tenantID, mappingID string, effectiveFrom time.Time, _ string) (*domain.AccountMapping, bool, error) {
+func (s *stubStore) ActivateMapping(_ context.Context, tenantID, mappingID string, effectiveFrom time.Time, _, reason string) (*domain.AccountMapping, bool, error) {
 	m, ok := s.mappingsByID[mappingID]
 	if !ok || m.TenantID != tenantID {
 		return nil, false, domain.ErrMappingNotFoundByID
@@ -652,11 +663,14 @@ func (s *stubStore) ActivateMapping(_ context.Context, tenantID, mappingID strin
 	m.Status = domain.AccountMappingStatusActive
 	m.ActivatedAt = &at
 	m.EffectiveFrom = at
+	if reason != "" {
+		m.Reason = reason
+	}
 	s.currentMappings[key] = m
 	return m, false, nil
 }
 
-func (s *stubStore) SupersedeMapping(_ context.Context, tenantID, mappingID, _, _ string) (*domain.AccountMapping, bool, error) {
+func (s *stubStore) SupersedeMapping(_ context.Context, tenantID, mappingID, _, _, reason string) (*domain.AccountMapping, bool, error) {
 	m, ok := s.mappingsByID[mappingID]
 	if !ok || m.TenantID != tenantID {
 		return nil, false, domain.ErrMappingNotFoundByID
@@ -668,6 +682,9 @@ func (s *stubStore) SupersedeMapping(_ context.Context, tenantID, mappingID, _, 
 	m.Status = domain.AccountMappingStatusSuperseded
 	m.EffectiveTo = &now
 	m.SupersededAt = &now
+	if reason != "" {
+		m.Reason = reason
+	}
 	delete(s.currentMappings, tenantID+"|"+m.MappingKey)
 	return m, false, nil
 }

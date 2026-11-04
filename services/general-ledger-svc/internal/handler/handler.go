@@ -64,11 +64,12 @@ type Store interface {
 	// ACC-02 Account Mapping — see migration 000008's doc comment.
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
 	GetCurrentAccountMapping(ctx context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error)
+	GetCurrentAccountMappingScoped(ctx context.Context, tenantID, mappingKey, legalEntityID, bookID string) (*domain.AccountMapping, error)
 	ListAccountMappings(ctx context.Context, tenantID string) ([]domain.AccountMapping, error)
 	CreateMapping(ctx context.Context, m *domain.AccountMapping, idempotencyKey string) (replay bool, err error)
-	ApproveMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey string) (*domain.AccountMapping, bool, error)
-	ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time, idempotencyKey string) (*domain.AccountMapping, bool, error)
-	SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey string) (*domain.AccountMapping, bool, error)
+	ApproveMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey, reason string) (*domain.AccountMapping, bool, error)
+	ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time, idempotencyKey, reason string) (*domain.AccountMapping, bool, error)
+	SupersedeMapping(ctx context.Context, tenantID, mappingID, principalID, idempotencyKey, reason string) (*domain.AccountMapping, bool, error)
 	GetMappingByID(ctx context.Context, tenantID, mappingID string) (*domain.AccountMapping, error)
 	GetMappingAsOf(ctx context.Context, tenantID, mappingKey string, asOf time.Time) (*domain.AccountMapping, error)
 	ListMappingAmbiguities(ctx context.Context, tenantID string) ([]string, error)
@@ -396,6 +397,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/ambiguities", h.ListMappingAmbiguities)
 		r.Post("/draft", h.CreateMapping)
 		r.Get("/{mapping_key}", h.GetAccountMapping)
+		r.Get("/{mapping_key}/resolve", h.ResolveAccountMapping)
 		r.Get("/{mapping_key}/as-of", h.GetMappingAsOf)
 		r.Get("/{mapping_key}/explain", h.ExplainMapping)
 		r.Post("/by-id/{mapping_id}/approve", h.ApproveMapping)
@@ -1519,6 +1521,10 @@ func (h *Handler) CreateMapping(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "mapping_key and account_code are required")
 		return
 	}
+	if req.BookID != nil && req.LegalEntityID == nil {
+		writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrMappingBookRequiresEntity.Error())
+		return
+	}
 	idempotencyKey, ok := requireMappingIdempotencyKey(w, r)
 	if !ok {
 		return
@@ -1545,11 +1551,18 @@ func (h *Handler) CreateMapping(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom:        time.Now().UTC(),
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
+		Reason:               req.Reason,
+		LegalEntityID:        req.LegalEntityID,
+		BookID:               req.BookID,
 	}
 	replay, err := h.store.CreateMapping(r.Context(), m, idempotencyKey)
 	if err != nil {
 		if errors.Is(err, domain.ErrMappingTargetAccountInvalid) {
 			writeError(w, http.StatusBadRequest, "invalid_target_account", err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrMappingBookRequiresEntity) {
+			writeError(w, http.StatusBadRequest, "invalid_field", err.Error())
 			return
 		}
 		if h.writeMappingErr(w, err) {
@@ -1592,6 +1605,10 @@ func (h *Handler) writeMappingErr(w http.ResponseWriter, err error) bool {
 // own author — ACC-02's maker-checker SoD requirement.
 func (h *Handler) ApproveMapping(w http.ResponseWriter, r *http.Request) {
 	mappingID := chi.URLParam(r, "mapping_id")
+	var req domain.MappingReasonRequest
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
 	idempotencyKey, ok := requireMappingIdempotencyKey(w, r)
 	if !ok {
 		return
@@ -1610,7 +1627,7 @@ func (h *Handler) ApproveMapping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m, replay, err := h.store.ApproveMapping(r.Context(), tenantID, mappingID, principalID, idempotencyKey)
+	m, replay, err := h.store.ApproveMapping(r.Context(), tenantID, mappingID, principalID, idempotencyKey, req.Reason)
 	if err != nil {
 		if h.writeMappingErr(w, err) {
 			return
@@ -1655,7 +1672,7 @@ func (h *Handler) ActivateMapping(w http.ResponseWriter, r *http.Request) {
 	if req.EffectiveFrom != nil {
 		effectiveFrom = req.EffectiveFrom.Time
 	}
-	m, replay, err := h.store.ActivateMapping(r.Context(), tenantID, mappingID, effectiveFrom, idempotencyKey)
+	m, replay, err := h.store.ActivateMapping(r.Context(), tenantID, mappingID, effectiveFrom, idempotencyKey, req.Reason)
 	if err != nil {
 		if h.writeMappingErr(w, err) {
 			return
@@ -1674,6 +1691,10 @@ func (h *Handler) ActivateMapping(w http.ResponseWriter, r *http.Request) {
 // yet approved to take its place.
 func (h *Handler) SupersedeMapping(w http.ResponseWriter, r *http.Request) {
 	mappingID := chi.URLParam(r, "mapping_id")
+	var req domain.MappingReasonRequest
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
 	idempotencyKey, ok := requireMappingIdempotencyKey(w, r)
 	if !ok {
 		return
@@ -1692,7 +1713,7 @@ func (h *Handler) SupersedeMapping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m, replay, err := h.store.SupersedeMapping(r.Context(), tenantID, mappingID, principalID, idempotencyKey)
+	m, replay, err := h.store.SupersedeMapping(r.Context(), tenantID, mappingID, principalID, idempotencyKey, req.Reason)
 	if err != nil {
 		if h.writeMappingErr(w, err) {
 			return
@@ -1853,6 +1874,43 @@ func (h *Handler) GetAccountMapping(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		h.log.Error("GetAccountMapping: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+// ResolveAccountMapping is ACC-02's own ResolveAccountMapping query, fully
+// scope-aware: given mapping_key and an optional legal_entity_id/book_id, it
+// resolves the most specific ACTIVE mapping — entity+book, then entity-only,
+// then tenant-wide — this service's "mapping precedence" (spec: "Server-
+// resolved / derived context: mapping precedence"), derived from scope
+// specificity rather than a caller-supplied number. With neither query
+// parameter given, this is identical to GetAccountMapping.
+func (h *Handler) ResolveAccountMapping(w http.ResponseWriter, r *http.Request) {
+	mappingKey := chi.URLParam(r, "mapping_key")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionViewAccountMapping); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	q := r.URL.Query()
+	m, err := h.store.GetCurrentAccountMappingScoped(r.Context(), tenantID, mappingKey, q.Get("legal_entity_id"), q.Get("book_id"))
+	if errors.Is(err, domain.ErrAccountMappingNotFound) {
+		writeError(w, http.StatusNotFound, "mapping_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("ResolveAccountMapping: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}

@@ -66,7 +66,7 @@ func TestPgStore_AccountMappingLifecycle_DraftApproveActivate(t *testing.T) {
 		t.Fatalf("a DRAFT mapping must not resolve, got %v", err)
 	}
 
-	approved, _, err := s.ApproveMapping(ctx, tenantID, m1.AccountMappingID, "approver-1", idemKey())
+	approved, _, err := s.ApproveMapping(ctx, tenantID, m1.AccountMappingID, "approver-1", idemKey(), "")
 	if err != nil {
 		t.Fatalf("ApproveMapping: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestPgStore_AccountMappingLifecycle_DraftApproveActivate(t *testing.T) {
 		t.Fatalf("an APPROVED mapping must not resolve either, got %v", err)
 	}
 
-	activated, _, err := s.ActivateMapping(ctx, tenantID, m1.AccountMappingID, time.Time{}, idemKey())
+	activated, _, err := s.ActivateMapping(ctx, tenantID, m1.AccountMappingID, time.Time{}, idemKey(), "")
 	if err != nil {
 		t.Fatalf("ActivateMapping: %v", err)
 	}
@@ -101,10 +101,10 @@ func TestPgStore_AccountMappingLifecycle_DraftApproveActivate(t *testing.T) {
 	if _, err := s.CreateMapping(ctx, m2, idemKey()); err != nil {
 		t.Fatalf("CreateMapping m2: %v", err)
 	}
-	if _, _, err := s.ApproveMapping(ctx, tenantID, m2.AccountMappingID, "approver-1", idemKey()); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m2.AccountMappingID, "approver-1", idemKey(), ""); err != nil {
 		t.Fatalf("ApproveMapping m2: %v", err)
 	}
-	if _, _, err := s.ActivateMapping(ctx, tenantID, m2.AccountMappingID, time.Time{}, idemKey()); err != nil {
+	if _, _, err := s.ActivateMapping(ctx, tenantID, m2.AccountMappingID, time.Time{}, idemKey(), ""); err != nil {
 		t.Fatalf("ActivateMapping m2: %v", err)
 	}
 
@@ -163,11 +163,11 @@ func TestPgStore_AccountMappingLifecycle_HighRiskMakerChecker(t *testing.T) {
 		t.Fatalf("expected IsHighRisk=true for a control-account mapping")
 	}
 
-	if _, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "author-1", idemKey()); !errors.Is(err, domain.ErrMappingSelfApproval) {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "author-1", idemKey(), ""); !errors.Is(err, domain.ErrMappingSelfApproval) {
 		t.Fatalf("expected ErrMappingSelfApproval for self-approval of a high-risk mapping, got %v", err)
 	}
 
-	approved, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-2", idemKey())
+	approved, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-2", idemKey(), "")
 	if err != nil {
 		t.Fatalf("ApproveMapping by a different principal: %v", err)
 	}
@@ -195,14 +195,14 @@ func TestPgStore_AccountMappingLifecycle_SupersedeWithoutReplacement(t *testing.
 	if _, err := s.CreateMapping(ctx, m, idemKey()); err != nil {
 		t.Fatalf("CreateMapping: %v", err)
 	}
-	if _, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey()); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey(), ""); err != nil {
 		t.Fatalf("ApproveMapping: %v", err)
 	}
-	if _, _, err := s.ActivateMapping(ctx, tenantID, m.AccountMappingID, time.Time{}, idemKey()); err != nil {
+	if _, _, err := s.ActivateMapping(ctx, tenantID, m.AccountMappingID, time.Time{}, idemKey(), ""); err != nil {
 		t.Fatalf("ActivateMapping: %v", err)
 	}
 
-	if _, _, err := s.SupersedeMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey()); err != nil {
+	if _, _, err := s.SupersedeMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey(), ""); err != nil {
 		t.Fatalf("SupersedeMapping: %v", err)
 	}
 	if _, err := s.GetCurrentAccountMapping(ctx, tenantID, "EXPENSE:TRAVEL"); !errors.Is(err, domain.ErrAccountMappingNotFound) {
@@ -210,7 +210,7 @@ func TestPgStore_AccountMappingLifecycle_SupersedeWithoutReplacement(t *testing.
 	}
 
 	// A second supersede must be refused — it is no longer ACTIVE.
-	if _, _, err := s.SupersedeMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey()); !errors.Is(err, domain.ErrMappingNotActive) {
+	if _, _, err := s.SupersedeMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey(), ""); !errors.Is(err, domain.ErrMappingNotActive) {
 		t.Fatalf("expected ErrMappingNotActive on a repeat supersede, got %v", err)
 	}
 }
@@ -241,11 +241,11 @@ func TestPgStore_GetMappingAsOf_ReconstructsHistory(t *testing.T) {
 	if _, err := s.CreateMapping(ctx, m1, idemKey()); err != nil {
 		t.Fatalf("CreateMapping m1: %v", err)
 	}
-	if _, _, err := s.ApproveMapping(ctx, tenantID, m1.AccountMappingID, "approver-1", idemKey()); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m1.AccountMappingID, "approver-1", idemKey(), ""); err != nil {
 		t.Fatalf("ApproveMapping m1: %v", err)
 	}
 	t1 := time.Now().UTC()
-	if _, _, err := s.ActivateMapping(ctx, tenantID, m1.AccountMappingID, t1, idemKey()); err != nil {
+	if _, _, err := s.ActivateMapping(ctx, tenantID, m1.AccountMappingID, t1, idemKey(), ""); err != nil {
 		t.Fatalf("ActivateMapping m1: %v", err)
 	}
 
@@ -255,11 +255,11 @@ func TestPgStore_GetMappingAsOf_ReconstructsHistory(t *testing.T) {
 	if _, err := s.CreateMapping(ctx, m2, idemKey()); err != nil {
 		t.Fatalf("CreateMapping m2: %v", err)
 	}
-	if _, _, err := s.ApproveMapping(ctx, tenantID, m2.AccountMappingID, "approver-1", idemKey()); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, m2.AccountMappingID, "approver-1", idemKey(), ""); err != nil {
 		t.Fatalf("ApproveMapping m2: %v", err)
 	}
 	t2 := time.Now().UTC()
-	if _, _, err := s.ActivateMapping(ctx, tenantID, m2.AccountMappingID, t2, idemKey()); err != nil {
+	if _, _, err := s.ActivateMapping(ctx, tenantID, m2.AccountMappingID, t2, idemKey(), ""); err != nil {
 		t.Fatalf("ActivateMapping m2: %v", err)
 	}
 
@@ -325,11 +325,11 @@ func TestPgStore_AccountMappingLifecycle_IdempotencyKeyReplay(t *testing.T) {
 	}
 
 	approveKey := idemKey()
-	approved1, replay, err := s.ApproveMapping(ctx, tenantID, firstID, "approver-2", approveKey)
+	approved1, replay, err := s.ApproveMapping(ctx, tenantID, firstID, "approver-2", approveKey, "")
 	if err != nil || replay {
 		t.Fatalf("first ApproveMapping: replay=%v err=%v", replay, err)
 	}
-	approved2, replay, err := s.ApproveMapping(ctx, tenantID, firstID, "approver-2", approveKey)
+	approved2, replay, err := s.ApproveMapping(ctx, tenantID, firstID, "approver-2", approveKey, "")
 	if err != nil || !replay {
 		t.Fatalf("retried ApproveMapping must replay: replay=%v err=%v", replay, err)
 	}
@@ -338,11 +338,11 @@ func TestPgStore_AccountMappingLifecycle_IdempotencyKeyReplay(t *testing.T) {
 	}
 
 	activateKey := idemKey()
-	activated1, replay, err := s.ActivateMapping(ctx, tenantID, firstID, time.Time{}, activateKey)
+	activated1, replay, err := s.ActivateMapping(ctx, tenantID, firstID, time.Time{}, activateKey, "")
 	if err != nil || replay {
 		t.Fatalf("first ActivateMapping: replay=%v err=%v", replay, err)
 	}
-	activated2, replay, err := s.ActivateMapping(ctx, tenantID, firstID, time.Time{}, activateKey)
+	activated2, replay, err := s.ActivateMapping(ctx, tenantID, firstID, time.Time{}, activateKey, "")
 	if err != nil || !replay {
 		t.Fatalf("retried ActivateMapping must replay: replay=%v err=%v", replay, err)
 	}
@@ -351,11 +351,11 @@ func TestPgStore_AccountMappingLifecycle_IdempotencyKeyReplay(t *testing.T) {
 	}
 
 	supersedeKey := idemKey()
-	superseded1, replay, err := s.SupersedeMapping(ctx, tenantID, firstID, "approver-2", supersedeKey)
+	superseded1, replay, err := s.SupersedeMapping(ctx, tenantID, firstID, "approver-2", supersedeKey, "")
 	if err != nil || replay {
 		t.Fatalf("first SupersedeMapping: replay=%v err=%v", replay, err)
 	}
-	superseded2, replay, err := s.SupersedeMapping(ctx, tenantID, firstID, "approver-2", supersedeKey)
+	superseded2, replay, err := s.SupersedeMapping(ctx, tenantID, firstID, "approver-2", supersedeKey, "")
 	if err != nil || !replay {
 		t.Fatalf("retried SupersedeMapping must replay: replay=%v err=%v", replay, err)
 	}
@@ -408,10 +408,10 @@ func TestPgStore_ActivateMapping_ConcurrentActivation_OneWinsOneGetsCleanConflic
 	if _, err := s.CreateMapping(ctx, mB, idemKey()); err != nil {
 		t.Fatalf("CreateMapping B: %v", err)
 	}
-	if _, _, err := s.ApproveMapping(ctx, tenantID, mA.AccountMappingID, "approver-1", idemKey()); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, mA.AccountMappingID, "approver-1", idemKey(), ""); err != nil {
 		t.Fatalf("ApproveMapping A: %v", err)
 	}
-	if _, _, err := s.ApproveMapping(ctx, tenantID, mB.AccountMappingID, "approver-1", idemKey()); err != nil {
+	if _, _, err := s.ApproveMapping(ctx, tenantID, mB.AccountMappingID, "approver-1", idemKey(), ""); err != nil {
 		t.Fatalf("ApproveMapping B: %v", err)
 	}
 
@@ -431,7 +431,7 @@ func TestPgStore_ActivateMapping_ConcurrentActivation_OneWinsOneGetsCleanConflic
 
 	bDone := make(chan struct{ err error })
 	go func() {
-		_, _, err := s.ActivateMapping(ctx, tenantID, mB.AccountMappingID, time.Time{}, idemKey())
+		_, _, err := s.ActivateMapping(ctx, tenantID, mB.AccountMappingID, time.Time{}, idemKey(), "")
 		bDone <- struct{ err error }{err}
 	}()
 
@@ -477,5 +477,152 @@ func TestPgStore_ActivateMapping_ConcurrentActivation_OneWinsOneGetsCleanConflic
 	}
 	if ambiguityEvents != 1 {
 		t.Fatalf("expected exactly one MappingAmbiguityDetected event recorded as evidence, got %d", ambiguityEvents)
+	}
+}
+
+// TestPgStore_AccountMapping_RationaleCapturedAcrossLifecycle proves ACC-02's
+// "rationale" required source input is actually captured: CreateMapping's
+// reason is preserved, and a later step's reason (ActivateMapping here)
+// overwrites it, while a step that supplies none (ApproveMapping) leaves it
+// untouched.
+func TestPgStore_AccountMapping_RationaleCapturedAcrossLifecycle(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	acct := newTestAccount(tenantID, "9000", "Misc Revenue")
+	if err := s.CreateAccount(ctx, acct); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	m := newMappingDraft(tenantID, "MISC:REASON", "9000", "author-1")
+	m.Reason = "initial mapping per finance policy FP-12"
+	if _, err := s.CreateMapping(ctx, m, idemKey()); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if m.Reason != "initial mapping per finance policy FP-12" {
+		t.Fatalf("expected the create reason to be persisted, got %q", m.Reason)
+	}
+
+	approved, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey(), "")
+	if err != nil {
+		t.Fatalf("ApproveMapping: %v", err)
+	}
+	if approved.Reason != "initial mapping per finance policy FP-12" {
+		t.Fatalf("an approval with no reason of its own must leave the existing reason untouched, got %q", approved.Reason)
+	}
+
+	activated, _, err := s.ActivateMapping(ctx, tenantID, m.AccountMappingID, time.Time{}, idemKey(), "activated early per CFO approval EML-2026-1104")
+	if err != nil {
+		t.Fatalf("ActivateMapping: %v", err)
+	}
+	if activated.Reason != "activated early per CFO approval EML-2026-1104" {
+		t.Fatalf("expected ActivateMapping's own reason to overwrite the prior one, got %q", activated.Reason)
+	}
+
+	stored, err := s.GetMappingByID(ctx, tenantID, m.AccountMappingID)
+	if err != nil || stored.Reason != "activated early per CFO approval EML-2026-1104" {
+		t.Fatalf("expected the reason to persist in the database, got %+v (err %v)", stored, err)
+	}
+}
+
+// TestPgStore_AccountMappingScoped_EntityAndBookPrecedence proves ACC-02's
+// scope-derived "mapping precedence" (spec: "Server-resolved / derived
+// context: mapping precedence"): a tenant-wide mapping, an entity-scoped
+// override, and an entity+book-scoped override can all be ACTIVE for the
+// SAME mapping_key at once — idx_account_mappings_active_scoped (migration
+// 000030) treats them as different scope tuples, not a conflict — and
+// GetCurrentAccountMappingScoped resolves the most specific one first,
+// falling back tier by tier.
+func TestPgStore_AccountMappingScoped_EntityAndBookPrecedence(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	entityID := uuid.New().String()
+	otherEntityID := uuid.New().String()
+
+	acctGlobal := newTestAccount(tenantID, "9100", "Global COGS")
+	acctEntity := newTestAccount(tenantID, "9101", "Entity-specific COGS")
+	acctBook := newTestAccount(tenantID, "9102", "Book-specific COGS")
+	for _, a := range []*domain.Account{acctGlobal, acctEntity, acctBook} {
+		if err := s.CreateAccount(ctx, a); err != nil {
+			t.Fatalf("CreateAccount %s: %v", a.AccountCode, err)
+		}
+	}
+
+	activate := func(accountCode string, legalEntityID, bookID *string) {
+		t.Helper()
+		m := newMappingDraft(tenantID, "COGS:SCOPED", accountCode, "author-1")
+		m.LegalEntityID = legalEntityID
+		m.BookID = bookID
+		if _, err := s.CreateMapping(ctx, m, idemKey()); err != nil {
+			t.Fatalf("CreateMapping %s: %v", accountCode, err)
+		}
+		if _, _, err := s.ApproveMapping(ctx, tenantID, m.AccountMappingID, "approver-1", idemKey(), ""); err != nil {
+			t.Fatalf("ApproveMapping %s: %v", accountCode, err)
+		}
+		if _, _, err := s.ActivateMapping(ctx, tenantID, m.AccountMappingID, time.Time{}, idemKey(), ""); err != nil {
+			t.Fatalf("ActivateMapping %s: %v", accountCode, err)
+		}
+	}
+	bookA := "BOOK-A"
+	activate("9100", nil, nil)
+	activate("9101", &entityID, nil)
+	activate("9102", &entityID, &bookA)
+
+	// Unscoped resolution (GetCurrentAccountMapping, every existing caller's
+	// path) must still see only the tenant-wide one.
+	unscoped, err := s.GetCurrentAccountMapping(ctx, tenantID, "COGS:SCOPED")
+	if err != nil || unscoped.AccountCode != "9100" {
+		t.Fatalf("expected the plain tenant-wide lookup to resolve 9100, got %+v (err %v)", unscoped, err)
+	}
+
+	cases := []struct {
+		name, entity, book, want string
+	}{
+		{"no entity -> tenant-wide", "", "", "9100"},
+		{"other entity, no book -> tenant-wide (no override for this entity)", otherEntityID, "", "9100"},
+		{"this entity, no book -> entity override", entityID, "", "9101"},
+		{"this entity, different book -> entity override (no book-specific one for THIS book)", entityID, "BOOK-B", "9101"},
+		{"this entity, matching book -> most specific", entityID, "BOOK-A", "9102"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := s.GetCurrentAccountMappingScoped(ctx, tenantID, "COGS:SCOPED", c.entity, c.book)
+			if err != nil || got.AccountCode != c.want {
+				t.Fatalf("expected %s, got %+v (err %v)", c.want, got, err)
+			}
+		})
+	}
+
+	keys, err := s.ListMappingAmbiguities(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("ListMappingAmbiguities: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("three coexisting ACTIVE mappings at different scopes for the same key must NOT be reported as an ambiguity, got %v", keys)
+	}
+}
+
+// TestPgStore_CreateMapping_BookRequiresEntity proves the schema-level
+// guard: a book-scoped mapping with no named entity is refused.
+func TestPgStore_CreateMapping_BookRequiresEntity(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	acct := newTestAccount(tenantID, "9200", "Whatever")
+	if err := s.CreateAccount(ctx, acct); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	book := "BOOK-X"
+	m := newMappingDraft(tenantID, "BOOK:ONLY", "9200", "author-1")
+	m.BookID = &book
+	if _, err := s.CreateMapping(ctx, m, idemKey()); !errors.Is(err, domain.ErrMappingBookRequiresEntity) {
+		t.Fatalf("expected ErrMappingBookRequiresEntity, got %v", err)
 	}
 }

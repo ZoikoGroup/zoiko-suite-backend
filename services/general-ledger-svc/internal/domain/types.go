@@ -713,6 +713,20 @@ type AccountMapping struct {
 	ActivatedAt           *time.Time `json:"activated_at,omitempty"`
 	SupersededAt          *time.Time `json:"superseded_at,omitempty"`
 	SupersededByMappingID *string    `json:"superseded_by_mapping_id,omitempty"`
+
+	// Reason, LegalEntityID and BookID are migration 000030's additions —
+	// ACC-02's own "rationale" and "target entity/book" required source
+	// inputs. Reason is set by whichever lifecycle command supplies one and
+	// left unchanged by any that don't. LegalEntityID/BookID nil/nil is a
+	// tenant-wide mapping — what every mapping was before this migration,
+	// and what any caller still gets by not naming a scope. A non-nil
+	// LegalEntityID scopes the mapping to one entity (optionally further to
+	// one book via BookID); this is ACC-02's "mapping precedence" as
+	// server-derived context, not a caller-supplied number — entity+book
+	// beats entity-only beats tenant-wide at resolution time.
+	Reason        string  `json:"reason,omitempty"`
+	LegalEntityID *string `json:"legal_entity_id,omitempty"`
+	BookID        *string `json:"book_id,omitempty"`
 }
 
 type SetAccountMappingRequest struct {
@@ -722,16 +736,28 @@ type SetAccountMappingRequest struct {
 
 // CreateMappingRequest is ACC-02's CreateMapping command: it only drafts a
 // mapping — nothing is eligible for resolution until ApproveMapping and
-// ActivateMapping have both run.
+// ActivateMapping have both run. LegalEntityID/BookID are optional scope
+// inputs; BookID requires LegalEntityID (a book belongs to an entity).
 type CreateMappingRequest struct {
-	MappingKey  string `json:"mapping_key"`
-	AccountCode string `json:"account_code"`
+	MappingKey    string  `json:"mapping_key"`
+	AccountCode   string  `json:"account_code"`
+	Reason        string  `json:"reason,omitempty"`
+	LegalEntityID *string `json:"legal_entity_id,omitempty"`
+	BookID        *string `json:"book_id,omitempty"`
+}
+
+// MappingReasonRequest is the optional body ApproveMapping and
+// SupersedeMapping accept — a reason for that specific step, recorded on
+// the mapping if given.
+type MappingReasonRequest struct {
+	Reason string `json:"reason,omitempty"`
 }
 
 // ActivateMappingRequest optionally backdates/forward-dates when the
 // mapping takes effect; omitted means now.
 type ActivateMappingRequest struct {
 	EffectiveFrom *EffectiveDate `json:"effective_from,omitempty"`
+	Reason        string         `json:"reason,omitempty"`
 }
 
 // Posting execution lifecycle states (ACC-04's state model, verbatim from
@@ -1251,6 +1277,10 @@ var (
 	// as ACTIVE — this is that guarantee surfacing as a clean, named refusal
 	// instead of a raw constraint-violation 503.
 	ErrMappingActivationConflict = errorString("another mapping for this key was activated concurrently; this mapping was not activated — re-check the current mapping and retry if it still needs to be")
+
+	// ErrMappingBookRequiresEntity mirrors migration 000030's own schema
+	// check: a book-scoped mapping with no named entity is meaningless.
+	ErrMappingBookRequiresEntity = errorString("book_id requires legal_entity_id")
 
 	ErrPostingExecutionNotFound = errorString("posting execution not found")
 

@@ -253,7 +253,7 @@ func TestPostAccountingEvent_DraftOrApprovedMapping_Returns422(t *testing.T) {
 		t.Fatalf("a DRAFT mapping must not be postable: expected 422, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	if _, _, err := s.ApproveMapping(context.Background(), "t1", "m-1", "approver-2", "idem-approve-1"); err != nil {
+	if _, _, err := s.ApproveMapping(context.Background(), "t1", "m-1", "approver-2", "idem-approve-1", ""); err != nil {
 		t.Fatalf("ApproveMapping: %v", err)
 	}
 	rec = doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
@@ -261,7 +261,7 @@ func TestPostAccountingEvent_DraftOrApprovedMapping_Returns422(t *testing.T) {
 		t.Fatalf("an APPROVED-but-not-ACTIVE mapping must not be postable either: expected 422, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	activated, _, err := s.ActivateMapping(context.Background(), "t1", "m-1", time.Time{}, "idem-activate-1")
+	activated, _, err := s.ActivateMapping(context.Background(), "t1", "m-1", time.Time{}, "idem-activate-1", "")
 	if err != nil {
 		t.Fatalf("ActivateMapping: %v", err)
 	}
