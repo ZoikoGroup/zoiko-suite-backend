@@ -257,7 +257,7 @@ jobs:
 
       - name: govulncheck
         working-directory: services/public-ai-svc
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: CycloneDX SBOM
         working-directory: services/public-ai-svc
