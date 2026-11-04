@@ -33,7 +33,7 @@ func capFixture(max int, existing ...string) (*fakeStore, *session.DurableCache,
 	}
 	var got []revocation
 	dc := session.NewDurableCache(hot, store, zap.NewNop(), max).
-		WithRevocationHook(func(_ context.Context, id, principalID string, reason domain.InvalidationReason, corr string) {
+		WithRevocationHook(func(_ context.Context, id, principalID, _ string, reason domain.InvalidationReason, corr string) {
 			got = append(got, revocation{id, reason, corr})
 		})
 	return store, dc, &got
@@ -57,6 +57,20 @@ func TestCap_RevokesTheOldestAndAnnouncesIt(t *testing.T) {
 	assert.Equal(t, revocation{"01A", domain.InvalidationReasonSessionConcurrencyCap, "corr-new"}, (*got)[0])
 }
 
+// TestSessionCap_EvictionEmitsRevokedEvent pins that every cap eviction hands
+// the revoked session to the revocation hook with SESSION_CONCURRENCY_CAP as
+// the reason, so the hook can publish identity.session.revoked + session.invalidated.
+func TestSessionCap_EvictionEmitsRevokedEvent(t *testing.T) {
+	store, dc, got := capFixture(2, "01A", "01B")
+	issue(t, store, dc, "01C", false, "01A", "01B")
+
+	require.Len(t, *got, 1, "exactly one session evicted")
+	ev := (*got)[0]
+	assert.Equal(t, domain.InvalidationReasonSessionConcurrencyCap, ev.reason,
+		"the revocation hook must record the cap reason on the revoked session")
+	assert.Equal(t, "01A", ev.id, "the oldest live session goes first")
+}
+
 // The new session survives even when its id sorts first, as ULIDs minted by
 // another replica in the same millisecond can.
 func TestCap_NeverRevokesTheSessionJustIssued(t *testing.T) {
@@ -74,9 +88,36 @@ func TestCap_UnderTheLimitRevokesNothing(t *testing.T) {
 	assert.Empty(t, *got)
 }
 
-func TestCap_MachinePrincipalsAreExempt(t *testing.T) {
+// With no workload cap configured, a workload session is not capped at all.
+func TestCap_MachinePrincipalsAreExemptFromTheHumanCap(t *testing.T) {
 	store, dc, got := capFixture(1, "01A", "01B", "01C")
 	issue(t, store, dc, "01D", true, "01A", "01B", "01C")
 	assert.Empty(t, store.invalidated)
 	assert.Empty(t, *got)
+}
+
+// TestSessionCap_WorkloadUsesOwnCap: service accounts and API clients are
+// capped by SESSION_CAP_WORKLOAD, not by the human cap and not unbounded.
+func TestSessionCap_WorkloadUsesOwnCap(t *testing.T) {
+	// Human cap 1, workload cap 3: a third workload session revokes nothing,
+	// although the human cap alone would have revoked two.
+	store, dc, got := capFixture(1, "01W1", "01W2")
+	dc.WithWorkloadCap(3)
+	issue(t, store, dc, "01W3", true, "01W1", "01W2")
+	assert.Empty(t, store.invalidated, "under its own cap a workload keeps its sessions")
+	assert.Empty(t, *got)
+
+	// The fourth goes over the workload cap: the oldest is revoked and announced.
+	store2, dc2, got2 := capFixture(1, "01W1", "01W2", "01W3")
+	dc2.WithWorkloadCap(3)
+	issue(t, store2, dc2, "01W4", true, "01W1", "01W2", "01W3")
+	assert.Equal(t, []string{"01W1"}, store2.invalidated)
+	require.Len(t, *got2, 1)
+	assert.Equal(t, domain.InvalidationReasonSessionConcurrencyCap, (*got2)[0].reason)
+
+	// A human session is still capped by the human cap.
+	store3, dc3, _ := capFixture(1, "01H1")
+	dc3.WithWorkloadCap(3)
+	issue(t, store3, dc3, "01H2", false, "01H1")
+	assert.Equal(t, []string{"01H1"}, store3.invalidated)
 }

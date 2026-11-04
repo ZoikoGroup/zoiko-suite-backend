@@ -18,6 +18,12 @@ type PrincipalStore interface {
 	FindActiveRoleAssignments(ctx context.Context, principalID, tenantID string, legalEntityID *string) ([]domain.PrincipalRoleAssignment, error)
 	FindActiveDelegations(ctx context.Context, principalID, tenantID string) ([]domain.DelegatedAuthority, error)
 	UpdateStatus(ctx context.Context, principalID, tenantID string, newStatus domain.PrincipalStatus, actorID, correlationID string) error
+	// GetIdentityLinks returns every external-IdP link bound to a principal in
+	// the caller's tenant (GET /v1/subjects/{id}/links).
+	GetIdentityLinks(ctx context.Context, tenantID, principalID string) ([]domain.IdentityLink, error)
+	// ResolveSubjectID follows merge aliases to the subject that answers for
+	// id (ORG-1); merged reports whether id itself was retired.
+	ResolveSubjectID(ctx context.Context, tenantID, id string) (survivor string, merged bool, err error)
 }
 
 // SessionCache manages the Redis-backed session envelope store.

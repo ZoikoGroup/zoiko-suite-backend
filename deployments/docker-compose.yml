@@ -559,7 +559,7 @@ services:
       # handles are actually published on — it used to read this one alone, so
       # authority.revoked, role.updated and entity.updated never ended a session.
       KAFKA_EVENTS_TOPIC: "zoiko.identity.events"
-      KAFKA_CONSUME_TOPICS: "zoiko.identity.events,zoiko.delegated-authority.events,zoiko.access-control.events,zoiko.entity.events"
+      KAFKA_CONSUME_TOPICS: "zoiko.identity.events,zoiko.delegated-authority.events,zoiko.access-control.events,zoiko.entity.events,zoiko.authorization.events"
       JWT_SIGNING_SECRET: "local-dev-jwt-signing-secret-key-32-chars-long"
       JWT_SIGNING_PRIVATE_KEY_PATH: "/keys/envelope_signing_key.pem"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -666,11 +666,19 @@ services:
       # in as client "zoiko-console" with its secret (local value:
       # local-dev-console-client-secret; the file holds only its SHA-256), so
       # the token carries a verified azp and a human session gets a VERIFIED
-      # source channel. "optional" until the console sends the client; then
-      # "required".
+      # source channel. "required" since 3 Nov 2026: the console
+      # (IDENTITY_CONSOLE_CLIENT_ID/SECRET), the E2E scripts, audit.sh and
+      # verify.ps1 all present the client, and a login without one is 401
+      # invalid_client.
       IDP_CLIENT_SECRETS_FILE: "/idp-clients/clients.json"
       IDP_CLIENT_CHANNELS: "zoiko-console=web"
-      IDP_CLIENT_AUTH: "optional"
+      IDP_CLIENT_AUTH: "required"
+      # Passkeys (WebAuthn, AU-11). The relying party is "localhost" (the
+      # issuer's host), shared by the hosted login on :8080 and the console on
+      # :3000. The browser reports the origin of the page that ran the
+      # ceremony, so both origins are listed.
+      WEBAUTHN_RP_ID: "localhost"
+      WEBAUTHN_RP_ORIGINS: "http://localhost:8080,http://localhost:3000"
       # The TOTP second factor (migration 000012): secrets are AES-256-GCM
       # encrypted under this key. LOCAL VALUE ONLY — staging and production
       # refuse to start without their own (from the secret store), and a

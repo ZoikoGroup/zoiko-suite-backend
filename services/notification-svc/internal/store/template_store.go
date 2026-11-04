@@ -23,19 +23,19 @@ import (
 
 const templateDefinitionColumns = `
 	template_id, tenant_id, legal_entity_id, name, business_purpose, owner_principal_id,
-	status, created_at, retired_at, retired_by_principal_id, intent_id
+	status, created_at, retired_at, retired_by_principal_id, intent_id, record_version
 `
 
 const templateVersionColumns = `
 	version_id, template_id, tenant_id, legal_entity_id, version_number, locale,
 	content, content_hash, variable_schema, subject, subject_variables, branding_metadata, accessibility_metadata,
 	status, created_by_principal_id, created_at, validated_at,
-	approved_by_principal_id, approved_at, published_at, retired_at, superseded_by_version_id
+	approved_by_principal_id, approved_at, published_at, retired_at, superseded_by_version_id, record_version
 `
 
 func scanTemplateDefinition(s scannable, d *domain.TemplateDefinition) error {
 	return s.Scan(&d.TemplateID, &d.TenantID, &d.LegalEntityID, &d.Name, &d.BusinessPurpose, &d.OwnerPrincipalID,
-		&d.Status, &d.CreatedAt, &d.RetiredAt, &d.RetiredByPrincipalID, &d.IntentID)
+		&d.Status, &d.CreatedAt, &d.RetiredAt, &d.RetiredByPrincipalID, &d.IntentID, &d.RecordVersion)
 }
 
 func scanTemplateVersion(s scannable, v *domain.TemplateVersion) error {
@@ -44,6 +44,7 @@ func scanTemplateVersion(s scannable, v *domain.TemplateVersion) error {
 		&v.Content, &v.ContentHash, &schemaRaw, &v.Subject, &subjectVarsRaw, &v.BrandingMetadata, &v.AccessibilityMetadata,
 		&v.Status, &v.CreatedByPrincipalID, &v.CreatedAt, &v.ValidatedAt,
 		&v.ApprovedByPrincipalID, &v.ApprovedAt, &v.PublishedAt, &v.RetiredAt, &v.SupersededByVersionID,
+		&v.RecordVersion,
 	); err != nil {
 		return err
 	}

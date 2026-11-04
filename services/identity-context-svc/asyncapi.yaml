@@ -143,6 +143,22 @@ channels:
           - $ref: "#/components/messages/AssignmentResumed"
           - $ref: "#/components/messages/AssignmentGranted"
 
+  zoiko.authorization.events:
+    description: Owned by authorization-svc. Consumed only (IAM-09 role-profile drift).
+    subscribe:
+      summary: |
+        Assignment lifecycle written by authorization-svc's own triggers
+        (000026; suspension 000037; one definition since 000041) and its
+        expiry sweep (000038). The id is payload.principal_role_assignment_id.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/AssignmentGranted"
+          - $ref: "#/components/messages/AssignmentRevoked"
+          - $ref: "#/components/messages/AssignmentSuspended"
+          - $ref: "#/components/messages/AssignmentResumed"
+          - $ref: "#/components/messages/AssignmentExpired"
+          - $ref: "#/components/messages/AssignmentApproved"
+
   zoiko.entity.events:
     description: Owned by tenant-entity-registry-svc. Consumed only.
     subscribe:
@@ -259,7 +275,8 @@ components:
       title: One session was revoked
       summary: |
         ZS-IAM-001 §23's name. Emitted as `session.invalidated` until 16 Oct
-        2026; no service consumed the old name, so it was retired outright.
+        2026; IC-4 now emits BOTH names per revocation so consumers on either
+        contract see every revocation including session-concurrency-cap evictions.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -272,7 +289,7 @@ components:
                   principal_id: { type: string }
                   invalidation_reason:
                     type: string
-                    enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED]
+                    enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED, SESSION_CONCURRENCY_CAP]
                   correlation_id: { type: string }
 
     RiskSignalUnavailable:
@@ -336,12 +353,19 @@ components:
 
     SubjectMerged:
       name: identity.subject.merged
-      title: A duplicate identity was merged into a surviving one
+      title: A duplicate identity was merged into its survivor (ORG-1 MergeDuplicateIdentity)
       summary: |
-        Written in the same transaction as the merge (POST /v1/identities/{id}/merge). The duplicate is disabled and
-        its id never reused. authorization-svc re-points the role assignments and delegations it holds for
-        duplicate_id to survivor_id; this service re-points its own provider links and reports what it did in
-        link_outcomes. Every session the duplicate held is ended after the commit.
+        Written to the outbox in the merge transaction. The duplicate is disabled and its
+        id is never reissued; it resolves to the survivor. authorization-svc re-points the
+        role assignments and delegations it holds for duplicate_id to survivor_id. Every
+        session the duplicate held is ended after the commit.
+
+        Two routes make a merge, and the payload says which:
+        - POST /v1/subjects/{id}/merge (If-Match, step-up) also writes
+          principal.status.changed and identity.subject.disabled for the duplicate, and
+          sends principal_id and new_status.
+        - POST /v1/identities/{id}/merge (idempotent) sends merge_id, merged_at and
+          link_outcomes: what it did with each of the duplicate's provider links.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -349,17 +373,37 @@ components:
             properties:
               payload:
                 type: object
+                required: [survivor_id, duplicate_id, tenant_id, actor]
                 properties:
-                  merge_id: { type: string }
-                  tenant_id: { type: string }
-                  survivor_id: { type: string }
-                  duplicate_id: { type: string }
-                  actor: { type: string }
-                  reason: { type: string }
-                  merged_at: { type: string, format: date-time }
-                  correlation_id: { type: string }
+                  survivor_id:
+                    type: string
+                  duplicate_id:
+                    type: string
+                  principal_id:
+                    type: string
+                    description: The duplicate (the subject whose status changed). /v1/subjects merges only.
+                  tenant_id:
+                    type: string
+                  new_status:
+                    type: string
+                    enum: [DISABLED]
+                    description: /v1/subjects merges only.
+                  actor:
+                    type: string
+                  reason:
+                    type: string
+                  correlation_id:
+                    type: string
+                  merge_id:
+                    type: string
+                    description: /v1/identities merges only.
+                  merged_at:
+                    type: string
+                    format: date-time
+                    description: /v1/identities merges only.
                   link_outcomes:
                     type: array
+                    description: /v1/identities merges only.
                     items:
                       type: object
                       properties:
@@ -458,11 +502,12 @@ components:
 
     MFAFactorEnrolled:
       name: identity.mfa_factor.enrolled
-      title: A TOTP factor was proven and is now active
+      title: A second factor (TOTP or passkey) was proven and is now active
       summary: |
         Written through the outbox in the transaction that activates the
-        factor (and retires any previous one). Payload: principal_id,
-        tenant_id, factor_id, factor_type, correlation_id. Never any secret.
+        factor (and, for TOTP, retires any previous one). Payload:
+        principal_id, tenant_id, factor_id, factor_type (TOTP or WEBAUTHN; a
+        passkey adds backup_eligible), correlation_id. Never any secret.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -470,10 +515,10 @@ components:
 
     MFAFactorRevoked:
       name: identity.mfa_factor.revoked
-      title: A principal revoked its own TOTP factor
+      title: A principal revoked one of its own factors
       summary: |
         Requires a recent step-up. Payload: principal_id, tenant_id, factor_id,
-        reason, actor, correlation_id.
+        reason, actor, correlation_id; a passkey adds factor_type WEBAUTHN.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -485,7 +530,9 @@ components:
       summary: |
         Credential recovery (ZS-IAM-001 §3). Payload: principal_id (the
         subject), tenant_id, reason_code, purpose, actor (the administrator),
-        correlation_id. Also streamed to SIEM at high severity.
+        correlation_id. One event for the TOTP factors and one (factor_type
+        WEBAUTHN, reason) for the passkeys when either is retired. Also
+        streamed to SIEM at high severity.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -495,9 +542,12 @@ components:
       name: identity.step_up.succeeded
       title: A session was stepped up with a second factor
       summary: |
-        Written with the accepted code. Payload: principal_id, tenant_id,
-        factor_id, session_context_id, amr, correlation_id. Doc 05 §13.2 names
-        MFA/step-up events a required SIEM signal.
+        Written with the accepted code, or with a passkey assertion's sign
+        counter. Payload: principal_id, tenant_id, factor_id,
+        session_context_id (TOTP step-up), amr (["pwd","otp"] or
+        ["pwd","hwk"]), correlation_id; a passkey adds factor_type WEBAUTHN and
+        context (login or step_up). Doc 05 §13.2 names MFA/step-up events a
+        required SIEM signal.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -931,6 +981,20 @@ components:
         principal_role_assignments, the table the resolver frames session
         roles from and handleRoleUpdated finds a role's holders in; it had no
         other feed. A principal unknown here is skipped. Revokes nothing.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentExpired:
+      name: iam.assignment.expired
+      title: An assignment reached its end date
+      summary: Handled as iam.assignment.revoked.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentApproved:
+      name: iam.assignment.approved
+      title: A pending assignment was approved
+      summary: Handled as iam.assignment.granted.
       payload:
         $ref: "#/components/schemas/Envelope"
 

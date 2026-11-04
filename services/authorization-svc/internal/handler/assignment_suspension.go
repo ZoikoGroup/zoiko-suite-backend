@@ -9,7 +9,9 @@ package handler
 //	GET  /v1/admin/role-assignments/as-of                         iam.assignment.read
 //
 // A suspended assignment grants nothing at once, but is still held: it can be
-// resumed, revoked or expire. See migration 000037.
+// resumed, revoked or expire. See migration 000037. Both commands honour
+// If-Match and answer with the ETag (API-3), and a resume takes what granting
+// took (resumeMayRestore).
 
 import (
 	"context"
@@ -101,6 +103,10 @@ func (h *Handler) changeSuspension(w http.ResponseWriter, r *http.Request, suspe
 			return
 		}
 	}
+	if body.ExpectedVersion < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_expected_version", "message": "expected_version must be positive"})
+		return
+	}
 	reason := strings.TrimSpace(body.reason())
 	// A suspension without a reason is evidence of nothing, so it is required
 	// whatever the command-contract mode; a resume's reason is optional.
@@ -115,27 +121,11 @@ func (h *Handler) changeSuspension(w http.ResponseWriter, r *http.Request, suspe
 	if !h.applyReason(w, &r, reason) {
 		return
 	}
-
-	// Suspending or resuming a platform-scope assignment is a platform act,
-	// as revoking one is.
-	if h.platformScopeEntityID != "" {
-		finder, ok := h.store.(roleAssignmentFinder)
-		if !ok {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			return
-		}
-		existing, err := finder.FindRoleAssignmentByID(r.Context(), assignmentID, tenantScope)
-		if err != nil {
-			if !writeSuspensionError(w, err) {
-				h.log.Error("suspension: assignment lookup failed", zap.String("correlation_id", r.Header.Get("X-Correlation-ID")), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			}
-			return
-		}
-		if existing.LegalEntityID != nil && h.isPlatformScopeEntity(*existing.LegalEntityID) &&
-			!h.requirePlatformAction(w, r, principalID, permission) {
-			return
-		}
+	// If-Match (API-3) is honoured, not yet required: callers that predate it
+	// send none on assignments.
+	expected, ok := optionalExpectedVersion(w, r, body.ExpectedVersion)
+	if !ok {
+		return
 	}
 
 	suspender, ok := h.store.(assignmentSuspender)
@@ -143,6 +133,20 @@ func (h *Handler) changeSuspension(w http.ResponseWriter, r *http.Request, suspe
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
+	existing, ok := h.assignmentForMutation(w, r, assignmentID, tenantScope, expected)
+	if !ok {
+		return
+	}
+	// Suspending or resuming a platform-scope assignment is a platform act,
+	// as revoking one is.
+	if existing.LegalEntityID != nil && h.isPlatformScopeEntity(*existing.LegalEntityID) &&
+		!h.requirePlatformAction(w, r, principalID, permission) {
+		return
+	}
+	if !suspend && !h.resumeMayRestore(w, r, principalID, tenantScope, existing) {
+		return
+	}
+
 	var (
 		a   *domain.PrincipalRoleAssignment
 		err error
@@ -159,7 +163,59 @@ func (h *Handler) changeSuspension(w http.ResponseWriter, r *http.Request, suspe
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, a)
+	writeJSONWithETag(w, http.StatusOK, a, a.Version)
+}
+
+// resumeMayRestore applies what granting the assignment took, since lifting a
+// suspension restores the access: never on one's own assignment,
+// iam.assignment.approve_privileged for a role carrying IAM or platform
+// administration, and no segregation-of-duties conflict with what the
+// principal holds now, which may have changed while it was suspended. Writes
+// the refusal and returns false.
+func (h *Handler) resumeMayRestore(w http.ResponseWriter, r *http.Request, principalID, tenantScope string, existing *domain.PrincipalRoleAssignment) bool {
+	if existing.PrincipalID == principalID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "self_resume_not_allowed",
+			"message": domain.ErrSelfResume.Error(),
+		})
+		return false
+	}
+	entity := ""
+	if existing.LegalEntityID != nil {
+		entity = *existing.LegalEntityID
+	}
+	roleActions, err := h.roleActiveActions(r.Context(), existing.RoleID, tenantScope)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return false
+	}
+	if anyPrivileged(roleActions) {
+		entitled, err := h.holdsPrivilegedApproval(r, principalID, tenantScope, entity)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return false
+		}
+		if !entitled {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":   "authorization_denied",
+				"message": PermissionApprovePrivileged + " is required to resume a privileged assignment",
+			})
+			return false
+		}
+	}
+	req := createAssignmentRequest{PrincipalID: existing.PrincipalID, RoleID: existing.RoleID, LegalEntityID: entity}
+	conflicts, ok := h.assignmentSoDConflicts(w, r, req, existing.RoleID, tenantScope)
+	if !ok {
+		return false
+	}
+	if len(conflicts) > 0 {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "sod_conflict", "message": "the assignment now conflicts with a segregation-of-duties rule for this principal",
+			"conflicts": conflicts,
+		})
+		return false
+	}
+	return true
 }
 
 // ListAssignmentSuspensions handles GET .../{assignment_id}/suspensions.

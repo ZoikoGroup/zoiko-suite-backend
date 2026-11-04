@@ -108,8 +108,8 @@ func page(w http.ResponseWriter, r *http.Request) (limit int, after *store.Curso
 	return limit, after, true
 }
 
-// GetSubjectIdentity answers GET /v1/identities/{principalID}.
-func (h *Handler) GetSubjectIdentity(w http.ResponseWriter, r *http.Request) {
+// GetIdentity answers GET /v1/identities/{principalID} (ORG-01 GetSubjectIdentity).
+func (h *Handler) GetIdentity(w http.ResponseWriter, r *http.Request) {
 	tenantID, subjectID, ok := h.subjectFor(w, r, ActionIdentityRead)
 	if !ok {
 		return
@@ -127,8 +127,8 @@ func (h *Handler) GetSubjectIdentity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s)
 }
 
-// ListIdentityLinks answers GET /v1/identities/{principalID}/links.
-func (h *Handler) ListIdentityLinks(w http.ResponseWriter, r *http.Request) {
+// ListIdentityProviderLinks answers GET /v1/identities/{principalID}/links (ORG-01 ListIdentityLinks).
+func (h *Handler) ListIdentityProviderLinks(w http.ResponseWriter, r *http.Request) {
 	tenantID, subjectID, ok := h.subjectFor(w, r, ActionIdentityRead)
 	if !ok {
 		return
@@ -152,8 +152,8 @@ func (h *Handler) ListIdentityLinks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": links})
 }
 
-// GetAssuranceHistory answers GET /v1/identities/{principalID}/assurance-history.
-func (h *Handler) GetAssuranceHistory(w http.ResponseWriter, r *http.Request) {
+// GetIdentityAssuranceHistory answers GET /v1/identities/{principalID}/assurance-history (ORG-01 GetAssuranceHistory).
+func (h *Handler) GetIdentityAssuranceHistory(w http.ResponseWriter, r *http.Request) {
 	tenantID, subjectID, ok := h.subjectFor(w, r, ActionIdentityRead)
 	if !ok {
 		return
@@ -177,8 +177,8 @@ func (h *Handler) GetAssuranceHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": next})
 }
 
-// ListAuthenticationEvents answers GET /v1/identities/{principalID}/authentication-events.
-func (h *Handler) ListAuthenticationEvents(w http.ResponseWriter, r *http.Request) {
+// ListIdentityAuthenticationEvents answers GET /v1/identities/{principalID}/authentication-events (ORG-01 ListAuthenticationEvents).
+func (h *Handler) ListIdentityAuthenticationEvents(w http.ResponseWriter, r *http.Request) {
 	tenantID, subjectID, ok := h.subjectFor(w, r, ActionAuthEventsRead)
 	if !ok {
 		return
@@ -237,10 +237,10 @@ type mergeRequest struct {
 	Reason      string `json:"reason"`
 }
 
-// MergeDuplicateIdentity answers POST /v1/identities/{survivorID}/merge: 201 when the merge is made, 200 when the
+// MergeIdentity answers POST /v1/identities/{survivorID}/merge (ORG-01 MergeDuplicateIdentity): 201 when the merge is made, 200 when the
 // same merge had already been made (idempotent by tenant and duplicate), 409 when the duplicate was merged into
 // someone else or the merge would chain.
-func (h *Handler) MergeDuplicateIdentity(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) MergeIdentity(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return

@@ -408,6 +408,8 @@ type ConfigDefinition struct {
 	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000014).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ConfigDefinitionVersion is one immutable published snapshot of a definition
@@ -788,6 +790,8 @@ type KillSwitch struct {
 	ExpiredAt            *time.Time `json:"expired_at,omitempty"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
 	CreatedAt            time.Time  `json:"created_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000014).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // CreateKillSwitchParams carries a kill-switch write.
@@ -893,6 +897,8 @@ type ConfigChange struct {
 	CreatedByPrincipalID string          `json:"created_by_principal_id"`
 	CreatedAt            time.Time       `json:"created_at"`
 	UpdatedAt            time.Time       `json:"updated_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000014).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // CreateChangeParams carries a POST /v1/config/changes write.
@@ -949,6 +955,8 @@ type EmergencyChange struct {
 	ActivatedAt            *time.Time `json:"activated_at,omitempty"`
 	HadPrior               bool       `json:"had_prior"`
 	RetrospectiveReference *string    `json:"retrospective_reference,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000014).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // EmergencyRetrospectiveWindow is how long after expiry the mandatory
@@ -1095,6 +1103,8 @@ type ReleasePlan struct {
 	Version                int             `json:"version"`
 	PublishedAt            time.Time       `json:"published_at"`
 	PublishedByPrincipalID string          `json:"published_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency token (migration 000014).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // CreateReleasePlanParams carries a POST /v1/flags/{key}/release-plans write.
@@ -1129,6 +1139,8 @@ type FlagRetirement struct {
 	RetiredByPrincipalID string          `json:"retired_by_principal_id"`
 	RetiredAt            time.Time       `json:"retired_at"`
 	RemovedAt            *time.Time      `json:"removed_at,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000014).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // RetireFlagParams carries a flag retirement write.

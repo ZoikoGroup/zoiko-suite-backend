@@ -91,7 +91,7 @@ func (h *Handler) writeGovernedErr(w http.ResponseWriter, r *http.Request, op st
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "rule_rejected",
 			"message": "this rule was rejected when it was proposed and can never take effect; propose a new one"})
 	case errors.Is(err, domain.ErrVersionConflict):
-		writeVersionConflict(w)
+		writeVersionConflict(w, r)
 	case errors.Is(err, domain.ErrInvalidTransition):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition",
 			"message": "only a limit in force can be retired"})
@@ -493,11 +493,13 @@ type authorityLimitRequest struct {
 	LegalEntityID *string `json:"legal_entity_id,omitempty"`
 	BookID        *string `json:"book_id,omitempty"`
 	OrgUnitID     *string `json:"org_unit_id,omitempty"`
-	Currency      string  `json:"currency"`
-	LowerLimit    string  `json:"lower_limit"`
-	UpperLimit    string  `json:"upper_limit"`
-	EffectiveFrom string  `json:"effective_from,omitempty"`
-	EffectiveTo   string  `json:"effective_to,omitempty"`
+	// LimitKind is MONETARY (the default) or QUANTITY (000040).
+	LimitKind     string `json:"limit_kind,omitempty"`
+	Currency      string `json:"currency"`
+	LowerLimit    string `json:"lower_limit"`
+	UpperLimit    string `json:"upper_limit"`
+	EffectiveFrom string `json:"effective_from,omitempty"`
+	EffectiveTo   string `json:"effective_to,omitempty"`
 	// §16 reason, recorded on the request.
 	ReasonCode string `json:"reason_code"`
 	Purpose    string `json:"purpose"`
@@ -519,18 +521,32 @@ func nonEmpty(p *string) *string {
 
 // validateLimit checks what the store cannot express usefully: amounts that
 // parse, a currency the conversion table knows (an unknown one would fail
-// every evaluation closed), and an order to the dates. It writes the 400.
+// every evaluation closed), and an order to the dates. A QUANTITY limit has
+// no currency and whole-number bounds. It writes the 400.
 func validateLimit(w http.ResponseWriter, req *authorityLimitRequest) (from time.Time, to *time.Time, ok bool) {
 	fail := func(field, msg string) (time.Time, *time.Time, bool) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": field, "message": msg})
 		return time.Time{}, nil, false
 	}
-	req.Currency = strings.ToUpper(strings.TrimSpace(req.Currency))
-	if req.Currency == "" {
-		req.Currency = "GBP"
+	req.LimitKind = strings.ToUpper(strings.TrimSpace(req.LimitKind))
+	if req.LimitKind == "" {
+		req.LimitKind = domain.AuthorityLimitMonetary
 	}
-	if _, known := StandardReferenceFXRates[req.Currency]; !known {
-		return fail("currency", "currency must be one the platform converts: GBP, USD, EUR, CAD, AUD, JPY or CHF")
+	req.Currency = strings.ToUpper(strings.TrimSpace(req.Currency))
+	switch req.LimitKind {
+	case domain.AuthorityLimitMonetary:
+		if req.Currency == "" {
+			req.Currency = "GBP"
+		}
+		if _, known := StandardReferenceFXRates[req.Currency]; !known {
+			return fail("currency", "currency must be one the platform converts: GBP, USD, EUR, CAD, AUD, JPY or CHF")
+		}
+	case domain.AuthorityLimitQuantity:
+		if req.Currency != "" {
+			return fail("currency", "a QUANTITY limit counts things and has no currency")
+		}
+	default:
+		return fail("limit_kind", "limit_kind is MONETARY or QUANTITY")
 	}
 	if strings.TrimSpace(req.LowerLimit) == "" {
 		req.LowerLimit = "0"
@@ -546,6 +562,8 @@ func validateLimit(w http.ResponseWriter, req *authorityLimitRequest) (from time
 		return fail("upper_limit", "upper_limit is a positive amount, e.g. 25000.00")
 	case upper.Cmp(lower) < 0:
 		return fail("upper_limit", "upper_limit must not be below lower_limit")
+	case req.LimitKind == domain.AuthorityLimitQuantity && (!lower.IsInt() || !upper.IsInt()):
+		return fail("upper_limit", "a QUANTITY limit's bounds are whole numbers, e.g. 0 and 50")
 	}
 	from = time.Now().UTC()
 	if s := strings.TrimSpace(req.EffectiveFrom); s != "" {
@@ -646,7 +664,7 @@ func (h *Handler) CreateAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	al, err := h.store.CreateAuthorityLimit(r.Context(), domain.CreateAuthorityLimitParams{
 		TenantID: tenantScope, PrincipalID: req.PrincipalID, RoleID: req.RoleID,
 		AuthorityType: strings.TrimSpace(req.AuthorityType), LegalEntityID: nonEmpty(req.LegalEntityID),
-		BookID: nonEmpty(req.BookID), OrgUnitID: nonEmpty(req.OrgUnitID), Currency: req.Currency,
+		BookID: nonEmpty(req.BookID), OrgUnitID: nonEmpty(req.OrgUnitID), LimitKind: req.LimitKind, Currency: req.Currency,
 		LowerLimit: strings.TrimSpace(req.LowerLimit), UpperLimit: strings.TrimSpace(req.UpperLimit),
 		EffectiveFrom: from, EffectiveTo: to, RequestedBy: maker, RequestReason: req.reason(),
 	})
@@ -654,7 +672,7 @@ func (h *Handler) CreateAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		h.writeGovernedErr(w, r, "CreateAuthorityLimit", err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, al)
+	writeJSONWithETag(w, http.StatusAccepted, al, al.Version)
 }
 
 // ChangeAuthorityLimit — POST /v1/admin/authority-limits/{authority_limit_id}/change.
@@ -682,13 +700,17 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	if !h.applyReason(w, &r, req.reason()) {
 		return
 	}
+	expected, ok := expectedVersion(w, r, req.ExpectedVersion)
+	if !ok {
+		return
+	}
 	cur, err := h.store.FindAuthorityLimitByID(r.Context(), chi.URLParam(r, "authority_limit_id"), tenantScope)
 	if err != nil {
 		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", err)
 		return
 	}
-	if req.ExpectedVersion > 0 && req.ExpectedVersion != cur.Version {
-		writeVersionConflict(w)
+	if expected > 0 && expected != cur.Version {
+		writeVersionConflict(w, r)
 		return
 	}
 	if cur.Status != domain.AuthorityLimitActive {
@@ -699,6 +721,17 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", domain.ErrChangePending)
 		return
 	}
+	// A limit's kind is what it measures; a different kind is a different limit.
+	curKind := cur.LimitKind
+	if curKind == "" {
+		curKind = domain.AuthorityLimitMonetary
+	}
+	if k := strings.TrimSpace(req.LimitKind); k != "" && !strings.EqualFold(k, curKind) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "limit_kind",
+			"message": "a limit's kind cannot change; retire it and request a new one"})
+		return
+	}
+	req.LimitKind = curKind
 	// Unset fields keep their current value.
 	if req.Currency == "" {
 		req.Currency = cur.Currency
@@ -718,7 +751,7 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	al, err := h.store.CreateAuthorityLimit(r.Context(), domain.CreateAuthorityLimitParams{
 		TenantID: tenantScope, PrincipalID: cur.PrincipalID, RoleID: cur.RoleID, AuthorityType: cur.AuthorityType,
-		LegalEntityID: cur.LegalEntityID, BookID: cur.BookID, OrgUnitID: cur.OrgUnitID, Currency: req.Currency,
+		LegalEntityID: cur.LegalEntityID, BookID: cur.BookID, OrgUnitID: cur.OrgUnitID, LimitKind: req.LimitKind, Currency: req.Currency,
 		LowerLimit: strings.TrimSpace(req.LowerLimit), UpperLimit: strings.TrimSpace(req.UpperLimit),
 		EffectiveFrom: from, EffectiveTo: to, RequestedBy: maker, RequestReason: req.reason(), SupersedesID: cur.AuthorityLimitID,
 	})
@@ -726,7 +759,7 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, al)
+	writeJSONWithETag(w, http.StatusAccepted, al, al.Version)
 }
 
 // RetireAuthorityLimit — POST /v1/admin/authority-limits/{authority_limit_id}/retire.
@@ -743,7 +776,7 @@ func (h *Handler) RetireAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	if !h.requirePermission(w, r, maker, tenantScope, domain.PermissionAuthorityLimitManage) {
 		return
 	}
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
@@ -757,7 +790,7 @@ func (h *Handler) RetireAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		h.writeGovernedErr(w, r, "RetireAuthorityLimit", err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, al)
+	writeJSONWithETag(w, http.StatusAccepted, al, al.Version)
 }
 
 // ApproveAuthorityLimit — POST /v1/admin/authority-limits/{authority_limit_id}/approve.

@@ -45,6 +45,8 @@ type Policy struct {
 
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency token (migration 000009).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // PolicyVersion is an effective-dated, state-machined rule-content record

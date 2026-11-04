@@ -56,7 +56,8 @@ const notificationColumns = `
 	COALESCE(purpose_context, ''), COALESCE(idempotency_key, ''),
 	resend_count, COALESCE(last_resend_reason, ''), last_resent_at, COALESCE(last_resent_by_principal_id, ''),
 	COALESCE(communication_class, ''), COALESCE(message_intent_id::text, ''), COALESCE(intent_version_id::text, ''),
-	job_id::text, not_before, expires_at, COALESCE(cancelled_by, ''), cancelled_at, COALESCE(cancel_reason, '')`
+	job_id::text, not_before, expires_at, COALESCE(cancelled_by, ''), cancelled_at, COALESCE(cancel_reason, ''),
+	record_version`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface{ Scan(dest ...any) error }
@@ -76,6 +77,7 @@ func scanNotification(s scannable, n *domain.Notification) error {
 		&n.ResendCount, &n.LastResendReason, &n.LastResentAt, &n.LastResentByPrincipalID,
 		&n.CommunicationClass, &n.MessageIntentID, &n.IntentVersionID,
 		&n.JobID, &n.NotBefore, &n.ExpiresAt, &n.CancelledBy, &n.CancelledAt, &n.CancelReason,
+		&n.RecordVersion,
 	)
 }
 

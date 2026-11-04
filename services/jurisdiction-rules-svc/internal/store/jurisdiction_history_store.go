@@ -164,14 +164,19 @@ func (s *PgStore) RetireJurisdictionWithQuerier(ctx context.Context, q Querier, 
 		       updated_at                    = NOW(),
 		       updated_by_principal_id       = $2
 		 WHERE jurisdiction_id = $1
+		   AND ($6::bigint IS NULL OR row_version = $6)
 		RETURNING `+jurisdictionColumns+`;`,
-		p.JurisdictionID, p.ActorID, p.Reason, p.EvidenceRef, p.SupersededBy))
+		p.JurisdictionID, p.ActorID, p.Reason, p.EvidenceRef, p.SupersededBy, p.ExpectedRowVersion))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The duplicate-deactivation trigger skipped the update: already retired.
+			// The duplicate-deactivation trigger skipped the update (already
+			// retired), or the row has moved past the caller's If-Match version.
 			existing, findErr := s.FindByIDAny(ctx, p.JurisdictionID)
 			if findErr != nil {
 				return nil, false, findErr
+			}
+			if p.ExpectedRowVersion != nil && existing.RowVersion != *p.ExpectedRowVersion {
+				return nil, false, domain.ErrVersionConflict
 			}
 			return existing, false, nil
 		}

@@ -36,7 +36,9 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/idempotency"
+	ic8metrics "zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/mfa"
+	"zoiko.io/identity-context-svc/internal/webauthn"
 	"zoiko.io/identity-context-svc/internal/mtlslistener"
 	"zoiko.io/identity-context-svc/internal/oidc"
 	"zoiko.io/identity-context-svc/internal/outbox"
@@ -131,6 +133,10 @@ func main() {
 	// because a stopped relay produces no errors and no latency while every
 	// governance event this service emits piles up in a table.
 	govMetrics := telemetry.NewGovMetrics("identity-context-svc")
+
+	// IC-8 observability instruments.
+	ic8Metrics := ic8metrics.New(prometheus.DefaultRegisterer)
+	ic8metrics.SetDefault(ic8Metrics)
 
 	// ── Postgres pool ─────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
@@ -253,14 +259,6 @@ func main() {
 	outboxStore := outbox.NewStore(pool, log)
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, outboxStore)
 
-	// A session the concurrency cap ends leaves the service as
-	// identity.session.revoked, like every other revocation.
-	sessionCache.WithRevocationHook(func(ctx context.Context, sessionContextID, principalID string, reason domain.InvalidationReason, correlationID string) {
-		if err := publisher.PublishSessionInvalidated(ctx, sessionContextID, principalID, reason, correlationID); err != nil {
-			log.Error("session revocation event not recorded", zap.String("session_context_id", sessionContextID), zap.Error(err))
-		}
-	})
-
 	relayCfg := outbox.DefaultRelayConfig()
 	relayCfg.BatchSize = cfg.OutboxRelayBatchSize
 	relayCfg.PollInterval = time.Duration(cfg.OutboxRelayPollMillis) * time.Millisecond
@@ -323,6 +321,12 @@ func main() {
 	}
 
 	siemClient := siem.New(cfg.SIEMServiceURL, "identity-context-svc", log)
+
+	// A session the concurrency cap ends leaves the service as
+	// identity.session.revoked, like every other revocation, and is streamed
+	// to SIEM as a security signal.
+	sessionCache.WithRevocationHook(capRevocationHook(publisher, siemClient, log)).
+		WithWorkloadCap(cfg.SessionCapWorkload)
 
 	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
 	// so without this a SIGTERM would discard security events already accepted.
@@ -437,6 +441,24 @@ func main() {
 			IssuerLabel:       cfg.MFAIssuerLabel,
 		})
 
+	// ── Passkeys (WebAuthn, AU-11) ────────────────────────────────────────
+	//
+	// The relying party is the issuer's host unless WEBAUTHN_RP_ID says
+	// otherwise. Ceremony challenges live in Redis so a begin answered by one
+	// replica can be finished on another, and each is taken exactly once.
+	passkeys, err := webauthn.New(webauthn.Config{
+		RPID:          cfg.AuthPlane.WebAuthnRPID,
+		RPDisplayName: cfg.AuthPlane.WebAuthnRPName,
+		RPOrigins:     cfg.AuthPlane.WebAuthnOrigins,
+	}, principalRepo, webauthn.NewRedisCeremonies(rdb), siemClient, log)
+	if err != nil {
+		log.Fatal("failed to build the passkey factor", zap.Error(err))
+	}
+	mfaService.WithPasskeys(passkeys)
+	log.Info("passkeys ready",
+		zap.String("rp_id", cfg.AuthPlane.WebAuthnRPID),
+		zap.Strings("rp_origins", cfg.AuthPlane.WebAuthnOrigins))
+
 	// ── Auth plane: throttle, OIDC provider, subject lifecycle (F-5) ──────
 	//
 	// Built 14–15 Oct and constructed by nothing until 19 Oct: the provider's
@@ -456,7 +478,7 @@ func main() {
 	}
 	provider, err := oidc.New(oidc.Options{
 		Cfg: cfg, Clients: oidcClients, Store: principalRepo, Pending: oidc.NewRedisPending(rdb), Ring: keyring,
-		AccessTokens: idpIssuer, AccessVerifier: verifier, Passwords: authenticator, MFA: loginMFA,
+		AccessTokens: idpIssuer, AccessVerifier: verifier, Passwords: authenticator, MFA: loginMFA, Passkeys: passkeys,
 		Sessions: resolver, Events: publisher, Limiter: loginLimiter, SIEM: siemClient, Log: log,
 		Metrics: oidc.NewMetrics(prometheus.DefaultRegisterer),
 	})
@@ -632,6 +654,11 @@ func main() {
 		log,
 	)
 
+	cursorSigner, err := apicontract.NewCursorSigner(cfg.CursorSigningKey)
+	if err != nil {
+		log.Fatal("cursor signer", zap.Error(err))
+	}
+
 	// Domain routes (all under /v1/)
 	h := identityctx.NewHandler(resolver, authenticator, sessionCache, principalRepo, authzClient, log).
 		WithEnvironment(domain.Environment(cfg.Environment)).
@@ -646,6 +673,8 @@ func main() {
 		}).
 		WithDPoP(provider.DPoPVerifier()).
 		WithStatusChanger(statusChanger{svc: lifecycleSvc}).
+		WithLifecycle(lifecycleSvc).
+		WithConsole(principalRepo, cursorSigner).
 		WithIdentityReader(principalRepo).
 		WithIdentityMerger(identityMerger{svc: lifecycleSvc})
 	provider.RegisterRoutes(r)
@@ -684,6 +713,38 @@ func main() {
 	retentionCtx, stopRetention := context.WithCancel(context.Background())
 	defer stopRetention()
 	go retentionWorker.Run(retentionCtx)
+
+	// IAM-6: identity_sessions_active is sampled from the durable store once
+	// a minute — the complete source, unlike a per-replica counter.
+	gaugeCtx, stopGauge := context.WithCancel(context.Background())
+	defer stopGauge()
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			sampleCtx, cancel := context.WithTimeout(context.WithoutCancel(gaugeCtx), 10*time.Second)
+			if n, err := principalRepo.CountActiveSessions(sampleCtx); err == nil {
+				ic8Metrics.SessionsActive.Set(float64(n))
+			} else {
+				log.Warn("identity_sessions_active not sampled", zap.Error(err))
+			}
+			cancel()
+			select {
+			case <-gaugeCtx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
+
+	// S1-B3: ingress bindings are re-read from tenant-entity-registry-svc at
+	// half their TTL, so a binding is STALE only while the registry is down.
+	if cfg.IngressBindingTTLSeconds > 0 && cfg.TenantRegistryURL != "" {
+		refreshCtx, stopRefresh := context.WithCancel(context.Background())
+		defer stopRefresh()
+		go identityctx.NewIngressRefresher(principalRepo, upstreamRegistry, domain.Environment(cfg.Environment),
+			time.Duration(cfg.IngressBindingTTLSeconds)*time.Second, log).Run(refreshCtx)
+	}
 
 	// ── Server ────────────────────────────────────────────────────────────
 	srv := &http.Server{

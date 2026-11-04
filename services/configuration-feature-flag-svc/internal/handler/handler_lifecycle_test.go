@@ -69,11 +69,12 @@ func TestResolve_RegionFromJurisdictionHeader(t *testing.T) {
 // accepted when the body does not carry one.
 func TestPublish_ApprovalReferenceFromEnvelope(t *testing.T) {
 	s := &stubStore{
-		getDefinitionResult: &domain.ConfigDefinition{DefinitionID: "d-1"},
+		getDefinitionResult: &domain.ConfigDefinition{DefinitionID: "d-1", RecordVersion: 1},
 		publishVersion:      &domain.ConfigDefinitionVersion{VersionID: "v-1"},
 	}
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/definitions/k/publish", strings.NewReader(`{"lifecycle":"PUBLISHED"}`)))
 	req.Header.Set("X-Approval-Reference", "CAB-7")
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	newRecoveryRouter(s, &stubAuthz{}).ServeHTTP(w, req)
 	if s.gotPublishDefinition.ApprovalReference != "CAB-7" {
@@ -82,8 +83,9 @@ func TestPublish_ApprovalReferenceFromEnvelope(t *testing.T) {
 }
 
 func TestPublish_MissingApprovalIs409(t *testing.T) {
-	s := &stubStore{getDefinitionResult: &domain.ConfigDefinition{DefinitionID: "d-1"}, publishErr: domain.ErrApprovalReferenceRequired}
+	s := &stubStore{getDefinitionResult: &domain.ConfigDefinition{DefinitionID: "d-1", RecordVersion: 1}, publishErr: domain.ErrApprovalReferenceRequired}
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/definitions/k/publish", strings.NewReader(`{"lifecycle":"PUBLISHED"}`)))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	newRecoveryRouter(s, &stubAuthz{}).ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {

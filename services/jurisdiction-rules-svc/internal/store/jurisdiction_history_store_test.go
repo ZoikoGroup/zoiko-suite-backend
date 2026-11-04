@@ -516,3 +516,29 @@ func TestMigration000027_DownIsRefusedWhileHistoryExists(t *testing.T) {
 }
 
 var _ = store.New
+
+// A retirement conditional on a version (If-Match, API-3) applies only to that
+// version: a stale one changes nothing and is ErrVersionConflict.
+func TestRetire_ExpectedRowVersionIsEnforced(t *testing.T) {
+	s, pool, ctx := newTestStore(t)
+	j := mustCreateJurisdiction(t, s, ctx, "VER", nil)
+	stale := j.RowVersion + 1
+
+	if _, _, err := s.RetireJurisdictionWithQuerier(ctx, pool, domain.RetireJurisdictionParams{
+		JurisdictionID: j.JurisdictionID, ActorID: "steward-1", Reason: "stale", ExpectedRowVersion: &stale,
+	}); !errors.Is(err, domain.ErrVersionConflict) {
+		t.Fatalf("stale version: %v, want ErrVersionConflict", err)
+	}
+	still, err := s.FindByID(ctx, j.JurisdictionID)
+	if err != nil || !still.ActiveFlag {
+		t.Fatalf("a refused retirement changed the jurisdiction: %+v (err %v)", still, err)
+	}
+
+	current := j.RowVersion
+	got, changed, err := s.RetireJurisdictionWithQuerier(ctx, pool, domain.RetireJurisdictionParams{
+		JurisdictionID: j.JurisdictionID, ActorID: "steward-1", Reason: "current", ExpectedRowVersion: &current,
+	})
+	if err != nil || !changed || got.ActiveFlag {
+		t.Fatalf("current version: changed=%v err=%v %+v", changed, err, got)
+	}
+}

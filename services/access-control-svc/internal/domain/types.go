@@ -56,6 +56,8 @@ type RoleDefinition struct {
 	// template-managed bundle carries. Empty / 0 for a tenant custom role.
 	TemplateCode    string `json:"template_code,omitempty"`
 	TemplateVersion int    `json:"template_version,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // PermissionBundleDef is a named set of permitted actions attached to a
@@ -75,6 +77,8 @@ type PermissionBundleDef struct {
 	// the template version's, and they change only by a template upgrade.
 	TemplateCode    string `json:"template_code,omitempty"`
 	TemplateVersion int    `json:"template_version,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ProtectedPermission is a platform-admin action that tenant roles may not include.
@@ -85,6 +89,8 @@ type ProtectedPermission struct {
 	ActiveFlag  bool      `json:"active_flag"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // RefusedEscalation records a pre-provisioning refusal for evidence/audit.
@@ -295,8 +301,12 @@ var (
 	// action into a tenant bundle.
 	ErrProtectedCatalogueUnavailable = errorString("protected-action catalogue unavailable")
 
-	// ErrProvisioningForbidden is returned when authorization-svc's admin API
-	// refuses the caller (403). It is a refusal, not an outage: the caller
-	// lacks the iam.* grant authorization-svc requires for the write.
-	ErrProvisioningForbidden = errorString("authorization-svc refused the provisioning call for this caller")
+// ErrProvisioningForbidden is returned when authorization-svc's admin API
+// refuses the caller (403). It is a refusal, not an outage: the caller
+// lacks the iam.* grant authorization-svc requires for the write.
+ErrProvisioningForbidden = errorString("authorization-svc refused the provisioning call for this caller")
+
+// ErrVersionConflict is returned when an update carries an expected_version
+// the object is no longer at — somebody else changed it since the caller read it.
+ErrVersionConflict = errorString("the object has changed since the expected version")
 )

@@ -724,7 +724,8 @@ func (s *PgStore) conflictOr(ctx context.Context, tenantID string, expectedVersi
 // ── principal_role_assignments ───────────────────────────────────────────────
 
 const assignmentColumns = `principal_role_assignment_id, principal_id, role_id, legal_entity_id, book_id, org_unit_id, effective_from, effective_to, assigned_by, created_at,
-	approval_status, approved_by, approval_reference, approval_decided_at, approval_expires_at`
+	approval_status, approved_by, approval_reference, approval_decided_at, approval_expires_at,
+	suspended_at, suspended_by, suspension_reason, version`
 
 func scanAssignment(row pgx.Row) (*domain.PrincipalRoleAssignment, error) {
 	a := &domain.PrincipalRoleAssignment{}
@@ -736,7 +737,8 @@ func scanAssignment(row pgx.Row) (*domain.PrincipalRoleAssignment, error) {
 func assignmentDest(a *domain.PrincipalRoleAssignment, extra ...any) []any {
 	return append([]any{&a.PrincipalRoleAssignmentID, &a.PrincipalID, &a.RoleID, &a.LegalEntityID, &a.BookID, &a.OrgUnitID,
 		&a.EffectiveFrom, &a.EffectiveTo, &a.AssignedBy, &a.CreatedAt,
-		&a.ApprovalStatus, &a.ApprovedBy, &a.ApprovalReference, &a.ApprovalDecidedAt, &a.ApprovalExpiresAt}, extra...)
+		&a.ApprovalStatus, &a.ApprovedBy, &a.ApprovalReference, &a.ApprovalDecidedAt, &a.ApprovalExpiresAt,
+		&a.SuspendedAt, &a.SuspendedBy, &a.SuspensionReason, &a.Version}, extra...)
 }
 
 func (s *PgStore) CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
@@ -889,6 +891,56 @@ func (s *PgStore) DecideRoleAssignment(ctx context.Context, assignmentID, tenant
 	return a, nil
 }
 
+// FindRoleAssignmentsAsOf reconstructs the assignments that granted in the
+// tenant at asOf (ORG-06 GetAssignmentsAsOf), from the 000038 history: each
+// assignment's latest state recorded at or before asOf, kept when that state
+// was approved, not suspended, and effective at asOf. A state recorded after
+// asOf — a later backdated grant, a later revocation — does not rewrite what
+// was true then. principalID narrows it to one principal; "" is everyone.
+func (s *PgStore) FindRoleAssignmentsAsOf(ctx context.Context, tenantID, principalID string, asOf time.Time) ([]domain.PrincipalRoleAssignment, error) {
+	const query = `
+		SELECT s.snapshot
+		  FROM (SELECT DISTINCT ON (h.principal_role_assignment_id) h.snapshot
+		          FROM principal_role_assignment_history h
+		          JOIN roles r ON r.role_id = (h.snapshot->>'role_id')::uuid
+		         WHERE r.tenant_id = $1::uuid
+		           AND h.recorded_at <= $2
+		           AND ($3 = '' OR h.snapshot->>'principal_id' = $3)
+		         ORDER BY h.principal_role_assignment_id, h.recorded_at DESC, h.history_id DESC) s
+		 WHERE s.snapshot->>'approval_status' = 'APPROVED'
+		   AND s.snapshot->>'suspended_at' IS NULL
+		   AND (s.snapshot->>'effective_from')::timestamptz <= $2
+		   AND (s.snapshot->>'effective_to' IS NULL OR (s.snapshot->>'effective_to')::timestamptz > $2)
+		 ORDER BY s.snapshot->>'principal_id', (s.snapshot->>'effective_from')::timestamptz, s.snapshot->>'principal_role_assignment_id'
+		 LIMIT 5000;`
+
+	out := []domain.PrincipalRoleAssignment{}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, tenantID, asOf, principalID)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if scanErr := rows.Scan(&raw); scanErr != nil {
+				return scanErr
+			}
+			var a domain.PrincipalRoleAssignment
+			if jErr := json.Unmarshal(raw, &a); jErr != nil {
+				return fmt.Errorf("decode assignment snapshot: %w", jErr)
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg FindRoleAssignmentsAsOf failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
 // FindRoleAssignmentByID reads one assignment, scoped to tenantID through its
 // role. One in another tenant reports ErrRoleAssignmentNotFound, same as a
 // missing one.
@@ -952,7 +1004,8 @@ func (s *PgStore) QueryRoleAssignments(ctx context.Context, q domain.AssignmentQ
 	query := `
 		SELECT a.principal_role_assignment_id, a.principal_id, a.role_id, a.legal_entity_id, a.book_id, a.org_unit_id,
 		       a.effective_from, a.effective_to, a.assigned_by, a.created_at,
-		       a.approval_status, a.approved_by, a.approval_reference, a.approval_decided_at, a.approval_expires_at, ` + usage + `
+		       a.approval_status, a.approved_by, a.approval_reference, a.approval_decided_at, a.approval_expires_at,
+		       a.suspended_at, a.suspended_by, a.suspension_reason, a.version, ` + usage + `
 		  FROM principal_role_assignments a
 		  JOIN roles r ON r.role_id = a.role_id
 		 WHERE r.tenant_id = $1
@@ -1839,7 +1892,7 @@ func (s *PgStore) FindGrantedActionsScoped(ctx context.Context, principalID, leg
 		JOIN roles r ON r.role_id = pra.role_id AND r.active_flag
 		JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
 		WHERE pra.principal_id = $1
-		  AND pra.approval_status = 'APPROVED'
+		  AND pra.approval_status = 'APPROVED' AND pra.suspended_at IS NULL
 		  AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
 		  AND ($3 = '' OR r.tenant_id::text = $3)
 		  AND (pra.book_id IS NULL OR pra.book_id = NULLIF($4, '')::uuid)
@@ -1983,7 +2036,7 @@ func (s *PgStore) FindGrantingAssignments(ctx context.Context, principalID, lega
 		  JOIN roles r ON r.role_id = pra.role_id AND r.active_flag
 		  JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
 		 WHERE pra.principal_id = $1
-		   AND pra.approval_status = 'APPROVED'
+		   AND pra.approval_status = 'APPROVED' AND pra.suspended_at IS NULL
 		   AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
 		   AND ($3 = '' OR r.tenant_id::text = $3)
 		   AND (pra.book_id IS NULL OR pra.book_id = NULLIF($4, '')::uuid)
@@ -2043,7 +2096,7 @@ func (s *PgStore) FindDelegationSource(ctx context.Context, delegatePrincipalID,
 		   AND da.effective_from <= NOW()
 		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
 		   AND r.tenant_id = da.tenant_id
-		   AND pra.approval_status = 'APPROVED'
+		   AND pra.approval_status = 'APPROVED' AND pra.suspended_at IS NULL
 		   AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
 		   AND (pra.book_id IS NULL OR pra.book_id = NULLIF($4, '')::uuid)
 		   AND (pra.org_unit_id IS NULL OR pra.org_unit_id = NULLIF($5, '')::uuid)
@@ -2105,7 +2158,7 @@ func (s *PgStore) FindDelegationFrom(ctx context.Context, delegatePrincipalID, d
 		   AND da.effective_from <= NOW()
 		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
 		   AND r.tenant_id = da.tenant_id
-		   AND pra.approval_status = 'APPROVED'
+		   AND pra.approval_status = 'APPROVED' AND pra.suspended_at IS NULL
 		   AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
 		   AND pra.effective_from <= NOW()
 		   AND (pra.effective_to IS NULL OR pra.effective_to > NOW())
@@ -2168,7 +2221,7 @@ func (s *PgStore) FindDelegatedActionsScoped(ctx context.Context, principalID, l
 		   AND da.effective_from <= NOW()
 		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
 		   AND r.tenant_id = da.tenant_id
-		   AND pra.approval_status = 'APPROVED'
+		   AND pra.approval_status = 'APPROVED' AND pra.suspended_at IS NULL
 		   AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
 		   AND (pra.book_id IS NULL OR pra.book_id = NULLIF($4, '')::uuid)
 		   AND (pra.org_unit_id IS NULL OR pra.org_unit_id = NULLIF($5, '')::uuid)
@@ -2960,7 +3013,7 @@ func (s *PgStore) FindPrincipalTenants(ctx context.Context, principalID string) 
 		  FROM principal_role_assignments pra
 		  JOIN roles r ON r.role_id = pra.role_id
 		 WHERE pra.principal_id = $1 AND r.tenant_id IS NOT NULL
-		   AND pra.approval_status = 'APPROVED'
+		   AND pra.approval_status = 'APPROVED' AND pra.suspended_at IS NULL
 		   AND pra.effective_from <= NOW() AND (pra.effective_to IS NULL OR pra.effective_to > NOW())
 		UNION
 		SELECT tenant_id::text FROM delegated_authorities
@@ -3030,7 +3083,8 @@ func isUndefinedTable(err error) bool {
 
 const privilegedSessionColumns = `session_id, tenant_id, principal_id, requested_actions, ticket_ref, reason, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by,
 	requested_by, resource_scope, target_environment, high_impact, approved_by, approved_at, review_status, reviewed_by, reviewed_at, review_notes,
-	requester_assurance, requester_authn_at, requester_identity_session, approver_assurance, approver_authn_at, approver_identity_session`
+	requester_assurance, requester_authn_at, requester_identity_session, approver_assurance, approver_authn_at, approver_identity_session,
+	record_version`
 
 func scanPrivilegedSession(row pgx.Row) (*domain.PrivilegedSession, error) {
 	var ps domain.PrivilegedSession
@@ -3062,6 +3116,7 @@ func scanPrivilegedSession(row pgx.Row) (*domain.PrivilegedSession, error) {
 		&ps.ReviewNotes,
 		&reqAssurance, &reqAuthnAt, &reqSession,
 		&apprAssurance, &apprAuthnAt, &apprSession,
+		&ps.RecordVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -3229,7 +3284,8 @@ func (s *PgStore) RevokePrivilegedSession(ctx context.Context, sessionID, tenant
 		UPDATE privileged_sessions
 		   SET status = 'REVOKED',
 		       revoked_at = NOW(),
-		       revoked_by = $3
+		       revoked_by = $3,
+		       record_version = record_version + 1
 		 WHERE session_id = $1::uuid
 		   AND tenant_id = $2::uuid
 		   AND status = 'ACTIVE'
@@ -3333,7 +3389,8 @@ func (s *PgStore) ReviewSession(ctx context.Context, kind, sessionID, tenantID, 
 // ── Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21) ───────────────────
 
 const breakGlassSessionColumns = "session_id, tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by, requested_by, review_status, reviewed_by, reviewed_at, review_notes, requester_assurance, requester_authn_at, requester_identity_session, " +
-	"approvals_required, approved_by, approved_at, rejected_by, rejected_at, request_expires_at"
+	"approvals_required, approved_by, approved_at, rejected_by, rejected_at, request_expires_at, " +
+	"record_version"
 
 func scanBreakGlassSession(row pgx.Row) (*domain.BreakGlassSession, error) {
 	var bg domain.BreakGlassSession
@@ -3361,6 +3418,7 @@ func scanBreakGlassSession(row pgx.Row) (*domain.BreakGlassSession, error) {
 		&bg.ReviewNotes,
 		&reqAssurance, &reqAuthnAt, &reqSession,
 		&approvalsRequired, &bg.ApprovedBy, &bg.ApprovedAt, &bg.RejectedBy, &bg.RejectedAt, &bg.RequestExpiresAt,
+		&bg.RecordVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -3548,7 +3606,8 @@ func (s *PgStore) RevokeBreakGlassSession(ctx context.Context, sessionID, tenant
 		UPDATE break_glass_sessions
 		   SET status = 'REVOKED',
 		       revoked_at = NOW(),
-		       revoked_by = $3
+		       revoked_by = $3,
+		       record_version = record_version + 1
 		 WHERE session_id = $1::uuid
 		   AND tenant_id = $2::uuid
 		   AND status = 'ACTIVE'
@@ -3579,7 +3638,7 @@ func (s *PgStore) RevokeBreakGlassSession(ctx context.Context, sessionID, tenant
 
 // ── Tenant Support Sessions (ZS-IAM-001 §15 & §21) ──────────────────────────
 
-const supportSessionColumns = "session_id, tenant_id, support_operator_id, ticket_ref, purpose, read_only, allow_bulk_export, allowed_actions, status, duration_seconds, expires_at, tenant_consent_obtained, created_at, revoked_at, revoked_by, requested_by"
+const supportSessionColumns = "session_id, tenant_id, support_operator_id, ticket_ref, purpose, read_only, allow_bulk_export, allowed_actions, status, duration_seconds, expires_at, tenant_consent_obtained, created_at, revoked_at, revoked_by, requested_by, record_version"
 
 func scanSupportSession(row pgx.Row) (*domain.SupportSession, error) {
 	var ss domain.SupportSession
@@ -3601,6 +3660,7 @@ func scanSupportSession(row pgx.Row) (*domain.SupportSession, error) {
 		&ss.RevokedAt,
 		&ss.RevokedBy,
 		&ss.RequestedBy,
+		&ss.RecordVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -3750,7 +3810,8 @@ func (s *PgStore) RevokeSupportSession(ctx context.Context, sessionID, tenantID,
 		UPDATE support_sessions
 		   SET status = 'REVOKED',
 		       revoked_at = NOW(),
-		       revoked_by = $3
+		       revoked_by = $3,
+		       record_version = record_version + 1
 		 WHERE session_id = $1::uuid
 		   AND tenant_id = $2::uuid
 		   AND status = 'ACTIVE'
@@ -3781,8 +3842,8 @@ func (s *PgStore) RevokeSupportSession(ctx context.Context, sessionID, tenantID,
 
 // ── authority_limits (ZS-IAM-001 §12, §21, §22) ──────────────────────────
 
-const authorityLimitColumns = `authority_limit_id, tenant_id, principal_id, role_id, authority_type, legal_entity_id, book_id, org_unit_id, currency, lower_limit::text, upper_limit::text, effective_from, effective_to, created_at,
-	status, pending_action, supersedes_id::text, requested_by, requested_at, request_reason, decided_by, decided_at, last_decision, version`
+const authorityLimitColumns = `authority_limit_id, tenant_id, principal_id, role_id, authority_type, legal_entity_id, book_id, org_unit_id, COALESCE(currency, ''), lower_limit::text, upper_limit::text, effective_from, effective_to, created_at,
+	status, pending_action, supersedes_id::text, requested_by, requested_at, request_reason, decided_by, decided_at, last_decision, version, limit_kind`
 
 func scanAuthorityLimit(row pgx.Row) (*domain.AuthorityLimit, error) {
 	al := &domain.AuthorityLimit{}
@@ -3791,7 +3852,7 @@ func scanAuthorityLimit(row pgx.Row) (*domain.AuthorityLimit, error) {
 		&al.Currency, &al.LowerLimit, &al.UpperLimit,
 		&al.EffectiveFrom, &al.EffectiveTo, &al.CreatedAt,
 		&al.Status, &al.PendingAction, &al.SupersedesID, &al.RequestedBy, &al.RequestedAt, &al.RequestReason,
-		&al.DecidedBy, &al.DecidedAt, &al.LastDecision, &al.Version)
+		&al.DecidedBy, &al.DecidedAt, &al.LastDecision, &al.Version, &al.LimitKind)
 	return al, err
 }
 
@@ -3805,7 +3866,11 @@ func (s *PgStore) CreateAuthorityLimit(ctx context.Context, params domain.Create
 	if params.AuthorityLimitID == "" {
 		params.AuthorityLimitID = uuid.New().String()
 	}
-	if params.Currency == "" {
+	if params.LimitKind == "" {
+		params.LimitKind = domain.AuthorityLimitMonetary
+	}
+	// A count has no currency (000040 refuses one on a QUANTITY limit).
+	if params.Currency == "" && params.LimitKind == domain.AuthorityLimitMonetary {
 		params.Currency = "GBP"
 	}
 	if params.LowerLimit == "" {
@@ -3824,10 +3889,10 @@ func (s *PgStore) CreateAuthorityLimit(ctx context.Context, params domain.Create
 			authority_limit_id, tenant_id, principal_id, role_id,
 			authority_type, legal_entity_id, book_id, org_unit_id,
 			currency, lower_limit, upper_limit, effective_from, effective_to,
-			status, requested_by, requested_at, request_reason, supersedes_id
+			status, requested_by, requested_at, request_reason, supersedes_id, limit_kind
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::numeric, $11::numeric, $12, $13,
-			'PENDING_APPROVAL', NULLIF($14, ''), NOW(), NULLIF($15, ''), NULLIF($16, '')::uuid)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10::numeric, $11::numeric, $12, $13,
+			'PENDING_APPROVAL', NULLIF($14, ''), NOW(), NULLIF($15, ''), NULLIF($16, '')::uuid, $17)
 		RETURNING ` + authorityLimitColumns + `;`
 
 	var al *domain.AuthorityLimit
@@ -3837,7 +3902,7 @@ func (s *PgStore) CreateAuthorityLimit(ctx context.Context, params domain.Create
 			params.AuthorityLimitID, params.TenantID, params.PrincipalID, params.RoleID,
 			params.AuthorityType, params.LegalEntityID, params.BookID, params.OrgUnitID,
 			params.Currency, params.LowerLimit, params.UpperLimit, params.EffectiveFrom, params.EffectiveTo,
-			params.RequestedBy, params.RequestReason, params.SupersedesID))
+			params.RequestedBy, params.RequestReason, params.SupersedesID, params.LimitKind))
 		return scanErr
 	})
 	if err != nil {

@@ -71,6 +71,8 @@ type SecretPolicyVersion struct {
 
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency token (migration 000007).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ApplicableSecretPolicyVersion is a SecretPolicyVersion enriched with
@@ -111,6 +113,8 @@ type SecretLease struct {
 
 	CorrelationID string    `json:"correlation_id"`
 	CreatedAt     time.Time `json:"created_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000007).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // SharedSecretException is one registered, evidence-backed, time-boxed
@@ -146,6 +150,8 @@ type SharedSecretException struct {
 	CreatedAt time.Time  `json:"created_at"`
 	RevokedAt *time.Time `json:"revoked_at"`
 	RevokedBy *string    `json:"revoked_by"`
+	// RecordVersion is the optimistic-concurrency token (migration 000007).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // DueRotation is one rotation due now: a scheduled secret policy version
@@ -340,6 +346,10 @@ var ErrSharedSecretExceptionExpired = errorString("shared secret exception expir
 // ErrRotationScheduleNotFound is returned when a secret_policy_version has
 // no rotation schedule row.
 var ErrRotationScheduleNotFound = errorString("rotation schedule not found")
+
+// ErrVersionConflict is returned when an If-Match header specifies a record_version
+// that no longer matches the current aggregate version.
+var ErrVersionConflict = errorString("version conflict: the object has been modified since the expected version")
 
 type errorString string
 
