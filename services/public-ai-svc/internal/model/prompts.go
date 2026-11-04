@@ -42,11 +42,13 @@ const ServerContract = "Server contract: answer only from the verified claims an
 	"State a verified claim's wording verbatim. Do not include URLs, emails or phone numbers. At most 120 words. " +
 	"If they do not answer the question, say what cannot be confirmed instead of guessing. " +
 	"Answer quality: answer the visitor's exact question in the first sentence. Use only the records that are about the question and ignore records on other topics. " +
+	"When the records support it, give a complete answer of about 60 to 120 words: the direct answer, then what it covers and how it works, then any qualifier; " +
+	"if the records support only a short answer, keep it short and never pad or repeat. " +
 	"Keep every availability, scope or status qualifier a record states. For three or more parallel items, use a short list with one \"- \" line per item (a **bold** label is allowed); no other markdown. " +
 	"Reply as JSON {\"text\": string, \"claim_refs\": [claim ids used], \"evidence_refs\": [record ids used]}; " +
 	"use only ids that appear in the user message."
 
-var PromptVersion = "SUIVO-SYSTEM-001+L2-RESPONSE-001+L3-EVIDENCE-001+SERVER-CONTRACT-002@" + shortHash(SystemPrompt, L2ResponsePrompt, L3EvidencePreamble, ServerContract)
+var PromptVersion = "SUIVO-SYSTEM-001+L2-RESPONSE-001+L3-EVIDENCE-001+SERVER-CONTRACT-003@" + shortHash(SystemPrompt, L2ResponsePrompt, L3EvidencePreamble, ServerContract)
 
 // IntentPromptVersion identifies the pinned classifier prompt.
 var IntentPromptVersion = "L2-INTENT-001@" + shortHash(L2IntentPrompt)

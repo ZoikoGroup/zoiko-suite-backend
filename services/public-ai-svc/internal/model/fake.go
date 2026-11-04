@@ -67,9 +67,11 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 			d.ClaimRefs = append(d.ClaimRefs, c.Ref)
 		}
 	} else if len(req.Evidence) > 0 {
-		// Extractive answer from the best-ranked evidence only (evidence
-		// arrives in rank order): up to two sentences that share words with
-		// the question, in document order, else the section's first sentence.
+		// Extractive answer (evidence arrives in rank order). Doc 01 §12 / Doc
+		// 02 §16: a direct answer of up to answerWords before "expand": the
+		// best passage's sentences that share words with the question (best
+		// first, shown in document order), else its first sentence; then, while
+		// under budget, the rest of that passage and closely related passages.
 		q := queryWords(req.Message)
 		top := req.Evidence[0]
 		var sentences, headings []string
@@ -102,11 +104,13 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 		}
 		sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
 		var picked []cand
+		used := 0
 		for _, c := range cands {
-			if len(picked) == 2 || c.score == 0 {
+			if c.score == 0 || (len(picked) > 0 && used+wordCount(c.s) > answerWords) {
 				break
 			}
 			picked = append(picked, c)
+			used += wordCount(c.s)
 		}
 		if len(picked) == 0 && len(cands) > 0 {
 			picked = append(picked, cand{sentences[0], 0, 0})
@@ -129,6 +133,25 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 				picked = append(picked, cand{s, 0, j})
 			}
 		}
+		// Under budget: the rest of the best passage, in reading order, gives
+		// the answer its context (Doc 02 §16 status and qualifiers).
+		used = 0
+		for _, c := range picked {
+			used += wordCount(c.s)
+		}
+		for j, s := range sentences {
+			if len(picked) == 0 || used >= fillWords {
+				break
+			}
+			kept := false
+			for _, c := range picked {
+				kept = kept || c.order == j
+			}
+			if !kept && used+wordCount(s) <= answerWords {
+				picked = append(picked, cand{s, 0, j})
+				used += wordCount(s)
+			}
+		}
 		sort.Slice(picked, func(i, j int) bool { return picked[i].order < picked[j].order })
 		focused := false
 		for _, c := range picked {
@@ -138,14 +161,23 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 		}
 		if len(parts) > 0 {
 			d.EvidenceRefs = append(d.EvidenceRefs, top.Ref)
-			// The next section of the same article adds its opening sentence,
-			// so a one-section answer is not cut short (not when the answer
-			// was narrowed to what the visitor asked about).
-			if next := req.Evidence[1:]; !focused && len(next) > 0 && next[0].SourceID != "" && next[0].SourceID == top.SourceID {
-				if s := passageText(next[0].Text); s != "" && !strings.Contains(d.Text+strings.Join(parts, " "), s) {
-					parts = append(parts, s)
-					d.EvidenceRefs = append(d.EvidenceRefs, next[0].Ref)
+			// Still under budget: further sections of the same article add
+			// their text in rank order, so a one-section answer is not cut
+			// short. Other articles never join (one answer, one article; not
+			// when the answer was narrowed to what was asked).
+			for _, ev := range req.Evidence[1:] {
+				if focused || wordCount(strings.Join(parts, " ")) >= fillWords {
+					break
 				}
+				if ev.SourceID == "" || ev.SourceID != top.SourceID {
+					continue
+				}
+				t := passageText(ev.Text)
+				if t == "" || strings.Contains(strings.Join(parts, " "), t) || wordCount(strings.Join(parts, " "))+wordCount(t) > answerWords {
+					continue
+				}
+				parts = append(parts, t)
+				d.EvidenceRefs = append(d.EvidenceRefs, ev.Ref)
 			}
 		}
 	}
@@ -258,6 +290,15 @@ func joinParts(parts []string) string {
 	}
 	return b.String()
 }
+
+// answerWords is Doc 01 §12's default answer length before "expand";
+// fillWords is where adding context stops.
+const (
+	answerWords = 110
+	fillWords   = 80
+)
+
+func wordCount(s string) int { return len(strings.Fields(s)) }
 
 // shortPassage is the most sentences a passage may have to be used whole.
 const shortPassage = 3
