@@ -55,7 +55,9 @@ func loadOpenAPI(t *testing.T) openAPIDoc {
 // registeredRoutes returns every METHOD + chi pattern the router serves.
 func registeredRoutes(t *testing.T) map[string]bool {
 	t.Helper()
-	mux, ok := newRouter(&stubSvc{}).(*chi.Mux)
+	// The party routes are mounted only for a service that offers parties, so the router under test is built with
+	// one: a spec path with no route, or a route with no spec path, is then caught for parties like the rest.
+	mux, ok := newPartyRouter(&partySvc{}).(*chi.Mux)
 	if !ok {
 		t.Fatal("router is not a *chi.Mux")
 	}
@@ -197,11 +199,11 @@ func TestOpenAPI_NamesEveryORGOperation(t *testing.T) {
 		"getTenantDefaults",          // GetTenantDefaults
 
 		// ORG-03 commands and reads.
-		"createEntity",           // CreateLegalEntity
+		"createLegalEntity",       // CreateLegalEntity
 		"amendLegalProfile",      // AmendLegalProfile
 		"changeRegisteredOffice", // ChangeRegisteredOffice
 		"changeLegalName",        // ChangeLegalName
-		"transitionEntityStatus", // DeactivateLegalEntity
+		"deactivateLegalEntity",   // DeactivateLegalEntity: POST /v1/entities/{id}/status
 		"getEntity",              // GetLegalEntity
 		"findByRegistryNumber",   // FindByRegistryNumber
 		"listEntityVersions",     // ListEntityVersions

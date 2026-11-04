@@ -251,7 +251,13 @@ type TransitionCommand struct {
 	// Outcome is the review's conclusion for CommandReviewSuspension:
 	// SuspensionUpheld or SuspensionOverturned.
 	Outcome string
-	Meta    EventMeta
+	// SupersedesVersionID names the active version an accounting activation
+	// replaces. An accounting policy never replaces its predecessor silently.
+	SupersedesVersionID string
+	// BreakGlassSessionID is the emergency session an emergency suspension was
+	// made under, recorded on its event.
+	BreakGlassSessionID string
+	Meta                EventMeta
 }
 
 // Lifecycle commands (GOV-05 commands). Supersession is not a command of its

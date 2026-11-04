@@ -19,7 +19,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go.uber.org/zap"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -56,6 +58,10 @@ func main() {
 		err = setFlag(ctx, os.Args[2:])
 	case "manifest":
 		err = manifest(ctx, os.Args[2:])
+	case "audit":
+		err = audit(ctx, os.Args[2:])
+	case "dlq-replay":
+		err = dlqReplay(ctx, os.Args[2:])
 	default:
 		usage()
 	}
@@ -66,7 +72,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest|audit|dlq-replay [flags]")
 	os.Exit(2)
 }
 
@@ -105,8 +111,9 @@ func buildKB(args []string) error {
 	// Drafts are admitted only for local/dev builds (KB_ALLOW_DRAFT=true with
 	// PUBLIC_AI_ENVIRONMENT dev or test); any other build with a draft fails.
 	env := envOr("PUBLIC_AI_ENVIRONMENT", "dev")
-	allowDraft := os.Getenv("KB_ALLOW_DRAFT") == "true" && (env == "dev" || env == "test")
-	manifest, sig, reports, err := release.BuildKBWith(*in, *id, time.Now(), key, knowledge.IngestOptions{AllowDraft: allowDraft})
+	devLike := env == "dev" || env == "test"
+	allowDraft := os.Getenv("KB_ALLOW_DRAFT") == "true" && devLike
+	manifest, sig, reports, err := release.BuildKBWith(*in, *id, time.Now(), key, knowledge.IngestOptions{AllowDraft: allowDraft, AllowSynthetic: devLike})
 	for _, r := range reports {
 		fmt.Printf("%-30s %-24s %-20s %s\n", r.File, r.SourceID, r.State, r.Reason)
 	}
@@ -133,7 +140,9 @@ func buildClaims(args []string) error {
 	if err != nil {
 		return err
 	}
-	manifest, sig, err := release.BuildClaims(*in, *id, time.Now(), key)
+	env := envOr("PUBLIC_AI_ENVIRONMENT", "dev")
+	devLike := env == "dev" || env == "test"
+	manifest, sig, err := release.BuildClaimsWith(*in, *id, time.Now(), key, release.ClaimsOptions{AllowSynthetic: devLike})
 	if err != nil {
 		return err
 	}
@@ -163,6 +172,7 @@ func publish(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("publish", flag.ExitOnError)
 	file := fs.String("file", "", "signed release file")
 	andPromote := fs.Bool("promote", false, "also promote the release")
+	op, eval, rollback := operatorFlags(fs)
 	_ = fs.Parse(args)
 	f, manifest, sig, err := signing.ReadFile(*file)
 	if err != nil {
@@ -177,7 +187,7 @@ func publish(ctx context.Context, args []string) error {
 	}
 	fmt.Println("published", f.Kind, f.ReleaseID)
 	if *andPromote {
-		return doPromote(ctx, st, f.Kind, f.ReleaseID)
+		return doPromote(ctx, st, f.Kind, f.ReleaseID, *op(), *eval, *rollback)
 	}
 	return nil
 }
@@ -186,15 +196,30 @@ func promote(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("promote", flag.ExitOnError)
 	kind := fs.String("kind", "", "kb or claims")
 	id := fs.String("id", "", "release id")
+	op, eval, rollback := operatorFlags(fs)
 	_ = fs.Parse(args)
 	st, err := openStore(ctx)
 	if err != nil {
 		return err
 	}
-	return doPromote(ctx, st, *kind, *id)
+	return doPromote(ctx, st, *kind, *id, *op(), *eval, *rollback)
 }
 
-func doPromote(ctx context.Context, st store.Store, kind, id string) error {
+// operatorFlags are the authority every control action records (Doc 06
+// §21, Doc 09 §22): -actor, -approval and -why, plus the evaluation report
+// for a promotion (Doc 03 §10-11) and -rollback to an earlier release.
+func operatorFlags(fs *flag.FlagSet) (func() *release.Operator, *string, *bool) {
+	actor := fs.String("actor", "", "who performs the action (required)")
+	approval := fs.String("approval", "", "approval or change reference (required)")
+	why := fs.String("why", "", "reason for the action")
+	eval := fs.String("eval", "", "evaluation report JSON (verdict, knowledge_release_id); not needed for -rollback")
+	rollback := fs.Bool("rollback", false, "roll back to a release that was already promoted")
+	return func() *release.Operator {
+		return &release.Operator{Actor: *actor, Approval: *approval, Reason: *why, Environment: os.Getenv("PUBLIC_AI_ENVIRONMENT")}
+	}, eval, rollback
+}
+
+func doPromote(ctx context.Context, st store.Store, kind, id string, op release.Operator, evalPath string, rollback bool) error {
 	rel, err := st.GetRelease(ctx, id)
 	if err != nil {
 		return err
@@ -202,14 +227,98 @@ func doPromote(ctx context.Context, st store.Store, kind, id string) error {
 	if err := signing.Verify(os.Getenv("PUBLIC_AI_SIGNING_PUBLIC_KEY"), rel.Manifest, rel.Signature); err != nil {
 		return err
 	}
-	ev, err := events.ReleasePromoted(id, signing.Digest(rel.Manifest), []string{"kbctl"}, time.Now())
+	var ev *release.EvalEvidence
+	if evalPath != "" {
+		b, err := os.ReadFile(evalPath)
+		if err != nil {
+			return err
+		}
+		ev = &release.EvalEvidence{}
+		if err := json.Unmarshal(b, ev); err != nil {
+			return fmt.Errorf("eval report: %w", err)
+		}
+	}
+	// Two distinct approvers, an independent promoter and a passing
+	// evaluation before the pointer moves (Doc 03 §10-11, KB-016, KB-027).
+	if err := release.PromotionGate(kind, id, rel.Manifest, op, ev, rollback); err != nil {
+		return err
+	}
+	approvers, _ := release.Approvers(kind, rel.Manifest)
+	event, err := events.ReleasePromoted(id, signing.Digest(rel.Manifest), approvers, time.Now())
 	if err != nil {
 		return err
 	}
-	if err := release.Promote(ctx, st, kind, id, []store.OutboxEvent{ev}); err != nil {
+	if err := release.PromoteAudited(ctx, st, op, kind, id, []store.OutboxEvent{event}); err != nil {
 		return err
 	}
-	fmt.Println("promoted", kind, id)
+	fmt.Println("promoted", kind, id, "by", op.Actor)
+	return nil
+}
+
+// dlqReplay re-publishes dead-lettered events after rechecking each one
+// (Doc 05 CT-042): authorization, envelope and allowlisted fields, and
+// freshness against the active releases, flags and revocation ledger. The
+// input file holds one CloudEvents JSON envelope per line. The replay is
+// recorded in the control audit before anything is published.
+func dlqReplay(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("dlq-replay", flag.ExitOnError)
+	file := fs.String("file", "", "file with one dead-lettered envelope per line")
+	op, _, _ := operatorFlags(fs)
+	_ = fs.Parse(args)
+	raw, err := os.ReadFile(*file)
+	if err != nil {
+		return err
+	}
+	var envelopes [][]byte
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			envelopes = append(envelopes, []byte(line))
+		}
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return err
+	}
+	o := op()
+	if err := st.AppendAudit(ctx, store.AuditEntry{Action: "dlq.replay", Target: *file, Actor: o.Actor, Approval: o.Approval,
+		Reason: o.Reason, AfterHash: store.Hash(raw), Environment: o.Environment, At: time.Now().UTC()}); err != nil {
+		return fmt.Errorf("control audit: %w", err)
+	}
+	logger, _ := zap.NewProduction()
+	var pub events.Publisher = events.LogPublisher{Log: logger}
+	if brokers := os.Getenv("PUBLIC_AI_KAFKA_BROKERS"); brokers != "" {
+		k := events.NewKafkaPublisher(strings.Split(brokers, ","))
+		defer k.Close() //nolint:errcheck
+		pub = k
+	}
+	rep, err := (&events.Replayer{Store: st, Pub: pub}).Replay(ctx, events.ReplayAuth{Actor: o.Actor, Approval: o.Approval}, envelopes)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("replayed %d, rejected %d\n", len(rep.Replayed), len(rep.Rejected))
+	for _, r := range rep.Rejected {
+		fmt.Printf("  rejected %s: %s\n", r.EventID, r.Reason)
+	}
+	return nil
+}
+
+// audit prints the newest control-audit entries (Doc 06 §21).
+func audit(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("audit", flag.ExitOnError)
+	limit := fs.Int("n", 20, "number of entries")
+	_ = fs.Parse(args)
+	st, err := openStore(ctx)
+	if err != nil {
+		return err
+	}
+	entries, err := st.ListAudit(ctx, *limit)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		fmt.Printf("%s %-18s %-30s actor=%s approval=%s reason=%q before=%.12s after=%.12s env=%s\n",
+			e.At.UTC().Format(time.RFC3339), e.Action, e.Target, e.Actor, e.Approval, e.Reason, e.BeforeHash, e.AfterHash, e.Environment)
+	}
 	return nil
 }
 
@@ -218,6 +327,7 @@ func revoke(ctx context.Context, args []string) error {
 	kind := fs.String("kind", "", "source or claim")
 	id := fs.String("id", "", "source id, source version id or claim id")
 	reason := fs.String("reason", "", "reason code")
+	op, _, _ := operatorFlags(fs)
 	_ = fs.Parse(args)
 	st, err := openStore(ctx)
 	if err != nil {
@@ -231,7 +341,7 @@ func revoke(ctx context.Context, args []string) error {
 		}
 		evs = append(evs, ev)
 	}
-	wm, err := release.Revoke(ctx, st, *kind, *id, *reason, evs)
+	wm, err := release.RevokeAudited(ctx, st, *op(), *kind, *id, *reason, evs)
 	if err != nil {
 		return err
 	}

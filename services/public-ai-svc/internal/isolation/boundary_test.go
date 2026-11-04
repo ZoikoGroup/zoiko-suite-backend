@@ -23,7 +23,7 @@ func TestT12_NoRouteToPrivateSystems(t *testing.T) {
 		"SigningPublicKey": true, "SigningKey": true, // release signatures, not access to other systems
 		"LogRawPrompt": true, // a refused switch, not a route
 		// Model token budgets, not access tokens.
-		"TokenBudgetPerTurn": true, "DailyTokenCeiling": true, "MonthlyTokenCeiling": true,
+		"TokenBudgetPerTurn": true, "DailyTokenCeiling": true, "MonthlyTokenCeiling": true, "SessionTokenCap": true,
 		// The approved model provider's key: egress to Groq only, not a private ZoikoSuite system.
 		"GroqAPIKey": true,
 	}

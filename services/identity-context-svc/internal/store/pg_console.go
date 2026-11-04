@@ -443,7 +443,9 @@ func (s *PgStore) GetIdentitySummary(ctx context.Context, tenantID string) (*Ide
 			{`SELECT COUNT(*) FROM password_reset_requests WHERE tenant_id = $1 AND status = 'PENDING_APPROVAL' AND expires_at > NOW()`, &out.PasswordResetsPending},
 			{`SELECT COUNT(*) FROM authentication_events WHERE tenant_id = $1 AND outcome = 'FAILURE' AND occurred_at > NOW() - INTERVAL '24 hours'`, &out.FailedSignIns24h},
 			{`SELECT COUNT(*) FROM authentication_events WHERE tenant_id = $1 AND event_type = 'LOGIN' AND outcome = 'SUCCESS' AND occurred_at > NOW() - INTERVAL '24 hours'`, &out.SuccessfulSignIns24h},
-			{`SELECT COUNT(*) FROM identity_merges WHERE tenant_id = $1`, &out.MergedIdentities},
+			// Both merge routes: /v1/subjects (identity_merges) and /v1/identities (principal_merges).
+			{`SELECT (SELECT COUNT(*) FROM identity_merges WHERE tenant_id = $1)
+			       + (SELECT COUNT(*) FROM principal_merges WHERE tenant_id = $1)`, &out.MergedIdentities},
 		}
 		for _, c := range counts {
 			if err := tx.QueryRow(ctx, c.sql, tenantID).Scan(c.dst); err != nil {

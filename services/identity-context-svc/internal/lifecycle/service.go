@@ -45,8 +45,14 @@ type Store interface {
 	CompleteResetRequestTx(ctx context.Context, tx pgx.Tx, requestID string) error
 	InsertCredentialTokenTx(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error
 	FindActiveCredentialByEmail(ctx context.Context, email, tenantID string) (*domain.Principal, *domain.PrincipalCredential, error)
+	// MergeSubjects backs Merge (POST /v1/subjects/{id}/merge: If-Match and
+	// step-up); MergeIdentities backs MergeDuplicate (POST
+	// /v1/identities/{id}/merge: idempotent). Each refuses a duplicate the
+	// other has already merged away.
 	MergeSubjects(ctx context.Context, tenantID, survivorID, duplicateID, actor, reason, correlationID string,
 		duplicateVersion int64, recs ...outbox.Record) (*store.MergeResult, error)
+	MergeIdentities(ctx context.Context, tenantID, survivorID, duplicateID, reason, actor, correlationID string,
+		build func(m store.IdentityMerge) ([]outbox.Record, error)) (*store.IdentityMerge, bool, error)
 }
 
 // SessionEnder ends every session a principal holds (login sessions, their
@@ -599,4 +605,48 @@ func (s *Service) Merge(ctx context.Context, a Actor, survivorID, duplicateID, r
 		}
 	}
 	return res, nil
+}
+
+// MergeDuplicate merges duplicateID into survivorID (ORG-01 MergeDuplicateIdentity). The survivor keeps its id;
+// the duplicate keeps its row, disabled, and its id becomes an alias that is never issued again. Its provider
+// links move to the survivor, every session it held ends, and identity.subject.merged tells the holders of its
+// role assignments and delegations (authorization-svc) to re-point them: this service does not own those.
+//
+// Idempotent: the second identical call returns the recorded merge with created=false and ends nothing.
+// The actor may be neither identity (an administrator does not merge their own account), which is the recovery
+// separation: nobody approves their own identity recovery.
+func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, duplicateID, reason string) (*store.IdentityMerge, bool, error) {
+	survivorID, duplicateID, reason = strings.TrimSpace(survivorID), strings.TrimSpace(duplicateID), strings.TrimSpace(reason)
+	switch {
+	case survivorID == "" || duplicateID == "":
+		return nil, false, fmt.Errorf("%w: a survivor and a duplicate are required", ErrInvalid)
+	case survivorID == duplicateID:
+		return nil, false, fmt.Errorf("%w: an identity cannot be merged into itself", ErrInvalid)
+	case reason == "":
+		return nil, false, fmt.Errorf("%w: a reason is required", ErrInvalid)
+	case a.PrincipalID == survivorID || a.PrincipalID == duplicateID:
+		return nil, false, fmt.Errorf("%w: you cannot merge your own identity", ErrForbidden)
+	}
+	m, created, err := s.store.MergeIdentities(ctx, a.TenantID, survivorID, duplicateID, reason, a.PrincipalID, a.CorrelationID,
+		func(m store.IdentityMerge) ([]outbox.Record, error) {
+			rec, err := events.Render(events.EventSubjectMerged, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,
+				map[string]any{"merge_id": m.MergeID, "tenant_id": m.TenantID, "survivor_id": m.SurvivorID,
+					"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": m.Reason, "link_outcomes": m.LinkOutcomes,
+					"merged_at": m.MergedAt, "correlation_id": a.CorrelationID})
+			return []outbox.Record{rec}, err
+		})
+	switch {
+	case errors.Is(err, store.ErrMergeConflict):
+		return nil, false, fmt.Errorf("%w: %v", ErrConflict, err)
+	case errors.Is(err, domain.ErrPrincipalNotFound):
+		return nil, false, fmt.Errorf("%w: %v", ErrNotFound, err)
+	case err != nil:
+		return nil, false, err
+	}
+	if created && s.end != nil {
+		if _, err := s.end(ctx, a.TenantID, duplicateID, domain.SessionEndMerged, a.PrincipalID, a.CorrelationID); err != nil {
+			s.log.Error("sessions not ended after a merge", zap.String("principal_id", duplicateID), zap.Error(err))
+		}
+	}
+	return m, created, nil
 }

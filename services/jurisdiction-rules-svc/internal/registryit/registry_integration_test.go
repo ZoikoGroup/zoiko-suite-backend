@@ -112,15 +112,35 @@ func TestMain(m *testing.M) {
 
 type spyPub struct {
 	events.Publisher
-	mu   sync.Mutex
-	seen []string
+	mu       sync.Mutex
+	seen     []string
+	payloads []seenEvent
 }
 
-func (p *spyPub) PublishRegistryEvent(_ context.Context, t, _, _, _ string, _ map[string]any) error {
+type seenEvent struct {
+	type_   string
+	payload map[string]any
+}
+
+func (p *spyPub) PublishRegistryEvent(_ context.Context, t, _, _, _ string, payload map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.seen = append(p.seen, t)
+	p.payloads = append(p.payloads, seenEvent{t, payload})
 	return nil
+}
+
+// payloadsOf are the payloads of every event of a type, in order.
+func (p *spyPub) payloadsOf(t string) []map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []map[string]any
+	for _, e := range p.payloads {
+		if e.type_ == t {
+			out = append(out, e.payload)
+		}
+	}
+	return out
 }
 func (p *spyPub) count(t string) int {
 	p.mu.Lock()

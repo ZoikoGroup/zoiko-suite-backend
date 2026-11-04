@@ -114,6 +114,26 @@ func (m Manifest) HasDraft() bool {
 	return false
 }
 
+// HasSynthetic reports whether the release carries any synthetic data. A
+// synthetic runtime refuses such a release unless local/dev explicitly
+// allows it.
+func (m Manifest) HasSynthetic() bool {
+	if m.Synthetic {
+		return true
+	}
+	for _, s := range m.Sources {
+		if s.Synthetic {
+			return true
+		}
+	}
+	for _, r := range m.Routes {
+		if r.Synthetic {
+			return true
+		}
+	}
+	return false
+}
+
 // Validate checks a manifest's internal consistency before it is signed or
 // served (KB-008, A14): every chunk must belong to a listed, approved,
 // PUBLIC_APPROVED source and carry the same labels; no orphan chunks.
@@ -136,8 +156,33 @@ func (m Manifest) Validate() error {
 		if c.Classification != s.Classification || c.Audience != s.Audience || c.ReleaseID != m.ReleaseID {
 			return fmt.Errorf("chunk %s lost its parent labels", c.ChunkID)
 		}
+		// KB-008: a chunk keeps its parent's authority tier and market scope,
+		// and its text matches its checksum.
+		if c.AuthorityTier != s.AuthorityTier || !sameSet(c.MarketCodes, s.MarketCodes) {
+			return fmt.Errorf("chunk %s changed its parent's tier or market scope", c.ChunkID)
+		}
+		if c.TextSHA256 != sha256Hex(c.PlainText) {
+			return fmt.Errorf("chunk %s text does not match its checksum", c.ChunkID)
+		}
 	}
 	return nil
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[string]int{}
+	for _, x := range a {
+		seen[x]++
+	}
+	for _, x := range b {
+		if seen[x] == 0 {
+			return false
+		}
+		seen[x]--
+	}
+	return true
 }
 
 // HeadingPrefix marks the start of a section inside chunk text. Retrieval and
@@ -161,4 +206,9 @@ type Manifest struct {
 	// Synonyms is the signed alias lexicon (Doc 03 §13), e.g. "ar" →
 	// "accounts receivable". Keys are lower-case visitor words.
 	Synonyms map[string][]string `json:"synonyms,omitempty"`
+	// Synthetic marks the whole release as test/dev data.
+	Synthetic bool `json:"synthetic,omitempty"`
+	// CompatiblePolicyVersions lists the prompt/policy versions this release
+	// was evaluated with (Doc 08 OPR-004); the runtime refuses any other.
+	CompatiblePolicyVersions []string `json:"compatible_policy_versions,omitempty"`
 }

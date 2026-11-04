@@ -104,8 +104,10 @@ const (
 	EventSubjectCreated  = "identity.subject.created"
 	EventSubjectDisabled = "identity.subject.disabled"
 	EventSubjectEnabled  = "identity.subject.enabled"
-	// EventSubjectMerged: a duplicate subject was retired into its survivor
-	// (ORG-1). authorization-svc re-points the duplicate's assignments.
+	// EventSubjectMerged: a duplicate identity was merged into a survivor
+	// (ORG-1), by POST /v1/subjects/{id}/merge or POST /v1/identities/{id}/merge.
+	// Consumers re-point what they hold for the duplicate (role assignments,
+	// delegations) to the survivor; the duplicate id is never reused.
 	EventSubjectMerged     = "identity.subject.merged"
 	EventSCIMSyncCompleted = "identity.scim_sync.completed"
 

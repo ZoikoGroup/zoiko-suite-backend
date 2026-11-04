@@ -37,6 +37,7 @@ const (
 	SessionEndDeprovisioned   = "DEPROVISIONED"
 	SessionEndPasswordChanged = "PASSWORD_CHANGED"
 	SessionEndAdminRevoke     = "ADMIN_REVOKE"
+	SessionEndMerged          = "IDENTITY_MERGED"
 	SessionEndPrincipalStatus = "PRINCIPAL_STATUS_CHANGED"
 )
 

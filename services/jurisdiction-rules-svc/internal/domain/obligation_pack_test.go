@@ -20,7 +20,7 @@ func obligationPackInput() CompileInput {
 	in.Calendars = []CompileCalendar{{
 		CalendarVersion: CalendarVersion{CalendarVersionID: "11111111-1111-1111-1111-111111111111", CalendarCode: "gb-hmrc", Version: 1,
 			EffectiveFrom: d(2026, 1, 1), Timezone: "Europe/London", WeekendDays: []int{0, 6},
-			Holidays: []Holiday{{"2026-11-09", "Authority closure"}}, SourceIDs: []string{"s-1"}},
+			Holidays: []Holiday{{Date: "2026-11-09", Name: "Authority closure"}}, SourceIDs: []string{"s-1"}},
 		JurisdictionID: "j-gb", Published: true}}
 	r := vatRule()
 	r.ObligationRuleID = "22222222-2222-2222-2222-222222222222"
@@ -45,7 +45,7 @@ func TestCompile_CalendarAndObligationModulesAloneMakeAPack(t *testing.T) {
 	// Reproducible: same inputs, same digest; any change to a holiday changes it.
 	assert.Equal(t, out.ArtifactDigest, Compile(obligationPackInput()).ArtifactDigest)
 	in := obligationPackInput()
-	in.Calendars[0].Holidays = append(in.Calendars[0].Holidays, Holiday{"2026-12-24", "Extra"})
+	in.Calendars[0].Holidays = append(in.Calendars[0].Holidays, Holiday{Date: "2026-12-24", Name: "Extra"})
 	assert.NotEqual(t, out.ArtifactDigest, Compile(in).ArtifactDigest)
 
 	// The artifact alone is enough to calculate a due date.

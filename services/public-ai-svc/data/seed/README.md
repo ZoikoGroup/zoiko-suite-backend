@@ -6,7 +6,7 @@ Every record here has `"synthetic": true`. None of it is ZoikoSuite fact.
   (10 modules in 4 domains: Finance, Workforce, Tax/Legal/Compliance, Commercial) and synonyms.
 - `kb/sources/`: 10 approved sources with two passages each (20 evidence passages). Passages
   carry no figures: prices, trial lengths and statuses live only in typed claims.
-- `claims.json`: plan availability, placeholder prices (`[price]`) and trials (`[N] days`) for
+- `claims.json`: plan availability, prices in the ISO 4217 test currency (`XTS`, never a real price) and 14-day trials for
   Starter, Growth and Enterprise in US and GB. The **GB trials are deliberately expired** so the
   assistant must abstain on them. SOC 2 is on HOLD (never claimed); two integration statuses.
 
@@ -14,3 +14,6 @@ Local dev mode serves this dataset by default (`PUBLIC_AI_DATASET=seed`). The un
 document acceptance suites keep using `testdata/fixtures`; `internal/acceptance/seed_test.go`
 runs the T1-T12 scenarios on this seed. Real content is loaded only through `kbctl` with signed
 approvals.
+
+A claim whose wording still has a blank such as `[price]`, `[N]` or `{{plan}}` is never answered:
+the resolver treats it as incomplete and the assistant points to the official pricing page instead.

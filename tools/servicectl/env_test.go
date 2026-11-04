@@ -105,7 +105,7 @@ func TestLoadGlobalEnvDoesNotExpand(t *testing.T) {
 }
 
 // PORT is the dangerous one: a stray PORT in the operator's shell would be
-// handed to all 86 services, and 85 would fail to bind with no obvious cause.
+// handed to all 87 services, and 85 would fail to bind with no obvious cause.
 func TestManagedKeysAreNotInherited(t *testing.T) {
 	t.Setenv("PORT", "9999")
 	t.Setenv("DB_NAME", "wrong_database")

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/otel"
@@ -192,6 +193,7 @@ func AccessLog(log *zap.Logger) func(http.Handler) http.Handler {
 			if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
 				route = rc.RoutePattern()
 			}
+			metrics.ObserveHTTP(route, r.Method, rec.status, time.Since(start))
 			log.Info("http_request",
 				zap.String("request_id", w.Header().Get("X-Request-ID")),
 				zap.String("trace_id", TraceID(r.Header.Get("traceparent"))),

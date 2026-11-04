@@ -104,6 +104,12 @@ type Handler struct {
 	// Nil answers 501 for those routes.
 	console ConsoleReader
 	cursors *apicontract.CursorSigner
+
+	// identity backs the ORG-01 reads under /v1/identities. Nil answers 501.
+	identity IdentityReader
+
+	// merger backs POST /v1/identities/{id}/merge. Nil answers 501.
+	merger IdentityMerger
 }
 
 // StatusChanger changes a principal's status as one governed command: the
@@ -453,6 +459,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/password-resets/{resetID}", h.GetReset)
 		// The Password resets register (console read model).
 		r.Get("/password-resets", h.ListPasswordResets)
+
+		// ── ORG-01 identity surface (handler_identity.go) ────────────────────
+		// The same spec operations as /subjects above, over the
+		// assurance-observation and filtered authentication-event read models.
+		// Both merge routes share one alias ledger check (store.mergedAway).
+		r.Get("/identities/{principalID}", h.GetIdentity)
+		r.Get("/identities/{principalID}/links", h.ListIdentityProviderLinks)
+		r.Get("/identities/{principalID}/assurance-history", h.GetIdentityAssuranceHistory)
+		r.Get("/identities/{principalID}/authentication-events", h.ListIdentityAuthenticationEvents)
+		r.Post("/identities/{principalID}/merge", h.MergeIdentity)
 	})
 }
 

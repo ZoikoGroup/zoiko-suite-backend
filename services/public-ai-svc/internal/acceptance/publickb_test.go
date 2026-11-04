@@ -377,3 +377,24 @@ func TestK14_RegionalCoverageAndBillingFollowUp(t *testing.T) {
 		t.Fatalf("regional coverage: %s %+v", r.Reason, r.Suggestions)
 	}
 }
+
+// Doc 09 §12: data-rights requests are route-only and claim no action.
+func TestDataRightsRequestsRouteOnly(t *testing.T) {
+	k := newKB(t)
+	for _, q := range []string{"Please delete my data", "I want to export my personal data", "This is a subject access request", "Right to be forgotten please"} {
+		r := k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: q, Locale: "en-US"})
+		if r.Status != contract.Handoff || r.Reason != contract.ReasonRouteOnly || !strings.Contains(r.Text, "Nothing has been recorded, exported or deleted") {
+			t.Fatalf("%q: %s %s %q", q, r.Status, r.Reason, r.Text)
+		}
+	}
+}
+
+// Doc 10 §21: contact details are masked, the question is still answered,
+// and the reply says they were not kept.
+func TestContactDetailsNotKept(t *testing.T) {
+	k := newKB(t)
+	r := k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: "What does Legal and Contracts do? my email is jane.roe@example.com", Locale: "en-US"})
+	if r.Status != contract.Answered || !strings.Contains(r.Text, "I didn't keep the contact details") || strings.Contains(r.Text, "jane.roe") {
+		t.Fatalf("contact masking: %s %q", r.Status, r.Text)
+	}
+}

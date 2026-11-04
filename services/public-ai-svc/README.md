@@ -21,7 +21,24 @@ TEST-ONLY synthetic data, and the blockers in "Open decisions" below need named 
 
 ```bash
 cd services/public-ai-svc
-PUBLIC_AI_ENABLED=true go run ./cmd/server          # PowerShell: $env:PUBLIC_AI_ENABLED='true'; go run ./cmd/server
+PUBLIC_AI_ENABLED=true PUBLIC_AI_ENVIRONMENT=dev go run ./cmd/server
+```
+
+PowerShell (Windows), in a new terminal:
+
+```powershell
+Set-Location services/public-ai-svc
+$env:PUBLIC_AI_ENABLED = 'true'
+$env:PUBLIC_AI_ENVIRONMENT = 'dev'
+$env:MODEL_PROVIDER = 'mock'
+$env:PUBLIC_AI_DATABASE_URL = ''
+go run ./cmd/server
+```
+
+Or let `servicectl` start it with the same dev/mock environment:
+
+```powershell
+go run ./tools/servicectl start public-ai-svc
 ```
 
 This starts **local dev mode** on `127.0.0.1:8001` (where the console's `ZOIKO_PUBLIC_AI_URL`
@@ -30,7 +47,7 @@ signs it with a throwaway key, publishes it, moves the active release pointers a
 signatures; `/health/ready` is green only after that. Defaults: `PUBLIC_AI_DATASET=public-kb` (the
 public articles in [data/public-kb](data/public-kb/README.md), served as drafts with
 `KB_ALLOW_DRAFT=true`, plus synthetic claims; `seed` is the older synthetic set), `MODEL_PROVIDER=mock` (deterministic,
-extractive, no tools; the only provider in this build, dev/test only). Then:
+extractive, no tools, dev/test only; set `MODEL_PROVIDER=groq` for the remote provider). Then:
 
 ```bash
 curl -s -X POST localhost:8001/public-ai/v1/sessions -H "Origin: http://localhost:3000" \
@@ -47,15 +64,27 @@ curl -s -X POST localhost:8001/public-ai/v1/turns -H "Origin: http://localhost:3
   -d '{"schema_version":"1.0","session_id":"<session_id>","client_turn_id":"11111111-1111-4111-8111-111111111111","message":"How much is the Growth plan per month in the United States?"}'
 ```
 
-Expected: `"status":"ANSWERED"`, the synthetic Growth price statements with `[price]` placeholders,
+Expected: `"status":"ANSWERED"`, the synthetic Growth price statements in the test currency `XTS`,
 `"market_code":"US"`, a citation and a `pricing` action. Each turn writes one dev-only
 `turn diagnostics` log line (request_id, stage, reason; never the message).
 
 ### Use Groq instead of the mock model
 
 ```bash
-# PowerShell: $env:MODEL_PROVIDER='groq'; $env:GROQ_API_KEY='<your key>'; $env:PUBLIC_AI_MODEL_TIMEOUT='15s'
-MODEL_PROVIDER=groq GROQ_API_KEY=<your key> PUBLIC_AI_MODEL_TIMEOUT=15s PUBLIC_AI_ENABLED=true go run ./cmd/server
+MODEL_PROVIDER=groq GROQ_API_KEY=<your key> PUBLIC_AI_MODEL_TIMEOUT=15s PUBLIC_AI_ENABLED=true PUBLIC_AI_ENVIRONMENT=dev go run ./cmd/server
+```
+
+PowerShell (Windows):
+
+```powershell
+Set-Location services/public-ai-svc
+$env:PUBLIC_AI_ENABLED = 'true'
+$env:PUBLIC_AI_ENVIRONMENT = 'dev'
+$env:MODEL_PROVIDER = 'groq'
+$env:GROQ_API_KEY = '<your key>'
+$env:PUBLIC_AI_MODEL_TIMEOUT = '15s'
+$env:PUBLIC_AI_DATABASE_URL = ''
+go run ./cmd/server
 ```
 
 `GROQ_MODEL` defaults to `openai/gpt-oss-120b`. The key stays on the server and is never logged.
@@ -66,6 +95,9 @@ run in code either way. Check the live path with
 
 With a database, `PUBLIC_AI_SEED_ON_START=true` (dev/test only) runs the same
 migrate → seed → sign and publish → activate sequence against Postgres.
+On startup the service logs `store=memory` or `store=postgres` so the active
+backend is visible. Empty `PUBLIC_AI_DATABASE_URL` is dev/test only: outside
+dev/test the service refuses to start rather than fall back to memory.
 
 ## How an answer is produced
 
@@ -100,7 +132,20 @@ go run ./cmd/kbctl build-kb -in testdata/fixtures/kb -id kb-dev-1 -out kb.releas
 go run ./cmd/kbctl build-claims -in testdata/fixtures/claims.json -id claims-dev-1 -out claims.release.json
 go run ./cmd/kbctl publish -file kb.release.json -promote
 go run ./cmd/kbctl publish -file claims.release.json -promote
-PUBLIC_AI_ENABLED=true go run ./cmd/server
+PUBLIC_AI_ENABLED=true PUBLIC_AI_ENVIRONMENT=dev go run ./cmd/server
+```
+
+PowerShell (Windows), using a local Postgres that exposes port 5432:
+
+```powershell
+Set-Location services/public-ai-svc
+$env:PUBLIC_AI_ENABLED = 'true'
+$env:PUBLIC_AI_ENVIRONMENT = 'dev'
+$env:PUBLIC_AI_DATABASE_URL = 'postgres://public_ai_app:<password>@127.0.0.1:5432/public_ai?sslmode=disable'
+$env:PUBLIC_AI_SIGNING_KEY = '<base64 private key>'
+$env:PUBLIC_AI_SIGNING_PUBLIC_KEY = '<base64 public key>'
+$env:PUBLIC_AI_SEED_ON_START = 'true'   # dev/test only; omit after publishing releases
+go run ./cmd/server
 ```
 
 Operations: `kbctl promote` (also rollback), `kbctl revoke -kind source|claim -id ... -reason ...`,
@@ -130,6 +175,18 @@ go run ./cmd/evalrun -dataset testdata/golden/golden-v1.json -out eval-report.js
 ```
 
 `evalrun` exits 1 on any P0 failure (BLOCK_RELEASE). Coverage map: `docs/suivo/test-traceability.md`. Doc 05 CT-001 to CT-052: `docs/suivo/contract-test-map.md`.
+
+Synthetic canary (Doc 08 §09) against a running service: readiness, config, a cited answer, a
+route-only CTA, an abstention and a private-data refusal. It exits 1 on any failure and its report
+holds outcomes and latencies only, never answer text or the session grant:
+
+```bash
+go run ./cmd/canary -base http://127.0.0.1:8001 -origin http://localhost:3000 -out canary-report.json
+```
+
+Release compatibility (Doc 08 OPR-004): `release.json` and `claims.json` may list
+`compatible_policy_versions`. A release that does not include the running `PUBLIC_AI_POLICY_VERSION`
+is refused at load; outside dev/test a release must declare the list.
 
 ## Open decisions (production blockers)
 

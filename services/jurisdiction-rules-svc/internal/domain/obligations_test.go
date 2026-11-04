@@ -44,7 +44,7 @@ func TestDueDate_IsDerived_AdjustedForWeekendsAndHolidays(t *testing.T) {
 	assert.Contains(t, strings.Join(res.Explanation, "|"), "weekend")
 
 	// JUR-NEG-26: a holiday on the Monday pushes it to Tuesday.
-	cal2 := gbCal(2, d(2026, 1, 1), Holiday{"2026-11-09", "Authority closure"})
+	cal2 := gbCal(2, d(2026, 1, 1), Holiday{Date: "2026-11-09", Name: "Authority closure"})
 	res = CalculateDueDate(r, []CalendarVersion{cal, cal2}, DueFacts{PeriodEnd: "2026-09-30"})
 	assert.Equal(t, "2026-11-10", res.DueDate)
 	assert.Contains(t, strings.Join(res.Explanation, "|"), "Authority closure")
@@ -84,8 +84,8 @@ func TestDueDate_WeekendDefinitionComesFromTheCalendar(t *testing.T) {
 func TestCalendarSelection_IsByEffectiveDate_AndAmendmentsAreNewVersions(t *testing.T) {
 	r := vatRule()
 	v1 := gbCal(1, d(2026, 1, 1))
-	v2 := gbCal(2, d(2026, 1, 1), Holiday{"2026-11-09", "Added later"})
-	v3 := gbCal(3, d(2027, 1, 1), Holiday{"2026-11-09", "Not yet in force"})
+	v2 := gbCal(2, d(2026, 1, 1), Holiday{Date: "2026-11-09", Name: "Added later"})
+	v3 := gbCal(3, d(2027, 1, 1), Holiday{Date: "2026-11-09", Name: "Not yet in force"})
 	assert.Equal(t, 2, pickCalendar([]CalendarVersion{v1, v2, v3}, "gb-hmrc", d(2026, 11, 7)).Version)
 	assert.Equal(t, 3, pickCalendar([]CalendarVersion{v1, v2, v3}, "gb-hmrc", d(2027, 6, 1)).Version)
 	assert.Nil(t, pickCalendar([]CalendarVersion{v1}, "gb-hmrc", d(2025, 12, 31)), "before any version is in force")
@@ -200,7 +200,7 @@ func TestDueDate_InstantUsesTheAuthorityTimeZoneAndCutoff(t *testing.T) {
 }
 
 func TestValidation_RejectsMalformedCalendarsAndRules(t *testing.T) {
-	good := gbCal(1, d(2026, 1, 1), Holiday{"2026-12-25", "Christmas"})
+	good := gbCal(1, d(2026, 1, 1), Holiday{Date: "2026-12-25", Name: "Christmas"})
 	require.NoError(t, ValidateCalendarVersion(good))
 	cut := "25:00"
 	for name, mut := range map[string]func(*CalendarVersion){
@@ -210,9 +210,9 @@ func TestValidation_RejectsMalformedCalendarsAndRules(t *testing.T) {
 		"dup weekend":    func(c *CalendarVersion) { c.WeekendDays = []int{0, 0} },
 		"all weekend":    func(c *CalendarVersion) { c.WeekendDays = []int{0, 1, 2, 3, 4, 5, 6} },
 		"bad cutoff":     func(c *CalendarVersion) { c.CutoffTime = &cut },
-		"bad holiday":    func(c *CalendarVersion) { c.Holidays = []Holiday{{"25-12-2026", "x"}} },
-		"nameless":       func(c *CalendarVersion) { c.Holidays = []Holiday{{"2026-12-25", " "}} },
-		"duplicate date": func(c *CalendarVersion) { c.Holidays = []Holiday{{"2026-12-25", "a"}, {"2026-12-25", "b"}} },
+		"bad holiday":    func(c *CalendarVersion) { c.Holidays = []Holiday{{Date: "25-12-2026", Name: "x"}} },
+		"nameless":       func(c *CalendarVersion) { c.Holidays = []Holiday{{Date: "2026-12-25", Name: " "}} },
+		"duplicate date": func(c *CalendarVersion) { c.Holidays = []Holiday{{Date: "2026-12-25", Name: "a"}, {Date: "2026-12-25", Name: "b"}} },
 	} {
 		c := good
 		mut(&c)

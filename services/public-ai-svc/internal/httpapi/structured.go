@@ -72,16 +72,46 @@ func (s *Server) structure(env *contract.Envelope, market string) {
 			links[l.URLKey] = l
 		}
 	}
+	validCitationCount := 0
 	for i := range env.Citations {
 		c := &env.Citations[i]
-		if l, ok := links[c.URLKey]; ok {
-			c.Title, c.URL = l.Title, l.URL // URL already blank for placeholders
+		// Try to resolve from the route registry (snapshot) by url_key.
+		var url string
+		var routeOk bool
+		if s.deps.Routes != nil {
+			url, routeOk = s.deps.Routes.ResolveRoute(c.URLKey, market)
+		}
+		if routeOk && !knowledge.IsPlaceholderURL(url) {
+			// route found
+			c.RouteKey = c.URLKey
+			c.Title = policy.RouteTitles[c.RouteKey] // display text only
+			c.URL = url
+			validCitationCount++
 			continue
 		}
-		// A claim cites an official route (pricing, trust, integrations).
-		if title, ok := policy.RouteTitles[c.URLKey]; ok {
-			c.Title, c.RouteKey, c.URL = title, c.URLKey, s.routeURL(c.URLKey, market)
+		// fallback to CitationLinks (already have title/URL)
+		if l, ok := links[c.URLKey]; ok {
+			c.Title, c.URL = l.Title, l.URL
+			c.RouteKey = c.URLKey // keep route key for consistency
+			validCitationCount++
+			continue
 		}
+		// fallback to policy.RouteTitles (display title only)
+		if title, ok := policy.RouteTitles[c.URLKey]; ok {
+			c.Title = title
+			c.RouteKey = c.URLKey
+			c.URL = s.routeURL(c.RouteKey, market)
+			validCitationCount++
+			continue
+		}
+		// no entry: drop citation
+		c.Title = ""
+		c.RouteKey = ""
+		c.URL = ""
+	}
+	// If the answer was ANSWERED but no valid citations remain, downgrade to ABSTAIN
+	if validCitationCount == 0 && env.Status == contract.Answered {
+		env.Status = contract.Abstain
 	}
 
 	var ctas []*contract.CTALink

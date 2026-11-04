@@ -353,12 +353,19 @@ components:
 
     SubjectMerged:
       name: identity.subject.merged
-      title: A duplicate subject was retired into its survivor (ORG-1 MergeDuplicateIdentity)
+      title: A duplicate identity was merged into its survivor (ORG-1 MergeDuplicateIdentity)
       summary: |
-        Written to the outbox in the merge transaction, with principal.status.changed
-        and identity.subject.disabled for the duplicate. The duplicate's id is never
-        reissued and resolves to the survivor. authorization-svc reissues the
-        duplicate's live assignments to the survivor and ends the duplicate's.
+        Written to the outbox in the merge transaction. The duplicate is disabled and its
+        id is never reissued; it resolves to the survivor. authorization-svc re-points the
+        role assignments and delegations it holds for duplicate_id to survivor_id. Every
+        session the duplicate held is ended after the commit.
+
+        Two routes make a merge, and the payload says which:
+        - POST /v1/subjects/{id}/merge (If-Match, step-up) also writes
+          principal.status.changed and identity.subject.disabled for the duplicate, and
+          sends principal_id and new_status.
+        - POST /v1/identities/{id}/merge (idempotent) sends merge_id, merged_at and
+          link_outcomes: what it did with each of the duplicate's provider links.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -374,18 +381,35 @@ components:
                     type: string
                   principal_id:
                     type: string
-                    description: The duplicate (the subject whose status changed).
+                    description: The duplicate (the subject whose status changed). /v1/subjects merges only.
                   tenant_id:
                     type: string
                   new_status:
                     type: string
                     enum: [DISABLED]
+                    description: /v1/subjects merges only.
                   actor:
                     type: string
                   reason:
                     type: string
                   correlation_id:
                     type: string
+                  merge_id:
+                    type: string
+                    description: /v1/identities merges only.
+                  merged_at:
+                    type: string
+                    format: date-time
+                    description: /v1/identities merges only.
+                  link_outcomes:
+                    type: array
+                    description: /v1/identities merges only.
+                    items:
+                      type: object
+                      properties:
+                        link_id: { type: string }
+                        issuer: { type: string }
+                        action: { type: string, enum: [MOVED, RETIRED] }
 
     LoginSessionStarted:
       name: identity.login_session.started

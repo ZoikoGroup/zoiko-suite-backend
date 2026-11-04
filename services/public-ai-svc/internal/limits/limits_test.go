@@ -2,9 +2,11 @@ package limits
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
+	"zoiko.io/public-ai-svc/internal/problem"
 	"zoiko.io/public-ai-svc/internal/store"
 )
 
@@ -49,6 +52,16 @@ func TestPerIPLimit(t *testing.T) {
 	w := hit(h, "203.0.113.7", "")
 	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("got %d retry=%q", w.Code, w.Header().Get("Retry-After"))
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content-type = %q", ct)
+	}
+	var p problem.Problem
+	if err := json.Unmarshal(w.Body.Bytes(), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Code != "publicai.rate_limited" || !p.Retryable || p.Status != http.StatusTooManyRequests {
+		t.Fatalf("problem = %+v", p)
 	}
 	if w := hit(h, "203.0.113.8", ""); w.Code != 200 {
 		t.Fatal("another client must not be affected")
@@ -168,5 +181,36 @@ func TestSpendCeilingStopsAnswering(t *testing.T) {
 	}
 	if inner.n != 1 {
 		t.Fatalf("model path called %d times", inner.n)
+	}
+}
+
+// Doc 06 §13: staged throttling on the spend ceilings.
+func TestSpendStages(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	cfg := config.Config{DailyTokenCeiling: 1000, MonthlyTokenCeiling: 100000}
+	g := New(cfg, st, nil)
+	day, month := UsageBuckets(g.now().UTC())
+	for _, c := range []struct {
+		used int64
+		want string
+	}{{0, ""}, {800, orchestrator.BudgetReduced}, {1000, orchestrator.BudgetStatic}} {
+		st.SetUsageForTest(day, c.used)
+		st.SetUsageForTest(month, c.used)
+		if got, failed := g.spendStage(ctx); failed || got != c.want {
+			t.Fatalf("used %d: stage %q failed %v, want %q", c.used, got, failed, c.want)
+		}
+	}
+}
+
+func TestBucketKeysAreNotAddresses(t *testing.T) {
+	for _, ip := range []string{"203.0.113.7", "2001:db8:1:2::1"} {
+		k := clientKey(net.ParseIP(ip))
+		if strings.Contains(k, "203.0.113") || strings.Contains(k, "2001:db8") {
+			t.Fatalf("bucket key %q contains the address", k)
+		}
+	}
+	if clientKey(net.ParseIP("203.0.113.7")) == clientKey(net.ParseIP("203.0.113.8")) {
+		t.Fatal("different visitors share a bucket")
 	}
 }

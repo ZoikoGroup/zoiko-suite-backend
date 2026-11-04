@@ -6,10 +6,20 @@
 package claims
 
 import (
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
+
+// placeholderRe matches an unfilled blank in approved wording, such as
+// "[price]", "[N]" or "{{plan}}".
+var placeholderRe = regexp.MustCompile(`\[[A-Za-z][A-Za-z0-9 _.-]{0,30}\]|\{\{[^{}]*\}\}`)
+
+// HasPlaceholder reports whether s still contains an unfilled blank. Such
+// text is never shown to a visitor (Doc 02 §17) and a claim worded that way
+// carries no typed value (Doc 03 evidence gates).
+func HasPlaceholder(s string) bool { return placeholderRe.MatchString(s) }
 
 const (
 	KindClaims = "claims"
@@ -45,6 +55,7 @@ const (
 	RevokedDecision      = "REVOKED"
 	ExpiredDecision      = "EXPIRED"
 	MarketRequired       = "MARKET_REQUIRED" // not a §17 decision: tells the orchestrator to CLARIFY
+	ReasonIncomplete     = "CLAIM_INCOMPLETE"
 )
 
 // Claim is one registry entry. Absent scope means unknown, never global:
@@ -73,8 +84,45 @@ type Claim struct {
 	CitationURLKey           string    `json:"citation_url_key"`
 	ApprovalRefs             []string  `json:"approval_refs"`
 	ConflictIDs              []string  `json:"conflict_ids"`
+	// OwnerID is the accountable team (Doc 03 §10 RACI); an ACTIVE claim
+	// must have one. ReviewDueAt: past it the claim is treated as expired
+	// until re-reviewed (Doc 03 §11, KB-028).
+	OwnerID                  string     `json:"owner_id"`
+	ReviewDueAt              *time.Time `json:"review_due_at,omitempty"`
+	PriceBookRelease         string     `json:"price_book_release,omitempty"`
+	TaxesFeesCaveat          string     `json:"taxes_fees_caveat,omitempty"`
+	TrialCohort              string     `json:"trial_cohort,omitempty"`
+	TrialDurationDays        int        `json:"trial_duration_days,omitempty"`
+	TrialCardRequired        *bool      `json:"trial_card_required,omitempty"`
+	TrialEndState            string     `json:"trial_end_state,omitempty"`
+	TrialAuthorizationPolicy string     `json:"trial_authorization_policy,omitempty"`
 	// Synthetic marks seed data that is not ZoikoSuite fact.
 	Synthetic bool `json:"synthetic,omitempty"`
+}
+
+func (c Claim) Complete() bool {
+	switch strings.ToUpper(strings.TrimSpace(c.ClaimType)) {
+	case Price:
+		return strings.TrimSpace(c.SubjectID) != "" &&
+			strings.TrimSpace(c.Plan) != "" &&
+			strings.TrimSpace(c.Currency) != "" &&
+			strings.TrimSpace(c.BillingTerm) != "" &&
+			strings.TrimSpace(c.Market) != "" &&
+			!c.ValidFrom.IsZero() &&
+			(strings.TrimSpace(c.PriceBookRelease) != "" || strings.TrimSpace(c.AuthorityRef) != "") &&
+			strings.TrimSpace(c.TaxesFeesCaveat) != ""
+	case Trial:
+		return strings.TrimSpace(c.SubjectID) != "" &&
+			strings.TrimSpace(c.Plan) != "" &&
+			strings.TrimSpace(c.Market) != "" &&
+			strings.TrimSpace(c.TrialCohort) != "" &&
+			c.TrialDurationDays > 0 &&
+			c.TrialCardRequired != nil &&
+			strings.TrimSpace(c.TrialEndState) != "" &&
+			strings.TrimSpace(c.TrialAuthorizationPolicy) != ""
+	default:
+		return true
+	}
 }
 
 // Manifest is a signed claim release.
@@ -87,6 +135,22 @@ type Manifest struct {
 	Markets     []string          `json:"markets"`      // markets offered as choices in config
 	Claims      []Claim           `json:"claims"`
 	Synthetic   bool              `json:"synthetic,omitempty"`
+	// CompatiblePolicyVersions: see knowledge.Manifest (Doc 08 OPR-004).
+	CompatiblePolicyVersions []string `json:"compatible_policy_versions,omitempty"`
+}
+
+// HasSynthetic reports whether the registry or any claim is synthetic. A
+// production runtime refuses such a release unless local/dev allows it.
+func (m Manifest) HasSynthetic() bool {
+	if m.Synthetic {
+		return true
+	}
+	for _, c := range m.Claims {
+		if c.Synthetic {
+			return true
+		}
+	}
+	return false
 }
 
 // Request asks for the claims about one subject.
@@ -110,6 +174,25 @@ type Decision struct {
 // RevocationSet reports revoked claim ids.
 type RevocationSet interface {
 	ClaimRevoked(claimID string) bool
+}
+
+// evidenceRevoker is implemented by revocation sets that also know which
+// evidence source versions were withdrawn (KB-030).
+type evidenceRevoker interface {
+	EvidenceRevoked(sourceVersionID string) bool
+}
+
+func evidenceRevoked(rev RevocationSet, c Claim) bool {
+	er, ok := rev.(evidenceRevoker)
+	if !ok {
+		return false
+	}
+	for _, v := range c.EvidenceSourceVersionIDs {
+		if er.EvidenceRevoked(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // needsMarket lists subjects that are meaningless without a market.
@@ -184,23 +267,26 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 		return d
 	}
 	var eligible []Claim
-	sawRevoked, sawExpired, sawConflict := false, false, false
+	sawRevoked, sawExpired, sawConflict, sawIncomplete := false, false, false, false
 	for _, c := range r.m.Claims {
 		if !r.matches(c, q) {
 			continue
 		}
 		switch {
-		case rev != nil && rev.ClaimRevoked(c.ClaimID):
+		case rev != nil && (rev.ClaimRevoked(c.ClaimID) || evidenceRevoked(rev, c)):
 			sawRevoked = true
 		case c.Status != StatusActive || !c.PubliclyPublishable || !c.OperationallyEnabled:
 			// HOLD/TARGET/RETIRED/CONDITIONAL or unpublished: never stated as fact.
-		case q.AsOf.Before(c.ValidFrom) || !q.AsOf.Before(c.ValidUntil):
+		case q.AsOf.Before(c.ValidFrom) || !q.AsOf.Before(c.ValidUntil) || (c.ReviewDueAt != nil && !q.AsOf.Before(*c.ReviewDueAt)):
 			sawExpired = true
 		case len(c.ConflictIDs) > 0 || (c.ClaimType == Price && r.disputed[c.SubjectID]):
 			sawConflict = true
 			d.ConflictKeys = append(d.ConflictKeys, c.ClaimID)
 		case strings.TrimSpace(c.PublicStatement) == "" || len(c.EvidenceSourceVersionIDs) == 0 || c.CitationURLKey == "":
 			// No approved wording or provenance: cannot be cited.
+		case (!c.Synthetic && !c.Complete()) || HasPlaceholder(c.PublicStatement):
+			// A blank such as "[price]" is not a value, even in synthetic data.
+			sawIncomplete = true
 		default:
 			eligible = append(eligible, c)
 		}
@@ -231,6 +317,8 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 		d.Decision, d.ReasonCode = RevokedDecision, "SOURCE_REVOKED"
 	case sawExpired:
 		d.Decision, d.ReasonCode = ExpiredDecision, "EXPIRED_SOURCE"
+	case sawIncomplete:
+		d.Decision, d.ReasonCode = InsufficientEvidence, ReasonIncomplete
 	default:
 		d.Decision, d.ReasonCode = InsufficientEvidence, "CLAIM_NOT_PUBLISHED"
 	}
@@ -248,6 +336,53 @@ func distinct(xs []string) int {
 }
 
 // Validate checks a manifest before it is signed.
+// ClaimConflict is a set of ACTIVE claims for one key whose values disagree
+// (KB-005). SubjectKey starts with the claim type.
+type ClaimConflict struct {
+	SubjectKey string
+	ClaimIDs   []string
+	OwnerID    string
+}
+
+// Conflicts lists every key with two or more ACTIVE claims that disagree,
+// in key order, with the first named owner among them.
+func (m Manifest) Conflicts() []ClaimConflict {
+	groups := map[string][]Claim{}
+	for _, c := range m.Claims {
+		if c.Status != StatusActive {
+			continue
+		}
+		k := strings.Join([]string{c.ClaimType, c.SubjectID, c.Predicate, c.Market, c.BillingTerm, c.Segment}, "|")
+		groups[k] = append(groups[k], c)
+	}
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []ClaimConflict
+	for _, k := range keys {
+		g := groups[k]
+		values := map[string]bool{}
+		for _, c := range g {
+			values[c.NormalizedValue] = true
+		}
+		if len(values) < 2 {
+			continue
+		}
+		cc := ClaimConflict{SubjectKey: k}
+		for _, c := range g {
+			cc.ClaimIDs = append(cc.ClaimIDs, c.ClaimID)
+			if cc.OwnerID == "" {
+				cc.OwnerID = c.OwnerID
+			}
+		}
+		sort.Strings(cc.ClaimIDs)
+		out = append(out, cc)
+	}
+	return out
+}
+
 func (m Manifest) Validate() []string {
 	var problems []string
 	seen := map[string]bool{}
@@ -259,8 +394,12 @@ func (m Manifest) Validate() []string {
 			problems = append(problems, "duplicate claim_id: "+c.ClaimID)
 		case c.Status == StatusActive && distinct(c.ApprovalRefs) < 2:
 			problems = append(problems, "ACTIVE claim needs two approvals (Doc 03 §10): "+c.ClaimID)
+		case c.Status == StatusActive && strings.TrimSpace(c.OwnerID) == "":
+			problems = append(problems, "ACTIVE claim needs an accountable owner (Doc 03 §10): "+c.ClaimID)
 		case c.Status == StatusActive && !c.ValidUntil.After(c.ValidFrom):
 			problems = append(problems, "invalid validity window: "+c.ClaimID)
+		case c.Status == StatusActive && !c.Synthetic && !c.Complete():
+			problems = append(problems, "ACTIVE price/trial claim missing typed fields (Doc 03 §17): "+c.ClaimID)
 		}
 		seen[c.ClaimID] = true
 	}

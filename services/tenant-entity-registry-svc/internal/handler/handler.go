@@ -138,6 +138,7 @@ func RegisterRoutes(r chi.Router, h *Handler, mws ...func(http.Handler) http.Han
 		// chi's static-before-parameter matching applies across all of them.
 		registerORGRoutes(r, h)
 		registerOwnershipRoutes(r, h)
+		registerPartyRoutes(r, h)
 
 		// ── Tenants ─────────────────────────────────────────────────────────
 		r.Post("/tenants", h.ProvisionTenant)

@@ -92,6 +92,17 @@ func codeEventNames() []string {
 		events.EventWorkspaceCreated,
 		events.EventWorkspaceUpdated,
 		events.EventWorkspaceStatusChanged,
+		// ORG-07 / MDM-01 parties (party_events.go).
+		events.EventPartyCreated,
+		events.EventPartyProfileAmended,
+		events.EventPartyFactPublished,
+		events.EventPartyRoleAdded,
+		events.EventPartyRoleRemoved,
+		events.EventPartyIdentifierLinked,
+		events.EventMasterConflictOpened,
+		events.EventPartiesMerged,
+		events.EventPartySplit,
+		events.EventMasterConflictResolved,
 	}
 }
 

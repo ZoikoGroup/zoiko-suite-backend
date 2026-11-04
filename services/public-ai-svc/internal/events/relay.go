@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"time"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -87,10 +88,13 @@ func (r *Relay) Once(ctx context.Context) (int, error) {
 		}
 		if len(dead) > 0 && r.Pub.Publish(ctx, dead) == nil {
 			_ = r.Store.MarkPublished(ctx, deadIDs, time.Now().UTC())
+			metrics.EventsDeadLettered(len(dead))
 			r.logger().Error("events diverted to DLQ", zap.Int("count", len(dead)))
 		}
 		return 0, err
 	}
+	metrics.EventsPublished(len(evs))
+	metrics.OutboxOldest(time.Since(evs[0].CreatedAt))
 	return len(evs), r.Store.MarkPublished(ctx, ids, time.Now().UTC())
 }
 

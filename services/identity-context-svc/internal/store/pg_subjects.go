@@ -20,9 +20,9 @@ import (
 var (
 	// ErrMergeNotFound: the survivor or the duplicate does not exist in the tenant.
 	ErrMergeNotFound = errors.New("survivor or duplicate subject not found")
-	// ErrMergeConflict: the duplicate was already merged, or the survivor is
-	// disabled or is itself a retired id.
-	ErrMergeConflict = errors.New("subject cannot be merged in its current state")
+	// ErrMergeConflict (pg_merge.go) is shared: the duplicate was already
+	// merged, or the survivor is disabled or is itself a retired id.
+	//
 	// ErrMergeStale: the duplicate's record_version is not the If-Match value.
 	ErrMergeStale = errors.New("duplicate subject changed since it was read")
 )
@@ -32,6 +32,15 @@ var (
 // merged into someone else; ten hops is far beyond any real history.
 const maxAliasHops = 10
 
+// mergedAwaySQL is the survivor that id $2 was merged into in tenant $1, by
+// either merge route: identity_merges (POST /v1/subjects/{id}/merge) or
+// principal_merges (POST /v1/identities/{id}/merge, pg_merge.go). Each route
+// refuses an id the other has merged away, so at most one row answers.
+const mergedAwaySQL = `SELECT survivor_id FROM identity_merges WHERE tenant_id = $1 AND retired_id = $2
+	UNION ALL
+	SELECT survivor_id FROM principal_merges WHERE tenant_id = $1 AND duplicate_id = $2
+	LIMIT 1`
+
 // ResolveSubjectID follows the merge aliases from id to the subject that now
 // answers for it. merged reports whether id was retired.
 func (s *PgStore) ResolveSubjectID(ctx context.Context, tenantID, id string) (survivor string, merged bool, err error) {
@@ -39,8 +48,7 @@ func (s *PgStore) ResolveSubjectID(ctx context.Context, tenantID, id string) (su
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		for hop := 0; hop < maxAliasHops; hop++ {
 			var next string
-			err := tx.QueryRow(ctx, `SELECT survivor_id FROM identity_merges WHERE tenant_id = $1 AND retired_id = $2`,
-				tenantID, survivor).Scan(&next)
+			err := tx.QueryRow(ctx, mergedAwaySQL, tenantID, survivor).Scan(&next)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
@@ -136,9 +144,13 @@ func (s *PgStore) MergeSubjects(ctx context.Context, tenantID, survivorID, dupli
 		if surv.status == string(domain.PrincipalStatusDisabled) {
 			return fmt.Errorf("%w: the survivor is disabled", ErrMergeConflict)
 		}
+		// Either ledger: a duplicate merged away by POST /v1/identities/{id}/merge
+		// is as retired as one merged here.
 		var retired bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM identity_merges
-			WHERE tenant_id = $1 AND retired_id IN ($2, $3))`, tenantID, survivorID, duplicateID).Scan(&retired); err != nil {
+			WHERE tenant_id = $1 AND retired_id IN ($2, $3))
+			OR EXISTS (SELECT 1 FROM principal_merges
+			WHERE tenant_id = $1 AND duplicate_id IN ($2, $3))`, tenantID, survivorID, duplicateID).Scan(&retired); err != nil {
 			return err
 		}
 		if retired {

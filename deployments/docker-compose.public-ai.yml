@@ -32,6 +32,8 @@ services:
     restart: unless-stopped
 
   public-ai-svc:
+    # Doc 08 OPR-012: SIGTERM drains (5 s) then waits out the turn lease.
+    stop_grace_period: 45s
     build:
       context: ../services/public-ai-svc
       args:
@@ -42,6 +44,10 @@ services:
         condition: service_healthy
     environment:
       PUBLIC_AI_ENABLED: ${PUBLIC_AI_ENABLED:-false}
+      # Required, never assumed (Doc 06 SEC-P0-06): dev, test, staging or production.
+      PUBLIC_AI_ENVIRONMENT: ${PUBLIC_AI_ENVIRONMENT:?set PUBLIC_AI_ENVIRONMENT (dev, test, staging or production)}
+      PUBLIC_AI_POLICY_DIGEST: ${PUBLIC_AI_POLICY_DIGEST:-}
+      PUBLIC_AI_ALLOWED_HOSTS: ${PUBLIC_AI_ALLOWED_HOSTS:-}
       PUBLIC_AI_HTTP_ADDR: ":8080"
       PUBLIC_AI_DATABASE_URL: postgres://public_ai_app:${PUBLIC_AI_DB_PASSWORD}@public-ai-postgres:5432/public_ai?sslmode=disable
       PUBLIC_AI_ALLOWED_ORIGINS: ${PUBLIC_AI_ALLOWED_ORIGINS:-http://localhost:3000}

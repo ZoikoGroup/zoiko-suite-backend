@@ -83,7 +83,15 @@ const (
 // the name the service's original specification (03-microservices.md s8.2)
 // reserved for this signal.
 const (
-	EventCalendarChanged         = "jurisdiction.calendar.changed"
+	EventCalendarChanged = "jurisdiction.calendar.changed"
+	// REF-10: a calendar version was published, and each holiday occurrence it
+	// adds, removes or changes.
+	EventBusinessCalendarUpdated  = "business-calendar.updated"
+	EventHolidayOccurrenceChanged = "holiday-occurrence.changed"
+	// REF-10 payment terms.
+	EventPaymentTermActivated    = "payment-term.activated"
+	EventPaymentTermSuperseded   = "payment-term.superseded"
+	EventPaymentTermRetired      = "payment-term.retired"
 	EventObligationRulePublished = "regulatory-obligation-rule.published"
 )
 
