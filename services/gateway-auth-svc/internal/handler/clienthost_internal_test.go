@@ -3,9 +3,13 @@ package handler
 import (
 	"net/http/httptest"
 	"testing"
+
+	"go.uber.org/zap"
+	"zoiko.io/gateway-auth-svc/internal/config"
 )
 
 func TestClientHostStripsThePort(t *testing.T) {
+	h := &Handler{cfg: &config.Config{}, log: zap.NewNop()}
 	for _, tc := range []struct{ name, remote, xff, want string }{
 		{"peer with port", "192.0.2.1:50123", "", "192.0.2.1"},
 		{"peer with different port is the same client", "192.0.2.1:50999", "", "192.0.2.1"},
@@ -20,7 +24,7 @@ func TestClientHostStripsThePort(t *testing.T) {
 			if tc.xff != "" {
 				r.Header.Set("X-Forwarded-For", tc.xff)
 			}
-			if got := clientHost(r); got != tc.want {
+			if got := h.clientHost(r); got != tc.want {
 				t.Fatalf("clientHost = %q, want %q", got, tc.want)
 			}
 		})

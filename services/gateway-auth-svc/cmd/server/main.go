@@ -152,6 +152,7 @@ func main() {
 		},
 		IPLimiter:     admission.NewLimiter(cfg.RateIPPerSecond, cfg.RateIPBurst, 0, nil),
 		TenantLimiter: admission.NewLimiter(cfg.RateTenantPerSecond, cfg.RateTenantBurst, 0, nil),
+		LoginLimiter:  admission.NewLimiter(cfg.RateLoginPerSecond, cfg.RateLoginBurst, 0, nil),
 		Gate:          admission.NewGate(cfg.MaxInFlight),
 		Recorder:      admission.NewRecorder(cfg.DecisionWindow, cfg.AbuseThresholdPerMinute, nil),
 	}
@@ -161,8 +162,9 @@ func main() {
 		zap.Strings("supported_api_versions", cfg.SupportedAPIVersions),
 		zap.Float64("rate_ip_per_second", cfg.RateIPPerSecond),
 		zap.Float64("rate_tenant_per_second", cfg.RateTenantPerSecond),
+		zap.Float64("rate_login_per_second", cfg.RateLoginPerSecond),
 		zap.Int("max_in_flight", cfg.MaxInFlight))
-	if !adm.IPLimiter.Enabled() || !adm.TenantLimiter.Enabled() || cfg.MaxInFlight == 0 {
+	if !adm.IPLimiter.Enabled() || !adm.TenantLimiter.Enabled() || !adm.LoginLimiter.Enabled() || cfg.MaxInFlight == 0 {
 		log.Warn("a gateway admission protection is DISABLED by configuration (a limit of 0)")
 	}
 

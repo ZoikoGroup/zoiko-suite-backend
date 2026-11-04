@@ -150,6 +150,128 @@ func TestINT01_RateLimitRace(t *testing.T) {
 	assert.GreaterOrEqual(t, int(wait.Seconds()), 1, "Retry-After advises at least one second")
 }
 
+// AU-04: login routes use a stricter per-IP bucket. A flood of failed logins
+// from one IP hits 429 before the 25th attempt.
+func TestAU04_LoginRoutesUseStricterBucket(t *testing.T) {
+	h, key, _ := newTestEnv(t)
+	tok := mintEnvelope(t, key, testKid, validClaims())
+	// Install a very small login bucket: 5/sec, burst 10
+	h.UseAdmission(handler.Admission{
+		LoginLimiter: admission.NewLimiter(5, 10, 0, nil),
+	})
+
+	// Make rapid requests to /v1/authenticate
+	codes := make([]int, 25)
+	for i := 0; i < 25; i++ {
+		rec := verifyNamed(t, h, tok, http.MethodPost, map[string]string{
+			"X-Forwarded-Uri": "/v1/authenticate",
+		})
+		codes[i] = rec.Code
+	}
+
+	// First 10 should be admitted (burst), then 429
+	admitted, limited := 0, 0
+	for _, c := range codes {
+		switch c {
+		case http.StatusOK:
+			admitted++
+		case http.StatusTooManyRequests:
+			limited++
+		}
+	}
+	assert.LessOrEqual(t, admitted, 10, "login bucket must not admit past the burst")
+	assert.Positive(t, limited, "some requests must be rate limited")
+}
+
+// AU-04: login throttle keyed on real client IP via trusted proxy.
+// An untrusted peer's XFF must be ignored; the limiter keys on the real client.
+func TestAU04_ThrottleKeyedOnRealClientIP(t *testing.T) {
+	h, key, cfg := newTestEnvWith(t, "", "")
+	cfg.TrustedProxyCIDRs = []string{"10.0.0.0/8"}
+	cfg.TrustedProxyDepth = 1
+	tok := mintEnvelope(t, key, testKid, validClaims())
+	h.UseAdmission(handler.Admission{
+		LoginLimiter: admission.NewLimiter(5, 10, 0, nil),
+	})
+
+	// Client A at 203.0.113.7 behind trusted proxy 10.0.1.5
+	codesA := make([]int, 15)
+	for i := 0; i < 15; i++ {
+		rec := verifyNamed(t, h, tok, http.MethodPost, map[string]string{
+			"X-Forwarded-Uri": "/v1/authenticate",
+			"X-Forwarded-For": "203.0.113.7, 10.0.1.5",
+		})
+		codesA[i] = rec.Code
+	}
+
+	// Client B at 203.0.113.8 behind same trusted proxy
+	codesB := make([]int, 15)
+	for i := 0; i < 15; i++ {
+		rec := verifyNamed(t, h, tok, http.MethodPost, map[string]string{
+			"X-Forwarded-Uri": "/v1/authenticate",
+			"X-Forwarded-For": "203.0.113.8, 10.0.1.5",
+		})
+		codesB[i] = rec.Code
+	}
+
+	// Both should hit their own bucket limits independently
+	limitedA, limitedB := 0, 0
+	for _, c := range codesA {
+		if c == http.StatusTooManyRequests {
+			limitedA++
+		}
+	}
+	for _, c := range codesB {
+		if c == http.StatusTooManyRequests {
+			limitedB++
+		}
+	}
+	assert.Positive(t, limitedA, "client A must be rate limited")
+	assert.Positive(t, limitedB, "client B must be rate limited")
+
+	// Client A forges XFF to pretend to be client B - must NOT bypass A's limit
+	rec := verifyNamed(t, h, tok, http.MethodPost, map[string]string{
+		"X-Forwarded-Uri": "/v1/authenticate",
+		"X-Forwarded-For": "203.0.113.8, 10.0.1.5", // forged
+	})
+	assert.Equal(t, http.StatusTooManyRequests, rec.Code, "forged XFF must not bypass client A's limit")
+}
+
+// AU-04: other login routes also use the stricter bucket.
+func TestAU04_OtherLoginRoutesUseLoginBucket(t *testing.T) {
+	loginRoutes := []string{
+		"/v1/authenticate/step-up",
+		"/v1/account/password",
+		"/v1/account/password/forgot",
+		"/v1/account/password/reset",
+		"/oauth2/login",
+		"/oauth2/token",
+	}
+
+	for _, route := range loginRoutes {
+		t.Run(route, func(t *testing.T) {
+			h, key, _ := newTestEnv(t)
+			tok := mintEnvelope(t, key, testKid, validClaims())
+			h.UseAdmission(handler.Admission{
+				LoginLimiter: admission.NewLimiter(5, 10, 0, nil),
+			})
+
+			// Burst 10
+			for i := 0; i < 10; i++ {
+				rec := verifyNamed(t, h, tok, http.MethodPost, map[string]string{
+					"X-Forwarded-Uri": route,
+				})
+				assert.Equal(t, http.StatusOK, rec.Code, "first 10 requests to %s must be admitted", route)
+			}
+			// 11th should be 429
+			rec := verifyNamed(t, h, tok, http.MethodPost, map[string]string{
+				"X-Forwarded-Uri": route,
+			})
+			assert.Equal(t, http.StatusTooManyRequests, rec.Code, "11th request to %s must be rate limited", route)
+		})
+	}
+}
+
 // MAT route-config-rollback: the active admission policy can be replaced —
 // and restored — without changing the handler, and a rolled-back version
 // admission refuses what it no longer admits.

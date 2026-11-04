@@ -50,8 +50,8 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 | D1-5d | SIEM denial stream + X-Auth-Denial-Reason | refuse()/dedicated events | TestVerify_TenantHostnameMismatchStreamsToSIEM | Denied tab | DONE |
 | D1-5e | Assurance headers: X-Assurance-Level, X-Authn-Age-Seconds, source channel, support context | setSessionContext | TestVerify_AuthnAgeFromAuthTime, TestVerify_SupportContextOnlyFromEnvelope | Trusted-header policy panel | DONE |
 | D1-5f | mTLS to identity-context + tenant registry (SEC-INV-05) | :8449 + mtls clients | TestLoad_MTLSEnabledSwitchesPeerURLs | Versions & policy tab | DONE |
-| AU-04 | Source-level login throttling; 25 failed logins → 429 before the 25th | login-rate bucket (GW-2) | TestAU04_LoginRoutesUseStricterBucket, TestAU04_ThrottleKeyedOnRealClientIP; live 25-login probe | Rate limits tab | PENDING → GW-2 |
-| S5-D3 | Client IP behind the GCP LB: trusted-hop design | clientIP + trusted CIDRs (GW-2) | TestClientIP_UntrustedPeerXFFIgnored, TestClientIP_TrustedChainTakesFirstUntrusted | Versions & policy tab | PENDING → GW-2 |
+| AU-04 | Source-level login throttling; 25 failed logins → 429 before the 25th | login-rate bucket (GW-2) | TestAU04_LoginRoutesUseStricterBucket, TestAU04_ThrottleKeyedOnRealClientIP; live 25-login probe | Rate limits tab | DONE (GW-2) |
+| S5-D3 | Client IP behind the GCP LB: trusted-hop design | clientIP + trusted CIDRs (GW-2) | TestClientIP_TrustedProxyCIDRs, TestClientIP_TrustedProxyDepth | Versions & policy tab | DONE (GW-2) |
 | S3-D1 | X-Commercial-Plan / X-Org-Unit-Id edge-set, stripped from clients | plan lookup (GW-3) + strip lists | TestS3D1_* | Trusted-header policy panel | PENDING → GW-3 |
 | AU-12 | Per-service audience; token exchange at the gateway (IAM-1) | GW-5 exchange | TestVerify_ExchangesForRouteAudience, TestIAM01_EnvelopeForPolicyRefusedByWorkflow | Overview | PENDING → GW-5 |
 | AU-27 | Sender-constrained envelopes (DPoP/mTLS binding) | — | — | — | BLOCKED: Security sign-off (D-7); interface note in SPEC_DEVIATIONS |
@@ -119,3 +119,24 @@ closed (403/503). Reads are never blocked.
 counters, pre-initialised at zero in `internal/telemetry/telemetry.go`.
 
 **Suite:** 8 packages ok, 0 fail. All eight MATs pass.
+
+## GW-2 — Trusted-hop client IP and AU-04 login throttling (2026-11-04)
+
+**Trusted proxy (S5-D3):** `clientIP` rewritten in `internal/handler/handler.go` to
+consume `GATEWAY_TRUSTED_PROXY_CIDRS` (comma-separated CIDR list, defaults to
+RFC 1918 private ranges) and `GATEWAY_TRUSTED_PROXY_DEPTH` (number of trusted
+hops to skip from the right). The client IP is the right-most X-Forwarded-For
+entry NOT in a trusted CIDR; an untrusted peer's XFF is ignored. Tests:
+`TestClientIP_TrustedProxyCIDRs`, `TestClientIP_TrustedProxyDepth`.
+
+**Login rate limit (AU-04):** new `LoginLimiter` in admission controls, keyed
+by the same trusted client IP. Applies to `/v1/authenticate`,
+`/v1/authenticate/step-up`, `/v1/account/*`, `/oauth2/login*`, `/oauth2/token`.
+Default 5 req/s, burst 10 (configurable via `GATEWAY_LOGIN_RATE_PER_SECOND`,
+`GATEWAY_LOGIN_BURST`). Tests: `TestAU04_LoginRoutesUseStricterBucket`,
+`TestAU04_ThrottleKeyedOnRealClientIP`, `TestAU04_OtherLoginRoutesUseLoginBucket`.
+
+**Config:** added `RateLoginPerSecond`, `RateLoginBurst`, `TrustedProxyCIDRs`,
+`TrustedProxyDepth` to `internal/config/config.go` with safe defaults.
+
+**Suite:** 8 packages ok, 0 fail. All new tests pass.

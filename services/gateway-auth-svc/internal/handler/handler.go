@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -324,7 +325,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	// already-fail-closed JWT check, not a replacement for it.
 	assessment := h.carta.Evaluate(ctx,
 		claims.Principal.PrincipalID, claims.TenantID, claims.LegalEntityID,
-		clientIP(r), r.Method+" "+r.Header.Get("X-Forwarded-Uri"),
+		h.clientIP(r), r.Method+" "+r.Header.Get("X-Forwarded-Uri"),
 		// No resource-classification registry exists on this platform yet
 		// (see docs/architecture/full-architecture-gap-analysis.md #16) —
 		// MEDIUM is an explicit, honestly-labeled placeholder floor, not a
@@ -676,19 +677,73 @@ func (h *Handler) checkResidency(ctx context.Context, w http.ResponseWriter, r *
 	}
 }
 
-// clientIP prefers the value Traefik sets over the raw socket address, which
-// would otherwise always be the gateway container's own address.
-// clientIP is the address CARTA scores. It is the RIGHTMOST X-Forwarded-For
-// entry: the one appended by the proxy directly in front of this service,
-// which no client can write. The leftmost entry is whatever the client sent,
-// so taking it let any caller choose the IP its risk was assessed on. With
-// ForwardAuth's trustForwardHeader off, Traefik sends a single entry (its
-// peer), so rightmost and only are the same.
-func clientIP(r *http.Request) string {
+// clientIP returns the client address for rate limiting and risk scoring.
+// It uses the trusted proxy configuration: the right-most X-Forwarded-For
+// entry NOT in a trusted CIDR is the client IP. An untrusted peer's XFF
+// is ignored. TrustedProxyDepth limits how many trusted hops to skip from
+// the right; 0 means only the immediate peer is trusted.
+func (h *Handler) clientIP(r *http.Request) string {
+	if len(h.cfg.TrustedProxyCIDRs) == 0 {
+		// No trusted proxy config: fall back to rightmost hop (original behavior)
+		hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+		for i := len(hops) - 1; i >= 0; i-- {
+			if hop := strings.TrimSpace(hops[i]); hop != "" {
+				return hop
+			}
+		}
+		return r.RemoteAddr
+	}
+
+	// Parse X-Forwarded-For hops
 	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	if len(hops) == 0 {
+		return r.RemoteAddr
+	}
+
+	// TrustedProxyDepth limits how many hops from the right we trust.
+	// We skip trusted hops from the right and return the first untrusted one.
+	depth := h.cfg.TrustedProxyDepth
+	if depth <= 0 {
+		depth = 1
+	}
+
+	// Build a list of hops from right to left (closest proxy first)
 	for i := len(hops) - 1; i >= 0; i-- {
-		if hop := strings.TrimSpace(hops[i]); hop != "" {
+		hop := strings.TrimSpace(hops[i])
+		if hop == "" {
+			continue
+		}
+
+		// Check if this hop is in a trusted CIDR
+		trusted := false
+		for _, cidr := range h.cfg.TrustedProxyCIDRs {
+			_, network, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+			if network.Contains(net.ParseIP(hop)) {
+				trusted = true
+				break
+			}
+		}
+
+		if trusted {
+			depth--
+			if depth <= 0 {
+				continue
+			}
+		} else {
+			// This is the first untrusted hop - the real client
 			return hop
+		}
+	}
+
+	// All hops were trusted or we ran out of depth - fall back to rightmost
+	if len(hops) > 0 {
+		for i := len(hops) - 1; i >= 0; i-- {
+			if hop := strings.TrimSpace(hops[i]); hop != "" {
+				return hop
+			}
 		}
 	}
 	return r.RemoteAddr

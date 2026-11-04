@@ -122,6 +122,21 @@ type Config struct {
 	RateTenantPerSecond float64
 	RateTenantBurst     int
 
+	// Stricter per-IP bucket for login routes (AU-04). Applies to
+	// /v1/authenticate, /v1/authenticate/step-up, /v1/account/*, /oauth2/login*,
+	// /oauth2/token. 429 + Retry-After, event api_rate_limited.
+	RateLoginPerSecond float64
+	RateLoginBurst     int
+
+	// Trusted proxy configuration for client IP extraction (S5-D3).
+	// TrustedProxyCIDRs is a comma-separated list of CIDR ranges that are
+	// considered trusted (e.g., the GCP load balancer ranges). The client IP is
+	// the right-most X-Forwarded-For entry NOT in a trusted CIDR. An untrusted
+	// peer's XFF is ignored. TrustedProxyDepth limits how many trusted hops to
+	// skip from the right; 0 means only the immediate peer is trusted.
+	TrustedProxyCIDRs  []string
+	TrustedProxyDepth  int
+
 	// MaxInFlight sheds /verify load above this many concurrent requests.
 	MaxInFlight int
 
@@ -248,11 +263,27 @@ func intEnv(key string, def int) (int, error) {
 	return n, nil
 }
 
+func intEnvOr(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
 type admission struct {
 	maxBody, maxCompressed     int64
 	encodings, versions        []string
 	ipRPS, tenantRPS           float64
 	ipBurst, tenantBurst       int
+	loginRPS                   float64
+	loginBurst                 int
+	trustedProxyCIDRs          []string
+	trustedProxyDepth          int
 	maxInFlight, window, abuse int
 	adminAddr, adminTokenFile  string
 }
@@ -262,6 +293,8 @@ func (a admission) apply(c *Config) {
 	c.AllowedRequestEncodings, c.SupportedAPIVersions = a.encodings, a.versions
 	c.RateIPPerSecond, c.RateIPBurst = a.ipRPS, a.ipBurst
 	c.RateTenantPerSecond, c.RateTenantBurst = a.tenantRPS, a.tenantBurst
+	c.RateLoginPerSecond, c.RateLoginBurst = a.loginRPS, a.loginBurst
+	c.TrustedProxyCIDRs, c.TrustedProxyDepth = a.trustedProxyCIDRs, a.trustedProxyDepth
 	c.MaxInFlight, c.DecisionWindow, c.AbuseThresholdPerMinute = a.maxInFlight, a.window, a.abuse
 	c.AdminAddr, c.AdminTokenFile = a.adminAddr, a.adminTokenFile
 }
@@ -292,6 +325,14 @@ func loadAdmission() (admission, error) {
 	if a.tenantBurst, err = intEnv("GATEWAY_RATE_TENANT_BURST", 4000); err != nil {
 		return a, err
 	}
+	if a.loginRPS, err = floatEnv("GATEWAY_LOGIN_RATE_PER_SECOND", 5); err != nil {
+		return a, err
+	}
+	if a.loginBurst, err = intEnv("GATEWAY_LOGIN_BURST", 10); err != nil {
+		return a, err
+	}
+	a.trustedProxyCIDRs = listEnv("GATEWAY_TRUSTED_PROXY_CIDRS", []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"})
+	a.trustedProxyDepth = intEnvOr("GATEWAY_TRUSTED_PROXY_DEPTH", 1)
 	if a.maxInFlight, err = intEnv("GATEWAY_MAX_INFLIGHT", 2000); err != nil {
 		return a, err
 	}
@@ -311,6 +352,7 @@ func loadAdmission() (admission, error) {
 		"GATEWAY_MAX_BODY_BYTES": float64(a.maxBody), "GATEWAY_MAX_COMPRESSED_BODY_BYTES": float64(a.maxCompressed),
 		"GATEWAY_RATE_IP_PER_SECOND": a.ipRPS, "GATEWAY_RATE_IP_BURST": float64(a.ipBurst),
 		"GATEWAY_RATE_TENANT_PER_SECOND": a.tenantRPS, "GATEWAY_RATE_TENANT_BURST": float64(a.tenantBurst),
+		"GATEWAY_LOGIN_RATE_PER_SECOND": a.loginRPS, "GATEWAY_LOGIN_BURST": float64(a.loginBurst),
 		"GATEWAY_MAX_INFLIGHT": float64(a.maxInFlight), "GATEWAY_DECISION_WINDOW": float64(a.window),
 		"GATEWAY_ABUSE_THRESHOLD_PER_MINUTE": float64(a.abuse),
 	} {
@@ -318,7 +360,7 @@ func loadAdmission() (admission, error) {
 			return a, fmt.Errorf("%s must not be negative (use 0 to disable)", name)
 		}
 	}
-	if (a.ipRPS > 0 && a.ipBurst < 1) || (a.tenantRPS > 0 && a.tenantBurst < 1) {
+	if (a.ipRPS > 0 && a.ipBurst < 1) || (a.tenantRPS > 0 && a.tenantBurst < 1) || (a.loginRPS > 0 && a.loginBurst < 1) {
 		return a, fmt.Errorf("an enabled rate limit needs a burst of at least 1")
 	}
 	return a, nil
