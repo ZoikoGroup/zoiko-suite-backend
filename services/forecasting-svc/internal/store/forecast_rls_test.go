@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
 	"zoiko.io/forecasting-svc/internal/domain"
@@ -179,6 +180,62 @@ func TestRLS_EnforcedByDatabase(t *testing.T) {
 	}
 	if n < 10 {
 		t.Fatalf("expected at least 10 tables, saw %d", n)
+	}
+}
+
+// TestRLS_EveryPolicyHasWithCheck: every RLS policy in the schema states an
+// explicit WITH CHECK (000003 for the FIN-02 tables and idempotency_keys,
+// 000004 for the AI-05 tables whose 000002 policies had USING only), and a
+// row written for another tenant is refused on each AI-05 table.
+func TestRLS_EveryPolicyHasWithCheck(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	rows, err := f.admin.Query(ctx, `SELECT tablename, policyname, COALESCE(with_check, '') FROM pg_policies
+		WHERE schemaname = current_schema()`)
+	if err != nil {
+		t.Fatalf("pg_policies: %v", err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var table, policy, check string
+		if err := rows.Scan(&table, &policy, &check); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		seen[table] = true
+		if check == "" {
+			t.Errorf("policy %s on %s has no WITH CHECK", policy, table)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	for _, table := range []string{"forecast_model_releases", "forecast_assist_jobs", "suggested_drivers",
+		"suggested_ranges", "evidence_references", "planner_decisions"} {
+		if !seen[table] {
+			t.Errorf("table %s has no RLS policy", table)
+		}
+	}
+
+	// Cross-tenant write refused by the policy itself: as orgB, insert an
+	// orgA row. Postgres checks RLS before NOT NULL / CHECK constraints, so
+	// the error must be 42501 (insufficient_privilege, RLS violation).
+	for _, table := range []string{"forecast_model_releases", "forecast_assist_jobs", "suggested_drivers",
+		"suggested_ranges", "evidence_references", "planner_decisions"} {
+		tx, err := f.app.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", orgB); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		_, err = tx.Exec(ctx, "INSERT INTO "+table+" (tenant_id) VALUES ($1)", orgA)
+		_ = tx.Rollback(ctx)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Fatalf("%s: expected RLS violation 42501 for a row of another tenant, got %v", table, err)
+		}
 	}
 }
 
