@@ -14,54 +14,54 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 
 | ID | requirement | route/consumer | test | console screen | status |
 |---|---|---|---|---|---|
-| INT01-01 | Ownership: gateway decision + routed telemetry authoritative here | /verify + admission Recorder | handler/admission suites | Overview KPIs | DONE |
+| INT01-01 | Ownership: gateway decision + routed telemetry authoritative here | /verify + admission Recorder | handler/admission suites | none: per-replica (Grafana `gateway_*`, SIEM; admin API via RUNBOOK) | DONE |
 | INT01-02 | Runtime op: authenticate one request (envelope verify) | Traefik ForwardAuth → /verify | TestVerify_* (handler_test) | Verify my session tab | DONE |
-| INT01-03 | Runtime op: admission (shape + version + in-flight cap) | /verify admission stage | TestPolicy*, TestGate*, TestINT01_RequestSizeAbuse | Overview pipeline | DONE (GW-1 completes) |
-| INT01-04 | Runtime op: throttle by client and tenant, 429 + Retry-After | IPLimiter/TenantLimiter | TestLimiter*, TestRateLimitedResponseIsProblemWithRetryAfter, TestAU04_* (GW-2) | Rate limits tab | DONE (GW-2 adds login bucket) |
-| INT01-05 | Runtime op: route with a resolved version and region | version gate + GTRM headers | TestPolicyVersionAdmission_INT_NP_003, TestINT01_RouteConfigRollback, TestINT01_ResidencyDenied | Versions & policy tab | DONE (GW-1 completes) |
-| INT01-06 | Server-resolved inputs: tenant, rate limit, routing, authorization, environment | resolver + admission + GTRM headers | TestVerify_* , TestTenantQuotaAppliesAfterAuthentication | Overview | DONE |
-| INT01-07 | Five queries: decision by id, decisions by outcome/tenant, usage, rate-limit state, route version status | admin reads | admin_test suite; GW-4 adds decisions list + policy | Registers (tabs) | DONE (GW-4 adds policy read) |
-| INT01-08 | Request state machine: received → validating → admitted / denied / rate-limited → forwarded | handler pipeline | TestValidCredentialIsAdmittedAndCounted_INT_NP_002, TestEveryAuthRefusalCarriesAProblemBody | Overview pipeline | DONE |
-| INT01-09 | Event api_request_denied | refuse() default event | TestAbuseThresholdRaisesOneEventPerClientPerWindow, TestINT01_ResidencyDenied | Denied tab | DONE (GW-1 completes) |
-| INT01-10 | Event api_rate_limited | limiter refusals | TestTenantRateLimitStreamsOneThrottledCanonicalEvent, TestAU04_* | Rate limits tab | DONE |
-| INT01-11 | Event api_route_version_unavailable | version gate refusal | TestUnsupportedAPIVersionRefusedWithoutFallback_INT_NP_003 | Versions tab | DONE |
-| INT01-12 | Event api_abuse_threshold_exceeded | Recorder abuse detection | TestAbuseThresholdRaisesOneEventPerClientPerWindow | Overview callout | DONE |
-| INT01-13 | Idempotency: decision reads replay identically; decisions retrievable by id | admin GET decisions/{id} | TestDecisionLookupAndList | Denied tab drawer | DONE |
-| INT01-14 | Failure semantics: dependency down distinguishable from caller error | JWKS/registry/CARTA paths | TestVerify_JWKSOutageIsNotReportedAsABadToken, TestVerify_RegistryUnavailableBlocksWriteWith503, TestINT01_DownstreamTimeoutDistinguishable (GW-1) | Overview | DONE (GW-1 completes) |
-| INT01-M1 | MAT forged tenant header refused | /verify stages 1/4 | TestINT01_ForgedTenantHeader (GW-1) | Denied tab | DONE (GW-1) |
-| INT01-M2 | MAT valid token, downstream denied — distinguishable | /verify 200 + backend 403 | TestGatewayAdmitsAndTheDomainRefusesWithBothDecisionsRetained_INT_NP_002, TestINT01_ValidTokenDownstreamDenied (GW-1) | Denied tab | DONE (GW-1) |
-| INT01-M3 | MAT version unsupported, no fallback | version gate | TestINT01_VersionUnsupported (GW-1) | Versions tab | DONE (GW-1) |
-| INT01-M4 | MAT request-size abuse refused before auth | Policy.Check | TestPolicyRequestSize_INT_NP_004, TestINT01_RequestSizeAbuse (GW-1) | Overview | DONE (GW-1) |
-| INT01-M5 | MAT rate-limit race never exceeds burst | IPLimiter concurrent | TestLimiterConcurrentRequestsCannotBypassQuota_INT_NP_005, TestINT01_RateLimitRace (GW-1) | Rate limits tab | DONE (GW-1) |
-| INT01-M6 | MAT route config rollback restores versions | policy reload | TestINT01_RouteConfigRollback (GW-1, new) | Versions tab | DONE (GW-1) |
-| INT01-M7 | MAT residency mismatch denied on a material request; fail closed on unknown (write) | GOV-01 resolve + GTRM region header | TestINT01_ResidencyDenied (GW-1, new check) | Denied tab | DONE (GW-1) |
-| INT01-M8 | MAT downstream timeout distinguishable | dependency timeouts | TestINT01_DownstreamTimeoutDistinguishable (GW-1, new) | Overview | DONE (GW-1) |
+| INT01-03 | Runtime op: admission (shape + version + in-flight cap) | /verify admission stage | TestPolicy*, TestGate*, TestINT01_RequestSizeAbuse | Pipeline panel | DONE (GW-1 completes) |
+| INT01-04 | Runtime op: throttle by client and tenant, 429 + Retry-After | IPLimiter/TenantLimiter | TestLimiter*, TestRateLimitedResponseIsProblemWithRetryAfter, TestAU04_* (GW-2) | Denial reasons tab (`rate_limited`); live bucket state via RUNBOOK | DONE (GW-2 adds login bucket) |
+| INT01-05 | Runtime op: route with a resolved version and region | version gate + GTRM headers | TestPolicyVersionAdmission_INT_NP_003, TestINT01_RouteConfigRollback, TestINT01_ResidencyDenied | Denial reasons tab (`version_unsupported`, `residency_*`) | DONE (GW-1 completes) |
+| INT01-06 | Server-resolved inputs: tenant, rate limit, routing, authorization, environment | resolver + admission + GTRM headers | TestVerify_* , TestTenantQuotaAppliesAfterAuthentication | Pipeline panel | DONE |
+| INT01-07 | Five queries: decision by id, decisions by outcome/tenant, usage, rate-limit state, route version status | admin reads | admin_test suite; GW-4 adds decisions list + policy | none: per-replica (Grafana `gateway_*`, SIEM; admin API via RUNBOOK) | DONE (GW-4 adds policy read) |
+| INT01-08 | Request state machine: received → validating → admitted / denied / rate-limited → forwarded | handler pipeline | TestValidCredentialIsAdmittedAndCounted_INT_NP_002, TestEveryAuthRefusalCarriesAProblemBody | Pipeline panel | DONE |
+| INT01-09 | Event api_request_denied | refuse() default event | TestAbuseThresholdRaisesOneEventPerClientPerWindow, TestINT01_ResidencyDenied | Denial reasons tab; events in SIEM | DONE (GW-1 completes) |
+| INT01-10 | Event api_rate_limited | limiter refusals | TestTenantRateLimitStreamsOneThrottledCanonicalEvent, TestAU04_* | Denial reasons tab (`rate_limited`); events in SIEM | DONE |
+| INT01-11 | Event api_route_version_unavailable | version gate refusal | TestUnsupportedAPIVersionRefusedWithoutFallback_INT_NP_003 | Denial reasons tab (`version_unsupported`) | DONE |
+| INT01-12 | Event api_abuse_threshold_exceeded | Recorder abuse detection | TestAbuseThresholdRaisesOneEventPerClientPerWindow | none: SIEM | DONE |
+| INT01-13 | Idempotency: decision reads replay identically; decisions retrievable by id | admin GET decisions/{id} | TestDecisionLookupAndList | none: per-replica (Grafana `gateway_*`, SIEM; admin API via RUNBOOK) | DONE |
+| INT01-14 | Failure semantics: dependency down distinguishable from caller error | JWKS/registry/CARTA paths | TestVerify_JWKSOutageIsNotReportedAsABadToken, TestVerify_RegistryUnavailableBlocksWriteWith503, TestINT01_DownstreamTimeoutDistinguishable (GW-1) | Denial reasons tab (503 = nothing decided) | DONE (GW-1 completes) |
+| INT01-M1 | MAT forged tenant header refused | /verify stages 1/4 | TestINT01_ForgedTenantHeader (GW-1) | Denial reasons tab (`tenant_hostname_mismatch`) | DONE (GW-1) |
+| INT01-M2 | MAT valid token, downstream denied — distinguishable | /verify 200 + backend 403 | TestGatewayAdmitsAndTheDomainRefusesWithBothDecisionsRetained_INT_NP_002, TestINT01_ValidTokenDownstreamDenied (GW-1) | Pipeline panel (every refusal names itself) | DONE (GW-1) |
+| INT01-M3 | MAT version unsupported, no fallback | version gate | TestINT01_VersionUnsupported (GW-1) | Denial reasons tab (`version_unsupported`) | DONE (GW-1) |
+| INT01-M4 | MAT request-size abuse refused before auth | Policy.Check | TestPolicyRequestSize_INT_NP_004, TestINT01_RequestSizeAbuse (GW-1) | Denial reasons tab (`malformed_request`) | DONE (GW-1) |
+| INT01-M5 | MAT rate-limit race never exceeds burst | IPLimiter concurrent | TestLimiterConcurrentRequestsCannotBypassQuota_INT_NP_005, TestINT01_RateLimitRace (GW-1) | Denial reasons tab (`rate_limited`) | DONE (GW-1) |
+| INT01-M6 | MAT route config rollback restores versions | policy reload | TestINT01_RouteConfigRollback (GW-1, new) | none: governed GTRM configuration | DONE (GW-1) |
+| INT01-M7 | MAT residency mismatch denied on a material request; fail closed on unknown (write) | GOV-01 resolve + GTRM region header | TestINT01_ResidencyDenied (GW-1, new check) | Denial reasons tab (`residency_denied`) | DONE (GW-1) |
+| INT01-M8 | MAT downstream timeout distinguishable | dependency timeouts | TestINT01_DownstreamTimeoutDistinguishable (GW-1, new) | Denial reasons tab (503 = nothing decided) | DONE (GW-1) |
 | SEC8-E1 | Internet edge: DDoS/WAF/bot/abuse/TLS/request-size | GCP LB + Traefik middlewares (rate limit, buffering) | — | — | BLOCKED: platform decision S5-D1; placement documented in SPEC_DEVIATIONS |
-| SEC8-I1 | Ingress: authenticated routes, hostname/tenant resolution, header sanitation | edge strip + /verify + tenant binding | TestEdgeContract_*, TestVerify_ResolvedTenantMismatch | Trusted-header policy panel | DONE |
-| SEC8-S2 | Service-to-service mTLS, unique workload identity | :8449 listeners + internal/mtls | mtls_test suite, TestLoad_MTLS* | Versions & policy tab | DONE |
-| SEC8-RT | Runtime: request-size limits, compressed-body refusal | admission Policy | TestPolicyAllowedEncodingStillCapped, TestPolicyRefusesCompressedBodiesByDefault | Versions & policy tab | DONE |
-| GOV01-I1 | Ingress stamps server-resolved context; caller cannot override | /verify header half | TestVerify_SourceChannelFromEnvelopeOverridesClient, TestVerify_AssuranceLevelFromSessionTrust | Trusted-header policy panel | DONE |
-| GOV01-I2 | Hostname ↔ tenant binding, no fallback | X-Zoiko-Resolved-Tenant-Id vs token claim | TestVerify_ResolvedTenantMismatch_Returns403 | Overview | DONE |
-| GOV01-I3 | Tenant operability + entity-in-tenant check | tenantctx resolver | TestVerify_SuspendedTenantDenied, TestVerify_CrossTenantEntityDenied | Tenant usage tab | DONE |
-| GOV01-I4 | Cache: fresh/stale/invalidated, bounded TTL | tenantctx cache | TestVerify_ResolutionIsCached | Versions & policy tab | DONE |
+| SEC8-I1 | Ingress: authenticated routes, hostname/tenant resolution, header sanitation | edge strip + /verify + tenant binding | TestEdgeContract_*, TestVerify_ResolvedTenantMismatch | Header-order panel | DONE |
+| SEC8-S2 | Service-to-service mTLS, unique workload identity | :8449 listeners + internal/mtls | mtls_test suite, TestLoad_MTLS* | none: infrastructure | DONE |
+| SEC8-RT | Runtime: request-size limits, compressed-body refusal | admission Policy | TestPolicyAllowedEncodingStillCapped, TestPolicyRefusesCompressedBodiesByDefault | Denial reasons tab (`malformed_request`) | DONE |
+| GOV01-I1 | Ingress stamps server-resolved context; caller cannot override | /verify header half | TestVerify_SourceChannelFromEnvelopeOverridesClient, TestVerify_AssuranceLevelFromSessionTrust | Header-order panel | DONE |
+| GOV01-I2 | Hostname ↔ tenant binding, no fallback | X-Zoiko-Resolved-Tenant-Id vs token claim | TestVerify_ResolvedTenantMismatch_Returns403 | Denial reasons tab (`tenant_hostname_mismatch`) | DONE |
+| GOV01-I3 | Tenant operability + entity-in-tenant check | tenantctx resolver | TestVerify_SuspendedTenantDenied, TestVerify_CrossTenantEntityDenied | Denial reasons tab (`tenant_context_denied`) | DONE |
+| GOV01-I4 | Cache: fresh/stale/invalidated, bounded TTL | tenantctx cache | TestVerify_ResolutionIsCached | none: internal cache | DONE |
 | D1-5a | /verify: envelope verify, issuer/audience pinned, incomplete claims refused | /verify | TestVerify_WrongAudience_Returns401, TestVerify_MissingPrincipalID_Returns401 | Verify my session tab | DONE |
-| D1-5b | Revocation within TTL (AU-01) | identity introspection | TestVerify_RevokedSessionIsRefused | Overview | DONE |
-| D1-5c | CARTA risk gate; STEP_UP_MFA → 401 step_up_required (AU-23); unreachable → closed writes / open reads (S5-D2) | carta stage | TestVerify_Carta* , TestVerify_CartaUnreachable_ClosedOnWritesOpenOnReads | Overview callout | DONE |
-| D1-5d | SIEM denial stream + X-Auth-Denial-Reason | refuse()/dedicated events | TestVerify_TenantHostnameMismatchStreamsToSIEM | Denied tab | DONE |
-| D1-5e | Assurance headers: X-Assurance-Level, X-Authn-Age-Seconds, source channel, support context | setSessionContext | TestVerify_AuthnAgeFromAuthTime, TestVerify_SupportContextOnlyFromEnvelope | Trusted-header policy panel | DONE |
-| D1-5f | mTLS to identity-context + tenant registry (SEC-INV-05) | :8449 + mtls clients | TestLoad_MTLSEnabledSwitchesPeerURLs | Versions & policy tab | DONE |
-| AU-04 | Source-level login throttling; 25 failed logins → 429 before the 25th | login-rate bucket (GW-2) | TestAU04_LoginRoutesUseStricterBucket, TestAU04_ThrottleKeyedOnRealClientIP; live 25-login probe | Rate limits tab | DONE (GW-2) |
-| S5-D3 | Client IP behind the GCP LB: trusted-hop design | clientIP + trusted CIDRs (GW-2) | TestClientIP_TrustedProxyCIDRs, TestClientIP_TrustedProxyDepth | Versions & policy tab | DONE (GW-2) |
-| S3-D1 | X-Commercial-Plan / X-Org-Unit-Id edge-set, stripped from clients | plan lookup (GW-3) + strip lists | TestS3D1_* | Trusted-header policy panel | DONE (GW-3) |
-| AU-12 | Per-service audience; token exchange at the gateway (IAM-1) | GW-5 exchange | TestVerify_ExchangesForRouteAudience, TestIAM01_EnvelopeForPolicyRefusedByWorkflow | Overview | DONE (GW-5) |
+| D1-5b | Revocation within TTL (AU-01) | identity introspection | TestVerify_RevokedSessionIsRefused | Denial reasons tab (`session_revoked`) | DONE |
+| D1-5c | CARTA risk gate; STEP_UP_MFA → 401 step_up_required (AU-23); unreachable → closed writes / open reads (S5-D2) | carta stage | TestVerify_Carta* , TestVerify_CartaUnreachable_ClosedOnWritesOpenOnReads | Denial reasons tab (`step_up_required`, `carta_*`) | DONE |
+| D1-5d | SIEM denial stream + X-Auth-Denial-Reason | refuse()/dedicated events | TestVerify_TenantHostnameMismatchStreamsToSIEM | Denial reasons tab; stream in SIEM | DONE |
+| D1-5e | Assurance headers: X-Assurance-Level, X-Authn-Age-Seconds, source channel, support context | setSessionContext | TestVerify_AuthnAgeFromAuthTime, TestVerify_SupportContextOnlyFromEnvelope | Assurance KPI + Verify my session tab | DONE |
+| D1-5f | mTLS to identity-context + tenant registry (SEC-INV-05) | :8449 + mtls clients | TestLoad_MTLSEnabledSwitchesPeerURLs | none: infrastructure | DONE |
+| AU-04 | Source-level login throttling; 25 failed logins → 429 before the 25th | login-rate bucket (GW-2) | TestAU04_LoginRoutesUseStricterBucket, TestAU04_ThrottleKeyedOnRealClientIP; live 25-login probe | Denial reasons tab (`rate_limited`) | DONE (GW-2) |
+| S5-D3 | Client IP behind the GCP LB: trusted-hop design | clientIP + trusted CIDRs (GW-2) | TestClientIP_TrustedProxyCIDRs, TestClientIP_TrustedProxyDepth | none: configuration | DONE (GW-2) |
+| S3-D1 | X-Commercial-Plan / X-Org-Unit-Id edge-set, stripped from clients | plan lookup (GW-3) + strip lists | TestS3D1_* | Header-order panel | DONE (GW-3) |
+| AU-12 | Per-service audience; token exchange at the gateway (IAM-1) | GW-5 exchange | TestVerify_ExchangesForRouteAudience, TestIAM01_EnvelopeForPolicyRefusedByWorkflow | none | DONE (GW-5) |
 | AU-27 | Sender-constrained envelopes (DPoP/mTLS binding) | — | — | — | BLOCKED: Security sign-off (D-7); interface note in SPEC_DEVIATIONS |
 | S5-B2 | Console → service calls bypass ForwardAuth | audience exchange + per-service gates (GW-5) | TestVerify_UnknownRouteFailsClosed | — | PENDING → GW-5 (exchange half); console routing stays frontend follow-up |
 | S4-B1 | Traefik serversTransport client certs for edge → service hop | — | — | — | BLOCKED: infrastructure (mtls-management-svc enrolment) |
 | R-1 console | Human login gets a verified channel | console client at login (done 3 Nov) | E2E-identity-context | — | DONE (IC-FE-1) |
-| GW-4 | Admin read surface enabled in compose | GATEWAY_ADMIN_ADDR :8192 | admin_test + compose probe | all tabs | DONE (GW-4) |
-| GW-5 | Audience exchange + rollout mode | ForwardTo/Exchanger | TestVerify_ExchangeFailureIs503NotPassThrough | Overview | DONE (GW-5) |
-| GW-FE-1 | Console reads: decisions, usage, rate limits, versions, policy | admin API | lib/api/gateway-auth.ts | all tabs | DONE |
-| GW-FE-2 | Console v2.0 layout: KPIs, pipeline, policy, denials, registers, verify | — | — | /admin/gateway | DONE |
+| GW-4 | Admin read surface enabled in compose | GATEWAY_ADMIN_ADDR :8192 | admin_test + compose probe | none: RUNBOOK (console reads removed, see Decisions) | DONE (GW-4) |
+| GW-5 | Audience exchange + rollout mode | ForwardTo/Exchanger | TestVerify_ExchangeFailureIs503NotPassThrough | none | DONE (GW-5) |
+| GW-FE-1 | Console reads of the per-replica admin API | — | — | — | REMOVED (decision, see Decisions taken) |
+| GW-FE-2 | Console diagnostic page: health and session KPIs, /verify pipeline, header order, denial reasons, verify, signing keys | /verify, /healthz, /readyz, identity JWKS | render check (frontend, live + mocked) | /admin/gateway | DONE (revised) |
 
 ## Decisions taken
 
@@ -72,7 +72,7 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 - **Admin token (GW-4):** Sourced from Docker secret (file), never from env. Listener on :8192, never through Traefik.
 - **Audience exchange (GW-5):** `IDENTITY_ACCEPT_LEGACY_AUDIENCE=true` kept in compose/k8s (per S5-B2). Exchange proven in tests + one E2E probe; cutover BLOCKED on S5-B2.
 - **Exchange failure (GW-5):** Unknown route on protected path fails closed (503) before exchange; exchange error passes original envelope through as fallback.
-- **Console (GW-FE-1/2):** Admin reads server-only, token from file. v2.0 layout with KPIs, panels, tabbed registers. No write commands; live data only.
+- **Console (GW-FE-1/2, revised 2026-11-04):** The console does not read the admin surface. Its decisions, usage and limiter state live in memory per replica, so behind a load balancer each page load would show a different replica, and a decision-by-id lookup would miss whenever it landed on another one. Fleet traffic belongs in Grafana (`gateway_*` metrics) and denials in SIEM. The admin surface (GW-4) stays as an operator tool used from the RUNBOOK. `/admin/gateway` is a diagnostic page built only on fleet-true or per-viewer data: probes, the identity JWKS, the viewer's session, and the denial-reason reference.
 
 ## GW-0 — Baseline and feature matrix (2026-11-04)
 
@@ -218,27 +218,32 @@ unknown routes before reaching this code path.
 
 **Suite:** 10 packages ok (carta now has Exchanger support), 0 fail.
 
-## GW-FE-1 — Console admin API client (2026-11-04)
+## GW-FE-1 — Console admin API client (removed 2026-11-04)
 
-**lib/api/gateway-auth.ts:** added typed admin read functions:
-- `listDeniedDecisions` — GET `/internal/v1/gateway/decisions` with filters
-- `getGatewayDecision` — GET `/internal/v1/gateway/decisions/{id}`
-- `getClientUsage` — GET `/internal/v1/gateway/usage`
-- `getRateLimitState` — GET `/internal/v1/gateway/rate-limit/{scope}/{key}`
-- `getRouteVersionStatus` — GET `/internal/v1/gateway/routes/versions`
-- `getPolicy` — GET `/internal/v1/gateway/policy`
+The first pass added six admin reads to `lib/api/gateway-auth.ts`. Verification found them unusable:
+- No `Authorization` header was sent, so every read got 401.
+- Three paths do not exist on the admin surface (`/decisions?…`, `/usage`, `/policy`).
+- The response types did not match `admin.go`.
+- `:8192` is not reachable from the console.
 
-All server-only (import "server-only"), admin token from file, never to browser.
+They were deleted together with the `gatewayAdmin` service URL. See the Console decision above for why they were not repaired.
 
-## GW-FE-2 — Console v2.0 page (2026-11-04)
+## GW-FE-2 — Console diagnostic page (revised 2026-11-04)
 
-**app/admin/gateway/page.tsx** rewritten to v2.0 layout:
-- PageHeader with breadcrumb, title, gold primary action ("Verify my session", "Recent spoofing")
-- 5 KPI cards: Admitted, Denied, Rate-limited, Step-up required, Risk engine unavailable (each labelled "this replica since start")
-- 3 panels: request Pipeline, trusted-header OrderedModel, denial-reasons BarList with amber callout when risk engine unavailable
-- RegisterCard with 5 tabs: Denied requests (drawer = GetGatewayDecision), Tenant usage, Rate limits (live lookup by scope:key), Versions & admission policy, Verify my session (GatewayVerifyForm)
-- State lives in URL: ?tab ?q ?page ?id ?pane
-- "Required controls: ..." footer noting route/policy changes are governed configuration
-- No write commands; shows live data only; unreadable sources show "unavailable", never 0
+`app/admin/gateway/page.tsx` follows the v2.0 layout, with data chosen to be correct in a multi-replica deployment:
+- **KPIs:** gateway process (`/healthz`), verifying sign-ins (`/readyz`), signing keys published (identity JWKS), your envelope (time to expiry), your assurance level (MFA and sign-in age, from the session's own envelope).
+- **Panels:**
+  - What /verify checks: stages admission → identity → risk → tenant → admitted, each showing how many refusals it can give.
+  - Who may set an identity header: edge strip → GTRM stamp → envelope verified → headers set → authResponseHeaders.
+  - This console and the gateway: `ZOIKO_USE_GATEWAY`, readiness, keys seen, plus a warning callout when not ready.
+- **Tabs:**
+  - Denial reasons (17, searchable by code, filterable by stage and status; the drawer gives meaning, fix, and whether retry helps).
+  - Verify my session (`GatewayVerifyForm`).
+  - Signing keys.
+- `DENIAL_REASONS` gained a `stage` field, plus `residency_denied` and `residency_unresolved` from GW-1.
+- No write commands. Unreadable sources show "Could not be read" / "Not reachable", never 0.
 
-**TypeScript:** clean for modified files (`npx tsc --noEmit --skipLibCheck lib/api/gateway-auth.ts lib/api/config.ts app/admin/gateway/page.tsx`).
+**Checks:** `eslint` clean on the touched files. `tsc --noEmit` shows the same 94 pre-existing errors before and after, none in touched files. Render check against the dev server:
+- Down path (gateway and JWKS unreachable): PASS.
+- Up path (mocked `:8092` and `:8080`): PASS, including search, stage filter, reason drawer and keys drawer.
+- Screenshot at 1600 px.

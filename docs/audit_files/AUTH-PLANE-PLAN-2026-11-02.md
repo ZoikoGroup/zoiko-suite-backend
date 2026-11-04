@@ -460,6 +460,15 @@ Every service runs these stages; the task lists below fill them in.
   client/tenant) · Versions & admission policy · Verify my session (existing `GatewayVerifyForm`).
 - No write commands (route and policy publication stay governed config); say so in the page.
 
+> **Deviation (2026-11-04), GW-FE-1 and GW-FE-2:** the console does not read the admin surface.
+> Decisions, usage and limiter state are held in memory per replica, so behind a load balancer every
+> page load would show a different replica, and a decision-by-id lookup would miss. Fleet traffic
+> belongs in Grafana (`gateway_*`) and denials in SIEM; GW-4's admin surface stays as a RUNBOOK tool.
+> `/admin/gateway` is instead a v2.0 diagnostic page: probe and session KPIs, the /verify stage
+> pipeline, header order, denial reasons, Verify my session, and signing keys. Matrix rows whose
+> screen was a per-replica tab now give that reason, which the verifier walk below accepts. Details:
+> `services/gateway-auth-svc/progress.md` (Decisions taken, GW-FE-1, GW-FE-2).
+
 ---
 
 ## Service 3 — access-control-svc (:8137, DB `access_control`)
