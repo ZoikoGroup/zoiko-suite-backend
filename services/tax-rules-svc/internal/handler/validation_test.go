@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tax-rules-svc/internal/domain"
+	"zoiko.io/tax-rules-svc/internal/store"
 )
 
 // A blank or malformed effective_from used to reach the DATE column and come
@@ -30,13 +31,13 @@ func TestCreateTaxRule_RejectsBadDateAndCategory(t *testing.T) {
 
 type dupStore struct{ *stubStore }
 
-func (dupStore) CreateTaxRule(_ context.Context, _ *domain.TaxRule) error {
+func (dupStore) CreateTaxRule(_ context.Context, _ *domain.TaxRule, _ store.EventMeta) error {
 	return domain.ErrDuplicateRuleCode
 }
 
 func TestCreateTaxRule_DuplicateIs409(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(dupStore{newStubStore()}, &stubPublisher{}, &stubAuthz{}, logger)
+	h := New(dupStore{newStubStore()}, &stubAuthz{}, logger)
 	w := httptest.NewRecorder()
 	h.CreateTaxRule(w, buildRequest(http.MethodPost, "/v1/tax-rules", domain.CreateTaxRuleRequest{
 		JurisdictionID: "GB", RuleCode: "R1", Name: "n", Category: domain.CategoryVAT, EffectiveFrom: "2026-01-01",

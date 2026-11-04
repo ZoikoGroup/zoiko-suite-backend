@@ -20,10 +20,10 @@ func TestPgStore_CreateTaxRule_DuplicateCodeIsErrDuplicateRuleCode(t *testing.T)
 		return &domain.TaxRule{JurisdictionID: "GB", RuleCode: "VAT-STD", Name: "n", Category: domain.CategoryVAT,
 			TaxRatePercentage: 20, EffectiveFrom: "2026-01-01", CreatedBy: "p1"}
 	}
-	if err := s.CreateTaxRule(ctx, mk()); err != nil {
+	if err := s.CreateTaxRule(ctx, mk(), store.EventMeta{}); err != nil {
 		t.Fatalf("first create: %v", err)
 	}
-	if err := s.CreateTaxRule(ctx, mk()); !errors.Is(err, domain.ErrDuplicateRuleCode) {
+	if err := s.CreateTaxRule(ctx, mk(), store.EventMeta{}); !errors.Is(err, domain.ErrDuplicateRuleCode) {
 		t.Fatalf("expected ErrDuplicateRuleCode, got %v", err)
 	}
 }
