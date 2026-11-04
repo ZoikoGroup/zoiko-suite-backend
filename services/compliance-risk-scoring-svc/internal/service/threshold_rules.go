@@ -95,7 +95,7 @@ func (s *Service) UpdateThresholdRule(ctx context.Context, cmd CommandContext, i
 	if !cmd.IfMatchPresent {
 		return nil, domain.PreconditionRequired("If-Match header with the rule's current ETag is required to update a threshold rule")
 	}
-	if _, err := s.GetThresholdRule(ctx, QueryContext{TenantID: cmd.TenantID}, id); err != nil {
+	if _, err := s.loadThresholdRule(ctx, cmd.TenantID, id); err != nil {
 		return nil, err
 	}
 	scope, err := thresholdAuthzScope(cmd)
@@ -159,7 +159,7 @@ func (s *Service) ApproveThresholdRule(ctx context.Context, cmd CommandContext, 
 	if err := checkBodyTenant(request.TenantID, cmd); err != nil {
 		return nil, err
 	}
-	if _, err := s.GetThresholdRule(ctx, QueryContext{TenantID: cmd.TenantID}, id); err != nil {
+	if _, err := s.loadThresholdRule(ctx, cmd.TenantID, id); err != nil {
 		return nil, err
 	}
 	scope, err := thresholdAuthzScope(cmd)
@@ -232,7 +232,7 @@ func (s *Service) RetireThresholdRule(ctx context.Context, cmd CommandContext, i
 	if err := checkBodyTenant(request.TenantID, cmd); err != nil {
 		return nil, err
 	}
-	if _, err := s.GetThresholdRule(ctx, QueryContext{TenantID: cmd.TenantID}, id); err != nil {
+	if _, err := s.loadThresholdRule(ctx, cmd.TenantID, id); err != nil {
 		return nil, err
 	}
 	scope, err := thresholdAuthzScope(cmd)
@@ -283,10 +283,20 @@ func (s *Service) RetireThresholdRule(ctx context.Context, cmd CommandContext, i
 // Reads
 // ---------------------------------------------------------------------------
 
-// GetThresholdRule returns one rule or 404.
+// GetThresholdRule returns one rule or 404. Rules are tenant-wide, so the
+// read is authorized against the caller's legal-entity scope (or the tenant).
 func (s *Service) GetThresholdRule(ctx context.Context, query QueryContext, id string) (*domain.RiskThresholdRule, error) {
+	if err := s.authorizeRead(ctx, query, query.readScope(""), ActionRiskThresholdRuleRead); err != nil {
+		return nil, err
+	}
+	return s.loadThresholdRule(ctx, query.TenantID, id)
+}
+
+// loadThresholdRule reads one rule without an authorization check (used by
+// writes, which authorize their own action).
+func (s *Service) loadThresholdRule(ctx context.Context, tenantID, id string) (*domain.RiskThresholdRule, error) {
 	var rule *domain.RiskThresholdRule
-	err := s.store.InTenantTx(ctx, query.TenantID, func(q *store.TenantQueries) error {
+	err := s.store.InTenantTx(ctx, tenantID, func(q *store.TenantQueries) error {
 		found, err := q.GetThresholdRule(ctx, id, false)
 		rule = found
 		return err
@@ -309,6 +319,9 @@ type ThresholdPage struct {
 
 // ListThresholdRules returns a filtered page of rules, newest first.
 func (s *Service) ListThresholdRules(ctx context.Context, query QueryContext, filter store.ThresholdFilter, page store.PageRequest) (*ThresholdPage, error) {
+	if err := s.authorizeRead(ctx, query, query.readScope(""), ActionRiskThresholdRuleRead); err != nil {
+		return nil, err
+	}
 	var rules []domain.RiskThresholdRule
 	var next *store.PageCursor
 	err := s.store.InTenantTx(ctx, query.TenantID, func(q *store.TenantQueries) error {
@@ -341,6 +354,9 @@ type EffectiveThresholds struct {
 // (tenant rule or platform default) and for each factor category (tenant
 // rule or NONE: factors are only banded when a tenant rule exists).
 func (s *Service) GetEffectiveThresholds(ctx context.Context, query QueryContext, asOfDate string) (*EffectiveThresholds, error) {
+	if err := s.authorizeRead(ctx, query, query.readScope(""), ActionRiskThresholdRuleRead); err != nil {
+		return nil, err
+	}
 	if asOfDate == "" {
 		asOfDate = todayUTC(s.currentTime())
 	}

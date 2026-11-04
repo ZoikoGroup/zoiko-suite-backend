@@ -43,10 +43,15 @@ func requirePrincipal(r *http.Request) (string, error) {
 // queryContext builds the caller context for a read: tenant (already
 // verified by TenantMiddleware) plus a mandatory principal.
 func queryContext(r *http.Request) (service.QueryContext, error) {
-	if _, err := requirePrincipal(r); err != nil {
+	principalID, err := requirePrincipal(r)
+	if err != nil {
 		return service.QueryContext{}, err
 	}
-	return service.QueryContext{TenantID: customMiddleware.GetTenantID(r.Context())}, nil
+	return service.QueryContext{
+		TenantID:         customMiddleware.GetTenantID(r.Context()),
+		PrincipalID:      principalID,
+		LegalEntityScope: strings.TrimSpace(r.Header.Get("X-Legal-Entity-Id")),
+	}, nil
 }
 
 // commandContext builds the caller context for a write from the envelope

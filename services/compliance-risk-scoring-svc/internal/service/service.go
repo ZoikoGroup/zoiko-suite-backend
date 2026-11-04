@@ -19,10 +19,13 @@ import (
 	"zoiko.io/compliance-risk-scoring-svc/internal/store"
 )
 
-// Authorization actions sent to authorization-svc. Reads are not
-// authorized per call (tenant isolation + RLS scope them), matching the
-// platform's other read paths.
+// Authorization actions sent to authorization-svc. Every write and every
+// tenant-data read is authorized per call (fail closed): tenant isolation and
+// RLS bound what a read can see, the READ action decides whether the
+// principal may see it at all.
 const (
+	ActionRiskScoreRead            = "RISK_SCORE_READ"
+	ActionRiskThresholdRuleRead    = "RISK_THRESHOLD_RULE_READ"
 	ActionRiskScoreCreate          = "RISK_SCORE_CREATE"
 	ActionRiskScoreReview          = "RISK_SCORE_REVIEW"
 	ActionRiskAssessmentArchive    = "RISK_ASSESSMENT_ARCHIVE"
@@ -87,7 +90,22 @@ type CommandResult struct {
 
 // QueryContext is the caller of a read.
 type QueryContext struct {
-	TenantID string
+	TenantID         string
+	PrincipalID      string
+	LegalEntityScope string // X-Legal-Entity-Id; may be empty
+}
+
+// readScope is the legal entity a tenant-wide read is authorized against:
+// the explicit filter when given, else the caller's X-Legal-Entity-Id, else
+// the tenant itself (as purchase-request-svc does for an unscoped list).
+func (q QueryContext) readScope(filterLegalEntityID string) string {
+	if filterLegalEntityID != "" {
+		return filterLegalEntityID
+	}
+	if q.LegalEntityScope != "" {
+		return q.LegalEntityScope
+	}
+	return q.TenantID
 }
 
 // ETagForVersion renders a row version as a strong ETag.
@@ -216,6 +234,17 @@ func (s *Service) authorize(ctx context.Context, cmd CommandContext, legalEntity
 	}
 	s.logger.Error("authorization check failed closed", zap.String("action", action), zap.Error(err))
 	return domain.Unavailable("authorization_unavailable", "authorization service unavailable; request refused (fail closed)")
+}
+
+// authorizeRead authorizes a read with a READ action against legalEntityID.
+// Same fail-closed mapping as a write: no principal -> 401, deny -> 403,
+// authorization-svc unreachable -> 503.
+func (s *Service) authorizeRead(ctx context.Context, query QueryContext, legalEntityID, action string) error {
+	if query.PrincipalID == "" {
+		return &domain.Error{Kind: domain.KindUnauthenticated, Code: "missing_principal",
+			Detail: "X-Principal-Id header is required"}
+	}
+	return s.authorize(ctx, CommandContext{TenantID: query.TenantID, PrincipalID: query.PrincipalID}, legalEntityID, action)
 }
 
 // checkBodyTenant: the tenant comes only from X-Tenant-Id. A body may

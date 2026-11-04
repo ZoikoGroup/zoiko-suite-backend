@@ -252,7 +252,7 @@ func (s *Service) ReviewScore(ctx context.Context, cmd CommandContext, id string
 		return nil, err
 	}
 
-	current, err := s.GetScore(ctx, QueryContext{TenantID: cmd.TenantID}, id)
+	current, err := s.loadScore(ctx, cmd.TenantID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +311,7 @@ func (s *Service) ArchiveScore(ctx context.Context, cmd CommandContext, id strin
 		return nil, domain.ValidationError([]domain.FieldError{{Field: "reason", Detail: "must be at most 500 characters"}})
 	}
 
-	current, err := s.GetScore(ctx, QueryContext{TenantID: cmd.TenantID}, id)
+	current, err := s.loadScore(ctx, cmd.TenantID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -358,10 +358,24 @@ func (s *Service) ArchiveScore(ctx context.Context, cmd CommandContext, id strin
 // ---------------------------------------------------------------------------
 
 // GetScore returns one score with its factor breakdown; another tenant's
-// score is reported as not found.
+// score is reported as not found. The caller must hold RISK_SCORE_READ for
+// the score's legal entity.
 func (s *Service) GetScore(ctx context.Context, query QueryContext, id string) (*domain.RiskScoreAssessment, error) {
+	assessment, err := s.loadScore(ctx, query.TenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authorizeRead(ctx, query, assessment.LegalEntityID, ActionRiskScoreRead); err != nil {
+		return nil, err
+	}
+	return assessment, nil
+}
+
+// loadScore reads one score in the tenant without an authorization check
+// (used by writes, which authorize their own action).
+func (s *Service) loadScore(ctx context.Context, tenantID, id string) (*domain.RiskScoreAssessment, error) {
 	var assessment *domain.RiskScoreAssessment
-	err := s.store.InTenantTx(ctx, query.TenantID, func(q *store.TenantQueries) error {
+	err := s.store.InTenantTx(ctx, tenantID, func(q *store.TenantQueries) error {
 		found, err := q.GetAssessment(ctx, id, false)
 		assessment = found
 		return err
@@ -384,6 +398,9 @@ type ScorePage struct {
 
 // ListScores returns a filtered page of scores, newest first.
 func (s *Service) ListScores(ctx context.Context, query QueryContext, filter store.AssessmentFilter, page store.PageRequest) (*ScorePage, error) {
+	if err := s.authorizeRead(ctx, query, query.readScope(filter.LegalEntityID), ActionRiskScoreRead); err != nil {
+		return nil, err
+	}
 	var assessments []domain.RiskScoreAssessment
 	var next *store.PageCursor
 	err := s.store.InTenantTx(ctx, query.TenantID, func(q *store.TenantQueries) error {
@@ -412,6 +429,9 @@ type SubjectHistory struct {
 // (ACTIVE, SUPERSEDED and ARCHIVED), newest first, plus the current ACTIVE
 // score and a trend derived from its delta to the previous score.
 func (s *Service) GetSubjectHistory(ctx context.Context, query QueryContext, subjectType domain.SubjectType, subjectID string, page store.PageRequest) (*SubjectHistory, error) {
+	if err := s.authorizeRead(ctx, query, query.readScope(""), ActionRiskScoreRead); err != nil {
+		return nil, err
+	}
 	history := &SubjectHistory{SubjectType: subjectType, SubjectID: subjectID, Trend: "NO_HISTORY"}
 
 	err := s.store.InTenantTx(ctx, query.TenantID, func(q *store.TenantQueries) error {
