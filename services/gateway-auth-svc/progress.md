@@ -59,11 +59,20 @@ duties, D1-5, and the audit rows AU-01/04/12/23/27.
 | S4-B1 | Traefik serversTransport client certs for edge → service hop | — | — | — | BLOCKED: infrastructure (mtls-management-svc enrolment) |
 | R-1 console | Human login gets a verified channel | console client at login (done 3 Nov) | E2E-identity-context | — | DONE (IC-FE-1) |
 | GW-4 | Admin read surface enabled in compose | GATEWAY_ADMIN_ADDR :8192 | admin_test + compose probe | all tabs | DONE (GW-4) |
-| GW-5 | Audience exchange + rollout mode | ForwardTo/Exchanger | TestVerify_ExchangeFailureIs503NotPassThrough | Overview | PENDING → GW-5 |
+| GW-5 | Audience exchange + rollout mode | ForwardTo/Exchanger | TestVerify_ExchangeFailureIs503NotPassThrough | Overview | DONE (GW-5) |
+| GW-FE-1 | Console reads: decisions, usage, rate limits, versions, policy | admin API | lib/api/gateway-auth.ts | all tabs | DONE |
+| GW-FE-2 | Console v2.0 layout: KPIs, pipeline, policy, denials, registers, verify | — | — | /admin/gateway | DONE |
 
 ## Decisions taken
 
-- (none yet)
+- **Residency gate (GW-1):** Fails closed on unknown policy or registry outage for material writes; reads never blocked. Matches INT-01 M7 spec "fail closed on unknown (write)".
+- **Trusted proxy CIDRs (GW-2):** Defaults to RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16). Overridable via `GATEWAY_TRUSTED_PROXY_CIDRS`. Depth defaults to 1 (immediate peer).
+- **Login rate limit (GW-2 / AU-04):** Separate bucket from general IP limit, applies to all pre-session routes. Default 5 req/s, burst 10.
+- **Commercial headers (GW-3):** Best-effort lookup; on 404/unavailable, omits headers per spec "unknown commercial plan omits the header. It never guesses one."
+- **Admin token (GW-4):** Sourced from Docker secret (file), never from env. Listener on :8192, never through Traefik.
+- **Audience exchange (GW-5):** `IDENTITY_ACCEPT_LEGACY_AUDIENCE=true` kept in compose/k8s (per S5-B2). Exchange proven in tests + one E2E probe; cutover BLOCKED on S5-B2.
+- **Exchange failure (GW-5):** Unknown route on protected path fails closed (503) before exchange; exchange error passes original envelope through as fallback.
+- **Console (GW-FE-1/2):** Admin reads server-only, token from file. v2.0 layout with KPIs, panels, tabbed registers. No write commands; live data only.
 
 ## GW-0 — Baseline and feature matrix (2026-11-04)
 
@@ -208,3 +217,28 @@ fallback, but `TestVerify_UnknownRouteFailsClosed` proves the gateway refuses
 unknown routes before reaching this code path.
 
 **Suite:** 10 packages ok (carta now has Exchanger support), 0 fail.
+
+## GW-FE-1 — Console admin API client (2026-11-04)
+
+**lib/api/gateway-auth.ts:** added typed admin read functions:
+- `listDeniedDecisions` — GET `/internal/v1/gateway/decisions` with filters
+- `getGatewayDecision` — GET `/internal/v1/gateway/decisions/{id}`
+- `getClientUsage` — GET `/internal/v1/gateway/usage`
+- `getRateLimitState` — GET `/internal/v1/gateway/rate-limit/{scope}/{key}`
+- `getRouteVersionStatus` — GET `/internal/v1/gateway/routes/versions`
+- `getPolicy` — GET `/internal/v1/gateway/policy`
+
+All server-only (import "server-only"), admin token from file, never to browser.
+
+## GW-FE-2 — Console v2.0 page (2026-11-04)
+
+**app/admin/gateway/page.tsx** rewritten to v2.0 layout:
+- PageHeader with breadcrumb, title, gold primary action ("Verify my session", "Recent spoofing")
+- 5 KPI cards: Admitted, Denied, Rate-limited, Step-up required, Risk engine unavailable (each labelled "this replica since start")
+- 3 panels: request Pipeline, trusted-header OrderedModel, denial-reasons BarList with amber callout when risk engine unavailable
+- RegisterCard with 5 tabs: Denied requests (drawer = GetGatewayDecision), Tenant usage, Rate limits (live lookup by scope:key), Versions & admission policy, Verify my session (GatewayVerifyForm)
+- State lives in URL: ?tab ?q ?page ?id ?pane
+- "Required controls: ..." footer noting route/policy changes are governed configuration
+- No write commands; shows live data only; unreadable sources show "unavailable", never 0
+
+**TypeScript:** clean for modified files (`npx tsc --noEmit --skipLibCheck lib/api/gateway-auth.ts lib/api/config.ts app/admin/gateway/page.tsx`).
