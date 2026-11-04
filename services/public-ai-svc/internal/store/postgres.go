@@ -129,7 +129,8 @@ func (p *Postgres) SessionByIdempotencyKey(ctx context.Context, key string) (Ses
 	err := p.pool.QueryRow(ctx, `SELECT `+sessionCols+`, i.request_hash
 		FROM public_ai.session_idempotency i JOIN public_ai.sessions s USING (session_id)
 		WHERE i.idempotency_key = $1`, key).
-		Scan(&s.SessionID, &s.GrantHash, &s.CreatedAt, &s.ExpiresAt, &s.Locale, &s.MarketCode, &s.PageContext, &s.DeletedAt, &s.PendingContext, &hash)
+		Scan(&s.SessionID, &s.GrantHash, &s.CreatedAt, &s.ExpiresAt, &s.Locale, &s.MarketCode, &s.PageContext, &s.DeletedAt, &s.PendingContext,
+			&s.LastSeenAt, &s.TokensUsed, &s.Origin, &hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, nil, ErrNotFound
 	}
