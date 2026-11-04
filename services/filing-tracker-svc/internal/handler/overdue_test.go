@@ -11,11 +11,12 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/filing-tracker-svc/internal/domain"
+	"zoiko.io/filing-tracker-svc/internal/store"
 )
 
 type alreadyOverdueStore struct{ *mockStore }
 
-func (alreadyOverdueStore) MarkOverdue(_ context.Context, _, _ string) (*domain.FilingRequirement, error) {
+func (alreadyOverdueStore) MarkOverdue(_ context.Context, _, _ string, _ store.EventMeta) (*domain.FilingRequirement, error) {
 	return nil, domain.ErrAlreadyOverdue
 }
 
@@ -25,7 +26,7 @@ func TestMarkOverdue_AlreadyOverdueIs409(t *testing.T) {
 	st.items["f1"] = &domain.FilingRequirement{FilingID: "f1", LegalEntityID: "le", Status: domain.StatusOverdue}
 	logger, _ := zap.NewDevelopment()
 	r := chi.NewRouter()
-	RegisterRoutes(r, New(alreadyOverdueStore{st}, &mockPublisher{}, &mockAuthz{}, logger))
+	RegisterRoutes(r, New(alreadyOverdueStore{st}, &mockAuthz{}, logger))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/filing-tracker/requirements/f1/mark-overdue", strings.NewReader(`{}`))
 	req.Header.Set("X-Tenant-Id", "t1")

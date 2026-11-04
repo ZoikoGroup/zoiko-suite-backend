@@ -21,6 +21,14 @@ var (
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".
 	ErrTenantMissing = errors.New("tenant scope missing")
+
+	// ErrSegregationOfDuties is a confirm by the principal who submitted the
+	// filing: submit and confirm must be done by different principals.
+	ErrSegregationOfDuties = errors.New("the principal who submitted the filing may not confirm it")
+
+	// ErrActorRequired is a write that reached the store without the
+	// gateway-verified principal that performs it.
+	ErrActorRequired = errors.New("acting principal is required")
 )
 
 type FilingStatus string
