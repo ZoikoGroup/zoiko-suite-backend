@@ -11,7 +11,6 @@ import (
 
 	"zoiko.io/clause-template-svc/internal/authz"
 	"zoiko.io/clause-template-svc/internal/domain"
-	"zoiko.io/clause-template-svc/internal/events"
 	"zoiko.io/clause-template-svc/internal/middleware"
 	"zoiko.io/clause-template-svc/internal/store"
 )
@@ -40,14 +39,16 @@ type AuthZClient interface {
 }
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthZClient
-	logger    *zap.Logger
+	store  store.Store
+	authz  AuthZClient
+	logger *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+// New creates a Handler. Events are not published from here: every store
+// write emits its event into the transactional outbox in the same
+// transaction, and the outbox relay (cmd/server) delivers it.
+func New(st store.Store, az AuthZClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
 }
 
 var _ AuthZClient = (*authz.Client)(nil)
@@ -104,6 +105,9 @@ func (h *Handler) CreateClause(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if !requireActor(w, principalID, req.CreatedBy) {
+		return
+	}
 	if req.Title == "" || req.Body == "" || req.Category == "" {
 		writeError(w, http.StatusBadRequest, "title, body, and category are required")
 		return
@@ -124,19 +128,14 @@ func (h *Handler) CreateClause(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom:  req.EffectiveFrom,
 		EffectiveTo:    req.EffectiveTo,
 		AuthoredByAI:   req.AuthoredByAI,
-		CreatedBy:      req.CreatedBy,
+		CreatedBy:      principalID,
 	}
 
-	if err := h.store.CreateClause(r.Context(), c); err != nil {
+	if err := h.store.CreateClause(auditCtx(r, principalID), c); err != nil {
 		h.writeLifecycleErr(w, "failed to create clause", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "clause.created", EntityID: c.ClauseID, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
-	})
 	writeJSON(w, http.StatusCreated, c)
 }
 
@@ -172,7 +171,6 @@ func (h *Handler) ListClauses(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateClause(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -195,6 +193,9 @@ func (h *Handler) UpdateClause(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if !requireActor(w, principalID, req.UpdatedBy) {
+		return
+	}
 
 	if req.Title != "" {
 		existing.Title = req.Title
@@ -212,22 +213,16 @@ func (h *Handler) UpdateClause(w http.ResponseWriter, r *http.Request) {
 		existing.EffectiveTo = req.EffectiveTo
 	}
 
-	if err := h.store.UpdateClause(r.Context(), existing, req.ChangeSummary); err != nil {
+	if err := h.store.UpdateClause(auditCtx(r, principalID), existing, req.ChangeSummary); err != nil {
 		h.writeLifecycleErr(w, "failed to update clause", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "clause.updated", EntityID: id, TenantID: tenantID,
-		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
-	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
 func (h *Handler) SubmitClauseForLegalReview(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetClause(r.Context(), id)
 	if err != nil {
@@ -243,16 +238,11 @@ func (h *Handler) SubmitClauseForLegalReview(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	c, err := h.store.SubmitClauseForLegalReview(r.Context(), id, principalID)
+	c, err := h.store.SubmitClauseForLegalReview(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to submit clause for legal review", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "clause.submitted_for_legal_review", EntityID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -260,7 +250,6 @@ func (h *Handler) SubmitClauseForLegalReview(w http.ResponseWriter, r *http.Requ
 // the principal who submitted the clause for review may not approve it.
 func (h *Handler) ApproveClause(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetClause(r.Context(), id)
 	if err != nil {
@@ -280,22 +269,16 @@ func (h *Handler) ApproveClause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := h.store.ApproveClause(r.Context(), id, principalID)
+	c, err := h.store.ApproveClause(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to approve clause", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "clause.version_approved", EntityID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) ActivateClause(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetClause(r.Context(), id)
 	if err != nil {
@@ -311,22 +294,16 @@ func (h *Handler) ActivateClause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := h.store.ActivateClause(r.Context(), id, principalID)
+	c, err := h.store.ActivateClause(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to activate clause", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "clause.activated", EntityID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) RetireClause(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetClause(r.Context(), id)
 	if err != nil {
@@ -342,22 +319,16 @@ func (h *Handler) RetireClause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := h.store.RetireClause(r.Context(), id, principalID)
+	c, err := h.store.RetireClause(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to retire clause", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "clause.retired", EntityID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) SupersedeClause(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.SupersedeClauseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -383,16 +354,11 @@ func (h *Handler) SupersedeClause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := h.store.SupersedeClause(r.Context(), id, req.SupersededBy)
+	c, err := h.store.SupersedeClause(auditCtx(r, principalID), id, req.SupersededBy)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to supersede clause", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "clause.superseded", EntityID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -415,7 +381,6 @@ func (h *Handler) ListClauseVersions(w http.ResponseWriter, r *http.Request) {
 // --- Deviation Rule Handlers ---
 
 func (h *Handler) CreateDeviationRule(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -425,6 +390,9 @@ func (h *Handler) CreateDeviationRule(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateDeviationRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !requireActor(w, principalID, req.ProposedBy) {
 		return
 	}
 	if req.Description == "" || req.JurisdictionID == "" {
@@ -449,16 +417,11 @@ func (h *Handler) CreateDeviationRule(w http.ResponseWriter, r *http.Request) {
 		Description:        req.Description,
 		ProposedBy:         principalID,
 	}
-	if err := h.store.CreateDeviationRule(r.Context(), d); err != nil {
+	if err := h.store.CreateDeviationRule(auditCtx(r, principalID), d); err != nil {
 		h.writeLifecycleErr(w, "failed to create deviation rule", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "deviation_rule.created", EntityID: d.DeviationID, TenantID: tenantID,
-		LegalEntityID: d.LegalEntityID, Jurisdiction: d.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
-	})
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -500,7 +463,6 @@ func (h *Handler) ListDeviationRules(w http.ResponseWriter, r *http.Request) {
 // not approve their own deviation.
 func (h *Handler) ApproveDeviationRule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetDeviationRule(r.Context(), id)
 	if err != nil {
@@ -520,16 +482,11 @@ func (h *Handler) ApproveDeviationRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	d, err := h.store.ApproveDeviationRule(r.Context(), id, principalID)
+	d, err := h.store.ApproveDeviationRule(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to approve deviation rule", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "deviation_rule.changed", EntityID: id, TenantID: tenantID,
-		LegalEntityID: d.LegalEntityID, Jurisdiction: d.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
-	})
 	writeJSON(w, http.StatusOK, d)
 }
 
@@ -546,6 +503,9 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateTemplateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !requireActor(w, principalID, req.CreatedBy) {
 		return
 	}
 	if req.Title == "" || req.ContractType == "" {
@@ -568,19 +528,14 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 		JurisdictionID: req.JurisdictionID,
 		EffectiveFrom:  req.EffectiveFrom,
 		EffectiveTo:    req.EffectiveTo,
-		CreatedBy:      req.CreatedBy,
+		CreatedBy:      principalID,
 	}
 
-	if err := h.store.CreateTemplate(r.Context(), t); err != nil {
+	if err := h.store.CreateTemplate(auditCtx(r, principalID), t); err != nil {
 		h.writeLifecycleErr(w, "failed to create template", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "template.created", EntityID: t.TemplateID, TenantID: tenantID,
-		LegalEntityID: t.LegalEntityID, Jurisdiction: t.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: t,
-	})
 	writeJSON(w, http.StatusCreated, t)
 }
 
@@ -616,7 +571,6 @@ func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -639,6 +593,9 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if !requireActor(w, principalID, req.UpdatedBy) {
+		return
+	}
 
 	if req.Title != "" {
 		existing.Title = req.Title
@@ -659,16 +616,11 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 		existing.EffectiveTo = req.EffectiveTo
 	}
 
-	if err := h.store.UpdateTemplate(r.Context(), existing); err != nil {
+	if err := h.store.UpdateTemplate(auditCtx(r, principalID), existing); err != nil {
 		h.writeLifecycleErr(w, "failed to update template", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "template.updated", EntityID: id, TenantID: tenantID,
-		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
-	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -676,7 +628,6 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 // canonical event (LEG-06 §8).
 func (h *Handler) ApproveTemplate(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetTemplate(r.Context(), id)
 	if err != nil {
@@ -692,16 +643,11 @@ func (h *Handler) ApproveTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := h.store.ApproveTemplate(r.Context(), id, principalID)
+	t, err := h.store.ApproveTemplate(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to approve template", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "template.approved", EntityID: id, TenantID: tenantID,
-		LegalEntityID: t.LegalEntityID, Jurisdiction: t.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: t,
-	})
 	writeJSON(w, http.StatusOK, t)
 }
 
@@ -754,4 +700,28 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// requireActor applies the platform actor rule to a request-body actor field
+// (created_by, updated_by, …): the actor of a write is the authenticated
+// X-Principal-Id. An absent body value is filled from the principal by the
+// caller; a present value naming someone else is refused 403 actor_mismatch
+// rather than silently recorded or silently overridden.
+func requireActor(w http.ResponseWriter, principalID, bodyActor string) bool {
+	if bodyActor != "" && bodyActor != principalID {
+		writeCoded(w, http.StatusForbidden, "actor_mismatch", "request body actor does not match the authenticated principal")
+		return false
+	}
+	return true
+}
+
+// auditCtx attaches the write attribution (principal + correlation id) that
+// the store stamps on the outbox event it writes in the same transaction.
+func auditCtx(r *http.Request, principalID string) context.Context {
+	return store.WithAudit(r.Context(), store.Audit{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")})
+}
+
+// writeCoded is writeError plus a stable machine-readable code.
+func writeCoded(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
 }

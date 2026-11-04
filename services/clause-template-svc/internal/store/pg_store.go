@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,8 +29,66 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/clause-template-svc/internal/domain"
+	"zoiko.io/clause-template-svc/internal/events"
 	"zoiko.io/clause-template-svc/internal/middleware"
+	"zoiko.io/clause-template-svc/internal/outbox"
 )
+
+// Audit identifies who caused a write and the request it belongs to. ActorID
+// is the authenticated principal (X-Principal-Id), never a request-body value.
+// The handler attaches it to the request context (WithAudit); every write
+// stamps it on the outbox event it emits in its own transaction, and a write
+// without one is refused rather than emitting an unattributed event.
+type Audit struct {
+	ActorID       string
+	CorrelationID string
+}
+
+type auditKey struct{}
+
+// WithAudit returns ctx carrying the write attribution.
+func WithAudit(ctx context.Context, a Audit) context.Context {
+	return context.WithValue(ctx, auditKey{}, a)
+}
+
+// AuditFrom returns the write attribution attached by WithAudit.
+func AuditFrom(ctx context.Context) (Audit, bool) {
+	a, ok := ctx.Value(auditKey{}).(Audit)
+	return a, ok && a.ActorID != ""
+}
+
+// ErrAuditMissing means a write reached the store without an attributed actor.
+var ErrAuditMissing = errors.New("write attribution (actor) missing from context")
+
+// emit writes one domain event into the transactional outbox using the
+// caller's transaction, so the change and its event commit or roll back
+// together. The payload is the full envelope the direct publish used to send.
+func (s *PgStore) emit(ctx context.Context, tx pgx.Tx, tenantID, eventType, entityID, legalEntityID, jurisdiction string, payload any) error {
+	a, ok := AuditFrom(ctx)
+	if !ok {
+		return fmt.Errorf("emit %s: %w", eventType, ErrAuditMissing)
+	}
+	id := uuid.NewString()
+	_, err := outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: id,
+		AggregateType: strings.SplitN(eventType, ".", 2)[0],
+		AggregateID:   entityID,
+		EventType:     eventType,
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		ActorID:       a.ActorID,
+		CorrelationID: a.CorrelationID,
+		Payload: events.NewEvent(id, events.PublishParams{
+			EventType: eventType, EntityID: entityID, TenantID: tenantID,
+			LegalEntityID: legalEntityID, Jurisdiction: jurisdiction,
+			ActorID: a.ActorID, CorrelationID: a.CorrelationID, Payload: payload,
+		}),
+	})
+	if err != nil {
+		return fmt.Errorf("emit %s: %w", eventType, err)
+	}
+	return nil
+}
 
 type Store interface {
 	CreateClause(ctx context.Context, c *domain.Clause) error
@@ -181,6 +240,9 @@ func (s *PgStore) CreateClause(ctx context.Context, c *domain.Clause) error {
 		return fmt.Errorf("snapshot clause version: %w", err)
 	}
 
+	if err := s.emit(ctx, tx, tenantID, "clause.created", c.ClauseID, c.LegalEntityID, c.JurisdictionID, c); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -286,6 +348,9 @@ func (s *PgStore) UpdateClause(ctx context.Context, c *domain.Clause, changeSumm
 		return fmt.Errorf("snapshot clause version: %w", err)
 	}
 
+	if err := s.emit(ctx, tx, tenantID, "clause.updated", c.ClauseID, c.LegalEntityID, c.JurisdictionID, c); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -320,6 +385,9 @@ func (s *PgStore) SubmitClauseForLegalReview(ctx context.Context, id, submittedB
 		WHERE clause_id=$5 AND tenant_id=$6`,
 		string(c.Status), c.SubmittedBy, c.SubmittedAt, c.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "clause.submitted_for_legal_review", c.ClauseID, c.LegalEntityID, c.JurisdictionID, c); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -371,6 +439,9 @@ func (s *PgStore) ApproveClause(ctx context.Context, id, approvedBy string) (*do
 	if err := s.snapshotClauseVersion(ctx, tx, c, "Clause approved"); err != nil {
 		return nil, err
 	}
+	if err := s.emit(ctx, tx, tenantID, "clause.version_approved", c.ClauseID, c.LegalEntityID, c.JurisdictionID, c); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -411,6 +482,9 @@ func (s *PgStore) ActivateClause(ctx context.Context, id, activatedBy string) (*
 	); err != nil {
 		return nil, err
 	}
+	if err := s.emit(ctx, tx, tenantID, "clause.activated", c.ClauseID, c.LegalEntityID, c.JurisdictionID, c); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -448,6 +522,9 @@ func (s *PgStore) RetireClause(ctx context.Context, id, retiredBy string) (*doma
 		WHERE clause_id=$5 AND tenant_id=$6`,
 		string(c.Status), c.RetiredBy, c.RetiredAt, c.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "clause.retired", c.ClauseID, c.LegalEntityID, c.JurisdictionID, c); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -490,6 +567,9 @@ func (s *PgStore) SupersedeClause(ctx context.Context, id, supersededBy string) 
 		WHERE clause_id=$4 AND tenant_id=$5`,
 		string(c.Status), c.SupersededBy, c.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "clause.superseded", c.ClauseID, c.LegalEntityID, c.JurisdictionID, c); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -599,6 +679,9 @@ func (s *PgStore) CreateTemplate(ctx context.Context, t *domain.ContractTemplate
 		return fmt.Errorf("insert template: %w", err)
 	}
 
+	if err := s.emit(ctx, tx, tenantID, "template.created", t.TemplateID, t.LegalEntityID, t.JurisdictionID, t); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -693,6 +776,9 @@ func (s *PgStore) UpdateTemplate(ctx context.Context, t *domain.ContractTemplate
 		return fmt.Errorf("update template: %w", err)
 	}
 
+	if err := s.emit(ctx, tx, tenantID, "template.updated", t.TemplateID, t.LegalEntityID, t.JurisdictionID, t); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -731,6 +817,9 @@ func (s *PgStore) ApproveTemplate(ctx context.Context, id, approvedBy string) (*
 		WHERE template_id=$5 AND tenant_id=$6`,
 		string(t.Status), t.ApprovedBy, t.ApprovedAt, t.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "template.approved", t.TemplateID, t.LegalEntityID, t.JurisdictionID, t); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -790,6 +879,9 @@ func (s *PgStore) CreateDeviationRule(ctx context.Context, d *domain.DeviationRu
 	)
 	if err != nil {
 		return fmt.Errorf("insert deviation rule: %w", err)
+	}
+	if err := s.emit(ctx, tx, tenantID, "deviation_rule.created", d.DeviationID, d.LegalEntityID, d.JurisdictionID, d); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }
@@ -888,6 +980,9 @@ func (s *PgStore) ApproveDeviationRule(ctx context.Context, id, approvedBy strin
 		WHERE deviation_id=$4 AND tenant_id=$5`,
 		string(d.Status), d.ApprovedBy, d.ApprovedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "deviation_rule.changed", d.DeviationID, d.LegalEntityID, d.JurisdictionID, d); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
