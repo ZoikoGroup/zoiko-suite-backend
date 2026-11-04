@@ -23,21 +23,21 @@ func TestPgStore_Assess_RequiresSubmitted(t *testing.T) {
 	ctx := middleware.WithTenant(context.Background(), "tenant-assess")
 	s := store.NewPgStore(pool)
 	r := newReturn()
-	if err := s.Create(ctx, r); err != nil {
+	if err := s.Create(ctx, r, store.EventMeta{}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	req := &domain.AssessTaxReturnRequest{AssessedTaxAmount: 25, AssessmentReference: "REF"}
-	if _, err := s.Assess(ctx, r.ReturnID, req); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+	if _, err := s.Assess(ctx, r.ReturnID, req, "p3", store.EventMeta{}); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("assess DRAFT: expected ErrInvalidStatusTransition, got %v", err)
 	}
-	if _, err := s.Submit(ctx, r.ReturnID, "p2"); err != nil {
+	if _, err := s.Submit(ctx, r.ReturnID, "p2", store.EventMeta{}); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	got, err := s.Assess(ctx, r.ReturnID, req)
+	got, err := s.Assess(ctx, r.ReturnID, req, "p3", store.EventMeta{})
 	if err != nil || got.Status != domain.StatusAssessed {
 		t.Fatalf("assess SUBMITTED: %v status=%v", err, got)
 	}
-	if _, err := s.Assess(ctx, r.ReturnID, req); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+	if _, err := s.Assess(ctx, r.ReturnID, req, "p3", store.EventMeta{}); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("re-assess: expected ErrInvalidStatusTransition, got %v", err)
 	}
 }
@@ -48,10 +48,33 @@ func TestPgStore_Create_DuplicateIsErrDuplicateReturn(t *testing.T) {
 	pool := freshTestDB(t)
 	ctx := middleware.WithTenant(context.Background(), "tenant-dup")
 	s := store.NewPgStore(pool)
-	if err := s.Create(ctx, newReturn()); err != nil {
+	if err := s.Create(ctx, newReturn(), store.EventMeta{}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := s.Create(ctx, newReturn()); !errors.Is(err, domain.ErrDuplicateReturn) {
+	if err := s.Create(ctx, newReturn(), store.EventMeta{}); !errors.Is(err, domain.ErrDuplicateReturn) {
 		t.Fatalf("expected ErrDuplicateReturn, got %v", err)
+	}
+}
+
+// Segregation of duties, enforced under the row lock: the submitter of a
+// return may not record its assessment.
+func TestPgStore_Assess_BySubmitterIsErrSegregationOfDuties(t *testing.T) {
+	pool := freshTestDB(t)
+	ctx := middleware.WithTenant(context.Background(), "tenant-sod")
+	s := store.NewPgStore(pool)
+	r := newReturn()
+	if err := s.Create(ctx, r, store.EventMeta{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.Submit(ctx, r.ReturnID, "p2", store.EventMeta{}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	req := &domain.AssessTaxReturnRequest{AssessedTaxAmount: 25, AssessmentReference: "REF"}
+	if _, err := s.Assess(ctx, r.ReturnID, req, "p2", store.EventMeta{}); !errors.Is(err, domain.ErrSegregationOfDuties) {
+		t.Fatalf("assess by submitter: expected ErrSegregationOfDuties, got %v", err)
+	}
+	got, err := s.GetByID(ctx, r.ReturnID)
+	if err != nil || got.Status != domain.StatusSubmitted {
+		t.Fatalf("refused assessment must leave the return SUBMITTED: %v %v", err, got)
 	}
 }

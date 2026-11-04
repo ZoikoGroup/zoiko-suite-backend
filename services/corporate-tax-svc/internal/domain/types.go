@@ -18,6 +18,9 @@ var (
 	// ErrInvalidStatusTransition is a lifecycle step requested from a status
 	// that does not permit it (e.g. assessing a return never submitted).
 	ErrInvalidStatusTransition = errors.New("corporate tax return status does not permit this action")
+	// ErrSegregationOfDuties: the principal who submitted a return may not
+	// also record its assessment.
+	ErrSegregationOfDuties = errors.New("the principal who submitted a corporate tax return may not assess it")
 
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".
