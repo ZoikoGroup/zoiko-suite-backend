@@ -116,7 +116,7 @@ func TestAU09_PreSessionRoutesThrottled(t *testing.T) {
 
 			var last *httptest.ResponseRecorder
 			for i := 0; i < 3; i++ {
-				last = postLifecycle(t, r, path, "tenant-a", "", map[string]any{"token": "t", "password": "Secret12345678", "email": "a@zoiko.io"})
+				last = postLifecycle(t, r, path, "tenant-a", "", map[string]any{"token": "t", "password": "Secret12345678", "email": "a@zoiko.io"}) // gitleaks:allow -- test fixture password, not a secret
 			}
 			assert.Equal(t, http.StatusTooManyRequests, last.Code, last.Body.String())
 			assert.NotEmpty(t, last.Header().Get("Retry-After"))

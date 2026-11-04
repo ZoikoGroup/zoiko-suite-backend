@@ -224,7 +224,7 @@ func TestAU09_ActivationLinkSingleUse(t *testing.T) {
 	st := &mockLifecycleStore{consumeErr: domain.ErrCredentialTokenUsed}
 	r := lifecycleRouter(newLifecycleService(st), &permittingAuthz{})
 
-	w := postLifecycle(t, r, "/v1/account/activate", "tenant-a", "", map[string]any{"token": "used-token", "password": "Secret12345678"})
+	w := postLifecycle(t, r, "/v1/account/activate", "tenant-a", "", map[string]any{"token": "used-token", "password": "Secret12345678"}) // gitleaks:allow -- test fixture password, not a secret
 
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), "link_invalid")
