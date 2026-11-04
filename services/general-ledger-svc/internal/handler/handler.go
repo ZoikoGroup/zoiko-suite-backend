@@ -1579,6 +1579,8 @@ func (h *Handler) writeMappingErr(w http.ResponseWriter, err error) bool {
 		writeError(w, http.StatusForbidden, "mapping_self_approval", err.Error())
 	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
 		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+	case errors.Is(err, domain.ErrMappingActivationConflict):
+		writeError(w, http.StatusConflict, "mapping_activation_conflict", err.Error())
 	default:
 		return false
 	}

@@ -1243,6 +1243,15 @@ var (
 	// ActivateMapping, where the maker-checker SoD check actually applies.
 	ErrMappingHighRiskRequiresGovernedLifecycle = errorString("mapping onto a control account requires the governed CreateMapping/ApproveMapping/ActivateMapping lifecycle, not SetAccountMapping")
 
+	// ErrMappingActivationConflict is ACC-02's negative path #1, "two active
+	// mappings with same precedence," caught at the one point it can still
+	// occur despite idx_account_mappings_active (migration 000029): two
+	// different APPROVED mappings for the same key both racing
+	// ActivateMapping. The index still guarantees only one can ever commit
+	// as ACTIVE — this is that guarantee surfacing as a clean, named refusal
+	// instead of a raw constraint-violation 503.
+	ErrMappingActivationConflict = errorString("another mapping for this key was activated concurrently; this mapping was not activated — re-check the current mapping and retry if it still needs to be")
+
 	ErrPostingExecutionNotFound = errorString("posting execution not found")
 
 	// ErrPostingRuleAmbiguous is returned when a posting line names neither

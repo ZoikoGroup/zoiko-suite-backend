@@ -363,3 +363,119 @@ func TestPgStore_AccountMappingLifecycle_IdempotencyKeyReplay(t *testing.T) {
 		t.Fatalf("both the original and the replay must report SUPERSEDED, got %s and %s", superseded1.Status, superseded2.Status)
 	}
 }
+
+// TestPgStore_ActivateMapping_ConcurrentActivation_OneWinsOneGetsCleanConflict
+// is ACC-02's negative path #1, "two active mappings with same precedence,"
+// actually happening: two different APPROVED mappings for the SAME key, both
+// racing ActivateMapping. idx_account_mappings_active (migration 000029)
+// guarantees only one can ever commit as ACTIVE; this proves the loser gets
+// a clean, named ErrMappingActivationConflict — not a raw constraint
+// violation surfaced as a generic 503 — and that the collision is recorded
+// as evidence (a MappingAmbiguityDetected event in the outbox).
+//
+// A plain goroutine race (start both, see who wins) is not reliable here:
+// ActivateMapping's own prevID lookup means a call that starts even
+// slightly after the other has COMMITTED takes the ordinary
+// supersede-by-replacement path, not the race path — this was tried first
+// and both calls simply succeeded sequentially, proving nothing. To force
+// the actual race deterministically, transaction A's activation is driven
+// by hand (the same SQL ActivateMapping itself runs) and held OPEN,
+// UNCOMMITTED, across the point where transaction B's real
+// s.ActivateMapping call reaches its own conflicting UPDATE and blocks on
+// A's still-uncommitted row — only then is A committed, so B's block
+// resolves into the exact 23505 this test exists to prove is handled
+// cleanly.
+func TestPgStore_ActivateMapping_ConcurrentActivation_OneWinsOneGetsCleanConflict(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	acctA := newTestAccount(tenantID, "8000", "Misc A")
+	acctB := newTestAccount(tenantID, "8001", "Misc B")
+	if err := s.CreateAccount(ctx, acctA); err != nil {
+		t.Fatalf("CreateAccount A: %v", err)
+	}
+	if err := s.CreateAccount(ctx, acctB); err != nil {
+		t.Fatalf("CreateAccount B: %v", err)
+	}
+
+	mA := newMappingDraft(tenantID, "RACE:KEY", "8000", "author-1")
+	mB := newMappingDraft(tenantID, "RACE:KEY", "8001", "author-1")
+	if _, err := s.CreateMapping(ctx, mA, idemKey()); err != nil {
+		t.Fatalf("CreateMapping A: %v", err)
+	}
+	if _, err := s.CreateMapping(ctx, mB, idemKey()); err != nil {
+		t.Fatalf("CreateMapping B: %v", err)
+	}
+	if _, _, err := s.ApproveMapping(ctx, tenantID, mA.AccountMappingID, "approver-1", idemKey()); err != nil {
+		t.Fatalf("ApproveMapping A: %v", err)
+	}
+	if _, _, err := s.ApproveMapping(ctx, tenantID, mB.AccountMappingID, "approver-1", idemKey()); err != nil {
+		t.Fatalf("ApproveMapping B: %v", err)
+	}
+
+	// Transaction A: activate mA by hand, same SQL as ActivateMapping's own
+	// final UPDATE, and leave it uncommitted.
+	txA, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin txA: %v", err)
+	}
+	defer txA.Rollback(context.Background()) //nolint:errcheck
+	if _, err := txA.Exec(context.Background(), `
+		UPDATE account_mappings SET status = 'ACTIVE', activated_at = NOW(), effective_from = NOW()
+		WHERE tenant_id = $1 AND account_mapping_id = $2 AND status = 'APPROVED'
+	`, tenantID, mA.AccountMappingID); err != nil {
+		t.Fatalf("txA activate mA: %v", err)
+	}
+
+	bDone := make(chan struct{ err error })
+	go func() {
+		_, _, err := s.ActivateMapping(ctx, tenantID, mB.AccountMappingID, time.Time{}, idemKey())
+		bDone <- struct{ err error }{err}
+	}()
+
+	// Give B time to reach its own conflicting UPDATE and block on txA's
+	// still-uncommitted row before txA is released.
+	time.Sleep(300 * time.Millisecond)
+	if err := txA.Commit(context.Background()); err != nil {
+		t.Fatalf("commit txA: %v", err)
+	}
+
+	result := <-bDone
+	if !errors.Is(result.err, domain.ErrMappingActivationConflict) {
+		t.Fatalf("expected B to lose the race with ErrMappingActivationConflict, got %v", result.err)
+	}
+
+	var activeRows int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM account_mappings WHERE tenant_id = $1 AND mapping_key = $2 AND status = 'ACTIVE'`, tenantID, "RACE:KEY").Scan(&activeRows); err != nil {
+		t.Fatalf("count active rows: %v", err)
+	}
+	if activeRows != 1 {
+		t.Fatalf("expected exactly one ACTIVE row to survive the race, got %d", activeRows)
+	}
+
+	resolved, err := s.GetCurrentAccountMapping(ctx, tenantID, "RACE:KEY")
+	if err != nil || resolved.AccountCode != "8000" {
+		t.Fatalf("expected A (8000) to be the resolvable winner, got %+v (err %v)", resolved, err)
+	}
+
+	bRow, err := s.GetMappingByID(ctx, tenantID, mB.AccountMappingID)
+	if err != nil {
+		t.Fatalf("GetMappingByID B: %v", err)
+	}
+	if bRow.Status != domain.AccountMappingStatusApproved {
+		t.Fatalf("B's own transaction must have rolled back on conflict, leaving it APPROVED, got %s", bRow.Status)
+	}
+
+	var ambiguityEvents int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT COUNT(*) FROM eventing_outbox
+		WHERE tenant_id = $1 AND event_type = 'com.zoikosuite.accounting.account-mapping.ambiguity-detected'
+	`, tenantID).Scan(&ambiguityEvents); err != nil {
+		t.Fatalf("count ambiguity events: %v", err)
+	}
+	if ambiguityEvents != 1 {
+		t.Fatalf("expected exactly one MappingAmbiguityDetected event recorded as evidence, got %d", ambiguityEvents)
+	}
+}

@@ -2005,6 +2005,10 @@ func (s *PgStore) ApproveMapping(ctx context.Context, tenantID, mappingID, princ
 func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID string, effectiveFrom time.Time, idempotencyKey string) (_ *domain.AccountMapping, replay bool, err error) {
 	var out *domain.AccountMapping
 	var supersededID string
+	// mappingKeyForEvidence survives the transaction even if it rolls back —
+	// a plain Go variable, not DB state — so a losing activation can still
+	// evidence WHICH key the race was over after the error path below runs.
+	var mappingKeyForEvidence string
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		claimedReplay, err := mappingIdempotencyRecord(ctx, tx, tenantID, idempotencyKey, commandActivateMapping, mappingID)
 		if err != nil {
@@ -2026,6 +2030,7 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 		if err != nil {
 			return mapPgError(err)
 		}
+		mappingKeyForEvidence = m.MappingKey
 		if m.Status != domain.AccountMappingStatusApproved {
 			return domain.ErrMappingNotApproved
 		}
@@ -2056,6 +2061,16 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 			WHERE tenant_id = $3 AND account_mapping_id = $4 AND status = $5
 		`, domain.AccountMappingStatusActive, at, tenantID, mappingID, domain.AccountMappingStatusApproved)
 		if err != nil {
+			// idx_account_mappings_active (migration 000029) is the ONLY
+			// unique index this UPDATE's new row can violate: another
+			// mapping for the same key raced this one to ACTIVE and won.
+			// This is negative path #1 ("two active mappings with same
+			// precedence") actually happening — surfaced here as a clean,
+			// named refusal rather than a raw constraint-violation 503.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.ErrMappingActivationConflict
+			}
 			return mapPgError(err)
 		}
 		if tag.RowsAffected() == 0 {
@@ -2083,6 +2098,24 @@ func (s *PgStore) ActivateMapping(ctx context.Context, tenantID, mappingID strin
 		}
 		return nil
 	})
+	if errors.Is(err, domain.ErrMappingActivationConflict) {
+		// The losing transaction above has already rolled back — this
+		// records the detected ambiguity (ACC-02's own MappingAmbiguityDetected
+		// event) in a fresh transaction, since nothing from the rolled-back
+		// one persists. Evidence recording is best-effort: if it fails, the
+		// caller still gets the real ErrMappingActivationConflict, not a
+		// masked store error.
+		_ = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+			var winnerID string
+			_ = tx.QueryRow(ctx, `
+				SELECT account_mapping_id FROM account_mappings
+				WHERE tenant_id = $1 AND mapping_key = $2 AND status = $3
+			`, tenantID, mappingKeyForEvidence, domain.AccountMappingStatusActive).Scan(&winnerID)
+			return s.enqueueMappingEvent(ctx, tx, "ambiguity-detected", tenantID, mappingID, "", "", map[string]any{
+				"mapping_key": mappingKeyForEvidence, "losing_mapping_id": mappingID, "winning_mapping_id": winnerID,
+			})
+		})
+	}
 	if err != nil {
 		return nil, false, err
 	}
