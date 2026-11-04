@@ -15,8 +15,10 @@ import (
 
 	"zoiko.io/key-management-svc/internal/authz"
 	"zoiko.io/key-management-svc/internal/config"
+	"zoiko.io/key-management-svc/internal/events"
 	"zoiko.io/key-management-svc/internal/handler"
 	"zoiko.io/key-management-svc/internal/idempotency"
+	"zoiko.io/key-management-svc/internal/outbox"
 	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
@@ -69,6 +71,19 @@ func main() {
 		WithIdempotency(idempotency.NewPgStore(pool)).
 		WithReadiness(pool)
 	router := handler.NewRouter(h)
+
+	// Transactional outbox relay: lifecycle events are written with the
+	// change in one transaction; the relay delivers them to Kafka.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if cfg.KafkaBrokers != "" {
+		publisher, closeKafka := events.NewKafkaPublisher(cfg.KafkaBrokers, cfg.KafkaTopic)
+		defer func() { _ = closeKafka() }()
+		go outbox.NewRelay(pool, publisher, 2*time.Second, 50, logger).Start(relayCtx)
+	} else {
+		logger.Warn("KAFKA_BROKERS is not set: the outbox relay is not running; events are kept in outbox_events and delivered once it is configured",
+			zap.String("topic", cfg.KafkaTopic))
+	}
 
 	// Wrap router with apicontract middleware
 	r := chi.NewRouter()

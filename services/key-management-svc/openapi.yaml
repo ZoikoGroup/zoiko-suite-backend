@@ -123,7 +123,7 @@ paths:
         - name: legal_entity_id
           in: query
           required: true
-          schema: { type: string, format: uuid }
+          schema: { type: string }
       responses:
         '200':
           description: List of keys
@@ -180,8 +180,10 @@ paths:
     post:
       summary: Rotate a customer key
       description: |
-        Advances the key's version by registering a new key with the same
-        alias and external ARN. The old key version is retired. Authorized
+        Records a rotation: the current version is retired and the next
+        version becomes current (key_version and rotation_count advance) in
+        one transaction. No key material is generated or re-wrapped here.
+        Emits key.rotated through the transactional outbox. Authorized
         on `KEY_ROTATE` at the key's own `legal_entity_id` (taken from the
         row, never from the caller).
       operationId: RotateKey
@@ -284,26 +286,36 @@ components:
 
     RegisterKeyRequest:
       type: object
-      required: [legal_entity_id, key_alias, key_model, key_provider, external_key_arn]
+      required: [legal_entity_id, key_alias, key_provider]
+      description: |
+        key_model defaults to BYOK. external_key_arn is required for BYOK and
+        HYOK keys.
       properties:
-        legal_entity_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
         key_alias: { type: string }
-        key_model: { type: string }
-        key_provider: { type: string }
-        external_key_arn: { type: string, format: uri }
+        key_model: { type: string, enum: [SYSTEM_MANAGED, BYOK, HYOK] }
+        key_provider: { type: string, enum: [AWS_KMS, AZURE_KEY_VAULT, GCP_KMS, HASHICORP_VAULT, EXTERNAL_HSM] }
+        external_key_arn: { type: string }
 
     CustomerKey:
       type: object
+      description: |
+        Key METADATA only. This service holds no key material and performs
+        no cryptographic operation; rotate and disable record lifecycle
+        changes against the external KMS reference.
+      required: [id, tenant_id, legal_entity_id, key_alias, key_model, key_provider, external_key_arn, key_version, state, rotation_count, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
-        legal_entity_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
         key_alias: { type: string }
-        key_model: { type: string }
-        key_provider: { type: string }
-        external_key_arn: { type: string, format: uri }
-        status: { type: string, enum: [ACTIVE, DISABLED, ROTATED] }
-        version: { type: integer }
-        prior_version_id: { type: string, format: uuid }
+        key_model: { type: string, enum: [SYSTEM_MANAGED, BYOK, HYOK] }
+        key_provider: { type: string, enum: [AWS_KMS, AZURE_KEY_VAULT, GCP_KMS, HASHICORP_VAULT, EXTERNAL_HSM] }
+        external_key_arn: { type: string }
+        key_version: { type: integer, minimum: 1 }
+        state: { type: string, enum: [ENABLED, DISABLED, PENDING_ROTATION, REVOKED] }
+        rotation_count: { type: integer, minimum: 0 }
+        last_rotated_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
