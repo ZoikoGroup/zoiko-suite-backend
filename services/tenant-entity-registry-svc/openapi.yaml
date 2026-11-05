@@ -2264,7 +2264,7 @@ paths:
         - bearerAuth: []
       parameters:
         - { name: status, in: query, required: false, schema: { type: string, enum: [OPEN, RESOLVED, DISMISSED] } }
-        - { name: case_type, in: query, required: false, schema: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT] } }
+        - { name: case_type, in: query, required: false, schema: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT, VERIFICATION_CONFLICT] } }
         - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
         - { name: cursor, in: query, required: false, schema: { type: string } }
       responses:
@@ -2282,7 +2282,7 @@ paths:
         `CREATE_NEW` (creates the party the held request asked for, as the requester's), `LINK_EXISTING` (names one of
         the candidates) or `DISMISS`. FACT_CONFLICT: `ACCEPT_PROPOSED_FACT` (the verified fact is superseded, never
         edited, and the accepted fact is verified now, so what was known earlier stays answerable) or `KEEP_VERIFIED`.
-        IDENTIFIER_CONFLICT: `KEEP_HOLDER` or `MOVE_TO_REQUESTER`. Merging is `:merge`.
+        IDENTIFIER_CONFLICT: `KEEP_HOLDER` or `MOVE_TO_REQUESTER`. VERIFICATION_CONFLICT: `KEEP_VERIFIED` or `ACCEPT_OBSERVATION`. Merging is `:merge`.
       tags: [Parties]
       security:
         - bearerAuth: []
@@ -2942,6 +2942,66 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
+  # ── ORG-09 / MDM-03 identifier verification ─────────────────────────────────
+  /v1/identifiers/{identifierID}:verify:
+    post:
+      operationId: verifyIdentifier
+      summary: ORG-09 VerifyIdentifier - record one observation of an external identifier and apply s14.1 precedence
+      description: |
+        Records what an authority or provider said (result MATCH, MISMATCH or NOT_FOUND), with its source, version,
+        exchange reference, time and evidence. The service calls no authority itself: whoever did, through the exchange
+        layer, or a steward holding the evidence, records the answer. The observation is always kept; whether it changes
+        the identifier is decided by precedence and freshness, never last-write-wins.
+
+        A provider or authority MATCH verifies (an LEI needs authority_status ISSUED). A tenant assertion or system import
+        verifies nothing. An observation older than the freshness window (90 days for an LEI, 365 for other schemes) or
+        older than the one already applied is recorded and not applied. A higher authority takes over a verification. A
+        higher authority that DISAGREES with a verified identifier opens a VERIFICATION_CONFLICT stewardship case and the
+        identifier becomes CONFLICTED: it is not overwritten, and no create links to it automatically until a steward
+        decides KEEP_VERIFIED or ACCEPT_OBSERVATION. The response's `effect` and `effect_note` say which of these happened.
+
+        For an LEI the value must be a well-formed ISO 17442 identifier (400 otherwise). `lei_alignment` compares a
+        verified LEI with the legal entity profile's LEI: ORG-03 owns the profile, so a difference is reported and never
+        written over. An LEI is one verified external identifier, never the platform's own key.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: identifierID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VerifyIdentifierRequest" } } }
+      responses:
+        "200":
+          description: The observation, the identifier, the party and any case it opened. A sensitive identifier's value is masked.
+          content: { application/json: { schema: { $ref: "#/components/schemas/IdentifierVerifyOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_master_version, the party is not live, or the identifier has ended", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/identifiers/{identifierID}/verifications:
+    get:
+      operationId: listIdentifierVerifications
+      summary: ORG-09 the observations recorded for an identifier, newest first, applied or not
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: identifierID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The observations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/IdentifierObservation" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3059,7 +3119,7 @@ components:
       type: object
       required: [decision, note, expected_case_version]
       properties:
-        decision: { type: string, enum: [CREATE_NEW, LINK_EXISTING, DISMISS, ACCEPT_PROPOSED_FACT, KEEP_VERIFIED, KEEP_HOLDER, MOVE_TO_REQUESTER] }
+        decision: { type: string, enum: [CREATE_NEW, LINK_EXISTING, DISMISS, ACCEPT_PROPOSED_FACT, KEEP_VERIFIED, KEEP_HOLDER, MOVE_TO_REQUESTER, ACCEPT_OBSERVATION] }
         party_id: { type: string, format: uuid, description: "LINK_EXISTING only: one of the case's candidates." }
         note: { type: string }
         expected_case_version: { type: integer, format: int64 }
@@ -3498,6 +3558,55 @@ components:
         transition: { $ref: "#/components/schemas/RegistrationTransition" }
         superseded: { $ref: "#/components/schemas/Registration" }
 
+    VerifyIdentifierRequest:
+      type: object
+      required: [expected_master_version, result, source_class, source_ref, observed_at, evidence_ref]
+      properties:
+        expected_master_version: { type: integer, minimum: 1 }
+        result: { type: string, enum: [MATCH, MISMATCH, NOT_FOUND] }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        source_ref: { type: string, description: "The authority or provider that answered." }
+        source_version: { type: string, description: "The data version of the answer." }
+        exchange_ref: { type: string, description: "The exchange-layer (XIC) reference that carried it." }
+        observed_at: { type: string, format: date-time, description: "When the source said it. Not in the future." }
+        authority_status: { type: string, description: "For an LEI, the registration status the LOU reports (ISSUED, LAPSED, RETIRED, ...). Only ISSUED verifies." }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        correlation_id: { type: string }
+
+    IdentifierObservation:
+      type: object
+      required: [observation_id, identifier_id, result, source_class, source_ref, observed_at, evidence_ref, effect, effect_note, status_before, status_after, recorded_by, recorded_at]
+      properties:
+        observation_id: { type: string, format: uuid }
+        identifier_id: { type: string, format: uuid }
+        result: { type: string, enum: [MATCH, MISMATCH, NOT_FOUND] }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        source_ref: { type: string }
+        source_version: { type: string }
+        exchange_ref: { type: string }
+        observed_at: { type: string, format: date-time }
+        authority_status: { type: string }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string }
+        effect: { type: string, enum: [VERIFIED, SOURCE_UPGRADED, FAILED, CONFLICT_OPENED, NO_CHANGE] }
+        effect_note: { type: string, description: "Why the observation did or did not change the identifier." }
+        case_id: { type: string, format: uuid }
+        status_before: { type: string }
+        status_after: { type: string }
+        recorded_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+
+    IdentifierVerifyOutcome:
+      type: object
+      required: [identifier, observation, party, lei_alignment]
+      properties:
+        identifier: { $ref: "#/components/schemas/PartyIdentifier" }
+        observation: { $ref: "#/components/schemas/IdentifierObservation" }
+        party: { $ref: "#/components/schemas/Party" }
+        case: { $ref: "#/components/schemas/ResolutionCase" }
+        lei_alignment: { type: string, enum: [ALIGNED, PROFILE_ABSENT, DIFFERS, NOT_LINKED, NOT_APPLICABLE] }
+
     IdentifierScheme:
       type: string
       enum: [COMPANY_REGISTRATION, TAX_ID, VAT, LEI, DUNS, NATIONAL_ID, SOURCE_SYSTEM]
@@ -3572,7 +3681,7 @@ components:
       properties:
         case_id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
-        case_type: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT] }
+        case_type: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT, VERIFICATION_CONFLICT] }
         status: { type: string, enum: [OPEN, RESOLVED, DISMISSED] }
         subject_party_id: { type: string, format: uuid }
         candidates: { type: array, items: { $ref: "#/components/schemas/PartyMatchCandidate" } }
@@ -3624,7 +3733,7 @@ components:
         scope: { type: string }
         value: { type: string }
         masked: { type: boolean }
-        verification_status: { type: string, enum: [UNVERIFIED, VERIFIED, FAILED] }
+        verification_status: { type: string, enum: [UNVERIFIED, VERIFIED, FAILED, CONFLICTED] }
         evidence_ref: { type: string }
         linked_at: { type: string, format: date-time }
 

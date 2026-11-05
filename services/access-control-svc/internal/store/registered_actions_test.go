@@ -86,6 +86,9 @@ var registeredActionMigrations = []struct {
 		"REGISTRATION_REVOKE":        "HIGH",
 		"REGISTRATION_NUMBER_REVEAL": "HIGH",
 	}},
+	{"000049_register_identifier_verify_action", "tenant-entity-registry-svc", map[string]string{
+		"PARTY_IDENTIFIER_VERIFY": "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

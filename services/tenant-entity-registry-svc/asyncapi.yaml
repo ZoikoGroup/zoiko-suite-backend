@@ -99,6 +99,7 @@ channels:
           - $ref: "#/components/messages/PartyRoleAdded"
           - $ref: "#/components/messages/PartyRoleRemoved"
           - $ref: "#/components/messages/PartyIdentifierLinked"
+          - $ref: "#/components/messages/PartyIdentifierVerified"
           - $ref: "#/components/messages/MasterConflictOpened"
           - $ref: "#/components/messages/PartiesMerged"
           - $ref: "#/components/messages/PartySplit"
@@ -557,6 +558,18 @@ components:
       title: A registration was replaced by a verified successor
       description: The spec names no event for supersession. The successor's own registration.verified precedes it.
       x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartyIdentifierVerified:
+      name: party.identifier.verified
+      title: An external identifier was verified, or verified by a higher authority
+      description: |
+        Published only when an observation passed the acceptance rules (`effect` VERIFIED or SOURCE_UPGRADED). Carries the
+        scheme, scope, source class and reference, source version, observation id and observed_at, never the value.
+        A dispute by a higher authority is published as master.conflict.opened instead.
+      x-spec-event: identifier_verified
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"

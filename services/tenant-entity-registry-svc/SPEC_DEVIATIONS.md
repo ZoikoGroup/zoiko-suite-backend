@@ -239,3 +239,35 @@ Where the spec leaves a choice, the code chooses the safer reading:
 - **FindByNumber is new, not an extension.** `GET /v1/registrations:find` matches the normalized number; the ORG-03
   registry-number lookup for legal entities is unchanged. Identifier verification and LEI alignment (`POST
   /v1/identifiers/{id}:verify`) are wave 2.
+
+### Identifier verification and LEI alignment (ORG-09 and MDM-03, wave 2)
+
+- **A verification is an observation, applied by rules.** `POST /v1/identifiers/{id}:verify` records what a source said
+  (MATCH, MISMATCH or NOT_FOUND) with its class, reference, version, exchange reference, time and evidence, always kept
+  (`GET /v1/identifiers/{id}/verifications`). Whether it changes the identifier is `domain.DecideObservation`: a provider
+  or authority MATCH verifies; a tenant assertion or system import never does; an observation older than the freshness
+  window (90 days for an LEI, 365 for other schemes) or older than the one already applied is recorded and not applied; a
+  higher authority takes over a verification (SOURCE_UPGRADED); a lower or equal one that disagrees changes nothing. It is
+  not last-write-wins. The response's `effect` and `effect_note` say which happened, and `party.identifier.verified` is
+  published only for VERIFIED and SOURCE_UPGRADED.
+- **The service calls no authority.** s14.1 step 3 puts external exchange in XIC, not in MDM-03. No XIC client exists
+  yet, so the observation is supplied by whoever called an authority through the exchange layer, or by a steward holding
+  the evidence; `exchange_ref` carries the exchange's own reference. Wiring a caller is a later integration, not a change
+  to these rules.
+- **A higher-authority disagreement opens a case instead of overwriting (step 6).** A MISMATCH or NOT_FOUND from a source
+  that outranks the one that verified the identifier opens a `VERIFICATION_CONFLICT` stewardship case and leaves the
+  identifier CONFLICTED, with its verifying source intact. A CONFLICTED identifier is not one a create links to
+  automatically, and no new observation moves it. The case is decided by someone other than whoever opened it:
+  `KEEP_VERIFIED` restores VERIFIED, `ACCEPT_OBSERVATION` makes it FAILED. "Registry conflicts" (the ORG-03 entity
+  registry-number quarantine) are not reused: those are about two entities claiming a number, and this is the party
+  stewardship case the rest of MDM-05 already uses.
+- **Source precedence is by class.** AUTHORITY_REGISTRY, then AUTHORITY_DOCUMENT, then EXTERNAL_PROVIDER, then
+  SYSTEM_IMPORT, then TENANT_ASSERTED. The spec says precedence is "by fact type" and per policy; no policy source exists,
+  so one order applies to every scheme.
+- **LEI (s13.3).** An LEI must be a well-formed ISO 17442 identifier to be verified (400 otherwise; linking one is still
+  unchecked, as before). A MATCH verifies only when the LOU reports `authority_status` ISSUED; LAPSED, RETIRED and the
+  rest are recorded and verify nothing. A verified LEI is compared with the legal entity profile's: `lei_alignment` is
+  ALIGNED, PROFILE_ABSENT, DIFFERS, NOT_LINKED or NOT_APPLICABLE. ORG-03 owns the profile, so a difference is reported and
+  never written over. GLEIF relationship observations (parent and ultimate parent) are not ingested.
+- **Existing identifiers.** Identifiers already VERIFIED when the migration ran are backfilled with the source that linked
+  them, and a trigger records it for every later insert, so no linking code changed.

@@ -122,6 +122,8 @@ func codeEventNames() []string {
 		events.EventRegistrationExpired,
 		events.EventRegistrationRevoked,
 		events.EventRegistrationSuperseded,
+		// ORG-09 / MDM-03 identifier verification (identifier_events.go).
+		events.EventPartyIdentifierVerified,
 	}
 }
 
