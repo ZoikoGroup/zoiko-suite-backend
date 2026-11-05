@@ -243,6 +243,7 @@ func main() {
 	// contract §3, §9.2 DoD gates 2 and 4.
 	handler.RegisterRoutes(r, h, idempotency.Middleware(pgStore, log))
 	go purgeIdempotencyKeys(relayCtx, pgStore, log)
+	go sweepRegistrationExpiries(relayCtx, svc, log)
 	go watchOutbox(relayCtx, relay, metrics, log)
 
 	// ── 7. Health probes (separate path, no auth) ────────────────────────────
@@ -398,6 +399,32 @@ func watchOutbox(ctx context.Context, relay *outbox.Relay, m *telemetry.Metrics,
 		published, failed := relay.Stats()
 		m.OutboxPublished.Set(float64(published))
 		m.OutboxFailed.Set(float64(failed))
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// registrationSweepEvery is how often registrations past their expiry date are recorded as EXPIRED and those coming
+// are warned about. Expiry is also computed from the dates on every read, so a late sweep never lets an expired
+// registration read as active; the sweep is what publishes the events and keeps the stored status true.
+const registrationSweepEvery = time.Hour
+
+// registrationWarnDays is how far ahead registration.expiring is published.
+const registrationWarnDays = 30
+
+func sweepRegistrationExpiries(ctx context.Context, svc *registry.Service, log *zap.Logger) {
+	t := time.NewTicker(registrationSweepEvery)
+	defer t.Stop()
+	for {
+		res, err := svc.SweepRegistrationExpiries(ctx, time.Now().UTC(), registrationWarnDays)
+		if err != nil && ctx.Err() == nil {
+			log.Error("registration expiry sweep failed", zap.Error(err))
+		} else if res.Expired > 0 || res.Warned > 0 {
+			log.Info("registration expiry sweep", zap.Int("expired", res.Expired), zap.Int("warned", res.Warned))
+		}
 		select {
 		case <-ctx.Done():
 			return

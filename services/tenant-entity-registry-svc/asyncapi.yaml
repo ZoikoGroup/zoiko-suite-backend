@@ -113,6 +113,15 @@ channels:
           - $ref: "#/components/messages/EstablishmentActivated"
           - $ref: "#/components/messages/EstablishmentDeactivated"
           - $ref: "#/components/messages/EstablishmentClosed"
+          # ── ORG-09 registrations ─────────────────────────────────────────
+          - $ref: "#/components/messages/RegistrationCreated"
+          - $ref: "#/components/messages/RegistrationVerified"
+          - $ref: "#/components/messages/RegistrationRenewed"
+          - $ref: "#/components/messages/RegistrationSuspended"
+          - $ref: "#/components/messages/RegistrationExpiring"
+          - $ref: "#/components/messages/RegistrationExpired"
+          - $ref: "#/components/messages/RegistrationRevoked"
+          - $ref: "#/components/messages/RegistrationSuperseded"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -471,6 +480,83 @@ components:
       title: An establishment was closed
       description: Final. `effective_date` is the end of the presence; history stays readable.
       x-spec-event: EstablishmentClosed
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationCreated:
+      name: registration.created
+      title: A registration or licence was recorded, unverified
+      description: Carries identifiers, type, jurisdiction, holder and dates, never the number.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationVerified:
+      name: registration.verified
+      title: A registration became ACTIVE on evidence
+      description: |
+        Records what an authority was shown to say; it concludes nothing about tax or legal sufficiency. Never carries the number.
+      x-spec-event: RegistrationVerified
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationRenewed:
+      name: registration.renewed
+      title: A registration was renewed to a later expiry date
+      description: Carries the new `expiry_date`. An expired registration renewed is ACTIVE again (`to_status`).
+      x-spec-event: RegistrationRenewed
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationSuspended:
+      name: registration.suspended
+      title: A registration was suspended
+      description: The spec names no event for suspension.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationExpiring:
+      name: registration.expiring
+      title: An active registration expires soon
+      description: |
+        From the expiry sweep, once per expiry date, `days_left` days ahead (30 by default). A renewal to a new date
+        warns again in its own window.
+      x-spec-event: RegistrationExpiring
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationExpired:
+      name: registration.expired
+      title: A registration expired
+      description: |
+        From the sweep (actor system:expiry-sweep) or ExpireRegistration. `effective_date` is the first day it was no
+        longer valid. Consumers should not rely on this alone: reads compute in_force from the dates.
+      x-spec-event: RegistrationExpired
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationRevoked:
+      name: registration.revoked
+      title: A registration was revoked
+      description: Final.
+      x-spec-event: RegistrationRevoked
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationSuperseded:
+      name: registration.superseded
+      title: A registration was replaced by a verified successor
+      description: The spec names no event for supersession. The successor's own registration.verified precedes it.
+      x-spec-event: null
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"

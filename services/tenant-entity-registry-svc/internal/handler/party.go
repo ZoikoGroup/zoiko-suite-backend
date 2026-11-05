@@ -57,6 +57,7 @@ func registerPartyRoutes(r chi.Router, h *Handler) {
 	registerPartyResolutionRoutes(r, h)
 	registerAddressRoutes(r, h)
 	registerEstablishmentRoutes(r, h)
+	registerRegistrationRoutes(r, h)
 }
 
 func (h *Handler) parties() PartyService {

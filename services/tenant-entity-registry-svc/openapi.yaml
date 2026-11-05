@@ -2673,6 +2673,275 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  # ── ORG-09 Registrations and licences ───────────────────────────────────────
+  /v1/registrations:
+    post:
+      operationId: createRegistration
+      summary: ORG-09 CreateRegistration - record a registration or licence, DRAFT (unverified)
+      description: |
+        Generic evidence that a holder (a legal entity or a party) is registered or licensed by an authority. It
+        starts DRAFT and never reads as in force until verified. It decides no tax semantics: a TAX_REFERENCE is a
+        reference, and TAX-01 stays authoritative for what it means. create_request_id makes a retry return the first
+        result. A live registration with the same authority, type, jurisdiction and number is a 409
+        DUPLICATE_CANDIDATE. supersedes_id names the registration this one replaces when it is verified.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateRegistrationRequest" } } }
+      responses:
+        "201":
+          description: Registration recorded as DRAFT
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "200":
+          description: Replay of an earlier create_request_id
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "A live registration of this number exists, create_request_id was used for a different registration, or the holder or the registration to supersede is not in a state that allows it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listRegistrations
+      summary: ORG-09 list registrations by holder, type, status or jurisdiction
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: holder_legal_entity_id, in: query, schema: { type: string, format: uuid } }
+        - { name: holder_party_id, in: query, schema: { type: string, format: uuid } }
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/RegistrationType" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/RegistrationStatus" } }
+        - { name: jurisdiction, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: reveal, in: query, schema: { type: boolean }, description: "Show sensitive numbers unmasked; needs the reveal permission (403 without it)." }
+      responses:
+        "200":
+          description: Registrations, with next_cursor when more remain; sensitive numbers masked unless revealed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Registration" } }
+                  next_cursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/registrations:find:
+    get:
+      operationId: findRegistrationsByNumber
+      summary: ORG-09 FindByNumber - on the normalized number, so "gb 123-456" finds "GB123456"
+      description: Sensitive numbers are masked unless revealed. The ORG-03 registry-number lookup for legal entities is unchanged.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: number, in: query, required: true, schema: { type: string } }
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/RegistrationType" } }
+        - { name: authority, in: query, schema: { type: string } }
+        - { name: jurisdiction, in: query, schema: { type: string } }
+        - { name: reveal, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Matching registrations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Registration" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/registrations/expiring:
+    get:
+      operationId: listExpiringRegistrations
+      summary: ORG-09 ListExpiringRegistrations - expiring within within_days of as_of, soonest first
+      description: |
+        Includes any ACTIVE or SUSPENDED registration already past its expiry date that the sweep has not yet recorded:
+        expiry is surfaced from the dates, whether or not the sweep has run.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: within_days, in: query, schema: { type: integer, minimum: 0, maximum: 3650, default: 30 } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: reveal, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Registrations by expiry date
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Registration" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/registrations/{registrationID}:
+    get:
+      operationId: getRegistration
+      summary: ORG-09 GetRegistration - with in_force and lapsed computed from the dates
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: reveal, in: query, schema: { type: boolean }, description: "Unmask a sensitive number; refused (403) without the reveal permission." }
+      responses:
+        "200":
+          description: The registration
+          content: { application/json: { schema: { $ref: "#/components/schemas/Registration" } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/registrations/{registrationID}/history:
+    get:
+      operationId: getRegistrationHistory
+      summary: ORG-09 GetRegistrationHistory - every recorded step, in order
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The steps, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/RegistrationTransition" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/registrations/{registrationID}:verify:
+    post:
+      operationId: verifyRegistration
+      summary: ORG-09 VerifyRegistration - DRAFT or SUSPENDED to ACTIVE, on evidence
+      description: |
+        A material registration (PERMIT, LICENSE, REGULATED) is not verified by the principal who created it: 403
+        SOD_DENIED, held by the table as well. A registration past its expiry date is renewed, not verified. Verifying a
+        registration that supersedes another ends the other as SUPERSEDED.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VerifyRegistrationRequest" } } }
+      responses:
+        "200":
+          description: Verified; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/registrations/{registrationID}:renew:
+    post:
+      operationId: renewRegistration
+      summary: ORG-09 RenewRegistration - a later expiry on evidence; an expired one becomes ACTIVE again
+      description: |
+        new_expiry_date must be later than the current one. A material registration is not renewed by the principal who
+        last verified or renewed it: 403 SOD_DENIED.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RenewRegistrationRequest" } } }
+      responses:
+        "200":
+          description: Renewed; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/registrations/{registrationID}:suspend:
+    post:
+      operationId: suspendRegistration
+      summary: ORG-09 SuspendRegistration - ACTIVE to SUSPENDED; reason and evidence required
+      description: A suspended registration is verified again to return to ACTIVE.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationEndRequest" } } }
+      responses:
+        "200":
+          description: Suspended; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/registrations/{registrationID}:expire:
+    post:
+      operationId: expireRegistration
+      summary: ORG-09 ExpireRegistration - ACTIVE or SUSPENDED to EXPIRED. The sweep does this itself when the date passes.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationEndRequest" } } }
+      responses:
+        "200":
+          description: Expired; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/registrations/{registrationID}:revoke:
+    post:
+      operationId: revokeRegistration
+      summary: ORG-09 RevokeRegistration - to REVOKED (final) from DRAFT, ACTIVE, SUSPENDED or EXPIRED
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationEndRequest" } } }
+      responses:
+        "200":
+          description: Revoked; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3107,6 +3376,127 @@ components:
         establishment: { $ref: "#/components/schemas/Establishment" }
         address: { nullable: true, allOf: [{ $ref: "#/components/schemas/AddressVersion" }] }
         history: { type: array, items: { $ref: "#/components/schemas/EstablishmentTransition" } }
+
+    RegistrationType:
+      type: string
+      enum: [COMPANY_REGISTRATION, TAX_REFERENCE, EMPLOYER_PAYROLL, PERMIT, LICENSE, REGULATED, OTHER_GOVERNED]
+      description: |
+        PERMIT, LICENSE and REGULATED are material: verified and renewed by independent principals. TAX_REFERENCE and
+        EMPLOYER_PAYROLL numbers are sensitive and masked unless revealed. TAX_REFERENCE is evidence only; TAX-01 owns tax semantics.
+
+    RegistrationStatus:
+      type: string
+      enum: [DRAFT, ACTIVE, SUSPENDED, EXPIRED, REVOKED, SUPERSEDED]
+
+    CreateRegistrationRequest:
+      type: object
+      required: [registration_type, issuing_authority, jurisdiction, number, effective_from, source_class, evidence_ref]
+      description: Name exactly one holder, holder_legal_entity_id or holder_party_id.
+      properties:
+        create_request_id: { type: string, maxLength: 128 }
+        registration_type: { $ref: "#/components/schemas/RegistrationType" }
+        issuing_authority: { type: string, minLength: 1, maxLength: 200 }
+        jurisdiction: { type: string, minLength: 1, maxLength: 16 }
+        number: { type: string, minLength: 1, maxLength: 100 }
+        holder_legal_entity_id: { type: string, format: uuid }
+        holder_party_id: { type: string, format: uuid }
+        issue_date: { type: string, format: date }
+        effective_from: { type: string, format: date }
+        expiry_date: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string, pattern: '^[0-9a-f]{64}$', description: "SHA-256 of the source document." }
+        supersedes_id: { type: string, format: uuid }
+        correlation_id: { type: string }
+
+    VerifyRegistrationRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        reason: { type: string }
+        correlation_id: { type: string }
+
+    RenewRegistrationRequest:
+      type: object
+      required: [expected_version, new_expiry_date, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        new_expiry_date: { type: string, format: date }
+        issue_date: { type: string, format: date }
+        effective_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        correlation_id: { type: string }
+
+    RegistrationEndRequest:
+      type: object
+      required: [expected_version, reason, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        effective_date: { type: string, format: date, description: "Defaults to today." }
+        correlation_id: { type: string }
+
+    Registration:
+      type: object
+      required: [registration_id, tenant_id, registration_type, issuing_authority, jurisdiction, number, status, material, effective_from, source_class, evidence_ref, record_version, created_by, created_at, in_force]
+      properties:
+        registration_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        registration_type: { $ref: "#/components/schemas/RegistrationType" }
+        issuing_authority: { type: string }
+        jurisdiction: { type: string }
+        number: { type: string, description: "As recorded; masked to its last four characters for a sensitive type unless revealed." }
+        number_masked: { type: boolean }
+        holder_legal_entity_id: { type: string, format: uuid }
+        holder_party_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/RegistrationStatus" }
+        material: { type: boolean }
+        issue_date: { type: string, format: date }
+        effective_from: { type: string, format: date }
+        expiry_date: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string }
+        supersedes_id: { type: string, format: uuid }
+        superseded_by_id: { type: string, format: uuid }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        verified_by: { type: string }
+        verified_at: { type: string, format: date-time }
+        in_force: { type: boolean, description: "What a consumer may rely on: ACTIVE, begun and not past its expiry date. A DRAFT never is." }
+        lapsed: { type: boolean, description: "The dates say it has expired but the sweep has not yet recorded it." }
+
+    RegistrationTransition:
+      type: object
+      required: [seq, command, to_status, effective_date, evidence_ref, actor, version_after, occurred_at]
+      properties:
+        seq: { type: integer }
+        command: { type: string }
+        from_status: { $ref: "#/components/schemas/RegistrationStatus" }
+        to_status: { $ref: "#/components/schemas/RegistrationStatus" }
+        effective_date: { type: string, format: date }
+        expiry_after: { type: string, format: date }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string }
+        actor: { type: string }
+        version_before: { type: integer }
+        version_after: { type: integer }
+        occurred_at: { type: string, format: date-time }
+
+    RegistrationOutcome:
+      type: object
+      required: [registration, transition]
+      properties:
+        registration: { $ref: "#/components/schemas/Registration" }
+        transition: { $ref: "#/components/schemas/RegistrationTransition" }
+        superseded: { $ref: "#/components/schemas/Registration" }
 
     IdentifierScheme:
       type: string

@@ -113,6 +113,15 @@ func codeEventNames() []string {
 		events.EventEstablishmentActivated,
 		events.EventEstablishmentDeactivated,
 		events.EventEstablishmentClosed,
+		// ORG-09 registrations (registration_events.go).
+		events.EventRegistrationCreated,
+		events.EventRegistrationVerified,
+		events.EventRegistrationRenewed,
+		events.EventRegistrationSuspended,
+		events.EventRegistrationExpiring,
+		events.EventRegistrationExpired,
+		events.EventRegistrationRevoked,
+		events.EventRegistrationSuperseded,
 	}
 }
 

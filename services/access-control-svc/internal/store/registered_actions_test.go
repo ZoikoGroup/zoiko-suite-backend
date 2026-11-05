@@ -77,6 +77,15 @@ var registeredActionMigrations = []struct {
 		"ESTABLISHMENT_DEACTIVATE": "STANDARD",
 		"ESTABLISHMENT_CLOSE":      "HIGH",
 	}},
+	{"000048_register_registration_actions", "tenant-entity-registry-svc", map[string]string{
+		"REGISTRATION_CREATE":        "STANDARD",
+		"REGISTRATION_VERIFY":        "HIGH",
+		"REGISTRATION_RENEW":         "HIGH",
+		"REGISTRATION_SUSPEND":       "HIGH",
+		"REGISTRATION_EXPIRE":        "STANDARD",
+		"REGISTRATION_REVOKE":        "HIGH",
+		"REGISTRATION_NUMBER_REVEAL": "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

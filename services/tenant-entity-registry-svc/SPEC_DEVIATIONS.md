@@ -207,3 +207,35 @@ Where the spec leaves a choice, the code chooses the safer reading:
   unstructured office (always accepted, unchanged) and a change that does not start after the current office began (a
   backdated correction would have to rewrite link intervals). The mirror emits no extra event: `entity.registered_office.changed`
   already attests the change.
+
+### Registrations and licences (ORG-09 and MDM-03, wave 1)
+
+- **Evidence, not conclusions.** A registration records what an authority was shown to say and the lifecycle of that
+  evidence. It decides no tax semantics (a `TAX_REFERENCE` is a reference; TAX-01 stays authoritative), no legal
+  sufficiency and no nexus. Events state the type, jurisdiction, status move and dates, never the number.
+- **Unverified cannot be active.** A registration is created DRAFT. `ACTIVE`, `SUSPENDED`, `EXPIRED` and `SUPERSEDED`
+  all require a recorded verification, and the table refuses otherwise. `in_force` (ACTIVE, begun, not past its expiry
+  date) and `lapsed` are computed from the dates on every read, so a registration past its date never reads as active
+  even when the sweep has not yet recorded it. A DRAFT is never in force.
+- **Lifecycle.** `:verify` takes DRAFT or SUSPENDED to ACTIVE on evidence (a registration already past its expiry is
+  renewed, not verified); `:renew` moves the expiry later on evidence and returns an EXPIRED one to ACTIVE; `:suspend`,
+  `:expire` and `:revoke` need a reason and evidence; REVOKED and SUPERSEDED are final. Every step appends a history row
+  with the dates, evidence, evidence hash, actor and versions (`GET /v1/registrations/{id}/history`). Creating with
+  `supersedes_id` ends the older registration as SUPERSEDED when the new one is verified.
+- **Segregation of duties, by type.** PERMIT, LICENSE and REGULATED are material: they are not verified by the principal
+  who created them, and not renewed by the principal who last verified or renewed them (403 SOD_DENIED; the first is also
+  a table constraint). The spec says "where policy says"; no policy source exists yet, so materiality is by type.
+- **Candidate uniqueness without exceptions.** One live registration per authority, type, jurisdiction and normalized
+  number (409 DUPLICATE_CANDIDATE); an ended registration frees its number. The spec allows jurisdiction-specific
+  exceptions; none are modelled until a jurisdiction pack says where a number is legitimately shared.
+- **Sensitive numbers are masked.** TAX_REFERENCE and EMPLOYER_PAYROLL numbers show their last four characters in every
+  read, search and expiry list unless `reveal=true` and the caller holds `REGISTRATION_NUMBER_REVEAL` (refused, not
+  silently masked, without it).
+- **The expiry sweep is a background loop.** `main.go` runs it hourly: it records the expiry of registrations past their
+  date (actor `system:expiry-sweep`, history row and `registration.expired` in one transaction) and publishes
+  `registration.expiring` once per expiry date, 30 days ahead; a renewal to a new date warns again. Which tenants have
+  anything due is found by one read-only, due-rows-only policy (`app.registration_sweep`); everything it then changes is
+  done inside that tenant's own policy.
+- **FindByNumber is new, not an extension.** `GET /v1/registrations:find` matches the normalized number; the ORG-03
+  registry-number lookup for legal entities is unchanged. Identifier verification and LEI alignment (`POST
+  /v1/identifiers/{id}:verify`) are wave 2.
