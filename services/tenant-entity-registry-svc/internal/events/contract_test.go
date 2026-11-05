@@ -136,6 +136,14 @@ func codeEventNames() []string {
 		events.EventBookBasisChanged,
 		events.EventBookPostingSuspend,
 		events.EventBookRetired,
+		// REF-08 financial dimensions (dimension_events.go).
+		events.EventDimensionTypeCreated,
+		events.EventDimensionValueCreated,
+		events.EventDimensionValueActivated,
+		events.EventDimensionValueDeactivated,
+		events.EventDimensionHierarchyProposed,
+		events.EventDimensionHierarchyChanged,
+		events.EventDimensionSourceMapped,
 	}
 }
 

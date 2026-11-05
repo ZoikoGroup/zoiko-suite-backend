@@ -3532,6 +3532,296 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: "Stale expected_version, or the book is already retired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
+  # ── REF-08 Financial dimensions ─────────────────────────────────────────────
+  /v1/dimension-types:
+    post:
+      operationId: createDimensionType
+      summary: REF-08 CreateDimensionType - define a kind of dimension, such as cost centre, project or region
+      description: |
+        `hierarchical` says whether values form a hierarchy; `controlled` marks a hierarchy that feeds reporting or control
+        aggregation, so a change to it waits for independent approval. `source_domain` names the operational domain that feeds
+        the type, when one does (PROJECT, LOCATION, PRODUCT). A type is immutable.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateDimensionTypeRequest" } } }
+      responses:
+        "201":
+          description: Type created
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionType" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "A type with that code exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listDimensionTypes
+      summary: REF-08 the tenant's dimension types
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Types
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/DimensionType" } }
+
+  /v1/dimension-types/{typeCode}/hierarchy:
+    get:
+      operationId: getDimensionHierarchyAsOf
+      summary: REF-08 GetHierarchyAsOf - every value of a type with its label and parent as they stood on a date
+      description: |
+        Reconstructs the roll-up on either side of a change: a value created after the date is absent, a value moved later is
+        where it was. With legal_entity_id the answer is the tenant-wide values and that entity's own.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: typeCode, in: path, required: true, schema: { type: string } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: legal_entity_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The hierarchy, shallowest nodes first
+          content: { application/json: { schema: { $ref: "#/components/schemas/HierarchyAsOf" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/dimension-types/{typeCode}/posting-eligible-values:
+    get:
+      operationId: listPostingEligibleDimensionValues
+      summary: REF-08 ListPostingEligibleValues - the values that could take a new posting on a date
+      description: |
+        Inactive and draft values are absent. An inactive value covered by an explicit controlled exception is listed with
+        exception true. This registry answers; the posting service must ask, because it cannot stop a posting itself.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: typeCode, in: path, required: true, schema: { type: string } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: legal_entity_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Eligible values
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/EligibleDimensionValue" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/dimension-values:
+    post:
+      operationId: createDimensionValue
+      summary: REF-08 CreateDimensionValue - open a DRAFT value with its first placement
+      description: |
+        A code is stable within its scope: unique per type, per entity for an entity's own values, and an entity's code never
+        shadows a tenant-wide one (409). A parent is of the same type and tenant-wide or of the same entity; a type with no
+        hierarchy takes none. The first placement needs no review: it is a new node, not a change to an existing aggregation.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateDimensionValueRequest" } } }
+      responses:
+        "201":
+          description: Value created as DRAFT
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The code is already used in this scope or another scope of the type, or the entity is not operational", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}:
+    get:
+      operationId: getDimensionValue
+      summary: REF-08 GetDimensionValue - the value as it was on a date
+      description: |
+        The label and parent then, the status then, the roll-up path then (root first) and whether it could take a posting.
+        A pending hierarchy change is shown but does not affect the roll-up until approved.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every hierarchy version and status change." }
+      responses:
+        "200":
+          description: The value
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionValueView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/dimension-values/{valueID}/hierarchy:
+    post:
+      operationId: reparentDimensionValue
+      summary: REF-08 ReparentDimensionValue - propose the next hierarchy version, a new parent or root and optionally a new label
+      description: |
+        Prospective only: valid_from is today or later and after the current version began, so a change never rewrites a roll-up
+        already reported. A loop is refused on the date it takes effect and on every later date a version of the type's hierarchy
+        begins. Renaming never changes the value's identity or code. For a controlled type the version is PENDING until someone
+        other than its proposer approves it; for any other type it takes effect directly.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ReparentDimensionValueRequest" } } }
+      responses:
+        "201":
+          description: Version recorded, PENDING or APPROVED
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or a change is already pending", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}/hierarchy/{versionNo}:approve:
+    post:
+      operationId: approveDimensionHierarchy
+      summary: REF-08 approve a pending hierarchy change of a controlled type
+      description: |
+        Not by the principal who proposed it (403 SOD_DENIED, held by the table as well). Approval checks again for loops and
+        refuses a change whose date has passed or that the hierarchy has overtaken (409); propose it again.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: versionNo, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ApproveDimensionHierarchyRequest" } } }
+      responses:
+        "200":
+          description: Approved; it takes effect from its valid_from
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, the version is not pending, or the proposal is stale", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}:activate:
+    post:
+      operationId: activateDimensionValue
+      summary: REF-08 ActivateDimensionValue - DRAFT or INACTIVE to ACTIVE
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/DimensionStatusRequest" } } }
+      responses:
+        "200":
+          description: Activated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}:deactivate:
+    post:
+      operationId: deactivateDimensionValue
+      summary: REF-08 DeactivateDimensionValue - ACTIVE to INACTIVE; reason required
+      description: |
+        An inactive value remains valid for history and rejects new postings. exception_until is an explicit controlled
+        exception: new postings are still accepted until that date, which must be after the deactivation and within 90 days of it.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/DimensionStatusRequest" } } }
+      responses:
+        "200":
+          description: Deactivated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}/source-mappings:
+    post:
+      operationId: mapDimensionSourceObject
+      summary: REF-08 MapSourceObject - map an operational source object to a value, by version
+      description: |
+        The source object (a project, a location) is owned elsewhere. The value must be ACTIVE, and when the type names a
+        source_domain the mapping is in that domain. A new mapping ends the source object's previous one where it begins, and
+        both versions are kept. Mapping it to the value it already maps to is a 200 no-op.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/MapSourceObjectRequest" } } }
+      responses:
+        "201":
+          description: Mapped
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionMappingOutcome" } } }
+        "200":
+          description: Already mapped to this value
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionMappingOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The value is not ACTIVE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimensions:resolve:
+    get:
+      operationId: resolveDimension
+      summary: REF-08 ResolveDimension - find a value by code, or by the operational source object mapped to it
+      description: |
+        By code (type_code and code): the caller's entity's own value wins, otherwise the tenant-wide one; a code that exists
+        only in another entity is not found. By source (type_code, source_domain and source_object_id): the mapping in force
+        on as_of. Either way the answer includes the value as it was on that date and whether it could take a posting. There
+        is no guessing: nothing found is a 404.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: type_code, in: query, required: true, schema: { type: string } }
+        - { name: code, in: query, schema: { type: string } }
+        - { name: legal_entity_id, in: query, schema: { type: string, format: uuid } }
+        - { name: source_domain, in: query, schema: { type: string } }
+        - { name: source_object_id, in: query, schema: { type: string } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The value and how it was found
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionResolution" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -4495,6 +4785,241 @@ components:
               status: { $ref: "#/components/schemas/BookStatus" }
               framework: { $ref: "#/components/schemas/BookFramework" }
         notes: { type: array, items: { type: string } }
+
+    CreateDimensionTypeRequest:
+      type: object
+      required: [type_code, name, hierarchical, controlled]
+      properties:
+        type_code: { type: string, pattern: '^[A-Z][A-Z0-9_]{1,39}$' }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        hierarchical: { type: boolean }
+        controlled: { type: boolean, description: "A hierarchy feeding reporting or control aggregation: a change is independently reviewed. Needs hierarchical." }
+        source_domain: { type: string, maxLength: 40 }
+        correlation_id: { type: string }
+
+    DimensionType:
+      type: object
+      required: [type_id, tenant_id, type_code, name, hierarchical, controlled, created_by, created_at]
+      properties:
+        type_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        type_code: { type: string }
+        name: { type: string }
+        description: { type: string }
+        hierarchical: { type: boolean }
+        controlled: { type: boolean }
+        source_domain: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    CreateDimensionValueRequest:
+      type: object
+      required: [type_code, code, label, evidence_ref]
+      properties:
+        type_code: { type: string }
+        legal_entity_id: { type: string, format: uuid, description: "Omit for a tenant-wide value." }
+        code: { type: string, pattern: '^[A-Z0-9][A-Z0-9_.-]{0,39}$' }
+        label: { type: string, maxLength: 200 }
+        parent_value_id: { type: string, format: uuid }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ReparentDimensionValueRequest:
+      type: object
+      required: [expected_version, reason, evidence_ref]
+      description: Name parent_value_id, or set root true, not both and not neither.
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        parent_value_id: { type: string, format: uuid }
+        root: { type: boolean }
+        new_label: { type: string, maxLength: 200 }
+        valid_from: { type: string, format: date }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ApproveDimensionHierarchyRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    DimensionStatusRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string, description: "Required to deactivate." }
+        evidence_ref: { type: string }
+        effective_date: { type: string, format: date, description: "Defaults to today. Not before the last change." }
+        exception_until: { type: string, format: date, description: "Deactivation only. A controlled exception, within 90 days of the deactivation." }
+        correlation_id: { type: string }
+
+    MapSourceObjectRequest:
+      type: object
+      required: [source_domain, source_object_id, evidence_ref]
+      properties:
+        source_domain: { type: string, maxLength: 40 }
+        source_object_id: { type: string, maxLength: 200 }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    DimensionValue:
+      type: object
+      required: [value_id, tenant_id, type_id, type_code, code, status, current_version, record_version, created_by, created_at]
+      properties:
+        value_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        type_id: { type: string, format: uuid }
+        type_code: { type: string }
+        legal_entity_id: { type: string, format: uuid }
+        code: { type: string, description: "Stable for the life of the value." }
+        status: { type: string, enum: [DRAFT, ACTIVE, INACTIVE] }
+        current_version: { type: integer }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    DimensionHierarchyVersion:
+      type: object
+      required: [version_no, label, status, valid_from, evidence_ref, proposed_by, proposed_at]
+      properties:
+        version_no: { type: integer }
+        parent_value_id: { type: string, format: uuid }
+        parent_code: { type: string }
+        label: { type: string }
+        status: { type: string, enum: [PENDING, APPROVED] }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        proposed_by: { type: string }
+        proposed_at: { type: string, format: date-time }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+
+    DimensionTransition:
+      type: object
+      required: [seq, to_status, effective_date, command, evidence_ref, actor, version_after, occurred_at]
+      properties:
+        seq: { type: integer }
+        from_status: { type: string }
+        to_status: { type: string }
+        effective_date: { type: string, format: date }
+        command: { type: string }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        exception_until: { type: string, format: date }
+        actor: { type: string }
+        version_before: { type: integer }
+        version_after: { type: integer }
+        occurred_at: { type: string, format: date-time }
+
+    DimensionOutcome:
+      type: object
+      required: [value]
+      properties:
+        value: { $ref: "#/components/schemas/DimensionValue" }
+        hierarchy: { $ref: "#/components/schemas/DimensionHierarchyVersion" }
+        transition: { $ref: "#/components/schemas/DimensionTransition" }
+
+    DimensionEligibility:
+      type: object
+      required: [value_id, as_of, eligible]
+      properties:
+        value_id: { type: string, format: uuid }
+        as_of: { type: string, format: date }
+        eligible: { type: boolean }
+        exception: { type: boolean, description: "Inactive, but a controlled exception still covers the date." }
+        reason: { type: string, enum: [NOT_ACTIVE, INACTIVE, NOT_YET_EFFECTIVE] }
+
+    DimensionPathNode:
+      type: object
+      required: [value_id, code, label]
+      properties:
+        value_id: { type: string, format: uuid }
+        code: { type: string }
+        label: { type: string }
+
+    DimensionValueView:
+      type: object
+      required: [value, as_of, status_as_of, hierarchy, posting_eligibility, path]
+      properties:
+        value: { $ref: "#/components/schemas/DimensionValue" }
+        as_of: { type: string, format: date }
+        hierarchy: { nullable: true, allOf: [{ $ref: "#/components/schemas/DimensionHierarchyVersion" }] }
+        status_as_of: { type: string, description: "Empty before the value began." }
+        posting_eligibility: { $ref: "#/components/schemas/DimensionEligibility" }
+        path: { type: array, items: { $ref: "#/components/schemas/DimensionPathNode" }, description: "From the root to the parent, as the hierarchy stood on the date." }
+        pending_change: { $ref: "#/components/schemas/DimensionHierarchyVersion" }
+        hierarchy_history: { type: array, items: { $ref: "#/components/schemas/DimensionHierarchyVersion" } }
+        status_history: { type: array, items: { $ref: "#/components/schemas/DimensionTransition" } }
+
+    HierarchyNode:
+      type: object
+      required: [value_id, code, label, status, depth]
+      properties:
+        value_id: { type: string, format: uuid }
+        code: { type: string }
+        label: { type: string }
+        legal_entity_id: { type: string, format: uuid }
+        parent_value_id: { type: string, format: uuid }
+        status: { type: string }
+        depth: { type: integer }
+
+    HierarchyAsOf:
+      type: object
+      required: [type_code, as_of, nodes]
+      properties:
+        type_code: { type: string }
+        as_of: { type: string, format: date }
+        nodes: { type: array, items: { $ref: "#/components/schemas/HierarchyNode" } }
+
+    EligibleDimensionValue:
+      type: object
+      required: [value_id, code, label]
+      properties:
+        value_id: { type: string, format: uuid }
+        code: { type: string }
+        label: { type: string }
+        legal_entity_id: { type: string, format: uuid }
+        exception: { type: boolean }
+
+    DimensionSourceMapping:
+      type: object
+      required: [mapping_id, value_id, source_domain, source_object_id, version_no, valid_from, evidence_ref, recorded_by, recorded_at]
+      properties:
+        mapping_id: { type: string, format: uuid }
+        type_code: { type: string }
+        value_id: { type: string, format: uuid }
+        source_domain: { type: string }
+        source_object_id: { type: string }
+        version_no: { type: integer }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        evidence_ref: { type: string }
+        recorded_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+
+    DimensionMappingOutcome:
+      type: object
+      required: [mapping]
+      properties:
+        mapping: { $ref: "#/components/schemas/DimensionSourceMapping" }
+        previous: { $ref: "#/components/schemas/DimensionSourceMapping" }
+
+    DimensionResolution:
+      type: object
+      required: [via, value]
+      properties:
+        via: { type: string, enum: [CODE, SOURCE_MAPPING] }
+        value: { $ref: "#/components/schemas/DimensionValueView" }
+        mapping: { $ref: "#/components/schemas/DimensionSourceMapping" }
 
     IdentifierScheme:
       type: string

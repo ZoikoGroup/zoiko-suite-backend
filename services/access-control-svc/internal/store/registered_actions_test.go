@@ -103,6 +103,15 @@ var registeredActionMigrations = []struct {
 		"ACCOUNTING_BOOK_SUSPEND_POSTING": "HIGH",
 		"ACCOUNTING_BOOK_RETIRE":          "HIGH",
 	}},
+	{"000052_register_dimension_actions", "tenant-entity-registry-svc", map[string]string{
+		"DIMENSION_TYPE_CREATE":       "STANDARD",
+		"DIMENSION_CREATE":            "STANDARD",
+		"DIMENSION_ACTIVATE":          "STANDARD",
+		"DIMENSION_DEACTIVATE":        "HIGH",
+		"DIMENSION_REPARENT":          "STANDARD",
+		"DIMENSION_APPROVE_HIERARCHY": "HIGH",
+		"DIMENSION_MAP_SOURCE":        "STANDARD",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

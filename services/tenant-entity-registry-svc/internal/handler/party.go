@@ -61,6 +61,7 @@ func registerPartyRoutes(r chi.Router, h *Handler) {
 	registerIdentifierVerificationRoutes(r, h)
 	registerFXRoutes(r, h)
 	registerBookRoutes(r, h)
+	registerDimensionRoutes(r, h)
 }
 
 func (h *Handler) parties() PartyService {

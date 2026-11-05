@@ -352,3 +352,36 @@ Where the spec leaves a choice, the code chooses the safer reading:
   not modelled.
 - **`GetBookAsOf` is `GetAccountingBook` with the date required**, at its own path; both return the book's status then,
   the basis then and the eligibility then.
+
+### Financial dimensions (REF-08, ORG-8 wave 3)
+
+- **Identity is separate from hierarchy and label.** A value's id and code never change (table guards). What it is called
+  and where it sits are effective-dated versions of its own, so renaming or moving a node leaves its identity alone and a
+  historical roll-up is reconstructable on either side of a change (`GET /v1/dimension-types/{type}/hierarchy?as_of=`,
+  and the `path` on `GET /v1/dimension-values/{id}?as_of=`). The spec has no rename command; renaming is carried on
+  `ReparentDimensionValue` (`new_label`), because the label is part of the same versioned placement.
+- **Hierarchy changes are prospective and loop-free.** A change starts today or later and after the current version began,
+  so it never rewrites a roll-up already reported. A loop is refused on the date the change takes effect and on every later
+  date a version of the type's hierarchy begins (a loop needs only one such date); approval checks again.
+- **Independent review is a type property.** `controlled` types (a hierarchy feeding reporting or control aggregation) hold a
+  change as PENDING until someone other than its proposer approves it with `POST .../hierarchy/{n}:approve` (403 SOD_DENIED,
+  and a table trigger holds it). Other types take effect directly. The approval command is not in the spec's list; it is how
+  "independently reviewed" is realised. The first version of a new node is its placement, not a change, and needs no review.
+  Which types are controlled is the steward's choice at type creation: no policy source says.
+- **Codes are stable within their scope.** Unique per type for tenant-wide values and per entity for an entity's own; an
+  entity's code never shadows a tenant-wide one, and a tenant-wide code never covers an entity's, so resolving by code is
+  never ambiguous. The spec's "effective scope" is the value's owner; codes are not reused over time.
+- **Inactive rejects new postings; a controlled exception is explicit and bounded.** DRAFT, ACTIVE, INACTIVE, each move a
+  recorded transition, and INACTIVE can be activated again (a dimension is reference data, not a legal record). Whether a
+  value could take a posting on a date is reconstructed from the transitions: ACTIVE only, or INACTIVE inside a recorded
+  `exception_until` (after the deactivation, within 90 days of it, with a reason). This registry answers the question
+  (`ListPostingEligibleValues`, and the eligibility on every read); the posting service must ask, because it cannot stop a
+  posting itself.
+- **Source mappings are versioned.** An operational source object maps to one value of a type at a time; mapping it again ends
+  the previous mapping where the new one begins and keeps both. The value must be ACTIVE, and when the type names a
+  `source_domain` the mapping must be in it. The spec says source mappings "may require joint approval": no approval step is
+  built, as no policy source says which. `ResolveDimension` finds a value by code or by source object as of a date, and says
+  not found rather than guessing.
+- **Not built.** Roll-up rules beyond the hierarchy itself (the spec's "roll-up rules" server-resolved context), and the
+  "impacted reporting nodes" lineage on a hierarchy change: the change event carries the old and new parent and label, and a
+  consumer computes the impact from the hierarchy as of either date.
