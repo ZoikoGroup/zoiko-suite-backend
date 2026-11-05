@@ -108,6 +108,11 @@ channels:
           - $ref: "#/components/messages/AddressVerified"
           - $ref: "#/components/messages/AddressSuperseded"
           - $ref: "#/components/messages/AddressLinked"
+          # ── ORG-08 establishments ────────────────────────────────────────
+          - $ref: "#/components/messages/EstablishmentCreated"
+          - $ref: "#/components/messages/EstablishmentActivated"
+          - $ref: "#/components/messages/EstablishmentDeactivated"
+          - $ref: "#/components/messages/EstablishmentClosed"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -428,6 +433,44 @@ components:
       title: An address was linked to a party
       description: Carries party_id, link_id, link_type and valid_from.
       x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EstablishmentCreated:
+      name: establishment.created
+      title: An establishment was proposed
+      description: Carries identifiers, type, address id and status, never the name or the address.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EstablishmentActivated:
+      name: establishment.activated
+      title: An establishment became ACTIVE
+      description: |
+        A recorded presence fact, not a tax or registration conclusion; those are decided by their own domains.
+        `effective_date` is the date it took effect, which can precede the time it was recorded.
+      x-spec-event: EstablishmentActivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EstablishmentDeactivated:
+      name: establishment.deactivated
+      title: An establishment became INACTIVE
+      description: The spec names no event for deactivation. It can be activated again.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EstablishmentClosed:
+      name: establishment.closed
+      title: An establishment was closed
+      description: Final. `effective_date` is the end of the presence; history stays readable.
+      x-spec-event: EstablishmentClosed
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"

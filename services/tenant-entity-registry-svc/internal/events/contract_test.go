@@ -108,6 +108,11 @@ func codeEventNames() []string {
 		events.EventAddressVerified,
 		events.EventAddressSuperseded,
 		events.EventAddressLinked,
+		// ORG-08 establishments (establishment_events.go).
+		events.EventEstablishmentCreated,
+		events.EventEstablishmentActivated,
+		events.EventEstablishmentDeactivated,
+		events.EventEstablishmentClosed,
 	}
 }
 

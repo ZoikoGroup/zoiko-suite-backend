@@ -310,15 +310,16 @@ func (r LinkAddressRequest) Validate() error {
 
 // AddressLink is an address used by a party.
 type AddressLink struct {
-	LinkID      string      `json:"link_id"`
-	AddressID   string      `json:"address_id"`
-	PartyID     string      `json:"party_id"`
-	LinkType    AddressType `json:"link_type"`
-	ValidFrom   string      `json:"valid_from"`
-	ValidTo     string      `json:"valid_to,omitempty"`
-	EvidenceRef string      `json:"evidence_ref"`
-	LinkedBy    string      `json:"linked_by"`
-	LinkedAt    time.Time   `json:"linked_at"`
+	LinkID        string      `json:"link_id"`
+	AddressID     string      `json:"address_id"`
+	PartyID       string      `json:"party_id,omitempty"`
+	LegalEntityID string      `json:"legal_entity_id,omitempty"`
+	LinkType      AddressType `json:"link_type"`
+	ValidFrom     string      `json:"valid_from"`
+	ValidTo       string      `json:"valid_to,omitempty"`
+	EvidenceRef   string      `json:"evidence_ref"`
+	LinkedBy      string      `json:"linked_by"`
+	LinkedAt      time.Time   `json:"linked_at"`
 }
 
 // PartyAddress is one address a party has or had, with the version in force at the date asked.

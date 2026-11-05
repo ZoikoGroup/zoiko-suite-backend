@@ -183,5 +183,27 @@ Where the spec leaves a choice, the code chooses the safer reading:
   start date and the old stays queryable (`GET /v1/parties/{id}/addresses?as_of=&include_ended=`).
 - **Country and subdivision are resolved against a built-in ISO 3166 list, not MDM-04 reference ids.** The reference
   module (ORG-8) is not built yet; when it is, the verifier should resolve through it.
-- **Establishments and the registered-office route are wave 2.** `POST /v1/entities/{id}/registered-office` still
-  stores opaque JSON until it is moved onto this model.
+
+### Establishments and the registered office on the address model (ORG-08, wave 2)
+
+- **An establishment is not its address.** It has its own id, stands at an address and is recorded from evidence
+  (`evidence_ref` and `source_class` required). Nothing is inferred from an address: no establishment, nexus or
+  registration follows from one existing. Events carry no name or address, and state no tax conclusion.
+- **Named status commands, recorded as transitions.** `:activate`, `:deactivate` and `:close` move PROPOSED, ACTIVE,
+  INACTIVE and CLOSED (final) by the lifecycle, each appending a transition with its effective date, evidence, actor and
+  versions. `GET /v1/entities/{id}/establishments?as_of=` reconstructs what was active on a date from the transitions,
+  not from the current status. The spec's `ChangeEstablishmentStatus` is one service operation behind the three routes
+  (ST-3: no generic status write).
+- **Segregation of duties.** A material establishment (BRANCH, PERMANENT_ESTABLISHMENT) cannot be activated by the
+  principal who proposed it (403 SOD_DENIED); a table constraint holds it even if the service is bypassed. The spec says
+  "where policy requires independent evidence"; no policy source exists yet, so materiality is by type. The other types
+  may be activated by their proposer.
+- **The registered-office route is kept and mirrored, not replaced.** `POST /v1/entities/{id}/registered-office` still
+  writes the ORG-03 profile version, which remains the legal record. When the office is a structured address (`lines`
+  or `line1`, `locality` or `city`, a two-letter `country`; key names matched leniently) and the command carries evidence,
+  the same transaction also records a REGISTERED address (source AUTHORITY_DOCUMENT, because the command is evidenced and
+  approved under ORG-03) and links it to the entity, ending the previous link on the new start date.
+  `GET /v1/entities/{id}/addresses?as_of=&include_ended=` reads it. Two cases stay in the profile history only: an
+  unstructured office (always accepted, unchanged) and a change that does not start after the current office began (a
+  backdated correction would have to rewrite link intervals). The mirror emits no extra event: `entity.registered_office.changed`
+  already attests the change.

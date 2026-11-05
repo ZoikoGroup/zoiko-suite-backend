@@ -2495,6 +2495,184 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  # ── ORG-08 Establishments ───────────────────────────────────────────────────
+  /v1/establishments:
+    post:
+      operationId: createEstablishment
+      summary: ORG-08 CreateEstablishment - record a legal-presence fact, starting PROPOSED
+      description: |
+        An establishment has its own id and stands at an address; the address does not make it one, and nothing is
+        inferred from it. evidence_ref and source_class are required. create_request_id makes a retry return the
+        first result (409 IDEMPOTENCY_MISMATCH if it carries different content). The entity must be operational.
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateEstablishmentRequest" } } }
+      responses:
+        "201":
+          description: Establishment recorded as PROPOSED
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "200":
+          description: Replay of an earlier create_request_id
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "create_request_id was used for a different establishment, or the entity is not operational", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/establishments/{establishmentID}:
+    get:
+      operationId: getEstablishment
+      summary: ORG-08 GetEstablishment - with the address version in force at as_of
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: establishmentID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every recorded status change." }
+      responses:
+        "200":
+          description: The establishment
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/establishments/{establishmentID}:activate:
+    post:
+      operationId: activateEstablishment
+      summary: ORG-08 ChangeEstablishmentStatus to ACTIVE (PROPOSED or INACTIVE to ACTIVE)
+      description: |
+        A material establishment (BRANCH, PERMANENT_ESTABLISHMENT) cannot be activated by the principal who proposed
+        it: 403 SOD_DENIED. The permission does not lift that.
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: establishmentID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChangeEstablishmentStatusRequest" } } }
+      responses:
+        "200":
+          description: Activated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow this move", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/establishments/{establishmentID}:deactivate:
+    post:
+      operationId: deactivateEstablishment
+      summary: ORG-08 ChangeEstablishmentStatus to INACTIVE (ACTIVE to INACTIVE); reason required
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: establishmentID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChangeEstablishmentStatusRequest" } } }
+      responses:
+        "200":
+          description: Deactivated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow this move", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/establishments/{establishmentID}:close:
+    post:
+      operationId: closeEstablishment
+      summary: ORG-08 ChangeEstablishmentStatus to CLOSED (final); reason required, sets the end of the presence
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: establishmentID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChangeEstablishmentStatusRequest" } } }
+      responses:
+        "200":
+          description: Closed; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow this move", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/entities/{entityID}/establishments:
+    get:
+      operationId: listEntityEstablishments
+      summary: ORG-08 ListEntityEstablishments, or GetEstablishmentsAsOf when as_of is given
+      description: |
+        Without as_of, lists by current status. With as_of, returns the establishments that were ACTIVE on that
+        date, reconstructed from the recorded transitions, each with its address version then.
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/EstablishmentStatus" } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Establishments (a list, or the as-of reconstruction)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  as_of: { type: string, format: date-time }
+                  items:
+                    type: array
+                    items:
+                      oneOf:
+                        - { $ref: "#/components/schemas/Establishment" }
+                        - { $ref: "#/components/schemas/EstablishmentView" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entities/{entityID}/addresses:
+    get:
+      operationId: listEntityAddresses
+      summary: ORG-08 an entity's addresses; the registered office is one, now or as it was
+      description: |
+        POST /v1/entities/{id}/registered-office still writes the ORG-03 profile version. When the office is sent
+        as a structured address (lines or line1, locality or city, country) it is also recorded here as a REGISTERED
+        address from authority evidence, ending the previous one on the new start date. An unstructured office, or a
+        change that does not start after the current one, stays in the profile history only.
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: include_ended, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Links with the address version in force at as_of
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/PartyAddress" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2817,11 +2995,12 @@ components:
 
     AddressLink:
       type: object
-      required: [link_id, address_id, party_id, link_type, valid_from, evidence_ref, linked_by, linked_at]
+      required: [link_id, address_id, link_type, valid_from, evidence_ref, linked_by, linked_at]
       properties:
         link_id: { type: string, format: uuid }
         address_id: { type: string, format: uuid }
         party_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid, description: "Set instead of party_id when the link is an entity's." }
         link_type: { $ref: "#/components/schemas/AddressType" }
         valid_from: { type: string, format: date }
         valid_to: { type: string, format: date }
@@ -2843,6 +3022,91 @@ components:
       properties:
         link: { $ref: "#/components/schemas/AddressLink" }
         version: { nullable: true, allOf: [{ $ref: "#/components/schemas/AddressVersion" }] }
+
+    EstablishmentType:
+      type: string
+      enum: [BRANCH, PERMANENT_ESTABLISHMENT, PLACE_OF_BUSINESS, REPRESENTATIVE_OFFICE, OPERATING_SITE, EMPLOYMENT_SITE]
+      description: "BRANCH and PERMANENT_ESTABLISHMENT are material: activated by a principal other than the proposer."
+
+    EstablishmentStatus:
+      type: string
+      enum: [PROPOSED, ACTIVE, INACTIVE, CLOSED]
+
+    CreateEstablishmentRequest:
+      type: object
+      required: [legal_entity_id, establishment_type, name, address_id, source_class, evidence_ref]
+      properties:
+        create_request_id: { type: string, maxLength: 128 }
+        legal_entity_id: { type: string, format: uuid }
+        establishment_type: { $ref: "#/components/schemas/EstablishmentType" }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        address_id: { type: string, format: uuid }
+        valid_from: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ChangeEstablishmentStatusRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        effective_date: { type: string, format: date, description: "Defaults to today. Not before the establishment began or its last change." }
+        reason: { type: string, description: "Required to deactivate or close." }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    Establishment:
+      type: object
+      required: [establishment_id, tenant_id, legal_entity_id, establishment_type, name, address_id, status, material, valid_from, source_class, evidence_ref, record_version, created_by, created_at]
+      properties:
+        establishment_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        establishment_type: { $ref: "#/components/schemas/EstablishmentType" }
+        name: { type: string }
+        address_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/EstablishmentStatus" }
+        material: { type: boolean }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        activated_by: { type: string }
+
+    EstablishmentTransition:
+      type: object
+      required: [seq, to_status, effective_date, command, evidence_ref, actor, version_after, occurred_at]
+      properties:
+        seq: { type: integer }
+        from_status: { $ref: "#/components/schemas/EstablishmentStatus" }
+        to_status: { $ref: "#/components/schemas/EstablishmentStatus" }
+        effective_date: { type: string, format: date }
+        command: { type: string }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        actor: { type: string }
+        version_before: { type: integer }
+        version_after: { type: integer }
+        occurred_at: { type: string, format: date-time }
+
+    EstablishmentOutcome:
+      type: object
+      required: [establishment, transition]
+      properties:
+        establishment: { $ref: "#/components/schemas/Establishment" }
+        transition: { $ref: "#/components/schemas/EstablishmentTransition" }
+
+    EstablishmentView:
+      type: object
+      required: [establishment, address]
+      properties:
+        establishment: { $ref: "#/components/schemas/Establishment" }
+        address: { nullable: true, allOf: [{ $ref: "#/components/schemas/AddressVersion" }] }
+        history: { type: array, items: { $ref: "#/components/schemas/EstablishmentTransition" } }
 
     IdentifierScheme:
       type: string
