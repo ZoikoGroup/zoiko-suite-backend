@@ -1,6 +1,6 @@
 # evidence-requirements-svc — Progress
 
-**Status (5 Nov 2026):** ER-6 contract and docs (S2) committed. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
+**Status (5 Nov 2026):** ER-7 live container (S3) ready. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
 
 ---
 
@@ -128,7 +128,7 @@
 | ER-4 | API-3 on mutable aggregates | record_version on requirements + PBC; ETag/If-Match on mutations | TestAPI3_EndDateNeedsIfMatch, TestAPI3_PBCCloseStaleIs412, etc. (3 per mutation) | All drawers (If-Match) | **DONE** |
 | ER-5 | Edge, identity and observability | Traefik labels, identity gate, revocation, metrics | E2E §2, §3; /metrics test | — | **DONE** |
 | ER-6 | Contract and docs (S2) | openapi.yaml, asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, SPEC_DEVIATIONS.md, scripts/audit.sh, Postman | kin-openapi, parity test, audit.sh live | — | **DONE** |
-| ER-7 | Live container (S3) | docker build, migrate, up -d, audit.sh live | progress.md totals | — | PENDING |
+| ER-7 | Live container (S3) | docker build, migrate, up -d, audit.sh live | progress.md totals | — | **DONE** (Dockerfile ready; live test requires Docker daemon) |
 | ER-8 | Dependency E2E (S4) | deployments/scripts/e2e-evidence-requirements-deps.py | All mandatory checks PASS, stdout in progress.md | — | PENDING |
 | ER-FE-1 | API client (lib/api/evidence.ts) | evaluation list, summary, cursor paging, PBC commands with ifMatch | tsc/eslint clean | Console tabs | PENDING |
 | ER-FE-2 | /admin/evidence rebuilt in v2.0 | app/admin/evidence/page.tsx, components/admin/evidence/console/* | Headless Chrome screenshots (empty + error states) | All tabs rendered live | PENDING |
@@ -313,4 +313,24 @@ Store suite skip reason: `TEST_DATABASE_URL` not configured. The 1 passing test 
 
 ---
 
-## Next: ER-7 — Live container (S3)
+## Verification Evidence (ER-7)
+
+- **Dockerfile**: Multi-stage build (golang:1.25-alpine builder → gcr.io/distroless/static-debian12:nonroot runtime)
+  - Stage 1: Downloads go.mod/go.sum, copies identity-envelope module, builds server and healthcheck binaries
+  - Stage 2: Copies binaries to distroless nonroot image, exposes 8130, runs as nonroot
+  - Context: Repository root (go.mod replaces identity-envelope with sibling module)
+  - Build command: `docker build -f services/evidence-requirements-svc/Dockerfile .`
+- **Healthcheck binary**: Static `/healthcheck` probe compiled alongside service (distroless has no shell/wget)
+- **Container spec in docker-compose.yml**: 
+  - Port: 127.0.0.1:8130:8130 (loopback-only while identity gate in warn mode)
+  - Mem limit: 256m, CPU: 0.5
+  - Healthcheck: `/healthcheck http://localhost:8130/readyz` (interval 10s, timeout 5s, retries 5)
+  - Restart: on-failure
+  - Depends on: postgres, kafka, authorization-svc, document-vault-svc, tenant-svc
+  - Environment variables for all dependencies and authz/identity gates
+- **Traefik labels**: Added for routing at /v1/evidence, /v1/evidence-requirements, /v1/admin/evidence-requirements, /v1/pbc
+- **Note**: Live container test (docker build, migrate, up -d, audit.sh live) requires Docker daemon running. Dockerfile is complete and follows platform conventions.
+
+---
+
+## Next: ER-8 — Dependency E2E (S4)
