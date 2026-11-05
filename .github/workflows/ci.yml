@@ -196,12 +196,27 @@ jobs:
           # Doc 07 §37: a regression against the approved baseline is NO_GO.
           go run ./cmd/evalrun -repeats 3 -sha "${{ github.sha }}" -baseline testdata/golden/baseline.json -out eval-report.json
 
-      - name: Upload eval report (public-ai-svc)
+      # Doc 06 §12/§24, SEC-T015: short fuzz runs of every parser that takes
+      # visitor or source input; a crash fails the build.
+      - name: Fuzz (public-ai-svc)
+        if: matrix.service == 'public-ai-svc'
+        working-directory: services/${{ matrix.service }}
+        run: |
+          go test ./internal/policy -run '^$' -fuzz FuzzClassifyAndRedact -fuzztime 20s
+          go test ./internal/contract -run '^$' -fuzz FuzzTurnRequest -fuzztime 15s
+          go test ./internal/contract -run '^$' -fuzz FuzzAnalyticsRequest -fuzztime 10s
+          go test ./internal/knowledge -run '^$' -fuzz FuzzParseMarkdownSource -fuzztime 15s
+
+      # Doc 06 §26, Doc 07 REL-QA-01/03: the per-test execution receipts
+      # (go test -json) are kept with the eval report.
+      - name: Upload eval report and test receipts (public-ai-svc)
         if: always() && matrix.service == 'public-ai-svc'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: public-ai-eval-report
-          path: services/public-ai-svc/eval-report.json
+          path: |
+            services/public-ai-svc/eval-report.json
+            services/public-ai-svc/test.json
           if-no-files-found: ignore
 
       # Doc 08 App. C operational drills (DR-01..DR-07) on the in-memory

@@ -70,7 +70,7 @@ func ParseMarkdownSource(raw string) (SourceFile, error) {
 		SubjectType: orDefault(fm["subject_type"], "CAPABILITY"), OwnerID: fm["owner"], ApproverIDs: list(fm["approvers"]),
 		MarketCodes: orList(list(fm["market_codes"]), []string{MarketAll}), Locale: fm["locale"], PlanCodes: []string{},
 		CapabilityIDs: list(fm["capability_ids"]), IntentIDs: list(fm["intent_ids"]), ApprovalState: fm["status"],
-		ApprovalTS: approvedAt, EffectiveFrom: &from, ExpiresAt: &until, SigningRef: "kbctl-dev", License: "OWNED_PUBLIC",
+		ApprovalTS: approvedAt, EffectiveFrom: &from, ExpiresAt: &until, SigningRef: "kbctl-dev", License: orDefault(fm["license"], "OWNED_PUBLIC"),
 		Domain: fm["domain"], ModuleID: fm["module_id"],
 	}
 	return SourceFile{Source: src, Body: body}, nil

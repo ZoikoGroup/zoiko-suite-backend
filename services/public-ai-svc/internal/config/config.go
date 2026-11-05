@@ -237,6 +237,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("PUBLIC_AI_STRUCTURED_RESPONSE is dev/test only: elsewhere set structured_response_enabled with an approval")
 	case !devLike && c.DatabaseURL == "":
 		return fmt.Errorf("PUBLIC_AI_DATABASE_URL is required outside dev/test: refusing to fall back to in-memory storage")
+	case !devLike && c.AdminAddr == "":
+		return fmt.Errorf("PUBLIC_AI_ADMIN_ADDR is required outside dev/test: /metrics and /health stay off the public listener (Doc 06 §12)")
 	}
 	if err := validateRetention(c); err != nil {
 		return err

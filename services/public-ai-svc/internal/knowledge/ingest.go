@@ -135,7 +135,14 @@ var publicLicences = map[string]bool{"OWNED_PUBLIC": true, "PUBLIC_REUSE": true,
 // highImpactSubjects need an in-date review (KB-028).
 var highImpactSubjects = map[string]bool{"PRICING": true, "TRUST": true}
 
-var hiddenContent = regexp.MustCompile(`(?i)<!--|<script|<style|<iframe|javascript:|[\x{200B}-\x{200F}\x{2060}\x{FEFF}]`)
+// hiddenContent is text a reader would not see but a model would (Doc 06
+// §09, SEC-T020): comments, scripts, CSS-hidden or zero-size text, the
+// hidden attribute, zero-width characters and bidirectional overrides that
+// reorder what is displayed.
+var hiddenContent = regexp.MustCompile(`(?i)<!--|<script|<style|<iframe|<object|<embed|javascript:|data:text/html` +
+	`|display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px|pt|em|rem)?\b|opacity\s*:\s*0(?:\.0+)?\b` +
+	`|<[a-z][^>]*\shidden(?:\s|=|>)|aria-hidden\s*=\s*["']?true` +
+	`|[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}]`)
 
 // IngestDir runs every *.source.json in dir/sources through the pipeline and
 // returns a release manifest of the STAGED sources plus a report per file.

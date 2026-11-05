@@ -49,6 +49,9 @@ services:
       PUBLIC_AI_POLICY_DIGEST: ${PUBLIC_AI_POLICY_DIGEST:-}
       PUBLIC_AI_ALLOWED_HOSTS: ${PUBLIC_AI_ALLOWED_HOSTS:-}
       PUBLIC_AI_HTTP_ADDR: ":8080"
+      # Doc 06 §12: /metrics and /health on an internal listener only
+      # (not published; Prometheus and the healthcheck reach it on the network).
+      PUBLIC_AI_ADMIN_ADDR: ":9091"
       PUBLIC_AI_DATABASE_URL: postgres://public_ai_app:${PUBLIC_AI_DB_PASSWORD}@public-ai-postgres:5432/public_ai?sslmode=disable
       PUBLIC_AI_ALLOWED_ORIGINS: ${PUBLIC_AI_ALLOWED_ORIGINS:-http://localhost:3000}
       PUBLIC_AI_SIGNING_PUBLIC_KEY: ${PUBLIC_AI_SIGNING_PUBLIC_KEY:?set PUBLIC_AI_SIGNING_PUBLIC_KEY}

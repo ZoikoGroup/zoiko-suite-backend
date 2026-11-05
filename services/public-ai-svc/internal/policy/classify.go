@@ -51,6 +51,11 @@ var exceptionRules = map[string][]*regexp.Regexp{
 			"ignore instructions", "ignore policy", "ignore the policy", "ignore your policy", "ignore policies", "ignore public only",
 			"ignore restrictions", "ignore the restrictions", "ignore safety", "bypass the filter", "bypass your", "without restrictions"),
 		regexp.MustCompile(`(?i)</?\s*(system|assistant|tool)\s*>|\[\s*system\s*\]|###\s*(system|instruction)|BEGIN SYSTEM`),
+		// Doc 06 §08/§25, QA-T040: the same instructions in other languages
+		// (Spanish, French, German, Portuguese, Italian, Dutch).
+		regexp.MustCompile(`(?i)\b(?:ignora|ignore|ignorez|ignoriere|ignorieren|negeer|olvida|oublie|oubliez|vergiss|esque[cç]a|dimentica)\b.{0,30}\b(?:instrucciones|instructions|anweisungen|instru[cç][oõ]es|istruzioni|instructies|reglas|r[eè]gles|regeln|regras|regole|regels)\b` +
+			`|\b(?:prompt|mensaje|invite)\s+(?:del|de|du)\s+(?:sistema|syst[eè]me)\b|\bsystemprompt\b|\bsystem-prompt\b` +
+			`|\b(?:muestra|revela|montre|r[eé]v[eè]le|zeige|verrate|mostra|rivela)\b.{0,25}\b(?:instrucciones|instructions|anweisungen|prompt|istruzioni)\b`),
 	},
 	X05SecurityEscalate: {
 		pattern("vulnerability", "vulnerabilities", "found a bug in your security", "security flaw", "exploit", "data breach",
