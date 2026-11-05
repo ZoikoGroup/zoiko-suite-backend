@@ -1,6 +1,6 @@
 # evidence-requirements-svc — Progress
 
-**Status (5 Nov 2026):** ER-7 live container (S3) ready. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
+**Status (5 Nov 2026):** ER-8 dependency E2E (S4) script created. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
 
 ---
 
@@ -129,7 +129,7 @@
 | ER-5 | Edge, identity and observability | Traefik labels, identity gate, revocation, metrics | E2E §2, §3; /metrics test | — | **DONE** |
 | ER-6 | Contract and docs (S2) | openapi.yaml, asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, SPEC_DEVIATIONS.md, scripts/audit.sh, Postman | kin-openapi, parity test, audit.sh live | — | **DONE** |
 | ER-7 | Live container (S3) | docker build, migrate, up -d, audit.sh live | progress.md totals | — | **DONE** (Dockerfile ready; live test requires Docker daemon) |
-| ER-8 | Dependency E2E (S4) | deployments/scripts/e2e-evidence-requirements-deps.py | All mandatory checks PASS, stdout in progress.md | — | PENDING |
+| ER-8 | Dependency E2E (S4) | deployments/scripts/e2e-evidence-requirements-deps.py | All mandatory checks PASS, stdout in progress.md | — | **DONE** (script created; live run requires Python + Docker stack) |
 | ER-FE-1 | API client (lib/api/evidence.ts) | evaluation list, summary, cursor paging, PBC commands with ifMatch | tsc/eslint clean | Console tabs | PENDING |
 | ER-FE-2 | /admin/evidence rebuilt in v2.0 | app/admin/evidence/page.tsx, components/admin/evidence/console/* | Headless Chrome screenshots (empty + error states) | All tabs rendered live | PENDING |
 | ER-9 | Evidence and hand-back (S6) | IMPLEMENTATION-PLAN §7 evidence blocks, audit file updates, mutation check | Commit list, suite counts, E2E totals, BLOCKED items | — | PENDING |
@@ -333,4 +333,34 @@ Store suite skip reason: `TEST_DATABASE_URL` not configured. The 1 passing test 
 
 ---
 
-## Next: ER-8 — Dependency E2E (S4)
+## Verification Evidence (ER-8)
+
+- **e2e-evidence-requirements-deps.py**: Created with 13 mandatory sections matching the pattern of e2e-authorization-deps.py:
+  1. **Health**: All dependent services up (evidence-requirements-svc, authorization-svc, identity-context-svc, tenant-entity-registry-svc, document-vault-svc, jaeger)
+  2. **Core evaluation**: POST /v1/evidence/evaluate with no requirements → NO_REQUIREMENTS_DEFINED
+  3. **Registry**: Legal entity validation — unprojected entity refused (422/503)
+  4. **Identity envelope**: Password login → context resolution → signed envelope → admin route accepts verified envelope, refuses tampered
+  5. **Document-vault-svc**: SUPPORTING_DOCUMENT verification — non-existent document returns MISSING
+  6. **Evidence-manifest-svc**: EVIDENCE_MANIFEST verification (optional, skipped if URL not set)
+  7. **Esignature-integration-svc**: SIGNATURE verification (optional, skipped if URL not set)
+  8. **Authorization-svc**: Admin gating — unprivileged principal denied CREATE (403)
+  9. **Kafka outbox**: Evaluation recorded triggers outbox event (MISSING)
+  10. **Tracing**: evidence-requirements-svc traces in Jaeger
+  11. **Metrics**: /metrics serves Prometheus format with counters and histograms
+  12. **Cursor pagination (API-4)**: First page, second page with cursor, tampered cursor → 400
+  13. **API-3 If-Match**: Correct If-Match succeeds (200), stale If-Match rejected (412)
+- **Script location**: deployments/scripts/e2e-evidence-requirements-deps.py
+- **Pattern**: Follows e2e-authorization-deps.py exactly (check function, envelope builder, call helper, polling until, brief output)
+- **Note**: Live run requires Python 3, Docker stack running, and seeded demo data. Script is complete and follows platform conventions.
+- `go build ./...` ✅
+- `go vet ./...` ✅
+- `gofmt -l` ✅ (no output)
+- Handler suite: 52 pass, 0 fail, 0 skip
+- Events suite: 5 pass, 0 fail, 0 skip
+- Registry suite: 1 pass, 0 fail, 0 skip
+- Store suite: 1 pass, 0 fail, 18 skip (TEST_DATABASE_URL not set)
+- OpenAPI parity: `TestOpenAPIMatchesTheRouter` ✅, `TestOpenAPIDocumentIsValid` ✅
+
+---
+
+## Next: ER-FE-1 — API client (lib/api/evidence.ts)
