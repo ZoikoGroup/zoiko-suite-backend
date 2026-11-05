@@ -312,8 +312,72 @@ func TestMigrationCutoverActionsAreSplitAcrossThreeTemplates(t *testing.T) {
 	require.Contains(t, byCode["VIEWER_AUDITOR_READ_ONLY"], "GL_CONSOLIDATION_READ", "version 4 keeps what version 3 granted")
 }
 
-// 000046: evidence-requirements-svc actions are registered and carried by templates.
-func TestEvidenceActionsAreRegisteredAndCarriedByTemplates(t *testing.T) {
+// evidenceActions is every action evidence-requirements-svc checks
+// (grep -rhoE "EVIDENCE_[A-Z_]+" internal/handler internal/authz there).
+var evidenceActions = []string{
+	"EVIDENCE_EVALUATE", "EVIDENCE_REQUIREMENT_READ", "EVIDENCE_EVALUATION_READ",
+	"EVIDENCE_REQUIREMENT_CREATE", "EVIDENCE_REQUIREMENT_RETIRE",
+	"EVIDENCE_REQUEST_CREATE", "EVIDENCE_REQUEST_MANAGE",
+	"EVIDENCE_REQUEST_SUBMIT_RESPONSE", "EVIDENCE_REQUEST_EVALUATE",
+}
+
+// R5, first half: every action evidence-requirements-svc checks is a
+// registered, active permission (000008, 000021), each described as enforced
+// by that service (000046 filled the six descriptions 000008 left empty).
+func TestR5_EvidenceActionsRegistered(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
+	cat := store.NewPermissionCatalogue(store.New(appPool))
+	got, err := cat.Lookup(ctx, evidenceActions)
+	require.NoError(t, err)
+	for _, a := range evidenceActions {
+		def, ok := got[a]
+		require.True(t, ok, "%s is not registered", a)
+		require.Contains(t, def.Description, "evidence-requirements-svc", "%s description", a)
+	}
+	// 000008 / 000021 registered all nine STANDARD; 000046 changes no tier.
+	for _, a := range evidenceActions {
+		require.Equal(t, domain.RiskStandard, got[a].RiskTier, a)
+	}
+}
+
+// R5, second half: every one of those actions is carried by the latest
+// version of at least one role template, so a role instantiated from a
+// template can grant it.
+func TestR5_EvidenceTemplateGrantsEveryAction(t *testing.T) {
+	s := store.New(appPool)
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
+	list, err := s.ListTemplates(ctx)
+	require.NoError(t, err)
+	carried := map[string]string{}
+	for _, tpl := range list {
+		for _, a := range tpl.LatestActions {
+			carried[a] = tpl.TemplateCode
+		}
+	}
+	for _, a := range evidenceActions {
+		require.NotEmpty(t, carried[a], "%s is in no role template", a)
+	}
+
+	byCode := map[string][]string{}
+	for _, tpl := range list {
+		byCode[tpl.TemplateCode] = tpl.LatestActions
+	}
+	require.Subset(t, byCode["COMPLIANCE_CATALOGUE_ADMINISTRATOR"],
+		[]string{"EVIDENCE_REQUIREMENT_READ", "EVIDENCE_REQUIREMENT_CREATE", "EVIDENCE_REQUIREMENT_RETIRE"})
+	require.Subset(t, byCode["EVIDENCE_REQUEST_MANAGER"],
+		[]string{"EVIDENCE_REQUEST_CREATE", "EVIDENCE_REQUEST_MANAGE", "EVIDENCE_REQUEST_SUBMIT_RESPONSE",
+			"EVIDENCE_REQUEST_EVALUATE", "EVIDENCE_REQUIREMENT_READ", "EVIDENCE_EVALUATION_READ"})
+	require.Subset(t, byCode["OBLIGATION_MANAGER"], []string{"EVIDENCE_EVALUATE", "EVIDENCE_REQUEST_EVALUATE"})
+	v, err := s.GetTemplateVersion(ctx, "COMPLIANCE_CATALOGUE_ADMINISTRATOR", 2)
+	require.NoError(t, err)
+	require.Contains(t, v.PermittedActions, "EVIDENCE_REQUIREMENT_RETIRE")
+}
+
+// 000047: evidence-manifest-svc's two actions are grantable from a template,
+// and every template whose holders evaluate evidence can also read the
+// manifest an evaluation offers (evidence-requirements-svc reads it as the
+// evaluating principal). The new versions keep everything the old ones had.
+func TestR5_EvidenceManifestActionsAreInTemplates(t *testing.T) {
 	s := store.New(appPool)
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
 	list, err := s.ListTemplates(ctx)
@@ -322,49 +386,19 @@ func TestEvidenceActionsAreRegisteredAndCarriedByTemplates(t *testing.T) {
 	for _, tpl := range list {
 		byCode[tpl.TemplateCode] = tpl.LatestActions
 	}
+	require.ElementsMatch(t, []string{"EVIDENCE_MANIFEST_GENERATE", "EVIDENCE_MANIFEST_READ"}, byCode["EVIDENCE_MANIFEST_MANAGER"])
+	require.Contains(t, byCode["EVIDENCE_REQUEST_MANAGER"], "EVIDENCE_MANIFEST_READ")
+	require.Contains(t, byCode["OBLIGATION_MANAGER"], "EVIDENCE_MANIFEST_READ")
+	require.NotContains(t, byCode["EVIDENCE_REQUEST_MANAGER"], "EVIDENCE_MANIFEST_GENERATE", "evaluating is not generating")
 
-	// COMPLIANCE_CATALOGUE_ADMINISTRATOR v2 now grants the catalogue mutation
-	// actions that were listed in v1 but missing from permission_definitions.
-	require.Contains(t, byCode["COMPLIANCE_CATALOGUE_ADMINISTRATOR"], "EVIDENCE_REQUIREMENT_CREATE")
-	require.Contains(t, byCode["COMPLIANCE_CATALOGUE_ADMINISTRATOR"], "EVIDENCE_REQUIREMENT_RETIRE")
-	require.Contains(t, byCode["COMPLIANCE_CATALOGUE_ADMINISTRATOR"], "EVIDENCE_REQUIREMENT_READ")
-	// Verify it's version 2
-	v, err := s.GetTemplateVersion(ctx, "COMPLIANCE_CATALOGUE_ADMINISTRATOR", 2)
-	require.NoError(t, err)
-	require.Contains(t, v.PermittedActions, "EVIDENCE_REQUIREMENT_CREATE")
-	require.Contains(t, v.PermittedActions, "EVIDENCE_REQUIREMENT_RETIRE")
-
-	// EVIDENCE_REQUEST_MANAGER v1 grants PBC lifecycle + evaluate + reads
-	require.Contains(t, byCode["EVIDENCE_REQUEST_MANAGER"], "EVIDENCE_REQUEST_CREATE")
-	require.Contains(t, byCode["EVIDENCE_REQUEST_MANAGER"], "EVIDENCE_REQUEST_MANAGE")
-	require.Contains(t, byCode["EVIDENCE_REQUEST_MANAGER"], "EVIDENCE_REQUEST_SUBMIT_RESPONSE")
-	require.Contains(t, byCode["EVIDENCE_REQUEST_MANAGER"], "EVIDENCE_REQUEST_EVALUATE")
-	require.Contains(t, byCode["EVIDENCE_REQUEST_MANAGER"], "EVIDENCE_REQUIREMENT_READ")
-	require.Contains(t, byCode["EVIDENCE_REQUEST_MANAGER"], "EVIDENCE_EVALUATION_READ")
-	v, err = s.GetTemplateVersion(ctx, "EVIDENCE_REQUEST_MANAGER", 1)
-	require.NoError(t, err)
-	require.Contains(t, v.PermittedActions, "EVIDENCE_REQUEST_CREATE")
-	require.Contains(t, v.PermittedActions, "EVIDENCE_REQUEST_EVALUATE")
-
-	// OBLIGATION_MANAGER v2 adds EVIDENCE_REQUEST_EVALUATE for mark-satisfied
-	require.Contains(t, byCode["OBLIGATION_MANAGER"], "EVIDENCE_REQUEST_EVALUATE")
-	v, err = s.GetTemplateVersion(ctx, "OBLIGATION_MANAGER", 2)
-	require.NoError(t, err)
-	require.Contains(t, v.PermittedActions, "EVIDENCE_REQUEST_EVALUATE")
-
-	// All six actions are registered with correct risk tiers
-	cat := store.NewPermissionCatalogue(store.New(appPool))
-	got, err := cat.Lookup(ctx, []string{
-		"EVIDENCE_REQUIREMENT_CREATE", "EVIDENCE_REQUIREMENT_RETIRE",
-		"EVIDENCE_REQUEST_CREATE", "EVIDENCE_REQUEST_MANAGE",
-		"EVIDENCE_REQUEST_SUBMIT_RESPONSE", "EVIDENCE_REQUEST_EVALUATE",
-	})
-	require.NoError(t, err)
-	require.Equal(t, domain.RiskHigh, got["EVIDENCE_REQUIREMENT_CREATE"].RiskTier)
-	require.Equal(t, domain.RiskHigh, got["EVIDENCE_REQUIREMENT_RETIRE"].RiskTier)
-	require.Equal(t, domain.RiskStandard, got["EVIDENCE_REQUEST_CREATE"].RiskTier)
-	require.Equal(t, domain.RiskStandard, got["EVIDENCE_REQUEST_MANAGE"].RiskTier)
-	require.Equal(t, domain.RiskStandard, got["EVIDENCE_REQUEST_SUBMIT_RESPONSE"].RiskTier)
-	require.Equal(t, domain.RiskStandard, got["EVIDENCE_REQUEST_EVALUATE"].RiskTier)
-	require.Contains(t, got["EVIDENCE_REQUIREMENT_CREATE"].Description, "evidence-requirements-svc")
+	for _, prev := range []struct {
+		code       string
+		old, newer int
+	}{{"EVIDENCE_REQUEST_MANAGER", 1, 2}, {"OBLIGATION_MANAGER", 2, 3}} {
+		o, err := s.GetTemplateVersion(ctx, prev.code, prev.old)
+		require.NoError(t, err)
+		n, err := s.GetTemplateVersion(ctx, prev.code, prev.newer)
+		require.NoError(t, err)
+		require.Subset(t, n.PermittedActions, o.PermittedActions, "%s v%d keeps what v%d granted", prev.code, prev.newer, prev.old)
+	}
 }
