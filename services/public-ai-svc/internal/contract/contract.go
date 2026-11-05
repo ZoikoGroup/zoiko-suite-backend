@@ -152,8 +152,28 @@ func DefaultClass(s Status) string {
 	}
 }
 
-// PageContexts is the allowlisted page_context enum (Doc 05 §08).
-var PageContexts = map[string]bool{"home": true, "pricing": true, "core_modules": true, "demo": true, "support": true, "other": true}
+// PageContexts is the allowlisted page_context enum (Doc 05 §08), plus
+// "trust": Doc 02 §22 defines a Trust page starter set, and the widget sends
+// it on /trust. Any other value is still rejected (CT-009).
+var PageContexts = map[string]bool{"home": true, "pricing": true, "core_modules": true, "trust": true, "demo": true, "support": true, "other": true}
+
+// SupportedLocales are the locales the public knowledge is written in.
+// DefaultLocale is served when a visitor asks for any other (Doc 05 §08–09):
+// a non-English locale must not filter out every approved source.
+var SupportedLocales = []string{"en-US"}
+
+const DefaultLocale = "en-US"
+
+// ServedLocale returns loc when its language is supported, else DefaultLocale.
+func ServedLocale(loc string) string {
+	lang := strings.ToLower(strings.SplitN(loc, "-", 2)[0])
+	for _, s := range SupportedLocales {
+		if lang != "" && strings.EqualFold(strings.SplitN(s, "-", 2)[0], lang) {
+			return loc
+		}
+	}
+	return DefaultLocale
+}
 
 var (
 	marketRe = regexp.MustCompile(`^[A-Z]{2}$`)

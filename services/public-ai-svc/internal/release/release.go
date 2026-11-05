@@ -463,7 +463,7 @@ func (r *Runtime) PublicConfig() contract.ConfigResponse {
 	cfg := contract.ConfigResponse{
 		AssistantDisplayName: "ZoikoSuite Assistant", // neutral until brand clearance (DEC-04)
 		Capabilities:         contract.Capabilities{},
-		SupportedLocales:     []string{"en-US"},
+		SupportedLocales:     append([]string(nil), contract.SupportedLocales...),
 		MarketChoices:        []string{},
 		PublicRoutes:         []contract.PublicRoute{},
 		CitationLinks:        []contract.CitationLink{},

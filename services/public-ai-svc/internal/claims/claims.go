@@ -326,6 +326,18 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 	return d
 }
 
+// approvesOwn reports whether the claim's owner is one of its approvers, so
+// the two-person rule would be met by the author and one other person.
+func approvesOwn(c Claim) bool {
+	owner := strings.ToLower(strings.TrimSpace(c.OwnerID))
+	for _, a := range c.ApprovalRefs {
+		if strings.ToLower(strings.TrimSpace(a)) == owner {
+			return true
+		}
+	}
+	return false
+}
+
 func distinct(xs []string) int {
 	seen := map[string]bool{}
 	for _, x := range xs {
@@ -437,6 +449,8 @@ func (m Manifest) StructuralProblems() []string {
 			problems = append(problems, "ACTIVE claim needs two approvals (Doc 03 §10): "+c.ClaimID)
 		case c.Status == StatusActive && strings.TrimSpace(c.OwnerID) == "":
 			problems = append(problems, "ACTIVE claim needs an accountable owner (Doc 03 §10): "+c.ClaimID)
+		case c.Status == StatusActive && approvesOwn(c):
+			problems = append(problems, "claim owner may not approve their own claim (Doc 03 §10): "+c.ClaimID)
 		case c.Status == StatusActive && !c.ValidUntil.After(c.ValidFrom):
 			problems = append(problems, "invalid validity window: "+c.ClaimID)
 		}

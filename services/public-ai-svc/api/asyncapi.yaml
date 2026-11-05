@@ -7,7 +7,8 @@ info:
     transactional outbox (Doc 05 §20). Consumers must be idempotent on the CloudEvents id, tolerate
     out-of-order delivery and re-check the revocation epoch on replay. Payloads carry identifiers, enums
     and coarse buckets only, never visitor text, prompts, model output, grants or contact data. Events that
-    fail 10 times are diverted to "<topic>.dlq". The browser never publishes events.
+    fail 10 times are diverted to "<topic>.dlq". The browser never publishes events. The payload
+    version is the ".vN" suffix of the CloudEvents type; a breaking change is a new type.
 defaultContentType: application/cloudevents+json
 channels:
   telemetry:
@@ -60,6 +61,7 @@ components:
               data:
                 type: object
                 additionalProperties: false
+                required: [request_id, intent_id, status, latency_bucket, release_id]
                 properties:
                   request_id: {type: string}
                   intent_id: {type: string}
@@ -76,6 +78,7 @@ components:
               data:
                 type: object
                 additionalProperties: false
+                required: [route_key, consent_flag]
                 properties:
                   route_key: {type: string}
                   market_code_if_explicit: {type: string}
@@ -89,10 +92,11 @@ components:
               data:
                 type: object
                 additionalProperties: false
+                required: [reason_class, request_id, severity]
                 properties:
-                  reason_class: {type: string, enum: [PROMPT_INJECTION, SENSITIVE_INPUT, SECURITY_REPORT]}
+                  reason_class: {type: string, enum: [PROMPT_INJECTION, SENSITIVE_INPUT, SECURITY_REPORT, TOOL_INSTRUCTION]}
                   request_id: {type: string}
-                  severity: {type: string}
+                  severity: {type: string, enum: [LOW, MEDIUM, HIGH]}
     killSwitchChanged:
       name: publicai.kill_switch.changed.v1
       payload:
@@ -102,6 +106,7 @@ components:
               data:
                 type: object
                 additionalProperties: false
+                required: [flag, actor_ref, approval_ref, environment, control_epoch]
                 properties:
                   flag: {type: string}
                   actor_ref: {type: string}
@@ -117,6 +122,7 @@ components:
               data:
                 type: object
                 additionalProperties: false
+                required: [release_id, kind, signer_refs, digest, effective_at, release_epoch]
                 properties:
                   release_id: {type: string}
                   kind: {type: string, enum: [kb, claims], description: "Which release pointer moved; replay rechecks that pointer (Doc 05 §22)."}
@@ -133,6 +139,7 @@ components:
               data:
                 type: object
                 additionalProperties: false
+                required: [source_version_id, reason_code, effective_at, revocation_epoch]
                 properties:
                   source_version_id: {type: string}
                   reason_code: {type: string}

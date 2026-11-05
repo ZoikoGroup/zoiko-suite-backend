@@ -1,6 +1,7 @@
 package claims
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -167,5 +168,21 @@ func TestConflictsNeedSameScopeAndOverlappingWindows(t *testing.T) {
 	d := NewResolver(Manifest{Claims: []Claim{usd, xtt}}).Resolve(Request{Subject: Price, Market: "US", AsOf: day(6)}, nil)
 	if d.Decision != Verified {
 		t.Fatalf("different currencies must not contradict: %+v", d)
+	}
+}
+
+// Doc 03 §10: no self-approval. The owner counted as one of the two
+// approvers makes the release structurally invalid.
+func TestOwnerMayNotApproveOwnClaim(t *testing.T) {
+	c := completePriceClaim()
+	c.OwnerID = "commercial-ops"
+	c.ApprovalRefs = []string{"approval-finance", "approval-legal"}
+	if p := (Manifest{Claims: []Claim{c}}).StructuralProblems(); len(p) != 0 {
+		t.Fatalf("independent approvers rejected: %v", p)
+	}
+	c.ApprovalRefs = []string{"approval-finance", " Commercial-Ops "}
+	p := (Manifest{Claims: []Claim{c}}).StructuralProblems()
+	if len(p) != 1 || !strings.Contains(p[0], "may not approve their own claim") {
+		t.Fatalf("self-approval not refused: %v", p)
 	}
 }

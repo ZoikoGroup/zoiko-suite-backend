@@ -17,6 +17,8 @@ func TestTurnRequestValidation(t *testing.T) {
 		field string
 	}{
 		{"ok", func(*TurnRequest) {}, ""},
+		{"trust page (Doc 02 §22)", func(r *TurnRequest) { r.PageContext = "trust" }, ""},
+		{"unknown page", func(r *TurnRequest) { r.PageContext = "blog" }, "page_context"},
 		{"bad schema", func(r *TurnRequest) { r.SchemaVersion = "2.0" }, "schema"},
 		{"short session", func(r *TurnRequest) { r.SessionID = "x" }, "session_id"},
 		{"bad uuid", func(r *TurnRequest) { r.ClientTurnID = "nope" }, "client_turn_id"},
@@ -106,6 +108,14 @@ func TestDoc05CT016_InvalidStatusEnum(t *testing.T) {
 			Citations: []Citation{}, Actions: []Action{}, AnswerClass: HandoffUnknown}
 		if e.Validate() == nil {
 			t.Errorf("status %q must be rejected", st)
+		}
+	}
+}
+
+func TestServedLocaleFallsBackToDefault(t *testing.T) {
+	for in, want := range map[string]string{"en-US": "en-US", "en-GB": "en-GB", "en": "en", "es-ES": DefaultLocale, "de": DefaultLocale, "": DefaultLocale} {
+		if got := ServedLocale(in); got != want {
+			t.Errorf("ServedLocale(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

@@ -272,7 +272,7 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 	}()
 	res := s.deps.Answerer.Answer(answerCtx, orchestrator.Input{
 		RequestID: rid, SessionID: sess.SessionID, TurnID: turnID, Message: req.Message, Pending: pending,
-		Locale: firstNonEmpty(req.Locale, sess.Locale), MarketCode: firstNonEmpty(req.MarketCode, sess.MarketCode),
+		Locale: contract.ServedLocale(firstNonEmpty(req.Locale, sess.Locale)), MarketCode: firstNonEmpty(req.MarketCode, sess.MarketCode),
 		PageContext:   firstNonEmpty(req.PageContext, sess.PageContext),
 		Budget:        s.sessionBudget(sess),
 		SessionCapped: s.cfg.SessionTokenCap > 0 && sess.TokensUsed >= s.cfg.SessionTokenCap,
