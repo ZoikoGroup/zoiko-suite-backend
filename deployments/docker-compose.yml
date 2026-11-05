@@ -2965,6 +2965,12 @@ services:
     ports:
       # Loopback only while the identity gate runs in warn mode.
       - "127.0.0.1:8130:8130"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.evidence-requirements-svc.rule=PathPrefix(`/v1/evidence`) || PathPrefix(`/v1/evidence-requirements`) || PathPrefix(`/v1/admin/evidence-requirements`) || PathPrefix(`/v1/pbc`)"
+      - "traefik.http.routers.evidence-requirements-svc.entrypoints=websecure"
+      - "traefik.http.routers.evidence-requirements-svc.tls=true"
+      - "traefik.http.services.evidence-requirements-svc.loadbalancer.server.port=8130"
     environment:
       PORT: "8130"
       DB_HOST: postgres

@@ -1,6 +1,6 @@
 # evidence-requirements-svc — Progress
 
-**Status (5 Nov 2026):** ER-4 API-3 on mutable aggregates committed. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
+**Status (5 Nov 2026):** ER-5 edge, identity and observability committed. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
 
 ---
 
@@ -126,7 +126,7 @@
 | ER-2 | Verify manifest and signature references | internal/manifest/client.go, internal/esignature/client.go, handler.checkArtifacts | TestER02_ManifestOutsideTenantDoesNotCount, TestER02_ManifestUnknownIsUnmet, TestER02_ManifestServiceDownIs503NoRow, TestER02_SignatureUnknownIsUnmet, TestER02_SignatureServiceDownIs503NoRow, TestER02_SameManifestTwiceCountsOnce, TestER02_UnconfiguredOwnerNeverCounts | Evidence types panel | **DONE** |
 | ER-3 | Console read models (API-4 cursor paging) | GET /v1/evidence/evaluations, /v1/evidence-requirements, /v1/pbc/requests, /v1/evidence/summary | List tests: first page, next page, tampered cursor 400, foreign tenant cursor 400, unknown filter 400, RLS isolation | All tabs (registers) | **DONE** |
 | ER-4 | API-3 on mutable aggregates | record_version on requirements + PBC; ETag/If-Match on mutations | TestAPI3_EndDateNeedsIfMatch, TestAPI3_PBCCloseStaleIs412, etc. (3 per mutation) | All drawers (If-Match) | **DONE** |
-| ER-5 | Edge, identity and observability | Traefik labels, identity gate, revocation, metrics | E2E §2, §3; /metrics test | — | PENDING |
+| ER-5 | Edge, identity and observability | Traefik labels, identity gate, revocation, metrics | E2E §2, §3; /metrics test | — | **DONE** |
 | ER-6 | Contract and docs (S2) | openapi.yaml, asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, SPEC_DEVIATIONS.md, scripts/audit.sh, Postman | kin-openapi, parity test, audit.sh live | — | PENDING |
 | ER-7 | Live container (S3) | docker build, migrate, up -d, audit.sh live | progress.md totals | — | PENDING |
 | ER-8 | Dependency E2E (S4) | deployments/scripts/e2e-evidence-requirements-deps.py | All mandatory checks PASS, stdout in progress.md | — | PENDING |
@@ -270,4 +270,27 @@ Store suite skip reason: `TEST_DATABASE_URL` not configured. The 1 passing test 
 
 ---
 
-## Next: ER-5 — Edge, identity and observability
+## Verification Evidence (ER-5)
+
+- Added Traefik labels to evidence-requirements-svc in docker-compose.yml for routing at `/v1/evidence`, `/v1/evidence-requirements`, `/v1/admin/evidence-requirements`, `/v1/pbc`
+- Identity gate already configured with `idenv.NewGateFromEnv` including:
+  - JWKS verification from identity-context-svc
+  - Session revocation checking via `IDENTITY_INTROSPECT_URL` (AU-01)
+  - DPoP sender constraint verification (AU-27)
+  - Workload peer verification over mTLS
+  - Modes: `IDENTITY_VERIFY=warn` (local/dev), `require` (production)
+- Metrics endpoint at `/metrics` with Prometheus counters, histograms, and readiness gauge
+- Health probes at `/healthz` (liveness) and `/readyz` (readiness with DB check)
+- OpenTelemetry tracing configured via `internal/telemetry` with OTLP exporter
+- `go build ./...` ✅
+- `go vet ./...` ✅
+- `gofmt -l` ✅ (no output)
+- Handler suite: 52 pass, 0 fail, 0 skip
+- Events suite: 5 pass, 0 fail, 0 skip
+- Registry suite: 1 pass, 0 fail, 0 skip
+- Store suite: 1 pass, 0 fail, 18 skip (TEST_DATABASE_URL not set)
+- OpenAPI parity: `TestOpenAPIMatchesTheRouter` ✅, `TestOpenAPIDocumentIsValid` ✅
+
+---
+
+## Next: ER-6 — Contract and docs (S2)
