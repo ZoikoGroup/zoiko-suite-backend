@@ -92,6 +92,17 @@ channels:
           - $ref: "#/components/messages/OwnershipRelationshipEnded"
           - $ref: "#/components/messages/OwnershipRelationshipRejected"
           - $ref: "#/components/messages/ControlRelationshipChanged"
+          # ── ORG-07 / MDM-01 parties ───────────────────────────────────────
+          - $ref: "#/components/messages/PartyCreated"
+          - $ref: "#/components/messages/PartyProfileAmended"
+          - $ref: "#/components/messages/PartyFactPublished"
+          - $ref: "#/components/messages/PartyRoleAdded"
+          - $ref: "#/components/messages/PartyRoleRemoved"
+          - $ref: "#/components/messages/PartyIdentifierLinked"
+          - $ref: "#/components/messages/MasterConflictOpened"
+          - $ref: "#/components/messages/PartiesMerged"
+          - $ref: "#/components/messages/PartySplit"
+          - $ref: "#/components/messages/MasterConflictResolved"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -271,6 +282,112 @@ components:
     # The envelope's object_id is the relationship id and its entity is the CHILD.
     # A CONTROL relationship's activation, supersession and end are all
     # control.relationship.changed; an OWNERSHIP relationship's have their own names.
+
+    # ── ORG-07 / MDM-01 parties ─────────────────────────────────────────────
+    # No party event carries a name, an identifier value or evidence text: a natural person's name is personal data
+    # and an identifier may be sensitive, and an event reaches every subscriber. A consumer reads the value through
+    # the permissioned API.
+    PartyCreated:
+      name: party.created
+      title: A new party was created
+      description: |
+        Emitted once, in the create transaction. A create that matched an existing party or opened a stewardship
+        case emits no party.created. Consumers create references and projections only, never a second master.
+      x-spec-event: PartyCreated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartyProfileAmended:
+      name: party.profile.amended
+      title: A fact about a party was recorded
+      description: |
+        One per proposed fact, whether it was verified or held PROPOSED. `quality_state` says which.
+      x-spec-event: PartyProfileAmended
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartyFactPublished:
+      name: party.fact.published
+      title: A fact about a party became VERIFIED
+      description: |
+        Consumers decide prospective adoption; historical artifacts are untouched. Carries fact_type,
+        valid_from/valid_to, source_class and quality_state.
+      x-spec-event: party_fact_published
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartyRoleAdded:
+      name: party.role.added
+      title: A party was given a role
+      x-spec-event: PartyRoleAdded
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartyRoleRemoved:
+      name: party.role.removed
+      title: A party's role was ended
+      description: The spec names no event for removing a role. `effective_at` is the end date.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartyIdentifierLinked:
+      name: party.identifier.linked
+      title: An external identifier was linked to a party
+      description: Carries the scheme, scope and verification status, never the value.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterConflictOpened:
+      name: master.conflict.opened
+      title: A stewardship case was opened
+      description: |
+        An ambiguous create, an identifier claimed by two parties, or a fact that contradicts a verified one.
+        Carries conflict_type, the case id and the candidate party ids. No consumer receives a conflicted fact as
+        VERIFIED.
+      x-spec-event: master_conflict_opened
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartiesMerged:
+      name: party.merged
+      title: Parties were merged; the survivor keeps its id and the others resolve to it
+      description: |
+        Emitted in the merge transaction. `survivor_id`, `alias_ids`, `decision_ref` (the stewardship case) and
+        `remediation_scope`: the domains that hold references to an alias re-point them prospectively through the
+        alias, and never rewrite a historical snapshot. Merged ids are never reused and still resolve.
+      x-spec-event: PartiesMerged
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartySplit:
+      name: party.split
+      title: A merge was corrected; the party is distinct again
+      description: |
+        Carries `restored_party_id`, `survivor_id`, `decision_ref` and `remediation_scope`. The merge stays in the
+        lineage; domains re-resolve live references and open their own exceptions.
+      x-spec-event: PartySplit
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterConflictResolved:
+      name: master.conflict.resolved
+      title: A stewardship case was decided
+      description: Carries the case id, conflict_type, decision and the party the decision settled on.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
 
     OwnershipRelationshipProposed:
       name: ownership.relationship.proposed

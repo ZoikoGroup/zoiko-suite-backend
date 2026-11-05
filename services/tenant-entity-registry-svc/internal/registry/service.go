@@ -1388,6 +1388,18 @@ func (s *Service) authorizeHierarchy(ctx context.Context, hierarchyID, action st
 	return s.authorizeEntities(ctx, "entity.hierarchy", action, h.ChildLegalEntityID, h.ParentLegalEntityID)
 }
 
+// GetHierarchyByID retrieves a hierarchy by ID for ETag/If-Match support.
+func (s *Service) GetHierarchyByID(ctx context.Context, hierarchyID string) (*domain.EntityHierarchy, error) {
+	h, err := s.store.GetHierarchyByID(ctx, hierarchyID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetHierarchyByID: %w", err)
+	}
+	if h == nil {
+		return nil, ErrNotFound
+	}
+	return h, nil
+}
+
 func (s *Service) authorizeJurisdictionAssignment(ctx context.Context, assignmentID, action string) error {
 	a, err := s.store.GetJurisdictionAssignmentByID(ctx, assignmentID)
 	if err != nil {
@@ -1397,6 +1409,18 @@ func (s *Service) authorizeJurisdictionAssignment(ctx context.Context, assignmen
 		return s.authorize(ctx, "entity.jurisdiction", action)
 	}
 	return s.authorizeEntity(ctx, a.LegalEntityID, "entity.jurisdiction", action)
+}
+
+// GetJurisdictionAssignmentByID retrieves a jurisdiction assignment by ID for ETag/If-Match support.
+func (s *Service) GetJurisdictionAssignmentByID(ctx context.Context, assignmentID string) (*domain.EntityJurisdictionAssignment, error) {
+	a, err := s.store.GetJurisdictionAssignmentByID(ctx, assignmentID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetJurisdictionAssignmentByID: %w", err)
+	}
+	if a == nil {
+		return nil, ErrNotFound
+	}
+	return a, nil
 }
 
 func (s *Service) authorizeBundle(ctx context.Context, bundleID, resource, action string) error {

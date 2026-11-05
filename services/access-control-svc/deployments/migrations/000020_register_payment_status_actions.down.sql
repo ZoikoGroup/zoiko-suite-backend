@@ -1,6 +1,15 @@
 -- Removes the 000020 entries. Refused while any bundle still names one:
 -- deleting a registered action under a live grant would leave the bundle
 -- holding a name the registry no longer recognises.
+--
+-- permission_bundle_defs is FORCE ROW LEVEL SECURITY, so a guard run under
+-- row security sees only the bundles of whatever tenant app.tenant_id names
+-- and would pass while another tenant's bundle still grants the action.
+-- row_security is turned off first: a role that may bypass row security then
+-- sees every tenant's bundles, and one that may not fails the query instead.
+-- Either way the guard never passes on a partial view.
+SET LOCAL row_security = off;
+
 DO $$
 DECLARE
     v_used TEXT;

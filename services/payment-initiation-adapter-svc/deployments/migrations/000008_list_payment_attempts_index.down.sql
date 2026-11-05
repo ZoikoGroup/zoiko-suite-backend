@@ -1,0 +1,1 @@
+DROP INDEX idx_payment_initiation_attempts_entity_list;

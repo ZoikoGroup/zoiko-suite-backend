@@ -345,6 +345,16 @@ func (s *SupportService) Approve(
 		return nil, domain.ErrSupportNotPending
 	}
 
+	// Re-read to get the updated record_version (incremented by the store).
+	fresh, err := s.store.FindSupportContext(ctx, sc.SupportContextID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("re-read support context after approve: %w", err)
+	}
+	if fresh == nil {
+		return nil, domain.ErrSupportContextNotFound
+	}
+	sc = fresh
+
 	// A privileged elevation into a customer tenant is the single highest
 	// signal this service produces. Streamed at CRITICAL, synchronously, and
 	// its failure is logged rather than swallowed — a break-glass the security

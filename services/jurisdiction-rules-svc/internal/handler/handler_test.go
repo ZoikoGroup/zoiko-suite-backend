@@ -208,7 +208,7 @@ func (s *stubStore) CreateJurisdictionWithQuerier(_ context.Context, _ store.Que
 }
 
 // DeactivateJurisdictionWithQuerier implements handler.JurisdictionStore.
-func (s *stubStore) DeactivateJurisdictionWithQuerier(_ context.Context, _ store.Querier, _, actorID string) (*domain.Jurisdiction, bool, error) {
+func (s *stubStore) DeactivateJurisdictionWithQuerier(_ context.Context, _ store.Querier, _, actorID string, _ *int64) (*domain.Jurisdiction, bool, error) {
 	return s.DeactivateJurisdiction(context.Background(), "", actorID)
 }
 

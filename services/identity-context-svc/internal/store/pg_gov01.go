@@ -253,6 +253,56 @@ func (s *PgStore) UpsertIngressBinding(ctx context.Context, b domain.TenantIngre
 	return nil
 }
 
+// CountActiveSessions counts live session contexts across every tenant, for
+// the identity_sessions_active gauge (IAM-6). Runs under the retention
+// worker's named sweep capability, which session_contexts' policy admits.
+func (s *PgStore) CountActiveSessions(ctx context.Context) (int, error) {
+	var n int
+	err := s.withSweepScope(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM session_contexts
+			WHERE invalidated_at IS NULL AND expires_at > NOW()`).Scan(&n)
+	})
+	return n, err
+}
+
+// ListIngressBindingTenants lists every tenant with a local ingress binding,
+// for the registry refresher (S1-B3).
+func (s *PgStore) ListIngressBindingTenants(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT tenant_id FROM tenant_ingress_bindings ORDER BY tenant_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list ingress binding tenants: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// DeactivateIngressBindingsExcept deactivates a tenant's active bindings whose
+// hostname the registry no longer lists, so a removed binding stops routing.
+func (s *PgStore) DeactivateIngressBindingsExcept(ctx context.Context, tenantID string, keep []string) (int, error) {
+	if tenantID == "" {
+		return 0, errors.New("DeactivateIngressBindingsExcept: tenant_id is required")
+	}
+	if keep == nil {
+		keep = []string{}
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE tenant_ingress_bindings
+		   SET active_flag = false, refreshed_at = NOW()
+		 WHERE tenant_id = $1 AND active_flag AND NOT (ingress_identifier = ANY($2))`, tenantID, keep)
+	if err != nil {
+		return 0, fmt.Errorf("deactivate ingress bindings: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // TouchIngressBindings marks a tenant's bindings stale so the next resolution
 // re-reads them, and reports how many were affected.
 //
@@ -319,8 +369,9 @@ func (s *PgStore) InsertSupportContextWithEvent(
 				support_context_id, tenant_id, support_principal_id, subject_principal_id,
 				reason_code, justification, ticket_ref, approver_principal_id,
 				granted_at, expires_at, evidence_id, correlation_id,
-				requested_by_principal_id, approval_status, requested_ttl_seconds)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULLIF($13::text, ''),$14,NULLIF($15::int, 0))`,
+				requested_by_principal_id, approval_status, requested_ttl_seconds,
+				record_version)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULLIF($13::text, ''),$14,NULLIF($15::int, 0), 1)`,
 			sc.SupportContextID, sc.TenantID, sc.SupportPrincipalID, sc.SubjectPrincipalID,
 			sc.ReasonCode, sc.Justification, sc.TicketRef, sc.ApproverPrincipalID,
 			sc.GrantedAt, sc.ExpiresAt, sc.EvidenceID, sc.CorrelationID,
@@ -412,7 +463,8 @@ func (s *PgStore) RevokeSupportContextWithEvent(
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE support_contexts
-			   SET revoked_at = $1, revocation_reason = $2
+			   SET revoked_at = $1, revocation_reason = $2,
+			       record_version = record_version + 1
 			 WHERE support_context_id = $3
 			   AND tenant_id = $4
 			   AND revoked_at IS NULL`,
@@ -580,7 +632,7 @@ const supportContextColumns = `
 	       reason_code, justification, ticket_ref, approver_principal_id,
 	       granted_at, expires_at, revoked_at, revocation_reason,
 	       reviewed_at, reviewed_by, evidence_id, correlation_id,
-	       COALESCE(requested_by_principal_id, ''), approval_status, approved_at, COALESCE(requested_ttl_seconds, 0)
+	       COALESCE(requested_by_principal_id, ''), approval_status, approved_at, COALESCE(requested_ttl_seconds, 0), record_version
 	  FROM support_contexts`
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows.
@@ -595,6 +647,7 @@ func scanSupportContext(r rowScanner, sc *domain.SupportContext) error {
 		&sc.GrantedAt, &sc.ExpiresAt, &sc.RevokedAt, &sc.RevocationReason,
 		&sc.ReviewedAt, &sc.ReviewedBy, &sc.EvidenceID, &sc.CorrelationID,
 		&sc.RequestedByPrincipalID, &sc.ApprovalStatus, &sc.ApprovedAt, &sc.RequestedTTLSeconds,
+		&sc.RecordVersion,
 	)
 }
 
@@ -622,7 +675,8 @@ func (s *PgStore) ApproveSupportContextWithEvent(
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE support_contexts
-			   SET approval_status = 'APPROVED', approved_at = $1, granted_at = $1, expires_at = $2
+			   SET approval_status = 'APPROVED', approved_at = $1, granted_at = $1, expires_at = $2,
+			       record_version = record_version + 1
 			 WHERE support_context_id = $3
 			   AND tenant_id = $4
 			   AND approver_principal_id = $5

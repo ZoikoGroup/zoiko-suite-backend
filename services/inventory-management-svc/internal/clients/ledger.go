@@ -12,10 +12,10 @@ import (
 )
 
 type postingEventLine struct {
-	// Exactly one of AccountCode/MappingKey is set (ACC-04 refuses both or
-	// neither as posting-rule ambiguity), so both are omitempty.
-	AccountCode  string  `json:"account_code,omitempty"`
-	MappingKey   string  `json:"mapping_key,omitempty"`
+	// MappingKey is the only way to name an account: general-ledger-svc's
+	// ACC-04 posting path no longer accepts a raw account_code at all (ACC-02
+	// is the sole account-resolution authority).
+	MappingKey   string  `json:"mapping_key"`
 	DebitAmount  float64 `json:"debit_amount,omitempty"`
 	CreditAmount float64 `json:"credit_amount,omitempty"`
 }
@@ -37,7 +37,6 @@ type postingExecutionResponse struct {
 // LedgerLine is the caller-facing shape for one journal line — mirrors
 // asset-management-svc's own clients.LedgerLine.
 type LedgerLine struct {
-	AccountCode  string // set this OR MappingKey, never both
 	MappingKey   string // ACC-02 mapping key, resolved to an account by the ledger
 	DebitAmount  float64
 	CreditAmount float64
@@ -54,7 +53,7 @@ func (c *Clients) PostInventoryAccountingEvent(ctx context.Context, tenantID, pr
 		SourceEventID: sourceEventID, CorrelationID: correlationID,
 	}
 	for _, l := range lines {
-		body.Lines = append(body.Lines, postingEventLine{AccountCode: l.AccountCode, MappingKey: l.MappingKey, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
+		body.Lines = append(body.Lines, postingEventLine{MappingKey: l.MappingKey, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {

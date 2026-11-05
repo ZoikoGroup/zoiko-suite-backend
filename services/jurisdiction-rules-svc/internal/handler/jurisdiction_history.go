@@ -53,14 +53,16 @@ const maxRetireTextLen = 2000
 
 // retire applies the retirement with whatever evidence the caller gave. A store
 // without the evidence-carrying method falls back to a bare deactivation.
-func (h *Handler) retire(ctx context.Context, q store.Querier, id, actor string, req retireRequest) (*domain.Jurisdiction, bool, error) {
+// expectedRowVersion is the If-Match version (API-3); nil is unconditional.
+func (h *Handler) retire(ctx context.Context, q store.Querier, id, actor string, req retireRequest, expectedRowVersion *int64) (*domain.Jurisdiction, bool, error) {
 	if r, ok := h.store.(jurisdictionRetirer); ok {
 		return r.RetireJurisdictionWithQuerier(ctx, q, domain.RetireJurisdictionParams{
 			JurisdictionID: id, ActorID: actor, Reason: strings.TrimSpace(req.Reason),
 			EvidenceRef: strings.TrimSpace(req.EvidenceRef), SupersededBy: req.SupersededByJurisdictionID,
+			ExpectedRowVersion: expectedRowVersion,
 		})
 	}
-	return h.store.DeactivateJurisdictionWithQuerier(ctx, q, id, actor)
+	return h.store.DeactivateJurisdictionWithQuerier(ctx, q, id, actor, expectedRowVersion)
 }
 
 // readRetireRequest reads the optional body, writing a 400 and returning false

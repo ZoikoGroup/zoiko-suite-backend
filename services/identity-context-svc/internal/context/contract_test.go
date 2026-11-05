@@ -277,3 +277,36 @@ func TestEverySchemaReferenceResolves(t *testing.T) {
 	// rather than here.
 	assert.Empty(t, dangling, "unresolved schema references")
 }
+
+// TestOrg01OperationIdsArePublished pins ORG-01's NAMED surface (ZS-SVC-I-001 s4.1). Commands that were already
+// served under another name are published under the spec's name; implementing them under a different one would
+// leave the estate unable to assert this service implements ORG-01.
+func TestOrg01OperationIdsArePublished(t *testing.T) {
+	doc := loadSpec(t)
+
+	found := map[string]bool{}
+	for _, methods := range doc.Paths {
+		for _, method := range opKeys(methods) {
+			if id := opID(methods[method]); id != "" {
+				found[id] = true
+			}
+		}
+	}
+
+	for _, want := range []string{
+		// Commands
+		"linkIdentityProvider", // LinkIdentityProvider: POST /v1/federation/links
+		"authenticate",         // Authenticate
+		"stepUp",               // StepUp
+		"disableIdentity",      // DisableIdentity: PUT /v1/principals/{id}/status
+		"mergeDuplicateIdentity", // MergeDuplicateIdentity
+		"revokeSession",        // RevokeSession
+		// Queries
+		"getSubjectIdentity",       // GetSubjectIdentity
+		"listIdentityLinks",        // ListIdentityLinks
+		"getAssuranceHistory",      // GetAssuranceHistory
+		"listAuthenticationEvents", // ListAuthenticationEvents
+	} {
+		assert.True(t, found[want], "ORG-01 operation %q is not published in the contract", want)
+	}
+}

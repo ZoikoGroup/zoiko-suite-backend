@@ -372,6 +372,78 @@ func (s *PgStore) applyPeriodTransition(ctx context.Context, tx pgx.Tx, tenantID
 	return &fp, nil
 }
 
+// loadFiscalPeriodTx reads one period inside tx — the tx-scoped counterpart
+// of GetFiscalPeriod, for use as a transitionWithClaim load callback.
+func loadFiscalPeriodTx(ctx context.Context, tx pgx.Tx, tenantID, id string) (*domain.FiscalPeriod, error) {
+	var fp domain.FiscalPeriod
+	err := tx.QueryRow(ctx, `
+		SELECT `+fiscalPeriodColumns+`
+		FROM fiscal_periods WHERE fiscal_period_id = $1 AND tenant_id = $2
+	`, id, tenantID).Scan(
+		&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd,
+		&fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID, &fp.ReopenedAt, &fp.ReopenExpiresAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrFiscalPeriodNotFound
+	}
+	return &fp, err
+}
+
+// periodTransitionWithClaim is ApplyPeriodTransition with an
+// Idempotency-Key claimed in the same transaction (SPEC_DEVIATIONS A11) —
+// the shared implementation behind StartSoftCloseTransition and
+// EnterCloseReviewTransition below, the two simple, single-UPDATE period
+// transitions this pass closes. HardClosePeriod/ReclosePeriod and the
+// reopen commands keep calling the unclaimed ApplyPeriodTransition — their
+// readiness checks, kernel sealing and evidence signing make a correct
+// idempotency boundary a separate, larger design question.
+//
+// On a refused transition (ErrInvalidPeriodTransition), the period as it
+// actually stands is still returned — same contract ApplyPeriodTransition
+// itself gives — so the caller can report "the period is X, this needs Y"
+// without a second read, and so this method never has to distinguish "no
+// result" from "refused" the way a bare error would.
+func (s *PgStore) periodTransitionWithClaim(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate,
+	fact, legacyType, correlationID, actorID, command, idempotencyKey, requestHash string) (fp *domain.FiscalPeriod, replay bool, err error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, false, domain.ErrIdentityMissing
+	}
+	var result *domain.FiscalPeriod
+	replay, err = s.transitionWithClaim(ctx, idempotencyKey, command, requestHash, targetFiscalPeriod, id,
+		func(tx pgx.Tx) error {
+			out, applyErr := s.applyPeriodTransition(ctx, tx, tenantID, id, allowedFrom, u, fact, legacyType, correlationID, actorID)
+			result = out
+			return applyErr
+		},
+		func(tx pgx.Tx, pid string) error {
+			out, loadErr := loadFiscalPeriodTx(ctx, tx, tenantID, pid)
+			if loadErr != nil {
+				return loadErr
+			}
+			result = out
+			return nil
+		})
+	return result, replay, mapPgError(err)
+}
+
+// StartSoftCloseTransition moves a period OPEN -> SOFT_CLOSE, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11). u.To is set
+// here, not by the caller: this method's whole point is that it is always
+// this one target state.
+func (s *PgStore) StartSoftCloseTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodSoftClose
+	return s.periodTransitionWithClaim(ctx, id, []string{domain.PeriodOpen}, u, fact, legacyType, correlationID, actorID, CommandStartSoftClose, idempotencyKey, requestHash)
+}
+
+// EnterCloseReviewTransition moves a period SOFT_CLOSE -> CLOSE_REVIEW,
+// claiming idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+// u.To is set here, not by the caller, for the same reason as above.
+func (s *PgStore) EnterCloseReviewTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodCloseReview
+	return s.periodTransitionWithClaim(ctx, id, []string{domain.PeriodSoftClose}, u, fact, legacyType, correlationID, actorID, CommandEnterCloseReview, idempotencyKey, requestHash)
+}
+
 // CreateReopenEvent inserts one permanent, append-only reopen record — a
 // database trigger (migration 000003) rejects any UPDATE/DELETE on this
 // table at the schema level, not just in application code.
@@ -619,46 +691,82 @@ func transitionArgs(id, fromStatus, toStatus string, setArgs []any) []any {
 	return append([]any{id, fromStatus, toStatus}, setArgs...)
 }
 
+// transitionAccrualStatusTx is transitionAccrualStatus's body, taking an
+// already-open transaction so a claim-protected caller (SubmitAccrualSchedule,
+// ApproveAccrualSchedule, CancelAccrualSchedule) can run the guarded UPDATE
+// and the command_idempotency claim in one transaction.
+func (s *PgStore) transitionAccrualStatusTx(ctx context.Context, tx pgx.Tx, scheduleID, fromStatus, toStatus, setClause string, args ...any) error {
+	query := fmt.Sprintf(`UPDATE accrual_schedules SET status = $3%s WHERE schedule_id = $1 AND status = $2`, setClause)
+	tag, err := tx.Exec(ctx, query, transitionArgs(scheduleID, fromStatus, toStatus, args)...)
+	if err != nil {
+		return mapPgError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Either the schedule does not exist, or it exists but is not in
+		// fromStatus. Distinguished so the handler can tell "not found"
+		// from "wrong state" rather than reporting both the same way.
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accrual_schedules WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
+			return mapPgError(err)
+		}
+		if !exists {
+			return domain.ErrAccrualNotFound
+		}
+		return domain.ErrInvalidAccrualTransition
+	}
+	return nil
+}
+
 // transitionAccrualStatus moves a schedule from fromStatus to toStatus,
 // atomically guarded by a WHERE status = fromStatus clause — the same
 // posture as LockFiscalPeriod's OPEN-only guard. setClause supplies any
-// additional columns (timestamps/actor) the specific transition sets.
+// additional columns (timestamps/actor) the specific transition sets. Used
+// by the internal, non-claim-protected transitions (Activate, Complete).
 func (s *PgStore) transitionAccrualStatus(ctx context.Context, scheduleID, fromStatus, toStatus, setClause string, args ...any) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := fmt.Sprintf(`UPDATE accrual_schedules SET status = $3%s WHERE schedule_id = $1 AND status = $2`, setClause)
-		tag, err := tx.Exec(ctx, query, transitionArgs(scheduleID, fromStatus, toStatus, args)...)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			// Either the schedule does not exist, or it exists but is not in
-			// fromStatus. Distinguished so the handler can tell "not found"
-			// from "wrong state" rather than reporting both the same way.
-			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accrual_schedules WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
-				return mapPgError(err)
-			}
-			if !exists {
-				return domain.ErrAccrualNotFound
-			}
-			return domain.ErrInvalidAccrualTransition
-		}
-		return nil
+		return s.transitionAccrualStatusTx(ctx, tx, scheduleID, fromStatus, toStatus, setClause, args...)
 	})
 }
 
-func (s *PgStore) SubmitAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error {
-	return s.transitionAccrualStatus(ctx, scheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval,
-		`, submitted_at = $4, submitted_by_principal_id = $5`, at, principalID)
+// loadAccrualSchedule is the transitionWithClaim load callback shared by
+// Submit/Approve/Cancel/Amend: on a replay, *sch is overwritten with the
+// schedule as it now stands, the same contract CreateAccrualSchedule gives.
+func loadAccrualSchedule(ctx context.Context, tx pgx.Tx, sch *domain.AccrualSchedule, id string) error {
+	existing, err := scanAccrualSchedule(tx.QueryRow(ctx, `SELECT `+accrualScheduleColumns+` FROM accrual_schedules WHERE schedule_id = $1`, id))
+	if err != nil {
+		return err
+	}
+	*sch = *existing
+	return nil
 }
 
-func (s *PgStore) ApproveAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error {
-	return s.transitionAccrualStatus(ctx, scheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved,
-		`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+// SubmitAccrualSchedule moves sch from DRAFT to PENDING_APPROVAL, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11: a retry after
+// a lost response previously got 422 instead of the schedule it already
+// submitted). On replay=true, *sch holds the schedule as it now stands —
+// which may be past PENDING_APPROVAL if it was since approved.
+func (s *PgStore) SubmitAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandSubmitAccrual, requestHash, targetAccrualSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			return s.transitionAccrualStatusTx(ctx, tx, sch.ScheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval,
+				`, submitted_at = $4, submitted_by_principal_id = $5`, at, principalID)
+		},
+		func(tx pgx.Tx, id string) error { return loadAccrualSchedule(ctx, tx, sch, id) })
+}
+
+// ApproveAccrualSchedule moves sch from PENDING_APPROVAL to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApproveAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApproveAccrual, requestHash, targetAccrualSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			return s.transitionAccrualStatusTx(ctx, tx, sch.ScheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved,
+				`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+		},
+		func(tx pgx.Tx, id string) error { return loadAccrualSchedule(ctx, tx, sch, id) })
 }
 
 // ActivateAccrualSchedule moves APPROVED -> ACTIVE, on the first
@@ -677,34 +785,67 @@ func (s *PgStore) CompleteAccrualSchedule(ctx context.Context, scheduleID string
 	return s.transitionAccrualStatus(ctx, scheduleID, domain.AccrualStatusActive, domain.AccrualStatusCompleted, "")
 }
 
-func (s *PgStore) CancelAccrualSchedule(ctx context.Context, scheduleID, fromStatus, principalID string, at time.Time) error {
-	return s.transitionAccrualStatus(ctx, scheduleID, fromStatus, domain.AccrualStatusCancelled,
-		`, cancelled_at = $4, cancelled_by_principal_id = $5`, at, principalID)
+// CancelAccrualSchedule moves sch from fromStatus to CANCELLED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+// CancelAccrualSchedule moves sch to CANCELLED from any status except
+// COMPLETED or CANCELLED, claiming idempotencyKey in the same transaction
+// (SPEC_DEVIATIONS A11).
+//
+// The guard is a fixed disallowed set, not "= fromStatus": fromStatus is the
+// schedule's status at GET time, so on an already-committed replay it would
+// already read CANCELLED, and a WHERE on that value would let the call
+// cancel a CANCELLED row a second time, or (on a stale fromStatus from a
+// racing request) a COMPLETED one. transitionWithClaim's own claim lookup
+// runs first, so a genuine retry under the same key never reaches this
+// guard at all — it replays from the claim instead.
+func (s *PgStore) CancelAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandCancelAccrual, requestHash, targetAccrualSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE accrual_schedules SET status = $2, cancelled_at = $3, cancelled_by_principal_id = $4
+				WHERE schedule_id = $1 AND status NOT IN ($5, $6)
+			`, sch.ScheduleID, domain.AccrualStatusCancelled, at, principalID,
+				domain.AccrualStatusCompleted, domain.AccrualStatusCancelled)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accrual_schedules WHERE schedule_id = $1)`, sch.ScheduleID).Scan(&exists); err != nil {
+					return mapPgError(err)
+				}
+				if !exists {
+					return domain.ErrAccrualNotFound
+				}
+				return domain.ErrInvalidAccrualTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return loadAccrualSchedule(ctx, tx, sch, id) })
 }
 
 // AmendAccrualSchedule updates the FUTURE shape of an APPROVED/ACTIVE
-// schedule. Callers must have already verified periodCount does not drop
-// below the number of periods already recognized (ErrAmendWouldDropRecognizedPeriods)
+// schedule, claiming idempotencyKey in the same transaction (SPEC_DEVIATIONS
+// A11). Callers must have already verified periodCount does not drop below
+// the number of periods already recognized (ErrAmendWouldDropRecognizedPeriods)
 // — enforced by the handler, not here, since only the handler has counted
 // recognition instances.
-func (s *PgStore) AmendAccrualSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE accrual_schedules SET total_amount = $1, period_count = $2
-			WHERE schedule_id = $3 AND status IN ($4, $5)
-		`, totalAmount, periodCount, scheduleID, domain.AccrualStatusApproved, domain.AccrualStatusActive)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidAccrualTransition
-		}
-		return nil
-	})
+func (s *PgStore) AmendAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, totalAmount float64, periodCount int, idempotencyKey, requestHash string) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandAmendAccrual, requestHash, targetAccrualSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE accrual_schedules SET total_amount = $1, period_count = $2
+				WHERE schedule_id = $3 AND status IN ($4, $5)
+			`, totalAmount, periodCount, sch.ScheduleID, domain.AccrualStatusApproved, domain.AccrualStatusActive)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return domain.ErrInvalidAccrualTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return loadAccrualSchedule(ctx, tx, sch, id) })
 }
 
 const recognitionInstanceColumns = `
@@ -993,34 +1134,62 @@ func (s *PgStore) ListPrepaymentSchedules(ctx context.Context, legalEntityID str
 	return out, nil
 }
 
+// transitionPrepaymentStatusTx is transitionPrepaymentStatus's body, taking
+// an already-open transaction so a claim-protected caller
+// (ApprovePrepaymentSchedule) can run the guarded UPDATE and the
+// command_idempotency claim in one transaction.
+func (s *PgStore) transitionPrepaymentStatusTx(ctx context.Context, tx pgx.Tx, scheduleID, fromStatus, toStatus, setClause string, args ...any) error {
+	query := fmt.Sprintf(`UPDATE prepayment_schedules SET status = $3%s WHERE schedule_id = $1 AND status = $2`, setClause)
+	tag, err := tx.Exec(ctx, query, transitionArgs(scheduleID, fromStatus, toStatus, args)...)
+	if err != nil {
+		return mapPgError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM prepayment_schedules WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
+			return mapPgError(err)
+		}
+		if !exists {
+			return domain.ErrPrepaymentNotFound
+		}
+		return domain.ErrInvalidPrepaymentTransition
+	}
+	return nil
+}
+
+// transitionPrepaymentStatus is used by the internal, non-claim-protected
+// transitions (Activate, Complete).
 func (s *PgStore) transitionPrepaymentStatus(ctx context.Context, scheduleID, fromStatus, toStatus, setClause string, args ...any) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := fmt.Sprintf(`UPDATE prepayment_schedules SET status = $3%s WHERE schedule_id = $1 AND status = $2`, setClause)
-		tag, err := tx.Exec(ctx, query, transitionArgs(scheduleID, fromStatus, toStatus, args)...)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM prepayment_schedules WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
-				return mapPgError(err)
-			}
-			if !exists {
-				return domain.ErrPrepaymentNotFound
-			}
-			return domain.ErrInvalidPrepaymentTransition
-		}
-		return nil
+		return s.transitionPrepaymentStatusTx(ctx, tx, scheduleID, fromStatus, toStatus, setClause, args...)
 	})
 }
 
-func (s *PgStore) ApprovePrepaymentSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error {
-	return s.transitionPrepaymentStatus(ctx, scheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved,
-		`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+// loadPrepaymentSchedule is the transitionWithClaim load callback shared by
+// Approve/Modify/Terminate: on a replay, *sch is overwritten with the
+// schedule as it now stands, the same contract CreatePrepaymentSchedule gives.
+func loadPrepaymentSchedule(ctx context.Context, tx pgx.Tx, sch *domain.PrepaymentSchedule, id string) error {
+	existing, err := scanPrepaymentSchedule(tx.QueryRow(ctx, `SELECT `+prepaymentScheduleColumns+` FROM prepayment_schedules WHERE schedule_id = $1`, id))
+	if err != nil {
+		return err
+	}
+	*sch = *existing
+	return nil
+}
+
+// ApprovePrepaymentSchedule moves sch from DRAFT to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApprovePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApprovePrepayment, requestHash, targetPrepaymentSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			return s.transitionPrepaymentStatusTx(ctx, tx, sch.ScheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved,
+				`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+		},
+		func(tx pgx.Tx, id string) error { return loadPrepaymentSchedule(ctx, tx, sch, id) })
 }
 
 // ActivatePrepaymentSchedule moves APPROVED -> ACTIVE on the first
@@ -1038,35 +1207,66 @@ func (s *PgStore) CompletePrepaymentSchedule(ctx context.Context, scheduleID str
 	return s.transitionPrepaymentStatus(ctx, scheduleID, domain.PrepaymentStatusActive, domain.PrepaymentStatusCompleted, "")
 }
 
-func (s *PgStore) TerminatePrepaymentSchedule(ctx context.Context, scheduleID, fromStatus, principalID, reason, treatment string, at time.Time) error {
-	return s.transitionPrepaymentStatus(ctx, scheduleID, fromStatus, domain.PrepaymentStatusTerminated,
-		`, terminated_at = $4, terminated_by_principal_id = $5, termination_reason = $6, termination_final_treatment = $7`,
-		at, principalID, reason, treatment)
+// TerminatePrepaymentSchedule moves sch to TERMINATED from any status except
+// COMPLETED or TERMINATED, claiming idempotencyKey in the same transaction
+// (SPEC_DEVIATIONS A11).
+//
+// The guard is a fixed disallowed set, not "= fromStatus" — see
+// CancelAccrualSchedule's doc comment for why a caller-supplied fromStatus
+// (the schedule's status at GET time) is unsafe as the sole guard: on an
+// already-committed replay it would read TERMINATED, and comparing against
+// that value would let the UPDATE re-terminate (or, on a stale read, wrongly
+// terminate a COMPLETED schedule).
+func (s *PgStore) TerminatePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, principalID, reason, treatment, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandTerminatePrepayment, requestHash, targetPrepaymentSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE prepayment_schedules
+				SET status = $2, terminated_at = $3, terminated_by_principal_id = $4,
+				    termination_reason = $5, termination_final_treatment = $6
+				WHERE schedule_id = $1 AND status NOT IN ($7, $8)
+			`, sch.ScheduleID, domain.PrepaymentStatusTerminated, at, principalID, reason, treatment,
+				domain.PrepaymentStatusCompleted, domain.PrepaymentStatusTerminated)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM prepayment_schedules WHERE schedule_id = $1)`, sch.ScheduleID).Scan(&exists); err != nil {
+					return mapPgError(err)
+				}
+				if !exists {
+					return domain.ErrPrepaymentNotFound
+				}
+				return domain.ErrInvalidPrepaymentTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return loadPrepaymentSchedule(ctx, tx, sch, id) })
 }
 
-// ModifyFutureSchedule updates the FUTURE shape of an APPROVED/ACTIVE
-// schedule. The handler is responsible for verifying periodCount does not
-// drop below the number of periods already recognized before calling this
-// (ErrModifyWouldDropRecognizedPeriods) — only it has counted recognition
-// instances.
-func (s *PgStore) ModifyFuturePrepaymentSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE prepayment_schedules SET total_amount = $1, period_count = $2
-			WHERE schedule_id = $3 AND status IN ($4, $5)
-		`, totalAmount, periodCount, scheduleID, domain.PrepaymentStatusApproved, domain.PrepaymentStatusActive)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidPrepaymentTransition
-		}
-		return nil
-	})
+// ModifyFuturePrepaymentSchedule updates the FUTURE shape of an
+// APPROVED/ACTIVE schedule, claiming idempotencyKey in the same transaction
+// (SPEC_DEVIATIONS A11). The handler is responsible for verifying
+// periodCount does not drop below the number of periods already recognized
+// before calling this (ErrModifyWouldDropRecognizedPeriods) — only it has
+// counted recognition instances.
+func (s *PgStore) ModifyFuturePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, totalAmount float64, periodCount int, idempotencyKey, requestHash string) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandModifyPrepayment, requestHash, targetPrepaymentSchedule, sch.ScheduleID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE prepayment_schedules SET total_amount = $1, period_count = $2
+				WHERE schedule_id = $3 AND status IN ($4, $5)
+			`, totalAmount, periodCount, sch.ScheduleID, domain.PrepaymentStatusApproved, domain.PrepaymentStatusActive)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return domain.ErrInvalidPrepaymentTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return loadPrepaymentSchedule(ctx, tx, sch, id) })
 }
 
 const prepaymentRecognitionColumns = `
@@ -1328,24 +1528,40 @@ func (s *PgStore) ListAllocationRules(ctx context.Context, legalEntityID string)
 	return out, nil
 }
 
-func (s *PgStore) ApproveAllocationRule(ctx context.Context, ruleVersionID, principalID string, at time.Time) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
+// loadAllocationRuleVersion is the transitionWithClaim/createWithClaim load
+// callback shared by Approve/Supersede: on a replay, *rule is overwritten
+// with the version as it now stands (header plus drivers), the same
+// contract CreateAllocationRule gives.
+func (s *PgStore) loadAllocationRuleVersion(ctx context.Context, tx pgx.Tx, rule *domain.AllocationRule, id string) error {
+	existing, err := scanAllocationRule(tx.QueryRow(ctx, `SELECT `+allocationRuleColumns+` FROM allocation_rules WHERE rule_version_id = $1`, id))
+	if err != nil {
+		return err
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE allocation_rules SET status = $1, approved_at = $2, approved_by_principal_id = $3
-			WHERE rule_version_id = $4 AND status = $5
-		`, domain.AllocationRuleStatusApproved, at, principalID, ruleVersionID, domain.AllocationRuleStatusDraft)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidAllocationRuleTransition
-		}
-		return nil
-	})
+	if existing.Drivers, err = s.loadAllocationDrivers(ctx, tx, id); err != nil {
+		return err
+	}
+	*rule = *existing
+	return nil
+}
+
+// ApproveAllocationRule moves rule from DRAFT to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApproveAllocationRule(ctx context.Context, rule *domain.AllocationRule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApproveAllocationRule, requestHash, targetAllocationRule, rule.RuleVersionID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE allocation_rules SET status = $1, approved_at = $2, approved_by_principal_id = $3
+				WHERE rule_version_id = $4 AND status = $5
+			`, domain.AllocationRuleStatusApproved, at, principalID, rule.RuleVersionID, domain.AllocationRuleStatusDraft)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return domain.ErrInvalidAllocationRuleTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error { return s.loadAllocationRuleVersion(ctx, tx, rule, id) })
 }
 
 // ActivateAllocationRule moves APPROVED -> ACTIVE on the first successful
@@ -1376,40 +1592,47 @@ func (s *PgStore) ActivateAllocationRule(ctx context.Context, ruleVersionID stri
 // idx_allocation_rules_current_version UNIQUE(rule_id) WHERE effective_to
 // IS NULL is the second, database-enforced one — even a race between two
 // concurrent supersede attempts cannot leave two current versions.
-func (s *PgStore) SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error {
+// SupersedeAllocationRule claims idempotencyKey exactly as
+// CreateAllocationRule does (SPEC_DEVIATIONS A11): it mints a new version
+// (newVersion.RuleVersionID) on every call, so unlike the pure transitions
+// above it uses createWithClaim, not transitionWithClaim. requestHash must
+// therefore be computed from the request body (plus ruleID, which the body
+// does not carry), never from newVersion.RuleVersionID — the caller mints a
+// fresh one on every attempt, including a retry, so folding it into the hash
+// would make a retry never match its own first attempt.
+func (s *PgStore) SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time, idempotencyKey, requestHash string) (replay bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var currentVersion int
-		err := tx.QueryRow(ctx, `
-			UPDATE allocation_rules SET status = $1, effective_to = $2
-			WHERE rule_id = $3 AND effective_to IS NULL AND status IN ($4, $5)
-			RETURNING version
-		`, domain.AllocationRuleStatusSuperseded, supersededAt, ruleID,
-			domain.AllocationRuleStatusApproved, domain.AllocationRuleStatusActive,
-		).Scan(&currentVersion)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrNoCurrentRuleToSupersede
-		}
-		if err != nil {
-			return mapPgError(err)
-		}
+	return s.createWithClaim(ctx, idempotencyKey, CommandSupersedeAllocationRule, requestHash, targetAllocationRule, newVersion.RuleVersionID,
+		func(tx pgx.Tx) error {
+			var currentVersion int
+			err := tx.QueryRow(ctx, `
+				UPDATE allocation_rules SET status = $1, effective_to = $2
+				WHERE rule_id = $3 AND effective_to IS NULL AND status IN ($4, $5)
+				RETURNING version
+			`, domain.AllocationRuleStatusSuperseded, supersededAt, ruleID,
+				domain.AllocationRuleStatusApproved, domain.AllocationRuleStatusActive,
+			).Scan(&currentVersion)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrNoCurrentRuleToSupersede
+			}
+			if err != nil {
+				return mapPgError(err)
+			}
 
-		newVersion.Version = currentVersion + 1
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO allocation_rules (
-				rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
-				source_account_code, status, created_at, created_by_principal_id, currency_code
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''))
-		`, newVersion.RuleVersionID, ruleID, newVersion.Version, tenantID, newVersion.LegalEntityID, newVersion.Name,
-			newVersion.SourceAccountCode, domain.AllocationRuleStatusDraft, newVersion.CreatedAt, newVersion.CreatedByPrincipalID,
-			newVersion.CurrencyCode); err != nil {
-			return mapPgError(err)
-		}
-		return mapPgError(insertAllocationDrivers(ctx, tx, newVersion.RuleVersionID, newVersion.Drivers))
-	})
+			newVersion.Version = currentVersion + 1
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO allocation_rules (
+					rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
+					source_account_code, status, created_at, created_by_principal_id, currency_code
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''))
+			`, newVersion.RuleVersionID, ruleID, newVersion.Version, tenantID, newVersion.LegalEntityID, newVersion.Name,
+				newVersion.SourceAccountCode, domain.AllocationRuleStatusDraft, newVersion.CreatedAt, newVersion.CreatedByPrincipalID,
+				newVersion.CurrencyCode); err != nil {
+				return mapPgError(err)
+			}
+			return mapPgError(insertAllocationDrivers(ctx, tx, newVersion.RuleVersionID, newVersion.Drivers))
+		},
+		func(tx pgx.Tx, id string) error { return s.loadAllocationRuleVersion(ctx, tx, newVersion, id) })
 }
 
 const allocationRunColumns = `
@@ -1783,24 +2006,31 @@ func (s *PgStore) ListFXRevaluationRuns(ctx context.Context, legalEntityID, fisc
 	return out, nil
 }
 
-func (s *PgStore) ApproveFXRevaluationRun(ctx context.Context, runID, principalID string, at time.Time) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE fx_revaluation_runs SET status = $1, approved_at = $2, approved_by_principal_id = $3
-			WHERE run_id = $4 AND status = $5
-		`, domain.FXRevaluationStatusApproved, at, principalID, runID, domain.FXRevaluationStatusReview)
-		if err != nil {
-			return mapPgError(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidFXRevaluationTransition
-		}
-		return nil
-	})
+// ApproveFXRevaluationRun moves run from REVIEW to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApproveFXRevaluationRun(ctx context.Context, run *domain.FXRevaluationRun, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApproveFXRevaluation, requestHash, targetFXRevaluationRun, run.RunID,
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE fx_revaluation_runs SET status = $1, approved_at = $2, approved_by_principal_id = $3
+				WHERE run_id = $4 AND status = $5
+			`, domain.FXRevaluationStatusApproved, at, principalID, run.RunID, domain.FXRevaluationStatusReview)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return domain.ErrInvalidFXRevaluationTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error {
+			existing, err := loadFXRun(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			*run = *existing
+			return nil
+		})
 }
 
 func (s *PgStore) MarkFXRevaluationPosted(ctx context.Context, runID, journalID, principalID string, at time.Time) error {
@@ -1995,9 +2225,69 @@ func (s *PgStore) QuarantineMigrationBatch(ctx context.Context, batchID, fromSta
 		`, quarantine_reason = $4`, reason)
 }
 
-func (s *PgStore) ApproveMigrationBatch(ctx context.Context, batchID, principalID string, at time.Time) error {
-	return s.transitionMigrationBatch(ctx, batchID, domain.MigrationBatchStatusValidated, domain.MigrationBatchStatusApproved,
-		`, approved_at = $4, approved_by_principal_id = $5`, at, principalID)
+// loadMigrationBatch reads one batch and its crosswalk entries inside tx —
+// the tx-scoped counterpart of GetMigrationBatch, for use as a
+// transitionWithClaim load callback.
+func loadMigrationBatch(ctx context.Context, tx pgx.Tx, batchID string) (*domain.MigrationBatch, error) {
+	b, err := scanMigrationBatch(tx.QueryRow(ctx, `SELECT `+migrationBatchColumns+` FROM migration_batches WHERE batch_id = $1`, batchID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrMigrationBatchNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT entry_id, batch_id, source_reference_id, source_account_code, target_account_code,
+		       debit_amount, credit_amount, source_reference_type, party_id
+		FROM migration_crosswalk_entries WHERE batch_id = $1 ORDER BY source_reference_id
+	`, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e domain.MigrationCrosswalkEntry
+		if err := rows.Scan(&e.EntryID, &e.BatchID, &e.SourceReferenceID, &e.SourceAccountCode, &e.TargetAccountCode,
+			&e.DebitAmount, &e.CreditAmount, &e.SourceReferenceType, &e.PartyID); err != nil {
+			return nil, err
+		}
+		b.Entries = append(b.Entries, e)
+	}
+	return b, rows.Err()
+}
+
+// ApproveMigrationBatch moves batch from VALIDATED to APPROVED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) ApproveMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandApproveMigrationBatch, requestHash, targetMigrationBatch, batch.BatchID,
+		func(tx pgx.Tx) error {
+			query := fmt.Sprintf(`UPDATE migration_batches SET status = $3%s WHERE batch_id = $1 AND status = $2`,
+				`, approved_at = $4, approved_by_principal_id = $5`)
+			tag, err := tx.Exec(ctx, query, transitionArgs(batch.BatchID, domain.MigrationBatchStatusValidated,
+				domain.MigrationBatchStatusApproved, []any{at, principalID})...)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM migration_batches WHERE batch_id = $1)`, batch.BatchID).Scan(&exists); err != nil {
+					return mapPgError(err)
+				}
+				if !exists {
+					return domain.ErrMigrationBatchNotFound
+				}
+				return domain.ErrInvalidMigrationBatchTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error {
+			existing, err := loadMigrationBatch(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			*batch = *existing
+			return nil
+		})
 }
 
 func (s *PgStore) MarkMigrationBatchPosted(ctx context.Context, batchID, journalID string, at time.Time) error {
@@ -2010,9 +2300,38 @@ func (s *PgStore) MarkMigrationBatchReconciled(ctx context.Context, batchID stri
 		`, reconciled_at = $4`, at)
 }
 
-func (s *PgStore) CertifyMigrationBatch(ctx context.Context, batchID, principalID, reason string, at time.Time) error {
-	return s.transitionMigrationBatch(ctx, batchID, domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified,
-		`, certified_at = $4, certified_by_principal_id = $5, certification_reason = $6`, at, principalID, reason)
+// CertifyMigrationBatch moves batch from RECONCILED to CERTIFIED, claiming
+// idempotencyKey in the same transaction (SPEC_DEVIATIONS A11).
+func (s *PgStore) CertifyMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, reason, idempotencyKey, requestHash string, at time.Time) (replay bool, err error) {
+	return s.transitionWithClaim(ctx, idempotencyKey, CommandCertifyMigrationBatch, requestHash, targetMigrationBatch, batch.BatchID,
+		func(tx pgx.Tx) error {
+			query := fmt.Sprintf(`UPDATE migration_batches SET status = $3%s WHERE batch_id = $1 AND status = $2`,
+				`, certified_at = $4, certified_by_principal_id = $5, certification_reason = $6`)
+			tag, err := tx.Exec(ctx, query, transitionArgs(batch.BatchID, domain.MigrationBatchStatusReconciled,
+				domain.MigrationBatchStatusCertified, []any{at, principalID, reason})...)
+			if err != nil {
+				return mapPgError(err)
+			}
+			if tag.RowsAffected() == 0 {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM migration_batches WHERE batch_id = $1)`, batch.BatchID).Scan(&exists); err != nil {
+					return mapPgError(err)
+				}
+				if !exists {
+					return domain.ErrMigrationBatchNotFound
+				}
+				return domain.ErrInvalidMigrationBatchTransition
+			}
+			return nil
+		},
+		func(tx pgx.Tx, id string) error {
+			existing, err := loadMigrationBatch(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			*batch = *existing
+			return nil
+		})
 }
 
 // ListQuarantinedMigrationBatches answers ACC-17's own

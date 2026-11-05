@@ -20,12 +20,12 @@ import (
 // administration writes behind /v1/admin/workload-bindings and the lookup
 // that stops the workload layer being opt-in.
 
-const workloadColumns = `workload_id, tenant_id, allowed_audience, allowed_actions, active_flag, created_at`
+const workloadColumns = `workload_id, tenant_id, allowed_audience, allowed_actions, active_flag, created_at, version`
 
 func scanWorkload(row pgx.Row) (*domain.WorkloadBinding, error) {
 	var wb domain.WorkloadBinding
 	var tid uuid.UUID
-	if err := row.Scan(&wb.WorkloadID, &tid, &wb.AllowedAudience, &wb.AllowedActions, &wb.ActiveFlag, &wb.CreatedAt); err != nil {
+	if err := row.Scan(&wb.WorkloadID, &tid, &wb.AllowedAudience, &wb.AllowedActions, &wb.ActiveFlag, &wb.CreatedAt, &wb.Version); err != nil {
 		return nil, err
 	}
 	wb.TenantID = tid.String()

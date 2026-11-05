@@ -119,10 +119,15 @@ func main() {
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter).WithProfile(cfg.EventResidencyRegion, cfg.EventClassification)
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter).
+		WithProfile(cfg.EventResidencyRegion, cfg.EventClassification).
+		WithBrokers(cfg.Kafka.Brokers)
 	relayCtx, stopRelay := context.WithCancel(context.Background())
 	defer stopRelay()
-	go outbox.NewRelay(pool, publisher, 0, 0, log).Start(relayCtx)
+	// WithProber: an extended broker outage must not spend outbox_events'
+	// publish_attempts, or it permanently dead-letters real control facts
+	// (certifications, exceptions) that were only ever unlucky in timing.
+	go outbox.NewRelay(pool, publisher, 0, 0, log).WithProber(publisher).Start(relayCtx)
 
 	endpoints, err := source.ParseEndpoints(cfg.SourceEndpoints)
 	if err != nil {

@@ -27,12 +27,13 @@ var StandardReferenceFXRates = map[string]float64{
 
 // evaluateAuthorityLimits evaluates monetary limits and currency conversion for the request (Phase 3.6 & 3.7, Scenario A09).
 func (h *Handler) evaluateAuthorityLimits(ctx context.Context, in evalContext, evaluationEntityID string) (denied bool, basis, reason string, reasonCodes []string, negativeControls []string, err error) {
-	amountStr := ""
+	amountStr, quantityStr := "", ""
 	if in.Attributes != nil {
 		amountStr = in.Attributes["amount"]
 		if amountStr == "" {
 			amountStr = in.Attributes["transaction_amount"]
 		}
+		quantityStr = strings.TrimSpace(in.Attributes["quantity"])
 	}
 
 	isMonetaryAction := amountStr != "" ||
@@ -40,7 +41,7 @@ func (h *Handler) evaluateAuthorityLimits(ctx context.Context, in evalContext, e
 		isReleaseAction(in.ActionType) ||
 		isApprovalAction(in.ActionType)
 
-	if !isMonetaryAction && amountStr == "" {
+	if !isMonetaryAction && amountStr == "" && quantityStr == "" {
 		return false, "", "", nil, nil, nil
 	}
 
@@ -72,8 +73,21 @@ func (h *Handler) evaluateAuthorityLimits(ctx context.Context, in evalContext, e
 		return false, "", "", nil, nil, nil
 	}
 
+	// A QUANTITY limit (000040, S8-D1) bounds the request's quantity, a
+	// MONETARY one its amount; each kind is judged on its own.
+	monetary, quantity := splitLimitsByKind(applicable)
+	if len(quantity) > 0 {
+		required := in.Attributes != nil && in.Attributes["authority_limit_required"] == "true"
+		if denied, basis, reason, codes, controls := checkQuantityLimit(selectEffectiveLimit(quantity), quantityStr, required); denied {
+			return true, basis, reason, codes, controls, nil
+		}
+	}
+	if len(monetary) == 0 {
+		return false, "", "", nil, nil, nil
+	}
+
 	// Select the most specific limit
-	limit := selectEffectiveLimit(applicable)
+	limit := selectEffectiveLimit(monetary)
 
 	// If no amount was provided but an authority limit was found and required
 	if amountStr == "" {
@@ -301,6 +315,53 @@ func filterApplicableLimits(limits []domain.AuthorityLimit, in evalContext, eval
 	}
 
 	return result
+}
+
+func splitLimitsByKind(limits []domain.AuthorityLimit) (monetary, quantity []domain.AuthorityLimit) {
+	for _, l := range limits {
+		if l.LimitKind == domain.AuthorityLimitQuantity {
+			quantity = append(quantity, l)
+		} else {
+			monetary = append(monetary, l)
+		}
+	}
+	return monetary, quantity
+}
+
+// checkQuantityLimit judges the request's `quantity` attribute — the one the
+// delegation ceiling reads — against a QUANTITY limit: a count, so nothing to
+// convert. No quantity is a denial only when the caller marks a limit
+// required, the rule a missing amount follows.
+func checkQuantityLimit(limit domain.AuthorityLimit, quantityStr string, required bool) (denied bool, basis, reason string, reasonCodes, negativeControls []string) {
+	if quantityStr == "" {
+		if required {
+			return true, "authority_limit:quantity_required",
+				"Quantity required for authority limit evaluation",
+				[]string{"QUANTITY_REQUIRED"},
+				[]string{"authority_limit:quantity_required"}
+		}
+		return false, "", "", nil, nil
+	}
+	q, ok := new(big.Rat).SetString(quantityStr)
+	if !ok || q.Sign() < 0 {
+		return true, "authority_limit:invalid_quantity",
+			"Quantity is not a non-negative number: " + quantityStr,
+			[]string{"INVALID_QUANTITY_FORMAT"},
+			[]string{"authority_limit:invalid_quantity"}
+	}
+	if upper, ok := new(big.Rat).SetString(limit.UpperLimit); ok && upper.Sign() > 0 && q.Cmp(upper) > 0 {
+		return true, "authority_limit:quantity_exceeded",
+			fmt.Sprintf("Requested quantity %s exceeds authority upper limit %s", quantityStr, limit.UpperLimit),
+			[]string{"AUTHORITY_LIMIT_EXCEEDED"},
+			[]string{"authority_limit:quantity_exceeded"}
+	}
+	if lower, ok := new(big.Rat).SetString(limit.LowerLimit); ok && lower.Sign() > 0 && q.Cmp(lower) < 0 {
+		return true, "authority_limit:quantity_below_lower_limit",
+			fmt.Sprintf("Requested quantity %s is below authority lower limit %s", quantityStr, limit.LowerLimit),
+			[]string{"AUTHORITY_LIMIT_BELOW_MINIMUM"},
+			[]string{"authority_limit:quantity_below_lower_limit"}
+	}
+	return false, "", "", nil, nil
 }
 
 func selectEffectiveLimit(limits []domain.AuthorityLimit) domain.AuthorityLimit {

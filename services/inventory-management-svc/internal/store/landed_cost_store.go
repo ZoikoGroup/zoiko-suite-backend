@@ -15,6 +15,7 @@ const landedCostColumns = `
 	allocation_id, legal_entity_id, item_id, location_id, movement_id, layer_id, idempotency_key,
 	amount, inventory_share, cogs_share, remaining_quantity_at_allocation, unit_uplift,
 	valuation_evidence_ref, fiscal_period, inventory_account_code, cogs_account_code, offset_account_code,
+	COALESCE(inventory_mapping_key, ''), COALESCE(cogs_mapping_key, ''), COALESCE(offset_mapping_key, ''),
 	status, journal_id, created_at, created_by_principal_id, emitted_at`
 
 func scanLandedCost(row pgx.Row) (*domain.LandedCostAllocation, error) {
@@ -23,6 +24,7 @@ func scanLandedCost(row pgx.Row) (*domain.LandedCostAllocation, error) {
 		&a.AllocationID, &a.LegalEntityID, &a.ItemID, &a.LocationID, &a.MovementID, &a.LayerID, &a.IdempotencyKey,
 		&a.Amount, &a.InventoryShare, &a.COGSShare, &a.RemainingQuantityAtAllocation, &a.UnitUplift,
 		&a.ValuationEvidenceRef, &a.FiscalPeriod, &a.InventoryAccountCode, &a.COGSAccountCode, &a.OffsetAccountCode,
+		&a.InventoryMappingKey, &a.COGSMappingKey, &a.OffsetMappingKey,
 		&a.Status, &a.JournalID, &a.CreatedAt, &a.CreatedByPrincipalID, &a.EmittedAt,
 	); err != nil {
 		return nil, err
@@ -111,11 +113,13 @@ func (s *PgStore) AllocateLandedCost(ctx context.Context, a *domain.LandedCostAl
 				allocation_id, tenant_id, legal_entity_id, item_id, location_id, movement_id, layer_id, idempotency_key,
 				amount, inventory_share, cogs_share, remaining_quantity_at_allocation, unit_uplift,
 				valuation_evidence_ref, fiscal_period, inventory_account_code, cogs_account_code, offset_account_code,
+				inventory_mapping_key, cogs_mapping_key, offset_mapping_key,
 				status, created_at, created_by_principal_id
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 		`, a.AllocationID, tenantID, legalEntityID, itemID, locationID, a.MovementID, layerID, a.IdempotencyKey,
 			a.Amount, invShare, cogsShare, remaining, uplift,
-			a.ValuationEvidenceRef, a.FiscalPeriod, a.InventoryAccountCode, a.COGSAccountCode, a.OffsetAccountCode,
+			a.ValuationEvidenceRef, a.FiscalPeriod, "", "", "",
+			a.InventoryMappingKey, a.COGSMappingKey, a.OffsetMappingKey,
 			a.Status, a.CreatedAt, a.CreatedByPrincipalID)
 		if err != nil {
 			return err

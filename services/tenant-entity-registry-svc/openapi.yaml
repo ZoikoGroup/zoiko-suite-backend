@@ -157,8 +157,8 @@ paths:
 
   /v1/entities:
     post:
-      operationId: createEntity
-      summary: Create a new legal entity
+      operationId: createLegalEntity
+      summary: CreateLegalEntity - create a new legal entity
       description: |
         `primary_jurisdiction_id` is validated synchronously against the
         Jurisdiction Rules Service before the entity is persisted (fail-closed).
@@ -269,8 +269,8 @@ paths:
                 $ref: "#/components/schemas/EntityStatusResponse"
         "404": { $ref: "#/components/responses/NotFound" }
     post:
-      operationId: transitionEntityStatus
-      summary: Transition an entity's status
+      operationId: deactivateLegalEntity
+      summary: DeactivateLegalEntity - transition an entity status (also reactivates, suspends and marks dormant)
       description: |
         Valid transitions: ACTIVE→DORMANT, ACTIVE→SUSPENDED, ACTIVE→DISSOLVED,
         DORMANT→ACTIVE, DORMANT→DISSOLVED, SUSPENDED→ACTIVE, SUSPENDED→DISSOLVED.
@@ -1946,6 +1946,377 @@ paths:
 
 # ── Components ────────────────────────────────────────────────────────────────
 
+  # ── ORG-07 / MDM-01 Parties ─────────────────────────────────────────────────
+
+  /v1/parties:
+    post:
+      operationId: createParty
+      summary: ORG-07 CreateParty - the MDM-01 create flow, idempotent on create_request_id
+      description: |
+        Never creates a duplicate. The request is matched first (MDM-05): a verified identifier in the right scheme
+        and scope that names one active party returns that party (`MATCHED_EXISTING`, 200); an ambiguous or
+        conflicting request opens a stewardship case and returns `REVIEW_REQUIRED` (202) without creating anything;
+        otherwise a party is created (201). The same `create_request_id` with the same request returns the first
+        answer (`replayed: true`); with a different request it is 409 IDEMPOTENCY_MISMATCH.
+        A source-system reference (`source_system` and `source_ref`) is an identifier like any other, so a replayed
+        ingest does not create a second party.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePartyRequest"
+      responses:
+        "201":
+          description: Party created
+          content: { application/json: { schema: { $ref: "#/components/schemas/CreatePartyResult" } } }
+        "200":
+          description: "An existing party matched, or a replay of an earlier create"
+          content: { application/json: { schema: { $ref: "#/components/schemas/CreatePartyResult" } } }
+        "202":
+          description: "REVIEW_REQUIRED: a stewardship case was opened and no party was created"
+          content: { application/json: { schema: { $ref: "#/components/schemas/CreatePartyResult" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "create_request_id already used for a different request", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+    get:
+      operationId: searchParties
+      summary: ORG-07 SearchParties
+      description: Reads the authoritative tables, not a search index, so it never lags a write.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: q, in: query, required: false, schema: { type: string }, description: "Words of a name; every word must appear" }
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [LEGAL_ENTITY, ORGANIZATION_NON_LEGAL, NATURAL_PERSON, PUBLIC_AUTHORITY] } }
+        - { name: role, in: query, required: false, schema: { type: string, enum: [CUSTOMER, SUPPLIER, COUNTERPARTY, SIGNATORY, BANK, REGULATOR, LANDLORD, EMPLOYER_LINK, OTHER_GOVERNED] } }
+        - { name: status, in: query, required: false, schema: { type: string, enum: [CANDIDATE, ACTIVE, INACTIVE, MERGED] } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: A page
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartySearchPage" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/parties/{partyID}:
+    get:
+      operationId: getPartyAsOf
+      summary: ORG-07 GetParty and GetPartyAsOf - the master view with quality and version metadata
+      description: |
+        Answers both what was true at `as_of` (valid time) and what ZoikoSuite knew at `known_at` (knowledge time).
+        Sensitive identifiers (tax and national ids) are masked unless `reveal=true`, which needs
+        PARTY_IDENTIFIER_REVEAL; asking without holding it is 403, not a silently masked answer.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - $ref: "#/components/parameters/AsOf"
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time }, description: "What was known at this instant. Defaults to now." }
+        - { name: reveal, in: query, required: false, schema: { type: boolean } }
+      responses:
+        "200":
+          description: The master view
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartyView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/parties/{partyID}/facts:propose:
+    post:
+      operationId: amendPartyProfile
+      summary: ORG-07 AmendPartyProfile - propose a sourced, effective-dated fact
+      description: |
+        Never overwrites a verified fact. An authority source verifies a fact that does not contradict one in force;
+        anything else is held `PROPOSED`. A proposal that contradicts a verified fact is held beside it and opens a
+        FACT_CONFLICT stewardship case (`master.conflict.opened`). Restating a verified fact is a no-op (200).
+        `expected_master_version` is required: a stale write is 409 VERSION_CONFLICT.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ProposePartyFactRequest" } } }
+      responses:
+        "201":
+          description: Fact recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartyFactOutcome" } } }
+        "200":
+          description: The fact restates a verified one
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartyFactOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_master_version, or the party is INACTIVE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/parties/{partyID}/roles:
+    post:
+      operationId: addPartyRole
+      summary: ORG-07 AddPartyRole - an explicit, evidenced, time-aware role
+      description: A role never redefines identity. One live role of a type at a time.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AddPartyRoleRequest" } } }
+      responses:
+        "201":
+          description: Role added
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartyRoleOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_master_version, or the party already has this role", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/parties/{partyID}/roles/{roleID}/removal:
+    post:
+      operationId: removePartyRole
+      summary: ORG-07 RemovePartyRole - end a role; the row stays as history
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - { name: roleID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RemovePartyRoleRequest" } } }
+      responses:
+        "200":
+          description: Role ended
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartyRoleOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_master_version, or the role was already removed", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/parties/{partyID}/identifiers:
+    post:
+      operationId: linkExternalIdentifier
+      summary: ORG-07 LinkExternalIdentifier
+      description: |
+        An identifier names one active party. Linking one the party already holds is a no-op (200). Linking one
+        another party holds does not link: it opens an IDENTIFIER_CONFLICT case (202). An authority source verifies
+        the identifier on arrival. The identifier value is never in an event.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/LinkIdentifierRequest" } } }
+      responses:
+        "201":
+          description: Identifier linked
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartyIdentifierOutcome" } } }
+        "200":
+          description: The party already holds this identifier
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartyIdentifierOutcome" } } }
+        "202":
+          description: "Another party holds this identifier; a stewardship case was opened and nothing was linked"
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartyIdentifierOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Stale expected_master_version, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/identifiers:find:
+    get:
+      operationId: findByExternalIdentifier
+      summary: ORG-07 FindByExternalIdentifier
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: scheme, in: query, required: true, schema: { $ref: "#/components/schemas/IdentifierScheme" } }
+        - { name: scope, in: query, required: false, schema: { type: string }, description: "An ISO 3166-1 alpha-2 code, or the source system for SOURCE_SYSTEM" }
+        - { name: value, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The party the identifier names, if any
+          content: { application/json: { schema: { type: object, required: [items], properties: { items: { type: array, items: { $ref: "#/components/schemas/PartySummary" } } } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/resolution-cases/{caseID}:
+    get:
+      operationId: getResolutionCase
+      summary: A stewardship case
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: caseID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The case
+          content: { application/json: { schema: { $ref: "#/components/schemas/ResolutionCase" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+
+  # ── MDM-05 matching, merge, split and stewardship ───────────────────────────
+
+  /v1/resolution:match:
+    post:
+      operationId: matchParties
+      summary: MDM-05 match candidates - what a create would do for this request, and why
+      description: |
+        Tenant-scoped and explainable; another tenant's parties are never candidates. Writes nothing. The verdict is
+        `SAFE_LINK` (a tier A match: a create would return that party), `REVIEW_REQUIRED` (a create would open a case)
+        or `NO_MATCH`. Each candidate carries its tier (A scheme-proven, B strong composite, C probabilistic, D
+        conflict), a score and the basis for it.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/MatchPartiesRequest" } } }
+      responses:
+        "200":
+          description: The verdict
+          content: { application/json: { schema: { $ref: "#/components/schemas/MatchPartiesResult" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/resolution/{caseID}:merge:
+    post:
+      operationId: mergeParties
+      summary: ORG-07 MergeParties - the non-destructive merge of MDM-05 s18.2
+      description: |
+        CRITICAL (PARTY_MERGE) and never self-approved: the principal who opened the case cannot decide its merge.
+        In one transaction, under a per-tenant lock and the parties' row locks: every party's expected version is
+        revalidated (409 VERSION_CONFLICT); the survivor keeps its id; each merged party keeps its row with status
+        `MERGED` and resolves to the survivor, so its id is never reused and still resolves; identifiers and roles
+        move by ending the old row and writing a new one that names where it came from; the decision is appended to
+        the lineage; and `party.merged` tells the domains to remediate (`remediation_scope`), prospectively, through
+        the alias. Prior transaction snapshots are untouched.
+
+        Prohibited (409 MERGE_PROHIBITED): a party that is not live; parties of different kinds; two parties that
+        stand for different legal entities; a survivor that was itself merged away or a merged party that already
+        absorbed others (merges do not chain). A case is decided once.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CaseID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/MergePartiesRequest" } } }
+      responses:
+        "201":
+          description: Merged
+          content: { application/json: { schema: { $ref: "#/components/schemas/MergeOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: "Not permitted, or the caller opened this case (SOD_DENIED)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "VERSION_CONFLICT, MERGE_PROHIBITED, or the case is already decided", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/resolution/{caseID}:split:
+    post:
+      operationId: splitParty
+      summary: ORG-07 SplitParty - correct a merge with new lineage
+      description: |
+        HIGH (PARTY_SPLIT). The party that was merged in error is distinct again: its status returns to what it was,
+        identifiers that moved go back, a legal entity the survivor adopted returns, and a `party.split` event
+        carries the remediation scope. The merge stays in the lineage; nothing is erased. The principal who merged
+        cannot split. Roles the merge consolidated are not guessed back: the domains re-resolve them from the event.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CaseID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/SplitPartiesRequest" } } }
+      responses:
+        "200":
+          description: Split
+          content: { application/json: { schema: { $ref: "#/components/schemas/SplitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: "Not permitted, or the caller made the merge (SOD_DENIED)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale version, or the party was not merged by this case or is already split", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/resolution-cases:
+    get:
+      operationId: listResolutionCases
+      summary: Stewardship cases, oldest first
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [OPEN, RESOLVED, DISMISSED] } }
+        - { name: case_type, in: query, required: false, schema: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT] } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: A page
+          content: { application/json: { schema: { $ref: "#/components/schemas/ResolutionCasePage" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/resolution-cases/{caseID}/decision:
+    post:
+      operationId: decideResolutionCase
+      summary: Decide a stewardship case that is not a merge
+      description: |
+        HIGH (PARTY_RESOLUTION_DECIDE). The principal who opened the case cannot decide it. DUPLICATE_REVIEW:
+        `CREATE_NEW` (creates the party the held request asked for, as the requester's), `LINK_EXISTING` (names one of
+        the candidates) or `DISMISS`. FACT_CONFLICT: `ACCEPT_PROPOSED_FACT` (the verified fact is superseded, never
+        edited, and the accepted fact is verified now, so what was known earlier stays answerable) or `KEEP_VERIFIED`.
+        IDENTIFIER_CONFLICT: `KEEP_HOLDER` or `MOVE_TO_REQUESTER`. Merging is `:merge`.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CaseID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CaseDecisionRequest" } } }
+      responses:
+        "200":
+          description: Decided
+          content: { application/json: { schema: { $ref: "#/components/schemas/CaseDecisionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: "Not permitted, or the caller opened this case (SOD_DENIED)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale case version, or the case is already decided", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/parties/{partyID}/merge-history:
+    get:
+      operationId: explainMergeHistory
+      summary: ORG-07 ExplainMergeHistory - where a party id resolves and every merge and split that touched it
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+      responses:
+        "200":
+          description: The history, oldest first
+          content: { application/json: { schema: { $ref: "#/components/schemas/MergeHistory" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1963,6 +2334,16 @@ components:
       required: false
       description: Business time, an RFC3339 timestamp or a YYYY-MM-DD date (read as midnight UTC). Defaults to now.
       schema: { type: string }
+    CaseID:
+      name: caseID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PartyID:
+      name: partyID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     RelationshipID:
       name: relationshipID
       in: path
@@ -2002,6 +2383,363 @@ components:
         If absent, the service generates one from the request ID.
 
   schemas:
+    # ── ORG-07 / MDM-01 Parties ───────────────────────────────────────────────
+    # ── MDM-05 matching, merge, split and stewardship ─────────────────────────
+    MatchPartiesRequest:
+      type: object
+      required: [party_kind]
+      properties:
+        party_kind: { type: string, enum: [LEGAL_ENTITY, ORGANIZATION_NON_LEGAL, NATURAL_PERSON, PUBLIC_AUTHORITY] }
+        names: { type: array, items: { $ref: "#/components/schemas/PartyNameInput" } }
+        country: { type: string }
+        identifiers: { type: array, items: { $ref: "#/components/schemas/PartyIdentifierInput" } }
+        legal_entity_id: { type: string, format: uuid }
+
+    MatchPartiesResult:
+      type: object
+      required: [verdict, candidates]
+      properties:
+        verdict: { type: string, enum: [SAFE_LINK, REVIEW_REQUIRED, NO_MATCH] }
+        case_type: { type: string }
+        candidates: { type: array, items: { $ref: "#/components/schemas/PartyMatchCandidate" } }
+
+    MergePartiesRequest:
+      type: object
+      required: [survivor_party_id, merged_party_ids, expected_master_versions, reason, evidence_ref]
+      properties:
+        survivor_party_id: { type: string, format: uuid }
+        merged_party_ids: { type: array, minItems: 1, maxItems: 10, items: { type: string, format: uuid } }
+        expected_master_versions:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+          description: "The version of every party involved, survivor included, as the steward saw it."
+        reason: { type: string }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    SplitPartiesRequest:
+      type: object
+      required: [merged_party_id, expected_master_versions, reason, evidence_ref]
+      properties:
+        merged_party_id: { type: string, format: uuid }
+        expected_master_versions:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+          description: "The version of the merged party and of its survivor."
+        reason: { type: string }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    CaseDecisionRequest:
+      type: object
+      required: [decision, note, expected_case_version]
+      properties:
+        decision: { type: string, enum: [CREATE_NEW, LINK_EXISTING, DISMISS, ACCEPT_PROPOSED_FACT, KEEP_VERIFIED, KEEP_HOLDER, MOVE_TO_REQUESTER] }
+        party_id: { type: string, format: uuid, description: "LINK_EXISTING only: one of the case's candidates." }
+        note: { type: string }
+        expected_case_version: { type: integer, format: int64 }
+        correlation_id: { type: string }
+
+    LineageEvent:
+      type: object
+      properties:
+        lineage_id: { type: string, format: uuid }
+        event_type: { type: string, enum: [MERGE, SPLIT] }
+        case_id: { type: string, format: uuid }
+        survivor_id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        actor: { type: string }
+        independent_of: { type: string, description: "Who this decision had to be independent of." }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        occurred_at: { type: string, format: date-time }
+        details: { type: object, additionalProperties: true }
+
+    MergeOutcome:
+      type: object
+      required: [survivor, aliases, lineage, case]
+      properties:
+        survivor: { $ref: "#/components/schemas/Party" }
+        aliases: { type: array, items: { $ref: "#/components/schemas/Party" } }
+        lineage: { type: array, items: { $ref: "#/components/schemas/LineageEvent" } }
+        case: { $ref: "#/components/schemas/ResolutionCase" }
+
+    SplitOutcome:
+      type: object
+      required: [restored, survivor, lineage]
+      properties:
+        restored: { $ref: "#/components/schemas/Party" }
+        survivor: { $ref: "#/components/schemas/Party" }
+        lineage: { $ref: "#/components/schemas/LineageEvent" }
+
+    CaseDecisionOutcome:
+      type: object
+      required: [case]
+      properties:
+        case: { $ref: "#/components/schemas/ResolutionCase" }
+        party: { $ref: "#/components/schemas/Party" }
+
+    ResolutionCasePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/ResolutionCase" } }
+        next_cursor: { type: string }
+
+    MergeHistory:
+      type: object
+      required: [party_id, status, resolves_to, alias_ids, lineage]
+      properties:
+        party_id: { type: string, format: uuid }
+        status: { type: string }
+        resolves_to: { type: string, format: uuid, description: "The survivor this id resolves to; itself when it was not merged away." }
+        alias_ids: { type: array, items: { type: string, format: uuid } }
+        lineage: { type: array, items: { $ref: "#/components/schemas/LineageEvent" } }
+
+    IdentifierScheme:
+      type: string
+      enum: [COMPANY_REGISTRATION, TAX_ID, VAT, LEI, DUNS, NATIONAL_ID, SOURCE_SYSTEM]
+      description: "TAX_ID and NATIONAL_ID are sensitive and masked unless revealed."
+
+    PartySourceClass:
+      type: string
+      enum: [AUTHORITY_REGISTRY, AUTHORITY_DOCUMENT, TENANT_ASSERTED, SYSTEM_IMPORT, EXTERNAL_PROVIDER]
+      description: "An authority class verifies a fact or identifier on arrival; the others are held PROPOSED."
+
+    PartyNameInput:
+      type: object
+      required: [type, value]
+      properties:
+        type: { type: string, enum: [LEGAL_NAME, TRADING_NAME, FORMER_NAME, LOCAL_SCRIPT_NAME, DISPLAY_NAME] }
+        value: { type: string }
+        language: { type: string, description: "Required for LOCAL_SCRIPT_NAME." }
+        script: { type: string, description: "Required for LOCAL_SCRIPT_NAME." }
+
+    PartyIdentifierInput:
+      type: object
+      required: [scheme, value]
+      properties:
+        scheme: { $ref: "#/components/schemas/IdentifierScheme" }
+        scope: { type: string, description: "An ISO 3166-1 alpha-2 code, or the source system for SOURCE_SYSTEM." }
+        value: { type: string }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+
+    CreatePartyRequest:
+      type: object
+      required: [create_request_id, party_kind, names, source_class, evidence_ref, valid_from]
+      properties:
+        create_request_id: { type: string, maxLength: 128 }
+        party_kind: { type: string, enum: [LEGAL_ENTITY, ORGANIZATION_NON_LEGAL, NATURAL_PERSON, PUBLIC_AUTHORITY] }
+        names: { type: array, minItems: 1, maxItems: 20, items: { $ref: "#/components/schemas/PartyNameInput" } }
+        country: { type: string, description: "ISO 3166-1 alpha-2. Required for a PUBLIC_AUTHORITY." }
+        identifiers: { type: array, maxItems: 20, items: { $ref: "#/components/schemas/PartyIdentifierInput" } }
+        source_system: { type: string }
+        source_ref: { type: string }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date }
+        legal_entity_id: { type: string, format: uuid, description: "LEGAL_ENTITY only: the ORG-03 legal entity this party is. A legal entity is one party." }
+        correlation_id: { type: string }
+
+    Party:
+      type: object
+      required: [party_id, tenant_id, party_kind, status, master_version]
+      properties:
+        party_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        party_kind: { type: string }
+        status: { type: string, enum: [CANDIDATE, ACTIVE, INACTIVE, MERGED] }
+        legal_entity_id: { type: string, format: uuid }
+        merged_into: { type: string, format: uuid, description: "Set when status is MERGED: the survivor this id resolves to." }
+        master_version: { type: integer, format: int64 }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    PartyMatchCandidate:
+      type: object
+      properties:
+        party_id: { type: string, format: uuid }
+        tier: { type: string, enum: [A, B, C, D], description: "MDM-05 s18.1: A scheme-proven exact, B strong composite, C probabilistic, D conflict." }
+        score: { type: number }
+        basis: { type: array, items: { type: string } }
+
+    ResolutionCase:
+      type: object
+      required: [case_id, case_type, status, candidates]
+      properties:
+        case_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        case_type: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT] }
+        status: { type: string, enum: [OPEN, RESOLVED, DISMISSED] }
+        subject_party_id: { type: string, format: uuid }
+        candidates: { type: array, items: { $ref: "#/components/schemas/PartyMatchCandidate" } }
+        create_request_id: { type: string }
+        reason: { type: string }
+        opened_by: { type: string }
+        opened_at: { type: string, format: date-time }
+        record_version: { type: integer, format: int64, description: "Send as expected_case_version when deciding." }
+        proposed_fact_id: { type: string, format: uuid }
+        decision: { type: string }
+        decided_by: { type: string }
+        decided_at: { type: string, format: date-time }
+        decision_note: { type: string }
+        resolved_party_id: { type: string, format: uuid }
+
+    CreatePartyResult:
+      type: object
+      required: [outcome, replayed]
+      properties:
+        outcome: { type: string, enum: [CREATED, MATCHED_EXISTING, REVIEW_REQUIRED] }
+        party: { $ref: "#/components/schemas/Party" }
+        match: { $ref: "#/components/schemas/PartyMatchCandidate" }
+        case: { $ref: "#/components/schemas/ResolutionCase" }
+        candidates: { type: array, items: { $ref: "#/components/schemas/PartyMatchCandidate" } }
+        replayed: { type: boolean }
+
+    PartyFact:
+      type: object
+      properties:
+        fact_id: { type: string, format: uuid }
+        fact_type: { type: string, enum: [LEGAL_NAME, TRADING_NAME, FORMER_NAME, LOCAL_SCRIPT_NAME, DISPLAY_NAME, COUNTRY, AUTHORITY_TYPE] }
+        value: { type: string }
+        language: { type: string }
+        script: { type: string }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        recorded_at: { type: string, format: date-time }
+        status: { type: string, enum: [PROPOSED, VERIFIED, SUPERSEDED, REJECTED, PROMOTED] }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        proposed_by: { type: string }
+
+    PartyIdentifier:
+      type: object
+      properties:
+        identifier_id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        scheme: { $ref: "#/components/schemas/IdentifierScheme" }
+        scope: { type: string }
+        value: { type: string }
+        masked: { type: boolean }
+        verification_status: { type: string, enum: [UNVERIFIED, VERIFIED, FAILED] }
+        evidence_ref: { type: string }
+        linked_at: { type: string, format: date-time }
+
+    PartyRole:
+      type: object
+      properties:
+        role_id: { type: string, format: uuid }
+        role_type: { type: string, enum: [CUSTOMER, SUPPLIER, COUNTERPARTY, SIGNATORY, BANK, REGULATOR, LANDLORD, EMPLOYER_LINK, OTHER_GOVERNED] }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        evidence_ref: { type: string }
+        added_by: { type: string }
+        added_at: { type: string, format: date-time }
+        removed_by: { type: string }
+        remove_reason: { type: string }
+
+    PartyView:
+      type: object
+      required: [party, as_of, known_at, names, facts, pending_facts, identifiers, roles, quality_flags]
+      properties:
+        party: { $ref: "#/components/schemas/Party" }
+        as_of: { type: string, format: date }
+        known_at: { type: string, format: date-time }
+        names: { type: array, items: { $ref: "#/components/schemas/PartyFact" } }
+        facts: { type: array, items: { $ref: "#/components/schemas/PartyFact" } }
+        pending_facts: { type: array, items: { $ref: "#/components/schemas/PartyFact" }, description: "PROPOSED facts, not yet part of the master view." }
+        identifiers: { type: array, items: { $ref: "#/components/schemas/PartyIdentifier" } }
+        roles: { type: array, items: { $ref: "#/components/schemas/PartyRole" } }
+        quality_flags:
+          type: array
+          items: { type: string, enum: [NO_VERIFIED_LEGAL_NAME, NO_VERIFIED_IDENTIFIER, UNVERIFIED_FACTS_PENDING, OPEN_RESOLUTION_CASE] }
+        alias_ids: { type: array, items: { type: string, format: uuid }, description: "Parties merged into this one." }
+
+    PartySummary:
+      type: object
+      properties:
+        party_id: { type: string, format: uuid }
+        party_kind: { type: string }
+        status: { type: string }
+        legal_name: { type: string }
+
+    PartySearchPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/PartySummary" } }
+        next_cursor: { type: string, description: "Empty on the last page." }
+
+    ProposePartyFactRequest:
+      type: object
+      required: [fact_type, value, valid_from, source_class, evidence_ref, expected_master_version]
+      properties:
+        fact_type: { type: string, enum: [LEGAL_NAME, TRADING_NAME, FORMER_NAME, LOCAL_SCRIPT_NAME, DISPLAY_NAME, COUNTRY, AUTHORITY_TYPE] }
+        value: { type: string }
+        language: { type: string }
+        script: { type: string }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        expected_master_version: { type: integer, format: int64 }
+        correlation_id: { type: string }
+
+    PartyFactOutcome:
+      type: object
+      required: [fact, party]
+      properties:
+        fact: { $ref: "#/components/schemas/PartyFact" }
+        party: { $ref: "#/components/schemas/Party" }
+        case: { $ref: "#/components/schemas/ResolutionCase" }
+
+    AddPartyRoleRequest:
+      type: object
+      required: [role_type, valid_from, evidence_ref, expected_master_version]
+      properties:
+        role_type: { type: string, enum: [CUSTOMER, SUPPLIER, COUNTERPARTY, SIGNATORY, BANK, REGULATOR, LANDLORD, EMPLOYER_LINK, OTHER_GOVERNED] }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        expected_master_version: { type: integer, format: int64 }
+        correlation_id: { type: string }
+
+    RemovePartyRoleRequest:
+      type: object
+      required: [end_date, reason, expected_master_version]
+      properties:
+        end_date: { type: string, format: date }
+        reason: { type: string }
+        expected_master_version: { type: integer, format: int64 }
+        correlation_id: { type: string }
+
+    PartyRoleOutcome:
+      type: object
+      required: [role, party]
+      properties:
+        role: { $ref: "#/components/schemas/PartyRole" }
+        party: { $ref: "#/components/schemas/Party" }
+
+    LinkIdentifierRequest:
+      type: object
+      required: [scheme, value, source_class, evidence_ref, expected_master_version]
+      properties:
+        scheme: { $ref: "#/components/schemas/IdentifierScheme" }
+        scope: { type: string }
+        value: { type: string }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        expected_master_version: { type: integer, format: int64 }
+        correlation_id: { type: string }
+
+    PartyIdentifierOutcome:
+      type: object
+      required: [party]
+      properties:
+        identifier: { $ref: "#/components/schemas/PartyIdentifier" }
+        party: { $ref: "#/components/schemas/Party" }
+        case: { $ref: "#/components/schemas/ResolutionCase" }
+
 
     # ── Tenant ────────────────────────────────────────────────────────────────
 

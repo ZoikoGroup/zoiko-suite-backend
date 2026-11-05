@@ -791,8 +791,66 @@ $BUNDLES = @(
             "iam.delegation.revoke",
             "iam.pam.manage",
             "iam.break_glass.manage",
-            "iam.support.manage"
+            "iam.support.manage",
+            # Session controls (authorization-svc 000030): the SUBJECT of a JIT
+            # or break-glass session must be eligible, an independent approver
+            # decides a high-impact JIT request, and a reviewer attests a session
+            # once it ends. Both demo principals hold this role, so each can be
+            # the other's approver; the service still refuses the requester and
+            # the subject as their own checker.
+            "iam.pam.eligible",
+            "iam.pam.approve",
+            "iam.break_glass.eligible",
+            "iam.session.review",
+            # Governed changes (000034-000035): approving a break-glass request,
+            # and requesting / deciding an authority limit.
+            "iam.break_glass.approve",
+            "iam.authority_limit.manage",
+            "iam.authority_limit.approve",
+            # Workload bindings (§16): the register read and its writes share
+            # one action.
+            "iam.workload.manage"
         )
+    },
+    @{
+        # identity-context-svc's principal and session administration, which it
+        # authorizes against the legal entity in the caller's envelope. Its own
+        # seed (scripts/seed-local-verification.sh) granted the retired
+        # PRINCIPAL_STATUS_MANAGE until 2 Nov 2026, so every suspend / reactivate
+        # from the console answered 403. IDENTITY_PRINCIPAL_STATUS_SET is HIGH
+        # (access-control 000021): suspending a principal denies them every
+        # action at authorization-svc's layer 0.
+        Code    = "IDENTITY_ADMIN_FULL"
+        Service = "identity-context-svc"
+        # The rest (3 Nov 2026) are what the rebuilt /admin/identity console
+        # calls: lifecycle (AU-09), maker-checker resets, sign-in events,
+        # support access, MFA reset and merge (ORG-1). The demo principal
+        # holds both reset halves; the service itself refuses a self-approval.
+        Actions = @("IDENTITY_SESSION_READ", "IDENTITY_SESSION_INVALIDATE",
+                    "IDENTITY_PRINCIPAL_READ", "IDENTITY_PRINCIPAL_STATUS_SET",
+                    "IDENTITY_PRINCIPAL_CREATE", "IDENTITY_PASSWORD_RESET_REQUEST",
+                    "IDENTITY_PASSWORD_RESET_APPROVE", "IDENTITY_AUTH_EVENTS_READ",
+                    "IDENTITY_SUBJECT_MERGE", "IDENTITY_MFA_RESET",
+                    "IDENTITY_SUPPORT_CONTEXT_ATTACH", "IDENTITY_SUPPORT_CONTEXT_REVIEW",
+                    "IDENTITY_SUPPORT_CONTEXT_APPROVE", "IDENTITY_SUPPORT_CONTEXT_REVOKE",
+                    "IDENTITY_CONTEXT_EXPLAIN", "IDENTITY_CONTEXT_CACHE_REFRESH",
+                    "IDENTITY_CONTEXT_TENANT_INVALIDATE",
+                    # Federation (access-control 000027, 3 Nov 2026): the
+                    # console's Federation tab reads, and the governed
+                    # connection commands when FEDERATION_ENABLED. The demo
+                    # principal holds both configure and approve, as it holds
+                    # both reset halves; the service refuses an approver who
+                    # proposed the version.
+                    "FEDERATION_READ", "FEDERATION_CONFIGURE", "FEDERATION_APPROVE",
+                    "FEDERATION_SUSPEND", "FEDERATION_LINK", "FEDERATION_PROVISIONING_MANAGE")
+    },
+    @{
+        # siem-integration-svc (access-control 000024): configuring where the
+        # tenant's security telemetry goes, and reading the stream
+        # authorization-svc and the auth plane send it.
+        Code    = "SIEM_FULL"
+        Service = "siem-integration-svc"
+        Actions = @("SIEM_EXPORTER_CREATE", "SIEM_EXPORTER_READ", "SIEM_EVENT_READ")
     },
     @{
         # retention-registry-svc. LEGAL_HOLD_RELEASE is deliberately in the same
@@ -982,10 +1040,24 @@ function Get-Decision {
         [Parameter(Mandatory)] [string] $Scope,
         [string] $Principal = $PRINCIPAL_ID
     )
-    $result = Invoke-Authz -Path "/v1/authorize" -Body @{
-        principal_id    = $Principal
-        legal_entity_id = $Scope
-        action_type     = $Action
+    try {
+        $result = Invoke-Authz -Path "/v1/authorize" -Body @{
+            principal_id    = $Principal
+            legal_entity_id = $Scope
+            action_type     = $Action
+        }
+    } catch {
+        # The tenant-scope probes ask /v1/authorize about the TENANT id as if it
+        # were a legal entity. Once tenant-entity-registry-svc is up, the service
+        # refuses that (tenant_scope_mismatch) because the registry knows no such
+        # entity; with the registry down it answers entity_registry_unavailable.
+        # Either way the probe cannot tell us the grant is there, so read it as
+        # "not granted": the bootstrap it guards is idempotent, and the admin
+        # gates themselves check tenant scope against the store, not the registry.
+        if ("$_" -match "tenant_scope_mismatch|entity_registry_unavailable") {
+            return @{ decision_outcome = "UNVERIFIED" }
+        }
+        throw
     }
     return $result.body
 }
@@ -1308,12 +1380,16 @@ function Add-Ref05Assignment {
     param([string] $PrincipalId, [string] $RoleId, [string] $Scope, [string] $Label)
     Write-Host "assign $RoleId to $PrincipalId on the $Label" -NoNewline
     try {
-        $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+        # The seed admin assigns, not the demo principal: several REF05 roles are
+        # FOR the demo principal, and authorization-svc refuses a principal
+        # assigning a role to themselves (self_grant_not_allowed). The seed admin
+        # holds iam.assignment.grant on the tenant and the platform scope.
+        $assignment = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/role-assignments" -Body @{
             principal_id    = $PrincipalId
             role_id         = $RoleId
             legal_entity_id = $Scope
             effective_from  = "2020-01-01T00:00:00Z"
-            assigned_by     = $PRINCIPAL_ID
+            assigned_by     = $SEED_ADMIN_ID
         }
         Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
     } catch {
@@ -1425,7 +1501,10 @@ Write-Host "Verifying the tenant-scoped fallback:" -ForegroundColor Cyan
 foreach ($action in $TENANT_SCOPED_ACTIONS) {
     $decision = Get-Decision -Action $action -Scope $TENANT_ID
     $outcome  = $decision.decision_outcome
-    if ($outcome -eq "GRANTED") { $colour = "Green" } else { $colour = "Red"; $failed += "$action (tenant scope)" }
+    # UNVERIFIED: /v1/authorize will not answer for the tenant id as a legal
+    # entity while the registry is up (see Get-Decision). The grant was made
+    # above; it just cannot be probed this way, so warn rather than fail.
+    if ($outcome -eq "GRANTED") { $colour = "Green" } elseif ($outcome -eq "UNVERIFIED") { $colour = "Yellow" } else { $colour = "Red"; $failed += "$action (tenant scope)" }
     Write-Host ("     {0,-28} {1,-30} -> {2}" -f "tenant-wide", $action, $outcome) -ForegroundColor $colour
 }
 

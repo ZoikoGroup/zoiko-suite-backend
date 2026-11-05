@@ -50,6 +50,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -858,6 +859,70 @@ func (s *Store) DecideRoleAssignment(ctx context.Context, assignmentID, tenantID
 	return a, err
 }
 
+// SuspendRoleAssignment and ResumeRoleAssignment stop and restart a grant
+// (000037), so cached grant sources are dropped like any revoke or approval.
+func (s *Store) SuspendRoleAssignment(ctx context.Context, assignmentID, tenantID, suspendedBy, reason string) (*domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		SuspendRoleAssignment(ctx context.Context, assignmentID, tenantID, suspendedBy, reason string) (*domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	a, err := f.SuspendRoleAssignment(ctx, assignmentID, tenantID, suspendedBy, reason)
+	if err == nil {
+		s.invalidateGrantSources(tenantID)
+	}
+	return a, err
+}
+
+func (s *Store) ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID, actor, reason string) (*domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID, actor, reason string) (*domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	a, err := f.ResumeRoleAssignment(ctx, assignmentID, tenantID, actor, reason)
+	if err == nil {
+		s.invalidateGrantSources(tenantID)
+	}
+	return a, err
+}
+
+// ListAssignmentSuspensions and QueryAssignmentsAsOf are reads for audit,
+// never a decision: forwarded uncached.
+func (s *Store) ListAssignmentSuspensions(ctx context.Context, assignmentID, tenantID string) ([]domain.AssignmentSuspension, error) {
+	f, ok := s.inner.(interface {
+		ListAssignmentSuspensions(ctx context.Context, assignmentID, tenantID string) ([]domain.AssignmentSuspension, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.ListAssignmentSuspensions(ctx, assignmentID, tenantID)
+}
+
+func (s *Store) QueryAssignmentsAsOf(ctx context.Context, q domain.AssignmentsAsOfQuery) ([]domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		QueryAssignmentsAsOf(ctx context.Context, q domain.AssignmentsAsOfQuery) ([]domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.QueryAssignmentsAsOf(ctx, q)
+}
+
+// FindRoleAssignmentsAsOf is a history read for audit, never a decision:
+// forwarded uncached.
+func (s *Store) FindRoleAssignmentsAsOf(ctx context.Context, tenantID, principalID string, asOf time.Time) ([]domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		FindRoleAssignmentsAsOf(ctx context.Context, tenantID, principalID string, asOf time.Time) ([]domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.FindRoleAssignmentsAsOf(ctx, tenantID, principalID, asOf)
+}
+
 // The GOV-04 exception lifecycle and its evaluation read are forwarded
 // uncached: an exception must stop applying the instant it is revoked or
 // expires, and FindActiveSoDException evaluates the time itself.
@@ -939,6 +1004,27 @@ func (s *Store) FindEntityStatus(ctx context.Context, legalEntityID, tenantID st
 
 func (s *Store) ProjectEntityStatus(ctx context.Context, params domain.ProjectEntityStatusParams) error {
 	return s.inner.ProjectEntityStatus(ctx, params)
+}
+
+// subjectMerger is the optional inner capability behind RepointMergedSubject;
+// optional so the many Inner test doubles need not grow a method they never use.
+type subjectMerger interface {
+	RepointMergedSubject(ctx context.Context, params domain.RepointMergedSubjectParams) (int, error)
+}
+
+// RepointMergedSubject moves a merged duplicate's assignments to its survivor
+// (identity.subject.merged) and drops the tenant's cached grant sources, so
+// neither subject is answered from the pre-merge grants.
+func (s *Store) RepointMergedSubject(ctx context.Context, params domain.RepointMergedSubjectParams) (int, error) {
+	m, ok := s.inner.(subjectMerger)
+	if !ok {
+		return 0, fmt.Errorf("%w: the inner store cannot re-point a merged subject", domain.ErrStoreUnavailable)
+	}
+	n, err := m.RepointMergedSubject(ctx, params)
+	if err == nil {
+		s.InvalidateGrantSourcesForTenant(params.TenantID)
+	}
+	return n, err
 }
 
 // FindEntityTenant memoises positive answers only. An entity never changes

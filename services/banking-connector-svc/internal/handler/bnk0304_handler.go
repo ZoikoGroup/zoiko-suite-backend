@@ -3,9 +3,14 @@
 package handler
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
+	"strconv"
+	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -20,6 +25,11 @@ const (
 	BANKING_TRANSACTION_NORMALIZE     = "BANKING_TRANSACTION_NORMALIZE"
 	BANKING_MAPPING_EXCEPTION_APPROVE = "BANKING_MAPPING_EXCEPTION_APPROVE"
 	BANKING_MAPPING_MANAGE            = "BANKING_MAPPING_MANAGE"
+
+	// BANK_TRANSACTION_READ is the spec's own BNK-04 read permission (table
+	// 24: "bank.transaction.read"), registered in access-control-svc's
+	// permission taxonomy by its migration 000022.
+	BANK_TRANSACTION_READ = "bank.transaction.read"
 )
 
 // BNK0304Handler embeds *Handler — same "separate registration function"
@@ -48,8 +58,12 @@ func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304S
 	})
 	r.Post("/v1/banking/transaction-mappings", bh.CreateTransactionMapping)
 	r.Route("/v1/banking/canonical-transactions", func(r chi.Router) {
+		r.Get("/", bh.ListCanonicalTransactions)
 		r.Get("/{id}", bh.GetCanonicalTransaction)
+		r.Get("/{id}/raw-lineage", bh.GetRawLineage)
+		r.Get("/{id}/normalization-version", bh.GetNormalizationVersion)
 	})
+	r.Get("/v1/banking/mapping-exceptions", bh.ListMappingExceptions)
 	r.Post("/v1/banking/mapping-exceptions/{id}/approve", bh.ApproveMappingException)
 }
 
@@ -362,4 +376,252 @@ func (h *BNK0304Handler) GetCanonicalTransaction(w http.ResponseWriter, r *http.
 		return
 	}
 	writeJSON(w, http.StatusOK, txn)
+}
+
+// listTransactionsParams are ListTransactions' accepted query parameters. Any
+// other is refused, as on the control-population route: a filter misspelled
+// by a caller must not silently widen the result.
+var listTransactionsParams = map[string]bool{
+	"legal_entity_id": true, "bank_account_id": true, "currency": true,
+	"transaction_date_from": true, "transaction_date_to": true, "limit": true, "cursor": true,
+}
+
+var currencyPattern = regexp.MustCompile(`^[A-Z]{3}$`)
+
+// ListCanonicalTransactions is BNK-04 ListTransactions:
+//
+//	GET /v1/banking/canonical-transactions?legal_entity_id=…[&bank_account_id=…]
+//	    [&currency=…][&transaction_date_from=YYYY-MM-DD][&transaction_date_to=YYYY-MM-DD]
+//	    [&limit=…][&cursor=…]
+//
+// NORMALIZED transactions only, of one legal entity, scoped to the request's
+// tenant by row-level security. Dates are inclusive UTC calendar days on
+// transaction_date. Authorized as bank.transaction.read on the legal entity —
+// a real authorization-svc decision, not just a principal header.
+//
+// Pagination follows the control-population route: limit defaults to 1000
+// and is capped at 5000; next_cursor is present exactly when more rows
+// exist, so a full page is never indistinguishable from the end of the
+// result.
+func (h *BNK0304Handler) ListCanonicalTransactions(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "missing_tenant_scope")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	query := r.URL.Query()
+	for k, v := range query {
+		if !listTransactionsParams[k] {
+			writeError(w, http.StatusBadRequest, "unknown query parameter: "+k)
+			return
+		}
+		if len(v) != 1 {
+			writeError(w, http.StatusBadRequest, "query parameter must appear once: "+k)
+			return
+		}
+	}
+
+	q := domain.ListTransactionsQuery{Limit: controlDefaultLimit}
+	q.LegalEntityID = query.Get("legal_entity_id")
+	if q.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+	if !idPattern.MatchString(q.LegalEntityID) {
+		writeError(w, http.StatusBadRequest, "legal_entity_id is invalid")
+		return
+	}
+	if query.Has("bank_account_id") {
+		q.BankAccountID = query.Get("bank_account_id")
+		if !idPattern.MatchString(q.BankAccountID) {
+			writeError(w, http.StatusBadRequest, "bank_account_id is invalid")
+			return
+		}
+	}
+	if query.Has("currency") {
+		q.Currency = query.Get("currency")
+		if !currencyPattern.MatchString(q.Currency) {
+			writeError(w, http.StatusBadRequest, "currency must be a three-letter upper-case ISO 4217 code")
+			return
+		}
+	}
+	for _, f := range []struct {
+		param string
+		into  **time.Time
+		next  bool // the exclusive upper bound is the day after
+	}{{"transaction_date_from", &q.From, false}, {"transaction_date_to", &q.ToExclusive, true}} {
+		if !query.Has(f.param) {
+			continue
+		}
+		raw := query.Get(f.param)
+		d, err := time.Parse("2006-01-02", raw)
+		if err != nil || len(raw) != 10 {
+			writeError(w, http.StatusBadRequest, f.param+" must be YYYY-MM-DD")
+			return
+		}
+		if f.next {
+			d = d.AddDate(0, 0, 1)
+		}
+		*f.into = &d
+	}
+	if q.From != nil && q.ToExclusive != nil && !q.From.Before(*q.ToExclusive) {
+		writeError(w, http.StatusBadRequest, "transaction_date_from must not be after transaction_date_to")
+		return
+	}
+	if query.Has("limit") {
+		n, err := strconv.Atoi(query.Get("limit"))
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		q.Limit = n
+		if q.Limit > controlMaxLimit {
+			q.Limit = controlMaxLimit
+		}
+	}
+	if query.Has("cursor") {
+		raw, err := base64.RawURLEncoding.DecodeString(query.Get("cursor"))
+		if err != nil || len(raw) == 0 || len(raw) > 128 || !utf8.Valid(raw) {
+			writeError(w, http.StatusBadRequest, "cursor is invalid")
+			return
+		}
+		q.AfterTransactionID = string(raw)
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, q.LegalEntityID, BANK_TRANSACTION_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	page, err := h.bnk0304Store.ListCanonicalTransactions(r.Context(), q)
+	if err != nil {
+		h.logger.Error("ListCanonicalTransactions: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "failed to list canonical transactions")
+		return
+	}
+	if page.NextCursor != "" {
+		page.NextCursor = base64.RawURLEncoding.EncodeToString([]byte(page.NextCursor))
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+// GetRawLineage handles GET /v1/banking/canonical-transactions/{id}/raw-lineage
+// (BNK-04 GetRawLineage, table 23/25). The legal entity isn't known until the
+// row is loaded, so this loads first (under RLS/tenant isolation) and only
+// then checks bank.transaction.read on the legal entity it resolves to — the
+// same real authorization-svc decision ListCanonicalTransactions already
+// makes (A20), not just a principal check.
+func (h *BNK0304Handler) GetRawLineage(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	lineage, err := h.bnk0304Store.GetRawLineage(r.Context(), tenantID, id)
+	if err != nil {
+		h.writeTransactionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, lineage.LegalEntityID, BANK_TRANSACTION_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, lineage)
+}
+
+// GetNormalizationVersion handles
+// GET /v1/banking/canonical-transactions/{id}/normalization-version
+// (BNK-04 GetNormalizationVersion, table 23/25). Same load-then-authorize
+// order as GetRawLineage, and the same bank.transaction.read decision.
+func (h *BNK0304Handler) GetNormalizationVersion(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	v, err := h.bnk0304Store.GetNormalizationVersion(r.Context(), tenantID, id)
+	if err != nil {
+		h.writeTransactionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, v.LegalEntityID, BANK_TRANSACTION_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+var listMappingExceptionsParams = map[string]bool{"status": true, "limit": true, "cursor": true}
+var mappingExceptionStatuses = map[string]bool{"OPEN": true, "APPROVED": true, "REJECTED": true}
+
+// ListMappingExceptions handles GET /v1/banking/mapping-exceptions (BNK-04
+// ListNormalizationExceptions, table 23). Authorized as a platform-level
+// action (empty legal_entity_id) with mapping.exception.approve — the same
+// posture ApproveMappingException and CreateTransactionMapping already use:
+// this is a shared ops/finance control queue, not a legal-entity-scoped
+// business read, and table 24 names no separate read permission for it.
+func (h *BNK0304Handler) ListMappingExceptions(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	query := r.URL.Query()
+	for k, v := range query {
+		if !listMappingExceptionsParams[k] {
+			writeError(w, http.StatusBadRequest, "unknown query parameter: "+k)
+			return
+		}
+		if len(v) != 1 {
+			writeError(w, http.StatusBadRequest, "query parameter must appear once: "+k)
+			return
+		}
+	}
+	q := domain.ListMappingExceptionsQuery{Limit: controlDefaultLimit}
+	if query.Has("status") {
+		q.Status = query.Get("status")
+		if !mappingExceptionStatuses[q.Status] {
+			writeError(w, http.StatusBadRequest, "status must be one of OPEN, APPROVED, REJECTED")
+			return
+		}
+	}
+	if query.Has("limit") {
+		n, err := strconv.Atoi(query.Get("limit"))
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		q.Limit = n
+		if q.Limit > controlMaxLimit {
+			q.Limit = controlMaxLimit
+		}
+	}
+	if query.Has("cursor") {
+		raw, err := base64.RawURLEncoding.DecodeString(query.Get("cursor"))
+		if err != nil || len(raw) == 0 || len(raw) > 128 || !utf8.Valid(raw) {
+			writeError(w, http.StatusBadRequest, "cursor is invalid")
+			return
+		}
+		q.AfterExceptionID = string(raw)
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, "", BANKING_MAPPING_EXCEPTION_APPROVE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	page, err := h.bnk0304Store.ListMappingExceptions(r.Context(), q)
+	if err != nil {
+		h.logger.Error("ListMappingExceptions: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "failed to list mapping exceptions")
+		return
+	}
+	if page.NextCursor != "" {
+		page.NextCursor = base64.RawURLEncoding.EncodeToString([]byte(page.NextCursor))
+	}
+	writeJSON(w, http.StatusOK, page)
 }

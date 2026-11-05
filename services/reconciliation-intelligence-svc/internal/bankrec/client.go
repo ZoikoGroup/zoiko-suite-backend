@@ -64,6 +64,12 @@ const (
 
 	runStatusSuperseded = "SUPERSEDED"
 	lineStatusUnmatched = "UNMATCHED"
+
+	// journalLookupBatchSize is bank-reconciliation-svc's
+	// domain.MaxJournalLookupIDs: the most journal ids ?journal_ids= accepts
+	// in one call. A2b part 3's candidate set is batched at this size rather
+	// than refused past it.
+	journalLookupBatchSize = 200
 )
 
 // Scope is who a read is made on behalf of: the VERIFIED tenant and
@@ -206,6 +212,65 @@ func (c *Client) ListUnmatchedLines(ctx context.Context, scope Scope, run *Run) 
 		out = append(out, line)
 	}
 	return out, nil
+}
+
+// journalLookupLine is the subset of bank-reconciliation-svc's StatementLine
+// wire shape the journal_ids lookup needs. MatchedJournalIDs/ProposedJournalIDs
+// are its A2b part 2 many-to-one form; a single-journal match or proposal
+// leaves them unset and uses the scalar fields instead.
+type journalLookupLine struct {
+	StatementLineID    string   `json:"statement_line_id"`
+	MatchedJournalID   *string  `json:"matched_journal_id"`
+	ProposedJournalID  *string  `json:"proposed_journal_id"`
+	MatchedJournalIDs  []string `json:"matched_journal_ids"`
+	ProposedJournalIDs []string `json:"proposed_journal_ids"`
+}
+
+// LookupClaimedJournalIDs asks bank-reconciliation-svc, via its
+// journal_ids lookup (A2b part 3), which of the given general-ledger-svc
+// journal ids are already somebody's matched or pending-confirmation
+// counterpart — scalar or A2b part 2's many-to-one form. The answer is a set
+// of claimed ids; an id absent from it is simply unclaimed, not confirmed
+// available (bank-reconciliation-svc's own verification at propose/confirm
+// time is still the real check).
+//
+// journalIDs may exceed bank-reconciliation-svc's per-request limit: this
+// batches the lookup rather than failing it, so a run with many candidate
+// journals is still fully checked. A batch that fails fails the whole
+// lookup — this service fails CLOSED, never partially checked.
+func (c *Client) LookupClaimedJournalIDs(ctx context.Context, scope Scope, journalIDs []string) (map[string]bool, error) {
+	claimed := make(map[string]bool)
+	if len(journalIDs) == 0 {
+		return claimed, nil
+	}
+	for start := 0; start < len(journalIDs); start += journalLookupBatchSize {
+		end := start + journalLookupBatchSize
+		if end > len(journalIDs) {
+			end = len(journalIDs)
+		}
+		batch := journalIDs[start:end]
+
+		var lines []journalLookupLine
+		q := url.Values{"journal_ids": {strings.Join(batch, ",")}}
+		if err := c.get(ctx, scope, "/v1/statement-lines", q, nil, &lines); err != nil {
+			return nil, err
+		}
+		for _, l := range lines {
+			if l.MatchedJournalID != nil && *l.MatchedJournalID != "" {
+				claimed[*l.MatchedJournalID] = true
+			}
+			if l.ProposedJournalID != nil && *l.ProposedJournalID != "" {
+				claimed[*l.ProposedJournalID] = true
+			}
+			for _, id := range l.MatchedJournalIDs {
+				claimed[id] = true
+			}
+			for _, id := range l.ProposedJournalIDs {
+				claimed[id] = true
+			}
+		}
+	}
+	return claimed, nil
 }
 
 // get performs one GET and decodes a 200 body into out. notFound, when

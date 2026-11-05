@@ -124,6 +124,7 @@ func (s *PgStore) RecalculateSchedule(ctx context.Context, scheduleID string, ne
 const depreciationRunColumns = `
 	run_id, tenant_id, legal_entity_id, fiscal_period,
 	depreciation_expense_account_code, accumulated_depreciation_account_code,
+	depreciation_expense_mapping_key, accumulated_depreciation_mapping_key,
 	status, journal_id, supersedes_run_id, superseded_by_run_id,
 	created_at, created_by_principal_id, frozen_at, validated_at,
 	approved_at, approved_by_principal_id, emitted_at, superseded_at, superseded_by_principal_id, ledger_journal_ids`
@@ -134,6 +135,7 @@ func scanDepreciationRun(row pgx.Row) (*domain.DepreciationRun, error) {
 	if err := row.Scan(
 		&r.RunID, &r.TenantID, &r.LegalEntityID, &r.FiscalPeriod,
 		&r.DepreciationExpenseAccountCode, &r.AccumulatedDepreciationAccountCode,
+		&r.DepreciationExpenseMappingKey, &r.AccumulatedDepreciationMappingKey,
 		&r.Status, &r.JournalID, &r.SupersedesRunID, &r.SupersededByRunID,
 		&r.CreatedAt, &r.CreatedByPrincipalID, &r.FrozenAt, &r.ValidatedAt,
 		&r.ApprovedAt, &r.ApprovedByPrincipalID, &r.EmittedAt, &r.SupersededAt, &r.SupersededByPrincipalID, &ids,
@@ -157,10 +159,12 @@ func (s *PgStore) CreateDepreciationRun(ctx context.Context, r *domain.Depreciat
 			INSERT INTO depreciation_runs (
 				run_id, tenant_id, legal_entity_id, fiscal_period,
 				depreciation_expense_account_code, accumulated_depreciation_account_code,
+				depreciation_expense_mapping_key, accumulated_depreciation_mapping_key,
 				status, supersedes_run_id, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		`, r.RunID, tenantID, r.LegalEntityID, r.FiscalPeriod,
-			r.DepreciationExpenseAccountCode, r.AccumulatedDepreciationAccountCode,
+			"", "",
+			r.DepreciationExpenseMappingKey, r.AccumulatedDepreciationMappingKey,
 			r.Status, r.SupersedesRunID, r.CreatedAt, r.CreatedByPrincipalID)
 		if err != nil {
 			if isUniqueViolation(err) {

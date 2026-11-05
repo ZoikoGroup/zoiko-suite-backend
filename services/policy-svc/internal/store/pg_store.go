@@ -85,7 +85,8 @@ func (s *PgStore) domainError(op string, err error) error {
 		domain.ErrPolicyNotFound, domain.ErrPolicyVersionNotFound, domain.ErrInvalidTransition,
 		domain.ErrConflict, domain.ErrApprovalRequired, domain.ErrSoDConflict,
 		domain.ErrConcurrencyConflict, domain.ErrPolicyConflicted, domain.ErrIdempotencyMismatch,
-		domain.ErrInvalidScope, domain.ErrEvaluationNotFound,
+		domain.ErrInvalidScope, domain.ErrEvaluationNotFound, domain.ErrAccountingDependencyNotFound,
+		domain.ErrSupersessionRequired, domain.ErrInvalidSupersedes,
 		domain.ErrControlTestDefinitionNotFound, domain.ErrAttestationNotFound,
 		domain.ErrInvalidAttestationTransition,
 	} {
@@ -125,7 +126,8 @@ const policyColumns = `
 	policy_status,
 	versioning_mode,
 	created_at,
-	created_by_principal_id`
+	created_by_principal_id,
+	record_version`
 
 func scanPolicy(row pgx.Row) (*domain.Policy, error) {
 	p := &domain.Policy{}
@@ -139,6 +141,7 @@ func scanPolicy(row pgx.Row) (*domain.Policy, error) {
 		&p.VersioningMode,
 		&p.CreatedAt,
 		&p.CreatedByPrincipalID,
+		&p.RecordVersion,
 	)
 	return p, err
 }
@@ -314,6 +317,23 @@ func sameVersionContent(v *domain.PolicyVersion, p domain.CreatePolicyVersionPar
 // A tenant-owned family only takes versions in its owner's scope; a platform
 // family takes global versions and tenant-scoped overrides.
 func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreatePolicyVersionParams) (*domain.PolicyVersion, bool, error) {
+	var v *domain.PolicyVersion
+	var created bool
+	err := s.withRLS(ctx, contextTenantID(ctx), func(tx pgx.Tx) error {
+		var err error
+		v, created, err = s.createVersionTx(ctx, tx, params)
+		return err
+	})
+	if err != nil {
+		return nil, false, s.domainError("CreatePolicyVersion", err)
+	}
+	return v, created, nil
+}
+
+// createVersionTx is CreatePolicyVersion inside the caller's transaction, so a
+// version can be created together with what else belongs to it (an accounting
+// policy's applicability, mappings and details).
+func (s *PgStore) createVersionTx(ctx context.Context, tx pgx.Tx, params domain.CreatePolicyVersionParams) (*domain.PolicyVersion, bool, error) {
 	if params.PolicyVersionID == "" {
 		params.PolicyVersionID = uuid.New().String()
 	}
@@ -330,7 +350,7 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 
 	var result *domain.PolicyVersion
 	var created bool
-	err := s.withRLS(ctx, contextTenantID(ctx), func(tx pgx.Tx) error {
+	err := func() error {
 		// FOR UPDATE serialises version numbering per family.
 		family, err := scanPolicy(tx.QueryRow(ctx, `SELECT `+policyColumns+` FROM policies WHERE policy_id = $1 FOR UPDATE;`, params.PolicyID))
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -405,11 +425,8 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 		}
 		result, created = v, true
 		return s.enqueue(ctx, tx, versionEvent("policy.updated", v, params.CreatedByPrincipalID, params.Meta, nil))
-	})
-	if err != nil {
-		return nil, false, s.domainError("CreatePolicyVersion", err)
-	}
-	return result, created, nil
+	}()
+	return result, created, err
 }
 
 // jsonEqual compares two JSON payloads structurally rather than byte-for-
@@ -637,7 +654,13 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 		if err != nil {
 			return nil, err
 		}
-		return &domain.TransitionResult{Version: next, Transitioned: true}, record(next, "policy.version.approved", nil)
+		if err := record(next, "policy.version.approved", nil); err != nil {
+			return nil, err
+		}
+		if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicyApproved, next, cmd.ActorID, cmd.Meta, nil); err != nil {
+			return nil, err
+		}
+		return &domain.TransitionResult{Version: next, Transitioned: true}, nil
 
 	case domain.CommandActivate, domain.CommandSchedule:
 		future := v.EffectiveFrom.After(now)
@@ -661,6 +684,11 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 		}
 		if err := expected(); err != nil {
 			return nil, err
+		}
+		if from == domain.StatusApproved {
+			if err := s.guardSupersession(ctx, tx, v, cmd.SupersedesVersionID); err != nil {
+				return nil, err
+			}
 		}
 		if from == domain.StatusApproved {
 			if err := s.guardActivation(ctx, tx, v, policyType); err != nil {
@@ -698,8 +726,14 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 		if _, err := tx.Exec(ctx, `DELETE FROM policy_activation_schedule WHERE policy_version_id = $1;`, v.PolicyVersionID); err != nil {
 			return nil, err
 		}
-		return &domain.TransitionResult{Version: next, Transitioned: true},
-			record(next, "policy.version.suspended", map[string]any{"reason": cmd.Reason})
+		if err := record(next, "policy.version.suspended", map[string]any{"reason": cmd.Reason}); err != nil {
+			return nil, err
+		}
+		if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicySuspended, next, cmd.ActorID, cmd.Meta,
+			map[string]any{"reason": cmd.Reason, "break_glass_session_id": nilIfEmpty(cmd.BreakGlassSessionID)}); err != nil {
+			return nil, err
+		}
+		return &domain.TransitionResult{Version: next, Transitioned: true}, nil
 
 	case domain.CommandReviewSuspension:
 		if v.SuspensionReviewedAt != nil {
@@ -760,11 +794,26 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 // The advisory lock serialises every activation of the policy type, so two
 // concurrent activations cannot both pass the check.
 func (s *PgStore) guardActivation(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion, policyType string) error {
+	// An accounting policy is one of many in the same type and scope (one per
+	// domain, book and jurisdiction): the rule that two policies of a type
+	// cannot share a scope would refuse every second domain. They are guarded
+	// by whether they could be ambiguous with one another instead.
+	fam, err := s.accountingApplicability(ctx, tx, v.PolicyID)
+	if err != nil {
+		return err
+	}
+	if fam != nil {
+		if err := s.guardAccountingOverlap(ctx, tx, v, fam); err != nil {
+			return err
+		}
+		return s.guardPendingSchedule(ctx, tx, v)
+	}
+
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1));`, "policy-svc:policy_type:"+policyType); err != nil {
 		return err
 	}
 	var conflicting string
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT pv.policy_version_id
 		FROM policy_versions pv
 		JOIN policies p ON p.policy_id = pv.policy_id
@@ -784,9 +833,14 @@ func (s *PgStore) guardActivation(ctx context.Context, tx pgx.Tx, v *domain.Poli
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
+	return s.guardPendingSchedule(ctx, tx, v)
+}
 
+// guardPendingSchedule refuses an activation that would race a scheduled
+// activation already pending in the version's own scope.
+func (s *PgStore) guardPendingSchedule(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion) error {
 	var pending string
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT policy_version_id FROM policy_versions
 		WHERE policy_id = $1
 		  AND tenant_id IS NOT DISTINCT FROM $2::uuid
@@ -868,6 +922,11 @@ func (s *PgStore) activateNow(ctx context.Context, tx pgx.Tx, v *domain.PolicyVe
 	})); err != nil {
 		return nil, err
 	}
+	if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicyActivated, next, actor, meta, map[string]any{
+		"superseded_version_ids": versionIDs(superseded),
+	}); err != nil {
+		return nil, err
+	}
 	active := domain.StatusActive
 	for _, old := range superseded {
 		if err := s.insertTransition(ctx, tx, old, &active, domain.StatusSuperseded, actor, "superseded by "+next.PolicyVersionID, "", meta.CorrelationID); err != nil {
@@ -877,6 +936,11 @@ func (s *PgStore) activateNow(ctx context.Context, tx pgx.Tx, v *domain.PolicyVe
 			"superseded_by_version_id": next.PolicyVersionID,
 			"previous_status":          domain.StatusActive,
 		})); err != nil {
+			return nil, err
+		}
+		if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicySuperseded, old, actor, meta, map[string]any{
+			"superseded_by_version_id": next.PolicyVersionID,
+		}); err != nil {
 			return nil, err
 		}
 	}

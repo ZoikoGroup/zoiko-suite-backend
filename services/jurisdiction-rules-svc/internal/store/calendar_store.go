@@ -39,6 +39,14 @@ type CalendarVersionRecord struct {
 	CreatedBy         string           `json:"created_by_principal_id"`
 	PublishedAt       *time.Time       `json:"published_at"`
 	PublishedBy       *string          `json:"published_by"`
+
+	// The evidence of the import this version came from (REF-10), when it came
+	// from one, and the digest of what it says.
+	SourceAuthority *string `json:"source_authority,omitempty"`
+	SourceReference *string `json:"source_reference,omitempty"`
+	SourceVersion   *string `json:"source_version,omitempty"`
+	ImportHash      *string `json:"import_hash,omitempty"`
+	ContentDigest   string  `json:"content_digest"`
 }
 
 type ObligationRuleRecord struct {
@@ -146,14 +154,15 @@ func (s *PgStore) ListCalendars(ctx context.Context) ([]*Calendar, error) {
 }
 
 const calVersionCols = `v.calendar_version_id::text, c.calendar_code, v.version, to_char(v.effective_from,'YYYY-MM-DD'), v.timezone,
-	v.weekend_days::int[], to_char(v.cutoff_time,'HH24:MI'), v.status, v.created_at, v.created_by_principal_id, v.published_at, v.published_by`
+	v.weekend_days::int[], to_char(v.cutoff_time,'HH24:MI'), v.status, v.created_at, v.created_by_principal_id, v.published_at, v.published_by,
+	v.source_authority, v.source_reference, v.source_version, v.import_hash`
 
 func (s *PgStore) loadCalendarVersion(ctx context.Context, q querier, where string, args ...any) (*CalendarVersionRecord, error) {
 	var r CalendarVersionRecord
 	var weekend []int32
 	err := q.QueryRow(ctx, `SELECT `+calVersionCols+` FROM regulatory_calendar_versions v JOIN regulatory_calendars c USING (calendar_id) WHERE `+where, args...).
 		Scan(&r.CalendarVersionID, &r.CalendarCode, &r.Version, &r.EffectiveFrom, &r.Timezone, &weekend, &r.CutoffTime, &r.Status,
-			&r.CreatedAt, &r.CreatedBy, &r.PublishedAt, &r.PublishedBy)
+			&r.CreatedAt, &r.CreatedBy, &r.PublishedAt, &r.PublishedBy, &r.SourceAuthority, &r.SourceReference, &r.SourceVersion, &r.ImportHash)
 	if err != nil {
 		return nil, err
 	}
@@ -161,16 +170,19 @@ func (s *PgStore) loadCalendarVersion(ctx context.Context, q querier, where stri
 	for i, w := range weekend {
 		r.WeekendDays[i] = int(w)
 	}
-	rows, err := q.Query(ctx, `SELECT to_char(holiday_date,'YYYY-MM-DD'), name FROM regulatory_holidays WHERE calendar_version_id::text=$1 ORDER BY holiday_date`, r.CalendarVersionID)
+	rows, err := q.Query(ctx, `SELECT to_char(holiday_date,'YYYY-MM-DD'), name, observed_rule, COALESCE(to_char(observed_date,'YYYY-MM-DD'), '') FROM regulatory_holidays WHERE calendar_version_id::text=$1 ORDER BY holiday_date`, r.CalendarVersionID)
 	if err != nil {
 		return nil, err
 	}
 	r.Holidays = []domain.Holiday{}
 	for rows.Next() {
 		var h domain.Holiday
-		if err := rows.Scan(&h.Date, &h.Name); err != nil {
+		if err := rows.Scan(&h.Date, &h.Name, &h.ObservedRule, &h.ObservedDate); err != nil {
 			rows.Close()
 			return nil, err
+		}
+		if h.ObservedRule == domain.ObservedNone {
+			h.ObservedRule = "" // a plain holiday reads as it always did
 		}
 		r.Holidays = append(r.Holidays, h)
 	}
@@ -189,6 +201,7 @@ func (s *PgStore) loadCalendarVersion(ctx context.Context, q querier, where stri
 		r.SourceIDs = append(r.SourceIDs, sid)
 	}
 	srows.Close()
+	r.ContentDigest = domain.CalendarContentDigest(r.Domain())
 	return &r, nil
 }
 
@@ -221,10 +234,8 @@ func (s *PgStore) CreateCalendarVersion(ctx context.Context, code, effectiveFrom
 		RETURNING calendar_version_id::text`, calID, effectiveFrom, tz, wk, cutoff, actor).Scan(&vid); err != nil {
 		return nil, s.registryFail("CreateCalendarVersion insert", err, nil)
 	}
-	for _, h := range holidays {
-		if _, err := tx.Exec(ctx, `INSERT INTO regulatory_holidays (calendar_version_id, holiday_date, name) VALUES ($1::uuid,$2::date,$3)`, vid, h.Date, h.Name); err != nil {
-			return nil, s.registryFail("CreateCalendarVersion holiday", err, nil)
-		}
+	if err := s.insertHolidays(ctx, tx, vid, holidays, weekend); err != nil {
+		return nil, err
 	}
 	rec, err := s.loadCalendarVersion(ctx, tx, `v.calendar_version_id::text=$1`, vid)
 	if err != nil {

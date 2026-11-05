@@ -4,6 +4,7 @@ package store_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,112 @@ import (
 	"zoiko.io/treasury-svc/internal/domain"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
 )
+
+// TestPgStore_SuspendAndClose_ReasonReachesAccountHistoryAndEvent is the
+// SPEC_DEVIATIONS A6 proof: suspend_reason/close_reason must be readable
+// back on the live account, carried into bank_account_history (not just the
+// live row), and present in the outbox event payload — none of which held
+// before migration 000013.
+func TestPgStore_SuspendAndClose_ReasonReachesAccountHistoryAndEvent(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	acct := newTestAccount(tenantID, uuid.New().String())
+	if _, err := s.CreateBankAccount(ctx, acct); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	suspended, err := s.SuspendBankAccount(ctx, domain.SuspendAccountParams{
+		BankAccountID: acct.BankAccountID, TenantID: tenantID, Reason: "suspicious activity",
+		ActorPrincipalID: "ops-1", CorrelationID: "corr-suspend-1",
+	})
+	if err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	if suspended.SuspendReason != "suspicious activity" {
+		t.Fatalf("expected the live row to report its own suspend reason, got %q", suspended.SuspendReason)
+	}
+	var histSuspendReason string
+	if err := testPool.QueryRow(ctx, `SELECT suspend_reason FROM bank_account_history
+		WHERE bank_account_id = $1 AND account_status = 'SUSPENDED' ORDER BY effective_at DESC LIMIT 1`,
+		acct.BankAccountID).Scan(&histSuspendReason); err != nil {
+		t.Fatalf("read history suspend_reason: %v", err)
+	}
+	if histSuspendReason != "suspicious activity" {
+		t.Fatalf("expected the history row to carry the suspend reason too, got %q", histSuspendReason)
+	}
+	payload := legacyEventTypeOf(t, ctx, tenantID, acct.BankAccountID, "com.zoikosuite.treasury.bank-account.suspended")
+	if !strings.Contains(payload, `"suspend_reason":"suspicious activity"`) {
+		t.Fatalf("expected the suspended event to carry suspend_reason, got: %s", payload)
+	}
+	if !strings.Contains(payload, `"correlation_id":"corr-suspend-1"`) {
+		t.Fatalf("expected the suspended event to carry the real correlation id, not an empty one: %s", payload)
+	}
+
+	if _, err := s.ReactivateBankAccount(ctx, domain.ReactivateAccountParams{BankAccountID: acct.BankAccountID, TenantID: tenantID, ActorPrincipalID: "ops-1"}); err != nil {
+		t.Fatalf("reactivate: %v", err)
+	}
+	closed, err := s.CloseBankAccount(ctx, domain.CloseAccountParams{
+		BankAccountID: acct.BankAccountID, TenantID: tenantID, Reason: "account closed by client",
+		ActorPrincipalID: "ops-1", CorrelationID: "corr-close-1",
+	})
+	if err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if closed.CloseReason != "account closed by client" {
+		t.Fatalf("expected the live row to report its own close reason, got %q", closed.CloseReason)
+	}
+	var histCloseReason string
+	if err := testPool.QueryRow(ctx, `SELECT close_reason FROM bank_account_history
+		WHERE bank_account_id = $1 AND account_status = 'CLOSED' ORDER BY effective_at DESC LIMIT 1`,
+		acct.BankAccountID).Scan(&histCloseReason); err != nil {
+		t.Fatalf("read history close_reason: %v", err)
+	}
+	if histCloseReason != "account closed by client" {
+		t.Fatalf("expected the history row to carry the close reason too, got %q", histCloseReason)
+	}
+	closedPayload := legacyEventTypeOf(t, ctx, tenantID, acct.BankAccountID, "com.zoikosuite.treasury.bank-account.closed")
+	if !strings.Contains(closedPayload, `"close_reason":"account closed by client"`) {
+		t.Fatalf("expected the closed event to carry close_reason, got: %s", closedPayload)
+	}
+	if !strings.Contains(closedPayload, `"correlation_id":"corr-close-1"`) {
+		t.Fatalf("expected the closed event to carry the real correlation id, not an empty one: %s", closedPayload)
+	}
+}
+
+// TestPgStore_BankAccountHistory_IsAppendOnlyForReasonColumns is the
+// negative-controlled proof that migration 000013's extended
+// reject_account_history_mutation trigger covers the two new columns, not
+// just the ones migration 000006 already enumerated.
+func TestPgStore_BankAccountHistory_IsAppendOnlyForReasonColumns(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	acct := newTestAccount(tenantID, uuid.New().String())
+	if _, err := s.CreateBankAccount(ctx, acct); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if _, err := s.SuspendBankAccount(ctx, domain.SuspendAccountParams{
+		BankAccountID: acct.BankAccountID, TenantID: tenantID, Reason: "original reason", ActorPrincipalID: "ops-1",
+	}); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	var historyID string
+	if err := testPool.QueryRow(ctx, `SELECT history_id FROM bank_account_history
+		WHERE bank_account_id = $1 AND account_status = 'SUSPENDED'`, acct.BankAccountID).Scan(&historyID); err != nil {
+		t.Fatalf("read history_id: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE bank_account_history SET suspend_reason = 'tampered' WHERE history_id = $1`, historyID); err == nil {
+		t.Fatal("expected the trigger to refuse rewriting suspend_reason on a standing history row")
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE bank_account_history SET close_reason = 'tampered' WHERE history_id = $1`, historyID); err == nil {
+		t.Fatal("expected the trigger to refuse rewriting close_reason on a standing history row")
+	}
+}
 
 // TestPgStore_VerifyBankAccountOwnership_SupersedesPriorEvidence is the
 // real proof of "ownership verification state is orthogonal and

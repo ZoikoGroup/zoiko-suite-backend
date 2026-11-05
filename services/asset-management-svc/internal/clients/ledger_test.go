@@ -31,7 +31,7 @@ func TestPostAssetEventAccountingEvent_SendsCurrencyAndDocumentDate(t *testing.T
 	srv, got := captureLedger(t)
 	c := clients.New(srv.URL, "", zap.NewNop())
 
-	lines := []clients.LedgerLine{{AccountCode: "A", DebitAmount: 10}, {AccountCode: "B", CreditAmount: 10}}
+	lines := []clients.LedgerLine{{MappingKey: "DEBIT_KEY", DebitAmount: 10}, {MappingKey: "CREDIT_KEY", CreditAmount: 10}}
 	id, err := c.PostAssetEventAccountingEvent(context.Background(), "t", "p", "le-1", "2026-09", "d", "evt-1", "corr", "EUR", "2026-09-15", lines)
 	if err != nil || id != "j-1" {
 		t.Fatalf("unexpected result %q, %v", id, err)
@@ -50,7 +50,7 @@ func TestPostDepreciationAccountingEvent_DoesNotInventCurrencyOrDate(t *testing.
 	srv, got := captureLedger(t)
 	c := clients.New(srv.URL, "", zap.NewNop())
 
-	lines := []clients.LedgerLine{{AccountCode: "A", DebitAmount: 10}, {AccountCode: "B", CreditAmount: 10}}
+	lines := []clients.LedgerLine{{MappingKey: "DEBIT_KEY", DebitAmount: 10}, {MappingKey: "CREDIT_KEY", CreditAmount: 10}}
 	if _, err := c.PostDepreciationAccountingEvent(context.Background(), "t", "p", "le-1", "2026-09", "d", "run-1", "corr", lines); err != nil {
 		t.Fatal(err)
 	}

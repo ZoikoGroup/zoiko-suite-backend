@@ -45,3 +45,11 @@ b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integrati
 # used as an Idempotency-Key header in a test, flagged as generic-api-key. It
 # is not a secret; the line is now a low-entropy key with `gitleaks:allow`.
 4f6ff90dcb85ebc12164c3cc35c68050263177c5:services/public-ai-svc/internal/httpapi/api_test.go:generic-api-key:283
+#
+# PR #249 (shashi-changes, identity-context-svc IC-1 and AU-09 tests): the
+# "Secret12345678" value in both is a fixture password posted to the
+# account-activation and forgot-password handlers in unit tests. Neither is
+# a secret. Both lines now carry `gitleaks:allow`; these cover the commits
+# already pushed.
+737515e70c7e1268e62b181a6c98fe119ecfe28a:services/identity-context-svc/internal/context/handler_au09_test.go:generic-api-key:119
+5724147f4da998f5d6f11872732cdf4bb6e37cfe:services/identity-context-svc/internal/context/handler_lifecycle_test.go:generic-api-key:196

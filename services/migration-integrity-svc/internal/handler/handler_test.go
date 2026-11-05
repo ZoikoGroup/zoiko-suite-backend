@@ -115,8 +115,8 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 	if job.IntegrityScore != 20 {
 		t.Fatalf("expected integrity score 20, got %f", job.IntegrityScore)
 	}
-	if len(job.IntegrityChecks) != 4 {
-		t.Fatalf("expected 4 integrity checks (schema, identity, dup, format), got %d", len(job.IntegrityChecks))
+	if len(job.IntegrityChecks) != 5 {
+		t.Fatalf("expected 5 integrity checks (schema, identity, dup, format, currency), got %d", len(job.IntegrityChecks))
 	}
 	if len(job.AuditEntries) == 0 {
 		t.Fatal("expected audit entries for violations")

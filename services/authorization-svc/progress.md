@@ -2506,3 +2506,41 @@ admin MFA reset. Evidence rows confirmed in both databases.
 certificate must carry clientAuth — not exercised live because the compose override turns
 mTLS off). Compose runs `AUTHZ_IDENTITY_ASSERTION=warn` until the console forwards the
 envelope. Everyone who issues or approves sessions must enrol a TOTP factor first.
+
+## 2 Nov: IAM-13, quantity limits (S8-D1), If-Match on assignments and bindings
+
+The three in-service gaps left by the Domain 2 status review (D2-5).
+
+**IAM-13, the ORG-06 role half.** AssignBusinessRole and ListPrincipalAssignments map to the
+existing `POST` / `GET /v1/admin/role-assignments` (`?principal_id=`). New:
+- **SuspendAssignment:** `/suspend` and `/resume`. Migration **000038** adds `suspended_at` (every
+  grant query now also requires `suspended_at IS NULL`), `suspended_by` and `suspension_reason`.
+  Suspend takes `iam.assignment.revoke`. Resume takes `iam.assignment.grant`, is never allowed on
+  one's own assignment, needs `approve_privileged` for a privileged role, and re-runs SoD.
+- **GetAssignmentsAsOf:** `GET ...?as_of=`. It reads `principal_role_assignment_history`, an
+  append-only record of every insert and real change, with actor, correlation id and reason.
+  Rows that predate the table are backfilled.
+- **Events:** `iam.assignment.suspended` and `.resumed`.
+
+**Quantity authority limits (S8-D1).** Migration **000040** adds `limit_kind` `MONETARY` or
+`QUANTITY`. The database refuses a currency or a fractional bound on a QUANTITY limit. The limit
+is judged against the request's `quantity` attribute, separately from the amount, so a
+delegator's own quantity cap now bounds their delegations too.
+
+**API-3 on assignments and workload bindings.** Migrations 000038 and **000039** add `version`.
+Approve, reject, revoke, suspend, resume, deactivate and reactivate honour `If-Match` (412 when
+stale) and return an `ETag`. It is **not yet required**, because the console and
+access-control-svc's revoke call send none. Making it mandatory means changing those callers
+first.
+
+**Proof:**
+- Unit and integration suites (both DSNs, NOBYPASSRLS IT role): 818 pass, 0 fail, 1 by-design
+  skip.
+- 4 mutants killed: grant ignores suspension, as-of ignores suspension, as-of ignores approval,
+  quantity limit read as money.
+- 000038–000040 down/up on scratch Postgres.
+- Live on the rebuilt container: dependency E2E 33/33, route probe 31/31, and 25/25 new-feature
+  checks (suspend denies, resume permits, as-of at four instants, stale If-Match 412, the four
+  events, history versions 1–4, quantity 10 PERMIT and 11 DENY).
+
+**Deploy:** apply 000038, 000039, 000040.

@@ -502,6 +502,7 @@ func TestRetireAndReactivateABACRule(t *testing.T) {
 
 	for _, path := range []string{"retire", "reactivate"} {
 		req := httptest.NewRequest(http.MethodPost, "/v1/admin/abac-rules/r-1/"+path, nil)
+		req.Header.Set("If-Match", `"v1"`)
 		req.Header.Set("X-Principal-Id", "admin-1")
 		req.Header.Set("X-Tenant-Id", testTenant)
 		w := httptest.NewRecorder()
@@ -521,6 +522,7 @@ func TestRetireABACRule_NotFoundIs404(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/abac-rules/r-missing/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", testTenant)
 	w := httptest.NewRecorder()

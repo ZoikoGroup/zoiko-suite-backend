@@ -191,3 +191,26 @@ The 14 Oct E2E (41 / 41) remains valid for what it covered:
 - the A-01 gate;
 - the session caps;
 - the admin MFA reset.
+
+## Re-score of AU-01 to AU-11, 3 November 2026 (identity-context-svc)
+
+Scored against the running stack, not against earlier write-ups: identity-context-svc image rebuilt
+3 Nov 16:34, `deployments/scripts/e2e-identity-context-deps.py` 61/61 PASS, `scripts/audit.sh`
+live 37/38 (the one failure is section 2, host `go test` binaries blocked by Windows Application
+Control; the same suite in a golang:1.26 container is green), plus a live probe with
+`FEDERATION_ENABLED=true`. AU-02 and AU-03 are authorization-svc rows and are not re-scored here.
+
+| Row | Was (14 Oct) | Now | Evidence |
+|---|---|---|---|
+| AU-01 | Open: a revoked envelope still worked | **Closed** | E2E: authorization-svc refuses the invalidated envelope 5.1 s after `POST .../invalidate` (session introspection) |
+| AU-04 | Open: 25 failed logins, never 429 | **Closed (identity side)** | Per-IP and per-tenant budgets on `/v1/authenticate`, step-up, pre-session routes and the hosted login; `TestAU09_PreSessionRoutesThrottled`, `TestHostedLoginIsThrottledAfterRepeatedFailures`, `TestAU11_HostedLoginRefusesAWrongPasskeyAndThrottles`. Edge throttling is gateway-auth-svc GW-2 |
+| AU-05 | Open: one key, secrets in env | **Closed in code** | Keyring + KMS interface (19 Oct). Live JWKS publishes one key (`local-dev-key-1`); a rotation with two published keys has not been exercised live |
+| AU-06 | Open: password-for-token, no OIDC | **Closed** | Discovery, code + PKCE S256 only, unregistered client refused without redirect (audit §7b); `/v1/authenticate` still open locally for the console |
+| AU-07 | Open: no federation | **Closed for OIDC** | Live with `FEDERATION_ENABLED=true`: connections and links read 200 for the admin, 403 without a grant, a forged id_token 401 with the uniform answer. The probe found every admin route 503 (tenant id passed as the legal entity) and the six FEDERATION_* actions unregistered; both fixed (access-control 000027). SAML is a recorded deviation pending D-4 |
+| AU-08 | Open: no SCIM | **Closed in code** | SCIM create/PATCH/DELETE with termination-priority deprovisioning (`internal/federation`, store suite). Not exercised live: provisioning is off on the local stack (`/scim/v2/*` 404) |
+| AU-09 | Open: no subject lifecycle | **Closed** | E2E: workload created ACTIVE without a password, person PENDING_ACTIVATION, idempotent replay, maker-checker reset (requester refused), the new Password resets register, forgot-password identical for known and unknown accounts; reset decisions now carry a reason |
+| AU-10 | Open: no refresh | **Closed** | Refresh rotation with reuse detection ending the login session (`TestRefreshRotatesAndReuseEndsTheSession`) |
+| AU-11 | Open: TOTP only | **Closed** | Passkeys (go-webauthn v0.17.4): registration, hosted-login second step, step-up to `PHISHING_RESISTANT`, revoke, administrator reset. E2E with a software P-256 authenticator: registration verified, an assertion from another origin refused, step-up envelope `assurance_level: PHISHING_RESISTANT`, a spent ceremony refused, sign-in event at `PASSKEY`, enrolled and step-up events in the outbox. A browser platform authenticator has not been exercised (headless Chrome has none) |
+
+Still open from this list: AU-05 live rotation, AU-08 live SCIM, SAML (D-4), and the console's
+passkey ceremony in a real browser.

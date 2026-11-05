@@ -308,6 +308,15 @@ type Handler struct {
 	// accrues a receipt (goods-service-receipt-svc's AP_GRNI_EXPENSE).
 	// INV-04 credits it when it reclasses that cost into inventory.
 	grniReclassMappingKey string
+
+	// ACC-02 mapping keys for the legacy (non-kernel) posting path. The
+	// ledger owns account resolution; this service never sends a raw GL
+	// account code on the posting path (see SPEC_DEVIATIONS-style fix: the
+	// *_account_code fields were removed from every create/request type).
+	inventoryMappingKey        string
+	cogsMappingKey             string
+	writeDownExpenseMappingKey string
+	landedCostOffsetMappingKey string
 }
 
 // DefaultGRNIReclassMappingKey matches goods-service-receipt-svc's default
@@ -324,6 +333,22 @@ func (h *Handler) WithGRNIReclassMappingKey(key string) *Handler {
 	if key != "" {
 		h.grniReclassMappingKey = key
 	}
+	return h
+}
+
+// WithValuationMappingKeys sets the ACC-02 mapping keys the legacy posting
+// path uses for valuation runs and write-downs. Left unconfigured, the
+// commands that need them refuse with mapping_key_not_configured rather than
+// falling back to a caller-supplied raw account code.
+func (h *Handler) WithValuationMappingKeys(inventoryKey, cogsKey, writeDownExpenseKey string) *Handler {
+	h.inventoryMappingKey, h.cogsMappingKey, h.writeDownExpenseMappingKey = inventoryKey, cogsKey, writeDownExpenseKey
+	return h
+}
+
+// WithLandedCostOffsetMappingKey sets the ACC-02 mapping key AllocateLandedCost
+// credits for the full allocation amount (e.g. a freight payable/accrual).
+func (h *Handler) WithLandedCostOffsetMappingKey(key string) *Handler {
+	h.landedCostOffsetMappingKey = key
 	return h
 }
 
@@ -414,10 +439,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 			r.Post("/{id}/emit", h.EmitInventoryAccountingEvent)
 		})
 		r.Route("/landed-costs", func(r chi.Router) {
-				r.Post("/", h.AllocateLandedCost)
-				r.Get("/{id}", h.GetLandedCostAllocation)
-			})
-			r.Route("/write-downs", func(r chi.Router) {
+			r.Post("/", h.AllocateLandedCost)
+			r.Get("/{id}", h.GetLandedCostAllocation)
+		})
+		r.Route("/write-downs", func(r chi.Router) {
 			r.Post("/", h.RecordInventoryWriteDown)
 			r.Get("/{id}", h.GetWriteDown)
 			r.Post("/{id}/reverse", h.ReverseWriteDown)

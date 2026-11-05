@@ -37,6 +37,7 @@ const (
 	SessionEndDeprovisioned   = "DEPROVISIONED"
 	SessionEndPasswordChanged = "PASSWORD_CHANGED"
 	SessionEndAdminRevoke     = "ADMIN_REVOKE"
+	SessionEndMerged          = "IDENTITY_MERGED"
 	SessionEndPrincipalStatus = "PRINCIPAL_STATUS_CHANGED"
 )
 
@@ -150,6 +151,8 @@ type ResetApproval struct {
 	ApproverID string    `json:"approver_id"`
 	At         time.Time `json:"at"`
 	Decision   string    `json:"decision"`
+	// Reason is the approver's recorded reason, when they gave one.
+	Reason string `json:"reason,omitempty"`
 }
 
 // ── Federation (AU-07) ───────────────────────────────────────────────────────

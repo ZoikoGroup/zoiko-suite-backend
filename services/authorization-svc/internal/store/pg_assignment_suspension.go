@@ -25,10 +25,15 @@ import (
 // assignment stops granting the instant this commits, and the
 // assignment_version watermark (000028) invalidates cached decisions on every
 // replica.
+//
+// The row's suspended_at / suspended_by / suspension_reason (000038) carry the
+// open suspension too, so the assignment's own representation and its
+// history snapshot (the ?as_of= read) show it.
 func (s *PgStore) SuspendRoleAssignment(ctx context.Context, assignmentID, tenantID, actor, reason string) (*domain.PrincipalRoleAssignment, error) {
 	const query = `
 		UPDATE principal_role_assignments
-		   SET approval_status = 'SUSPENDED'
+		   SET approval_status = 'SUSPENDED',
+		       suspended_at = clock_timestamp(), suspended_by = $3, suspension_reason = NULLIF($4, '')
 		 WHERE principal_role_assignment_id = $1
 		   AND approval_status = 'APPROVED'
 		   AND (effective_to IS NULL OR effective_to > NOW())
@@ -38,7 +43,7 @@ func (s *PgStore) SuspendRoleAssignment(ctx context.Context, assignmentID, tenan
 	var a *domain.PrincipalRoleAssignment
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var scanErr error
-		a, scanErr = scanAssignment(tx.QueryRow(ctx, query, assignmentID, tenantID))
+		a, scanErr = scanAssignment(tx.QueryRow(ctx, query, assignmentID, tenantID, actor, reason))
 		if scanErr != nil {
 			return scanErr
 		}
@@ -72,7 +77,8 @@ func (s *PgStore) explainSuspendRefusal(ctx context.Context, assignmentID, tenan
 func (s *PgStore) ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID, actor, reason string) (*domain.PrincipalRoleAssignment, error) {
 	const query = `
 		UPDATE principal_role_assignments
-		   SET approval_status = 'APPROVED'
+		   SET approval_status = 'APPROVED',
+		       suspended_at = NULL, suspended_by = NULL, suspension_reason = NULL
 		 WHERE principal_role_assignment_id = $1
 		   AND approval_status = 'SUSPENDED'
 		   AND principal_id <> $3

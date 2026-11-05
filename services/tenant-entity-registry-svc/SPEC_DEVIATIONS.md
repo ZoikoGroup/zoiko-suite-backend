@@ -115,3 +115,52 @@ All refused at boot in staging and production.
 | `ONBOARDING_KEY_OPTIONAL` | provisioning without `external_customer_key` |
 | `LEGACY_PROVISIONING_INPUTS` | provisioning without the §4.2 inputs (000013), and entity creation without `registered_office` / `source_evidence_ref` (§4.3) |
 | `EXPECTED_VERSION_OPTIONAL` | substitution of the read version for a missing `expected_version` |
+
+## Master data lives here, not in separate MDM services (R15, ORG-07 and MDM-01 / MDM-05)
+
+ZS-SVC-U-001 describes MDM-01 to MDM-05 as services. They are built as modules of this service, with their own
+tables, so a legal entity (ORG-03), its parties (ORG-07) and its ownership (ORG-04) commit in one database. A
+consumer that follows the spec's `/v1/parties` surface finds it here.
+
+Party kinds, the match ladder, the create flow and the non-destructive merge are as ZS-SVC-U-001 s9, s10 and s18.
+Where the spec leaves a choice, the code chooses the safer reading:
+
+- **No automatic link below tier A.** Tier A (a verified identifier in the right scheme and scope that names one
+  active party) may return the existing party. An identifier the tenant only asserted is tier B, and a name match
+  is tier B or C: all of them answer `REVIEW_REQUIRED` and open a case. The spec allows a governed threshold to link
+  tier B for low-impact object types; none is configured, so none links.
+- **An authority source verifies on arrival; nothing else does.** `AUTHORITY_REGISTRY` and `AUTHORITY_DOCUMENT`
+  verify a fact or identifier when it is recorded. A tenant's own assertion is held `PROPOSED`. A fact that
+  contradicts a verified one is held beside it and opens a FACT_CONFLICT case, even from an authority: replacing a
+  verified fact is a steward's decision (s19), not a side effect of a write.
+- **Scheme-proven needs a verified identifier.** The one exception is the source-system reference
+  (`SOURCE_SYSTEM`, scope = the system), which exists to make an ingest replay-safe.
+- **Sensitive identifiers** (`TAX_ID`, `NATIONAL_ID`) are masked in every read and answer; unmasking is
+  `PARTY_IDENTIFIER_REVEAL` and is refused, not silently masked, when asked for without it. No event carries an
+  identifier value, a name or evidence text.
+- **Identifier verification through XIC** (`POST /v1/identifiers/{id}:verify`) is not built here; the verification
+  state comes from the source class of the link until it is.
+- **Search reads the authoritative tables.** The spec expects a search projection; a projection lags a write, and
+  the answer to "does this party already exist" must not.
+
+### Merge, split and stewardship (MDM-05, wave 2)
+
+- **Merge is a case decision.** `POST /v1/resolution/{case}:merge` decides an open DUPLICATE_REVIEW or
+  IDENTIFIER_CONFLICT case. Every party involved must be named by the case, and the steward sends the version of each
+  (s18.2 step 2). The spec's "authorization/WFC approval where material" is built as separation of duties: the
+  principal who opened the case cannot decide it, and the principal who merged cannot split. Every merge is treated as
+  material because this service cannot see which parties are linked to financial records. A workflow approval step in
+  front of the command is the place to relax that for low-impact objects; none is configured.
+- **Absorbed ids stay.** A merged party keeps its row, status `MERGED`, resolving to the survivor. Merges do not chain:
+  a survivor that was merged away, or a party that already absorbed others, is refused rather than re-pointed.
+- **Identifiers and roles are consolidated here; references are not.** The survivor gains the identifiers and roles it
+  lacked (new rows naming their source; the old rows end). `party.merged` carries `remediation_scope`, and each domain
+  re-points what it owns prospectively through the alias. A historical snapshot is never rewritten.
+- **A split restores, it does not guess.** Identifiers and a legal-entity link the merge moved go back; roles the merge
+  consolidated are left for the domains to re-resolve from `party.split`. The merge stays in the lineage.
+- **Matching skips merged parties.** A create resembling a merged-away name matches nothing; names are not copied to
+  the survivor. If that matters, steward the survivor's names with `facts:propose`.
+- **Decisions are not a merge.** `CREATE_NEW`, `LINK_EXISTING`, `DISMISS`, `ACCEPT_PROPOSED_FACT`, `KEEP_VERIFIED`,
+  `KEEP_HOLDER` and `MOVE_TO_REQUESTER` settle the other cases. Accepting a proposed fact supersedes the verified one
+  rather than editing it, and records the accepted fact as verified at decision time, so "what did we know then" still
+  has its answer.

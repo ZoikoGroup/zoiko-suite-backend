@@ -188,6 +188,21 @@ type Handler struct {
 	authz     AuthZClient
 	ledger    DepreciationLedgerClient
 	log       *zap.Logger
+
+	depreciationExpenseMappingKey     string
+	accumulatedDepreciationMappingKey string
+
+	assetEventDebitMappingKey        string
+	assetEventCreditMappingKey       string
+	assetEventImpairmentMappingKeys  MappingKeyPair
+	assetEventRevaluationMappingKeys MappingKeyPair
+	assetEventDisposalMappingKeys    MappingKeyPair
+}
+
+// MappingKeyPair is one governed debit/credit ACC-02 mapping pair.
+type MappingKeyPair struct {
+	Debit  string
+	Credit string
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
@@ -204,6 +219,51 @@ func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *
 func (h *Handler) WithLedgerClient(c DepreciationLedgerClient) *Handler {
 	h.ledger = c
 	return h
+}
+
+// WithDepreciationMappingKeys configures the ACC-02 mapping keys every new
+// depreciation run persists and every legacy run falls back to. Empty values
+// deliberately fail closed; the ledger is never asked to resolve a raw code.
+func (h *Handler) WithDepreciationMappingKeys(expense, accumulated string) *Handler {
+	h.depreciationExpenseMappingKey = expense
+	h.accumulatedDepreciationMappingKey = accumulated
+	return h
+}
+
+// WithAssetEventMappingKeys configures governed defaults for asset-event
+// postings. Per-event-type pairs cover IMPAIRMENT, REVALUATION and DISPOSAL;
+// the generic pair is the fallback for every other event type.
+func (h *Handler) WithAssetEventMappingKeys(defaultPair, impairment, revaluation, disposal MappingKeyPair) *Handler {
+	h.assetEventDebitMappingKey = defaultPair.Debit
+	h.assetEventCreditMappingKey = defaultPair.Credit
+	h.assetEventImpairmentMappingKeys = impairment
+	h.assetEventRevaluationMappingKeys = revaluation
+	h.assetEventDisposalMappingKeys = disposal
+	return h
+}
+
+func (h *Handler) assetEventDefaultMappingKeys(eventType string) MappingKeyPair {
+	switch eventType {
+	case domain.AssetEventTypeImpairment:
+		return h.assetEventImpairmentMappingKeys
+	case domain.AssetEventTypeRevaluation:
+		return h.assetEventRevaluationMappingKeys
+	case domain.AssetEventTypeDisposal:
+		return h.assetEventDisposalMappingKeys
+	default:
+		return MappingKeyPair{Debit: h.assetEventDebitMappingKey, Credit: h.assetEventCreditMappingKey}
+	}
+}
+
+func (h *Handler) resolveAssetEventMappingKeys(e *domain.AssetEvent) MappingKeyPair {
+	keys := h.assetEventDefaultMappingKeys(e.EventType)
+	if e.DebitMappingKey != nil && *e.DebitMappingKey != "" {
+		keys.Debit = *e.DebitMappingKey
+	}
+	if e.CreditMappingKey != nil && *e.CreditMappingKey != "" {
+		keys.Credit = *e.CreditMappingKey
+	}
+	return keys
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {

@@ -442,6 +442,232 @@ paths:
 
   # ── Rules (public read) ────────────────────────────────────────────────────
 
+  /v1/admin/jurisdiction-imports:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: ImportJurisdictionUpdate, propose an externally sourced update (REF-01)
+      description: |
+        Proposes an update from an external source (an ISO 3166 edition, a regulator's list) as a
+        batch of rows: `ADD` a jurisdiction, `UPDATE` one (name, authority type, or its parent) or
+        `RETIRE` one, optionally naming its successor. **Proposing changes nothing.** Every row is
+        checked against the registry as it is now and its errors are kept, row by row, so a whole
+        file's problems are reported at once. A batch with a bad row is stored and can be read, but
+        **cannot be approved**.
+
+        A row names a jurisdiction by `jurisdiction_id`, or by `code` and `type` together, never by
+        code alone, because one code can mean a country and a tax authority. A name that matches no
+        active jurisdiction, or more than one, is a row error: the registry does not choose. A row
+        may name, as its parent or successor, a jurisdiction that an earlier row of the same file adds.
+
+        `(source_standard, source_version)` is imported once. The same content again (compared by
+        the import hash of the normalised content, so padding and time zones do not matter) answers
+        `200` with the first batch; different content for the same version is `409
+        import_version_conflict`. A rejected batch frees its version.
+
+        Needs `JURISDICTION_IMPORT_PROPOSE`. The principal who proposes cannot approve.
+      operationId: importJurisdictionUpdate
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProposeImportRequest' }
+      responses:
+        "200":
+          description: This source version was already proposed with the same content.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "201":
+          description: Proposed. Read `invalid_count` and each row's `validation_errors` before asking for approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "409":
+          description: This source version was already proposed or imported with different content (`import_version_conflict`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+    get:
+      tags: [Admin, Jurisdictions]
+      summary: List jurisdiction import batches (REF-01)
+      description: Newest first, without rows. Read one batch for its rows. Needs `JURISDICTION_IMPORT_VIEW`.
+      operationId: listJurisdictionImports
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [PROPOSED, APPROVED, REJECTED] }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: The batches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [imports]
+                properties:
+                  imports:
+                    type: array
+                    items: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}:
+    get:
+      tags: [Admin, Jurisdictions]
+      summary: Get a jurisdiction import batch with its rows (REF-01)
+      description: |
+        The batch, every row as it was sent, each row's validation errors and, once approved, each
+        row's outcome and the jurisdiction it concerned. Needs `JURISDICTION_IMPORT_VIEW`.
+      operationId: getJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The batch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}/approve:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: Approve and apply a jurisdiction import (REF-01)
+      description: |
+        Approval by a principal **other than the proposer** (`403 segregation_of_duties`, also
+        enforced by a database constraint). A batch with a row that failed validation is
+        `422 import_has_invalid_rows`.
+
+        Approval applies every row, in order, **in one transaction: all rows or none.** If a row
+        cannot be applied (the registry moved on since the proposal, or two moves would together
+        make a cycle) nothing is applied, the batch stays `PROPOSED` and the answer is
+        `422 import_row_failed` naming the row. Hierarchy changes are serialised, so two imports
+        approved at once cannot leave a cycle. The registry history records each change against
+        the batch, its evidence and the row's effective date.
+
+        The response carries counts that add up to the number of rows. Publishes, in the same
+        transaction, `jurisdiction.created` for an add, `jurisdiction.deactivated` for a
+        retirement, `jurisdiction.hierarchy.changed` for a move (previous and new parent, and the
+        import) and `jurisdiction.updated` (`change_type` `ATTRIBUTES_CHANGED`, with the previous
+        and current values) for a changed name or authority type. A row that changed nothing
+        publishes nothing. Needs `JURISDICTION_IMPORT_APPROVE`.
+      operationId: approveJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecideImportRequest' }
+      responses:
+        "200":
+          description: Approved and applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: The batch was already decided (`import_already_decided`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "422":
+          description: A row failed validation (`import_has_invalid_rows`), or a row could not be applied and nothing was (`import_row_failed`, with `item_no` and `message`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}/reject:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: Reject a jurisdiction import (REF-01)
+      description: |
+        Rejects a proposed batch, with a `reason` (required). Nothing in the registry changes and
+        the source version can be proposed again. The proposer may reject (withdraw) their own
+        batch. Needs `JURISDICTION_IMPORT_APPROVE`.
+      operationId: rejectJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecideImportRequest' }
+      responses:
+        "200":
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: The batch was already decided (`import_already_decided`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
   /v1/jurisdictions/{jurisdiction_id}/rules:
     get:
       tags: [Rules]
@@ -1763,11 +1989,302 @@ paths:
       description: |
         Action REGULATORY_CALENDAR_VERSION_PUBLISH. The publisher must differ from the author (403 segregation_of_duties,
         also a database check); the version must cite at least one reviewed, non-superseded source (409 source_not_ready).
-        Emits jurisdiction.calendar.changed. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
+        Emits jurisdiction.calendar.changed, business-calendar.updated and a holiday-occurrence.changed for each holiday it adds, removes or changes against the previous published version. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
       operationId: publishCalendarVersion
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
+  /v1/admin/calendars/{calendar_code}/imports:
+    post:
+      tags: [Admin, Calendar]
+      summary: ImportHolidayCalendar, import an authority's holiday list as a draft version (REF-10)
+      description: |
+        Action REGULATORY_CALENDAR_VERSION_CREATE. Drafts the next version of the calendar from a holiday list, with the
+        evidence of where it came from: `source_authority`, `source_reference` and the authority's own `source_version`
+        (all required), and a content hash computed here. Body also as for a calendar version (`effective_from`,
+        `timezone`, `weekend_days`, `cutoff_time?`, `holidays`) and optional `source_ids` citing registered regulatory
+        sources, which publishing requires.
+
+        Each holiday may carry an `observed_rule` (`NONE`, `WEEKEND_TO_NEXT_WEEKDAY`, `WEEKEND_TO_PREVIOUS_WEEKDAY`,
+        `WEEKEND_TO_NEAREST_WEEKDAY`) saying how it is observed when it falls on a weekend. Its observed date is worked out
+        here from the rule and the calendar's own weekend, never taken from the caller, and business-day arithmetic uses it.
+
+        One source version is imported once per calendar: the same edition with the same content again answers `200` with
+        the first version; the same edition with different content is `409 calendar_import_conflict`. The draft is then
+        published by a different principal, as any calendar version is.
+      operationId: importHolidayCalendar
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportCalendarRequest' }
+      responses:
+        "201": { description: Drafted as the next version. }
+        "200": { description: This source version was already imported with the same content. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: This source version was already imported with different content (calendar_import_conflict)., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/calendars/{calendar_code}/is-business-day:
+    get:
+      tags: [Calendar]
+      summary: IsBusinessDay (REF-10)
+      description: |
+        Whether `date` is a business day of the calendar, and if not why (`WEEKEND`, or `HOLIDAY` with its name; a holiday
+        is non-business on the date it is observed). Deterministic, and it says which calendar version answered, with its
+        content digest and the evidence of its import.
+
+        Only published versions answer. Without `calendar_version` it is the highest version effective on or before the date
+        and published at `known_at` (default now), so a correction published later does not change what a past date was
+        answered with as it was known then. With `calendar_version` it is that version exactly, to reproduce an earlier answer.
+      operationId: isBusinessDay
+      parameters:
+        - { name: calendar_code, in: path, required: true, schema: { type: string } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The answer and the calendar version that gave it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BusinessDayCheck' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/calendars/{calendar_code}/add-business-days:
+    get:
+      tags: [Calendar]
+      summary: AddBusinessDays (REF-10)
+      description: |
+        Moves `days` business days from `date` (negative moves back, at most 1000). The start date is never counted, so one
+        business day from a Friday or from a Saturday is the Monday. The days passed over are returned with their reasons.
+
+        One calendar version, the one governing the start date, answers the whole calculation: a shift that crosses the
+        start of a later version does not change calendars halfway. `known_at` and `calendar_version` are as for
+        `is-business-day`.
+      operationId: addBusinessDays
+      parameters:
+        - { name: calendar_code, in: path, required: true, schema: { type: string } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: days, in: query, required: true, schema: { type: integer, minimum: -1000, maximum: 1000 } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The result date, what was skipped, and the calendar version that gave it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AddBusinessDaysResult' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: Register a payment term (REF-10)
+      description: |
+        Action PAYMENT_TERM_CREATE. Registers a term by its code (upper-case, such as `NET30` or `EOM45`), its name and,
+        optionally, the jurisdiction it is specific to. The rule lives on its versions. The same code with the same name and
+        jurisdiction answers `200`; the same code naming a different term is `409`.
+      operationId: createPaymentTerm
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePaymentTermRequest' }
+      responses:
+        "201": { description: Registered. }
+        "200": { description: An identical term already exists. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "409": { description: The code names a different term., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms/{term_code}/versions:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: Draft the next version of a payment term (REF-10)
+      description: |
+        Action PAYMENT_TERM_CREATE. Drafts a version: how the due date is worked out (`basis_date_rule`, `due_method`,
+        `due_days` or `due_day_of_month`), the `business_day_convention` and the `calendar_code` it is applied by, `grace_days`,
+        an optional early-payment discount, and a `rationale`. Every problem is reported at once (`400`, with `problems`). A term
+        beyond 90 days of credit must say it changes controlled credit policy (`controlled_credit`). The version number, the
+        formula in words and the content digest are assigned by the service. A version is immutable once drafted; a change is a
+        new version.
+      operationId: createPaymentTermVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: term_code, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentTermVersionInput' }
+      responses:
+        "201": { description: Drafted., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTermVersion' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms/{term_code}/versions/{version}/approve:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: ApprovePaymentTerm (REF-10)
+      description: |
+        Action PAYMENT_TERM_APPROVE. Approves a DRAFT, which puts it in force from its `effective_from`. **The author cannot
+        approve their own version** (`403 segregation_of_duties`, also a database check). Approving over another approved
+        version that governs any of its period is `409 supersession_required`: replacing a term in force is stated, with
+        `supersede`. A version applied by a calendar needs that calendar to have a published version (`409 calendar_not_ready`).
+        Repeating it answers `200`. Publishes `payment-term.activated`.
+      operationId: approvePaymentTerm
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: term_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      responses:
+        "200": { description: Approved (or already)., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTermVersion' } } } }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: Not a draft; supersession_required; or calendar_not_ready., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms/{term_code}/versions/{version}/supersede:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: SupersedePaymentTerm (REF-10)
+      description: |
+        Action PAYMENT_TERM_SUPERSEDE. Approves a DRAFT over the ACTIVE version named in `supersedes_version`, in one
+        transaction. The replaced version stops governing on the new version's `effective_from`, so every date before it keeps
+        the replaced version's rule and due dates already worked out are not changed. The version named must be this term's
+        active version, and the new one must start after it (`409 invalid_supersession`). The author cannot do it. Publishes
+        `payment-term.superseded` for the replaced version and `payment-term.activated` for the new one.
+      operationId: supersedePaymentTerm
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: term_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SupersedeTermRequest' }
+      responses:
+        "200": { description: Superseded (or already)., content: { application/json: { schema: { $ref: '#/components/schemas/SupersedeTermResult' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: Not a draft; not active; invalid_supersession; or calendar_not_ready., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms/{term_code}/versions/{version}/retire:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: RetirePaymentTerm (REF-10)
+      description: |
+        Action PAYMENT_TERM_RETIRE. A draft is withdrawn. An active version stops governing on `ends_on` (default today, which
+        must be after its `effective_from`), so the dates before it keep its rule. A `reason` is required. A superseded
+        version is already over (`409`). Repeating it answers `200`. Publishes `payment-term.retired`.
+      operationId: retirePaymentTerm
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: term_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetireTermRequest' }
+      responses:
+        "200": { description: Retired (or already)., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTermVersion' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: The version is superseded., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}:
+    get:
+      tags: [PaymentTerm]
+      summary: GetPaymentTerm (REF-10)
+      operationId: getPaymentTerm
+      parameters: [{ name: term_code, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: The term., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTerm' } } } }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}/versions:
+    get:
+      tags: [PaymentTerm]
+      summary: List the versions of a payment term, oldest first (REF-10)
+      operationId: listPaymentTermVersions
+      parameters: [{ name: term_code, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: The versions. }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}/versions/{version}:
+    get:
+      tags: [PaymentTerm]
+      summary: One version of a payment term (REF-10)
+      operationId: getPaymentTermVersion
+      parameters: [{ name: term_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { description: The version., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTermVersion' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}/due-date:
+    get:
+      tags: [PaymentTerm]
+      summary: CalculateDueDate (REF-10)
+      description: |
+        The due date for an invoice, and what it was worked out by: the **term version**, the **calendar version**, the **basis
+        date** and the **adjustment convention** (the answer's `term`, `calendar`, `basis_date` and `adjustment_convention`).
+
+        The term version is the approved one in force on `invoice_date` (which is therefore required) and already approved at
+        `known_at` (default now). A term that counts from the receipt or delivery date needs `receipt_date` or `delivery_date`
+        (`400 basis_date_required`). The calendar version is the published one governing the date the due date lands on, before
+        any adjustment.
+
+        **Historical due dates are never silently recalculated.** A version superseded or retired later, or a calendar amended
+        later, does not change an answer asked as it was known then (`known_at`), and either version can be pinned
+        (`term_version`, `calendar_version`) to reproduce an earlier answer exactly. Deterministic: the same inputs always give
+        the same answer.
+      operationId: calculateDueDate
+      parameters:
+        - { name: term_code, in: path, required: true, schema: { type: string } }
+        - { name: invoice_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: receipt_date, in: query, required: false, schema: { type: string, format: date } }
+        - { name: delivery_date, in: query, required: false, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: term_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200": { description: The due date and its provenance., content: { application/json: { schema: { $ref: '#/components/schemas/DueDateResult' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}/explain-due-date:
+    get:
+      tags: [PaymentTerm]
+      summary: ExplainDueDate (REF-10)
+      description: |
+        The due date as `due-date` gives it, with `steps`, how it was worked out, in order. The explanation is the executed calculation, never written separately. Same parameters.
+      operationId: explainDueDate
+      parameters:
+        - { name: term_code, in: path, required: true, schema: { type: string } }
+        - { name: invoice_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: receipt_date, in: query, required: false, schema: { type: string, format: date } }
+        - { name: delivery_date, in: query, required: false, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: term_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200": { description: "The due date, its provenance and the steps.", content: { application/json: { schema: { $ref: '#/components/schemas/DueDateResult' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
   /v1/admin/obligation-rules:
     post:
       tags: [Admin, Obligations]
@@ -2584,6 +3101,188 @@ components:
           format: uuid
           description: The active jurisdiction that takes over. Must be a different, active jurisdiction.
 
+
+    ImportCalendarRequest:
+      type: object
+      required: [source_authority, source_reference, source_version, effective_from, timezone, weekend_days, holidays]
+      properties:
+        source_authority: { type: string, maxLength: 512, description: "The holiday authority, for example UK Government." }
+        source_reference: { type: string, maxLength: 512, description: "Where the list came from." }
+        source_version: { type: string, maxLength: 64, description: "The authority's own identifier for this edition. One edition is imported once per calendar." }
+        effective_from: { type: string, format: date }
+        timezone: { type: string, description: IANA time zone. }
+        weekend_days: { type: array, items: { type: integer, minimum: 0, maximum: 6 }, description: "0=Sunday .. 6=Saturday. Required: it differs between authorities." }
+        cutoff_time: { type: string, nullable: true, description: "HH:MM authority-local." }
+        holidays:
+          type: array
+          minItems: 1
+          maxItems: 400
+          items:
+            type: object
+            required: [date, name]
+            properties:
+              date: { type: string, format: date }
+              name: { type: string }
+              observed_rule: { type: string, enum: [NONE, WEEKEND_TO_NEXT_WEEKDAY, WEEKEND_TO_PREVIOUS_WEEKDAY, WEEKEND_TO_NEAREST_WEEKDAY], description: "How the holiday is observed when it falls on a weekend." }
+        source_ids: { type: array, items: { type: string, format: uuid }, description: "Registered regulatory sources cited, which publishing requires." }
+
+    CalendarProvenance:
+      type: object
+      description: Which calendar version answered, so the answer can be reproduced.
+      required: [calendar_code, calendar_version, calendar_version_id, content_digest, timezone, effective_from, pinned]
+      properties:
+        calendar_code: { type: string }
+        calendar_version: { type: integer }
+        calendar_version_id: { type: string, format: uuid }
+        content_digest: { type: string, description: "Digest of what the version says; two versions with the same digest give the same answers." }
+        timezone: { type: string }
+        effective_from: { type: string, format: date }
+        source_authority: { type: string }
+        source_version: { type: string }
+        import_hash: { type: string }
+        pinned: { type: boolean, description: "True when the caller named the version rather than asking for the one in force." }
+
+    BusinessDayCheck:
+      type: object
+      required: [date, is_business_day, calendar]
+      properties:
+        date: { type: string, format: date }
+        is_business_day: { type: boolean }
+        reason: { type: string, enum: [WEEKEND, HOLIDAY] }
+        holiday_name: { type: string }
+        calendar: { $ref: '#/components/schemas/CalendarProvenance' }
+
+    AddBusinessDaysResult:
+      type: object
+      required: [start_date, days, result_date, skipped, calendar]
+      properties:
+        start_date: { type: string, format: date }
+        days: { type: integer }
+        result_date: { type: string, format: date }
+        skipped:
+          type: array
+          items:
+            type: object
+            required: [date, reason]
+            properties:
+              date: { type: string, format: date }
+              reason: { type: string, enum: [WEEKEND, HOLIDAY] }
+              name: { type: string }
+        calendar: { $ref: '#/components/schemas/CalendarProvenance' }
+
+    CreatePaymentTermRequest:
+      type: object
+      required: [term_code, term_name]
+      properties:
+        term_code: { type: string, pattern: '^[A-Z][A-Z0-9_]{1,31}$', example: NET30 }
+        term_name: { type: string, maxLength: 512 }
+        jurisdiction_id: { type: string, format: uuid, nullable: true, description: "Omit for a term not specific to one jurisdiction." }
+
+    PaymentTerm:
+      type: object
+      properties:
+        term_id: { type: string, format: uuid }
+        term_code: { type: string }
+        term_name: { type: string }
+        jurisdiction_id: { type: string, format: uuid, nullable: true }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+
+    PaymentTermVersionInput:
+      type: object
+      required: [basis_date_rule, due_method, business_day_convention, rationale, effective_from]
+      properties:
+        basis_date_rule: { type: string, enum: [INVOICE_DATE, RECEIPT_DATE, DELIVERY_DATE] }
+        due_method: { type: string, enum: [NET_DAYS, END_OF_MONTH_PLUS, DAY_OF_NEXT_MONTH], description: "NET_DAYS: basis + due_days. END_OF_MONTH_PLUS: end of the basis month + due_days. DAY_OF_NEXT_MONTH: due_day_of_month of the month after, clamped to its length." }
+        due_days: { type: integer, minimum: 0, maximum: 365, default: 0, description: "Beyond 90 needs controlled_credit. Must be 0 for DAY_OF_NEXT_MONTH." }
+        due_day_of_month: { type: integer, minimum: 1, maximum: 31, description: "DAY_OF_NEXT_MONTH only." }
+        business_day_convention: { type: string, enum: [NONE, FOLLOWING, PRECEDING, MODIFIED_FOLLOWING, MODIFIED_PRECEDING] }
+        calendar_code: { type: string, description: "Required with a convention, and only then." }
+        grace_days: { type: integer, minimum: 0, maximum: 90, default: 0 }
+        discount_percent: { type: string, description: "A decimal above 0 and at most 100, such as 2.5. With discount_days." }
+        discount_days: { type: integer, minimum: 1, maximum: 365, description: "Days from the basis date the discount can be taken. Fewer than due_days for NET_DAYS." }
+        controlled_credit: { type: boolean, default: false, description: "The term changes controlled credit policy: required beyond 90 days." }
+        rationale: { type: string }
+        source_ref: { type: string }
+        effective_from: { type: string, format: date }
+
+    PaymentTermVersion:
+      allOf:
+        - $ref: '#/components/schemas/PaymentTermVersionInput'
+        - type: object
+          properties:
+            term_version_id: { type: string, format: uuid }
+            term_code: { type: string }
+            version: { type: integer }
+            status: { type: string, enum: [DRAFT, ACTIVE, SUPERSEDED, RETIRED] }
+            formula_text: { type: string, description: "The rule in words, derived from the rule." }
+            content_digest: { type: string, description: "Digest of what the term does; two versions with the same digest give the same due dates." }
+            ends_on: { type: string, format: date, description: "Set once, when the version stops governing." }
+            created_at: { type: string, format: date-time }
+            created_by: { type: string }
+            approved_at: { type: string, format: date-time }
+            approved_by: { type: string }
+            superseded_at: { type: string, format: date-time }
+            superseded_by_version_id: { type: string, format: uuid }
+            retired_at: { type: string, format: date-time }
+            retired_by: { type: string }
+            retire_reason: { type: string }
+
+    SupersedeTermRequest:
+      type: object
+      required: [supersedes_version]
+      properties:
+        supersedes_version: { type: integer, minimum: 1, description: "The active version this one replaces." }
+
+    SupersedeTermResult:
+      type: object
+      properties:
+        version: { $ref: '#/components/schemas/PaymentTermVersion' }
+        superseded: { $ref: '#/components/schemas/PaymentTermVersion' }
+
+    RetireTermRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string }
+        ends_on: { type: string, format: date, nullable: true, description: "For an active version: the day it stops governing (default today)." }
+
+    DueDateResult:
+      type: object
+      required: [basis_date_rule, basis_date, unadjusted_due_date, due_date, adjustment_convention, adjusted, skipped, term]
+      properties:
+        basis_date_rule: { type: string }
+        basis_date: { type: string, format: date }
+        unadjusted_due_date: { type: string, format: date, description: "Before any business-day convention." }
+        due_date: { type: string, format: date }
+        adjustment_convention: { type: string, enum: [NONE, FOLLOWING, PRECEDING, MODIFIED_FOLLOWING, MODIFIED_PRECEDING] }
+        adjusted: { type: boolean, description: "Whether the convention moved the date." }
+        skipped:
+          type: array
+          items: { type: object, properties: { date: { type: string, format: date }, reason: { type: string, enum: [WEEKEND, HOLIDAY] }, name: { type: string } } }
+        grace_until: { type: string, format: date }
+        discount:
+          type: object
+          properties:
+            percent: { type: string }
+            until: { type: string, format: date, description: "The last day the discount can be taken, adjusted by the convention and never later than the due date." }
+        term:
+          type: object
+          required: [term_code, term_version, term_version_id, content_digest, formula_text, effective_from, pinned]
+          properties:
+            term_code: { type: string }
+            term_version: { type: integer }
+            term_version_id: { type: string, format: uuid }
+            content_digest: { type: string }
+            formula_text: { type: string }
+            effective_from: { type: string, format: date }
+            ends_on: { type: string, format: date }
+            pinned: { type: boolean }
+        calendar: { $ref: '#/components/schemas/CalendarProvenance' }
+        steps:
+          type: array
+          items: { type: string }
+          description: "Only from explain-due-date."
     JurisdictionAlias:
       type: object
       required: [alias_id, jurisdiction_id, alias_system, alias_code, source_standard, source_version, mapping_rationale, valid_from, created_by, created_at]
@@ -2648,6 +3347,98 @@ components:
       properties:
         valid_to: { type: string, format: date-time }
         reason: { type: string }
+
+    JurisdictionRef:
+      type: object
+      description: "A jurisdiction named by jurisdiction_id, or by code and type together. A code alone never names one."
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        code: { type: string, maxLength: 32 }
+        type: { type: string, maxLength: 64 }
+
+    ImportItemInput:
+      type: object
+      required: [action, target]
+      properties:
+        action: { type: string, enum: [ADD, UPDATE, RETIRE] }
+        target:
+          description: "What the row is about. For an ADD, the new jurisdiction's code and type; its id is assigned by the registry."
+          $ref: '#/components/schemas/JurisdictionRef'
+        jurisdiction_name: { type: string, maxLength: 500 }
+        authority_type: { type: string, maxLength: 64 }
+        parent:
+          description: "Where the jurisdiction sits. On an UPDATE, absent means unchanged. May name a jurisdiction an earlier row adds."
+          $ref: '#/components/schemas/JurisdictionRef'
+        effective_from:
+          type: string
+          format: date-time
+          description: "Required for an ADD. Optional for an UPDATE (default: when it is applied) and must follow the version in force. Not accepted for a RETIRE, which takes effect when approved."
+        successor:
+          description: "RETIRE only: the jurisdiction that takes over."
+          $ref: '#/components/schemas/JurisdictionRef'
+        note: { type: string, maxLength: 2000 }
+
+    ImportItem:
+      description: "A stored row: what was sent, what validation said and, once approved, what it did."
+      allOf:
+        - $ref: '#/components/schemas/ImportItemInput'
+        - type: object
+          required: [item_no, validation_errors]
+          properties:
+            item_no: { type: integer, minimum: 1 }
+            validation_errors:
+              type: array
+              items: { type: string }
+              description: "Empty when the row passed validation."
+            outcome: { type: string, enum: [ADDED, UPDATED, RETIRED, UNCHANGED] }
+            jurisdiction_id: { type: string, format: uuid }
+
+    ImportBatch:
+      type: object
+      required: [batch_id, source_standard, source_version, import_hash, evidence_ref, summary, status, item_count, invalid_count, proposed_by, proposed_at]
+      properties:
+        batch_id: { type: string, format: uuid }
+        source_standard: { type: string }
+        source_version: { type: string }
+        import_hash:
+          type: string
+          description: "SHA-256 of the normalised content: the same content hashes the same however it was formatted."
+        evidence_ref: { type: string }
+        summary: { type: string }
+        status: { type: string, enum: [PROPOSED, APPROVED, REJECTED] }
+        item_count: { type: integer }
+        invalid_count: { type: integer, description: "Rows that failed validation. A batch with any cannot be approved." }
+        proposed_by: { type: string }
+        proposed_at: { type: string, format: date-time }
+        decided_by: { type: string }
+        decided_at: { type: string, format: date-time }
+        decision_reason: { type: string }
+        added_count: { type: integer }
+        updated_count: { type: integer }
+        retired_count: { type: integer }
+        unchanged_count: { type: integer, description: "With the other three counts, adds up to item_count once approved." }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ImportItem' }
+
+    ProposeImportRequest:
+      type: object
+      required: [source_standard, source_version, evidence_ref, summary, items]
+      properties:
+        source_standard: { type: string, maxLength: 128 }
+        source_version: { type: string, maxLength: 64 }
+        evidence_ref: { type: string, description: "Where the source came from." }
+        summary: { type: string }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 2000
+          items: { $ref: '#/components/schemas/ImportItemInput' }
+
+    DecideImportRequest:
+      type: object
+      properties:
+        reason: { type: string, description: "Required to reject, optional to approve." }
 
     Jurisdiction:
       type: object

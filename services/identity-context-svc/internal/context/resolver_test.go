@@ -73,6 +73,12 @@ func (m *mockPrincipalStore) FindActiveDelegations(_ context.Context, _, _ strin
 func (m *mockPrincipalStore) UpdateStatus(_ context.Context, _, _ string, _ domain.PrincipalStatus, _, _ string) error {
 	return nil
 }
+func (m *mockPrincipalStore) GetIdentityLinks(_ context.Context, _, _ string) ([]domain.IdentityLink, error) {
+	return nil, nil
+}
+func (m *mockPrincipalStore) ResolveSubjectID(_ context.Context, _, id string) (string, bool, error) {
+	return id, false, nil
+}
 
 // mockSessionCache
 //

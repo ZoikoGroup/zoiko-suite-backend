@@ -6,6 +6,10 @@ TEN=11111111-1111-1111-1111-111111111111
 PRIN=33333333-3333-3333-3333-333333333333
 ENT=22222222-2222-2222-2222-222222222222
 SUP=44444444-4444-4444-4444-444444444444
+# Idempotency keys are recorded for days: a fixed key replayed by the next run
+# with a different body is a 409 IDEMPOTENCY_MISMATCH, so every run uses its own.
+RUN=$(date +%s)$$
+PROM=${PROM:-http://127.0.0.1:9090}
 # The break-glass approver: never the caller (PRIN) nor the grantee (SUP) — S1-1.
 APPR=55555555-5555-5555-5555-555555555555
 H=(-H "Content-Type: application/json" -H "X-Tenant-Id: $TEN" -H "X-Principal-Id: $PRIN" -H "X-Legal-Entity-Id: $ENT" -H "X-Source-Channel: api")
@@ -66,10 +70,13 @@ done
 
 echo
 echo "-- 6. GOV-01 contract surface (spec section 4) ---------------------"
+# The console's confidential client (IDP_CLIENT_AUTH=required on the stack).
+CID=${IDENTITY_CONSOLE_CLIENT_ID:-zoiko-console}
+CSEC=${IDENTITY_CONSOLE_CLIENT_SECRET:-local-dev-console-client-secret}
 TOKEN=$(curl -s -m 20 -X POST $B/v1/authenticate -H 'Content-Type: application/json' \
-  -d "{\"tenant_id\":\"$TEN\",\"email\":\"admin@zoikosuite.com\",\"password\":\"Zoiko@Governance1\"}" \
+  -d "{\"tenant_id\":\"$TEN\",\"email\":\"admin@zoikosuite.com\",\"password\":\"Zoiko@Governance1\",\"client_id\":\"$CID\",\"client_secret\":\"$CSEC\"}" \
   | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
-R=$(curl -s -m 25 -X POST $B/v1/context/resolve "${H[@]}" -H "X-Request-Id: au1" -H "Idempotency-Key: au1" -H "X-Correlation-ID: au1" \
+R=$(curl -s -m 25 -X POST $B/v1/context/resolve "${H[@]}" -H "X-Request-Id: au1" -H "Idempotency-Key: au1-$RUN" -H "X-Correlation-ID: au1" \
   -d "{\"bearer_token\":\"$TOKEN\",\"legal_entity_id\":\"$ENT\",\"correlation_id\":\"au1\"}")
 SID=$(echo "$R" | python -c "import sys,json;print(json.load(sys.stdin).get('session_context_id',''))" 2>/dev/null)
 if [ -n "$SID" ]; then ok "ResolveTenantContext        POST /v1/context/resolve"; else bad "ResolveTenantContext"; fi
@@ -79,10 +86,10 @@ chk "GetEffectiveContext        GET  /v1/context/session/{id}" \
 chk "ExplainContextResolution   GET  .../explain" \
     "$(code $B/v1/context/session/$SID/explain "${H[@]}" -H 'X-Request-Id: au3' -H 'X-Correlation-ID: au3')" "200"
 chk "RefreshTenantContextCache  POST /v1/context/cache/refresh" \
-    "$(code -X POST $B/v1/context/cache/refresh "${H[@]}" -H 'X-Request-Id: au4' -H 'Idempotency-Key: au4' -H 'X-Correlation-ID: au4' -d '{"correlation_id":"au4"}')" "200"
+    "$(code -X POST $B/v1/context/cache/refresh "${H[@]}" -H 'X-Request-Id: au4' -H "Idempotency-Key: au4-$RUN" -H 'X-Correlation-ID: au4' -d '{"correlation_id":"au4"}')" "200"
 chk "InvalidateTenantContext    POST /v1/context/tenant/invalidate" \
-    "$(code -X POST $B/v1/context/tenant/invalidate "${H[@]}" -H 'X-Request-Id: au5' -H 'Idempotency-Key: au5' -H 'X-Correlation-ID: au5' -d '{"correlation_id":"au5","justification":"audit run: verifying the named command surface"}')" "200"
-SR=$(curl -s -m 25 -X POST $B/v1/context/support "${H[@]}" -H "X-Request-Id: au6" -H "Idempotency-Key: au6" -H "X-Correlation-ID: au6" \
+    "$(code -X POST $B/v1/context/tenant/invalidate "${H[@]}" -H 'X-Request-Id: au5' -H "Idempotency-Key: au5-$RUN" -H 'X-Correlation-ID: au5' -d '{"correlation_id":"au5","justification":"audit run: verifying the named command surface"}')" "200"
+SR=$(curl -s -m 25 -X POST $B/v1/context/support "${H[@]}" -H "X-Request-Id: au6" -H "Idempotency-Key: au6-$RUN" -H "X-Correlation-ID: au6" \
   -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$SUP\",\"approver_principal_id\":\"$APPR\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: exercising the privileged break-glass command\",\"ticket_ref\":\"AUDIT-X\",\"ttl_seconds\":300}")
 SC=$(echo "$SR" | python -c "import sys,json;print(json.load(sys.stdin).get('support_context_id',''))" 2>/dev/null)
 # Attach is a REQUEST since 8 Oct (S1-1): it answers 202 PENDING_APPROVAL and
@@ -100,7 +107,7 @@ docker exec zoiko-postgres psql -U postgres -d identity_context -c \
 NP1=$(curl -s -m 25 -X POST $B/v1/context/resolve -H 'Content-Type: application/json' \
   -H 'X-Tenant-Id: 88888888-8888-8888-8888-888888888888' -H "X-Principal-Id: $PRIN" \
   -H "X-Legal-Entity-Id: $ENT" -H 'X-Source-Channel: api' \
-  -H 'X-Request-Id: np1' -H 'Idempotency-Key: np1' -H 'X-Correlation-ID: np1' \
+  -H 'X-Request-Id: np1' -H "Idempotency-Key: np1-$RUN" -H 'X-Correlation-ID: np1' \
   -d "{\"bearer_token\":\"$TOKEN\",\"legal_entity_id\":\"$ENT\"}" \
   | python -c "
 import sys,json,base64
@@ -119,14 +126,18 @@ else
   bad "NP1 spoofed tenant header honoured (envelope bound to $NP1)"
 fi
 chk "NP2 unknown ingress cannot select a tenant" \
-    "$(code -X POST $B/v1/context/resolve "${H[@]}" -H 'X-Canonical-Ingress: audit-other.zoiko.local' -H 'X-Request-Id: np2' -H 'Idempotency-Key: np2' -H 'X-Correlation-ID: np2' -d "{\"bearer_token\":\"$TOKEN\",\"legal_entity_id\":\"$ENT\"}")" "401"
+    "$(code -X POST $B/v1/context/resolve "${H[@]}" -H 'X-Canonical-Ingress: audit-other.zoiko.local' -H 'X-Request-Id: np2' -H "Idempotency-Key: np2-$RUN" -H 'X-Correlation-ID: np2' -d "{\"bearer_token\":\"$TOKEN\",\"legal_entity_id\":\"$ENT\"}")" "401"
 chk "NP3 self-approved break-glass refused" \
-    "$(code -X POST $B/v1/context/support "${H[@]}" -H 'X-Request-Id: np3' -H 'Idempotency-Key: np3' -H 'X-Correlation-ID: np3' -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$PRIN\",\"approver_principal_id\":\"$PRIN\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: self-approval must be refused\",\"ticket_ref\":\"AUDIT-Y\",\"ttl_seconds\":300}")" "400"
+    "$(code -X POST $B/v1/context/support "${H[@]}" -H 'X-Request-Id: np3' -H "Idempotency-Key: np3-$RUN" -H 'X-Correlation-ID: np3' -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$PRIN\",\"approver_principal_id\":\"$PRIN\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: self-approval must be refused\",\"ticket_ref\":\"AUDIT-Y\",\"ttl_seconds\":300}")" "400"
 chk "NP3 excessive TTL refused" \
-    "$(code -X POST $B/v1/context/support "${H[@]}" -H 'X-Request-Id: np3b' -H 'Idempotency-Key: np3b' -H 'X-Correlation-ID: np3b' -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$SUP\",\"approver_principal_id\":\"$APPR\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: TTL beyond the ceiling must be refused\",\"ticket_ref\":\"AUDIT-Z\",\"ttl_seconds\":999999}")" "400"
+    "$(code -X POST $B/v1/context/support "${H[@]}" -H 'X-Request-Id: np3b' -H "Idempotency-Key: np3b-$RUN" -H 'X-Correlation-ID: np3b' -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$SUP\",\"approver_principal_id\":\"$APPR\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: TTL beyond the ceiling must be refused\",\"ticket_ref\":\"AUDIT-Z\",\"ttl_seconds\":999999}")" "400"
 if [ -n "$SC" ]; then
-  chk "NP4 revoke support context" "$(code -X DELETE $B/v1/context/support/$SC "${H[@]}" -H 'X-Request-Id: np4a' -H 'Idempotency-Key: np4a' -H 'X-Correlation-ID: np4a')" "204"
-  chk "NP4 revoke is idempotent"   "$(code -X DELETE $B/v1/context/support/$SC "${H[@]}" -H 'X-Request-Id: np4b' -H 'Idempotency-Key: np4b' -H 'X-Correlation-ID: np4b')" "204"
+  # Revoke mutates an existing aggregate, so it takes If-Match (API-3): 428
+  # without one, 204 with the ETag the read returned.
+  etag() { curl -s -m 20 -D - -o /dev/null $B/v1/context/support/$SC "${H[@]}" -H "X-Correlation-ID: et-$RUN" | tr -d '\r' | sed -n 's/^[Ee][Tt]ag: //p'; }
+  chk "NP4 revoke without If-Match refused" "$(code -X DELETE $B/v1/context/support/$SC "${H[@]}" -H 'X-Request-Id: np4z' -H "Idempotency-Key: np4z-$RUN" -H 'X-Correlation-ID: np4z')" "428"
+  chk "NP4 revoke support context" "$(code -X DELETE $B/v1/context/support/$SC "${H[@]}" -H "If-Match: $(etag)" -H 'X-Request-Id: np4a' -H "Idempotency-Key: np4a-$RUN" -H 'X-Correlation-ID: np4a')" "204"
+  chk "NP4 revoke is idempotent"   "$(code -X DELETE $B/v1/context/support/$SC "${H[@]}" -H "If-Match: $(etag)" -H 'X-Request-Id: np4b' -H "Idempotency-Key: np4b-$RUN" -H 'X-Correlation-ID: np4b')" "204"
 fi
 # Resolve is declassified from the envelope contract (it mints the envelope),
 # so a bare request is refused by the GOV-01 correlation guard: 400, not 401.
@@ -156,7 +167,7 @@ echo "$M" | grep -q 'identity_context_outbox_pending' && ok "outbox depth gauge 
 
 echo
 echo "-- 9. Alert rules (gate 11) ----------------------------------------"
-RULES=$(curl -s -m 20 "http://localhost:9090/api/v1/rules")
+RULES=$(curl -s -m 20 "$PROM/api/v1/rules")
 NR=$(echo "$RULES" | python -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -169,7 +180,7 @@ n=sum(1 for g in d['data']['groups'] if 'gov-01' in g['name'] for r in g['rules'
 print(n)" 2>/dev/null)
 chk "GOV-01 alert rules loaded" "$NR" "8"
 chk "alert rules evaluating (health ok)" "$NH" "8"
-UP=$(curl -s -m 20 --get "http://localhost:9090/api/v1/query" --data-urlencode 'query=up{job="identity-context-svc"}' | python -c "
+UP=$(curl -s -m 20 --get "$PROM/api/v1/query" --data-urlencode 'query=up{job="identity-context-svc"}' | python -c "
 import sys,json
 r=json.load(sys.stdin)['data']['result']
 print(r[0]['value'][1] if r else '0')" 2>/dev/null)
