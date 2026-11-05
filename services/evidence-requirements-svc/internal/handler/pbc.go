@@ -256,7 +256,8 @@ func (h *pbcHandler) SendRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_correlation_id", "")
 		return
 	}
-	updated, err := h.store.SendEvidenceRequest(r.Context(), domain.SendEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, CorrelationID: correlationID})
+	ifMatch := r.Header.Get("If-Match")
+	updated, err := h.store.SendEvidenceRequest(r.Context(), domain.SendEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, CorrelationID: correlationID, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -286,7 +287,8 @@ func (h *pbcHandler) ReassignRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "new_assignee_principal_id")
 		return
 	}
-	updated, err := h.store.ReassignEvidenceRequest(r.Context(), domain.ReassignEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, NewAssigneePrincipalID: req.NewAssigneePrincipalID})
+	ifMatch := r.Header.Get("If-Match")
+	updated, err := h.store.ReassignEvidenceRequest(r.Context(), domain.ReassignEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, NewAssigneePrincipalID: req.NewAssigneePrincipalID, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -316,7 +318,8 @@ func (h *pbcHandler) ExtendDueDate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "new_due_at")
 		return
 	}
-	updated, err := h.store.ExtendDueDate(r.Context(), domain.ExtendDueDateParams{RequestID: requestID, TenantID: tenantID, NewDueAt: req.NewDueAt})
+	ifMatch := r.Header.Get("If-Match")
+	updated, err := h.store.ExtendDueDate(r.Context(), domain.ExtendDueDateParams{RequestID: requestID, TenantID: tenantID, NewDueAt: req.NewDueAt, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -332,7 +335,8 @@ func (h *pbcHandler) ViewRequest(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requirePrincipal(w, r); !ok {
 		return
 	}
-	updated, err := h.store.ViewEvidenceRequest(r.Context(), domain.ViewEvidenceRequestParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID})
+	ifMatch := r.Header.Get("If-Match")
+	updated, err := h.store.ViewEvidenceRequest(r.Context(), domain.ViewEvidenceRequestParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -383,8 +387,9 @@ func (h *pbcHandler) SubmitResponse(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	ifMatch := r.Header.Get("If-Match")
 	response, created, err := h.store.SubmitResponse(r.Context(), domain.SubmitResponseParams{
-		RequestID: requestID, TenantID: tenantID, SubmittedByPrincipalID: principalID, ArtifactDocumentID: req.ArtifactDocumentID, CorrelationID: req.CorrelationID,
+		RequestID: requestID, TenantID: tenantID, SubmittedByPrincipalID: principalID, ArtifactDocumentID: req.ArtifactDocumentID, CorrelationID: req.CorrelationID, IfMatch: ifMatch,
 	})
 	if err != nil {
 		h.writePBCErr(w, r, err)
@@ -438,7 +443,8 @@ func (h *pbcHandler) RecordScanResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_field", "result must be CLEAN or QUARANTINED")
 		return
 	}
-	updated, err := h.store.RecordScanResult(r.Context(), domain.ScanResultParams{ResponseID: responseID, TenantID: tenantID, Result: req.Result})
+	ifMatch := r.Header.Get("If-Match")
+	updated, err := h.store.RecordScanResult(r.Context(), domain.ScanResultParams{ResponseID: responseID, TenantID: tenantID, Result: req.Result, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -455,7 +461,8 @@ func (h *pbcHandler) AcknowledgeReceipt(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	receipt, err := h.store.AcknowledgeReceipt(r.Context(), domain.AcknowledgeReceiptParams{ResponseID: chi.URLParam(r, "response_id"), TenantID: tenantID, AcknowledgedByPrincipalID: principalID})
+	ifMatch := r.Header.Get("If-Match")
+	receipt, err := h.store.AcknowledgeReceipt(r.Context(), domain.AcknowledgeReceiptParams{ResponseID: chi.URLParam(r, "response_id"), TenantID: tenantID, AcknowledgedByPrincipalID: principalID, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -493,7 +500,8 @@ func (h *pbcHandler) AddNote(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_field", "visibility must be SHARED or AUDIT_ONLY")
 		return
 	}
-	note, err := h.store.AddRequestNote(r.Context(), domain.AddRequestNoteParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID, AuthorPrincipalID: principalID, Body: req.Body, Visibility: req.Visibility})
+	ifMatch := r.Header.Get("If-Match")
+	note, err := h.store.AddRequestNote(r.Context(), domain.AddRequestNoteParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID, AuthorPrincipalID: principalID, Body: req.Body, Visibility: req.Visibility, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -522,7 +530,8 @@ func (h *pbcHandler) RequestClarification(w http.ResponseWriter, r *http.Request
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	updated, err := h.store.RequestClarification(r.Context(), domain.RequestClarificationParams{RequestID: requestID, TenantID: tenantID, Reason: req.Reason})
+	ifMatch := r.Header.Get("If-Match")
+	updated, err := h.store.RequestClarification(r.Context(), domain.RequestClarificationParams{RequestID: requestID, TenantID: tenantID, Reason: req.Reason, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -553,7 +562,8 @@ func (h *pbcHandler) MarkSatisfied(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, r, err)
 		return
 	}
-	updated, err := h.store.MarkSatisfied(r.Context(), domain.MarkSatisfiedParams{RequestID: requestID, TenantID: tenantID, ActorPrincipalID: principalID})
+	ifMatch := r.Header.Get("If-Match")
+	updated, err := h.store.MarkSatisfied(r.Context(), domain.MarkSatisfiedParams{RequestID: requestID, TenantID: tenantID, ActorPrincipalID: principalID, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -574,7 +584,8 @@ func (h *pbcHandler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireManageAuthz(w, r, tenantID, principalID, requestID); !ok {
 		return
 	}
-	updated, err := h.store.CloseEvidenceRequest(r.Context(), domain.CloseEvidenceRequestParams{RequestID: requestID, TenantID: tenantID})
+	ifMatch := r.Header.Get("If-Match")
+	updated, err := h.store.CloseEvidenceRequest(r.Context(), domain.CloseEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, IfMatch: ifMatch})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return

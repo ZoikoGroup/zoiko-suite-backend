@@ -45,7 +45,7 @@ type Store interface {
 	ListRequirements(ctx context.Context, filter domain.ListRequirementsFilter) ([]domain.EvidenceRequirement, error)
 	ListRequirementsCursor(ctx context.Context, filter domain.ListRequirementsFilter) (domain.CursorPage[domain.EvidenceRequirement], error)
 	EffectiveRequirements(ctx context.Context, tenantID, legalEntityID, domainCode, actionType string, asOf time.Time) ([]domain.EvidenceRequirement, error)
-	EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID string) (*domain.EvidenceRequirement, error)
+	EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID, ifMatch string) (*domain.EvidenceRequirement, error)
 	// RecordEvaluation appends an evaluation record and optionally writes an
 	// outbox event atomically in the same transaction. If outboxEvent is non-nil,
 	// it is written to the outbox table only when the evaluation is newly created
@@ -1206,6 +1206,8 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ifMatch := r.Header.Get("If-Match")
+
 	effectiveTo := time.Now().UTC()
 	if req.EffectiveTo != nil {
 		effectiveTo = req.EffectiveTo.UTC()
@@ -1223,7 +1225,7 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.EndDateRequirement(r.Context(), tenantID, requirementID, effectiveTo, req.Reason, principalID)
+	updated, err := h.store.EndDateRequirement(r.Context(), tenantID, requirementID, effectiveTo, req.Reason, principalID, ifMatch)
 	switch {
 	case err == nil:
 		writeJSON(w, r, http.StatusOK, updated)

@@ -96,48 +96,59 @@ type CreateEvidenceRequestParams struct {
 
 type SendEvidenceRequestParams struct {
 	RequestID, TenantID, CorrelationID string
+	IfMatch                            string
 }
 
 type ReassignEvidenceRequestParams struct {
 	RequestID, TenantID, NewAssigneePrincipalID string
+	IfMatch                                     string
 }
 
 type ExtendDueDateParams struct {
 	RequestID, TenantID string
 	NewDueAt            time.Time
+	IfMatch             string
 }
 
 type ViewEvidenceRequestParams struct {
 	RequestID, TenantID string
+	IfMatch             string
 }
 
 type SubmitResponseParams struct {
 	RequestID, TenantID, SubmittedByPrincipalID, CorrelationID string
 	ArtifactDocumentID                                         *string
+	IfMatch                                                    string
 }
 
 type ScanResultParams struct {
 	ResponseID, TenantID, Result string
+	IfMatch                      string
 }
 
 type AcknowledgeReceiptParams struct {
 	ResponseID, TenantID, AcknowledgedByPrincipalID string
+	IfMatch                                         string
 }
 
 type AddRequestNoteParams struct {
 	RequestID, TenantID, AuthorPrincipalID, Body, Visibility string
+	IfMatch                                                  string
 }
 
 type RequestClarificationParams struct {
 	RequestID, TenantID, Reason string
+	IfMatch                     string
 }
 
 type MarkSatisfiedParams struct {
 	RequestID, TenantID, ActorPrincipalID string
+	IfMatch                               string
 }
 
 type CloseEvidenceRequestParams struct {
 	RequestID, TenantID string
+	IfMatch             string
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────

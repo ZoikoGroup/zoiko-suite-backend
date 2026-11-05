@@ -346,7 +346,16 @@ func (s *PgStore) SendEvidenceRequest(ctx context.Context, p domain.SendEvidence
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = transitionEvidenceRequest(ctx, tx, p.RequestID, p.TenantID, []domain.EvidenceRequestStatus{domain.EvidenceRequestDraft}, domain.EvidenceRequestSent)
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `UPDATE evidence_requests SET status=$1, record_version = record_version + 1 WHERE request_id=$2 AND tenant_id=$3 AND record_version = $4 RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestSent, p.RequestID, p.TenantID, p.IfMatch}
+		} else {
+			query = `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestSent, p.RequestID, p.TenantID}
+		}
+		out, err = scanEvidenceRequest(tx.QueryRow(ctx, query, args...))
 		return err
 	})
 	if errors.Is(err, domain.ErrEvidenceRequestNotFound) || errors.Is(err, domain.ErrEvidenceRequestInvalidState) {
@@ -362,8 +371,16 @@ func (s *PgStore) ReassignEvidenceRequest(ctx context.Context, p domain.Reassign
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET assigned_to_principal_id=$1 WHERE request_id=$2 AND tenant_id=$3 RETURNING `+evidenceRequestColumns,
-			p.NewAssigneePrincipalID, p.RequestID, p.TenantID))
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `UPDATE evidence_requests SET assigned_to_principal_id=$1, record_version = record_version + 1 WHERE request_id=$2 AND tenant_id=$3 AND record_version = $4 RETURNING ` + evidenceRequestColumns
+			args = []any{p.NewAssigneePrincipalID, p.RequestID, p.TenantID, p.IfMatch}
+		} else {
+			query = `UPDATE evidence_requests SET assigned_to_principal_id=$1 WHERE request_id=$2 AND tenant_id=$3 RETURNING ` + evidenceRequestColumns
+			args = []any{p.NewAssigneePrincipalID, p.RequestID, p.TenantID}
+		}
+		out, err = scanEvidenceRequest(tx.QueryRow(ctx, query, args...))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -379,8 +396,16 @@ func (s *PgStore) ExtendDueDate(ctx context.Context, p domain.ExtendDueDateParam
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET due_at=$1 WHERE request_id=$2 AND tenant_id=$3 RETURNING `+evidenceRequestColumns,
-			p.NewDueAt, p.RequestID, p.TenantID))
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `UPDATE evidence_requests SET due_at=$1, record_version = record_version + 1 WHERE request_id=$2 AND tenant_id=$3 AND record_version = $4 RETURNING ` + evidenceRequestColumns
+			args = []any{p.NewDueAt, p.RequestID, p.TenantID, p.IfMatch}
+		} else {
+			query = `UPDATE evidence_requests SET due_at=$1 WHERE request_id=$2 AND tenant_id=$3 RETURNING ` + evidenceRequestColumns
+			args = []any{p.NewDueAt, p.RequestID, p.TenantID}
+		}
+		out, err = scanEvidenceRequest(tx.QueryRow(ctx, query, args...))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -403,7 +428,16 @@ func (s *PgStore) ViewEvidenceRequest(ctx context.Context, p domain.ViewEvidence
 			out = current
 			return nil // idempotent — already viewed or past it
 		}
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 RETURNING `+evidenceRequestColumns, domain.EvidenceRequestViewed, p.RequestID))
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `UPDATE evidence_requests SET status=$1, record_version = record_version + 1 WHERE request_id=$2 AND tenant_id=$3 AND record_version = $4 RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestViewed, p.RequestID, p.TenantID, p.IfMatch}
+		} else {
+			query = `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestViewed, p.RequestID, p.TenantID}
+		}
+		out, err = scanEvidenceRequest(tx.QueryRow(ctx, query, args...))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -437,9 +471,16 @@ func (s *PgStore) SubmitResponse(ctx context.Context, p domain.SubmitResponsePar
 		// Lock the parent request so two concurrent submissions cannot both
 		// read MAX(version) and race to insert the same version.
 		var lockedRequestID string
-		if err := tx.QueryRow(ctx,
-			`SELECT request_id FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2 FOR UPDATE`,
-			p.RequestID, p.TenantID).Scan(&lockedRequestID); err != nil {
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `SELECT request_id, record_version FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2 AND record_version = $3 FOR UPDATE`
+			args = []any{p.RequestID, p.TenantID, p.IfMatch}
+		} else {
+			query = `SELECT request_id FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2 FOR UPDATE`
+			args = []any{p.RequestID, p.TenantID}
+		}
+		if err := tx.QueryRow(ctx, query, args...).Scan(&lockedRequestID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrEvidenceRequestNotFound
 			}
@@ -492,8 +533,17 @@ func (s *PgStore) SubmitResponse(ctx context.Context, p domain.SubmitResponsePar
 			return err
 		}
 
-		if _, err := tx.Exec(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND status NOT IN ($3,$4)`,
-			domain.EvidenceRequestResponseReceived, p.RequestID, domain.EvidenceRequestSatisfied, domain.EvidenceRequestClosed); err != nil {
+		// Update parent request status and increment record_version
+		var updateQuery string
+		var updateArgs []any
+		if p.IfMatch != "" {
+			updateQuery = `UPDATE evidence_requests SET status=$1, record_version = record_version + 1 WHERE request_id=$2 AND tenant_id=$3 AND status NOT IN ($4,$5) AND record_version = $6`
+			updateArgs = []any{domain.EvidenceRequestResponseReceived, p.RequestID, p.TenantID, domain.EvidenceRequestSatisfied, domain.EvidenceRequestClosed, p.IfMatch}
+		} else {
+			updateQuery = `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 AND status NOT IN ($4,$5)`
+			updateArgs = []any{domain.EvidenceRequestResponseReceived, p.RequestID, p.TenantID, domain.EvidenceRequestSatisfied, domain.EvidenceRequestClosed}
+		}
+		if _, err := tx.Exec(ctx, updateQuery, updateArgs...); err != nil {
 			return err
 		}
 		created = true
@@ -511,8 +561,16 @@ func (s *PgStore) SubmitResponse(ctx context.Context, p domain.SubmitResponsePar
 func (s *PgStore) RecordScanResult(ctx context.Context, p domain.ScanResultParams) (*domain.EvidenceRequestResponse, error) {
 	var out *domain.EvidenceRequestResponse
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `UPDATE evidence_request_responses SET malware_scan_status=$1 WHERE response_id=$2 AND tenant_id=$3 AND malware_scan_status=$4 RETURNING `+responseColumns,
-			p.Result, p.ResponseID, p.TenantID, domain.MalwareScanPending)
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `UPDATE evidence_request_responses SET malware_scan_status=$1, record_version = record_version + 1 WHERE response_id=$2 AND tenant_id=$3 AND malware_scan_status=$4 AND record_version = $5 RETURNING ` + responseColumns
+			args = []any{p.Result, p.ResponseID, p.TenantID, domain.MalwareScanPending, p.IfMatch}
+		} else {
+			query = `UPDATE evidence_request_responses SET malware_scan_status=$1 WHERE response_id=$2 AND tenant_id=$3 AND malware_scan_status=$4 RETURNING ` + responseColumns
+			args = []any{p.Result, p.ResponseID, p.TenantID, domain.MalwareScanPending}
+		}
+		row := tx.QueryRow(ctx, query, args...)
 		var err error
 		out, err = scanResponse(row)
 		return err
@@ -585,8 +643,16 @@ func (s *PgStore) RequestClarification(ctx context.Context, p domain.RequestClar
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 AND status=$4 RETURNING `+evidenceRequestColumns,
-			domain.EvidenceRequestClarificationRequired, p.RequestID, p.TenantID, domain.EvidenceRequestResponseReceived))
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `UPDATE evidence_requests SET status=$1, record_version = record_version + 1 WHERE request_id=$2 AND tenant_id=$3 AND status=$4 AND record_version = $5 RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestClarificationRequired, p.RequestID, p.TenantID, domain.EvidenceRequestResponseReceived, p.IfMatch}
+		} else {
+			query = `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 AND status=$4 RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestClarificationRequired, p.RequestID, p.TenantID, domain.EvidenceRequestResponseReceived}
+		}
+		out, err = scanEvidenceRequest(tx.QueryRow(ctx, query, args...))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -628,11 +694,24 @@ func (s *PgStore) MarkSatisfied(ctx context.Context, p domain.MarkSatisfiedParam
 			return domain.ErrArtifactNotScanned
 		}
 
-		row := tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1
-			WHERE request_id=$2 AND tenant_id=$3 AND status IN ($4,$5)
-			AND NOT EXISTS (SELECT 1 FROM evidence_request_responses r WHERE r.request_id=$2 AND r.version=(SELECT MAX(version) FROM evidence_request_responses WHERE request_id=$2) AND r.submitted_by_principal_id=$6)
-			RETURNING `+evidenceRequestColumns,
-			domain.EvidenceRequestSatisfied, p.RequestID, p.TenantID, domain.EvidenceRequestResponseReceived, domain.EvidenceRequestUnderEvaluation, p.ActorPrincipalID)
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `UPDATE evidence_requests SET status=$1, record_version = record_version + 1
+				WHERE request_id=$2 AND tenant_id=$3 AND status IN ($4,$5)
+				AND NOT EXISTS (SELECT 1 FROM evidence_request_responses r WHERE r.request_id=$2 AND r.version=(SELECT MAX(version) FROM evidence_request_responses WHERE request_id=$2) AND r.submitted_by_principal_id=$6)
+				AND record_version = $7
+				RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestSatisfied, p.RequestID, p.TenantID, domain.EvidenceRequestResponseReceived, domain.EvidenceRequestUnderEvaluation, p.ActorPrincipalID, p.IfMatch}
+		} else {
+			query = `UPDATE evidence_requests SET status=$1
+				WHERE request_id=$2 AND tenant_id=$3 AND status IN ($4,$5)
+				AND NOT EXISTS (SELECT 1 FROM evidence_request_responses r WHERE r.request_id=$2 AND r.version=(SELECT MAX(version) FROM evidence_request_responses WHERE request_id=$2) AND r.submitted_by_principal_id=$6)
+				RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestSatisfied, p.RequestID, p.TenantID, domain.EvidenceRequestResponseReceived, domain.EvidenceRequestUnderEvaluation, p.ActorPrincipalID}
+		}
+
+		row := tx.QueryRow(ctx, query, args...)
 		out, err = scanEvidenceRequest(row)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrEvidenceRequestInvalidState
@@ -653,8 +732,16 @@ func (s *PgStore) CloseEvidenceRequest(ctx context.Context, p domain.CloseEviden
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 AND status <> $1 RETURNING `+evidenceRequestColumns,
-			domain.EvidenceRequestClosed, p.RequestID, p.TenantID))
+		var query string
+		var args []any
+		if p.IfMatch != "" {
+			query = `UPDATE evidence_requests SET status=$1, record_version = record_version + 1 WHERE request_id=$2 AND tenant_id=$3 AND status <> $1 AND record_version = $4 RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestClosed, p.RequestID, p.TenantID, p.IfMatch}
+		} else {
+			query = `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 AND status <> $1 RETURNING ` + evidenceRequestColumns
+			args = []any{domain.EvidenceRequestClosed, p.RequestID, p.TenantID}
+		}
+		out, err = scanEvidenceRequest(tx.QueryRow(ctx, query, args...))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

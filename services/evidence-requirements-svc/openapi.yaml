@@ -198,7 +198,9 @@ paths:
     post:
       tags: [catalogue]
       operationId: endDateRequirement
-      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/IfMatch'}
       requestBody:
         required: true
         content:
@@ -209,11 +211,13 @@ paths:
               properties:
                 effective_to: {type: string, format: date-time, description: After effective_from and not before now}
                 reason: {type: string}
+                if_match: {type: string, description: Current record_version for optimistic concurrency control (API-3)}
       responses:
         '200': {description: Retired by end-dating (never deleted), content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/VersionMismatch'}
         '422': {$ref: '#/components/responses/Problem'}
   /v1/pbc/requests:
     post:
@@ -254,38 +258,60 @@ paths:
         '200': {$ref: '#/components/responses/EvidenceRequest'}
         '404': {$ref: '#/components/responses/Problem'}
   /v1/pbc/requests/{request_id}/send:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: sendEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: sendEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/requests/{request_id}/reassign:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: reassignEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: reassignEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/requests/{request_id}/extend-due-date:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: extendEvidenceRequestDueDate, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: extendEvidenceRequestDueDate, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/requests/{request_id}/view:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: viewEvidenceRequest, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: viewEvidenceRequest, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/requests/{request_id}/responses:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: submitEvidenceResponse, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Response recorded}, '409': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: submitEvidenceResponse, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Response recorded}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/requests/{request_id}/notes:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: addEvidenceRequestNote, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Note added}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: addEvidenceRequestNote, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Note added}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/requests/{request_id}/clarify:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: requestEvidenceClarification, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: requestEvidenceClarification, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/requests/{request_id}/mark-satisfied:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: markEvidenceRequestSatisfied, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: markEvidenceRequestSatisfied, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/requests/{request_id}/close:
-    parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: closeEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/RequestID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: closeEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/responses/{response_id}/scan-result:
-    parameters: [{$ref: '#/components/parameters/ResponseID'}]
-    post: {tags: [pbc], operationId: recordScanResult, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {description: Scan result recorded}, '404': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/ResponseID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: recordScanResult, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {description: Scan result recorded}, '404': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /v1/pbc/responses/{response_id}/acknowledge:
-    parameters: [{$ref: '#/components/parameters/ResponseID'}]
-    post: {tags: [pbc], operationId: acknowledgeEvidenceResponse, responses: {'201': {description: Receipt recorded}, '404': {$ref: '#/components/responses/Problem'}}}
+    parameters:
+      - {$ref: '#/components/parameters/ResponseID'}
+      - {$ref: '#/components/parameters/IfMatch'}
+    post: {tags: [pbc], operationId: acknowledgeEvidenceResponse, responses: {'201': {description: Receipt recorded}, '404': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
   /healthz:
     get: {tags: [probes], operationId: liveness, security: [], responses: {'200': {description: Process up}}}
   /readyz:
@@ -297,6 +323,7 @@ components:
     IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string}}
     RequestID: {name: request_id, in: path, required: true, schema: {type: string}}
     ResponseID: {name: response_id, in: path, required: true, schema: {type: string}}
+    IfMatch: {name: If-Match, in: header, schema: {type: string}, description: Current record_version for optimistic concurrency control (API-3)}
   requestBodies:
     PBCCommand:
       required: true
@@ -314,6 +341,15 @@ components:
       content:
         application/json:
           schema: {$ref: '#/components/schemas/EvidenceRequest'}
+    VersionMismatch:
+      description: Optimistic concurrency conflict — the resource was modified since the client last read it
+      headers:
+        ETag: {description: Current record_version, schema: {type: string}}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+            description: code will be 'version_mismatch'
   schemas:
     Problem:
       type: object

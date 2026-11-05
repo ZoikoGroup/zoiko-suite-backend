@@ -383,15 +383,23 @@ func (s *PgStore) EffectiveRequirements(ctx context.Context, tenantID, legalEnti
 // does not exist within this tenant. Never a silent no-op:
 // invoice-approval-svc's non-atomic read-then-write is the anti-pattern
 // here, and it can double-apply under concurrency.
-func (s *PgStore) EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID string) (*domain.EvidenceRequirement, error) {
+func (s *PgStore) EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID, ifMatch string) (*domain.EvidenceRequirement, error) {
 	var out *domain.EvidenceRequirement
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var where string
+		var args []any
+		if ifMatch != "" {
+			where = `WHERE evidence_requirement_id = $1 AND tenant_id = $2 AND effective_to IS NULL AND record_version = $3`
+			args = []any{effectiveTo, actorPrincipalID, reason, requirementID, tenantID, ifMatch}
+		} else {
+			where = `WHERE evidence_requirement_id = $1 AND tenant_id = $2 AND effective_to IS NULL`
+			args = []any{effectiveTo, actorPrincipalID, reason, requirementID, tenantID}
+		}
+
 		r, err := scanRequirement(tx.QueryRow(ctx, `
 			UPDATE evidence_requirements
-			SET effective_to = $1, retired_by_principal_id = $2, retired_reason = $3
-			WHERE evidence_requirement_id = $4 AND tenant_id = $5 AND effective_to IS NULL
-			RETURNING `+requirementColumns,
-			effectiveTo, actorPrincipalID, reason, requirementID, tenantID))
+			SET effective_to = $1, retired_by_principal_id = $2, retired_reason = $3, record_version = record_version + 1
+			`+where+` RETURNING `+requirementColumns, args...))
 		if err == nil {
 			out = r
 			return nil

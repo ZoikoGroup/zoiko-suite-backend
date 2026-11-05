@@ -96,7 +96,7 @@ func (s *stubStore) EffectiveRequirements(_ context.Context, _, _, _, _ string, 
 	return s.effective, s.effectErr
 }
 
-func (s *stubStore) EndDateRequirement(_ context.Context, _, _ string, _ time.Time, _, _ string) (*domain.EvidenceRequirement, error) {
+func (s *stubStore) EndDateRequirement(_ context.Context, _, _ string, _ time.Time, _, _, _ string) (*domain.EvidenceRequirement, error) {
 	if s.endDateErr != nil {
 		return nil, s.endDateErr
 	}

@@ -199,6 +199,7 @@ type CreateRequirementRequest struct {
 type EndDateRequirementRequest struct {
 	EffectiveTo *time.Time `json:"effective_to,omitempty"`
 	Reason      string     `json:"reason"`
+	IfMatch     string     `json:"if_match"`
 }
 
 // ListRequirementsFilter holds filters for querying the catalog. TenantID is
