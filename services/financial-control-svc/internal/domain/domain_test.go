@@ -205,9 +205,13 @@ func TestDigestLogic_CanonicalAndSensitive(t *testing.T) {
 }
 
 func TestTolerancePolicyValidation(t *testing.T) {
+	// SPEC_DEVIATIONS A4: approval is no longer a caller-declared field on
+	// create — a policy is created pending and a separate, independently
+	// authorized ApproveTolerancePolicy command approves it (see the store
+	// package's TestApproveTolerancePolicy_* tests for that half).
 	ok := CreateTolerancePolicyRequest{LegalEntityID: "e", Metric: "FIN-CTRL-001", AbsoluteTolerance: "0.01",
-		Currency: "USD", Rationale: "rounding", EffectiveFrom: "2026-09-01", ApprovedBy: "approver"}
-	if err := ok.Validate("maker"); err != nil {
+		Currency: "USD", Rationale: "rounding", EffectiveFrom: "2026-09-01"}
+	if err := ok.Validate(); err != nil {
 		t.Fatalf("valid tolerance rejected: %v", err)
 	}
 	cases := map[string]func(*CreateTolerancePolicyRequest){
@@ -218,45 +222,33 @@ func TestTolerancePolicyValidation(t *testing.T) {
 		"bad currency":               func(r *CreateTolerancePolicyRequest) { r.Currency = "usd" },
 		"no rationale":               func(r *CreateTolerancePolicyRequest) { r.Rationale = "" },
 		"bad date basis":             func(r *CreateTolerancePolicyRequest) { r.DateBasis = "LUNAR" },
-		"no approver":                func(r *CreateTolerancePolicyRequest) { r.ApprovedBy = "" },
 	}
 	for name, mutate := range cases {
 		r := ok
 		mutate(&r)
-		if err := r.Validate("maker"); !errors.Is(err, ErrInvalidArgument) {
+		if err := r.Validate(); !errors.Is(err, ErrInvalidArgument) {
 			t.Errorf("%s: expected ErrInvalidArgument, got %v", name, err)
 		}
-	}
-	// Scenario 04 support: the person changing a tolerance cannot approve their own change.
-	self := ok
-	self.ApprovedBy = "maker"
-	if err := self.Validate("maker"); !errors.Is(err, ErrSelfApproval) {
-		t.Errorf("self-approved tolerance must be refused, got %v", err)
 	}
 	// 0.01 must survive exactly — no float artefacts.
 	precise := ok
 	precise.AbsoluteTolerance = "0.1000000000001"[:14]
-	if err := precise.Validate("maker"); err != nil {
+	if err := precise.Validate(); err != nil {
 		t.Errorf("12-digit precision must be accepted: %v", err)
 	}
 }
 
 func TestMaterialityValidation(t *testing.T) {
 	ok := CreateMaterialityPolicyRequest{LegalEntityID: "e", ReportingBasis: "US_GAAP", AmountThreshold: "1000",
-		AggregateThreshold: "5000", Currency: "USD", EffectiveFrom: "2026-09-01", ApprovedBy: "cfo"}
-	if err := ok.Validate("maker"); err != nil {
+		AggregateThreshold: "5000", Currency: "USD", EffectiveFrom: "2026-09-01"}
+	if err := ok.Validate(); err != nil {
 		t.Fatalf("valid materiality rejected: %v", err)
 	}
 	// §11 aggregation: a looser aggregate than individual threshold is incoherent.
 	bad := ok
 	bad.AggregateThreshold = "500"
-	if err := bad.Validate("maker"); !errors.Is(err, ErrInvalidArgument) {
+	if err := bad.Validate(); !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("aggregate < individual must be refused, got %v", err)
-	}
-	self := ok
-	self.ApprovedBy = "maker"
-	if err := self.Validate("maker"); !errors.Is(err, ErrSelfApproval) {
-		t.Errorf("self-approval must be refused, got %v", err)
 	}
 }
 

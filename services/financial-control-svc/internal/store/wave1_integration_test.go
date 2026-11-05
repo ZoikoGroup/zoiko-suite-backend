@@ -502,9 +502,11 @@ func TestE2E_PinnedToleranceGovernsTheRun(t *testing.T) {
 	x.src.set("ar", "invoices", "wm", r("a1", "INV-1", "10.00"))
 	x.src.set("gl", "ar-postings", "wm", r("g1", "INV-1", "9.60"))
 
-	_, err := testStore.CreateTolerancePolicy(ctx, x.tenant, "maker", domain.CreateTolerancePolicyRequest{
+	tol, err := testStore.CreateTolerancePolicy(ctx, x.tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: x.entity, Metric: "FIN-CTRL-001", AbsoluteTolerance: "0.01", Currency: "USD",
-		Rationale: "cent rounding", EffectiveFrom: "2026-01-01", ApprovedBy: "owner"})
+		Rationale: "cent rounding", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	_, err = testStore.ApproveTolerancePolicy(ctx, x.tenant, x.entity, tol.ToleranceID, "owner")
 	require.NoError(t, err)
 	run, _, err := testStore.CreateRun(ctx, x.tenant, "prep", "c", "create", runReq(x.def.ControlDefinitionID, x.entity))
 	require.NoError(t, err)
@@ -513,7 +515,7 @@ func TestE2E_PinnedToleranceGovernsTheRun(t *testing.T) {
 	// After the run exists, someone creates a much wider tolerance. It cannot rescue this run.
 	_, err = testStore.CreateTolerancePolicy(ctx, x.tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: x.entity, Metric: "FIN-CTRL-001", AbsoluteTolerance: "100", Currency: "USD",
-		Rationale: "widened after the fact", EffectiveFrom: "2026-01-01", ApprovedBy: "owner"})
+		Rationale: "widened after the fact", EffectiveFrom: "2026-01-01"})
 	require.NoError(t, err)
 
 	final := x.execute(run, "k1")
@@ -528,9 +530,11 @@ func TestE2E_PinnedToleranceGovernsTheRun(t *testing.T) {
 
 func TestE2E_SeverityFromPinnedMateriality(t *testing.T) {
 	x := newE2E(t)
-	_, err := testStore.CreateMaterialityPolicy(ctx, x.tenant, "maker", domain.CreateMaterialityPolicyRequest{
+	mat, err := testStore.CreateMaterialityPolicy(ctx, x.tenant, "maker", domain.CreateMaterialityPolicyRequest{
 		LegalEntityID: x.entity, ReportingBasis: "US_GAAP", AmountThreshold: "1000", AggregateThreshold: "5000",
-		Currency: "USD", EffectiveFrom: "2026-01-01", ApprovedBy: "cfo"})
+		Currency: "USD", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	_, err = testStore.ApproveMaterialityPolicy(ctx, x.tenant, x.entity, mat.MaterialityID, "cfo")
 	require.NoError(t, err)
 	x.src.set("ar", "invoices", "wm", r("a1", "I-1", "5000"), r("a2", "I-2", "2"))
 	x.src.set("gl", "ar-postings", "wm")

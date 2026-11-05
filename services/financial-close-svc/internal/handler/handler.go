@@ -40,6 +40,11 @@ type Store interface {
 	// transactional outbox in the same transaction (e.g. "soft_closed",
 	// "close_review_started", "reopened", "reclosed").
 	ApplyPeriodTransition(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID string) (*domain.FiscalPeriod, error)
+	// StartSoftCloseTransition/EnterCloseReviewTransition claim the caller's
+	// Idempotency-Key (SPEC_DEVIATIONS A11); HardClose/Reclose/Reopen above
+	// keep using the unclaimed ApplyPeriodTransition.
+	StartSoftCloseTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error)
+	EnterCloseReviewTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, idempotencyKey, requestHash string) (*domain.FiscalPeriod, bool, error)
 	CreateReopenRequest(ctx context.Context, req *domain.ReopenRequest, correlationID, actorID string) error
 	GetReopenRequest(ctx context.Context, requestID string) (*domain.ReopenRequest, error)
 	ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, *domain.FiscalPeriod, error)
@@ -63,12 +68,16 @@ type Store interface {
 	CreateAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, idempotencyKey, requestHash string) (replay bool, err error)
 	GetAccrualSchedule(ctx context.Context, scheduleID string) (*domain.AccrualSchedule, error)
 	ListAccrualSchedules(ctx context.Context, legalEntityID string) ([]domain.AccrualSchedule, error)
-	SubmitAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error
-	ApproveAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error
+	// Submit/Approve/Cancel/Amend claim the caller's Idempotency-Key the same
+	// way the four creates do (SPEC_DEVIATIONS A11): replay=true means *sch
+	// now holds the schedule as it stands, not necessarily the state this
+	// call itself would have produced.
+	SubmitAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
+	ApproveAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	ActivateAccrualSchedule(ctx context.Context, scheduleID string) error
 	CompleteAccrualSchedule(ctx context.Context, scheduleID string) error
-	CancelAccrualSchedule(ctx context.Context, scheduleID, fromStatus, principalID string, at time.Time) error
-	AmendAccrualSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error
+	CancelAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
+	AmendAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, totalAmount float64, periodCount int, idempotencyKey, requestHash string) (replay bool, err error)
 	CreateRecognitionInstance(ctx context.Context, inst *domain.RecognitionInstance) (created bool, err error)
 	ListRecognitionInstances(ctx context.Context, scheduleID string) ([]domain.RecognitionInstance, error)
 	GetRecognitionInstanceByPeriod(ctx context.Context, scheduleID, fiscalPeriod string) (*domain.RecognitionInstance, error)
@@ -80,11 +89,13 @@ type Store interface {
 	CreatePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, idempotencyKey, requestHash string) (replay bool, err error)
 	GetPrepaymentSchedule(ctx context.Context, scheduleID string) (*domain.PrepaymentSchedule, error)
 	ListPrepaymentSchedules(ctx context.Context, legalEntityID string) ([]domain.PrepaymentSchedule, error)
-	ApprovePrepaymentSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error
+	// Approve/Modify/Terminate claim the caller's Idempotency-Key the same
+	// way the ACC-07 accrual lifecycle does (SPEC_DEVIATIONS A11).
+	ApprovePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	ActivatePrepaymentSchedule(ctx context.Context, scheduleID string) error
 	CompletePrepaymentSchedule(ctx context.Context, scheduleID string) error
-	TerminatePrepaymentSchedule(ctx context.Context, scheduleID, fromStatus, principalID, reason, treatment string, at time.Time) error
-	ModifyFuturePrepaymentSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error
+	TerminatePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, principalID, reason, treatment, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
+	ModifyFuturePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, totalAmount float64, periodCount int, idempotencyKey, requestHash string) (replay bool, err error)
 	CreatePrepaymentRecognition(ctx context.Context, inst *domain.PrepaymentRecognitionInstance) (created bool, err error)
 	ListPrepaymentRecognitions(ctx context.Context, scheduleID string) ([]domain.PrepaymentRecognitionInstance, error)
 
@@ -94,10 +105,13 @@ type Store interface {
 	GetCurrentAllocationRule(ctx context.Context, ruleID string) (*domain.AllocationRule, error)
 	GetAllocationRuleVersion(ctx context.Context, ruleVersionID string) (*domain.AllocationRule, error)
 	ListAllocationRules(ctx context.Context, legalEntityID string) ([]domain.AllocationRule, error)
-	ApproveAllocationRule(ctx context.Context, ruleVersionID, principalID string, at time.Time) error
+	// Approve/Supersede claim the caller's Idempotency-Key (SPEC_DEVIATIONS
+	// A11): see internal/store's doc comments on each for why Approve is a
+	// transition claim but Supersede is a create claim.
+	ApproveAllocationRule(ctx context.Context, rule *domain.AllocationRule, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	// SupersedeAllocationRule is ACC-09's own SupersedeAllocationRule
 	// command — see its own doc comment in internal/store.
-	SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error
+	SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time, idempotencyKey, requestHash string) (replay bool, err error)
 	ActivateAllocationRule(ctx context.Context, ruleVersionID string) error
 	CreateAllocationRun(ctx context.Context, run *domain.AllocationRun) error
 	GetAllocationRunByRuleAndPeriod(ctx context.Context, ruleID, fiscalPeriod string) (*domain.AllocationRun, error)
@@ -116,7 +130,10 @@ type Store interface {
 	CreateFXReversalRun(ctx context.Context, run *domain.FXRevaluationRun) (replay bool, err error)
 	GetFXRevaluationRun(ctx context.Context, runID string) (*domain.FXRevaluationRun, error)
 	ListFXRevaluationRuns(ctx context.Context, legalEntityID, fiscalPeriod string) ([]domain.FXRevaluationRun, error)
-	ApproveFXRevaluationRun(ctx context.Context, runID, principalID string, at time.Time) error
+	// ApproveFXRevaluationRun claims the caller's Idempotency-Key
+	// (SPEC_DEVIATIONS A11); PostRevaluation's own already-POSTED check
+	// (not a claim) covers Post, as the doc comment there explains.
+	ApproveFXRevaluationRun(ctx context.Context, run *domain.FXRevaluationRun, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	MarkFXRevaluationPosted(ctx context.Context, runID, journalID, principalID string, at time.Time) error
 
 	// ACC-17 (Opening Balance & Migration) — see domain.MigrationBatch's
@@ -126,10 +143,14 @@ type Store interface {
 	GetMigrationBatch(ctx context.Context, batchID string) (*domain.MigrationBatch, error)
 	MarkMigrationBatchValidated(ctx context.Context, batchID string, at time.Time) error
 	QuarantineMigrationBatch(ctx context.Context, batchID, fromStatus, reason string) error
-	ApproveMigrationBatch(ctx context.Context, batchID, principalID string, at time.Time) error
+	// Approve/Certify claim the caller's Idempotency-Key (SPEC_DEVIATIONS
+	// A11); Commit's own RECONCILED/CERTIFIED/POSTED switch covers Post, and
+	// Validate is deliberately not claimed — see internal/store's doc
+	// comment on CommandApproveMigrationBatch/CommandCertifyMigrationBatch.
+	ApproveMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	MarkMigrationBatchPosted(ctx context.Context, batchID, journalID string, at time.Time) error
 	MarkMigrationBatchReconciled(ctx context.Context, batchID string, at time.Time) error
-	CertifyMigrationBatch(ctx context.Context, batchID, principalID, reason string, at time.Time) error
+	CertifyMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, reason, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
 	ListQuarantinedMigrationBatches(ctx context.Context, legalEntityID string) ([]domain.MigrationBatch, error)
 
 	// ACC-16 (Signed Financial Snapshot) — see domain.FinancialSnapshot's
@@ -1745,6 +1766,10 @@ func (h *Handler) ListAccruals(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) SubmitAccrual(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -1762,12 +1787,11 @@ func (h *Handler) SubmitAccrual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.SubmitAccrualSchedule(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ ScheduleID string }{id})
+	if _, err := h.store.SubmitAccrualSchedule(r.Context(), sch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeAccrualStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.AccrualStatusPendingApproval
-	sch.SubmittedAt, sch.SubmittedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -1779,6 +1803,10 @@ func (h *Handler) SubmitAccrual(w http.ResponseWriter, r *http.Request) {
 // sod_accrual_approver_independent makes the row refuse it too.
 func (h *Handler) ApproveAccrual(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -1800,12 +1828,11 @@ func (h *Handler) ApproveAccrual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.ApproveAccrualSchedule(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ ScheduleID string }{id})
+	if _, err := h.store.ApproveAccrualSchedule(r.Context(), sch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeAccrualStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.AccrualStatusApproved
-	sch.ApprovedAt, sch.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -1817,6 +1844,10 @@ func (h *Handler) ApproveAccrual(w http.ResponseWriter, r *http.Request) {
 // or duplicate accounting consequence).
 func (h *Handler) AmendFutureSchedule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.AmendFutureScheduleRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -1854,16 +1885,23 @@ func (h *Handler) AmendFutureSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.AmendAccrualSchedule(r.Context(), id, req.TotalAmount, req.PeriodCount); err != nil {
+	requestHash := requestFingerprint(struct {
+		ScheduleID string
+		Req        domain.AmendFutureScheduleRequest
+	}{id, req})
+	if _, err := h.store.AmendAccrualSchedule(r.Context(), sch, req.TotalAmount, req.PeriodCount, idempotencyKey, requestHash); err != nil {
 		h.writeAccrualStoreErr(w, err)
 		return
 	}
-	sch.TotalAmount, sch.PeriodCount = req.TotalAmount, req.PeriodCount
 	writeJSON(w, http.StatusOK, sch)
 }
 
 func (h *Handler) CancelFutureAccrual(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -1880,17 +1918,17 @@ func (h *Handler) CancelFutureAccrual(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	if sch.Status == domain.AccrualStatusCompleted || sch.Status == domain.AccrualStatusCancelled {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAccrualTransition))
-		return
-	}
+	// The COMPLETED/CANCELLED refusal is enforced by the store's own fixed
+	// guard now, not here: sch.Status is this GET's snapshot, so checking it
+	// here would reject a legitimate replay of an already-cancelled schedule
+	// (its status having since become CANCELLED) before the Idempotency-Key
+	// claim lookup ever runs.
 	now := time.Now().UTC()
-	if err := h.store.CancelAccrualSchedule(r.Context(), id, sch.Status, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ ScheduleID string }{id})
+	if _, err := h.store.CancelAccrualSchedule(r.Context(), sch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeAccrualStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.AccrualStatusCancelled
-	sch.CancelledAt, sch.CancelledByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -2178,6 +2216,8 @@ func (h *Handler) writeAccrualStoreErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("accrual store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -2317,6 +2357,10 @@ func (h *Handler) ListPrepayments(w http.ResponseWriter, r *http.Request) {
 // (also migration 000021's sod_prepayment_approver_independent).
 func (h *Handler) ApprovePrepayment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -2338,12 +2382,11 @@ func (h *Handler) ApprovePrepayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.ApprovePrepaymentSchedule(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ ScheduleID string }{id})
+	if _, err := h.store.ApprovePrepaymentSchedule(r.Context(), sch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writePrepaymentStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.PrepaymentStatusApproved
-	sch.ApprovedAt, sch.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -2354,6 +2397,10 @@ func (h *Handler) ApprovePrepayment(w http.ResponseWriter, r *http.Request) {
 // refused, since recognized history is permanent evidence.
 func (h *Handler) ModifyPrepayment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.ModifyFutureScheduleRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -2391,11 +2438,14 @@ func (h *Handler) ModifyPrepayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.ModifyFuturePrepaymentSchedule(r.Context(), id, req.TotalAmount, req.PeriodCount); err != nil {
+	requestHash := requestFingerprint(struct {
+		ScheduleID string
+		Req        domain.ModifyFutureScheduleRequest
+	}{id, req})
+	if _, err := h.store.ModifyFuturePrepaymentSchedule(r.Context(), sch, req.TotalAmount, req.PeriodCount, idempotencyKey, requestHash); err != nil {
 		h.writePrepaymentStoreErr(w, err)
 		return
 	}
-	sch.TotalAmount, sch.PeriodCount = req.TotalAmount, req.PeriodCount
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -2604,6 +2654,10 @@ func (h *Handler) GetPrepaymentRemainingBalance(w http.ResponseWriter, r *http.R
 // silence.
 func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.TerminatePrepaymentRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -2638,11 +2692,15 @@ func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	if sch.Status == domain.PrepaymentStatusCompleted || sch.Status == domain.PrepaymentStatusTerminated {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidPrepaymentTransition))
-		return
-	}
-
+	// The COMPLETED/TERMINATED refusal is enforced by the store's own fixed
+	// guard now, not here: sch.Status is this GET's snapshot, so checking it
+	// here would reject a legitimate replay of an already-terminated schedule
+	// before the Idempotency-Key claim lookup ever runs (the same ordering
+	// bug CancelFutureAccrual had). A replay's RECOGNIZE_REMAINING branch
+	// below still runs, harmlessly: general-ledger-svc dedups on the
+	// schedule:period correlation id, and CreatePrepaymentRecognition dedups
+	// on its own (schedule_id, fiscal_period) constraint, so re-running it
+	// re-reads the existing journal/evidence rather than duplicating them.
 	if req.FinalBalanceTreatment == domain.TerminationTreatmentRecognizeRemaining {
 		recognized, err := h.store.ListPrepaymentRecognitions(r.Context(), id)
 		if err != nil {
@@ -2705,13 +2763,14 @@ func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	if err := h.store.TerminatePrepaymentSchedule(r.Context(), id, sch.Status, principalID, req.Reason, req.FinalBalanceTreatment, now); err != nil {
+	requestHash := requestFingerprint(struct {
+		ScheduleID string
+		Req        domain.TerminatePrepaymentRequest
+	}{id, req})
+	if _, err := h.store.TerminatePrepaymentSchedule(r.Context(), sch, principalID, req.Reason, req.FinalBalanceTreatment, idempotencyKey, requestHash, now); err != nil {
 		h.writePrepaymentStoreErr(w, err)
 		return
 	}
-	sch.Status = domain.PrepaymentStatusTerminated
-	sch.TerminatedAt, sch.TerminatedByPrincipalID = &now, &principalID
-	sch.TerminationReason, sch.TerminationFinalTreatment = &req.Reason, &req.FinalBalanceTreatment
 	writeJSON(w, http.StatusOK, sch)
 }
 
@@ -2725,6 +2784,8 @@ func (h *Handler) writePrepaymentStoreErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("prepayment store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -2864,6 +2925,10 @@ func (h *Handler) ListAllocationRules(w http.ResponseWriter, r *http.Request) {
 // sod_allocation_rule_approver_independent).
 func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -2916,12 +2981,11 @@ func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) 
 	}
 
 	now := time.Now().UTC()
-	if err := h.store.ApproveAllocationRule(r.Context(), rule.RuleVersionID, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ RuleVersionID string }{rule.RuleVersionID})
+	if _, err := h.store.ApproveAllocationRule(r.Context(), rule, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeAllocationErr(w, err)
 		return
 	}
-	rule.Status = domain.AllocationRuleStatusApproved
-	rule.ApprovedAt, rule.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, rule)
 }
 
@@ -2932,6 +2996,10 @@ func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) 
 // eligible to post its own allocation run against the same source balance.
 func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.SupersedeAllocationRuleRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -2993,7 +3061,15 @@ func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request
 		CreatedAt:            now,
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.SupersedeAllocationRule(r.Context(), id, newVersion, now); err != nil {
+	requestHash := requestFingerprint(struct {
+		RuleID string
+		Req    domain.SupersedeAllocationRuleRequest
+	}{id, req})
+	replay, err := h.store.SupersedeAllocationRule(r.Context(), id, newVersion, now, idempotencyKey, requestHash)
+	if err != nil {
+		if writeClaimErr(w, err) {
+			return
+		}
 		if errors.Is(err, domain.ErrNoCurrentRuleToSupersede) {
 			writeError(w, http.StatusUnprocessableEntity, "no_current_rule_to_supersede", err.Error())
 			return
@@ -3002,11 +3078,12 @@ func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-
-	newVersion.RuleID = id
-	newVersion.TenantID = current.TenantID
-	newVersion.Status = domain.AllocationRuleStatusDraft
-	writeJSON(w, http.StatusCreated, newVersion)
+	if !replay {
+		newVersion.RuleID = id
+		newVersion.TenantID = current.TenantID
+		newVersion.Status = domain.AllocationRuleStatusDraft
+	}
+	writeCreateResult(w, replay, newVersion)
 }
 
 // allocationAmountsFor computes each driver's share of sourceAmount,
@@ -3303,6 +3380,8 @@ func (h *Handler) writeAllocationErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("allocation store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -3513,6 +3592,10 @@ func (h *Handler) ReversePriorRevaluation(w http.ResponseWriter, r *http.Request
 // for why ACC-10 gets the same rule as ACC-07/08/09).
 func (h *Handler) ApproveRevaluation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -3534,12 +3617,11 @@ func (h *Handler) ApproveRevaluation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.ApproveFXRevaluationRun(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ RunID string }{id})
+	if _, err := h.store.ApproveFXRevaluationRun(r.Context(), run, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeFXRevaluationErr(w, err)
 		return
 	}
-	run.Status = domain.FXRevaluationStatusApproved
-	run.ApprovedAt, run.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, run)
 }
 
@@ -3740,6 +3822,8 @@ func (h *Handler) writeFXRevaluationErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("FX revaluation store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -3977,6 +4061,10 @@ func (h *Handler) quarantineMigrationBatch(ctx context.Context, batchID, reason 
 // (migration 000021's sod_migration_approver_independent).
 func (h *Handler) ApproveMigrationBatchHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -3998,11 +4086,11 @@ func (h *Handler) ApproveMigrationBatchHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.ApproveMigrationBatch(r.Context(), id, principalID, now); err != nil {
+	requestHash := requestFingerprint(struct{ BatchID string }{id})
+	if _, err := h.store.ApproveMigrationBatch(r.Context(), batch, principalID, idempotencyKey, requestHash, now); err != nil {
 		h.writeMigrationErr(w, err)
 		return
 	}
-	batch.Status, batch.ApprovedAt, batch.ApprovedByPrincipalID = domain.MigrationBatchStatusApproved, &now, &principalID
 	writeJSON(w, http.StatusOK, batch)
 }
 
@@ -4184,6 +4272,10 @@ func migrationReconciliationDiscrepancy(batch *domain.MigrationBatch, journal *d
 
 func (h *Handler) CertifyMigrationAccounting(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	var req domain.CertifyMigrationBatchRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -4216,11 +4308,14 @@ func (h *Handler) CertifyMigrationAccounting(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.CertifyMigrationBatch(r.Context(), id, principalID, req.Reason, now); err != nil {
+	requestHash := requestFingerprint(struct {
+		BatchID string
+		Req     domain.CertifyMigrationBatchRequest
+	}{id, req})
+	if _, err := h.store.CertifyMigrationBatch(r.Context(), batch, principalID, req.Reason, idempotencyKey, requestHash, now); err != nil {
 		h.writeMigrationErr(w, err)
 		return
 	}
-	batch.Status, batch.CertifiedAt, batch.CertifiedByPrincipalID, batch.CertificationReason = domain.MigrationBatchStatusCertified, &now, &principalID, &req.Reason
 	writeJSON(w, http.StatusOK, batch)
 }
 
@@ -4284,6 +4379,8 @@ func (h *Handler) writeMigrationErr(w http.ResponseWriter, err error) {
 		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("migration batch store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -5664,6 +5761,8 @@ func (h *Handler) writeStoreErr(w http.ResponseWriter, err error, notFoundCode s
 		writeError(w, http.StatusNotFound, notFoundCode, "")
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	default:
 		h.log.Error("store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

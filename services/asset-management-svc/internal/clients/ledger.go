@@ -81,17 +81,17 @@ func (c *Clients) CheckPeriodOpen(ctx context.Context, tenantID, legalEntityID, 
 }
 
 type postingEventLine struct {
-	AccountCode  string  `json:"account_code"`
+	MappingKey   string  `json:"mapping_key"`
 	DebitAmount  float64 `json:"debit_amount,omitempty"`
 	CreditAmount float64 `json:"credit_amount,omitempty"`
 }
 
 type postAccountingEventRequest struct {
-	LegalEntityID string             `json:"legal_entity_id"`
-	FiscalPeriod  string             `json:"fiscal_period"`
-	Description   string             `json:"description"`
-	SourceEventID string             `json:"source_event_id"`
-	CorrelationID string             `json:"correlation_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
+	Description   string `json:"description"`
+	SourceEventID string `json:"source_event_id"`
+	CorrelationID string `json:"correlation_id"`
 	// TransactionCurrency / DocumentDate are required by general-ledger-svc
 	// (ZS-ACC-KERNEL-001). omitempty only so a posting path that has no real
 	// source for them (depreciation runs) is left unchanged rather than
@@ -111,7 +111,7 @@ type postingExecutionResponse struct {
 // and consolidation-svc's PostConsolidationAdjustmentJournal clients this
 // session.
 type LedgerLine struct {
-	AccountCode  string
+	MappingKey   string
 	DebitAmount  float64
 	CreditAmount float64
 }
@@ -136,7 +136,7 @@ func (c *Clients) postAccountingEvent(ctx context.Context, tenantID, principalID
 		TransactionCurrency: transactionCurrency, DocumentDate: documentDate,
 	}
 	for _, l := range lines {
-		body.Lines = append(body.Lines, postingEventLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
+		body.Lines = append(body.Lines, postingEventLine{MappingKey: l.MappingKey, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {

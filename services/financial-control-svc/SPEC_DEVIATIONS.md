@@ -56,27 +56,50 @@ policies a run pins.
   the target as it now stands) instead of a 409/412. The same key used for
   another target or decision is a 409. Migration 000008 adds the
   `exception_id` an exception transition needs, and widens `command`.
-- **A4. Tolerance and materiality approval is self-declared.**
-  `CreateTolerancePolicy` / `CreateMaterialityPolicy` take `approved_by` as a
-  free-text body field; the only check is `approved_by != caller`. No second
-  authenticated actor ever approves, so one principal can create and "approve"
-  a wider tolerance by typing a colleague's id. §11 ("policy change requires
-  governed configuration change") and §27 ("Finance Control Policy authority")
-  require a real approval; rule versions already do it properly
-  (`…/rule-versions/{version}/approve`). Scope: create policies in a pending
-  state, add an approve endpoint with its own action, and make run creation
-  resolve only approved versions. Also missing: any read endpoint for
-  materiality policies (create only).
-- **A5. No manual match (§10).** Matching is fully automatic; there is no
-  command to pair two records manually with permission, reason and evidence.
-  Consequences: an unmatched pair that a human can explain can only be
-  resolved through remediation + reperformance, waiver or carry-forward;
-  reconciliation-intelligence-svc's suggestions have no command here to act
-  through; and the §28 manual-match-rate metric is reported as unavailable
-  (`internal/domain/monitoring.go`). Scope: `POST /controls/v1/runs/{id}/manual-matches`
-  with the §10/§27 rules — explicit permission, reason, evidence reference,
-  amounts must agree within the run's pinned tolerance (scenario 06), blocked
-  where an own-transaction rule applies.
+- **A4. Tolerance and materiality approval is self-declared. — Closed (B10).**
+  `CreateTolerancePolicy` / `CreateMaterialityPolicy` no longer accept
+  `approved_by` at all: a policy is created pending (`approved_by`/
+  `approved_at` both NULL) and independently approved through
+  `POST …/tolerance-policies/{id}/approve` and
+  `…/materiality-policies/{id}/approve`, gated by a new `FINCTRL_APPROVE_POLICY`
+  action (migration 000010 here; access-control-svc migration 000023 registers
+  it, the same deployment prerequisite A1/B6 needed for `FINCTRL_REVOKE`). The
+  creator cannot approve their own policy (`ErrSelfApproval`, mirroring
+  `ApproveRuleVersion`), an approved policy cannot be re-approved, and the
+  approval triggers (`trg_immutable_tolerance`/`trg_immutable_materiality`,
+  previously blanket-append-only) were replaced with
+  `guard_tolerance_policy`/`guard_materiality_policy`, mirroring
+  `control_rule_versions`' own `guard_rule_version`: only an unapproved row
+  may be updated, and only its approval columns may change. `CreateRun`'s
+  tolerance/materiality resolution — both the named-id path and the
+  latest-effective fallback — now requires `approved_by IS NOT NULL`, the
+  same condition the rule-version resolution already enforced; a pending
+  policy is never pinned to a run, named or not. `ListMaterialityPolicies`
+  (`GET /controls/v1/materiality-policies`) closes the missing read endpoint.
+- **A5. No manual match (§10). — Closed (B11), one sub-item not enforced.**
+  `POST /controls/v1/runs/{run_id}/manual-matches` (`FINCTRL_MANUAL_MATCH`,
+  access-control-svc migration 000024) records a human-asserted pairing of
+  records a run's automatic matching left unmatched: explicit permission,
+  mandatory `reason` and `evidence_ref`, amounts summed from the run's own
+  frozen side A/B populations and compared against the run's pinned
+  tolerance exactly as the engine does (absolute only — the engine itself
+  does not yet combine a percentage tolerance into execution, a pre-existing
+  gap this does not invent a fix for). A difference beyond that tolerance is
+  refused outright, never recorded (§10 "cannot hide amount difference"), a
+  different currency on each side is refused (no FX without an approved
+  basis), an unknown record id is refused, and a certified run's manual
+  matches are refused (Invariant 2/9: sealed evidence). Rows live in their
+  own `manual_matches` table, not `match_results` — a manual match has no
+  algorithm version to record (Invariant 16), and conflating the two would
+  misrepresent a human decision as an algorithmic one. `GET
+  .../manual-matches` lists them. The §28 `manual_match_rate` signal is now
+  computed (`internal/domain/monitoring.go`), not reported unavailable.
+  **Not enforced:** §27's "blocked if own-transaction rule applies" — no
+  population record this service receives carries who created or posted it
+  (`control-population-contract.md` defines no such field, confirmed by
+  re-reading it for this change), so there is no input to enforce that rule
+  against. This is the same class of gap as A8 (cross-currency, blocked on
+  an FX-rate capability this service lacks), not an oversight.
 - **A6. Run-level reperformance is not implemented.** The `REMEDIATION` and
   `REPERFORMANCE` lifecycle states exist but nothing enters them, and §25's
   `POST /runs/{id}:reperform` has no equivalent. Reperformance is recorded per

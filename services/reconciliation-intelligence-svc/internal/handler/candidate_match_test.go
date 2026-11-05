@@ -130,8 +130,15 @@ func TestAnalyze_LedgerUnavailableOrTruncated_FailsClosed(t *testing.T) {
 			t.Fatalf("expected 503, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
-	t.Run("a full page cannot be told from a truncated one", func(t *testing.T) {
-		entries := make([]fakeLedgerEntry, 1000)
+	// A15's keyset cursor means a merely-full page (exactly one page's worth
+	// of rows, no continuation) is no longer ambiguous — the client follows
+	// next_cursor until general-ledger-svc itself says there is no more.
+	// What is still a fail-closed refusal is a window so large the client's
+	// own maxPages bound (internal/ledger) gives up rather than loop
+	// forever: more matching rows than maxPages*maxEntries (20*1000).
+	t.Run("a window larger than the client will follow is still refused", func(t *testing.T) {
+		const tooMany = 20*1000 + 1
+		entries := make([]fakeLedgerEntry, tooMany)
 		for i := range entries {
 			entries[i] = ledgerEntry(fmt.Sprintf("11111111-aaaa-4aaa-8aaa-%012d", i), "le-1", "2026-07-01", "1")
 		}
@@ -139,6 +146,17 @@ func TestAnalyze_LedgerUnavailableOrTruncated_FailsClosed(t *testing.T) {
 		rec := postAnalyze(newTestRouter(t, deps{runs: candidateRun(), ledgerURL: gl.URL}), "le-1", runCandidates)
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("exactly one page's worth of rows is read completely, not refused", func(t *testing.T) {
+		entries := make([]fakeLedgerEntry, 1000)
+		for i := range entries {
+			entries[i] = ledgerEntry(fmt.Sprintf("11111111-aaaa-4aaa-8aaa-%012d", i), "le-1", "2026-07-01", "1")
+		}
+		gl := newFakeLedgerServer(t, entries, nil)
+		rec := postAnalyze(newTestRouter(t, deps{runs: candidateRun(), ledgerURL: gl.URL}), "le-1", runCandidates)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201 (1000 matching rows is a complete, not truncated, page), got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
 }

@@ -30,10 +30,9 @@ func (h *Handler) AllocateLandedCost(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.MovementID == "" || req.IdempotencyKey == "" || req.FiscalPeriod == "" ||
-		req.InventoryAccountCode == "" || req.COGSAccountCode == "" || req.OffsetAccountCode == "" {
+	if req.MovementID == "" || req.IdempotencyKey == "" || req.FiscalPeriod == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields",
-			"movement_id, idempotency_key, fiscal_period, inventory_account_code, cogs_account_code and offset_account_code are required")
+			"movement_id, idempotency_key and fiscal_period are required")
 		return
 	}
 	if req.Amount <= 0 {
@@ -42,6 +41,11 @@ func (h *Handler) AllocateLandedCost(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ValuationEvidenceRef == "" {
 		writeError(w, http.StatusUnprocessableEntity, "valuation_evidence_required", domain.ErrValuationEvidenceRequired.Error())
+		return
+	}
+	if h.inventoryMappingKey == "" || h.cogsMappingKey == "" || h.landedCostOffsetMappingKey == "" {
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+			"landed cost requires configured ACC-02 inventory, cogs and offset mapping keys")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -74,7 +78,7 @@ func (h *Handler) AllocateLandedCost(w http.ResponseWriter, r *http.Request) {
 	a := &domain.LandedCostAllocation{
 		AllocationID: uuid.NewString(), MovementID: req.MovementID, IdempotencyKey: req.IdempotencyKey,
 		Amount: req.Amount, ValuationEvidenceRef: req.ValuationEvidenceRef, FiscalPeriod: req.FiscalPeriod,
-		InventoryAccountCode: req.InventoryAccountCode, COGSAccountCode: req.COGSAccountCode, OffsetAccountCode: req.OffsetAccountCode,
+		InventoryMappingKey: h.inventoryMappingKey, COGSMappingKey: h.cogsMappingKey, OffsetMappingKey: h.landedCostOffsetMappingKey,
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	created, err := h.store.AllocateLandedCost(r.Context(), a)
@@ -86,12 +90,12 @@ func (h *Handler) AllocateLandedCost(w http.ResponseWriter, r *http.Request) {
 	if a.Status == domain.LandedCostStatusPendingPosting {
 		var lines []clients.LedgerLine
 		if a.InventoryShare > 0 {
-			lines = append(lines, clients.LedgerLine{AccountCode: a.InventoryAccountCode, DebitAmount: a.InventoryShare})
+			lines = append(lines, clients.LedgerLine{MappingKey: a.InventoryMappingKey, DebitAmount: a.InventoryShare})
 		}
 		if a.COGSShare > 0 {
-			lines = append(lines, clients.LedgerLine{AccountCode: a.COGSAccountCode, DebitAmount: a.COGSShare})
+			lines = append(lines, clients.LedgerLine{MappingKey: a.COGSMappingKey, DebitAmount: a.COGSShare})
 		}
-		lines = append(lines, clients.LedgerLine{AccountCode: a.OffsetAccountCode, CreditAmount: a.Amount})
+		lines = append(lines, clients.LedgerLine{MappingKey: a.OffsetMappingKey, CreditAmount: a.Amount})
 
 		correlationID := getCorrelationID(r)
 		journalID, err := h.postLandedCostJournal(r.Context(), tenantID, principalID, correlationID, a, lines)

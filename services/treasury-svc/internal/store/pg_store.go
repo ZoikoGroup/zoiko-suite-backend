@@ -183,13 +183,13 @@ const bankAccountColumns = `
 	bank_account_id, tenant_id, legal_entity_id, account_name,
 	masked_account_number, bank_identifier, currency_code, account_status,
 	branch_ref, country, account_type, requested_operational_use, token_version,
-	created_by_principal_id, created_at, updated_at`
+	created_by_principal_id, suspend_reason, close_reason, created_at, updated_at`
 
 func scanBankAccount(row pgx.Row, acct *domain.BankAccount) error {
 	return row.Scan(&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
 		&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
 		&acct.BranchRef, &acct.Country, &acct.AccountType, &acct.RequestedOperationalUse, &acct.TokenVersion,
-		&acct.CreatedByPrincipalID, &acct.CreatedAt, &acct.UpdatedAt)
+		&acct.CreatedByPrincipalID, &acct.SuspendReason, &acct.CloseReason, &acct.CreatedAt, &acct.UpdatedAt)
 }
 
 // CreateBankAccount registers a new bank account. Idempotent on

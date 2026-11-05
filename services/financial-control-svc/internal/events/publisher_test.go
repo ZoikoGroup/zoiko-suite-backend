@@ -88,6 +88,24 @@ func TestPartitionKeyIsStableOpaqueAndPerAggregate(t *testing.T) {
 	assert.NotContains(t, string(a), "t1", "the key is opaque: it does not leak tenant or aggregate ids")
 }
 
+func TestProbe_NoBrokersConfiguredFailsClosed(t *testing.T) {
+	w := &captureWriter{}
+	err := NewPublisher(zap.NewNop(), "topic", w).Probe(context.Background())
+	require.Error(t, err, "Probe must fail when WithBrokers was never called, so a misconfigured "+
+		"publisher can only make the relay retry forever, never wrongly dead-letter a real event")
+}
+
+func TestProbe_UnreachableBrokerFailsWithinTimeout(t *testing.T) {
+	w := &captureWriter{}
+	p := NewPublisher(zap.NewNop(), "topic", w).WithBrokers([]string{"127.0.0.1:1"})
+	p.probeTimeout = 2 * time.Second
+
+	start := time.Now()
+	err := p.Probe(context.Background())
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second, "probe must respect its timeout, not hang")
+}
+
 func TestProfileDefaultsToUnspecifiedNotBlank(t *testing.T) {
 	w := &captureWriter{}
 	d := delivery()

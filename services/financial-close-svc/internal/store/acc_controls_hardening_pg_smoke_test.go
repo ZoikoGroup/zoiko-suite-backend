@@ -58,15 +58,15 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateAccrualSchedule(ctx, sch, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAccrualSchedule: %v", err)
 	}
-	if err := s.SubmitAccrualSchedule(ctx, sch.ScheduleID, "submitter-1", now); err != nil {
+	if _, err := s.SubmitAccrualSchedule(ctx, sch, "submitter-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("SubmitAccrualSchedule: %v", err)
 	}
 	for _, self := range []string{"preparer-1", "submitter-1"} {
-		if err := s.ApproveAccrualSchedule(ctx, sch.ScheduleID, self, now); !errors.Is(err, domain.ErrSelfApproval) {
+		if _, err := s.ApproveAccrualSchedule(ctx, sch, self, uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 			t.Fatalf("accrual approved by its %s: want ErrSelfApproval, got %v", self, err)
 		}
 	}
-	if err := s.ApproveAccrualSchedule(ctx, sch.ScheduleID, "approver-1", now); err != nil {
+	if _, err := s.ApproveAccrualSchedule(ctx, sch, "approver-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("independent accrual approval refused: %v", err)
 	}
 
@@ -80,7 +80,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreatePrepaymentSchedule(ctx, ppy, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreatePrepaymentSchedule: %v", err)
 	}
-	if err := s.ApprovePrepaymentSchedule(ctx, ppy.ScheduleID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApprovePrepaymentSchedule(ctx, ppy, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("prepayment self-approval: want ErrSelfApproval, got %v", err)
 	}
 
@@ -94,7 +94,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateAllocationRule(ctx, rule, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
-	if err := s.ApproveAllocationRule(ctx, ruleID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApproveAllocationRule(ctx, rule, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("allocation rule self-approval: want ErrSelfApproval, got %v", err)
 	}
 
@@ -106,7 +106,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateFXRevaluationRun(ctx, fx, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateFXRevaluationRun: %v", err)
 	}
-	if err := s.ApproveFXRevaluationRun(ctx, fx.RunID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApproveFXRevaluationRun(ctx, fx, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("FX revaluation self-approval: want ErrSelfApproval, got %v", err)
 	}
 
@@ -123,10 +123,10 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if err := s.MarkMigrationBatchValidated(ctx, batch.BatchID, now); err != nil {
 		t.Fatalf("MarkMigrationBatchValidated: %v", err)
 	}
-	if err := s.ApproveMigrationBatch(ctx, batch.BatchID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApproveMigrationBatch(ctx, batch, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("migration self-approval: want ErrSelfApproval, got %v", err)
 	}
-	if err := s.ApproveMigrationBatch(ctx, batch.BatchID, "approver-1", now); err != nil {
+	if _, err := s.ApproveMigrationBatch(ctx, batch, "approver-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("ApproveMigrationBatch: %v", err)
 	}
 	if err := s.MarkMigrationBatchPosted(ctx, batch.BatchID, "journal-1", now); err != nil {
@@ -135,10 +135,10 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if err := s.MarkMigrationBatchReconciled(ctx, batch.BatchID, now); err != nil {
 		t.Fatalf("MarkMigrationBatchReconciled: %v", err)
 	}
-	if err := s.CertifyMigrationBatch(ctx, batch.BatchID, "preparer-1", "cutover signed", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.CertifyMigrationBatch(ctx, batch, "preparer-1", "cutover signed", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("migration self-certification: want ErrSelfApproval, got %v", err)
 	}
-	if err := s.CertifyMigrationBatch(ctx, batch.BatchID, "certifier-1", "cutover signed", now); err != nil {
+	if _, err := s.CertifyMigrationBatch(ctx, batch, "certifier-1", "cutover signed", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("independent certification refused: %v", err)
 	}
 }
@@ -155,15 +155,17 @@ func TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB(t *testing.T) {
 	if _, err := s.CreateAccrualSchedule(ctx, sch, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAccrualSchedule: %v", err)
 	}
-	if err := s.CancelAccrualSchedule(ctx, sch.ScheduleID, domain.AccrualStatusDraft, "canceller-1", now); err != nil {
+	if _, err := s.CancelAccrualSchedule(ctx, sch, "canceller-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("CancelAccrualSchedule: %v", err)
 	}
 	got, err := s.GetAccrualSchedule(ctx, sch.ScheduleID)
 	if err != nil || got.Status != domain.AccrualStatusCancelled || derefStr(got.CancelledByPrincipalID) != "canceller-1" {
 		t.Fatalf("cancel did not land: %+v (err %v)", got, err)
 	}
-	if err := s.CancelAccrualSchedule(ctx, sch.ScheduleID, domain.AccrualStatusDraft, "canceller-1", now); !errors.Is(err, domain.ErrInvalidAccrualTransition) {
-		t.Fatalf("second cancel from DRAFT: want ErrInvalidAccrualTransition, got %v", err)
+	// A second cancel attempt under a NEW key (not a replay of the first) must
+	// still be refused: the schedule is already CANCELLED.
+	if _, err := s.CancelAccrualSchedule(ctx, sch, "canceller-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrInvalidAccrualTransition) {
+		t.Fatalf("second cancel of an already-cancelled schedule: want ErrInvalidAccrualTransition, got %v", err)
 	}
 
 	ppy := &domain.PrepaymentSchedule{
@@ -175,8 +177,8 @@ func TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB(t *testing.T) {
 	if _, err := s.CreatePrepaymentSchedule(ctx, ppy, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreatePrepaymentSchedule: %v", err)
 	}
-	if err := s.TerminatePrepaymentSchedule(ctx, ppy.ScheduleID, domain.PrepaymentStatusDraft, "terminator-1", "contract ended",
-		domain.TerminationTreatmentWriteOff, now); err != nil {
+	if _, err := s.TerminatePrepaymentSchedule(ctx, ppy, "terminator-1", "contract ended",
+		domain.TerminationTreatmentWriteOff, uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("TerminatePrepaymentSchedule: %v", err)
 	}
 	gotP, err := s.GetPrepaymentSchedule(ctx, ppy.ScheduleID)
@@ -466,7 +468,7 @@ func TestPgStore_ListPostedJournalLineage_ClassifiesInOneQuery_RealDB(t *testing
 	}
 	for _, step := range []func() error{
 		func() error { return s.MarkMigrationBatchValidated(ctx, batch.BatchID, now) },
-		func() error { return s.ApproveMigrationBatch(ctx, batch.BatchID, "approver-1", now) },
+		func() error { _, err := s.ApproveMigrationBatch(ctx, batch, "approver-1", uuid.NewString(), testRequestHash, now); return err },
 		func() error { return s.MarkMigrationBatchPosted(ctx, batch.BatchID, "journal-migration", now) },
 		func() error {
 			return s.QuarantineMigrationBatch(ctx, batch.BatchID, domain.MigrationBatchStatusPosted, "reconciliation mismatch")
