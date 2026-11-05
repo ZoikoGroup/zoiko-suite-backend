@@ -51,7 +51,7 @@ func TestFetchEliminableIntercompanyEntries_PeriodAndCounterparty(t *testing.T) 
 		 "source_legal_entity_id":"le-us","target_legal_entity_id":"le-uk","source_journal_id":"s1","target_journal_id":"t1"},
 		{"intercompany_entry_id":"ic-2","match_status":"CLOSED","amount":10,"counterparty_amount":10,"source_journal_id":"s2","target_journal_id":"t2"}
 	]`)
-	got, err := clients.New("", srv.URL, zap.NewNop()).FetchEliminableIntercompanyEntries(context.Background(), "tenant-1", "principal-1")
+	got, err := clients.New("", srv.URL, zap.NewNop()).FetchEliminableIntercompanyEntries(context.Background(), "tenant-1", "principal-1", []string{"child-a"})
 	if err != nil || len(got) != 2 {
 		t.Fatalf("got %+v, %v", got, err)
 	}

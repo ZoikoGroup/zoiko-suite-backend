@@ -389,7 +389,7 @@ func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ s
 	return map[string]float64{"1000-Cash": 10000.0}, nil
 }
 
-func (c *stubClients) FetchEliminableIntercompanyEntries(_ context.Context, _, principalID string) ([]clients.IntercompanyEntry, error) {
+func (c *stubClients) FetchEliminableIntercompanyEntries(_ context.Context, _, principalID string, _ []string) ([]clients.IntercompanyEntry, error) {
 	c.principalIDReceived = principalID
 	if c.intercompanyErr != nil {
 		return nil, c.intercompanyErr

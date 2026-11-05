@@ -72,7 +72,7 @@ type AuthZClient interface {
 
 type DomainClients interface {
 	FetchTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (map[string]float64, error)
-	FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]clients.IntercompanyEntry, error)
+	FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string, childLegalEntityIDs []string) ([]clients.IntercompanyEntry, error)
 	FetchReciprocalBalances(ctx context.Context, tenantID, principalID, entityA, entityB, fiscalPeriod string) (*domain.ReciprocalBalances, error)
 	FetchJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error)
 
@@ -263,7 +263,7 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	// The population itself must be readable: a run that cannot list the
 	// pairs cannot know what it failed to eliminate, so it fails rather
 	// than completing with no elimination at all.
-	eliminableEntries, err := h.clients.FetchEliminableIntercompanyEntries(r.Context(), tenantID, principalID)
+	eliminableEntries, err := h.clients.FetchEliminableIntercompanyEntries(r.Context(), tenantID, principalID, req.ChildLegalEntityIDs)
 	if err != nil {
 		h.log.Error("failed to fetch intercompany entries for elimination", zap.Error(err))
 		_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC(), principalID, correlationID, 0, nil)
@@ -657,6 +657,21 @@ func (h *Handler) CreateEliminationProposal(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid_adjustment_type", "adjustment_type must be ELIMINATION or MANUAL")
 		return
 	}
+	// A5: an ELIMINATION proposal must name the intercompany pair it
+	// eliminates, so its bound check (below) is scoped to that pair's
+	// reciprocal balance instead of every eliminable balance in the tenant.
+	if req.AdjustmentType == domain.AdjustmentTypeElimination {
+		if req.SourceLegalEntityID == "" || req.TargetLegalEntityID == "" {
+			writeError(w, http.StatusBadRequest, "missing_fields",
+				"source_legal_entity_id and target_legal_entity_id are required for an ELIMINATION adjustment")
+			return
+		}
+		if req.SourceLegalEntityID == req.TargetLegalEntityID {
+			writeError(w, http.StatusBadRequest, "same_entity_forbidden",
+				"source_legal_entity_id and target_legal_entity_id must be different legal entities")
+			return
+		}
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -694,22 +709,26 @@ func (h *Handler) CreateEliminationProposal(w http.ResponseWriter, r *http.Reque
 	// Negative path: "Elimination exceeds matched reciprocal balance." Only
 	// checked for ELIMINATION-type adjustments — a MANUAL top-side
 	// adjustment (e.g. a consolidation-only reclass) has no matched
-	// intercompany balance to be bounded by.
+	// intercompany balance to be bounded by. Scoped to the named pair and
+	// period (A5), not every eliminable balance in the tenant: a proposal
+	// for entity X/Y can no longer be bounded by entity P/Q's balance just
+	// because both happen to be eliminable somewhere in the tenant.
 	if req.AdjustmentType == domain.AdjustmentTypeElimination {
-		eliminable, err := h.clients.FetchEliminableIntercompanyEntries(r.Context(), tenantID, principalID)
+		balances, err := h.clients.FetchReciprocalBalances(r.Context(), tenantID, principalID,
+			req.SourceLegalEntityID, req.TargetLegalEntityID, req.FiscalPeriod)
 		if err != nil {
-			h.log.Error("failed to fetch eliminable intercompany entries for elimination proposal", zap.Error(err))
+			if errors.Is(err, domain.ErrAuthorizationDenied) {
+				h.writeAuthzErr(w, err)
+				return
+			}
+			h.log.Error("failed to fetch reciprocal balances for elimination proposal", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "intercompany_unavailable", err.Error())
 			return
 		}
 		// Summed exactly (ZS-DATA-001 D06). A malformed amount already
 		// failed the fetch above; this is defence in depth, and refuses
 		// rather than treating the entry as zero.
-		amounts := make([]string, 0, len(eliminable))
-		for _, e := range eliminable {
-			amounts = append(amounts, string(e.Amount))
-		}
-		matchedTotal, err := domain.SumAmounts(amounts)
+		matchedTotal, err := domain.SumMatchedOrClosedNet(balances)
 		if err != nil {
 			h.log.Error("intercompany-accounting-svc returned an unreadable amount", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "intercompany_unavailable", err.Error())
@@ -744,6 +763,10 @@ func (h *Handler) CreateEliminationProposal(w http.ResponseWriter, r *http.Reque
 		Lines:                req.Lines,
 		CreatedAt:            now,
 		CreatedByPrincipalID: principalID,
+	}
+	if req.AdjustmentType == domain.AdjustmentTypeElimination {
+		adjustment.SourceLegalEntityID = &req.SourceLegalEntityID
+		adjustment.TargetLegalEntityID = &req.TargetLegalEntityID
 	}
 	persisted, replay, err := h.store.CreateAdjustment(r.Context(), adjustment, idempotencyKey, getCorrelationID(r))
 	if err != nil {

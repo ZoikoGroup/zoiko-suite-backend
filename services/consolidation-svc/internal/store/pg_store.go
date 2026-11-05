@@ -519,7 +519,8 @@ const consolidationAdjustmentColumns = `
 	created_at, created_by_principal_id,
 	approved_at, approved_by_principal_id,
 	posted_at, posted_by_principal_id,
-	reversed_at, reversed_by_principal_id, reversal_reason, superseded_by_adjustment_id`
+	reversed_at, reversed_by_principal_id, reversal_reason, superseded_by_adjustment_id,
+	source_legal_entity_id, target_legal_entity_id`
 
 func scanConsolidationAdjustment(row pgx.Row, a *domain.ConsolidationAdjustment) error {
 	var linesRaw []byte
@@ -530,6 +531,7 @@ func scanConsolidationAdjustment(row pgx.Row, a *domain.ConsolidationAdjustment)
 		&a.ApprovedAt, &a.ApprovedByPrincipalID,
 		&a.PostedAt, &a.PostedByPrincipalID,
 		&a.ReversedAt, &a.ReversedByPrincipalID, &a.ReversalReason, &a.SupersededByAdjustmentID,
+		&a.SourceLegalEntityID, &a.TargetLegalEntityID,
 	); err != nil {
 		return err
 	}
@@ -631,7 +633,9 @@ func (s *PgStore) createAdjustment(ctx context.Context, a *domain.ConsolidationA
 			// period and adjustment type.
 			if existing.GroupLegalEntityID != a.GroupLegalEntityID ||
 				existing.FiscalPeriod != a.FiscalPeriod ||
-				existing.AdjustmentType != a.AdjustmentType {
+				existing.AdjustmentType != a.AdjustmentType ||
+				!stringPtrEqual(existing.SourceLegalEntityID, a.SourceLegalEntityID) ||
+				!stringPtrEqual(existing.TargetLegalEntityID, a.TargetLegalEntityID) {
 				return commandConflict(idempotencyKey, claim)
 			}
 			out, replay = &existing, true
@@ -642,11 +646,13 @@ func (s *PgStore) createAdjustment(ctx context.Context, a *domain.ConsolidationA
 			INSERT INTO consolidation_adjustments (
 				consolidation_adjustment_id, tenant_id, group_legal_entity_id, fiscal_period,
 				adjustment_type, description, status, lines,
-				created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				created_at, created_by_principal_id,
+				source_legal_entity_id, target_legal_entity_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		`, a.ConsolidationAdjustmentID, tenantID, a.GroupLegalEntityID, a.FiscalPeriod,
 			a.AdjustmentType, a.Description, a.Status, linesJSON,
-			a.CreatedAt, a.CreatedByPrincipalID); err != nil {
+			a.CreatedAt, a.CreatedByPrincipalID,
+			a.SourceLegalEntityID, a.TargetLegalEntityID); err != nil {
 			return err
 		}
 		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, a.ConsolidationAdjustmentID,
