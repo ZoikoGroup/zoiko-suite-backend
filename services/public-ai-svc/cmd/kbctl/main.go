@@ -309,18 +309,35 @@ func dlqReplay(ctx context.Context, args []string) error {
 func audit(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	limit := fs.Int("n", 20, "number of entries")
+	verify := fs.Bool("verify", false, "verify the whole hash chain (Doc 06 §21) instead of listing")
 	_ = fs.Parse(args)
 	st, err := openStore(ctx)
 	if err != nil {
 		return err
+	}
+	if *verify {
+		all, err := st.ListAudit(ctx, 1<<30)
+		if err != nil {
+			return err
+		}
+		chain := make([]store.AuditEntry, 0, len(all))
+		for i := len(all) - 1; i >= 0; i-- {
+			chain = append(chain, all[i])
+		}
+		if err := store.VerifyAuditChain(chain); err != nil {
+			return fmt.Errorf("control audit chain BROKEN: %w", err)
+		}
+		fmt.Printf("control audit chain intact: %d rows\n", len(chain))
+		return nil
 	}
 	entries, err := st.ListAudit(ctx, *limit)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
-		fmt.Printf("%s %-18s %-30s actor=%s approval=%s reason=%q before=%.12s after=%.12s env=%s\n",
-			e.At.UTC().Format(time.RFC3339), e.Action, e.Target, e.Actor, e.Approval, e.Reason, e.BeforeHash, e.AfterHash, e.Environment)
+		fmt.Printf("%s %-18s %-30s actor=%s role=%s approval=%s request=%s reason=%q before=%.12s after=%.12s env=%s hash=%.12s\n",
+			e.At.UTC().Format(time.RFC3339), e.Action, e.Target, e.Actor, e.ActorRole, e.Approval, e.RequestID, e.Reason,
+			e.BeforeHash, e.AfterHash, e.Environment, e.RowHash)
 	}
 	return nil
 }

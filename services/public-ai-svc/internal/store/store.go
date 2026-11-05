@@ -132,6 +132,11 @@ type AuditEntry struct {
 	AfterHash   string
 	Environment string
 	At          time.Time
+	// RequestID and ActorRole complete the Doc 09 §21 audit envelope.
+	RequestID string
+	ActorRole string
+	// PrevHash and RowHash chain the rows (AuditRowHash); set by the store.
+	PrevHash, RowHash string
 }
 
 // Hash is the before/after fingerprint recorded in the control audit: the

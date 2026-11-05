@@ -214,3 +214,50 @@ func TestBucketKeysAreNotAddresses(t *testing.T) {
 		t.Fatal("different visitors share a bucket")
 	}
 }
+
+// Doc 06 §13: two replicas sharing one store and salt enforce one per-minute
+// limit between them; without the shared salt each replica counts alone.
+func TestSharedLimitAcrossReplicas(t *testing.T) {
+	st := store.NewMemory()
+	cfg := config.Config{RateLimitPerIPPerMinute: 4, RateLimitPerSessionPerMin: 100, DailyTokenCeiling: 100, MonthlyTokenCeiling: 1000,
+		RateKeySalt: strings.Repeat("k", 32)}
+	a := New(cfg, st, fixedFlags{flags.Defaults()}).Middleware(okHandler())
+	b := New(cfg, st, fixedFlags{flags.Defaults()}).Middleware(okHandler())
+	allowed := 0
+	for i := 0; i < 8; i++ {
+		h := a
+		if i%2 == 1 {
+			h = b
+		}
+		if w := hit(h, "203.0.113.9", ""); w.Code == http.StatusOK {
+			allowed++
+		} else if w.Header().Get("Retry-After") == "" {
+			t.Fatal("429 without Retry-After")
+		}
+	}
+	if allowed != 4 {
+		t.Fatalf("two replicas allowed %d requests in one minute, want 4", allowed)
+	}
+	// Per-replica only (no salt): each replica has its own budget.
+	cfg.RateKeySalt = ""
+	st2 := store.NewMemory()
+	c := New(cfg, st2, fixedFlags{flags.Defaults()}).Middleware(okHandler())
+	d := New(cfg, st2, fixedFlags{flags.Defaults()}).Middleware(okHandler())
+	allowed = 0
+	for i := 0; i < 8; i++ {
+		h := c
+		if i%2 == 1 {
+			h = d
+		}
+		if hit(h, "203.0.113.9", "").Code == http.StatusOK {
+			allowed++
+		}
+	}
+	if allowed <= 4 {
+		t.Fatalf("without a shared salt each replica keeps its own budget, so together they allow more than one limit: %d", allowed)
+	}
+}
+
+func okHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+}

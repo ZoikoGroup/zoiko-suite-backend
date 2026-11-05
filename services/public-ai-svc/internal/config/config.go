@@ -86,6 +86,10 @@ type Config struct {
 	// RateLimitSessionCreatePerMin is the tighter per-IP limit on new
 	// sessions (Doc 06 §13, SEC-T055).
 	RateLimitSessionCreatePerMin int
+	// RateKeySalt (PUBLIC_AI_RATE_KEY_SALT) is the secret shared by every
+	// replica: limit keys are HMACs with it, so all replicas count the same
+	// visitor in one shared window (Doc 06 §13). Empty: per-replica only.
+	RateKeySalt string
 	// TrustedProxies are the CIDRs whose X-Forwarded-For is believed when
 	// keying the per-IP limit (the console's same-origin proxy, the edge).
 	TrustedProxies      []string
@@ -150,6 +154,7 @@ func Load() (Config, error) {
 		RateLimitPerIPPerMinute:      envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
 		RateLimitPerSessionPerMin:    envInt("PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN", 20),
 		RateLimitSessionCreatePerMin: envInt("PUBLIC_AI_RATE_LIMIT_SESSION_CREATE_PER_MIN", 10),
+		RateKeySalt:                  os.Getenv("PUBLIC_AI_RATE_KEY_SALT"),
 		TrustedProxies:               splitList(env("PUBLIC_AI_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
 		DailyTokenCeiling:            int64(envInt("PUBLIC_AI_DAILY_TOKEN_CEILING", 2_000_000)),
 		MonthlyTokenCeiling:          int64(envInt("PUBLIC_AI_MONTHLY_TOKEN_CEILING", 40_000_000)),
@@ -239,6 +244,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("PUBLIC_AI_DATABASE_URL is required outside dev/test: refusing to fall back to in-memory storage")
 	case !devLike && c.AdminAddr == "":
 		return fmt.Errorf("PUBLIC_AI_ADMIN_ADDR is required outside dev/test: /metrics and /health stay off the public listener (Doc 06 §12)")
+	case !devLike && len(c.RateKeySalt) < 32:
+		return fmt.Errorf("PUBLIC_AI_RATE_KEY_SALT (at least 32 characters, the same on every replica) is required outside dev/test: quotas must hold across replicas (Doc 06 §13)")
 	}
 	if err := validateRetention(c); err != nil {
 		return err

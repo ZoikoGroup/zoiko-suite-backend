@@ -452,31 +452,50 @@ func (p *Postgres) SetFlag(ctx context.Context, f Flag, events []OutboxEvent) er
 }
 
 func (p *Postgres) AppendAudit(ctx context.Context, e AuditEntry) error {
-	return appendAudit(ctx, p.pool, e)
+	// In a transaction, so the chain's advisory lock holds until commit.
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error { return appendAudit(ctx, tx, e) })
 }
 
 type execer interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
+
+// auditChainLock serialises audit appends so each row chains to the last.
+const auditChainLock = 7_001_021
 
 func appendAudit(ctx context.Context, db execer, e AuditEntry) error {
 	if e.Actor == "" || e.Approval == "" {
 		return ErrAuditIncomplete
 	}
-	_, err := db.Exec(ctx, `INSERT INTO public_ai.control_audit (action, target, actor, approval, reason, before_hash, after_hash, environment, at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, e.Action, e.Target, e.Actor, e.Approval, e.Reason, e.BeforeHash, e.AfterHash, e.Environment, e.At)
+	if _, err := db.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, auditChainLock); err != nil {
+		return err
+	}
+	err := db.QueryRow(ctx, `SELECT row_hash FROM public_ai.control_audit ORDER BY audit_id DESC LIMIT 1`).Scan(&e.PrevHash)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	e.At = e.At.UTC().Truncate(time.Microsecond) // what Postgres stores, so the hash verifies on read
+	e.RowHash = AuditRowHash(e.PrevHash, e)
+	_, err = db.Exec(ctx, `INSERT INTO public_ai.control_audit (action, target, actor, approval, reason, before_hash, after_hash, environment, at,
+		request_id, actor_role, prev_hash, row_hash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, e.Action, e.Target, e.Actor, e.Approval, e.Reason, e.BeforeHash, e.AfterHash, e.Environment, e.At,
+		e.RequestID, e.ActorRole, e.PrevHash, e.RowHash)
 	return err
 }
 
 func (p *Postgres) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) {
-	rows, err := p.pool.Query(ctx, `SELECT audit_id, action, target, actor, approval, reason, before_hash, after_hash, environment, at
+	rows, err := p.pool.Query(ctx, `SELECT audit_id, action, target, actor, approval, reason, before_hash, after_hash, environment, at,
+		request_id, actor_role, prev_hash, row_hash
 		FROM public_ai.control_audit ORDER BY audit_id DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (AuditEntry, error) {
 		var e AuditEntry
-		err := row.Scan(&e.AuditID, &e.Action, &e.Target, &e.Actor, &e.Approval, &e.Reason, &e.BeforeHash, &e.AfterHash, &e.Environment, &e.At)
+		err := row.Scan(&e.AuditID, &e.Action, &e.Target, &e.Actor, &e.Approval, &e.Reason, &e.BeforeHash, &e.AfterHash, &e.Environment, &e.At,
+			&e.RequestID, &e.ActorRole, &e.PrevHash, &e.RowHash)
+		e.At = e.At.UTC()
 		return e, err
 	})
 }

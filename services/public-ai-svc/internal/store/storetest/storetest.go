@@ -22,6 +22,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("FlagsUsageOutbox", func(t *testing.T) { testFlagsUsageOutbox(t, newStore(t)) })
 	t.Run("FeedbackPurge", func(t *testing.T) { testFeedbackPurge(t, newStore(t)) })
 	t.Run("ControlAudit", func(t *testing.T) { testControlAudit(t, newStore(t)) })
+	t.Run("RateCounters", func(t *testing.T) { testRateCounters(t, newStore(t)) })
 	t.Run("ConflictCases", func(t *testing.T) { testConflictCases(t, newStore(t)) })
 	t.Run("CompleteTurnNeedsLiveSession", func(t *testing.T) { testCompleteTurnNeedsLiveSession(t, newStore(t)) })
 	t.Run("RetentionPurge", func(t *testing.T) { testRetentionPurge(t, newStore(t)) })
@@ -196,6 +197,30 @@ func testControlAudit(t *testing.T, s store.Store) {
 	}
 	if err := s.SetFlag(ctx, store.Flag{Name: "public_ai_enabled", Value: []byte("true"), UpdatedAt: now}, nil); err == nil {
 		t.Fatal("a flag change without actor and approval must be refused")
+	}
+	// Doc 06 §21: the rows are hash-chained, oldest first.
+	if err := s.AppendAudit(ctx, store.AuditEntry{Action: "release.rollback", Target: "kb", Actor: "sre-3", ActorRole: "R07", Approval: "CHG-3",
+		RequestID: "req_1", At: now.Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.ListAudit(ctx, 10)
+	chain := make([]store.AuditEntry, 0, len(got))
+	for i := len(got) - 1; i >= 0; i-- {
+		chain = append(chain, got[i])
+	}
+	if err := store.VerifyAuditChain(chain); err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+	if chain[2].PrevHash != chain[1].RowHash || chain[2].ActorRole != "R07" || chain[2].RequestID != "req_1" {
+		t.Fatalf("chained row: %+v", chain[2])
+	}
+	tampered := append([]store.AuditEntry(nil), chain...)
+	tampered[1].Actor = "someone-else"
+	if store.VerifyAuditChain(tampered) == nil {
+		t.Fatal("an edited row must break the chain")
+	}
+	if store.VerifyAuditChain([]store.AuditEntry{chain[0], chain[2]}) == nil {
+		t.Fatal("a removed row must break the chain")
 	}
 }
 
@@ -423,5 +448,33 @@ func testRetentionPurge(t *testing.T, s store.Store) {
 	}
 	if !got["old-delivered"] || got["new-delivered"] || !got["undelivered"] {
 		t.Fatalf("after purge, unpublished = %v", got)
+	}
+}
+
+// Doc 06 §13: the shared per-minute counter counts per key and window and
+// forgets old windows.
+func testRateCounters(t *testing.T, s store.Store) {
+	rc, ok := s.(store.RateCounter)
+	if !ok {
+		t.Fatal("store does not share rate counters")
+	}
+	ctx := context.Background()
+	w := time.Now().UTC().Truncate(time.Minute)
+	for i := 1; i <= 3; i++ {
+		if n, err := rc.IncrRate(ctx, "ip:a", w); err != nil || n != int64(i) {
+			t.Fatalf("hit %d: %d %v", i, n, err)
+		}
+	}
+	if n, _ := rc.IncrRate(ctx, "ip:b", w); n != 1 {
+		t.Fatalf("keys share a count: %d", n)
+	}
+	if n, _ := rc.IncrRate(ctx, "ip:a", w.Add(time.Minute)); n != 1 {
+		t.Fatalf("windows share a count: %d", n)
+	}
+	if err := rc.PurgeRateCounters(ctx, w.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := rc.IncrRate(ctx, "ip:a", w); n != 1 {
+		t.Fatalf("purged window kept its count: %d", n)
 	}
 }

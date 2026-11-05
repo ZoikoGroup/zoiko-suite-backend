@@ -27,6 +27,8 @@ func TestT12_NoRouteToPrivateSystems(t *testing.T) {
 		"TokenBudgetPerTurn": true, "DailyTokenCeiling": true, "MonthlyTokenCeiling": true, "SessionTokenCap": true,
 		// The approved model provider's key: egress to Groq only, not a private ZoikoSuite system.
 		"GroqAPIKey": true,
+		// The HMAC salt for shared rate-limit keys: a local secret, not a route (Doc 06 §13).
+		"RateKeySalt": true,
 	}
 	ct := reflect.TypeOf(config.Config{})
 	for i := 0; i < ct.NumField(); i++ {

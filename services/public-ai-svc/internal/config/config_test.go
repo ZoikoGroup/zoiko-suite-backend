@@ -96,6 +96,10 @@ func TestNonDevRequiresDatabase(t *testing.T) {
 		t.Fatalf("non-dev must keep /metrics and /health off the public listener: %v", err)
 	}
 	c.AdminAddr = ":9091"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_RATE_KEY_SALT") {
+		t.Fatalf("non-dev must share rate limits across replicas: %v", err)
+	}
+	c.RateKeySalt = strings.Repeat("s", 32)
 	if err := c.Validate(); err != nil {
 		t.Fatalf("valid production config refused: %v", err)
 	}
@@ -118,6 +122,7 @@ func validProduction(t *testing.T) Config {
 	c.DatabaseURL = "postgres://example/public_ai"
 	c.AllowedOrigins = []string{"https://www.zoikosuite.example"}
 	c.AdminAddr = ":9091"
+	c.RateKeySalt = strings.Repeat("s", 32)
 	if err := c.Validate(); err != nil {
 		t.Fatalf("baseline production config refused: %v", err)
 	}
