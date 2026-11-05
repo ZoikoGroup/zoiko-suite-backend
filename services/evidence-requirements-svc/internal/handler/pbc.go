@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
 	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
@@ -29,8 +30,7 @@ type PBCStore interface {
 	CreateEvidenceRequest(ctx context.Context, requestID string, p domain.CreateEvidenceRequestParams) (*domain.EvidenceRequest, bool, error)
 	GetEvidenceRequest(ctx context.Context, tenantID, requestID string) (*domain.EvidenceRequest, error)
 	GetResponseRequest(ctx context.Context, tenantID, responseID string) (*domain.EvidenceRequest, error)
-	ListOpenEvidenceRequests(ctx context.Context, tenantID, legalEntityID string) ([]*domain.EvidenceRequest, error)
-	ListOpenEvidenceRequestsCursor(ctx context.Context, filter domain.ListPBCRequestsFilter) (domain.CursorPage[*domain.EvidenceRequest], error)
+	ListEvidenceRequestsPage(ctx context.Context, tenantID string, f domain.ListEvidenceRequestsFilter, offset, limit int) ([]*domain.EvidenceRequest, error)
 	SendEvidenceRequest(ctx context.Context, p domain.SendEvidenceRequestParams) (*domain.EvidenceRequest, error)
 	ReassignEvidenceRequest(ctx context.Context, p domain.ReassignEvidenceRequestParams) (*domain.EvidenceRequest, error)
 	ExtendDueDate(ctx context.Context, p domain.ExtendDueDateParams) (*domain.EvidenceRequest, error)
@@ -48,8 +48,7 @@ func RegisterPBCRoutes(r chi.Router, h *Handler, pbcStore PBCStore) {
 	ph := &pbcHandler{Handler: h, store: pbcStore}
 	r.Route("/v1/pbc/requests", func(r chi.Router) {
 		r.Post("/", ph.CreateRequest)
-		r.Get("/", ph.ListOpenRequests)
-		r.Get("/cursor", ph.ListOpenRequestsCursor)
+		r.Get("/", ph.ListRequests)
 		r.Get("/{request_id}", ph.GetRequest)
 		r.Post("/{request_id}/send", ph.SendRequest)
 		r.Post("/{request_id}/reassign", ph.ReassignRequest)
@@ -139,87 +138,54 @@ func (h *pbcHandler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	if created {
 		status = http.StatusCreated
 	}
+	apicontract.WriteETag(w, request.RecordVersion)
 	writeJSON(w, r, status, request)
 }
 
+// GetRequest serves one request to its manager or its assignee (D-ER-29,
+// Governance row 21). It was authorized by tenant only, so any principal in
+// the tenant could read any entity's request.
 func (h *pbcHandler) GetRequest(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-	req, err := h.store.GetEvidenceRequest(r.Context(), tenantID, chi.URLParam(r, "request_id"))
-	if err != nil {
-		h.writePBCErr(w, r, err)
+	req, ok := h.requireManagerOrAssignee(w, r, h.readMode, tenantID, principalID, chi.URLParam(r, "request_id"))
+	if !ok {
 		return
 	}
+	apicontract.WriteETag(w, req.RecordVersion)
 	writeJSON(w, r, http.StatusOK, req)
 }
 
-func (h *pbcHandler) ListOpenRequests(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requirePrincipal(w, r); !ok {
-		return
-	}
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	if legalEntityID != "" && !isUUID(legalEntityID) {
-		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
-		return
-	}
-	reqs, err := h.store.ListOpenEvidenceRequests(r.Context(), tenantID, legalEntityID)
+// requireManagerOrAssignee loads the request and authorizes the principal on
+// it at the request's own legal entity (D-ER-29): the assignee under
+// EVIDENCE_REQUEST_SUBMIT_RESPONSE, anyone else under EVIDENCE_REQUEST_MANAGE.
+// One authorization call; the loaded request is returned.
+func (h *pbcHandler) requireManagerOrAssignee(w http.ResponseWriter, r *http.Request, mode GateMode, tenantID, principalID, requestID string) (*domain.EvidenceRequest, bool) {
+	req, err := h.store.GetEvidenceRequest(r.Context(), tenantID, requestID)
 	if err != nil {
 		h.writePBCErr(w, r, err)
-		return
+		return nil, false
 	}
-	writeJSON(w, r, http.StatusOK, reqs)
+	action := actionManageEvidenceRequest
+	if isAssignee(req, principalID) {
+		action = actionSubmitEvidenceResponse
+	}
+	if !h.gate(w, r, mode, principalID, req.LegalEntityID, action) {
+		return nil, false
+	}
+	return req, true
 }
 
-func (h *pbcHandler) ListOpenRequestsCursor(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requirePrincipal(w, r); !ok {
-		return
-	}
-
-	filter := domain.ListPBCRequestsFilter{
-		TenantID:      tenantID,
-		LegalEntityID: r.URL.Query().Get("legal_entity_id"),
-		Status:        r.URL.Query().Get("status"),
-		Cursor:        r.URL.Query().Get("cursor"),
-		PageSize:      0,
-		Sort:          r.URL.Query().Get("sort"),
-	}
-
-	if filter.LegalEntityID != "" && !isUUID(filter.LegalEntityID) {
-		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
-		return
-	}
-
-	if ps := r.URL.Query().Get("page_size"); ps != "" {
-		n, err := strconv.Atoi(ps)
-		if err != nil || n < 1 || n > 200 {
-			writeError(w, r, http.StatusBadRequest, "invalid_page_size", "page_size must be between 1 and 200")
-			return
-		}
-		filter.PageSize = n
-	}
-
-	page, err := h.store.ListOpenEvidenceRequestsCursor(r.Context(), filter)
-	if err != nil {
-		h.writePBCErr(w, r, err)
-		return
-	}
-	if page.Items == nil {
-		page.Items = []*domain.EvidenceRequest{}
-	}
-	writeJSON(w, r, http.StatusOK, page)
+// isAssignee reports whether principalID is the request's assignee. A request
+// with no assignee has none, so an empty principal never matches it.
+func isAssignee(req *domain.EvidenceRequest, principalID string) bool {
+	return req.AssignedToPrincipalID != "" && req.AssignedToPrincipalID == principalID
 }
 
 // requireManageAuthz fetches the request (to learn its own legal entity)
@@ -256,13 +222,12 @@ func (h *pbcHandler) SendRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_correlation_id", "")
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	updated, err := h.store.SendEvidenceRequest(r.Context(), domain.SendEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, CorrelationID: correlationID, IfMatch: ifMatch})
-	if err != nil {
-		h.writePBCErr(w, r, err)
+	expected, ok := requireIfMatch(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, r, http.StatusOK, updated)
+	updated, err := h.store.SendEvidenceRequest(r.Context(), domain.SendEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, CorrelationID: correlationID, ExpectedVersion: expected})
+	h.writeCommandResult(w, r, updated, err)
 }
 
 type reassignRequestRequest struct {
@@ -287,13 +252,12 @@ func (h *pbcHandler) ReassignRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "new_assignee_principal_id")
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	updated, err := h.store.ReassignEvidenceRequest(r.Context(), domain.ReassignEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, NewAssigneePrincipalID: req.NewAssigneePrincipalID, IfMatch: ifMatch})
-	if err != nil {
-		h.writePBCErr(w, r, err)
+	expected, ok := requireIfMatch(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, r, http.StatusOK, updated)
+	updated, err := h.store.ReassignEvidenceRequest(r.Context(), domain.ReassignEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, NewAssigneePrincipalID: req.NewAssigneePrincipalID, ExpectedVersion: expected})
+	h.writeCommandResult(w, r, updated, err)
 }
 
 type extendDueDateRequest struct {
@@ -318,30 +282,44 @@ func (h *pbcHandler) ExtendDueDate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "new_due_at")
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	updated, err := h.store.ExtendDueDate(r.Context(), domain.ExtendDueDateParams{RequestID: requestID, TenantID: tenantID, NewDueAt: req.NewDueAt, IfMatch: ifMatch})
-	if err != nil {
-		h.writePBCErr(w, r, err)
+	expected, ok := requireIfMatch(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, r, http.StatusOK, updated)
+	updated, err := h.store.ExtendDueDate(r.Context(), domain.ExtendDueDateParams{RequestID: requestID, TenantID: tenantID, NewDueAt: req.NewDueAt, ExpectedVersion: expected})
+	h.writeCommandResult(w, r, updated, err)
 }
 
+// ViewRequest records that the assignee opened the request (SENT → VIEWED).
+// Only the assignee, holding EVIDENCE_REQUEST_SUBMIT_RESPONSE at the request's
+// entity, may record it (D-ER-29). It had no authorization: any principal in
+// the tenant could move the request and bump its version, so the manager's
+// next command was refused 412.
 func (h *pbcHandler) ViewRequest(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	updated, err := h.store.ViewEvidenceRequest(r.Context(), domain.ViewEvidenceRequestParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID, IfMatch: ifMatch})
+	requestID := chi.URLParam(r, "request_id")
+	evReq, err := h.store.GetEvidenceRequest(r.Context(), tenantID, requestID)
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, r, http.StatusOK, updated)
+	if !isAssignee(evReq, principalID) {
+		writeError(w, r, http.StatusForbidden, "authorization_denied", "only the request's assignee records a view")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, evReq.LegalEntityID, actionSubmitEvidenceResponse); err != nil {
+		h.writeAuthzErr(w, r, err)
+		return
+	}
+	updated, err := h.store.ViewEvidenceRequest(r.Context(), domain.ViewEvidenceRequestParams{RequestID: requestID, TenantID: tenantID})
+	h.writeCommandResult(w, r, updated, err)
 }
 
 type submitResponseRequest struct {
@@ -387,9 +365,8 @@ func (h *pbcHandler) SubmitResponse(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ifMatch := r.Header.Get("If-Match")
 	response, created, err := h.store.SubmitResponse(r.Context(), domain.SubmitResponseParams{
-		RequestID: requestID, TenantID: tenantID, SubmittedByPrincipalID: principalID, ArtifactDocumentID: req.ArtifactDocumentID, CorrelationID: req.CorrelationID, IfMatch: ifMatch,
+		RequestID: requestID, TenantID: tenantID, SubmittedByPrincipalID: principalID, ArtifactDocumentID: req.ArtifactDocumentID, CorrelationID: req.CorrelationID,
 	})
 	if err != nil {
 		h.writePBCErr(w, r, err)
@@ -443,8 +420,7 @@ func (h *pbcHandler) RecordScanResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_field", "result must be CLEAN or QUARANTINED")
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	updated, err := h.store.RecordScanResult(r.Context(), domain.ScanResultParams{ResponseID: responseID, TenantID: tenantID, Result: req.Result, IfMatch: ifMatch})
+	updated, err := h.store.RecordScanResult(r.Context(), domain.ScanResultParams{ResponseID: responseID, TenantID: tenantID, Result: req.Result})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -452,6 +428,10 @@ func (h *pbcHandler) RecordScanResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, updated)
 }
 
+// AcknowledgeReceipt records that a manager received a response. It needs
+// EVIDENCE_REQUEST_MANAGE at the parent request's legal entity (D-ER-29); it
+// had no authorization, so any principal in the tenant could acknowledge any
+// response.
 func (h *pbcHandler) AcknowledgeReceipt(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -461,8 +441,17 @@ func (h *pbcHandler) AcknowledgeReceipt(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	receipt, err := h.store.AcknowledgeReceipt(r.Context(), domain.AcknowledgeReceiptParams{ResponseID: chi.URLParam(r, "response_id"), TenantID: tenantID, AcknowledgedByPrincipalID: principalID, IfMatch: ifMatch})
+	responseID := chi.URLParam(r, "response_id")
+	evReq, err := h.store.GetResponseRequest(r.Context(), tenantID, responseID)
+	if err != nil {
+		h.writePBCErr(w, r, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, evReq.LegalEntityID, actionManageEvidenceRequest); err != nil {
+		h.writeAuthzErr(w, r, err)
+		return
+	}
+	receipt, err := h.store.AcknowledgeReceipt(r.Context(), domain.AcknowledgeReceiptParams{ResponseID: responseID, TenantID: tenantID, AcknowledgedByPrincipalID: principalID})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -479,6 +468,11 @@ type addNoteRequest struct {
 // client contributor" — visibility is stored on the note itself; a
 // caller-facing read path (not built here — no client-contributor portal
 // exists yet in this monorepo) would filter AUDIT_ONLY notes out.
+//
+// Authorization (D-ER-29): a SHARED note may come from the request's manager
+// or its assignee; an AUDIT_ONLY note only from a manager
+// (EVIDENCE_REQUEST_MANAGE at the request's entity), since it is hidden from
+// the contributor. It had no authorization at all.
 func (h *pbcHandler) AddNote(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -500,8 +494,15 @@ func (h *pbcHandler) AddNote(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_field", "visibility must be SHARED or AUDIT_ONLY")
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	note, err := h.store.AddRequestNote(r.Context(), domain.AddRequestNoteParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID, AuthorPrincipalID: principalID, Body: req.Body, Visibility: req.Visibility, IfMatch: ifMatch})
+	requestID := chi.URLParam(r, "request_id")
+	if req.Visibility == domain.NoteVisibilityAuditOnly {
+		if _, ok := h.requireManageAuthz(w, r, tenantID, principalID, requestID); !ok {
+			return
+		}
+	} else if _, ok := h.requireManagerOrAssignee(w, r, GateEnforce, tenantID, principalID, requestID); !ok {
+		return
+	}
+	note, err := h.store.AddRequestNote(r.Context(), domain.AddRequestNoteParams{RequestID: requestID, TenantID: tenantID, AuthorPrincipalID: principalID, Body: req.Body, Visibility: req.Visibility})
 	if err != nil {
 		h.writePBCErr(w, r, err)
 		return
@@ -530,13 +531,12 @@ func (h *pbcHandler) RequestClarification(w http.ResponseWriter, r *http.Request
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	updated, err := h.store.RequestClarification(r.Context(), domain.RequestClarificationParams{RequestID: requestID, TenantID: tenantID, Reason: req.Reason, IfMatch: ifMatch})
-	if err != nil {
-		h.writePBCErr(w, r, err)
+	expected, ok := requireIfMatch(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, r, http.StatusOK, updated)
+	updated, err := h.store.RequestClarification(r.Context(), domain.RequestClarificationParams{RequestID: requestID, TenantID: tenantID, Reason: req.Reason, ExpectedVersion: expected})
+	h.writeCommandResult(w, r, updated, err)
 }
 
 // MarkSatisfied is the real enforcement point for AUD-NEG-016 — see
@@ -562,13 +562,12 @@ func (h *pbcHandler) MarkSatisfied(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, r, err)
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	updated, err := h.store.MarkSatisfied(r.Context(), domain.MarkSatisfiedParams{RequestID: requestID, TenantID: tenantID, ActorPrincipalID: principalID, IfMatch: ifMatch})
-	if err != nil {
-		h.writePBCErr(w, r, err)
+	expected, ok := requireIfMatch(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, r, http.StatusOK, updated)
+	updated, err := h.store.MarkSatisfied(r.Context(), domain.MarkSatisfiedParams{RequestID: requestID, TenantID: tenantID, ActorPrincipalID: principalID, ExpectedVersion: expected})
+	h.writeCommandResult(w, r, updated, err)
 }
 
 func (h *pbcHandler) CloseRequest(w http.ResponseWriter, r *http.Request) {
@@ -584,13 +583,12 @@ func (h *pbcHandler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireManageAuthz(w, r, tenantID, principalID, requestID); !ok {
 		return
 	}
-	ifMatch := r.Header.Get("If-Match")
-	updated, err := h.store.CloseEvidenceRequest(r.Context(), domain.CloseEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, IfMatch: ifMatch})
-	if err != nil {
-		h.writePBCErr(w, r, err)
+	expected, ok := requireIfMatch(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, r, http.StatusOK, updated)
+	updated, err := h.store.CloseEvidenceRequest(r.Context(), domain.CloseEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, ExpectedVersion: expected})
+	h.writeCommandResult(w, r, updated, err)
 }
 
 func (h *pbcHandler) writeDocumentErr(w http.ResponseWriter, r *http.Request, err error) {
@@ -604,7 +602,23 @@ func (h *pbcHandler) writeDocumentErr(w http.ResponseWriter, r *http.Request, er
 	}
 }
 
+// writeCommandResult answers a request command: the updated request with its
+// new ETag, or the refusal.
+func (h *pbcHandler) writeCommandResult(w http.ResponseWriter, r *http.Request, updated *domain.EvidenceRequest, err error) {
+	if err != nil {
+		h.writePBCErr(w, r, err)
+		return
+	}
+	apicontract.WriteETag(w, updated.RecordVersion)
+	writeJSON(w, r, http.StatusOK, updated)
+}
+
 func (h *pbcHandler) writePBCErr(w http.ResponseWriter, r *http.Request, err error) {
+	var stale *domain.StaleVersionError
+	if errors.As(err, &stale) {
+		writeStale(w, r, stale.Current)
+		return
+	}
 	switch {
 	case errors.Is(err, domain.ErrEvidenceRequestNotFound):
 		writeError(w, r, http.StatusNotFound, "evidence_request_not_found", "")
@@ -621,7 +635,7 @@ func (h *pbcHandler) writePBCErr(w http.ResponseWriter, r *http.Request, err err
 	case errors.Is(err, domain.ErrInvalidIdentifier):
 		writeError(w, r, http.StatusBadRequest, "invalid_identifier", domain.ErrInvalidIdentifier.Error())
 	default:
-		h.log.Error("pbc store error")
+		h.log.Error("pbc store error", zap.Error(err))
 		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 	}
 }

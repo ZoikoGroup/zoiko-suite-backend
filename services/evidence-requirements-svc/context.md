@@ -180,25 +180,31 @@ engine, so the boundary needs to be exact. The clean framing:
 
 ## 4. API surface
 
-Mirrors `jurisdiction-rules-svc`'s proven split: public read paths plus a
-separate `/v1/admin/...` namespace for catalog mutation
-(`internal/handler/handler.go:112-121`).
+Mirrors `jurisdiction-rules-svc`'s split: public read paths plus a separate
+`/v1/admin/...` namespace for catalog mutation.
 
-The contract is `openapi.yaml` (21 Oct 2026; kin-openapi valid, route parity
-tested). Every route sits behind the identity-envelope gate; errors are RFC
-9457 problem documents with the §16 `error_class`.
+The contract is `openapi.yaml` (1.4.0, 5 Nov 2026; kin-openapi valid, route
+parity tested). Every route sits behind the identity-envelope gate; errors are
+RFC 9457 problem documents with the §16 `error_class`. Requirements and
+evidence requests carry `record_version`, served as the ETag `"v<n>"`; every
+manager command requires If-Match (API-3, SPEC_DEVIATIONS D-ER-21). The lists
+are API-4 pages: `filter[...]`, `page_size`, signed `cursor` (D-ER-22).
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/evidence/evaluate` | **The point of the service.** Sufficiency determination for one pending action. Authorized on `EVIDENCE_EVALUATE` at the legal entity, which must exist in the caller's tenant. Publishes `evidence.requirement.satisfied` or `evidence.requirement.missing` through the outbox. Idempotent on `Idempotency-Key` (a changed body is 409). See §5. |
-| `GET` | `/v1/evidence-requirements` | List the caller's tenant catalogue. The scope is the verified tenant (`?tenant_id` may only repeat it); filters `legal_entity_id`, `domain_code`, `action_type`, `as_of` (`now`, or RFC 3339; omitted = full history). `EVIDENCE_REQUIREMENT_READ`. |
-| `GET` | `/v1/evidence-requirements/{evidence_requirement_id}` | Get one. `EVIDENCE_REQUIREMENT_READ` at its entity (PLATFORM if tenant-wide). |
-| `GET` | `/v1/evidence/evaluations/{evaluation_id}` | Retrieve a past determination as evidence. `EVIDENCE_EVALUATION_READ` at its entity. |
-| `POST` | `/v1/admin/evidence-requirements` | Create a requirement. `EVIDENCE_REQUIREMENT_CREATE` at its entity, or PLATFORM for a tenant-wide one. `requirement_payload` must match `{minimum_count, artifact_subtype, description}`. Idempotent on `Idempotency-Key`. |
-| `POST` | `/v1/admin/evidence-requirements/{id}/end-date` | Retire by setting `effective_to` (after `effective_from`, not retroactive). `EVIDENCE_REQUIREMENT_RETIRE`. Never a DELETE. |
-| `…` | `/v1/pbc/requests…`, `/v1/pbc/responses…` | Provided-by-client evidence requests (see `openapi.yaml`). |
-| `GET` | `/healthz` | Liveness. |
-| `GET` | `/readyz` | Readiness (DB connectivity). |
+| `POST` | `/v1/evidence/evaluate` | **The point of the service.** Sufficiency determination for one pending action. `EVIDENCE_EVALUATE` at the legal entity, which must exist in the caller's tenant. SUPPORTING_DOCUMENT, EVIDENCE_MANIFEST and SIGNATURE references are confirmed with their owner; an owner that cannot answer is 503 and nothing is recorded. Publishes `evidence.requirement.satisfied` / `.missing` through the outbox. Idempotent on `Idempotency-Key` (a changed body is 409). See §5. |
+| `GET` | `/v1/evidence/evaluations` | The evaluation ledger, newest first. `filter[outcome|domain_code|action_type|legal_entity_id|since]`. `EVIDENCE_EVALUATION_READ`. |
+| `GET` | `/v1/evidence/evaluations/{evaluation_id}` | A past determination. `EVIDENCE_EVALUATION_READ` at its entity. |
+| `GET` | `/v1/evidence/summary` | The console's KPI row. `EVIDENCE_REQUIREMENT_READ` at PLATFORM. |
+| `GET` | `/v1/evidence-requirements` | The caller's tenant catalogue (`?tenant_id` may only repeat it). `filter[legal_entity_id|domain_code|action_type|evidence_type|as_of]`. `EVIDENCE_REQUIREMENT_READ`. |
+| `GET` | `/v1/evidence-requirements/{evidence_requirement_id}` | One requirement, with its ETag. `EVIDENCE_REQUIREMENT_READ` at its entity (PLATFORM if tenant-wide). |
+| `POST` | `/v1/admin/evidence-requirements` | Create. `EVIDENCE_REQUIREMENT_CREATE` at its entity, or PLATFORM for a tenant-wide one. `requirement_payload` must match `{minimum_count, artifact_subtype, description}`. Idempotent on `Idempotency-Key`. |
+| `POST` | `/v1/admin/evidence-requirements/{id}/end-date` | Retire by setting `effective_to`. `EVIDENCE_REQUIREMENT_RETIRE`, If-Match required. Never a DELETE. |
+| `…` | `/v1/pbc/requests…`, `/v1/pbc/responses…` | Evidence requests (PBC). The register is read under `EVIDENCE_REQUEST_MANAGE`; send/reassign/extend/clarify/mark-satisfied/close need If-Match. See `openapi.yaml`. |
+| `GET` | `/healthz` `/readyz` `/metrics` | Liveness, readiness (DB), Prometheus. |
+
+At the edge: `https://<gateway>/evidence-requirements/...` through Traefik with
+the gateway-auth ForwardAuth (D-ER-28).
 
 **Consumed events:** none in v1. Evaluation is synchronous request/response
 because it is a **blocking precondition** on a caller's in-flight
@@ -384,30 +390,25 @@ the store/authz/Kafka corrections from `purchase-order-svc` per §2.1.
 
 ---
 
-## 9. Why now: the constraint is currently unenforced
+## 9. Who calls the gate (state on 5 Nov 2026)
 
-> **State on 21 Oct 2026 (supersedes the table below).** Three services call
-> the gate: board-resolutions-svc (pass), corporate-actions-svc (execute) and
-> filing-preparation-svc (validate). general-ledger-svc, financial-close-svc,
-> vat-gst-svc and corporate-tax-svc still have no gate, and the three callers
-> still send an incomplete envelope and two treat any outcome other than
-> MISSING as a pass. All seven are outside the Identity and Governance
-> domains and are tracked in the Governance audit as caller-side gaps; this
-> service's side of the contract is complete.
+§8.6 says *"No finalization path may skip required evidence states."* This
+service's side of that contract is built and proven live; the gaps are on the
+callers' side and belong to their owners (progress.md "Cross-team follow-ups"):
 
-§8.6 says *"No finalization path may skip required evidence states."*
-Every finalization path built to date skips them, because there is nothing
-to call. Verified by direct route inspection, with **zero references to
-`evidence-requirements` anywhere in `services/`**:
-
-| Service | Terminal route | Evidence gate today |
+| Service | Terminal route | Evidence gate |
 | --- | --- | --- |
-| `general-ledger-svc` | `POST /v1/journals/{journal_id}/post` (`handler.go:68`) | none |
-| `financial-close-svc` | `POST /v1/close/periods/{id}/lock` (`handler.go:80`) | none |
-| `board-resolutions-svc` | resolution pass | none |
-| `corporate-actions-svc` | action execute | none |
+| `board-resolutions-svc` | resolution pass | calls evaluate; envelope incomplete |
+| `corporate-actions-svc` | action execute | calls evaluate; envelope incomplete; passes any outcome but MISSING (fails open) |
+| `filing-preparation-svc` | validate | calls evaluate; envelope incomplete; passes any outcome but MISSING (fails open) |
+| `general-ledger-svc` | `POST /v1/journals/{journal_id}/post` | none |
+| `financial-close-svc` | `POST /v1/close/periods/{id}/lock` | none |
 | `vat-gst-svc` | return filing | none |
 | `corporate-tax-svc` | return submission | none |
+
+A caller must treat only SATISFIED as a pass: MISSING blocks, and
+NO_REQUIREMENTS_DEFINED is the caller's decision (D-ER-5), never an implicit
+pass.
 
 ### 9.1 Retrofit exactly two call sites in v1
 
@@ -528,24 +529,17 @@ a *caller* does with `NO_REQUIREMENTS_DEFINED` is the open question.
 
 ---
 
-## 12. Build sequencing & environment
+## 12. Build & environment (5 Nov 2026)
 
-Dependencies, all already built and running in
-`deployments/docker-compose.yml`: `postgres`, `kafka`, `authorization-svc`
-(admin gating), and `document-vault-svc` (only if §11.2 resolves to (b)).
+Runs in `deployments/docker-compose.yml` as `evidence-requirements-svc`
+(image built from the repository root). Live dependencies: postgres, kafka,
+authorization-svc, identity-context-svc, tenant-entity-registry-svc,
+document-vault-svc, evidence-manifest-svc; esignature-integration-svc runs in
+the phase7 stack and is reached through the host port. RUNBOOK.md has the
+configuration, start-up refusals and operations.
 
-**Environment as of 2026-07-27, stated plainly:**
-- **Docker: available**, daemon live (server 29.3.1). So compilation *can*
-  be genuinely verified via the Dockerfile build stage, and a full HTTP
-  lifecycle *can* be exercised against real Postgres/Kafka — the same
-  route `purchase-order-svc` took.
-- **Go toolchain: not installed.** `go build`, `go vet`, `go test`, and
-  `go mod tidy` cannot be run locally. `handler_test.go` and
-  `tenant_isolation_test.go` will be written but **cannot be executed
-  here** — they need a real CI run or a machine with Go.
-
-That gap is recorded here and tracked in `progress.md` rather than glossed
-over, per this project's own hard-won lesson from the Kubernetes
-`kind_run_log.md` fabricated-boot-evidence incident (commit `7377db4`):
-**do not claim verification that did not actually happen.** `progress.md`
-distinguishes "written" from "verified" for exactly this reason.
+Go 1.26 is installed on the host. Windows Application Control blocks host
+test binaries, so the suite runs in a throwaway `golang:1.26-alpine`
+container against a scratch Postgres (progress.md records the command). The
+store suites run against real Postgres with no skips, including the
+integration-tagged isolation suite and an RLS check as a NOBYPASSRLS role.

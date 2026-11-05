@@ -42,6 +42,9 @@ type EvidenceRequest struct {
 	CorrelationID         string                `json:"correlation_id"`
 	CreatedAt             time.Time             `json:"created_at"`
 	IsOverdue             bool                  `json:"is_overdue"`
+	// RecordVersion is the API-3 version (migration 000010), served as the
+	// ETag "v<n>". Every manager command requires it in If-Match.
+	RecordVersion int64 `json:"record_version"`
 }
 
 // EvidenceRequestResponse is append-only — SubmitResponse always inserts
@@ -94,61 +97,64 @@ type CreateEvidenceRequestParams struct {
 	DueAt                                                                                                   time.Time
 }
 
+// ExpectedVersion on the six manager commands below is the API-3 If-Match
+// version: the command applies only while the request is still at that
+// record_version. 0 means unconditional, which only "If-Match: *" produces.
+// Submit, view, scan, note and acknowledge take no version: they are the
+// contributor's and the scanner's own actions on an open request, not edits
+// of it. Submit and view do move the request's status, so they bump
+// record_version, and a manager holding an older ETag is refused with 412.
+
 type SendEvidenceRequestParams struct {
 	RequestID, TenantID, CorrelationID string
-	IfMatch                            string
+	ExpectedVersion                    int64
 }
 
 type ReassignEvidenceRequestParams struct {
 	RequestID, TenantID, NewAssigneePrincipalID string
-	IfMatch                                     string
+	ExpectedVersion                             int64
 }
 
 type ExtendDueDateParams struct {
 	RequestID, TenantID string
 	NewDueAt            time.Time
-	IfMatch             string
+	ExpectedVersion     int64
 }
 
 type ViewEvidenceRequestParams struct {
 	RequestID, TenantID string
-	IfMatch             string
 }
 
 type SubmitResponseParams struct {
 	RequestID, TenantID, SubmittedByPrincipalID, CorrelationID string
 	ArtifactDocumentID                                         *string
-	IfMatch                                                    string
 }
 
 type ScanResultParams struct {
 	ResponseID, TenantID, Result string
-	IfMatch                      string
 }
 
 type AcknowledgeReceiptParams struct {
 	ResponseID, TenantID, AcknowledgedByPrincipalID string
-	IfMatch                                         string
 }
 
 type AddRequestNoteParams struct {
 	RequestID, TenantID, AuthorPrincipalID, Body, Visibility string
-	IfMatch                                                  string
 }
 
 type RequestClarificationParams struct {
 	RequestID, TenantID, Reason string
-	IfMatch                     string
+	ExpectedVersion             int64
 }
 
 type MarkSatisfiedParams struct {
 	RequestID, TenantID, ActorPrincipalID string
-	IfMatch                               string
+	ExpectedVersion                       int64
 }
 
 type CloseEvidenceRequestParams struct {
 	RequestID, TenantID string
-	IfMatch             string
+	ExpectedVersion     int64
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────

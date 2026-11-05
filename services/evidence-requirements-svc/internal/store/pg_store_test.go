@@ -283,7 +283,7 @@ func TestPgStore_MalformedUUID_ReadsAsAbsent(t *testing.T) {
 		t.Fatal("malformed evaluation id somehow matched a row")
 	}
 
-	_, err = s.EndDateRequirement(ctx, tenantID, "not-a-uuid", time.Now(), "reason", "actor", "")
+	_, err = s.EndDateRequirement(ctx, tenantID, "not-a-uuid", time.Now(), "reason", "actor", 0)
 	if !errors.Is(err, domain.ErrRequirementNotFound) {
 		t.Fatalf("EndDateRequirement err = %v, want ErrRequirementNotFound — a malformed "+
 			"id names no requirement, so \"already retired\" would be a claim about a "+
@@ -305,7 +305,7 @@ func TestPgStore_EndDateRequirement_RetiresWithoutDeleting(t *testing.T) {
 	}
 
 	retireAt := time.Now().UTC()
-	retired, err := s.EndDateRequirement(ctx, tenantID, r.EvidenceRequirementID, retireAt, "superseded by policy", "retirer-1", "")
+	retired, err := s.EndDateRequirement(ctx, tenantID, r.EvidenceRequirementID, retireAt, "superseded by policy", "retirer-1", 0)
 	if err != nil {
 		t.Fatalf("EndDateRequirement: %v", err)
 	}
@@ -321,13 +321,13 @@ func TestPgStore_EndDateRequirement_RetiresWithoutDeleting(t *testing.T) {
 	}
 
 	// Re-retiring is 422 already_retired, never a silent no-op.
-	if _, err := s.EndDateRequirement(ctx, tenantID, r.EvidenceRequirementID, retireAt, "again", "retirer-2", ""); !errors.Is(err, domain.ErrAlreadyRetired) {
+	if _, err := s.EndDateRequirement(ctx, tenantID, r.EvidenceRequirementID, retireAt, "again", "retirer-2", 0); !errors.Is(err, domain.ErrAlreadyRetired) {
 		t.Errorf("re-retire err = %v, want ErrAlreadyRetired", err)
 	}
 
 	// Retiring something that does not exist is a different fact from retiring
 	// something already retired, and must not be collapsed into one answer.
-	if _, err := s.EndDateRequirement(ctx, tenantID, uuid.New().String(), retireAt, "x", "y", ""); !errors.Is(err, domain.ErrRequirementNotFound) {
+	if _, err := s.EndDateRequirement(ctx, tenantID, uuid.New().String(), retireAt, "x", "y", 0); !errors.Is(err, domain.ErrRequirementNotFound) {
 		t.Errorf("retire-unknown err = %v, want ErrRequirementNotFound", err)
 	}
 }
@@ -345,7 +345,7 @@ func TestPgStore_EndDateRequirement_OtherTenant_IsNotFound(t *testing.T) {
 
 	_, err := s.EndDateRequirement(
 		svcmiddleware.WithTenant(context.Background(), intruder),
-		intruder, r.EvidenceRequirementID, time.Now(), "not mine", "intruder", "")
+		intruder, r.EvidenceRequirementID, time.Now(), "not mine", "intruder", 0)
 	if !errors.Is(err, domain.ErrRequirementNotFound) {
 		t.Fatalf("cross-tenant retire err = %v, want ErrRequirementNotFound", err)
 	}
@@ -421,7 +421,7 @@ func TestPgStore_EffectiveRequirements_ScopeAndPointInTime(t *testing.T) {
 	// Retire the tenant-wide one and confirm it drops out at a later asOf while
 	// remaining in force at an instant before its end date.
 	retireAt := now.Add(time.Minute)
-	if _, err := s.EndDateRequirement(ctx, tenantID, tenantWide.EvidenceRequirementID, retireAt, "superseded", "retirer", ""); err != nil {
+	if _, err := s.EndDateRequirement(ctx, tenantID, tenantWide.EvidenceRequirementID, retireAt, "superseded", "retirer", 0); err != nil {
 		t.Fatalf("EndDateRequirement: %v", err)
 	}
 
@@ -462,7 +462,7 @@ func TestPgStore_ListRequirements_ZeroAsOfIncludesRetired(t *testing.T) {
 		t.Fatalf("create to-retire: %v", err)
 	}
 	retireAt := time.Now().UTC()
-	if _, err := s.EndDateRequirement(ctx, tenantID, gone.EvidenceRequirementID, retireAt, "superseded", "retirer", ""); err != nil {
+	if _, err := s.EndDateRequirement(ctx, tenantID, gone.EvidenceRequirementID, retireAt, "superseded", "retirer", 0); err != nil {
 		t.Fatalf("EndDateRequirement: %v", err)
 	}
 

@@ -1,341 +1,1584 @@
 {
   "info": {
-    "name": "evidence-requirements-svc API",
-    "description": "Evidence Requirements Service API — Governance Platform 7/7. Determines what supporting evidence must exist before an action may be completed.",
-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
-    "_exporter_id": "zoiko-suite"
+    "name": "evidence-requirements-svc",
+    "_postman_id": "evidence-requirements-svc-1.5.0",
+    "description": "Generated from openapi.yaml 1.5.0. Every request sends the canonical envelope; POSTs send an Idempotency-Key; manager commands send If-Match.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
-    { "key": "baseUrl", "value": "http://localhost:8130", "type": "string" },
-    { "key": "token", "value": "", "type": "string" },
-    { "key": "tenantId", "value": "", "type": "string" },
-    { "key": "legalEntityId", "value": "", "type": "string" },
-    { "key": "correlationId", "value": "", "type": "string" },
-    { "key": "idempotencyKey", "value": "", "type": "string" },
-    { "key": "ifMatch", "value": "", "type": "string" },
-    { "key": "requirementId", "value": "", "type": "string" },
-    { "key": "requestId", "value": "", "type": "string" },
-    { "key": "responseId", "value": "", "type": "string" }
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8130"
+    },
+    {
+      "key": "tenant_id",
+      "value": "11111111-1111-1111-1111-111111111111"
+    },
+    {
+      "key": "principal_id",
+      "value": "33333333-3333-3333-3333-333333333333"
+    },
+    {
+      "key": "legal_entity_id",
+      "value": "22222222-2222-2222-2222-222222222222"
+    },
+    {
+      "key": "envelope",
+      "value": ""
+    },
+    {
+      "key": "assignee",
+      "value": "66666666-6666-6666-6666-666666666666"
+    },
+    {
+      "key": "requirement_id",
+      "value": ""
+    },
+    {
+      "key": "evaluation_id",
+      "value": ""
+    },
+    {
+      "key": "request_id",
+      "value": ""
+    },
+    {
+      "key": "response_id",
+      "value": ""
+    },
+    {
+      "key": "document_id",
+      "value": ""
+    },
+    {
+      "key": "record_version",
+      "value": "1"
+    },
+    {
+      "key": "next_cursor",
+      "value": ""
+    }
   ],
-  "auth": {
-    "type": "bearer",
-    "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }]
-  },
   "item": [
     {
-      "name": "Health & Readiness",
+      "name": "evaluation",
       "item": [
         {
-          "name": "Liveness",
-          "request": { "method": "GET", "url": "{{baseUrl}}/healthz" }
-        },
-        {
-          "name": "Readiness",
-          "request": { "method": "GET", "url": "{{baseUrl}}/readyz" }
-        },
-        {
-          "name": "Metrics",
-          "request": { "method": "GET", "url": "{{baseUrl}}/metrics" }
-        }
-      ]
-    },
-    {
-      "name": "Evidence Evaluation",
-      "item": [
-        {
-          "name": "Evaluate Evidence",
+          "name": "evaluate",
           "request": {
             "method": "POST",
-            "url": "{{baseUrl}}/v1/evidence/evaluate",
             "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "X-Legal-Entity-Id", "value": "{{legalEntityId}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/evidence/evaluate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "evidence",
+                "evaluate"
+              ]
+            },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"domain_code\": \"FINANCE\",\n  \"action_type\": \"JOURNAL_POST\",\n  \"correlation_id\": \"{{correlationId}}\",\n  \"present_artifacts\": [\n    { \"evidence_type\": \"SUPPORTING_DOCUMENT\", \"reference_id\": \"<document-id>\" }\n  ]\n}"
+              "raw": "{\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"domain_code\": \"FINANCE\",\n  \"action_type\": \"JOURNAL_POST\",\n  \"correlation_id\": \"{{$guid}}\",\n  \"present_artifacts\": [\n    {\n      \"evidence_type\": \"SUPPORTING_DOCUMENT\",\n      \"reference_id\": \"{{document_id}}\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             }
           }
         },
         {
-          "name": "Evaluate — Idempotency Replay",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/evidence/evaluate",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "X-Legal-Entity-Id", "value": "{{legalEntityId}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"domain_code\": \"FINANCE\",\n  \"action_type\": \"JOURNAL_POST\",\n  \"correlation_id\": \"{{correlationId}}\",\n  \"present_artifacts\": [\n    { \"evidence_type\": \"SUPPORTING_DOCUMENT\", \"reference_id\": \"<document-id>\" }\n  ]\n}"
-            }
-          }
-        },
-        {
-          "name": "Get Evaluation",
-          "request": { "method": "GET", "url": "{{baseUrl}}/v1/evidence/evaluations/{{evaluationId}}" }
-        },
-        {
-          "name": "List Evaluations (Cursor)",
+          "name": "listEvaluations",
           "request": {
             "method": "GET",
-            "url": "{{baseUrl}}/v1/evidence/evaluations?page_size=20&cursor={{cursor}}"
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/evidence/evaluations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "evidence",
+                "evaluations"
+              ],
+              "query": [
+                {
+                  "key": "filter[outcome]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[domain_code]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[action_type]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[legal_entity_id]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[since]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "page_size",
+                  "value": "50"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{next_cursor}}",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "The evaluation register, newest first. Authorized under EVIDENCE_EVALUATION_READ at filter[legal_entity_id], PLATFORM when unfiltered."
           }
         },
         {
-          "name": "Evidence Summary",
-          "request": { "method": "GET", "url": "{{baseUrl}}/v1/evidence/summary" }
-        }
-      ]
-    },
-    {
-      "name": "Requirement Catalogue",
-      "item": [
-        {
-          "name": "List Requirements",
+          "name": "getEvaluation",
           "request": {
             "method": "GET",
-            "url": "{{baseUrl}}/v1/evidence-requirements?page_size=20&legal_entity_id={{legalEntityId}}"
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/evidence/evaluations/{{evaluation_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "evidence",
+                "evaluations",
+                "{{evaluation_id}}"
+              ]
+            }
           }
         },
         {
-          "name": "List Requirements (Cursor)",
+          "name": "getEvidenceSummary",
           "request": {
             "method": "GET",
-            "url": "{{baseUrl}}/v1/evidence-requirements/cursor?page_size=20&cursor={{cursor}}"
-          }
-        },
-        {
-          "name": "Get Requirement",
-          "request": { "method": "GET", "url": "{{baseUrl}}/v1/evidence-requirements/{{requirementId}}" }
-        },
-        {
-          "name": "Create Requirement",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/admin/evidence-requirements",
             "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
             ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"domain_code\": \"FINANCE\",\n  \"action_type\": \"JOURNAL_POST\",\n  \"evidence_type\": \"SUPPORTING_DOCUMENT\",\n  \"requirement_payload\": { \"minimum_count\": 1 },\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
-            }
-          }
-        },
-        {
-          "name": "End-Date Requirement",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/admin/evidence-requirements/{{requirementId}}/end-date",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"reason\": \"superseded by new policy\",\n  \"effective_to\": \"2026-12-31T23:59:59Z\",\n  \"if_match\": \"{{ifMatch}}\"\n}"
-            }
-          }
-        }
-      ]
-    },
-    {
-      "name": "PBC Requests",
-      "item": [
-        {
-          "name": "Create PBC Request",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"requirement_id\": \"{{requirementId}}\",\n  \"title\": \"Provide supporting documentation\",\n  \"description\": \"Please provide the signed contract and bank statements for the period.\",\n  \"assigned_to_principal_id\": \"<assignee-principal-id>\",\n  \"due_at\": \"2026-12-31T23:59:59Z\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
-            }
-          }
-        },
-        {
-          "name": "List Open Requests",
-          "request": {
-            "method": "GET",
-            "url": "{{baseUrl}}/v1/pbc/requests"
-          }
-        },
-        {
-          "name": "List Open Requests (Cursor)",
-          "request": {
-            "method": "GET",
-            "url": "{{baseUrl}}/v1/pbc/requests/cursor?page_size=20&cursor={{cursor}}"
-          }
-        },
-        {
-          "name": "Get Request",
-          "request": { "method": "GET", "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}" }
-        },
-        {
-          "name": "Send Request",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/send",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": { "mode": "raw", "raw": "{}" }
-          }
-        },
-        {
-          "name": "Reassign Request",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/reassign",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"new_assignee_principal_id\": \"<new-assignee-principal-id>\"\n}"
-            }
-          }
-        },
-        {
-          "name": "Extend Due Date",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/extend-due-date",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"new_due_at\": \"2027-01-31T23:59:59Z\"\n}"
-            }
-          }
-        },
-        {
-          "name": "View Request",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/view",
-            "header": [
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false }
-            ],
-            "body": { "mode": "raw", "raw": "{}" }
-          }
-        },
-        {
-          "name": "Submit Response",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/responses",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"artifact_document_id\": \"<document-id>\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
-            }
-          }
-        },
-        {
-          "name": "Add Note",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/notes",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"body\": \"Please see the attached documents.\",\n  \"visibility\": \"SHARED\"\n}"
-            }
-          }
-        },
-        {
-          "name": "Request Clarification",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/clarify",
-            "header": [
-              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"reason\": \"The bank statement is missing page 3.\"\n}"
-            }
-          }
-        },
-        {
-          "name": "Mark Satisfied",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/mark-satisfied",
-            "header": [
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false }
-            ],
-            "body": { "mode": "raw", "raw": "{}" }
-          }
-        },
-        {
-          "name": "Close Request",
-          "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/close",
-            "header": [
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false }
-            ],
-            "body": { "mode": "raw", "raw": "{}" }
+            "url": {
+              "raw": "{{baseUrl}}/v1/evidence/summary",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "evidence",
+                "summary"
+              ]
+            },
+            "description": "The console KPI row and panels. Tenant-wide (EVIDENCE_REQUIREMENT_READ at PLATFORM). A count that cannot be read is a 503, never a 0."
           }
         }
       ]
     },
     {
-      "name": "PBC Responses",
+      "name": "catalogue",
       "item": [
         {
-          "name": "Record Scan Result",
+          "name": "listRequirements",
           "request": {
-            "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/responses/{{responseId}}/scan-result",
+            "method": "GET",
             "header": [
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
-              { "key": "Content-Type", "value": "application/json" }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
             ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"result\": \"CLEAN\"\n}"
+            "url": {
+              "raw": "{{baseUrl}}/v1/evidence-requirements",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "evidence-requirements"
+              ],
+              "query": [
+                {
+                  "key": "filter[legal_entity_id]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[domain_code]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[action_type]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[evidence_type]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[as_of]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "page_size",
+                  "value": "50"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{next_cursor}}",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "The caller's tenant catalogue. Authorized under EVIDENCE_REQUIREMENT_READ at filter[legal_entity_id], PLATFORM when unfiltered."
+          }
+        },
+        {
+          "name": "getRequirement",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/evidence-requirements/{{requirement_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "evidence-requirements",
+                "{{requirement_id}}"
+              ]
             }
           }
         },
         {
-          "name": "Acknowledge Receipt",
+          "name": "createRequirement",
           "request": {
             "method": "POST",
-            "url": "{{baseUrl}}/v1/pbc/responses/{{responseId}}/acknowledge",
             "header": [
-              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false }
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
-            "body": { "mode": "raw", "raw": "{}" }
+            "url": {
+              "raw": "{{baseUrl}}/v1/admin/evidence-requirements",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "evidence-requirements"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenant_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"domain_code\": \"FINANCE\",\n  \"action_type\": \"JOURNAL_POST\",\n  \"evidence_type\": \"SUPPORTING_DOCUMENT\",\n  \"requirement_payload\": {\n    \"minimum_count\": 1\n  },\n  \"correlation_id\": \"{{$guid}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "endDateRequirement",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"v{{record_version}}\"",
+                "description": "The ETag of your last read (API-3); 428 without, 412 when stale"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/admin/evidence-requirements/{{requirement_id}}/end-date",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "evidence-requirements",
+                "{{requirement_id}}",
+                "end-date"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"superseded\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "pbc",
+      "item": [
+        {
+          "name": "createEvidenceRequest",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"title\": \"Q3 bank confirmation\",\n  \"assigned_to_principal_id\": \"{{assignee}}\",\n  \"due_at\": \"2026-12-31T00:00:00Z\",\n  \"correlation_id\": \"{{$guid}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "listEvidenceRequests",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests"
+              ],
+              "query": [
+                {
+                  "key": "filter[legal_entity_id]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[status]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "filter[open]",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "page_size",
+                  "value": "50"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{next_cursor}}",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "The evidence request register, soonest due first. Without filter[status] it lists open\nrequests (not SATISFIED or CLOSED); filter[open]=false lists all. Authorized under\nEVIDENCE_REQUEST_MANAGE at filter[legal_entity_id], PLATFORM when unfiltered.\n"
+          }
+        },
+        {
+          "name": "getEvidenceRequest",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}"
+              ]
+            },
+            "description": "One request, with its ETag. Authorized at the request's legal entity (D-ER-29): the assignee under EVIDENCE_REQUEST_SUBMIT_RESPONSE, anyone else under EVIDENCE_REQUEST_MANAGE."
+          }
+        },
+        {
+          "name": "sendEvidenceRequest",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"v{{record_version}}\"",
+                "description": "The ETag of your last read (API-3); 428 without, 412 when stale"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "send"
+              ]
+            },
+            "description": "DRAFT to SENT."
+          }
+        },
+        {
+          "name": "reassignEvidenceRequest",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"v{{record_version}}\"",
+                "description": "The ETag of your last read (API-3); 428 without, 412 when stale"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/reassign",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "reassign"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_assignee_principal_id\": \"{{assignee}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "extendEvidenceRequestDueDate",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"v{{record_version}}\"",
+                "description": "The ETag of your last read (API-3); 428 without, 412 when stale"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/extend-due-date",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "extend-due-date"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_due_at\": \"2027-01-15T00:00:00Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "viewEvidenceRequest",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/view",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "view"
+              ]
+            },
+            "description": "The assignee opened it (SENT to VIEWED). Only the assignee, holding EVIDENCE_REQUEST_SUBMIT_RESPONSE at the request's entity, records a view (D-ER-29); anyone else is 403 and the version is unchanged. No If-Match: an action on the request, not an edit of it; it bumps record_version."
+          }
+        },
+        {
+          "name": "submitEvidenceResponse",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "responses"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"artifact_document_id\": \"{{document_id}}\",\n  \"correlation_id\": \"{{$guid}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Appends a new response version. No If-Match; it bumps the request's record_version."
+          }
+        },
+        {
+          "name": "addEvidenceRequestNote",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/notes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "notes"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"body\": \"chasing\",\n  \"visibility\": \"SHARED\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Appends a note (append-only; no If-Match). A SHARED note may come from the assignee (EVIDENCE_REQUEST_SUBMIT_RESPONSE) or a manager (EVIDENCE_REQUEST_MANAGE); an AUDIT_ONLY note, hidden from the contributor, only from a manager. Both at the request's entity (D-ER-29)."
+          }
+        },
+        {
+          "name": "requestEvidenceClarification",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"v{{record_version}}\"",
+                "description": "The ETag of your last read (API-3); 428 without, 412 when stale"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/clarify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "clarify"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"INCOMPLETE: the statement is cut off\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "markEvidenceRequestSatisfied",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"v{{record_version}}\"",
+                "description": "The ETag of your last read (API-3); 428 without, 412 when stale"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/mark-satisfied",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "mark-satisfied"
+              ]
+            }
+          }
+        },
+        {
+          "name": "closeEvidenceRequest",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"v{{record_version}}\"",
+                "description": "The ETag of your last read (API-3); 428 without, 412 when stale"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/requests/{{request_id}}/close",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "requests",
+                "{{request_id}}",
+                "close"
+              ]
+            }
+          }
+        },
+        {
+          "name": "recordScanResult",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/responses/{{response_id}}/scan-result",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "responses",
+                "{{response_id}}",
+                "scan-result"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"result\": \"CLEAN\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "The scanner's callback (EVIDENCE_REQUEST_MANAGE, interim, D-ER-2). Updates the response, not the request; no If-Match."
+          }
+        },
+        {
+          "name": "acknowledgeEvidenceResponse",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/pbc/responses/{{response_id}}/acknowledge",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "pbc",
+                "responses",
+                "{{response_id}}",
+                "acknowledge"
+              ]
+            },
+            "description": "A manager acknowledges receipt of a response: EVIDENCE_REQUEST_MANAGE at the parent request's entity (D-ER-29). Appends a receipt (append-only; no If-Match)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "probes",
+      "item": [
+        {
+          "name": "liveness",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/healthz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            }
+          }
+        },
+        {
+          "name": "readiness",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenant_id}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principal_id}}"
+              },
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legal_entity_id}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "api"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/readyz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "readyz"
+              ]
+            }
           }
         }
       ]

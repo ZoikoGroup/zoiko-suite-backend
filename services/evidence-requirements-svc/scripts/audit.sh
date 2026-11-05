@@ -1,196 +1,168 @@
 #!/usr/bin/env bash
-# evidence-requirements-svc — Audit Script
-# Runs the complete audit checklist for the service.
-# Usage: ./scripts/audit.sh [--live] [--base-url http://localhost:8130]
+# Audit test — evidence-requirements-svc only.
+#
+# Re-runnable proof, against the running stack, that this service does what
+# its spec says: static checks, live health, the allow path, every refusal, the
+# API-3 / API-4 contract, telemetry, and the OpenAPI contract. The dependency
+# edges (document vault, manifest, Kafka, gateway, …) are proven by
+# deployments/scripts/e2e-evidence-requirements-deps.py; this script proves the
+# service's own behaviour.
+#
+# Requires: the service on $B (default http://127.0.0.1:8130), identity-context
+# on $IDENTITY (default :8080) for a real envelope, the demo seeds, a Go
+# toolchain, curl, and python on PATH (or PY=/path/to/python).
+#
+# Exits with the number of failed checks, so CI can gate on it.
 
-set -euo pipefail
+SVC="${SVC:-$(cd "$(dirname "$0")/.." && pwd)}"
+B=${B:-http://127.0.0.1:8130}
+IDENTITY=${IDENTITY:-http://127.0.0.1:8080}
+PY=${PY:-python}
 
-BASE_URL="${BASE_URL:-http://localhost:8130}"
-LIVE_MODE=false
-TOKEN=""
+TEN=11111111-1111-1111-1111-111111111111
+OTHER_TEN=99999999-9999-4999-8999-999999999999
+PRIN=33333333-3333-3333-3333-333333333333
+ENTITY=22222222-2222-2222-2222-222222222222
+EMAIL=${EMAIL:-admin@zoikosuite.com}
+PASSWORD=${PASSWORD:-Zoiko@Governance1}
+STAMP=$(date +%s)
 
-for arg in "$@"; do
-  case $arg in
-    --live) LIVE_MODE=true ;;
-    --base-url=*) BASE_URL="${arg#*=}" ;;
-    --token=*) TOKEN="${arg#*=}" ;;
-    *) echo "Unknown argument: $arg"; exit 1 ;;
-  esac
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
+bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
+chk() { if [ "$2" = "$3" ]; then ok "$1 ($3)"; else bad "$1 (got $2, want $3)"; fi; }
+
+uuid() { "$PY" -c "import uuid;print(uuid.uuid4())"; }
+field() { "$PY" -c "import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+v=d
+for k in '$1'.split('.'):
+    v=v.get(k,'') if isinstance(v,dict) else ''
+print(v)"; }
+
+# req METHOD PATH [BODY] [extra curl args…] — prints "<status> <body>" with the
+# canonical envelope. R_TEN, R_PRIN and R_ENT override the identity headers for
+# one call; set one to empty to send no such header at all.
+req() { local m=$1 p=$2 body=${3:-}; shift 2; [ $# -gt 0 ] && shift
+  local ten=${R_TEN-$TEN} prin=${R_PRIN-$PRIN} ent=${R_ENT-$ENTITY}
+  local args=(-s -m 20 -o "$TMP/body" -w '%{http_code}' -X "$m" "$B$p"
+    -H "X-Correlation-ID: audit-$STAMP" -H "X-Request-Id: audit-$(uuid)" -H "X-Source-Channel: api"
+    -H "Content-Type: application/json")
+  [ -n "$ten" ] && args+=(-H "X-Tenant-Id: $ten")
+  [ -n "$prin" ] && args+=(-H "X-Principal-Id: $prin")
+  [ -n "$ent" ] && args+=(-H "X-Legal-Entity-Id: $ent")
+  [ -n "$body" ] && args+=(--data-binary "$body")
+  local s; s=$(curl "${args[@]}" "$@"); printf '%s %s' "$s" "$(cat "$TMP/body")"; }
+status() { echo "${1%% *}"; }
+body() { echo "${1#* }"; }
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+echo "==================================================================="
+echo " AUDIT — evidence-requirements-svc"
+echo " $(date -u '+%Y-%m-%dT%H:%M:%SZ')   service: $B"
+echo "==================================================================="
+
+echo
+echo "-- 1. Static analysis ----------------------------------------------"
+cd "$SVC" || exit 1
+if [ -z "$(go build ./... 2>&1)" ]; then ok "go build ./... clean"; else bad "go build"; fi
+if [ -z "$(go vet ./... 2>&1)" ]; then ok "go vet ./... clean"; else bad "go vet"; fi
+if [ -z "$(go vet -tags=integration ./internal/store/ 2>&1)" ]; then ok "go vet -tags=integration (store) clean"; else bad "go vet -tags=integration"; fi
+unformatted=$(for f in $(find . -name '*.go'); do tr -d '\r' < "$f" | gofmt -l >/dev/null 2>&1 || true; [ -n "$(tr -d '\r' < "$f" | gofmt -l 2>&1)" ] && echo "$f"; done)
+if [ -z "$unformatted" ]; then ok "gofmt clean"; else bad "gofmt: $unformatted"; fi
+missing_down=$(for u in deployments/migrations/*.up.sql; do [ -f "${u%.up.sql}.down.sql" ] || echo "$u"; done)
+if [ -z "$missing_down" ]; then ok "every migration has a .down.sql"; else bad "no .down.sql: $missing_down"; fi
+if grep -q "/cursor" openapi.yaml; then bad "openapi.yaml still documents a /cursor route"; else ok "no /cursor routes in the contract"; fi
+for f in asyncapi.yaml RUNBOOK.md RELEASE_CERTIFICATE.md SPEC_DEVIATIONS.md; do
+  if [ -s "$f" ]; then ok "$f present"; else bad "$f missing"; fi
+done
+if grep -q "evidence.requirement.satisfied" asyncapi.yaml && grep -q "evidence.requirement.missing" asyncapi.yaml; then
+  ok "asyncapi.yaml lists both events"; else bad "asyncapi.yaml does not list both events"; fi
+
+echo
+echo "-- 2. Live health ---------------------------------------------------"
+chk "GET /healthz" "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$B/healthz")" 200
+chk "GET /readyz" "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$B/readyz")" 200
+metrics=$(curl -s -m 10 "$B/metrics")
+for series in http_requests_total readiness_up evidence_evaluations_total evidence_owner_unavailable_total evidence_outbox_unpublished; do
+  if echo "$metrics" | grep -q "^$series"; then ok "/metrics serves $series"; else bad "/metrics lacks $series"; fi
 done
 
-if [[ "$LIVE_MODE" == true && -z "$TOKEN" ]]; then
-  echo "ERROR: --live requires --token=<bearer-token>"
-  exit 1
+echo
+echo "-- 3. Allow path (a real envelope) --------------------------------"
+login=$(curl -s -m 20 -X POST "$IDENTITY/v1/authenticate" -H "Content-Type: application/json" \
+  -d "{\"tenant_id\":\"$TEN\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"client_id\":\"zoiko-console\",\"client_secret\":\"local-dev-console-client-secret\"}")
+access=$(echo "$login" | field access_token)
+JWT=""
+if [ -n "$access" ]; then
+  JWT=$(curl -s -m 20 -X POST "$IDENTITY/v1/context/resolve" -H "Content-Type: application/json" \
+    -H "X-Tenant-Id: $TEN" -H "X-Principal-Id: $PRIN" -H "X-Request-Id: audit-$(uuid)" -H "Idempotency-Key: $(uuid)" \
+    -H "X-Source-Channel: api" -H "X-Correlation-ID: audit-$STAMP" \
+    -d "{\"bearer_token\":\"$access\",\"legal_entity_id\":\"$ENTITY\"}" | field envelope_jwt)
 fi
+if [ -n "$JWT" ]; then ok "envelope minted by identity-context"; else bad "no envelope (login or resolve failed)"; fi
+r=$(req GET /v1/evidence/summary "" -H "Authorization: Bearer $JWT"); chk "summary with the verified envelope" "$(status "$r")" 200
+r=$(req POST /v1/evidence/evaluate "{\"legal_entity_id\":\"$ENTITY\",\"domain_code\":\"AUDIT\",\"action_type\":\"AUDIT_$STAMP\",\"correlation_id\":\"c\"}" -H "Idempotency-Key: $(uuid)")
+chk "evaluate an ungated action" "$(status "$r")" 200
+chk "  …outcome" "$(body "$r" | field outcome)" NO_REQUIREMENTS_DEFINED
 
-AUTH_HEADER=""
-if [[ -n "$TOKEN" ]]; then
-  AUTH_HEADER="-H \"Authorization: Bearer $TOKEN\""
+echo
+echo "-- 4. Refusals ------------------------------------------------------"
+r=$(R_TEN= req GET /v1/evidence/summary ""); chk "no tenant" "$(status "$r")" 401
+r=$(R_PRIN= req GET /v1/evidence/summary ""); chk "no principal" "$(status "$r")" 401
+if [ -n "$JWT" ]; then
+  r=$(req GET /v1/evidence/summary "" -H "Authorization: Bearer ${JWT%????}AAAA"); chk "tampered envelope (warn mode too)" "$(status "$r")" 401
 fi
+r=$(req GET "/v1/evidence-requirements?tenant_id=$OTHER_TEN" ""); chk "another tenant named in the query" "$(status "$r")" 403
+r=$(req GET "/v1/evidence-requirements?filter%5Bcolour%5D=red" ""); chk "unknown filter" "$(status "$r")" 400
+r=$(req GET "/v1/evidence-requirements?legal_entity_id=$ENTITY" ""); chk "bare (pre-API-4) filter" "$(status "$r")" 400
+r=$(req GET "/v1/evidence/evaluations?cursor=forged.cursor" ""); chk "tampered cursor" "$(status "$r")" 400
+r=$(req GET "/v1/evidence/evaluations?page_size=201" ""); chk "page_size above 200" "$(status "$r")" 400
+stranger=$(uuid)
+r=$(R_ENT=$stranger req POST /v1/evidence/evaluate "{\"legal_entity_id\":\"$stranger\",\"domain_code\":\"AUDIT\",\"action_type\":\"X\",\"correlation_id\":\"c\"}" -H "Idempotency-Key: $(uuid)")
+chk "a legal entity not in the tenant" "$(status "$r")" 422
+r=$(req POST /v1/evidence/evaluate "{\"legal_entity_id\":\"$(uuid)\",\"domain_code\":\"AUDIT\",\"action_type\":\"X\",\"correlation_id\":\"c\"}" -H "Idempotency-Key: $(uuid)")
+chk "body entity disagrees with X-Legal-Entity-Id" "$(status "$r")" 400
+key=$(uuid)
+req POST /v1/evidence/evaluate "{\"legal_entity_id\":\"$ENTITY\",\"domain_code\":\"AUDIT\",\"action_type\":\"AUDIT_$STAMP\",\"correlation_id\":\"c\"}" -H "Idempotency-Key: $key" >/dev/null
+r=$(req POST /v1/evidence/evaluate "{\"legal_entity_id\":\"$ENTITY\",\"domain_code\":\"AUDIT\",\"action_type\":\"OTHER_$STAMP\",\"correlation_id\":\"c\"}" -H "Idempotency-Key: $key")
+chk "same Idempotency-Key, different action" "$(status "$r")" 409
+"$PY" -c "print('{\"legal_entity_id\":\"x\",\"pad\":\"' + 'a'*300000 + '\"}')" > "$TMP/big.json"
+r=$(req POST /v1/evidence/evaluate "" -H "Idempotency-Key: $(uuid)" --data-binary "@$TMP/big.json"); chk "body over 256 KiB" "$(status "$r")" 413
+r=$(req POST /v1/admin/evidence-requirements "{\"tenant_id\":\"$TEN\",\"domain_code\":\"AUDIT\",\"action_type\":\"AUDIT_$STAMP\",\"evidence_type\":\"APPROVAL_RECORD\",\"correlation_id\":\"c\"}" -H "Idempotency-Key: $(uuid)")
+chk "create a requirement" "$(status "$r")" 201
+rid=$(body "$r" | field evidence_requirement_id)
+r=$(req POST "/v1/admin/evidence-requirements/$rid/end-date" '{"reason":"audit"}' -H "Idempotency-Key: $(uuid)"); chk "end-date without If-Match" "$(status "$r")" 428
+r=$(req POST "/v1/admin/evidence-requirements/$rid/end-date" '{"reason":"audit"}' -H 'If-Match: "v7"' -H "Idempotency-Key: $(uuid)"); chk "end-date with a stale If-Match" "$(status "$r")" 412
+r=$(req POST "/v1/admin/evidence-requirements/$rid/end-date" '{"reason":"audit"}' -H 'If-Match: "v1"' -H "Idempotency-Key: $(uuid)"); chk "end-date with the current If-Match" "$(status "$r")" 200
+r=$(req POST "/v1/admin/evidence-requirements/$rid/end-date" '{"reason":"audit"}' -H 'If-Match: "v2"' -H "Idempotency-Key: $(uuid)"); chk "end-date again (already retired)" "$(status "$r")" 422
+r=$(req POST /v1/admin/evidence-requirements "{\"tenant_id\":\"$OTHER_TEN\",\"domain_code\":\"AUDIT\",\"action_type\":\"X\",\"evidence_type\":\"APPROVAL_RECORD\",\"correlation_id\":\"c\"}" -H "Idempotency-Key: $(uuid)")
+chk "create into another tenant" "$(status "$r")" 403
 
-echo "=========================================="
-echo "evidence-requirements-svc Audit"
-echo "Base URL: $BASE_URL"
-echo "Live mode: $LIVE_MODE"
-echo "=========================================="
+echo
+echo "-- 5. Problem documents -------------------------------------------"
+ctype=$(curl -s -m 10 -o /dev/null -w '%{content_type}' "$B/v1/evidence/summary" -H "X-Tenant-Id: $TEN" -H "X-Request-Id: audit-$(uuid)")
+chk "a refusal is application/problem+json" "$ctype" "application/problem+json"
 
-# 1. Health & Readiness
-echo ""
-echo "1. Health & Readiness"
-echo "---------------------"
-curl -sf "$BASE_URL/healthz" >/dev/null && echo "  ✅ /healthz" || echo "  ❌ /healthz"
-curl -sf "$BASE_URL/readyz" >/dev/null && echo "  ✅ /readyz" || echo "  ❌ /readyz"
-
-# 2. Metrics
-echo ""
-echo "2. Metrics"
-echo "----------"
-curl -sf "$BASE_URL/metrics" | grep -q "http_requests_total" && echo "  ✅ /metrics (http_requests_total present)" || echo "  ❌ /metrics"
-
-# 3. OpenAPI Spec
-echo ""
-echo "3. OpenAPI Spec"
-echo "---------------"
-curl -sf "$BASE_URL/openapi.yaml" >/dev/null && echo "  ✅ /openapi.yaml served" || echo "  ⚠️  /openapi.yaml not served (expected if not mounted)"
-
-# 4. Contract Tests (require auth)
-if [[ "$LIVE_MODE" == true ]]; then
-  echo ""
-  echo "4. Contract Tests (authenticated)"
-  echo "----------------------------------"
-  
-  # 4.1 List requirements
-  curl -sf $AUTH_HEADER "$BASE_URL/v1/evidence-requirements?page_size=5" >/dev/null \
-    && echo "  ✅ GET /v1/evidence-requirements" || echo "  ❌ GET /v1/evidence-requirements"
-  
-  # 4.2 Cursor pagination
-  curl -sf $AUTH_HEADER "$BASE_URL/v1/evidence-requirements/cursor?page_size=5" >/dev/null \
-    && echo "  ✅ GET /v1/evidence-requirements/cursor" || echo "  ❌ GET /v1/evidence-requirements/cursor"
-  
-  # 4.3 Evaluations cursor
-  curl -sf $AUTH_HEADER "$BASE_URL/v1/evidence/evaluations?page_size=5" >/dev/null \
-    && echo "  ✅ GET /v1/evidence/evaluations" || echo "  ❌ GET /v1/evidence/evaluations"
-  
-  # 4.4 PBC requests cursor
-  curl -sf $AUTH_HEADER "$BASE_URL/v1/pbc/requests/cursor?page_size=5" >/dev/null \
-    && echo "  ✅ GET /v1/pbc/requests/cursor" || echo "  ❌ GET /v1/pbc/requests/cursor"
-  
-  # 4.5 Summary
-  curl -sf $AUTH_HEADER "$BASE_URL/v1/evidence/summary" >/dev/null \
-    && echo "  ✅ GET /v1/evidence/summary" || echo "  ❌ GET /v1/evidence/summary"
-  
-  # 4.6 Evaluate (expects 422 for missing legal entity or 503 for unavailable deps)
-  IDEM_KEY=$(uuidgen)
-  EVAL_RESP=$(curl -s -w "\n%{http_code}" $AUTH_HEADER \
-    -H "Idempotency-Key: $IDEM_KEY" \
-    -H "X-Legal-Entity-Id: 00000000-0000-0000-0000-000000000000" \
-    -H "Content-Type: application/json" \
-    "$BASE_URL/v1/evidence/evaluate" \
-    -d '{"legal_entity_id":"00000000-0000-0000-0000-000000000000","domain_code":"FINANCE","action_type":"JOURNAL_POST","present_artifacts":[]}')
-  HTTP_CODE=$(echo "$EVAL_RESP" | tail -1)
-  if [[ "$HTTP_CODE" == "422" || "$HTTP_CODE" == "503" || "$HTTP_CODE" == "401" ]]; then
-    echo "  ✅ POST /v1/evidence/evaluate (returns $HTTP_CODE as expected for test entity)"
-  else
-    echo "  ⚠️  POST /v1/evidence/evaluate returned $HTTP_CODE"
-  fi
-  
-  # 4.7 Idempotency replay
-  REPLAY_RESP=$(curl -s -w "\n%{http_code}" $AUTH_HEADER \
-    -H "Idempotency-Key: $IDEM_KEY" \
-    -H "X-Legal-Entity-Id: 00000000-0000-0000-0000-000000000000" \
-    -H "Content-Type: application/json" \
-    "$BASE_URL/v1/evidence/evaluate" \
-    -d '{"legal_entity_id":"00000000-0000-0000-0000-000000000000","domain_code":"FINANCE","action_type":"JOURNAL_POST","present_artifacts":[]}')
-  REPLAY_CODE=$(echo "$REPLAY_RESP" | tail -1)
-  if [[ "$REPLAY_CODE" == "$HTTP_CODE" ]]; then
-    echo "  ✅ Idempotency replay returns same status"
-  else
-    echo "  ⚠️  Idempotency replay returned $REPLAY_CODE (expected $HTTP_CODE)"
-  fi
-  
-  # 4.8 Create requirement (tenant-wide, requires PLATFORM scope)
-  CREATE_KEY=$(uuidgen)
-  CREATE_RESP=$(curl -s -w "\n%{http_code}" $AUTH_HEADER \
-    -H "Idempotency-Key: $CREATE_KEY" \
-    -H "Content-Type: application/json" \
-    "$BASE_URL/v1/admin/evidence-requirements" \
-    -d '{"tenant_id":"'"$(echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq -r .tenant_id // "00000000-0000-0000-0000-000000000000")"'","domain_code":"TEST","action_type":"TEST_ACTION","evidence_type":"SUPPORTING_DOCUMENT","requirement_payload":{"minimum_count":1},"effective_from":"2026-01-01T00:00:00Z","correlation_id":"'"$CREATE_KEY"'"}')
-  CREATE_CODE=$(echo "$CREATE_RESP" | tail -1)
-  if [[ "$CREATE_CODE" == "201" || "$CREATE_CODE" == "403" || "$CREATE_CODE" == "401" ]]; then
-    echo "  ✅ POST /v1/admin/evidence-requirements (returns $CREATE_CODE)"
-  else
-    echo "  ⚠️  POST /v1/admin/evidence-requirements returned $CREATE_CODE"
-  fi
+echo
+echo "-- 6. Contract -----------------------------------------------------"
+# The parity and validity tests read openapi.yaml against the router. Run
+# them in a container when the host blocks Go test binaries (Windows
+# Application Control): GO_TEST_IN_DOCKER=1.
+if [ "${GO_TEST_IN_DOCKER:-0}" = "1" ]; then
+  SRC_DIR=$(cd "$SVC/.." && { pwd -W 2>/dev/null || pwd; })
+  out=$(MSYS_NO_PATHCONV=1 docker run --rm -e GOFLAGS=-mod=mod -e GOPROXY=off -e CGO_ENABLED=0 \
+    -v "$SRC_DIR:/src" -v "${GOMODCACHE:-$HOME/go/pkg/mod}:/go/pkg/mod" \
+    -w /src/evidence-requirements-svc golang:1.26-alpine go test -count=1 -run 'OpenAPI' ./internal/handler/ 2>&1)
 else
-  echo ""
-  echo "4. Contract Tests (skipped — not in live mode)"
-  echo "   Run with --live --token=<bearer> to execute"
+  out=$(go test -count=1 -run 'OpenAPI' ./internal/handler/ 2>&1)
 fi
+if echo "$out" | grep -q "^ok"; then ok "openapi.yaml valid and matches the router"; else bad "OpenAPI contract tests: $(echo "$out" | tail -1)"; fi
 
-# 5. Database Migrations (check via readiness)
-echo ""
-echo "5. Database Migrations"
-echo "----------------------"
-curl -sf "$BASE_URL/readyz" >/dev/null && echo "  ✅ Database reachable (readyz OK)" || echo "  ❌ Database not reachable"
-
-# 6. Outbox Health
-if [[ "$LIVE_MODE" == true ]]; then
-  echo ""
-  echo "6. Outbox Health"
-  echo "----------------"
-  SUMMARY=$(curl -sf $AUTH_HEADER "$BASE_URL/v1/evidence/summary")
-  UNPUB=$(echo "$SUMMARY" | jq -r '.unpublished_outbox_older_than_5_minutes // -1')
-  if [[ "$UNPUB" -eq 0 ]]; then
-    echo "  ✅ No unpublished outbox events > 5min"
-  elif [[ "$UNPUB" -gt 0 ]]; then
-    echo "  ⚠️  $UNPUB unpublished outbox events > 5min"
-  else
-    echo "  ❌ Could not read summary"
-  fi
-fi
-
-# 7. SPEC_DEVIATIONS Check
-echo ""
-echo "7. SPEC_DEVIATIONS"
-echo "------------------"
-if [[ -f "SPEC_DEVIATIONS.md" ]]; then
-  echo "  ✅ SPEC_DEVIATIONS.md present"
-  grep -c "^## D-ER-" SPEC_DEVIATIONS.md | xargs -I {} echo "  📋 {} deviations recorded"
-else
-  echo "  ❌ SPEC_DEVIATIONS.md missing"
-fi
-
-# 8. Runbook
-echo ""
-echo "8. Runbook"
-echo "----------"
-if [[ -f "RUNBOOK.md" ]]; then
-  echo "  ✅ RUNBOOK.md present"
-else
-  echo "  ❌ RUNBOOK.md missing"
-fi
-
-# 9. Release Certificate
-echo ""
-echo "9. Release Certificate"
-echo "----------------------"
-if [[ -f "RELEASE_CERTIFICATE.md" ]]; then
-  echo "  ✅ RELEASE_CERTIFICATE.md present"
-else
-  echo "  ❌ RELEASE_CERTIFICATE.md missing"
-fi
-
-# 10. AsyncAPI
-echo ""
-echo "10. AsyncAPI Spec"
-echo "-----------------"
-if [[ -f "asyncapi.yaml" ]]; then
-  echo "  ✅ asyncapi.yaml present"
-else
-  echo "  ❌ asyncapi.yaml missing"
-fi
-
-echo ""
-echo "=========================================="
-echo "Audit Complete"
-echo "=========================================="
+echo
+echo "==================================================================="
+echo " $PASS passed, $FAIL failed"
+echo "==================================================================="
+exit "$FAIL"

@@ -54,8 +54,8 @@ marked ❓ are not scored.
 | 4 | obligations-svc | 8088 | Doc 03 §8.5 + Doc 04 §13 (R-001 WFC-05 unscored) | 45% → **63.1%** (19 Oct) | 65% → **80.0%** (19 Oct) |
 | 5 | authorization-svc | 8089 | Doc 03 §8.3; GOV-03 (+ GOV-04 / GOV-12); ZS-IAM-001 | 43% → **100%** (14 Oct) | 57% → **100%** (14 Oct) |
 | 6 | workflow-svc | 8090 | Doc 03 §8.4; GOV-06; R-001 WFC-02 / WFC-03 | 34% → **47.5%** (19 Oct) | 49% → **67.2%** (19 Oct) |
-| 7 | evidence-requirements-svc | 8130 | Doc 03 §8.6 + Doc 04 §7.1; GCP §1 / §2 / §16 | 37% → **46.5%** (19 Oct) | 58% → **67.4%** (19 Oct) |
-| | **Group 2 total** | | 418 → **436** scored items | **39%** → **78.7%** (19 Oct) | **57%** → **87.4%** (19 Oct) |
+| 7 | evidence-requirements-svc | 8130 | Doc 03 §8.6 + Doc 04 §7.1; GCP §1 / §2 / §16 | 37% → **90.7%** (5 Nov) | 58% → **91.9%** (5 Nov) |
+| | **Group 2 total** | | 418 → **436** scored items | **39%** → **83.0%** (5 Nov) | **57%** → **89.8%** (5 Nov) |
 
 | Service | ✅ | ⚠️ | ❌ | ❓ (unscored) | Scored |
 |---|---|---|---|---|---|
@@ -65,8 +65,8 @@ marked ❓ are not scored.
 | obligations-svc | 29 → **41** | 27 → **22** | 9 → **2** | 1 (+16 WFC-05 rows) | 65 |
 | authorization-svc | 29 → **85** | 20 → **0** | 19 → **0** | 4 → **0** (decided 7 Oct) | 68 → **85** (+17 session rows) |
 | workflow-svc | 21 → **29** | 18 → **24** | 22 → **8** | 2 | 61 |
-| evidence-requirements-svc | 16 → **20** | 18 | 9 → **5** | 5 | 43 |
-| **Total** | **165** → **343** | **144** → **76** | **109** → **17** | **22** → **17** | **418** → **436** |
+| evidence-requirements-svc | 16 → **39** | 18 → **1** | 9 → **3** | 5 | 43 |
+| **Total** | **165** → **362** | **144** → **59** | **109** → **15** | **22** → **17** | **418** → **436** |
 
 The 28 September figures above are the baseline; the arrows show each service's latest verified
 score. jurisdiction-rules-svc and governance-decision-log-svc were re-scored on 12 October,
@@ -3817,3 +3817,66 @@ authorization-svc orders by `emitted_at` when the payload has no timestamp
   read authorization-svc's assignments.
 - **Live proof.** The suspension handling has not run against a real broker. The 3 Nov live E2E
   used an image built before the merge.
+
+# evidence-requirements-svc completion, 5 November 2026
+
+Plan: `EVIDENCE-REQUIREMENTS-PLAN-2026-11-04.md` (ER-0 … ER-9, ER-FE-1/2). A first execution the same
+day reported every task done; the verifier protocol found most of it was not (named tests that did
+not exist, an end-date that failed on Postgres, an If-Match path that could never match, a SQL
+injection in list `sort`, no image, no E2E run, no console). This section scores the re-done pass.
+Evidence: `services/evidence-requirements-svc/progress.md` "Verification evidence"; live
+`scripts/audit.sh` 42/42 and `deployments/scripts/e2e-evidence-requirements-deps.py --with-outage`
+84/84 (3 owner-blocked skips, never counted) on the rebuilt image; suites handler 72, store 24 /
+35 (integration), events 5, manifest 3, esignature 3, registry 1, telemetry 1 — 0 fail, 0 skip.
+
+**Score: 20 → 39 ✅, 18 → 1 ⚠️, 5 → 3 ❌, 5 ❓ of 43 — 90.7% full, 91.9% weighted.**
+
+Rows that moved (file:line at 5 Nov):
+
+| Row | 19 Oct | 5 Nov | Evidence |
+|---|---|---|---|
+| Owns document requirements, and verifies document evidence | ❌ | ✅ | `handler.go:516` checkArtifacts → document-vault with the envelope forwarded; live E2E §6: a vault document SATISFIED, a random id MISSING with the reason, another entity's document MISSING, vault stopped → 503 and the ledger count unchanged |
+| Sufficiency counts distinct artifacts | ❌ | ✅ | canonical key `artifactKey`; `TestER02_SameManifestTwiceCountsOnce`, `TestEvaluate_TheSameDocumentInAnotherCaseCountsOnce`; live E2E §6 (one document twice vs minimum 2 → MISSING); mutation check |
+| Owns signature requirements | ⚠️ | ✅ | `internal/esignature/client.go` (existence in tenant + entity); `TestER02_SignatureUnknownIsUnmet`, `TestER02_SignatureServiceDownIs503NoRow`, `TestVerifyEnvelope*`; live: owner unreachable → 503 `esignature_unavailable`, no row. A real envelope could not be shown live (phase7 stack) |
+| Non-document artifacts | ⚠️ | ✅ | an empty reference never counts (`TestER02_EmptyReferenceNeverCounts`); EVIDENCE_MANIFEST verified (`TestER02_Manifest*`); unconfigured owner = 503 (`TestER02_UnconfiguredOwnerNeverCounts`) |
+| Event envelope (causation, jurisdiction, governing refs) | ⚠️ | ✅ | `handler.go:429`, `outbox/worker.go:114-122`; asyncapi.yaml 1.1.0 rewritten from a real record; live E2E §9 |
+| tenant_id resolved by GOV-01, never trusted from an arbitrary header | ⚠️ | ✅ | compose route through `gateway-auth@file` (D-ER-28); live E2E §3: forged X-Tenant-Id / X-Principal-Id next to an envelope are replaced, the ledger row carries the verified ones |
+| Server-resolved context (tenant and entity operable) | ⚠️ | ✅ | `handler.go:236` registry check; live E2E §5 (foreign / random entity 422, no ledger row) |
+| A missing tenant gets 401 | ⚠️ | ✅ | `handler.go:1140`; `TestEvaluate_MissingTenant_Returns401`; audit.sh §4 |
+| Workload identity accepted | ⚠️ | ✅ | `handler.go:1159`; `TestEvaluate_AVerifiedPeerWorkloadIsTheCaller` |
+| Stable error classes | ⚠️ | ✅ | RFC 9457 via apicontract; `TestAPI2_ErrorResponsesAreProblemDetails`; owner-specific 503 codes (`handler.go:1083`) |
+| Effective interval validity | ⚠️ | ✅ | `handler.go:868`, `handler.go:1015` |
+| Requirement payload validated when authored | ⚠️ | ✅ | `handler.go:939`; `TestCreateRequirement_PayloadMustMatchTheRuleShape` |
+| Evaluation ledger is append-only / immutable | ⚠️ | ✅ | migrations 000007 (UPDATE/DELETE trigger), 000009 (TRUNCATE); `TestPgStore_EvaluationLedgerIsAppendOnly` |
+| Decision is reproducible (governing versions retained) | ⚠️ | ✅ | `handler.go:410` requirement_ids stored and published as governing_refs; console drawer "Tested against" |
+| Legal entity is validated by the server | ⚠️ | ✅ | registry (`TENANT_REGISTRY_URL`, required outside local); `TestEvaluate_LegalEntityMustExistInTheTenant`; live E2E §5 |
+| API endpoints specified in the primary spec | ⚠️ | ✅ | openapi.yaml 1.4.0; `TestOpenAPIMatchesTheRouter`, `TestOpenAPIDocumentIsValid` |
+| context.md §4 list semantics | ⚠️ | ✅ | context.md §4 / §9 / §12 refreshed 5 Nov |
+| context and progress claims vs the estate | ⚠️ | ✅ | progress.md rewritten; every test it names resolves (`grep -rn "func <Name>("`) |
+| Postman collection is usable | ⚠️ | ✅ | regenerated from openapi.yaml: full envelope, Idempotency-Key, If-Match |
+
+Still ⚠️ (1): **Read contracts are strongly scoped** — the lists and the requirement / evaluation reads are
+authorized at the entity, but `GET /v1/pbc/requests/{id}` (`pbc.go:145`) still checks the tenant only.
+
+Still ❌ (3), all on the callers' side and owned by their teams: no gate in general-ledger post,
+financial-close lock, vat-gst or corporate-tax; board-resolutions, corporate-actions and
+filing-preparation send an incomplete envelope; corporate-actions and filing-preparation pass any
+outcome other than MISSING (fail open).
+
+Defects found live in this pass, not visible to unit tests: the outbox refused every event under the
+real runtime role (000008's `FOR ALL USING (false)`; fixed by 000011, `TestOutbox_AppRoleAppendsButCannotRead`);
+compose connected as a role with no CONNECT on the database; the ER-5 Traefik route sat on an entrypoint
+that redirects before routing and had no ForwardAuth; access-control 000046 claimed to register six actions
+000008 already registered, and its down migration deleted them (rewritten; `TestR5_EvidenceActionsRegistered`,
+`TestR5_EvidenceTemplateGrantsEveryAction`, access-control store suite 47/47).
+
+Blocked outside this service: evidence-manifest-svc authorizes every read on `EVIDENCE_MANIFEST_READ`,
+which access-control does not register, so no manifest can count yet (references fail closed);
+esignature-integration-svc runs only in the phase7 stack; document-vault refuses uploads without clamd,
+which compose does not run; document-vault and gateway-auth-svc each have a compose defect (DB role;
+admin-token volume mounted where a file is expected).
+
+| Service | ✅ | ⚠️ | ❌ | ❓ | Scored | Full | Weighted | Last live |
+|---|---|---|---|---|---|---|---|---|
+| evidence-requirements-svc | 39 | 1 | 3 | 5 | 43 | 90.7% | 91.9% | 5 Nov: audit 42/42, E2E 84/84 |
+| **Group 2 total** | **362** | **59** | **15** | **17** | **436** | **83.0%** | **89.8%** | |

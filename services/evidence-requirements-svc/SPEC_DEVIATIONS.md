@@ -83,22 +83,26 @@ unreachable or had no match).
 ---
 
 ## D-ER-6: Compose Gate Modes Warn
-**Spec:** `AUTH-PLANE-PLAN-2026-11-02.md` "Global constraints" states the service must
-enforce identity and authorization gates. However, the callers outside the governance
-domains (board-resolutions-svc, corporate-actions-svc, filing-preparation-svc) do not
-yet send a full identity envelope, and their principals are not yet granted the
-required actions.
+**Spec:** `AUTH-PLANE-PLAN-2026-11-02.md` "Global constraints": the service enforces
+identity and authorization. The callers outside the governance domains
+(board-resolutions-svc, corporate-actions-svc, filing-preparation-svc) do not yet send
+an identity envelope, and their principals are not yet granted EVIDENCE_EVALUATE.
 
-**Built:** The compose stack runs with:
-- `EVIDENCE_EVALUATE_AUTHZ=warn` — authorization failures are logged and admitted
-- `IDENTITY_VERIFY=warn` — missing/invalid envelopes are logged and admitted
+**Built:** compose runs `EVIDENCE_EVALUATE_AUTHZ=warn` and `IDENTITY_VERIFY=warn`
+(both default to enforce/require in code). What warn admits, exactly
+(identity-envelope `gate.go`, pinned by `TestGateWarnStillRefusesBadEnvelope` there and
+by `TestER05_TamperedOrExpiredEnvelopeIs401EvenInWarnMode` here):
+- a request with **no** envelope is admitted as asserted and marked
+  `X-Identity-Assertion: missing`;
+- a request whose envelope is **present but invalid** (bad signature, expired, wrong
+  audience) is **401** in both modes, and so is one whose session identity-context
+  reports revoked (`TestER05_RevokedSessionIsRefused`; live: E2E §2);
+- with evaluate in warn, a principal without EVIDENCE_EVALUATE is admitted **and** the
+  refusal is recorded in authorization-svc's decision log (E2E §10).
+Reads, catalogue writes and PBC commands are always enforced.
 
-Both default to `enforce` in code; the warn mode is set via compose environment
-variables. This is a migration state, not a resting state. The callers must be
-updated to send full envelopes and have their principals granted before switching to
-`enforce`.
-
-**Status:** BUILT — RECORDED.
+**Status:** BUILT — RECORDED. A migration state: switch both to enforce once the three
+callers forward the envelope and their principals are granted (cross-team follow-ups).
 
 ---
 
@@ -276,59 +280,84 @@ UPDATE or DELETE. The table is append-only. `unmet_payload` and
 
 ---
 
-## D-ER-21: ETag/If-Match on All Mutations (API-3)
-**Spec:** `IMPLEMENTATION-PLAN` §5 API-3.
+## D-ER-21: API-3 — which commands need If-Match
+**Spec:** `IMPLEMENTATION-PLAN` §5 API-3; plan ER-4.
 
-**Built:** Migration 000010 adds `record_version` to `evidence_requirements` and
-`evidence_requests`. All 13 mutation endpoints (1 end-date + 12 PBC) read the
-`If-Match` header and include it in the UPDATE's WHERE clause as
-`record_version = $ifMatch`. Stale version → 412 with `version_mismatch` code.
-Response includes `ETag` header with current version.
+**Built:** migration 000010 adds `record_version` to `evidence_requirements` and
+`evidence_requests`, served as the ETag `"v<n>"` on every read and every command's
+response. The rule applied:
+- **If-Match required** on every manager command that changes an existing aggregate:
+  requirement end-date; PBC send, reassign, extend-due-date, clarify, mark-satisfied,
+  close. Missing → 428 `precondition_required`; stale → 412 `precondition_failed` with
+  `current_version` and the current ETag; malformed → 400; `*` → unconditional.
+  The version is part of the same compare-and-set UPDATE (no read-then-write).
+- **No If-Match** on the contributor's and the scanner's own actions on an open
+  request — submit response, view, add note, acknowledge receipt, scan result. They
+  append rows (responses, notes, receipts) or update a response, not edit the request.
+  Submit and view do move the request's status, so they bump `record_version`, and a
+  manager holding the ETag from before the response is refused with 412.
 
-**Status:** BUILT — RECORDED.
-
----
-
-## D-ER-22: API-4 Cursor Pagination on All Lists
-**Spec:** `IMPLEMENTATION-PLAN` §5 API-4.
-
-**Built:** Four list endpoints use opaque, HMAC-signed cursor tokens:
-- GET /v1/evidence-requirements/cursor
-- GET /v1/evidence/evaluations
-- GET /v1/pbc/requests/cursor
-- GET /v1/evidence/summary (single page, no cursor)
-
-Cursors encode tenant_id, route, filter, sort, offset, and last_id. Tampered/foreign
-cursors → 400.
+Tests: `TestAPI3_*` (handler, three cases per command) and
+`TestAPI3_EndDateRequirementIsConditionalOnTheVersion`,
+`TestAPI3_PBCCommandsBumpTheVersionAndRefuseStaleOnes` (real Postgres).
 
 **Status:** BUILT — RECORDED.
 
 ---
 
-## D-ER-23: Evidence Summary Endpoint
-**Spec:** `IMPLEMENTATION-PLAN` §5 console read models.
+## D-ER-22: API-4 on the console lists (breaking change to two list routes)
+**Spec:** `IMPLEMENTATION-PLAN` §5 API-4; plan ER-3.
 
-**Built:** GET /v1/evidence/summary returns aggregate counts:
-- `active_requirements`
-- `evaluations_satisfied_30d`
-- `evaluations_missing_30d`
-- `actions_with_no_requirements_30d`
-- `open_pbc_requests`
-- `overdue_pbc_requests`
-- `unpublished_outbox_older_than_5_minutes`
+**Built:** `GET /v1/evidence-requirements`, `GET /v1/evidence/evaluations` and
+`GET /v1/pbc/requests` take `filter[name]=value`, `page_size` (1..200, default 50) and an
+opaque HMAC-signed `cursor` bound to the tenant, the route and the filter set
+(identity-envelope/apicontract, as in identity-context-svc). Response
+`{items, next_cursor, page_size}`. Unknown filter → 400 `unknown_filter`; a tampered
+cursor, or one replayed by another tenant or with other filters → 400 `invalid_cursor`.
+A bare pre-API-4 filter (`?legal_entity_id=`) is refused with 400 rather than ignored,
+so a caller never receives an unfiltered list it believes is filtered.
+
+Deviation: the two existing lists changed shape (array → page). The only caller is the
+admin console, rebuilt in the same pass; no other service reads them.
+
+Key: `CURSOR_SIGNING_KEY_HEX` (≥ 32 bytes), required outside local/dev; local/dev use a
+per-process random key, so a cursor does not survive a restart.
 
 **Status:** BUILT — RECORDED.
 
 ---
 
-## D-ER-24: `SUPPORTING_DOCUMENT` Verified, Others Taken on Caller's Word
-**Spec:** §8.6 owns "document requirements" and "supporting artifact rules".
+## D-ER-23: Evidence summary
+**Spec:** plan ER-3 / ER-FE-2 (console KPI row).
 
-**Built:** Only `SUPPORTING_DOCUMENT` is verified against `document-vault-svc`.
-`EVIDENCE_MANIFEST` is verified against `evidence-manifest-svc` (when configured).
-`SIGNATURE` is verified against `esignature-integration-svc` (when configured).
-All other evidence types (APPROVAL_RECORD, etc.) are taken on the caller's word in v1.
-When their owner services exist, they become verifiable the same way.
+**Built:** `GET /v1/evidence/summary` (EVIDENCE_REQUIREMENT_READ at PLATFORM) returns, in
+one transaction: active requirements; evaluations by outcome over 30 days; distinct
+(domain, action) pairs evaluated with NO_REQUIREMENTS_DEFINED, and the 20 most frequent;
+open and overdue PBC requests; active requirements by evidence type and by domain; and
+outbox rows unpublished for more than 5 minutes. The outbox count is **platform-wide**
+(the outbox has no tenant column) and is read through the SECURITY DEFINER
+`outbox_unpublished_count()` (000011). If any count cannot be read the route is 503 —
+never a partial summary, so the console shows "unavailable", not 0.
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-24: Which evidence types are verified
+**Spec:** §8.6 owns document and signature requirements and supporting artifact rules.
+
+**Built:** `SUPPORTING_DOCUMENT` is verified with document-vault-svc, `EVIDENCE_MANIFEST`
+with evidence-manifest-svc (`GET /v1/evidence-manifests/{id}`), `SIGNATURE` with
+esignature-integration-svc (`GET /v1/esignature/envelopes/{id}`): existence in the
+caller's tenant and legal entity (D-ER-3: no status is required). Not found / other
+entity → does not count, reason in `unmet`. Owner unreachable, refusing (any non-200 /
+404) or unconfigured → 503, nothing recorded. Every other evidence type
+(APPROVAL_RECORD, …) counts on the caller's word when its reference is not empty.
+
+Live status (5 Nov 2026): EVIDENCE_MANIFEST references currently always fail closed,
+because evidence-manifest-svc authorizes every read on `EVIDENCE_MANIFEST_READ`, which
+access-control does not register (cross-team follow-up). SIGNATURE could not be run live:
+esignature-integration-svc runs in the phase7 stack.
 
 **Status:** BUILT — RECORDED.
 
@@ -340,6 +369,52 @@ When their owner services exist, they become verifiable the same way.
 **Built:** The compose port mapping is `127.0.0.1:8130:8130` (loopback only) while
 `EVIDENCE_EVALUATE_AUTHZ=warn` and `IDENTITY_VERIFY=warn`. This prevents external
 access to the service when enforcement is relaxed.
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-26: The outbox is append-only for the runtime role (migration 000011)
+**Spec:** Event Catalogue §6 (transactional outbox); R4 (RLS on every table).
+
+**Found:** 000008 put `FOR ALL USING (false)` on `outbox`. For the runtime role
+(`app_evidence_requirements`: NOSUPERUSER, NOBYPASSRLS, not the owner) that refuses INSERT
+too, so every SATISFIED/MISSING evaluation failed with "new row violates row-level security
+policy for table outbox" and was answered 503. Verified live before the fix.
+
+**Built:** policy `outbox_append_only FOR INSERT WITH CHECK (true)`; no SELECT, UPDATE or
+DELETE policy, so the role cannot read or rewrite events; the worker keeps using the
+SECURITY DEFINER claim/mark functions; `outbox_unpublished_count()` for the backlog.
+Grants guarded on the role existing. Test: `TestOutbox_AppRoleAppendsButCannotRead`.
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-27: The PBC register is the managers' register
+**Spec:** GA-21 "read contracts strongly scoped"; plan R6 (authorization at the object).
+
+**Built:** `GET /v1/pbc/requests` is authorized under `EVIDENCE_REQUEST_MANAGE` (read gate
+mode) at `filter[legal_entity_id]`, PLATFORM when unfiltered — no PBC read action exists in
+access-control. `GET /v1/pbc/requests/{id}` is unchanged in this pass and is still
+authorized by tenant only (recorded as an open follow-up, not fixed here).
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-28: Edge route on websecure with `gateway-auth@file`
+**Spec:** plan ER-5 (Traefik labels with ForwardAuth, copied from jurisdiction-svc).
+
+**Built:** router `evidence-requirements`, `PathPrefix(/evidence-requirements)`, stripped,
+middlewares `gateway-auth@file,evidence-requirements-strip`, entrypoint **websecure**
+(`https://127.0.0.1:8443`). Two deliberate differences from jurisdiction-svc: the web
+entrypoint redirects every request to websecure before routing, so a router on web alone
+is unreachable; and `gateway-auth@file` (emitted by the GTRM compiler) does not depend on
+jurisdiction-svc's container being up to define the middleware. Live (E2E §3): no bearer
+→ 401 `X-Auth-Denial-Reason: no_token`; forged X-Tenant-Id / X-Principal-Id next to an
+envelope are replaced. A write through the edge also needs carta-svc (gateway-auth fails
+closed on material writes when its risk engine is configured but silent).
 
 **Status:** BUILT — RECORDED.
 

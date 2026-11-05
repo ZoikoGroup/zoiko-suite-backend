@@ -153,3 +153,63 @@ func newDiscardResponseWriter() *discardResponseWriter {
 func (d *discardResponseWriter) Header() http.Header         { return d.header }
 func (d *discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
 func (d *discardResponseWriter) WriteHeader(int)             {}
+
+// EvidenceMetrics are the domain series this service exports (ER-5):
+//
+//   - evidence_evaluations_total{outcome}: determinations recorded (replays
+//     are not counted again);
+//   - evidence_owner_unavailable_total{owner}: evaluations refused with 503
+//     because an artifact owner could not answer (nothing was recorded);
+//   - evidence_outbox_unpublished: events in the outbox not yet on Kafka.
+//
+// Every label value is created at zero, so an alert on rate() has a series to
+// read before the first event.
+type EvidenceMetrics struct {
+	EvaluationsTotal      *prometheus.CounterVec
+	OwnerUnavailableTotal *prometheus.CounterVec
+	OutboxUnpublished     prometheus.Gauge
+}
+
+// NewEvidenceMetrics registers the domain series on reg.
+func NewEvidenceMetrics(reg prometheus.Registerer, serviceName string) *EvidenceMetrics {
+	m := &EvidenceMetrics{
+		EvaluationsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "evidence_evaluations_total",
+			Help:        "Evidence determinations recorded, by outcome.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"outcome"}),
+		OwnerUnavailableTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "evidence_owner_unavailable_total",
+			Help:        "Evaluations refused (503, nothing recorded) because an artifact owner could not answer.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"owner"}),
+		OutboxUnpublished: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "evidence_outbox_unpublished",
+			Help:        "Events written to the outbox and not yet published to Kafka.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
+	}
+	reg.MustRegister(m.EvaluationsTotal, m.OwnerUnavailableTotal, m.OutboxUnpublished)
+	for _, o := range []string{"SATISFIED", "MISSING", "NO_REQUIREMENTS_DEFINED"} {
+		m.EvaluationsTotal.WithLabelValues(o)
+	}
+	for _, o := range []string{"document-vault-svc", "evidence-manifest-svc", "esignature-integration-svc"} {
+		m.OwnerUnavailableTotal.WithLabelValues(o)
+	}
+	return m
+}
+
+// EvaluationRecorded counts one recorded determination.
+func (m *EvidenceMetrics) EvaluationRecorded(outcome string) {
+	m.EvaluationsTotal.WithLabelValues(outcome).Inc()
+}
+
+// OwnerUnavailable counts one evaluation refused because owner was down.
+func (m *EvidenceMetrics) OwnerUnavailable(owner string) {
+	m.OwnerUnavailableTotal.WithLabelValues(owner).Inc()
+}
+
+// SetOutboxUnpublished sets the outbox backlog gauge.
+func (m *EvidenceMetrics) SetOutboxUnpublished(n int64) {
+	m.OutboxUnpublished.Set(float64(n))
+}

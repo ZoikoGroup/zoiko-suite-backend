@@ -272,7 +272,7 @@ func TestPgStore_TenantIsolation_EndDateRequirement(t *testing.T) {
 	// tenantID as the scope — what a handler bug would look like if tenant
 	// scope came from the request body instead of the verified header.
 	_, err := testStore.EndDateRequirement(context.Background(), b.tenantID, a.requirementID,
-		time.Now().UTC(), "attacker retire", "attacker")
+		time.Now().UTC(), "attacker retire", "attacker", 0)
 	assert.ErrorIs(t, err, domain.ErrRequirementNotFound,
 		"ISOLATION FAILURE: tenant B was able to reach tenant A's requirement")
 
@@ -286,7 +286,7 @@ func TestPgStore_TenantIsolation_EndDateRequirement(t *testing.T) {
 
 	// Sanity: tenant B can retire its OWN.
 	updated, err := testStore.EndDateRequirement(context.Background(), b.tenantID, b.requirementID,
-		time.Now().UTC(), "legit retire", "b-admin")
+		time.Now().UTC(), "legit retire", "b-admin", 0)
 	require.NoError(t, err)
 	require.NotNil(t, updated.EffectiveTo)
 }
@@ -297,11 +297,11 @@ func TestPgStore_EndDate_SecondAttemptRejected(t *testing.T) {
 	f := setupFixture(t, "AlreadyRetired")
 
 	_, err := testStore.EndDateRequirement(context.Background(), f.tenantID, f.requirementID,
-		time.Now().UTC(), "first", "admin")
+		time.Now().UTC(), "first", "admin", 0)
 	require.NoError(t, err)
 
 	_, err = testStore.EndDateRequirement(context.Background(), f.tenantID, f.requirementID,
-		time.Now().UTC(), "second", "admin")
+		time.Now().UTC(), "second", "admin", 0)
 	assert.ErrorIs(t, err, domain.ErrAlreadyRetired)
 }
 
@@ -381,7 +381,7 @@ func TestPgStore_EffectiveRequirements_ExcludesRetired(t *testing.T) {
 	require.Len(t, before, 1)
 
 	_, err = testStore.EndDateRequirement(ctx, f.tenantID, f.requirementID,
-		time.Now().UTC().Add(-time.Minute), "superseded", "admin")
+		time.Now().UTC().Add(-time.Minute), "superseded", "admin", 0)
 	require.NoError(t, err)
 
 	after, err := testStore.EffectiveRequirements(ctx, f.tenantID, f.entityID,

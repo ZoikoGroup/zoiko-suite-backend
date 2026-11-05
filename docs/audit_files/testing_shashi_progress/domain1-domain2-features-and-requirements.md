@@ -40,7 +40,7 @@ Task ids in brackets (API-3, IAM-12, WF-3, ...) refer to the implementation plan
 | D2-4 | obligations-svc | 8088 | Doc 03 §8.5 (WFC-05 unscored) | 41/22/2 of 65 (63.1%, 80.0%) | DONE | not re-run |
 | D2-5 | authorization-svc | 8089 | Doc 03 §8.3, GOV-03/04/12, ZS-IAM-001 | 85/0/0 of 85 (100%) | PARTIAL (sessions only) | pass |
 | D2-6 | workflow-svc | 8090 | Doc 03 §8.4, GOV-06, R-001 WFC-02/03 | 36/25/0 of 61 (59.0%, 79.5%) | DONE | pass |
-| D2-7 | evidence-requirements-svc | 8130 | Doc 03 §8.6 | 20/18/5 of 43 (46.5%, 67.4%) | n/a (no versioned aggregate) | not re-run |
+| D2-7 | evidence-requirements-svc | 8130 | Doc 03 §8.6 | 39/1/3 of 43 (90.7%, 91.9%) | DONE (5 Nov) | pass (5 Nov: audit 42/42, E2E 84/84) |
 
 Domain 1 group score: 291/303 (96.0% full, 97.9% weighted). Domain 2 group score: 350 met / 77 partial / 9 failed of 436 (80.3% full, 89.1% weighted).
 
@@ -545,35 +545,29 @@ These services answer "is this allowed, under which rules, who must approve, and
 
 ## D2-7. evidence-requirements-svc (:8130)
 
-**Features**
-- **DONE:** evaluate (`POST /v1/evidence/evaluate`). Answers SATISFIED or MISSING; fails closed on a malformed rule.
-- **DONE:** get an evaluation.
-- **DONE:** requirement catalogue: list, get, create (idempotent), end-date.
-- **DONE:** supporting-artifact rules (subtype, minimum count), data-driven.
-- **DONE:** append-only decision ledger; outbox events `evidence.requirement.satisfied` / `.missing`.
-- **BUILT:** PBC (prepared-by-client) requests: create, list open, get, send, reassign, extend due date, view, responses, notes, clarify, mark satisfied, close, scan result, acknowledge receipt.
-- **MISSING:** document verification against document-vault-svc. The client sends only `X-Tenant-Id`, so every evaluation that includes a SUPPORTING_DOCUMENT gets 503.
-- **PARTIAL:** signature verification. A signature counts as present whenever the caller says so.
-- **MISSING:** counting distinct artifacts. One document offered twice satisfies `minimum_count: 2`.
-- **PARTIAL:** non-document artifacts. An empty `reference_id` still counts, and `EVIDENCE_MANIFEST` refs are not checked.
-- **MISSING:** gate coverage for general-ledger post, financial-close lock, vat-gst and corporate-tax.
-- **MISSING (caller side):** corporate-actions and filing-preparation don't send the full envelope, and pass any outcome that isn't MISSING (deny-list, fails open).
-- **MISSING (decision):** authorization on evaluate; `openapi.yaml`.
+Re-checked against the code on 5 Nov 2026 (completion plan ER-0 … ER-9; file:line as of that day).
 
-**Required to make all features work**
-- The document-vault client forwards the envelope and principal, and gets `DOCUMENT_READ`.
-- Count distinct `reference_id`s; refuse an empty `reference_id`; check `EVIDENCE_MANIFEST` refs against evidence-manifest-svc.
-- Cross-team (WF-4 follow-ups):
-  - general-ledger, financial-close, vat-gst and corporate-tax call the gate before governed actions;
-  - all callers forward the envelope;
-  - only SATISFIED passes (an allow-list).
-- Decisions:
-  - which authorization action guards evaluate;
-  - whether `NO_REQUIREMENTS_DEFINED` blocks or permits (C9);
-  - scan ownership; tier; which document statuses (superseded, revoked, draft) count; `openapi.yaml`.
-- Seed the requirement catalogue. It is empty today, so once callers are fixed every gated action would pass with no evidence.
-- Use esignature-integration-svc for signature verification.
-- Check the legal entity against tenant-entity-registry-svc.
+**Features**
+- **DONE:** evaluate (`POST /v1/evidence/evaluate`): SATISFIED / MISSING / NO_REQUIREMENTS_DEFINED; fails closed on a malformed rule.
+- **DONE:** get an evaluation; evaluation register `GET /v1/evidence/evaluations` (API-4); summary `GET /v1/evidence/summary`.
+- **DONE:** requirement catalogue: list (API-4), get (ETag), create (idempotent), end-date (If-Match).
+- **DONE:** supporting-artifact rules (subtype, minimum count), data-driven.
+- **DONE:** append-only decision ledger; outbox events `evidence.requirement.satisfied` / `.missing`, proven on Kafka (one record per decision, none for replays or NO_REQUIREMENTS_DEFINED). Fixed in this pass: the outbox refused every event under the real runtime role (migration 000011).
+- **DONE:** PBC requests (14 routes); every manager command needs If-Match; register paged and authorized.
+- **DONE (was MISSING):** document verification against document-vault-svc, envelope forwarded (`internal/documentvault/client.go`; live E2E §6).
+- **DONE (was PARTIAL):** signature verification against esignature-integration-svc (`internal/esignature/client.go`). Live SATISFIED not shown: that service runs only in the phase7 stack.
+- **DONE (was MISSING):** distinct artifacts by canonical reference (`handler.go:516`; `TestER02_SameManifestTwiceCountsOnce`).
+- **DONE (was PARTIAL):** an empty `reference_id` never counts; EVIDENCE_MANIFEST refs checked against evidence-manifest-svc. A real manifest cannot count yet: `EVIDENCE_MANIFEST_READ` is not registered, so the owner refuses every read (fails closed).
+- **DONE (was MISSING, decision):** authorization on evaluate (EVIDENCE_EVALUATE; compose warn, D-ER-6) and `openapi.yaml` 1.4.0 with parity test.
+- **MISSING (callers):** gate coverage for general-ledger post, financial-close lock, vat-gst and corporate-tax.
+- **MISSING (callers):** board-resolutions, corporate-actions and filing-preparation send an incomplete envelope; corporate-actions and filing-preparation pass any outcome but MISSING (fail open).
+- **PARTIAL:** `GET /v1/pbc/requests/{id}` is still authorized by tenant only.
+
+**Still required**
+- Cross-team: the four missing caller gates; the full envelope from the three callers; an allow-list (only SATISFIED passes).
+- evidence-manifest-svc: register `EVIDENCE_MANIFEST_READ` in access-control and a template, so manifests can count.
+- Decisions recorded, not taken: tier (D-ER-1), scan-result ownership (D-ER-2), which document/signature statuses count (D-ER-3).
+- Switch compose evaluate/identity gates to enforce once the callers send envelopes.
 
 ## Domain 2: cross-cutting requirements
 
@@ -582,7 +576,7 @@ These services answer "is this allowed, under which rules, who must approve, and
 - **Group decisions:**
   - Decided: C3 keep wire names and add canonical names alongside (R9); C8 obligations-svc is the owner; WFC-05 is in scope.
   - Open: C4, which API surface binds.
-- **API contract:** finish API-3 in authorization-svc. API-4, API-5 and API-6 are TODO.
+- **API contract:** finish API-3 in authorization-svc. API-4 done in evidence-requirements-svc (5 Nov); elsewhere API-4, API-5 and API-6 are TODO.
 - **Plan tasks:**
   - G-07 evidence ledger; G-08 schema registry lifecycle; G-09/G-10 retention and legal hold (retention-registry-svc); G-05/03/04/12 named-operation parity;
   - WF-1 … WF-4, ST-1 … ST-3, REF-1 … REF-3, JUR-1.

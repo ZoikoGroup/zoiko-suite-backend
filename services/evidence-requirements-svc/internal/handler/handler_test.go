@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
 	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
@@ -62,15 +63,35 @@ type stubStore struct {
 	recordedEvals  []domain.EvidenceEvaluation
 	getRequirement *domain.EvidenceRequirement
 
-	// listFilter records what ListRequirements was actually called with, so a
-	// test can assert the catalog was read in the caller's verified tenant
-	// rather than in whatever ?tenant_id= named.
+	// listFilter / listTenant record what ListRequirementsPage was actually
+	// called with, so a test can assert the catalog was read in the caller's
+	// verified tenant rather than in whatever ?tenant_id= named.
 	listFilter domain.ListRequirementsFilter
+	listTenant string
 
-	// For cursor pagination
-	listRequirementsCursorResult domain.CursorPage[domain.EvidenceRequirement]
-	listEvaluationsCursorResult  domain.CursorPage[domain.EvidenceEvaluation]
-	summaryResult                *domain.EvidenceSummary
+	// Console read models: the rows each list pages over, and the window
+	// the last list call asked for.
+	requirements     []domain.EvidenceRequirement
+	evaluations      []domain.EvidenceEvaluation
+	evaluationFilter domain.ListEvaluationsFilter
+	listErr          error
+	summaryResult    *domain.EvidenceSummary
+	summaryErr       error
+
+	// endDateVersion is the If-Match version EndDateRequirement was called with.
+	endDateVersion int64
+}
+
+// window returns rows[offset:offset+limit], clamped.
+func window[T any](rows []T, offset, limit int) []T {
+	if offset >= len(rows) {
+		return []T{}
+	}
+	end := offset + limit
+	if end > len(rows) {
+		end = len(rows)
+	}
+	return rows[offset:end]
 }
 
 func (s *stubStore) CreateRequirement(_ context.Context, r *domain.EvidenceRequirement) (bool, error) {
@@ -87,16 +108,12 @@ func (s *stubStore) GetRequirement(_ context.Context, _ string) (*domain.Evidenc
 	return s.getRequirement, nil
 }
 
-func (s *stubStore) ListRequirements(_ context.Context, filter domain.ListRequirementsFilter) ([]domain.EvidenceRequirement, error) {
-	s.listFilter = filter
-	return s.effective, nil
-}
-
 func (s *stubStore) EffectiveRequirements(_ context.Context, _, _, _, _ string, _ time.Time) ([]domain.EvidenceRequirement, error) {
 	return s.effective, s.effectErr
 }
 
-func (s *stubStore) EndDateRequirement(_ context.Context, _, _ string, _ time.Time, _, _, _ string) (*domain.EvidenceRequirement, error) {
+func (s *stubStore) EndDateRequirement(_ context.Context, _, _ string, _ time.Time, _, _ string, expectedVersion int64) (*domain.EvidenceRequirement, error) {
+	s.endDateVersion = expectedVersion
 	if s.endDateErr != nil {
 		return nil, s.endDateErr
 	}
@@ -118,16 +135,24 @@ func (s *stubStore) GetEvaluation(_ context.Context, _ string) (*domain.Evidence
 	return s.evaluation, nil
 }
 
-func (s *stubStore) ListRequirementsCursor(_ context.Context, _ domain.ListRequirementsFilter) (domain.CursorPage[domain.EvidenceRequirement], error) {
-	return s.listRequirementsCursorResult, nil
+func (s *stubStore) ListRequirementsPage(_ context.Context, tenantID string, f domain.ListRequirementsFilter, offset, limit int) ([]domain.EvidenceRequirement, error) {
+	s.listTenant, s.listFilter = tenantID, f
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return window(s.requirements, offset, limit), nil
 }
 
-func (s *stubStore) ListEvaluationsCursor(_ context.Context, _ domain.ListEvaluationsFilter) (domain.CursorPage[domain.EvidenceEvaluation], error) {
-	return s.listEvaluationsCursorResult, nil
+func (s *stubStore) ListEvaluationsPage(_ context.Context, _ string, f domain.ListEvaluationsFilter, offset, limit int) ([]domain.EvidenceEvaluation, error) {
+	s.evaluationFilter = f
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return window(s.evaluations, offset, limit), nil
 }
 
 func (s *stubStore) GetSummary(_ context.Context, _ string) (*domain.EvidenceSummary, error) {
-	return s.summaryResult, nil
+	return s.summaryResult, s.summaryErr
 }
 
 // stubPublisher collects the evaluations whose event reached the outbox.
@@ -179,8 +204,41 @@ func newRouter(store handler.Store, pub *stubPublisher, az handler.AuthZClient, 
 	r.Use(svcmiddleware.TenantContext())
 	// Envelope middleware in observe mode so tests can pass with partial headers
 	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
-	handler.RegisterRoutes(r, handler.New(outboxCapture{Store: store, pub: pub}, az, docs, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(outboxCapture{Store: store, pub: pub}, az, docs, zap.NewNop()).WithCursors(testCursors))
 	return r
+}
+
+// testCursors signs the console lists' next_cursor in tests.
+var testCursors = func() *apicontract.CursorSigner {
+	c, err := apicontract.NewCursorSigner([]byte("evidence-requirements-test-cursor-key-32b"))
+	if err != nil {
+		panic(err)
+	}
+	return c
+}()
+
+// doWith is do with extra request headers (If-Match, X-Correlation-ID).
+func doWith(t *testing.T, h http.Handler, method, path string, body any, tenant, principal string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		require.NoError(t, json.NewEncoder(&buf).Encode(body))
+	}
+	req := httptest.NewRequest(method, path, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "idem-test-"+t.Name())
+	if tenant != "" {
+		req.Header.Set("X-Tenant-Id", tenant)
+	}
+	if principal != "" {
+		req.Header.Set("X-Principal-Id", principal)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
 }
 
 // do issues a request with the standard verified-identity headers. Pass
@@ -611,8 +669,8 @@ func TestEndDate_AlreadyRetired_Returns422(t *testing.T) {
 	}
 	h := newRouter(st, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
 
-	rec := do(t, h, http.MethodPost, "/v1/admin/evidence-requirements/req-1/end-date",
-		domain.EndDateRequirementRequest{Reason: "superseded"}, testTenant, testPrincipal)
+	rec := doWith(t, h, http.MethodPost, "/v1/admin/evidence-requirements/req-1/end-date",
+		domain.EndDateRequirementRequest{Reason: "superseded"}, testTenant, testPrincipal, map[string]string{"If-Match": `"v1"`})
 	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code,
 		"a second retirement must be rejected, never a silent no-op")
 	assert.Contains(t, rec.Body.String(), "already_retired")
@@ -638,12 +696,12 @@ func TestEndDate_CallsAuthorization(t *testing.T) {
 	az := &stubAuthz{}
 	st := &stubStore{
 		getRequirement: &domain.EvidenceRequirement{EvidenceRequirementID: "req-1", TenantID: testTenant},
-		endDated:       &domain.EvidenceRequirement{EvidenceRequirementID: "req-1"},
+		endDated:       &domain.EvidenceRequirement{EvidenceRequirementID: "req-1", RecordVersion: 2},
 	}
 	h := newRouter(st, &stubPublisher{}, az, &stubDocs{})
 
-	rec := do(t, h, http.MethodPost, "/v1/admin/evidence-requirements/req-1/end-date",
-		domain.EndDateRequirementRequest{Reason: "superseded"}, testTenant, testPrincipal)
+	rec := doWith(t, h, http.MethodPost, "/v1/admin/evidence-requirements/req-1/end-date",
+		domain.EndDateRequirementRequest{Reason: "superseded"}, testTenant, testPrincipal, map[string]string{"If-Match": `"v1"`})
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, 1, az.calls)
 	assert.Equal(t, "EVIDENCE_REQUIREMENT_RETIRE", az.action)
@@ -667,7 +725,7 @@ func TestListRequirements_NoQueryParam_UsesVerifiedScope(t *testing.T) {
 	h := newRouter(st, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
 	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements", nil, testTenant, testPrincipal)
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, testTenant, st.listFilter.TenantID,
+	assert.Equal(t, testTenant, st.listTenant,
 		"the catalog must be read in the caller's verified tenant, not in whatever the query named")
 }
 
@@ -685,15 +743,17 @@ func TestListRequirements_ForeignTenantQueryParam_Refused(t *testing.T) {
 // permission to proceed.
 func TestListRequirements_MalformedLegalEntityFilter_Refused(t *testing.T) {
 	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
-	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements?legal_entity_id=not-a-uuid", nil, testTenant, testPrincipal)
+	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements?filter[legal_entity_id]=not-a-uuid", nil, testTenant, testPrincipal)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_filter")
 }
 
 func TestListRequirements_RejectsBadAsOf(t *testing.T) {
 	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
 	rec := do(t, h, http.MethodGet,
-		"/v1/evidence-requirements?tenant_id="+testTenant+"&as_of=yesterday", nil, testTenant, testPrincipal)
+		"/v1/evidence-requirements?tenant_id="+testTenant+"&filter[as_of]=yesterday", nil, testTenant, testPrincipal)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_filter")
 }
 
 func TestGetEvaluation_NotFound_Returns404(t *testing.T) {

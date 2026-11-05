@@ -1,155 +1,106 @@
 # evidence-requirements-svc — Runbook
 
-## Service Overview
-**Port:** 8130  
-**Database:** evidence_requirements (PostgreSQL)  
-**Message Broker:** Kafka (topic: zoiko.evidence-requirements.events)  
-**Dependencies:** postgres, kafka, authorization-svc, document-vault-svc, tenant-entity-registry-svc, identity-context-svc, evidence-manifest-svc (optional), esignature-integration-svc (optional)
+Port 8130. Decides whether the evidence required before an action may complete exists
+(Doc 03 §8.6), records every determination in an append-only ledger, and publishes
+`evidence.requirement.satisfied` / `.missing`. Also runs evidence requests (PBC).
 
-## Startup Order
-1. postgres (healthy)
-2. kafka (healthy)
-3. authorization-svc (healthy)
-4. document-vault-svc (healthy)
-5. tenant-entity-registry-svc (healthy)
-6. evidence-requirements-svc
+## Configuration
 
-## Environment Variables
-
-| Variable | Required | Default | Description |
+| Variable | Required | Local default | Meaning |
 |---|---|---|---|
-| PORT | Yes | 8130 | HTTP listen port |
-| DB_HOST | Yes | postgres | PostgreSQL host |
-| DB_PORT | Yes | 5432 | PostgreSQL port |
-| DB_NAME | Yes | evidence_requirements | Database name |
-| DB_USER | Yes | zoiko_app | Database user |
-| DB_PASSWORD | Yes | - | Database password |
-| DB_SSLMODE | No | disable | PostgreSQL SSL mode |
-| KAFKA_BROKERS | Yes | kafka:9094 | Kafka bootstrap servers |
-| KAFKA_EVENTS_TOPIC | Yes | zoiko.evidence-requirements.events | Outbox event topic |
-| AUTHZ_SERVICE_URL | Yes | http://authorization-svc:8089 | Authorization service URL |
-| DOCUMENT_VAULT_SERVICE_URL | Yes | http://document-vault-svc:8094 | Document vault service URL |
-| EVIDENCE_MANIFEST_SERVICE_URL | No* | - | Evidence manifest service URL |
-| ESIGNATURE_SERVICE_URL | No* | - | Esignature service URL |
-| TENANT_REGISTRY_URL | Yes | - | Tenant entity registry URL |
-| EVIDENCE_EVALUATE_AUTHZ | No | enforce | Evaluate authz mode (enforce/warn) |
-| EVIDENCE_READ_AUTHZ | No | enforce | Read authz mode (enforce/warn) |
-| IDENTITY_VERIFY | No | warn | Identity verification mode |
-| IDENTITY_JWKS_URL | No | http://identity-context-svc:8080/.well-known/jwks.json | JWKS URL |
-| IDENTITY_INTROSPECT_URL | No | http://identity-context-svc:8080/v1/context/session/introspect | Session introspection URL |
-| IDENTITY_ISSUER | No | identity-context-svc | JWT issuer |
-| OTEL_EXPORTER_OTLP_ENDPOINT | No | http://otel-collector:4318 | OTLP exporter endpoint |
-| CURSOR_SIGNING_KEY | No* | local-dev default | HMAC key for cursor signing |
+| `ENV` | — | `local` | `local`/`dev`/`development`/`test` relax the start-up refusals below |
+| `PORT` | — | 8130 | |
+| `DB_HOST` `DB_PORT` `DB_NAME` | yes | `postgres` `5432` `evidence_requirements` | |
+| `DB_USER` / `DB_PASSWORD` | yes | `app_evidence_requirements` / `postgres` | The per-service role (create-app-roles.sh): NOSUPERUSER, NOBYPASSRLS, CONNECT on this database only. `zoiko_app` cannot connect. |
+| `KAFKA_BROKERS` `KAFKA_EVENTS_TOPIC` | yes | `kafka:9094` `zoiko.evidence-requirements.events` | |
+| `AUTHZ_SERVICE_URL` | yes | `http://authorization-svc:8089` | Every gate; unreachable = 503 (fail closed) |
+| `AUTHZ_MTLS_ENABLED` / `AUTHZ_MTLS_URL` | no | `false` | Production mTLS client to authorization-svc :8449 |
+| `DOCUMENT_VAULT_SERVICE_URL` | yes | `http://document-vault-svc:8094` | SUPPORTING_DOCUMENT verification |
+| `EVIDENCE_MANIFEST_SERVICE_URL` | outside local | `http://evidence-manifest-svc:8095` | EVIDENCE_MANIFEST verification; unset locally = those references are 503 |
+| `ESIGNATURE_SERVICE_URL` | outside local | `http://host.docker.internal:8148` | SIGNATURE verification (phase7 stack); unset locally = 503 |
+| `TENANT_REGISTRY_URL` | outside local | `http://tenant-entity-registry-svc:8081` | Legal entity of every evaluation/requirement |
+| `CURSOR_SIGNING_KEY_HEX` | outside local | random per process | ≥ 32 bytes, hex. Signs list cursors; shared by every replica |
+| `EVIDENCE_EVALUATE_AUTHZ` | — | `enforce` (compose: `warn`) | Gate mode for EVIDENCE_EVALUATE (D-ER-6) |
+| `EVIDENCE_READ_AUTHZ` | — | `enforce` | Gate mode for the reads and lists |
+| `IDENTITY_VERIFY` | — | `require` (compose: `warn`) | identity-envelope gate; an invalid envelope is 401 in both modes |
+| `IDENTITY_JWKS_URL` `IDENTITY_INTROSPECT_URL` `IDENTITY_ISSUER` | yes | identity-context-svc | Envelope keys and session revocation (TTL 5 s) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | `http://otel-collector:4318` | Traces |
 
-*Required outside local/dev; unset locally means the evidence type is verified as unavailable (503).
+### Start-up refusals
+Outside local/dev the process exits when any of these is unset:
+`EVIDENCE_MANIFEST_SERVICE_URL`, `ESIGNATURE_SERVICE_URL`, `TENANT_REGISTRY_URL`,
+`CURSOR_SIGNING_KEY_HEX` (or shorter than 32 bytes). It also exits when Postgres is
+unreachable at start, or when the identity gate configuration is refused.
 
-## Health Checks
-- **Liveness:** `GET /healthz` — process is up
-- **Readiness:** `GET /readyz` — database connectivity verified
-- **Metrics:** `GET /metrics` — Prometheus scrape endpoint
+## Build, migrate, run (local)
 
-## Database Migrations
-Migrations are in `deployments/migrations/` and run automatically on container start via the `migrate` tool. Key migrations:
-- 000001: Initial schema (evidence_requirements, evidence_evaluations, outbox)
-- 000004: PBC requests (evidence_requests, evidence_request_responses, etc.)
-- 000005: Outbox table
-- 000006: Idempotency constraint on correlation_id
-- 000007: Evaluation ledger immutability trigger
-- 000008: Transactional outbox
-- 000009: Ledger guard trigger
-- 000010: record_version for API-3 optimistic concurrency
-
-## Common Operations
-
-### Seed Demo RBAC
 ```bash
-pwsh deployments/scripts/seed-demo-rbac.ps1
-```
-Grants EVIDENCE_FULL bundle to governance roles.
-
-### View Active Requirements
-```bash
-curl -H "Authorization: Bearer <token>" \
-  "http://localhost:8130/v1/evidence-requirements?page_size=50"
+cd deployments
+docker compose -p deployments build evidence-requirements-svc          # root context
+docker images | grep evidence-requirements                               # check the timestamp
+python3.14 migrate.py up --db evidence_requirements                      # 000001–000011
+docker compose -p deployments up -d --no-deps --no-build --force-recreate evidence-requirements-svc
+powershell -File scripts/seed-demo-rbac.ps1                              # EVIDENCE_FULL bundle
 ```
 
-### Evaluate Evidence
-```bash
-curl -X POST -H "Authorization: Bearer <token>" \
-  -H "Idempotency-Key: <uuid>" \
-  -H "X-Legal-Entity-Id: <uuid>" \
-  -H "Content-Type: application/json" \
-  "http://localhost:8130/v1/evidence/evaluate" \
-  -d '{"legal_entity_id":"<uuid>","domain_code":"FINANCE","action_type":"JOURNAL_POST","present_artifacts":[{"evidence_type":"SUPPORTING_DOCUMENT","reference_id":"<doc-id>"}]}'
-```
+Verify: `bash services/evidence-requirements-svc/scripts/audit.sh` (service behaviour) and
+`python3.14 deployments/scripts/e2e-evidence-requirements-deps.py [--with-outage]` (every
+dependency edge). Both exit with the number of failures.
 
-### Retire a Requirement
-```bash
-curl -X POST -H "Authorization: Bearer <token>" \
-  -H "Idempotency-Key: <uuid>" \
-  -H "If-Match: <record_version>" \
-  -H "Content-Type: application/json" \
-  "http://localhost:8130/v1/admin/evidence-requirements/<req-id>/end-date" \
-  -d '{"reason":"superseded by new policy","effective_to":"2026-12-31T23:59:59Z"}'
-```
+Migrations 000007–000009 are not idempotent: on a scratch database, recreate it between
+runs.
 
-## Troubleshooting
+## Seeding the catalogue
 
-### 503 on Evaluate — Document Vault Unavailable
-**Symptom:** `POST /v1/evidence/evaluate` returns 503 with `store_unavailable` or `document_service_unavailable`
-**Cause:** document-vault-svc is down or network partition
-**Action:** Check document-vault-svc health; the evaluation fails closed (no row written)
+A requirement is data, never code: `POST /v1/admin/evidence-requirements` with
+`domain_code`, `action_type`, `evidence_type`, `requirement_payload`
+(`{"minimum_count":2,"artifact_subtype":"BANK_STATEMENT","description":"…"}`) and
+`legal_entity_id` (omit for tenant-wide, authorized at PLATFORM). Or the console:
+/admin/evidence → Add requirement. Retire by end-dating (If-Match required), never delete.
 
-### 503 on Evaluate — Identity Session Unavailable
-**Symptom:** `POST /v1/evidence/evaluate` returns 503 with `identity_status_unavailable`
-**Cause:** identity-context-svc session introspection failed
-**Action:** Check identity-context-svc health; the request fails closed (AU-01)
+## Operations
 
-### 412 Precondition Failed — Version Mismatch
-**Symptom:** `POST /v1/admin/evidence-requirements/{id}/end-date` returns 412 with `version_mismatch`
-**Cause:** The requirement was modified by another request since the client read it
-**Action:** Client should re-read the requirement (GET), then retry with the new If-Match value
+### An owner is down (503 `document_service_unavailable` / `evidence_manifest_unavailable` / `esignature_unavailable`)
+The evaluation was refused and **nothing was recorded**; the caller retries with the same
+Idempotency-Key. Metric: `evidence_owner_unavailable_total{owner}`; alert
+`EvidenceOwnerUnavailable`. Restore the owner. A 403 from the owner is treated the same
+way (the service cannot confirm the artifact): EVIDENCE_MANIFEST references currently
+always land here because evidence-manifest-svc's `EVIDENCE_MANIFEST_READ` is not
+registered in access-control.
 
-### 409 Idempotency Mismatch
-**Symptom:** Reusing an Idempotency-Key with a different request body
-**Action:** Generate a new Idempotency-Key for each unique evaluation
+### Outbox backlog
+`evidence_outbox_unpublished` > 0 for 10 minutes (alert `EvidenceOutboxBacklog`):
+decisions are recorded, their events are waiting. Check Kafka and the log line
+`outbox: failed to publish`. The worker retries every 5 s; nothing is lost. Count by hand:
+`SELECT outbox_unpublished_count();` (any role).
 
-### 403 Tenant Scope Mismatch
-**Symptom:** Caller sends X-Tenant-Id that doesn't match the gateway-verified tenant
-**Action:** Ensure gateway-auth-svc is correctly setting X-Tenant-Id from the verified envelope
+If evaluations answer 503 `store_unavailable` and the log shows `new row violates
+row-level security policy for table "outbox"`, migration 000011 is not applied.
 
-### Outbox Events Not Publishing
-**Symptom:** `unpublished_outbox_older_than_5_minutes` > 0 in `/v1/evidence/summary`
-**Cause:** Kafka broker unavailable or outbox worker stopped
-**Action:** Check Kafka connectivity; restart evidence-requirements-svc to restart outbox worker
+### Gate modes
+Compose runs evaluate and identity in `warn` (D-ER-6). A refusal in warn is logged
+(`authorization gate (warn mode): would be refused; admitted`) and recorded in
+authorization-svc's decision log. Switch to `enforce`/`require` once the calling services
+send the envelope and their principals hold EVIDENCE_EVALUATE.
 
-## Key Metrics to Watch
-- `http_requests_total{route="/v1/evidence/evaluate",status_code="503"}` — evaluate failures
-- `readiness_up` — should be 1
-- `unpublished_outbox_older_than_5_minutes` — should be 0
-- `http_request_duration_seconds{route="/v1/evidence/evaluate"}` — p99 < 500ms
+### 412 / 428
+428: the client sent no If-Match. 412: the record changed since the client read it; the
+response carries the current ETag. Read again and retry.
 
-## Logs
-Structured JSON logs via zap. Key fields:
-- `service`: "evidence-requirements-svc"
-- `evaluation_id`: for evaluation traces
-- `tenant_id`: tenant scope
-- `correlation_id`: end-to-end trace
+### 409 `idempotency_mismatch`
+The same Idempotency-Key was sent with a different body. The original answer stands; send
+a new key for a new request.
 
-## Security
-- Runs as non-root user in distroless container
-- mTLS to authorization-svc configurable via `AUTHZ_MTLS_ENABLED`
-- Identity envelope verification via identity-context-svc (AU-01, AU-27)
-- Row-level security (RLS) on all tenant-scoped tables
-- Explicit `tenant_id` filter in every query (defense in depth)
+### 400 `invalid_cursor`
+A list cursor was tampered with, came from another tenant or another filter set, or was
+signed by another key (a restart without `CURSOR_SIGNING_KEY_HEX`). Start from page one.
 
-## Rollback Procedure
-1. Stop the new container
-2. Start the previous container image
-3. Run down migrations if schema changed: `migrate -path deployments/migrations down 1`
-4. Verify `/readyz` returns 200
+## Metrics
+`evidence_evaluations_total{outcome}`, `evidence_owner_unavailable_total{owner}`,
+`evidence_outbox_unpublished`, `http_requests_total`, `http_request_duration_seconds`,
+`readiness_up`. Alerts: `deployments/prometheus-rules.yml`, group `evidence-requirements`.
 
-## Contact
-On-call: Platform Governance team  
-Slack: #platform-governance  
-Repo: zoiko-suite-backend-platform/services/evidence-requirements-svc
+## Rollback
+Redeploy the previous image. Migrations 000010/000011 have down files; rolling back 000011
+restores the outbox policy under which the runtime role cannot write events, so roll the
+image back first and keep 000011 unless the previous image connected as a superuser.

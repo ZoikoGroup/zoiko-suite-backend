@@ -1,6 +1,9 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -70,10 +73,12 @@ type Config struct {
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
 
-	// CursorSigningKey is the HMAC key for signing API-4 cursors.
-	// Must be at least 16 bytes. In local/dev a deterministic default is
-	// used; outside local/dev it MUST be set via env.
-	CursorSigningKey string
+	// CursorSigningKey signs the next_cursor of every console list (API-4),
+	// binding it to the tenant, route and filter that minted it.
+	// CURSOR_SIGNING_KEY_HEX, at least 32 bytes; required outside local/dev.
+	// Local and dev generate one per process, which only means a cursor does
+	// not survive a restart. Same contract as identity-context-svc.
+	CursorSigningKey []byte
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -104,7 +109,7 @@ type KafkaConfig struct {
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
-	return &Config{
+	cfg := &Config{
 		Env: env("ENV", "local"),
 		// 8130: 8080-8129 are already claimed by every service built so far
 		// (purchase-order-svc took 8129) — see deployments/docker-compose.yml.
@@ -133,8 +138,38 @@ func Load() (*Config, error) {
 		EvaluateAuthzMode:          strings.ToLower(env("EVIDENCE_EVALUATE_AUTHZ", "enforce")),
 		ReadAuthzMode:              strings.ToLower(env("EVIDENCE_READ_AUTHZ", "enforce")),
 		OTELExporterEndpoint:       env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		CursorSigningKey:           env("CURSOR_SIGNING_KEY", ""),
-	}, nil
+	}
+
+	key, err := cursorKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), cfg.LocalEnv())
+	if err != nil {
+		return nil, err
+	}
+	cfg.CursorSigningKey = key
+	return cfg, nil
+}
+
+// cursorKey decodes CURSOR_SIGNING_KEY_HEX. Unset is an error outside
+// local/dev, where a per-process random key would make every next_cursor
+// fail after a restart or on another replica.
+func cursorKey(raw string, local bool) ([]byte, error) {
+	if raw == "" {
+		if !local {
+			return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is required outside local/dev")
+		}
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("generate cursor signing key: %w", err)
+		}
+		return key, nil
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is not hex: %w", err)
+	}
+	if len(key) < 32 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be at least 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }
 
 // LocalEnv reports whether Env names a developer tier.

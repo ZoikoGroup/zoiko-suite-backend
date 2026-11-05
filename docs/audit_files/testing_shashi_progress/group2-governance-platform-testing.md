@@ -1170,8 +1170,45 @@ Key evidence: idempotent replay single row; 409 compatibility violations; NONE e
 # evidence-requirements-svc (Port 8130) — Service 16 · Group 2 (7/7) — Tier 0 Evidence Requirements
 
 **Group:** 2 — Governance Platform
-**Status:** ✅ **ALL TESTS PASSING** (54 test funcs / 5 files · 0 fail · race clean · **42/42 live probes green** on real binaries; **8 defects fixed**: idempotent replays accepted different payloads · PBC authz scoped to tenant instead of request entity · scan-result unauthenticated · body/envelope entity confusion · malformed UUIDs answered 503 · outbox events never claimed/published · empty-key idempotency collisions · nanosecond-vs-microsecond replay false mismatch) · **ZS-QA-001 live audit: GREEN** (service 16 of 17; seventh and final of Group 2)
-**Last Verified:** 2026-10-19 — static checks, full suite vs real Postgres 16, integration-tagged store suite (29 cases), race suite in Docker `golang:1.25`, and a full live E2E (real `evidence-requirements-svc` + real `authorization-svc` binaries; scratch DBs `evidence_requirements_live` / `authorization_live`; document-vault, Kafka and OTLP endpoints intentionally unreachable)
+**Status:** ✅ **COMPLETE — verified 2026-11-05** (completion plan EVIDENCE-REQUIREMENTS-PLAN-2026-11-04 ER-0…ER-9, ER-FE-1/2): handler 72 · store 24 (35 with `-tags=integration`) · events 5 · manifest 3 · esignature 3 · registry 1 · telemetry 1 — 0 fail, 0 skip on real Postgres 16 · `scripts/audit.sh` live 42/42 · `e2e-evidence-requirements-deps.py --with-outage` live **84/84, 3 skipped (owner-blocked, not passes)** · mutation check 3/3 caught
+**Last Verified:** 2026-11-05 — rebuilt image on the compose stack (app role `app_evidence_requirements`), migrations 000001–000011, every dependency edge crossed live (identity-context, gateway-auth + Traefik, tenant registry, document-vault, evidence-manifest, authorization, Kafka, Jaeger)
+
+---
+
+## 🔬 Completion pass and verification (2026-11-05)
+
+The first execution of the completion plan (same day, another model) reported every task DONE. Verification found it was not:
+seven ER-02 tests and two API-3 tests named in progress.md did not exist; `EndDateRequirement` failed on Postgres (parameters bound
+in the wrong positions); the integration-tagged store suite did not compile; the If-Match path compared the raw ETag string with a
+bigint and referenced a `record_version` column the responses table does not have; `send` lost its DRAFT→SENT guard; list `sort`
+was spliced into ORDER BY unvalidated (SQL injection) and keyset paging ordered by one column while seeking on another; the cursor
+key was hard-coded; no image had been built, no E2E run, the console not rebuilt. All of it was redone in this pass.
+
+Defects found live and fixed (not visible to unit tests):
+- **The outbox refused every event under the real runtime role.** 000008's `FOR ALL USING (false)` blocks INSERT for a
+  NOBYPASSRLS non-owner, so every SATISFIED/MISSING evaluation answered 503. Migration 000011 (append-only policy + SECURITY
+  DEFINER backlog count); `TestOutbox_AppRoleAppendsButCannotRead`.
+- **compose connected as `zoiko_app`**, which has no CONNECT on `evidence_requirements` (create-app-roles.sh) — the container
+  could not start. Now `app_evidence_requirements`.
+- **The ER-5 Traefik route was unreachable** (web entrypoint redirects before routing) and had no ForwardAuth. Now websecure +
+  `gateway-auth@file`; live: no bearer 401 `no_token`, forged identity headers replaced.
+- **access-control 000046** claimed to register six actions that 000008 already registered; its down deleted 000008's rows and
+  its tests failed. Rewritten as templates + descriptions only; `TestR5_EvidenceActionsRegistered`,
+  `TestR5_EvidenceTemplateGrantsEveryAction` (access-control store suite 47/47).
+- asyncapi.yaml described envelope fields as Kafka headers; the record has none (key `<tenant>/<evaluation_id>`, envelope in
+  the value). Rewritten from a real message.
+
+Live E2E (84 checks) proves, per edge: the verified envelope admitted and a tampered one refused in warn mode; an invalidated
+session refused within the revocation TTL; the gateway's 401 and header replacement; NO_REQUIREMENTS_DEFINED, replay = same
+evaluation_id, mismatched replay 409; the registry refusing foreign and random entities with no ledger row; document-vault
+verification (SATISFIED, random id MISSING, the same document twice vs minimum 2 MISSING, another entity's document MISSING,
+vault stopped → 503 and no row); an owner that refuses (403) failing closed; exactly one Kafka record per SATISFIED/MISSING and
+none for NO_REQUIREMENTS_DEFINED or replays; the warn-mode DENY in authorization-svc's decision log; the PBC lifecycle with
+428/412 and self-evaluation / scan gates; signed cursors; all three domain metrics; traces in Jaeger.
+
+Still BLOCKED (owners): a real evidence manifest cannot count — `EVIDENCE_MANIFEST_READ` is not registered, so
+evidence-manifest-svc refuses every read; SIGNATURE live (esignature-integration-svc is in the phase7 stack); document upload
+needs clamd, which compose does not run; caller-side gating and envelopes (see the service's progress.md).
 
 ---
 
@@ -1375,7 +1412,7 @@ events and records publish errors with Kafka down; document-vault outage 503 wit
 | obligations-svc | 8088 | 2 | ✅ Complete | 58 tests · 0 skip · race clean · live E2E green (2 fixes: committed compile break + applicability 503) |
 | authorization-svc | 8089 | 2 | ✅ Complete | 749 tests · 1 by-design skip · race clean · live E2E 46/46 green (12 gofmt files fixed · openapi.yaml + parity test added · 1 flaky IT fixed) |
 | workflow-svc | 8090 | 2 | ✅ Complete | 235 test funcs · race clean · live E2E 35/35 green (2 integration fixes: platform-scope sentinel · request-changes evidence; compile break + missing 000008 migration + 24-file gofmt drift fixed) |
-| evidence-requirements-svc | 8130 | 2 | ✅ Complete | 54 test funcs / 5 files · 29 integration cases · race clean · live E2E 42/42 green (8 defects fixed: idempotency payload checks · PBC authz scope + scan gate · entity authority · malformed UUID 400 · response-retry race · outbox claim/payload · empty-key collisions · µs date precision) |
+| evidence-requirements-svc | 8130 | 2 | ✅ Complete (re-verified 2026-11-05) | handler 72 · store 24/35 (0 skip) · audit.sh 42/42 live · E2E 84/84 live (3 owner-blocked skips) · mutation 3/3 · fixed live: outbox RLS refused every event (000011), compose DB role, unreachable edge route, 000046 · v2.0 console |
 | schema-registry-svc | 8093 | — (supporting) | ✅ Complete | 80 test funcs · 0 fail · race clean · live E2E 20/20 green (openapi.yaml fixed + validated + route-parity test added · spec drift corrected · 1-file gofmt) |
 
 **Completed:** 16/17 services (94.1%)

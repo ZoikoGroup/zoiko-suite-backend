@@ -2965,26 +2965,50 @@ services:
     ports:
       # Loopback only while the identity gate runs in warn mode.
       - "127.0.0.1:8130:8130"
+    # Gateway routing, same shape as jurisdiction-svc: PathPrefix
+    # /evidence-requirements is stripped, and every request passes the
+    # gateway-auth ForwardAuth first, so a request with no or a bad envelope is
+    # 401 from gateway-auth-svc and never reaches this container, and
+    # X-Tenant-Id / X-Principal-Id are the verified ones (Traefik overwrites a
+    # client's copy). Two differences from jurisdiction-svc, both deliberate:
+    #   * entrypoint websecure (https://127.0.0.1:8443): the web entrypoint
+    #     redirects every request to websecure before routing, so a router on
+    #     web alone is never reached;
+    #   * gateway-auth@file: the ForwardAuth the GTRM compiler emits into
+    #     gtrm/compiled-traefik.yml, so this route does not depend on
+    #     jurisdiction-svc's container being up to define the middleware.
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.evidence-requirements-svc.rule=PathPrefix(`/v1/evidence`) || PathPrefix(`/v1/evidence-requirements`) || PathPrefix(`/v1/admin/evidence-requirements`) || PathPrefix(`/v1/pbc`)"
-      - "traefik.http.routers.evidence-requirements-svc.entrypoints=websecure"
-      - "traefik.http.routers.evidence-requirements-svc.tls=true"
-      - "traefik.http.services.evidence-requirements-svc.loadbalancer.server.port=8130"
+      - "traefik.http.routers.evidence-requirements.rule=PathPrefix(`/evidence-requirements`)"
+      - "traefik.http.routers.evidence-requirements.entrypoints=websecure"
+      - "traefik.http.routers.evidence-requirements.tls=true"
+      - "traefik.http.services.evidence-requirements.loadbalancer.server.port=8130"
+      - "traefik.http.middlewares.evidence-requirements-strip.stripprefix.prefixes=/evidence-requirements"
+      - "traefik.http.routers.evidence-requirements.middlewares=gateway-auth@file,evidence-requirements-strip"
     environment:
       PORT: "8130"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: evidence_requirements
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      # The per-service role create-app-roles.sh provisions for this database
+      # (NOSUPERUSER, NOBYPASSRLS): CONNECT on evidence_requirements is revoked
+      # from PUBLIC and granted to this role alone, so zoiko_app cannot connect.
+      DB_USER: "${DB_USER_EVIDENCE_REQUIREMENTS:-app_evidence_requirements}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.evidence-requirements.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      # EVIDENCE_MANIFEST and SIGNATURE references are verified with their
+      # owners (ER-2). esignature-integration-svc runs in the phase7 stack on its
+      # own network, so it is reached through the host port; while that stack is
+      # down a SIGNATURE reference is answered 503 (fail-closed), never counted.
+      EVIDENCE_MANIFEST_SERVICE_URL: "http://evidence-manifest-svc:8095"
+      ESIGNATURE_SERVICE_URL: "${ESIGNATURE_SERVICE_URL:-http://host.docker.internal:8148}"
       # The legal entity of every evaluation and requirement is confirmed here.
       TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # Evaluate is gated on EVIDENCE_EVALUATE (decided 21 Oct 2026). warn on the
       # local stack until the callers outside the governance domains
       # (board-resolutions, corporate-actions, filing-preparation) have their

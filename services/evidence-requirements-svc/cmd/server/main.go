@@ -24,6 +24,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -91,6 +92,7 @@ func main() {
 	}()
 
 	metrics := telemetry.NewMetrics("evidence-requirements-svc")
+	evidenceMetrics := telemetry.NewEvidenceMetrics(prometheus.DefaultRegisterer, "evidence-requirements-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	// Tier 0 pool sizing — same values as policy-svc/jurisdiction-rules-svc/
@@ -188,7 +190,7 @@ func main() {
 	}
 
 	// ── 4b. Outbox worker ──────────────────────────────────────────────────────
-	outboxWorker := outbox.NewWorker(pool, kafkaWriter, log)
+	outboxWorker := outbox.NewWorker(pool, kafkaWriter, log).WithBacklogGauge(evidenceMetrics.SetOutboxUnpublished)
 	outboxWorker.Start(context.Background())
 	defer outboxWorker.Stop()
 
@@ -247,9 +249,17 @@ func main() {
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+	// Console read models (API-4): every next_cursor is signed with this key.
+	cursorSigner, err := apicontract.NewCursorSigner(cfg.CursorSigningKey)
+	if err != nil {
+		log.Fatal("cursor signer", zap.Error(err))
+	}
+
 	h := handler.New(pgStore, authzClient, docsClient, log).
 		WithRegistry(entityChecker).
-		WithGateModes(evaluateMode, readMode)
+		WithGateModes(evaluateMode, readMode).
+		WithCursors(cursorSigner).
+		WithMetrics(evidenceMetrics)
 	if manifestClient != nil {
 		h = h.WithManifestClient(manifestClient)
 	}

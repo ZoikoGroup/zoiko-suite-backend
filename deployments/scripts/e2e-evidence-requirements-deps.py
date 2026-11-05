@@ -4,40 +4,58 @@
 Each check crosses one real dependency edge of evidence-requirements-svc on the
 local compose stack, so a failure names the edge that is broken:
 
-  tenant-entity-registry-svc  HTTP: legal entity existence + jurisdiction
-  identity-context-svc        HTTP: envelope verification + session introspection
-  document-vault-svc          HTTP: SUPPORTING_DOCUMENT verification
-  evidence-manifest-svc       HTTP: EVIDENCE_MANIFEST verification (optional)
-  esignature-integration-svc  HTTP: SIGNATURE verification (optional)
-  authorization-svc           HTTP: admin gating (EVIDENCE_REQUIREMENT_CREATE/RETIRE)
-  kafka                       Outbox: evidence.requirement.satisfied/missing events
+  access-control-svc          HTTP: every action the service checks is registered
+  identity-context-svc        HTTP: envelope JWKS + session introspection (revocation)
+  gateway-auth-svc + Traefik  HTTP: ForwardAuth on /evidence-requirements, verified
+                              identity headers replace the client's
+  tenant-entity-registry-svc  HTTP: the legal entity of an evaluation
+  document-vault-svc          HTTP: SUPPORTING_DOCUMENT references verified
+  evidence-manifest-svc       HTTP: EVIDENCE_MANIFEST references verified
+  esignature-integration-svc  HTTP: SIGNATURE references verified (fail-closed when down)
+  authorization-svc           HTTP: every gate; its decision log shows the warn-mode DENY
+  postgres                    the ledger, the outbox, record_version (API-3)
+  kafka                       evidence.requirement.* published exactly once
   otel-collector / jaeger     OTLP: traces reach Jaeger
-  prometheus                  Metrics: /metrics endpoint serves Prometheus format
 
-    python deployments/scripts/e2e-evidence-requirements-deps.py
+    python deployments/scripts/e2e-evidence-requirements-deps.py [--with-outage]
 
-Run seed-demo-rbac.ps1 and seed-demo-registry.ps1 first; the demo principal
-needs their grants. It writes a little, and undoes what it can: the
-requirement is end-dated, the evaluation correlation_id is unique, and
-the PBC request is closed.
+Run seed-demo-rbac.ps1 and seed-demo-registry.ps1 first. Writes are undone where
+the API allows it: requirements are end-dated, evidence requests closed;
+documents are left in place, titled e2e-…. A check that cannot run prints SKIP,
+is counted separately and is never a pass; no mandatory edge may be skipped.
 
 Exit status is the number of failed checks.
 """
-import argparse, json, os, subprocess, sys, time, urllib.error, urllib.request, uuid
-from datetime import datetime, timezone
+import argparse, base64, json, os, ssl, subprocess, sys, time, urllib.error, urllib.request, uuid
+from datetime import datetime, timedelta, timezone
 
 sys.stdout.reconfigure(encoding="utf-8")
 
 TENANT = "11111111-1111-1111-1111-111111111111"
 ENTITY = "22222222-2222-2222-2222-222222222222"
 ADMIN = "33333333-3333-3333-3333-333333333333"
+APPROVER = "66666666-6666-6666-6666-666666666666"  # second demo principal (same role)
+OTHER_TENANT = "99999999-9999-4999-8999-999999999999"
 
 H = "http://127.0.0.1"
 EVIDENCE, AUTHZ, IDENTITY, REGISTRY = f"{H}:8130", f"{H}:8089", f"{H}:8080", f"{H}:8081"
-DOCVAULT, MANIFEST, ESIGNATURE = f"{H}:8094", f"{H}:8131", f"{H}:8132"
-JAEGER = f"{H}:16686"
+ACCESS, VAULT, MANIFEST, ESIGN = f"{H}:8137", f"{H}:8094", f"{H}:8095", f"{H}:8148"
+GATEWAY_AUTH, EDGE, JAEGER = f"{H}:8092", "https://127.0.0.1:8443/evidence-requirements", f"{H}:16686"
+TOPIC = "zoiko.evidence-requirements.events"
+STAMP = uuid.uuid4().hex[:8].upper()
 
-results = []
+EVIDENCE_ACTIONS = ["EVIDENCE_EVALUATE", "EVIDENCE_REQUIREMENT_READ", "EVIDENCE_EVALUATION_READ",
+                    "EVIDENCE_REQUIREMENT_CREATE", "EVIDENCE_REQUIREMENT_RETIRE", "EVIDENCE_REQUEST_CREATE",
+                    "EVIDENCE_REQUEST_MANAGE", "EVIDENCE_REQUEST_SUBMIT_RESPONSE", "EVIDENCE_REQUEST_EVALUATE"]
+
+results, skips = [], []
+cleanup = []   # (label, fn) run at the end
+published = {}  # evaluation_id -> outcome, for the Kafka check
+not_published = []  # evaluation ids that must produce no event
+
+_insecure = ssl.create_default_context()
+_insecure.check_hostname = False
+_insecure.verify_mode = ssl.CERT_NONE
 
 
 def check(name, ok, detail=""):
@@ -46,21 +64,24 @@ def check(name, ok, detail=""):
     return bool(ok)
 
 
-def envelope(principal=ADMIN, write=False, tenant=TENANT, entity=ENTITY):
+def skip(name, reason):
+    skips.append((name, reason))
+    print(f"SKIP  {name}  — {reason}", flush=True)
+
+
+def envelope(principal=ADMIN, write=False, tenant=TENANT, entity=ENTITY, jwt=None, if_match=None):
     """The canonical input contract: identity, correlation, channel, and on a
-    write an Idempotency-Key and X-Occurred-At."""
+    write an Idempotency-Key."""
     rid = str(uuid.uuid4())
-    h = {
-        "X-Tenant-Id": tenant,
-        "X-Principal-Id": principal,
-        "X-Legal-Entity-Id": entity,
-        "X-Correlation-ID": "e2e-evidence-" + rid[:8],
-        "X-Request-Id": rid,
-        "X-Source-Channel": "api",
-        "X-Source-System": "e2e-evidence-requirements-deps",
-    }
+    h = {"X-Tenant-Id": tenant, "X-Principal-Id": principal, "X-Legal-Entity-Id": entity,
+         "X-Correlation-ID": "e2e-evr-" + rid[:8], "X-Request-Id": rid, "X-Source-Channel": "api",
+         "X-Source-System": "e2e-evidence-requirements-deps"}
+    if jwt:
+        h["Authorization"] = "Bearer " + jwt
     if write:
         h["Idempotency-Key"] = str(uuid.uuid4())
+    if if_match:
+        h["If-Match"] = if_match
     return h
 
 
@@ -71,7 +92,8 @@ def call(method, url, headers=None, body=None, timeout=15):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        ctx = _insecure if url.startswith("https://") else None
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
             status, hdrs, raw = r.status, r.headers, r.read()
     except urllib.error.HTTPError as e:
         status, hdrs, raw = e.code, e.headers, e.read()
@@ -84,12 +106,7 @@ def call(method, url, headers=None, body=None, timeout=15):
     return status, hdrs, parsed
 
 
-def brief(body):
-    return json.dumps(body)[:220]
-
-
 def until(predicate, seconds=30, step=1.0):
-    """Poll predicate() until it returns a truthy value or time runs out."""
     deadline = time.time() + seconds
     while True:
         v = predicate()
@@ -98,7 +115,59 @@ def until(predicate, seconds=30, step=1.0):
         time.sleep(step)
 
 
-# ── 0. Every service is up ───────────────────────────────────────────────────
+def brief(body):
+    return json.dumps(body)[:220]
+
+
+def code(body):
+    return body.get("code") or body.get("error") if isinstance(body, dict) else None
+
+
+def psql(db, sql):
+    out = subprocess.run(["docker", "exec", "zoiko-postgres", "psql", "-U", "postgres", "-d", db, "-tAX", "-c", sql],
+                         capture_output=True, text=True, timeout=30)
+    return out.stdout.strip() if out.returncode == 0 else "ERR " + out.stderr.strip()[:200]
+
+
+def ledger_count():
+    return psql("evidence_requirements", f"SELECT count(*) FROM evidence_evaluations WHERE tenant_id = '{TENANT}'")
+
+
+# ── API helpers ──────────────────────────────────────────────────────────────
+
+def create_requirement(action, evidence_type, minimum=1, entity=None):
+    body = {"tenant_id": TENANT, "domain_code": "E2E", "action_type": action, "evidence_type": evidence_type,
+            "correlation_id": "e2e-" + uuid.uuid4().hex[:8], "requirement_payload": {"minimum_count": minimum}}
+    if entity:
+        body["legal_entity_id"] = entity
+    h = envelope(write=True)
+    s, hd, b = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements", h, body)
+    if s == 201:
+        rid = b["evidence_requirement_id"]
+        cleanup.append((f"end-date requirement {action}/{evidence_type}", lambda: retire(rid)))
+    return s, hd, b, h, body
+
+
+def retire(rid):
+    s, hd, _ = call("GET", f"{EVIDENCE}/v1/evidence-requirements/{rid}", envelope())
+    if s != 200:
+        return s
+    s, _, _ = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements/{rid}/end-date",
+                   envelope(write=True, if_match=hd.get("ETag")), {"reason": "e2e dependency check finished"})
+    return s
+
+
+def evaluate(action, artifacts=(), principal=ADMIN, entity=ENTITY, key=None, base=EVIDENCE, jwt=None, tenant=TENANT):
+    h = envelope(principal, write=True, entity=entity, jwt=jwt, tenant=tenant)
+    if key:
+        h["Idempotency-Key"] = key
+    body = {"legal_entity_id": entity, "domain_code": "E2E", "action_type": action,
+            "correlation_id": "e2e-" + uuid.uuid4().hex[:8], "present_artifacts": list(artifacts)}
+    s, hd, b = call("POST", f"{base}/v1/evidence/evaluate", h, body)
+    return s, b, h["Idempotency-Key"], body
+
+
+# ── 0. every service is up ───────────────────────────────────────────────────
 
 def health():
     for name, url in [
@@ -106,365 +175,450 @@ def health():
         ("authorization-svc", f"{AUTHZ}/readyz"),
         ("identity-context-svc", f"{IDENTITY}/health"),
         ("tenant-entity-registry-svc", f"{REGISTRY}/healthz"),
-        ("document-vault-svc", f"{DOCVAULT}/healthz"),
+        ("access-control-svc", f"{ACCESS}/healthz"),
+        ("document-vault-svc", f"{VAULT}/healthz"),
+        ("evidence-manifest-svc", f"{MANIFEST}/healthz"),
+        ("gateway-auth-svc", f"{GATEWAY_AUTH}/healthz"),
+        ("traefik (zoiko-gateway)", "http://127.0.0.1:8091/api/overview"),
         ("jaeger", f"{JAEGER}/api/services"),
     ]:
-        s, _, b = call("GET", url, timeout=5)
+        s, _, _ = call("GET", url, timeout=5)
         check(f"health {name}", s == 200, f"HTTP {s}" if s != 200 else "")
 
 
-# ── 1. Core evaluation path ──────────────────────────────────────────────────
+# ── 1. access-control-svc: every checked action is registered (ER-1) ─────────
 
-def core_evaluation():
-    """POST /v1/evidence/evaluate with no requirements defined → NO_REQUIREMENTS_DEFINED."""
-    idem = str(uuid.uuid4())
+def access_control():
+    s, _, b = call("GET", f"{ACCESS}/v1/permission-definitions?page_size=500", envelope())
+    items = b if isinstance(b, list) else (b.get("items") or b.get("data") or b.get("permission_definitions") or [])
+    names = {i.get("action_name") for i in items if isinstance(i, dict)}
+    missing = [a for a in EVIDENCE_ACTIONS if a not in names]
+    check("access-control: every evidence action is a registered permission", s == 200 and not missing,
+          f"HTTP {s} missing={missing}" if missing or s != 200 else f"{len(EVIDENCE_ACTIONS)} actions")
+
+
+# ── 2. identity-context-svc ───────────────────────────────────────────────────
+
+def login(password):
+    s, _, b = call("POST", f"{IDENTITY}/v1/authenticate", {"Content-Type": "application/json"},
+                   {"tenant_id": TENANT, "email": "admin@zoikosuite.com", "password": password,
+                    "client_id": os.environ.get("IDENTITY_CONSOLE_CLIENT_ID", "zoiko-console"),
+                    "client_secret": os.environ.get("IDENTITY_CONSOLE_CLIENT_SECRET", "local-dev-console-client-secret")})
+    if s != 200 or not b.get("access_token"):
+        return None, None, f"login HTTP {s} {brief(b)}"
+    s, _, r = call("POST", f"{IDENTITY}/v1/context/resolve", envelope(write=True),
+                   {"bearer_token": b["access_token"], "legal_entity_id": ENTITY})
+    if not r.get("envelope_jwt"):
+        return None, None, f"resolve HTTP {s} {brief(r)}"
+    return r["envelope_jwt"], r.get("session_context_id"), ""
+
+
+def identity(password):
+    jwt, sid, why = login(password)
+    if not check("identity: password login resolved to a signed envelope", jwt, why):
+        return None
+    s, hd, b = call("GET", f"{EVIDENCE}/v1/evidence/summary", envelope(jwt=jwt))
+    check("identity: the verified envelope is admitted", s == 200 and (hd.get("X-Identity-Assertion") or "") != "missing",
+          f"HTTP {s} assertion={hd.get('X-Identity-Assertion')}")
+    head, payload, sig = jwt.split(".")
+    tampered = ".".join([head, payload, sig[:-4] + ("AAAA" if not sig.endswith("AAAA") else "BBBB")])
+    s, _, b = call("GET", f"{EVIDENCE}/v1/evidence/summary", envelope(jwt=tampered))
+    check("identity: a tampered envelope is 401 (warn mode too)", s == 401, f"HTTP {s} {code(b)}")
+
+    # A second session, invalidated at identity-context, is refused within the TTL.
+    jwt2, sid2, why = login(password)
+    if not check("identity: second session for the revocation check", jwt2 and sid2, why or "no session_context_id"):
+        return jwt
+    s, _, _ = call("GET", f"{EVIDENCE}/v1/evidence/summary", envelope(jwt=jwt2))
+    check("identity: the second session is admitted before invalidation", s == 200, f"HTTP {s}")
+    s, _, b = call("POST", f"{IDENTITY}/v1/context/session/{sid2}/invalidate", envelope(write=True, jwt=jwt2), {"reason": "ADMIN_REVOKE"})
+    if check("identity: session invalidated", s in (200, 204), f"HTTP {s} {brief(b)}" if s not in (200, 204) else ""):
+        t0 = time.time()
+        while True:
+            s, _, b = call("GET", f"{EVIDENCE}/v1/evidence/summary", envelope(jwt=jwt2))
+            if s == 401 or time.time() - t0 > 60:
+                break
+            time.sleep(0.5)
+        check("identity: the invalidated session is refused within the revocation TTL", s == 401,
+              f"HTTP {s} {code(b)}; lag {time.time() - t0:.1f}s")
+    return jwt
+
+
+# ── 3. Traefik + gateway-auth-svc ─────────────────────────────────────────────
+
+def edge(jwt):
+    s, hd, b = call("GET", f"{EDGE}/v1/evidence/summary", {"X-Request-Id": str(uuid.uuid4())})
+    check("edge: no bearer is 401 from the gateway", s == 401 and (hd.get("X-Auth-Denial-Reason") or "") == "no_token",
+          f"HTTP {s} X-Auth-Denial-Reason={hd.get('X-Auth-Denial-Reason')}")
+    if not jwt:
+        skip("edge: verified envelope through Traefik", "no envelope (identity login failed)")
+        return
+    s, _, b = call("GET", f"{EDGE}/v1/evidence/summary", {"Authorization": "Bearer " + jwt, "X-Request-Id": str(uuid.uuid4())})
+    check("edge: the verified envelope reaches the service through Traefik", s == 200, f"HTTP {s} {brief(b)}" if s != 200 else "")
+
+    # A client forging another tenant and principal next to its envelope: the
+    # gateway's verified values replace them, so the determination is recorded
+    # in the verified tenant for the verified principal.
+    action = f"E2E_EDGE_{STAMP}"
+    s, b, _, _ = evaluate(action, base=EDGE, jwt=jwt, tenant=OTHER_TENANT, principal="forged-principal")
+    eid = b.get("evaluation_id")
+    if check("edge: an evaluation with forged X-Tenant-Id / X-Principal-Id is served", s == 200 and eid, f"HTTP {s} {brief(b)}"):
+        not_published.append(eid)  # NO_REQUIREMENTS_DEFINED
+        row = psql("evidence_requirements", f"SELECT tenant_id || '|' || evaluated_for_principal_id FROM evidence_evaluations WHERE evaluation_id = '{eid}'")
+        check("edge: the ledger row carries the verified tenant and principal, not the forged ones",
+              row.startswith(TENANT + "|") and "forged" not in row, row)
+
+
+# ── 4. core evaluate and idempotency ──────────────────────────────────────────
+
+def core():
+    action = f"E2E_CORE_{STAMP}"
+    s, b, _, _ = evaluate(action)
+    if check("core: a fresh action_type is NO_REQUIREMENTS_DEFINED", s == 200 and b.get("outcome") == "NO_REQUIREMENTS_DEFINED",
+             f"HTTP {s} {b.get('outcome')}"):
+        not_published.append(b["evaluation_id"])
+
+    s, hd, r, h, body = create_requirement(action, "APPROVAL_RECORD")
+    check("core: requirement created (201, ETag v1)", s == 201 and hd.get("ETag") == '"v1"', f"HTTP {s} ETag={hd.get('ETag')} {brief(r) if s != 201 else ''}")
+    s2, _, r2 = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements", h, body)
+    check("core: requirement replay is 200 with the same id", s2 == 200 and r2.get("evidence_requirement_id") == r.get("evidence_requirement_id"), f"HTTP {s2}")
+    s3, _, r3 = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements", h, {**body, "evidence_type": "OTHER_RECORD"})
+    check("core: same key, different requirement is 409 idempotency_mismatch", s3 == 409 and code(r3) == "idempotency_mismatch", f"HTTP {s3} {code(r3)}")
+
+    s, b, key, ebody = evaluate(action, [{"evidence_type": "APPROVAL_RECORD", "reference_id": "approval-" + STAMP}])
+    if check("core: SATISFIED with the required artifact", s == 200 and b.get("outcome") == "SATISFIED", f"HTTP {s} {brief(b)}"):
+        published[b["evaluation_id"]] = "SATISFIED"
+    first = b.get("evaluation_id")
     h = envelope(write=True)
-    h["Idempotency-Key"] = idem
-    h["X-Legal-Entity-Id"] = ENTITY
-    s, _, b = call("POST", f"{EVIDENCE}/v1/evidence/evaluate", h, {
-        "legal_entity_id": ENTITY,
-        "domain_code": "FINANCE",
-        "action_type": "JOURNAL_POST",
-        "correlation_id": "e2e-core-" + uuid.uuid4().hex[:8],
-        "present_artifacts": []
-    })
-    check("evaluate: no requirements defined returns NO_REQUIREMENTS_DEFINED",
-          s == 200 and b.get("outcome") == "NO_REQUIREMENTS_DEFINED",
-          f"HTTP {s} outcome={b.get('outcome')} {brief(b)}")
+    h["Idempotency-Key"] = key
+    s, _, b = call("POST", f"{EVIDENCE}/v1/evidence/evaluate", h, ebody)
+    check("core: evaluate replay is 200 with the same evaluation_id", s == 200 and b.get("evaluation_id") == first, f"HTTP {s} {b.get('evaluation_id')}")
+    s, _, b = call("POST", f"{EVIDENCE}/v1/evidence/evaluate", h, {**ebody, "action_type": action + "_OTHER"})
+    check("core: same key, different action is 409 idempotency_mismatch", s == 409 and code(b) == "idempotency_mismatch", f"HTTP {s} {code(b)}")
+
+    s, b, _, _ = evaluate(action, [{"evidence_type": "APPROVAL_RECORD", "reference_id": "  "}])
+    if check("core: an empty reference does not count (MISSING)", s == 200 and b.get("outcome") == "MISSING", f"HTTP {s} {b.get('outcome')}"):
+        published[b["evaluation_id"]] = "MISSING"
 
 
-# ── 2. Tenant-entity-registry-svc ────────────────────────────────────────────
+# ── 5. tenant-entity-registry-svc ─────────────────────────────────────────────
 
 def registry():
-    """Legal entity validation: unprojected entity is refused."""
-    idem = str(uuid.uuid4())
-    h = envelope(write=True)
-    h["Idempotency-Key"] = idem
-    h["X-Legal-Entity-Id"] = str(uuid.uuid4())  # unprojected
-    s, _, b = call("POST", f"{EVIDENCE}/v1/evidence/evaluate", h, {
-        "legal_entity_id": h["X-Legal-Entity-Id"],
-        "domain_code": "FINANCE",
-        "action_type": "JOURNAL_POST",
-        "correlation_id": "e2e-registry-" + uuid.uuid4().hex[:8],
-        "present_artifacts": []
-    })
-    check("registry: unprojected entity outside tenant is refused (422/503)",
-          s in (422, 503),
-          f"HTTP {s} {brief(b)}")
+    before = ledger_count()
+    other = psql("tenant_entity_registry", f"SELECT legal_entity_id FROM legal_entities WHERE tenant_id <> '{TENANT}' LIMIT 1")
+    if other and not other.startswith("ERR"):
+        s, b, _, _ = evaluate(f"E2E_REG_{STAMP}", entity=other)
+        check("registry: a legal entity of another tenant is refused (422 legal_entity_not_found)",
+              s == 422 and code(b) == "legal_entity_not_found", f"HTTP {s} {code(b)}")
+    else:
+        skip("registry: a legal entity of another tenant", "the registry seed holds no second tenant's entity")
+    s, b, _, _ = evaluate(f"E2E_REG_{STAMP}", entity=str(uuid.uuid4()))
+    check("registry: a random legal entity is refused (422 legal_entity_not_found)", s == 422 and code(b) == "legal_entity_not_found", f"HTTP {s} {code(b)}")
+    check("registry: neither refusal wrote a ledger row", ledger_count() == before, f"before={before} after={ledger_count()}")
 
 
-# ── 3. Identity-context-svc ──────────────────────────────────────────────────
+# ── 6. document-vault-svc ─────────────────────────────────────────────────────
 
-def identity_envelope(password):
-    """Login, get envelope, verify it works on admin route."""
-    s, _, b = call("POST", f"{IDENTITY}/v1/authenticate", {"Content-Type": "application/json"}, {
-        "tenant_id": TENANT,
-        "email": "admin@zoikosuite.com",
-        "password": password,
-        "client_id": os.environ.get("IDENTITY_CONSOLE_CLIENT_ID", "zoiko-console"),
-        "client_secret": os.environ.get("IDENTITY_CONSOLE_CLIENT_SECRET", "local-dev-console-client-secret")
-    })
-    if not check("identity: password login", s == 200 and b.get("access_token"), f"HTTP {s} {brief(b)}" if s != 200 else ""):
+PLATFORM_ENTITY = "00000000-0000-0000-0000-00000000f001"  # the demo admin's platform-scope assignment
+
+
+def create_document(entity=ENTITY):
+    """A document through document-vault-svc's API; (status, document_id, body)."""
+    h = envelope(write=True, entity=entity)
+    # document-vault-svc requires a purpose on every write (canonical input contract).
+    h["X-Purpose-Context"] = "evidence-requirements e2e: a supporting document to verify"
+    s, _, b = call("POST", f"{VAULT}/v1/documents", h, {
+        "legal_entity_id": entity, "title": f"e2e-evidence-{STAMP}", "classification": "INTERNAL",
+        "content_type": "text/plain", "content_base64": base64.b64encode(f"e2e evidence {STAMP}".encode()).decode()})
+    doc = b.get("document", b) if isinstance(b, dict) else {}
+    return s, doc.get("document_id"), b
+
+
+def fixture_document(entity):
+    """A document row written straight into document_vault, for a stack whose
+    vault refuses every upload (no clamd). The verification edge -- the
+    envelope forwarded to GET /v1/documents/{id} and the vault's own
+    DOCUMENT_READ check -- runs exactly as for an uploaded one."""
+    out = psql("document_vault", "INSERT INTO documents (tenant_id, legal_entity_id, title, classification, created_by_principal_id) "
+               f"VALUES ('{TENANT}', '{entity}', 'e2e-evidence-fixture-{STAMP}', 'INTERNAL', '{ADMIN}') RETURNING document_id")
+    return out.splitlines()[0] if out and not out.startswith("ERR") else None
+
+
+def document_vault(with_outage):
+    s, doc, b = create_document()
+    if s == 503 and code(b) == "scan_unavailable":
+        skip("document-vault: a document uploaded through its API",
+             "the vault refuses every upload without clamd, and compose runs none (BLOCKED: owner environment); a fixture row is used instead")
+        doc = fixture_document(ENTITY)
+        if not check("document-vault: fixture document in the demo entity", doc, "insert failed"):
+            return
+    elif not check("document-vault: a real document created", s == 201 and doc, f"HTTP {s} {brief(b)}"):
         return
-    token = b["access_token"]
-    h = envelope(write=True)
-    h["Authorization"] = "Bearer " + token
-    # Resolve context
-    s, _, b = call("POST", f"{IDENTITY}/v1/context/resolve", h, {
-        "bearer_token": token, "legal_entity_id": ENTITY
-    })
-    jwt = b.get("envelope_jwt")
-    if not check("identity: context resolved to signed envelope", s in (200, 201) and jwt, f"HTTP {s} {brief(b)}" if not jwt else ""):
+    one, two = f"E2E_DOC1_{STAMP}", f"E2E_DOC2_{STAMP}"
+    create_requirement(one, "SUPPORTING_DOCUMENT", 1)
+    create_requirement(two, "SUPPORTING_DOCUMENT", 2)
+    s, b, _, _ = evaluate(one, [{"evidence_type": "SUPPORTING_DOCUMENT", "reference_id": doc}])
+    if check("document-vault: the document is verified with the vault — SATISFIED", s == 200 and b.get("outcome") == "SATISFIED", f"HTTP {s} {brief(b)}"):
+        published[b["evaluation_id"]] = "SATISFIED"
+    s, b, _, _ = evaluate(one, [{"evidence_type": "SUPPORTING_DOCUMENT", "reference_id": str(uuid.uuid4())}])
+    reason = " ".join(u.get("reason", "") for u in b.get("unmet") or [])
+    if check("document-vault: a random id is MISSING with the reason", s == 200 and b.get("outcome") == "MISSING" and "does not exist" in reason,
+             f"HTTP {s} {b.get('outcome')} {reason[:120]}"):
+        published[b["evaluation_id"]] = "MISSING"
+    s, b, _, _ = evaluate(two, [{"evidence_type": "SUPPORTING_DOCUMENT", "reference_id": doc},
+                                {"evidence_type": "SUPPORTING_DOCUMENT", "reference_id": doc.upper()}])
+    if check("document-vault: one document twice against minimum_count 2 is MISSING", s == 200 and b.get("outcome") == "MISSING",
+             f"HTTP {s} {b.get('outcome')}"):
+        published[b["evaluation_id"]] = "MISSING"
+    # A document the caller may read, but of another legal entity: the vault
+    # answers it, and it must not count for this entity's action.
+    other = fixture_document(PLATFORM_ENTITY)
+    if other:
+        s, b, _, _ = evaluate(one, [{"evidence_type": "SUPPORTING_DOCUMENT", "reference_id": other}])
+        reason = " ".join(u.get("reason", "") for u in b.get("unmet") or [])
+        if check("document-vault: a document of another legal entity is MISSING", s == 200 and b.get("outcome") == "MISSING"
+                 and "different tenant or legal entity" in reason, f"HTTP {s} {b.get('outcome')} {reason[:120]}"):
+            published[b["evaluation_id"]] = "MISSING"
+    else:
+        skip("document-vault: a document of another legal entity", "could not write the fixture row")
+
+    if with_outage:
+        before = ledger_count()
+        subprocess.run(["docker", "stop", "document-vault-svc"], capture_output=True, timeout=60)
+        try:
+            s, b, _, _ = evaluate(one, [{"evidence_type": "SUPPORTING_DOCUMENT", "reference_id": doc}])
+            check("document-vault outage: 503 document_service_unavailable", s == 503 and code(b) == "document_service_unavailable", f"HTTP {s} {code(b)}")
+            check("document-vault outage: no ledger row written", ledger_count() == before, f"before={before} after={ledger_count()}")
+        finally:
+            subprocess.run(["docker", "start", "document-vault-svc"], capture_output=True, timeout=60)
+            until(lambda: (call("GET", f"{VAULT}/healthz", timeout=3)[0] == 200, None), seconds=60, step=2)
+
+
+# ── 7. evidence-manifest-svc ──────────────────────────────────────────────────
+
+def evidence_manifest():
+    action = f"E2E_MAN_{STAMP}"
+    create_requirement(action, "EVIDENCE_MANIFEST", 1)
+    s, b, _, _ = evaluate(action, [{"evidence_type": "EVIDENCE_MANIFEST", "reference_id": str(uuid.uuid4())}])
+    reason = " ".join(u.get("reason", "") for u in b.get("unmet") or [])
+    if check("evidence-manifest: an unknown manifest is MISSING with the reason",
+             s == 200 and b.get("outcome") == "MISSING" and "evidence-manifest-svc" in reason, f"HTTP {s} {brief(b)}"):
+        published[b["evaluation_id"]] = "MISSING"
+    real = psql("evidence_manifest", f"SELECT manifest_id FROM evidence_manifests WHERE tenant_id = '{TENANT}' AND legal_entity_id = '{ENTITY}' LIMIT 1")
+    if not real or real.startswith("ERR"):
+        skip("evidence-manifest: a manifest generated through its API",
+             "generating one needs governance-svc, workflow-svc and workflow-history-svc (BLOCKED: owner seed); a fixture row is used instead")
+        real = psql("evidence_manifest", "INSERT INTO evidence_manifests (tenant_id, legal_entity_id, scenario_type, requested_by, status, generated_at) "
+                    f"VALUES ('{TENANT}', '{ENTITY}', 'AUDIT', '{ADMIN}', 'GENERATED', now()) RETURNING manifest_id").splitlines()[0]
+    if not check("evidence-manifest: a manifest exists for the demo entity", real and not real.startswith("ERR"), real):
         return
-    # Use envelope on admin route
-    h = envelope()
-    h["Authorization"] = "Bearer " + jwt
-    s, hd, b = call("GET", f"{EVIDENCE}/v1/admin/evidence-requirements?page_size=1", h)
-    check("evidence admin route accepts verified envelope",
-          s in (200, 403) and (hd.get("X-Identity-Assertion") or "") != "missing",
-          f"HTTP {s} assertion={hd.get('X-Identity-Assertion')}" if s not in (200, 403) else f"assertion={hd.get('X-Identity-Assertion')}")
-    # Tampered envelope
-    head, payload, sig = jwt.split(".")
-    h["Authorization"] = "Bearer " + ".".join([head, payload, sig[:-4] + "AAAA"])
-    s, _, b = call("GET", f"{EVIDENCE}/v1/admin/evidence-requirements?page_size=1", h)
-    check("evidence admin route refuses tampered envelope", s == 401, f"HTTP {s} {b.get('error', '')}")
+    registered = psql("access_control", "SELECT count(*) FROM permission_definitions WHERE action_name = 'EVIDENCE_MANIFEST_READ'")
+    before = ledger_count()
+    s, b, _, _ = evaluate(action, [{"evidence_type": "EVIDENCE_MANIFEST", "reference_id": real}])
+    if registered == "0":
+        # evidence-manifest-svc authorizes every read on EVIDENCE_MANIFEST_READ,
+        # which access-control does not register, so the owner refuses (403)
+        # for every caller. That refusal must stop the check, not count.
+        check("evidence-manifest: an owner that refuses the read is 503, never counted",
+              s == 503 and code(b) == "evidence_manifest_unavailable", f"HTTP {s} {code(b)}")
+        check("evidence-manifest: the refusal wrote no ledger row", ledger_count() == before, f"before={before} after={ledger_count()}")
+        skip("evidence-manifest: a real manifest counts (SATISFIED)",
+             "EVIDENCE_MANIFEST_READ is not registered in access-control, so evidence-manifest-svc refuses every read (BLOCKED: owner R5)")
+    elif check("evidence-manifest: the manifest is verified with its owner — SATISFIED", s == 200 and b.get("outcome") == "SATISFIED", f"HTTP {s} {brief(b)}"):
+        published[b["evaluation_id"]] = "SATISFIED"
 
 
-# ── 4. Document-vault-svc ────────────────────────────────────────────────────
-
-def document_vault():
-    """SUPPORTING_DOCUMENT verification: document must exist and be in scope."""
-    # Create a requirement with minimum_count=1 for SUPPORTING_DOCUMENT
-    idem = str(uuid.uuid4())
-    h = envelope(write=True)
-    h["Idempotency-Key"] = idem
-    s, _, b = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements", h, {
-        "tenant_id": TENANT,
-        "legal_entity_id": ENTITY,
-        "domain_code": "E2E",
-        "action_type": "DOC_CHECK",
-        "evidence_type": "SUPPORTING_DOCUMENT",
-        "requirement_payload": {"minimum_count": 1},
-        "effective_from": datetime.now(timezone.utc).isoformat(),
-        "correlation_id": "e2e-docvault-" + uuid.uuid4().hex[:8]
-    })
-    req_id = b.get("evidence_requirement_id") if s in (200, 201) else None
-    if not check("docvault: requirement created", s in (200, 201) and req_id, f"HTTP {s} {brief(b)}"):
-        return
-
-    # Evaluate with non-existent document → MISSING
-    idem2 = str(uuid.uuid4())
-    h2 = envelope(write=True)
-    h2["Idempotency-Key"] = idem2
-    h2["X-Legal-Entity-Id"] = ENTITY
-    s, _, b = call("POST", f"{EVIDENCE}/v1/evidence/evaluate", h2, {
-        "legal_entity_id": ENTITY,
-        "domain_code": "E2E",
-        "action_type": "DOC_CHECK",
-        "correlation_id": "e2e-docvault-" + uuid.uuid4().hex[:8],
-        "present_artifacts": [{"evidence_type": "SUPPORTING_DOCUMENT", "reference_id": str(uuid.uuid4())}]
-    })
-    check("docvault: non-existent document is MISSING",
-          s == 200 and b.get("outcome") == "MISSING",
-          f"HTTP {s} outcome={b.get('outcome')} {brief(b)}")
-
-    # Clean up: end-date the requirement
-    if req_id:
-        idem3 = str(uuid.uuid4())
-        h3 = envelope(write=True)
-        h3["Idempotency-Key"] = idem3
-        call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements/{req_id}/end-date", h3, {
-            "reason": "e2e cleanup",
-            "effective_to": datetime.now(timezone.utc).isoformat()
-        })
-
-
-# ── 5. Evidence-manifest-svc (optional) ──────────────────────────────────────
-
-def manifest():
-    """EVIDENCE_MANIFEST verification: manifest must exist and be in scope."""
-    if os.environ.get("EVIDENCE_MANIFEST_SERVICE_URL", "").strip() == "":
-        check("manifest: EVIDENCE_MANIFEST_SERVICE_URL not set", True, "SKIPPED — optional dependency")
-        return
-    # Similar pattern to document_vault but for EVIDENCE_MANIFEST
-    check("manifest: optional dependency check", True, "SKIPPED — not implemented in e2e")
-
-
-# ── 6. Esignature-integration-svc (optional) ─────────────────────────────────
+# ── 8. esignature-integration-svc ─────────────────────────────────────────────
 
 def esignature():
-    """SIGNATURE verification: envelope must exist and be in scope."""
-    if os.environ.get("ESIGNATURE_SERVICE_URL", "").strip() == "":
-        check("esignature: ESIGNATURE_SERVICE_URL not set", True, "SKIPPED — optional dependency")
+    action = f"E2E_SIG_{STAMP}"
+    create_requirement(action, "SIGNATURE", 1)
+    up = call("GET", f"{ESIGN}/healthz", timeout=3)[0] == 200
+    before = ledger_count()
+    s, b, _, _ = evaluate(action, [{"evidence_type": "SIGNATURE", "reference_id": str(uuid.uuid4())}])
+    if up:
+        if check("esignature: an unknown envelope is MISSING", s == 200 and b.get("outcome") == "MISSING", f"HTTP {s} {brief(b)}"):
+            published[b["evaluation_id"]] = "MISSING"
+    else:
+        check("esignature unreachable: a SIGNATURE reference is 503 esignature_unavailable, never counted",
+              s == 503 and code(b) == "esignature_unavailable", f"HTTP {s} {code(b)}")
+        check("esignature unreachable: no ledger row written", ledger_count() == before, f"before={before} after={ledger_count()}")
+        skip("esignature: a real envelope counts / an unknown one is MISSING",
+             "esignature-integration-svc runs in the phase7 stack (its own postgres-p7/kafka-p7 network), not up beside this stack (BLOCKED)")
+
+
+# ── 9. Kafka ──────────────────────────────────────────────────────────────────
+
+def kafka():
+    time.sleep(7)  # the outbox worker polls every 5 s
+    out = subprocess.run(["docker", "exec", "zoiko-kafka", "/opt/kafka/bin/kafka-console-consumer.sh",
+                          "--bootstrap-server", "localhost:9094", "--topic", TOPIC, "--from-beginning",
+                          "--timeout-ms", "15000", "--property", "print.key=true", "--property", "key.separator=\t"],
+                         capture_output=True, text=True, timeout=90)
+    keys = {}
+    for line in out.stdout.splitlines():
+        k, _, v = line.partition("\t")
+        keys.setdefault(k, []).append(v)
+    if not check("kafka: topic readable", out.returncode == 0 or keys, (out.stderr or "")[-200:] if not keys else f"{len(keys)} keys"):
         return
-    check("esignature: optional dependency check", True, "SKIPPED — not implemented in e2e")
+    for eid, outcome in published.items():
+        msgs = keys.get(f"{TENANT}/{eid}", [])
+        ok = len(msgs) == 1 and f"evidence.requirement.{outcome.lower()}" in msgs[0]
+        check(f"kafka: {outcome} {eid[:8]} published exactly once, key <tenant>/<evaluation_id>", ok, f"{len(msgs)} message(s)")
+    stray = [e for e in not_published if keys.get(f"{TENANT}/{e}")]
+    check("kafka: NO_REQUIREMENTS_DEFINED and replays published nothing", not stray, f"stray={stray}")
+    ids = ",".join(f"'{e}'" for e in published)
+    if ids:
+        n = psql("evidence_requirements", f"SELECT count(*) FILTER (WHERE published_at IS NULL) || '/' || count(*) FROM outbox WHERE aggregate_id IN ({ids})")
+        check("outbox: every row of this run is published", n.startswith("0/"), n)
 
 
-# ── 7. Authorization-svc (admin gating) ──────────────────────────────────────
+# ── 10. authorization-svc ─────────────────────────────────────────────────────
 
-def authorization():
-    """Admin gating: CREATE and RETIRE require EVIDENCE_REQUIREMENT_CREATE/RETIRE."""
-    # Create requirement without proper grant → 403
-    idem = str(uuid.uuid4())
-    h = envelope(write=True)
-    h["Idempotency-Key"] = idem
-    # Use a principal that does NOT have EVIDENCE_REQUIREMENT_CREATE
+def authorization(subject):
+    h = envelope(subject, write=True)
     s, _, b = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements", h, {
-        "tenant_id": TENANT,
-        "domain_code": "E2E",
-        "action_type": "AUTHZ_CHECK",
-        "evidence_type": "SUPPORTING_DOCUMENT",
-        "requirement_payload": {"minimum_count": 1},
-        "effective_from": datetime.now(timezone.utc).isoformat(),
-        "correlation_id": "e2e-authz-" + uuid.uuid4().hex[:8]
-    })
-    check("authz: unprivileged principal denied CREATE", s == 403,
-          f"HTTP {s} {brief(b)}" if s != 403 else "")
-    # End-date without RETIRE grant → 403 (would need a real requirement ID)
-    # This is harder to test without a real requirement; skip the RETIRE check
+        "tenant_id": TENANT, "domain_code": "E2E", "action_type": f"E2E_DENY_{STAMP}", "evidence_type": "APPROVAL_RECORD",
+        "correlation_id": "e2e-deny"})
+    check("authz: the unprivileged subject is refused catalogue create (403)", s == 403, f"HTTP {s} {code(b)}")
+    s, _, b = call("GET", f"{EVIDENCE}/v1/evidence-requirements", envelope(subject))
+    check("authz: the unprivileged subject is refused the catalogue read (403)", s == 403, f"HTTP {s} {code(b)}")
+    s, _, b = call("GET", f"{EVIDENCE}/v1/evidence/evaluations", envelope(subject))
+    check("authz: the unprivileged subject is refused the evaluation read (403)", s == 403, f"HTTP {s} {code(b)}")
+    s, _, b = call("GET", f"{EVIDENCE}/v1/pbc/requests", envelope(subject))
+    check("authz: the unprivileged subject is refused the PBC register (403)", s == 403, f"HTTP {s} {code(b)}")
+
+    since = datetime.now(timezone.utc) - timedelta(seconds=2)
+    s, b, _, _ = evaluate(f"E2E_WARN_{STAMP}", principal=subject)
+    if check("authz: evaluate is admitted for the subject in warn mode", s == 200, f"HTTP {s} {code(b)}"):
+        not_published.append(b["evaluation_id"])
+    row = psql("authorization_svc", "SELECT decision_outcome FROM access_decision_log WHERE principal_id = '%s' AND action_type = 'EVIDENCE_EVALUATE' "
+               "AND decided_at >= '%s' ORDER BY decided_at DESC LIMIT 1" % (subject, since.isoformat()))
+    check("authz: the decision log records the warn-mode DENY for EVIDENCE_EVALUATE", row in ("DENY", "DENIED"), row or "no row")
 
 
-# ── 8. Kafka outbox ──────────────────────────────────────────────────────────
+# ── 11. PBC end to end, API-3 on every command ────────────────────────────────
 
-def kafka_outbox():
-    """Outbox events published after evaluation."""
-    # Trigger a SATISFIED evaluation by creating a requirement and satisfying it
-    idem = str(uuid.uuid4())
-    h = envelope(write=True)
-    h["Idempotency-Key"] = idem
-    s, _, b = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements", h, {
-        "tenant_id": TENANT,
-        "legal_entity_id": ENTITY,
-        "domain_code": "E2E_KAFKA",
-        "action_type": "OUTBOX_CHECK",
-        "evidence_type": "SUPPORTING_DOCUMENT",
-        "requirement_payload": {"minimum_count": 1},
-        "effective_from": datetime.now(timezone.utc).isoformat(),
-        "correlation_id": "e2e-kafka-" + uuid.uuid4().hex[:8]
-    })
-    req_id = b.get("evidence_requirement_id") if s in (200, 201) else None
-    if not req_id:
-        check("kafka: requirement created for outbox test", False, f"HTTP {s} {brief(b)}")
+def pbc(subject):
+    due = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    s, hd, req = call("POST", f"{EVIDENCE}/v1/pbc/requests", envelope(write=True), {
+        "legal_entity_id": ENTITY, "title": f"e2e-pbc-{STAMP}", "description": "dependency check",
+        "assigned_to_principal_id": APPROVER, "due_at": due, "correlation_id": "e2e-pbc-" + STAMP})
+    rid = req.get("request_id")
+    if not check("pbc: request created (201, ETag v1)", s == 201 and rid and hd.get("ETag") == '"v1"', f"HTTP {s} {hd.get('ETag')} {brief(req) if s != 201 else ''}"):
         return
+    etag = hd.get("ETag")
 
-    # Evaluate with a document that doesn't exist → MISSING (triggers outbox)
-    idem2 = str(uuid.uuid4())
-    h2 = envelope(write=True)
-    h2["Idempotency-Key"] = idem2
-    h2["X-Legal-Entity-Id"] = ENTITY
-    s, _, b = call("POST", f"{EVIDENCE}/v1/evidence/evaluate", h2, {
-        "legal_entity_id": ENTITY,
-        "domain_code": "E2E_KAFKA",
-        "action_type": "OUTBOX_CHECK",
-        "correlation_id": "e2e-kafka-eval-" + uuid.uuid4().hex[:8],
-        "present_artifacts": [{"evidence_type": "SUPPORTING_DOCUMENT", "reference_id": str(uuid.uuid4())}]
-    })
-    check("kafka: evaluation recorded (MISSING triggers outbox)", s == 200,
-          f"HTTP {s} outcome={b.get('outcome')}")
+    def cmd(path, body=None, principal=ADMIN, if_match=None, extra=None):
+        h = envelope(principal, write=True, if_match=if_match)
+        h.update(extra or {})
+        return call("POST", f"{EVIDENCE}/v1/pbc/requests/{rid}{path}", h, body)
 
-    # Clean up
-    if req_id:
-        call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements/{req_id}/end-date", envelope(write=True), {
-            "reason": "e2e cleanup",
-            "effective_to": datetime.now(timezone.utc).isoformat()
-        })
+    try:
+        s, _, b = cmd("/send")
+        check("pbc: send without If-Match is 428", s == 428 and code(b) == "precondition_required", f"HTTP {s} {code(b)}")
+        s, hd, b = cmd("/send", if_match=etag)
+        check("pbc: send with the current If-Match (v2)", s == 200 and hd.get("ETag") == '"v2"', f"HTTP {s} {hd.get('ETag')} {code(b)}")
+        stale, etag = etag, hd.get("ETag")
+        s, hd, b = cmd("/reassign", {"new_assignee_principal_id": APPROVER}, if_match=stale)
+        check("pbc: a stale If-Match is 412 with the current ETag", s == 412 and code(b) == "precondition_failed" and hd.get("ETag") == etag,
+              f"HTTP {s} {code(b)} ETag={hd.get('ETag')}")
+        s, hd, b = cmd("/extend-due-date", {"new_due_at": (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()}, if_match=etag)
+        check("pbc: extend due date (v3)", s == 200 and hd.get("ETag") == '"v3"', f"HTTP {s} {hd.get('ETag')} {code(b)}")
+        etag = hd.get("ETag")
+
+        s, _, resp = cmd("/responses", {"correlation_id": "e2e-resp-" + STAMP}, principal=APPROVER)
+        rsp = resp.get("response_id")
+        check("pbc: the assignee submits a response (no If-Match)", s == 201 and rsp, f"HTTP {s} {brief(resp)}")
+        s, hd, _ = call("GET", f"{EVIDENCE}/v1/pbc/requests/{rid}", envelope())
+        check("pbc: the response moved the request and bumped its version", hd.get("ETag") == '"v4"', f"ETag={hd.get('ETag')}")
+        s, _, b = cmd("/mark-satisfied", if_match=hd.get("ETag"), principal=APPROVER)
+        check("pbc: the submitter cannot mark it satisfied (403 self_evaluation_not_allowed)", s == 403 and code(b) == "self_evaluation_not_allowed",
+              f"HTTP {s} {code(b)}")
+        s, _, b = cmd("/mark-satisfied", if_match=hd.get("ETag"))
+        check("pbc: mark satisfied before a clean scan is 422 artifact_not_scanned", s == 422 and code(b) == "artifact_not_scanned", f"HTTP {s} {code(b)}")
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/responses/{rsp}/scan-result", envelope(subject, write=True), {"result": "CLEAN"})
+        check("pbc: a scan result from a principal without EVIDENCE_REQUEST_MANAGE is 403", s == 403, f"HTTP {s} {code(b)}")
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/responses/{rsp}/scan-result", envelope(write=True), {"result": "CLEAN"})
+        check("pbc: scan result CLEAN recorded by a manager", s == 200, f"HTTP {s} {code(b)}")
+        s, hd, b = cmd("/mark-satisfied", if_match='"v4"')
+        check("pbc: marked satisfied by another principal (v5)", s == 200 and b.get("status") == "SATISFIED" and hd.get("ETag") == '"v5"',
+              f"HTTP {s} {b.get('status')} {hd.get('ETag')} {code(b)}")
+        etag = hd.get("ETag")
+    finally:
+        s, hd, _ = call("GET", f"{EVIDENCE}/v1/pbc/requests/{rid}", envelope())
+        s, _, b = cmd("/close", if_match=hd.get("ETag"))
+        check("pbc: request closed (undo)", s == 200 and b.get("status") == "CLOSED", f"HTTP {s} {code(b)}")
 
 
-# ── 9. Tracing (OTel → Jaeger) ───────────────────────────────────────────────
+# ── 12. console read models (API-4) ───────────────────────────────────────────
 
-def tracing():
+def lists():
+    s, _, b = call("GET", f"{EVIDENCE}/v1/evidence/evaluations?page_size=2&filter[domain_code]=E2E", envelope())
+    nxt = b.get("next_cursor")
+    check("lists: first page of evaluations with a next cursor", s == 200 and len(b.get("items", [])) == 2 and nxt, f"HTTP {s} {brief(b)[:120]}")
+    if nxt:
+        s, _, b2 = call("GET", f"{EVIDENCE}/v1/evidence/evaluations?page_size=2&filter[domain_code]=E2E&cursor={urllib.request.quote(nxt)}", envelope())
+        ids1 = {i["evaluation_id"] for i in b.get("items", [])}
+        check("lists: the next page continues without repeating", s == 200 and not ids1 & {i["evaluation_id"] for i in b2.get("items", [])}, f"HTTP {s}")
+        s, _, b3 = call("GET", f"{EVIDENCE}/v1/evidence/evaluations?page_size=2&filter[domain_code]=E2E&cursor={urllib.request.quote(nxt[:-2] + 'xx')}", envelope())
+        check("lists: a tampered cursor is 400 invalid_cursor", s == 400 and code(b3) == "invalid_cursor", f"HTTP {s} {code(b3)}")
+    s, _, b = call("GET", f"{EVIDENCE}/v1/evidence-requirements?filter[colour]=red", envelope())
+    check("lists: an unknown filter is 400 unknown_filter", s == 400 and code(b) == "unknown_filter", f"HTTP {s} {code(b)}")
+    s, _, b = call("GET", f"{EVIDENCE}/v1/evidence/summary", envelope())
+    check("lists: the summary reads", s == 200 and isinstance(b.get("active_requirements"), int), f"HTTP {s} {brief(b)[:160]}")
+
+
+# ── 13. metrics and tracing ───────────────────────────────────────────────────
+
+def telemetry():
+    req = urllib.request.Request(f"{EVIDENCE}/metrics")
+    try:
+        raw = urllib.request.urlopen(req, timeout=10).read().decode()
+    except OSError as e:
+        raw = str(e)
+    for series in ("evidence_evaluations_total", "evidence_owner_unavailable_total", "evidence_outbox_unpublished"):
+        check(f"metrics: {series} is served", series in raw)
+
     def listed():
         s, _, b = call("GET", f"{JAEGER}/api/services")
         return ("evidence-requirements-svc" in (b.get("data") or []), b.get("data"))
-    found, services = until(listed, seconds=20, step=2)
-    check("tracing: evidence-requirements-svc traces in Jaeger", found,
-          "" if found else f"services={services}")
-
-
-# ── 10. Metrics (Prometheus) ─────────────────────────────────────────────────
-
-def metrics():
-    s, _, b = call("GET", f"{EVIDENCE}/metrics")
-    has_counter = "http_requests_total" in str(b)
-    has_histogram = "http_request_duration_seconds" in str(b)
-    check("metrics: /metrics serves Prometheus format", s == 200 and has_counter and has_histogram,
-          f"HTTP {s} counter={has_counter} histogram={has_histogram}" if s != 200 else "")
-
-
-# ── 11. Cursor pagination (API-4) ────────────────────────────────────────────
-
-def cursor_pagination():
-    # First page
-    s, hd, b = call("GET", f"{EVIDENCE}/v1/evidence-requirements/cursor?page_size=2", envelope())
-    check("cursor: first page returns items and next_cursor", s == 200 and "items" in b and "next_cursor" in b,
-          f"HTTP {s} {brief(b)}")
-    next_cursor = b.get("next_cursor")
-    if not next_cursor:
-        check("cursor: next_cursor present", False, "no next_cursor")
-        return
-    # Second page with cursor
-    s, _, b = call("GET", f"{EVIDENCE}/v1/evidence-requirements/cursor?page_size=2&cursor={next_cursor}", envelope())
-    check("cursor: second page with valid cursor", s == 200 and "items" in b,
-          f"HTTP {s} {brief(b)}")
-    # Tampered cursor
-    tampered = next_cursor[:-1] + ("A" if next_cursor[-1] != "A" else "B")
-    s, _, b = call("GET", f"{EVIDENCE}/v1/evidence-requirements/cursor?page_size=2&cursor={tampered}", envelope())
-    check("cursor: tampered cursor rejected (400)", s == 400, f"HTTP {s} {brief(b)}")
-
-
-# ── 12. API-3 If-Match (optimistic concurrency) ──────────────────────────────
-
-def api3_if_match():
-    # Create a requirement
-    idem = str(uuid.uuid4())
-    h = envelope(write=True)
-    h["Idempotency-Key"] = idem
-    s, _, b = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements", h, {
-        "tenant_id": TENANT,
-        "legal_entity_id": ENTITY,
-        "domain_code": "E2E_API3",
-        "action_type": "IF_MATCH_CHECK",
-        "evidence_type": "SUPPORTING_DOCUMENT",
-        "requirement_payload": {"minimum_count": 1},
-        "effective_from": datetime.now(timezone.utc).isoformat(),
-        "correlation_id": "e2e-api3-" + uuid.uuid4().hex[:8]
-    })
-    req_id = b.get("evidence_requirement_id") if s in (200, 201) else None
-    etag = hd.get("ETag") if 'hd' in locals() else None
-    if not req_id:
-        check("api3: requirement created for If-Match test", False, f"HTTP {s} {brief(b)}")
-        return
-
-    # End-date with correct ETag
-    idem2 = str(uuid.uuid4())
-    h2 = envelope(write=True)
-    h2["Idempotency-Key"] = idem2
-    h2["If-Match"] = etag or "1"
-    s, _, b = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements/{req_id}/end-date", h2, {
-        "reason": "e2e cleanup",
-        "effective_to": datetime.now(timezone.utc).isoformat(),
-        "if_match": etag or "1"
-    })
-    check("api3: correct If-Match succeeds", s == 200, f"HTTP {s} {brief(b)}")
-
-    # Re-create for stale test
-    idem3 = str(uuid.uuid4())
-    h3 = envelope(write=True)
-    h3["Idempotency-Key"] = idem3
-    s, _, b = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements", h3, {
-        "tenant_id": TENANT,
-        "legal_entity_id": ENTITY,
-        "domain_code": "E2E_API3",
-        "action_type": "IF_MATCH_CHECK2",
-        "evidence_type": "SUPPORTING_DOCUMENT",
-        "requirement_payload": {"minimum_count": 1},
-        "effective_from": datetime.now(timezone.utc).isoformat(),
-        "correlation_id": "e2e-api3-" + uuid.uuid4().hex[:8]
-    })
-    req_id2 = b.get("evidence_requirement_id") if s in (200, 201) else None
-    etag2 = hd.get("ETag") if 'hd' in locals() else "1"
-    # End-date with stale ETag
-    idem4 = str(uuid.uuid4())
-    h4 = envelope(write=True)
-    h4["Idempotency-Key"] = idem4
-    h4["If-Match"] = str(int(etag2) + 1) if etag2.isdigit() else "999"
-    s, _, b = call("POST", f"{EVIDENCE}/v1/admin/evidence-requirements/{req_id2}/end-date", h4, {
-        "reason": "e2e stale",
-        "effective_to": datetime.now(timezone.utc).isoformat(),
-        "if_match": h4["If-Match"]
-    })
-    check("api3: stale If-Match rejected (412)", s == 412, f"HTTP {s} {brief(b)}")
-
-
-# ── 13. PBC requests (API-3 on mutations) ──────────────────────────────────
-
-def pbc_api3():
-    check("pbc: API-3 on PBC mutations", True, "SKIPPED — covered by handler tests")
+    found, services = until(listed, seconds=30, step=3)
+    check("tracing: evidence-requirements-svc traces in Jaeger", found, "" if found else f"services={services}")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--password", default=os.environ.get("E2E_ADMIN_PASSWORD", "Zoiko@Governance1"),
-                    help="admin@zoikosuite.com's password (the demo seed's)")
+    ap.add_argument("--subject", default=os.environ.get("E2E_SUBJECT", "798980b8-d26e-4439-a065-a7f80120c36e"),
+                    help="a principal in the demo tenant that holds no evidence grant")
+    ap.add_argument("--password", default=os.environ.get("E2E_ADMIN_PASSWORD", "Zoiko@Governance1"))
+    ap.add_argument("--with-outage", action="store_true", help="stop document-vault-svc for one evaluation, then start it")
     a = ap.parse_args()
 
     health()
-    core_evaluation()
+    access_control()
+    jwt = identity(a.password)
+    edge(jwt)
+    core()
     registry()
-    identity_envelope(a.password)
-    document_vault()
-    manifest()
+    document_vault(a.with_outage)
+    evidence_manifest()
     esignature()
-    authorization()
-    kafka_outbox()
-    tracing()
-    metrics()
-    cursor_pagination()
-    api3_if_match()
-    pbc_api3()
+    authorization(a.subject)
+    pbc(a.subject)
+    lists()
+    kafka()
+    telemetry()
+
+    for label, fn in reversed(cleanup):
+        s = fn()
+        if s != 200:
+            print(f"note  undo failed: {label} (HTTP {s})")
 
     failed = [r for r in results if not r[1]]
-    print(f"\n{len(results) - len(failed)}/{len(results)} passed")
+    print(f"\n{len(results) - len(failed)}/{len(results)} passed, {len(skips)} skipped")
+    for name, reason in skips:
+        print(f"  skipped: {name} — {reason}")
     sys.exit(len(failed))
 
 

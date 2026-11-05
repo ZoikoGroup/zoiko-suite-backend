@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: evidence-requirements-svc
-  version: 1.3.0
+  version: 1.5.0
   description: |
     Evidence Requirements Service (Doc 03 §8.6, Doc 04 §7.1): decides what evidence must exist
     before an action may complete, and records each determination in an append-only ledger.
@@ -10,16 +10,32 @@ info:
     outcome (decided 21 Oct 2026): it is never reported as SATISFIED, and the calling service
     decides whether its action may proceed without configured requirements.
 
+    Artifacts are verified with their owner before they count: SUPPORTING_DOCUMENT with
+    document-vault-svc, EVIDENCE_MANIFEST with evidence-manifest-svc, SIGNATURE with
+    esignature-integration-svc (existence in the caller's tenant and legal entity). An owner that
+    cannot answer is a 503 and no determination is recorded. Other evidence types count on the
+    caller's word when the reference is not empty.
+
     Identity: identity-context-svc's signed envelope (Authorization: Bearer), verified against
     its JWKS and session status; a service may instead call over verified mTLS as a registered
     peer workload. Authorization at the legal entity: EVIDENCE_EVALUATE, EVIDENCE_REQUIREMENT_READ,
-    EVIDENCE_EVALUATION_READ, EVIDENCE_REQUIREMENT_CREATE, EVIDENCE_REQUIREMENT_RETIRE (tenant-wide
-    requirements at PLATFORM scope); the legal entity must exist in the caller's tenant
-    (tenant-entity-registry-svc). Errors: RFC 9457 problem+json with the §16 error_class.
+    EVIDENCE_EVALUATION_READ, EVIDENCE_REQUIREMENT_CREATE, EVIDENCE_REQUIREMENT_RETIRE, and the
+    EVIDENCE_REQUEST_* actions (tenant-wide scope is PLATFORM); the legal entity must exist in the
+    caller's tenant (tenant-entity-registry-svc). Errors: RFC 9457 problem+json with the §16
+    error_class.
+
+    API-3: requirements and evidence requests carry record_version, served as the ETag "v<n>".
+    A change to an existing one requires If-Match: none is 428 precondition_required, a stale one
+    is 412 precondition_failed (with current_version and the current ETag), "*" is unconditional.
+
+    API-4: the lists take filter[name]=value, page_size (1..200, default 50) and an opaque,
+    signed cursor bound to the tenant, route and filters that produced it. An unknown filter is
+    400 unknown_filter; a tampered or foreign cursor is 400 invalid_cursor.
 
     Events (transactional outbox, topic zoiko.evidence-requirements.events, key
     `<tenant>/<evaluation>`): evidence.requirement.satisfied, evidence.requirement.missing; the
     envelope carries causation_id, jurisdiction_context and governing_refs.requirement_ids.
+    See asyncapi.yaml.
 servers:
   - url: http://localhost:8130
 security:
@@ -51,12 +67,12 @@ paths:
                 correlation_id: {type: string}
                 present_artifacts:
                   type: array
-                  description: The same artifact offered twice (by canonical reference) counts once.
+                  description: The same artifact offered twice (by canonical reference) counts once. An empty reference_id never counts.
                   items:
                     type: object
                     required: [evidence_type, reference_id]
                     properties:
-                      evidence_type: {type: string, description: SUPPORTING_DOCUMENT references are verified against document-vault-svc}
+                      evidence_type: {type: string, description: 'SUPPORTING_DOCUMENT, EVIDENCE_MANIFEST and SIGNATURE are verified with their owner'}
                       reference_id: {type: string}
                       artifact_subtype: {type: string}
       responses:
@@ -68,9 +84,33 @@ paths:
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
+        '409': {description: 'idempotency_mismatch: the key was used for a different evaluation', content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
         '413': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
+        '503':
+          description: |
+            Nothing was recorded. Codes: document_service_unavailable, evidence_manifest_unavailable,
+            esignature_unavailable (an artifact owner could not answer), registry_unavailable,
+            authorization_service_unavailable, store_unavailable.
+          content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
+  /v1/evidence/evaluations:
+    get:
+      tags: [evaluation]
+      operationId: listEvaluations
+      description: The evaluation register, newest first. Authorized under EVIDENCE_EVALUATION_READ at filter[legal_entity_id], PLATFORM when unfiltered.
+      parameters:
+        - {name: 'filter[outcome]', in: query, schema: {type: string, enum: [SATISFIED, MISSING, NO_REQUIREMENTS_DEFINED]}}
+        - {name: 'filter[domain_code]', in: query, schema: {type: string}}
+        - {name: 'filter[action_type]', in: query, schema: {type: string}}
+        - {name: 'filter[legal_entity_id]', in: query, schema: {type: string, format: uuid}}
+        - {name: 'filter[since]', in: query, schema: {type: string, format: date-time}}
+        - {$ref: '#/components/parameters/PageSize'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200': {description: A page of evaluations, content: {application/json: {schema: {$ref: '#/components/schemas/EvaluationPage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
   /v1/evidence/evaluations/{evaluation_id}:
     parameters:
@@ -83,68 +123,36 @@ paths:
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
-  /v1/evidence/evaluations:
-    get:
-      tags: [evaluation]
-      operationId: listEvaluationsCursor
-      parameters:
-        - {name: legal_entity_id, in: query, schema: {type: string, format: uuid}}
-        - {name: domain_code, in: query, schema: {type: string}}
-        - {name: action_type, in: query, schema: {type: string}}
-        - {name: outcome, in: query, schema: {type: string}}
-        - {name: since, in: query, schema: {type: string, format: date-time}}
-        - {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
-        - {name: cursor, in: query, schema: {type: string}}
-        - {name: sort, in: query, schema: {type: string}}
-      responses:
-        '200': {description: Cursor-paginated evaluations, content: {application/json: {schema: {$ref: '#/components/schemas/CursorPageEvaluation'}}}}
-        '400': {$ref: '#/components/responses/Problem'}
-        '401': {$ref: '#/components/responses/Problem'}
-        '403': {$ref: '#/components/responses/Problem'}
   /v1/evidence/summary:
     get:
       tags: [evaluation]
       operationId: getEvidenceSummary
+      description: The console KPI row and panels. Tenant-wide (EVIDENCE_REQUIREMENT_READ at PLATFORM). A count that cannot be read is a 503, never a 0.
       responses:
-        '200': {description: Evidence summary counts, content: {application/json: {schema: {$ref: '#/components/schemas/EvidenceSummary'}}}}
+        '200': {description: Evidence summary, content: {application/json: {schema: {$ref: '#/components/schemas/EvidenceSummary'}}}}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
   /v1/evidence-requirements:
     get:
       tags: [catalogue]
       operationId: listRequirements
+      description: The caller's tenant catalogue. Authorized under EVIDENCE_REQUIREMENT_READ at filter[legal_entity_id], PLATFORM when unfiltered.
       parameters:
-        - {name: legal_entity_id, in: query, schema: {type: string, format: uuid}}
-        - {name: domain_code, in: query, schema: {type: string}}
-        - {name: action_type, in: query, schema: {type: string}}
-        - {name: as_of, in: query, description: "RFC 3339 or 'now'; omitted returns the full history", schema: {type: string}}
-        - {name: tenant_id, in: query, description: May only repeat the caller's tenant, schema: {type: string}}
-        - {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
-        - {name: cursor, in: query, schema: {type: string}}
-        - {name: sort, in: query, schema: {type: string}}
+        - {name: 'filter[legal_entity_id]', in: query, schema: {type: string, format: uuid}}
+        - {name: 'filter[domain_code]', in: query, schema: {type: string}}
+        - {name: 'filter[action_type]', in: query, schema: {type: string}}
+        - {name: 'filter[evidence_type]', in: query, schema: {type: string}}
+        - {name: 'filter[as_of]', in: query, description: "RFC 3339 or 'now'; omitted returns the full history, retired requirements included", schema: {type: string}}
+        - {name: tenant_id, in: query, description: May only repeat the caller's tenant (403 otherwise), schema: {type: string}}
+        - {$ref: '#/components/parameters/PageSize'}
+        - {$ref: '#/components/parameters/Cursor'}
       responses:
-        '200': {description: The caller's tenant catalogue, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Requirement'}}}}}
+        '200': {description: A page of requirements, content: {application/json: {schema: {$ref: '#/components/schemas/RequirementPage'}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
-  /v1/evidence-requirements/cursor:
-    get:
-      tags: [catalogue]
-      operationId: listRequirementsCursor
-      parameters:
-        - {name: legal_entity_id, in: query, schema: {type: string, format: uuid}}
-        - {name: domain_code, in: query, schema: {type: string}}
-        - {name: action_type, in: query, schema: {type: string}}
-        - {name: as_of, in: query, description: "RFC 3339 or 'now'; omitted returns the full history", schema: {type: string}}
-        - {name: tenant_id, in: query, description: May only repeat the caller's tenant, schema: {type: string}}
-        - {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
-        - {name: cursor, in: query, schema: {type: string}}
-        - {name: sort, in: query, schema: {type: string}}
-      responses:
-        '200': {description: Cursor-paginated requirements, content: {application/json: {schema: {$ref: '#/components/schemas/CursorPageRequirement'}}}}
-        '400': {$ref: '#/components/responses/Problem'}
-        '401': {$ref: '#/components/responses/Problem'}
-        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
   /v1/evidence-requirements/{evidence_requirement_id}:
     parameters:
       - {name: evidence_requirement_id, in: path, required: true, schema: {type: string}}
@@ -152,7 +160,10 @@ paths:
       tags: [catalogue]
       operationId: getRequirement
       responses:
-        '200': {description: The requirement, content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
+        '200':
+          description: The requirement
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
@@ -182,6 +193,7 @@ paths:
           description: Created
           headers:
             Location: {description: The new requirement, schema: {type: string}}
+            ETag: {$ref: '#/components/headers/ETag'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Requirement'}
@@ -211,14 +223,16 @@ paths:
               properties:
                 effective_to: {type: string, format: date-time, description: After effective_from and not before now}
                 reason: {type: string}
-                if_match: {type: string, description: Current record_version for optimistic concurrency control (API-3)}
       responses:
-        '200': {description: Retired by end-dating (never deleted), content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
+        '200': {$ref: '#/components/responses/Requirement'}
         '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
-        '412': {$ref: '#/components/responses/VersionMismatch'}
+        '412': {$ref: '#/components/responses/PreconditionFailed'}
         '422': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '503': {$ref: '#/components/responses/Problem'}
   /v1/pbc/requests:
     post:
       tags: [pbc]
@@ -227,91 +241,88 @@ paths:
       requestBody: {$ref: '#/components/requestBodies/PBCCommand'}
       responses:
         '201': {$ref: '#/components/responses/EvidenceRequest'}
+        '200': {$ref: '#/components/responses/EvidenceRequest'}
         '400': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
     get:
       tags: [pbc]
-      operationId: listOpenEvidenceRequests
-      responses:
-        '200': {description: Open requests, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/EvidenceRequest'}}}}}
-  /v1/pbc/requests/cursor:
-    get:
-      tags: [pbc]
-      operationId: listOpenEvidenceRequestsCursor
+      operationId: listEvidenceRequests
+      description: |
+        The evidence request register, soonest due first. Without filter[status] it lists open
+        requests (not SATISFIED or CLOSED); filter[open]=false lists all. Authorized under
+        EVIDENCE_REQUEST_MANAGE at filter[legal_entity_id], PLATFORM when unfiltered.
       parameters:
-        - {name: legal_entity_id, in: query, schema: {type: string, format: uuid}}
-        - {name: status, in: query, schema: {type: string}}
-        - {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
-        - {name: cursor, in: query, schema: {type: string}}
-        - {name: sort, in: query, schema: {type: string}}
+        - {name: 'filter[legal_entity_id]', in: query, schema: {type: string, format: uuid}}
+        - {name: 'filter[status]', in: query, schema: {type: string, enum: [DRAFT, SENT, VIEWED, RESPONSE_RECEIVED, UNDER_EVALUATION, SATISFIED, CLARIFICATION_REQUIRED, CLOSED]}}
+        - {name: 'filter[open]', in: query, schema: {type: string, enum: ['true', 'false']}}
+        - {$ref: '#/components/parameters/PageSize'}
+        - {$ref: '#/components/parameters/Cursor'}
       responses:
-        '200': {description: Cursor-paginated PBC requests, content: {application/json: {schema: {$ref: '#/components/schemas/CursorPageEvidenceRequest'}}}}
+        '200': {description: A page of evidence requests, content: {application/json: {schema: {$ref: '#/components/schemas/EvidenceRequestPage'}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
   /v1/pbc/requests/{request_id}:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
     get:
       tags: [pbc]
       operationId: getEvidenceRequest
+      description: >-
+        One request, with its ETag. Authorized at the request's legal entity (D-ER-29): the assignee
+        under EVIDENCE_REQUEST_SUBMIT_RESPONSE, anyone else under EVIDENCE_REQUEST_MANAGE.
       responses:
         '200': {$ref: '#/components/responses/EvidenceRequest'}
+        '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
   /v1/pbc/requests/{request_id}/send:
     parameters:
       - {$ref: '#/components/parameters/RequestID'}
       - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: sendEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+      - {name: X-Correlation-ID, in: header, required: true, schema: {type: string}}
+    post: {tags: [pbc], operationId: sendEvidenceRequest, description: DRAFT to SENT., responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/PreconditionFailed'}, '422': {$ref: '#/components/responses/Problem'}, '428': {$ref: '#/components/responses/PreconditionRequired'}}}
   /v1/pbc/requests/{request_id}/reassign:
     parameters:
       - {$ref: '#/components/parameters/RequestID'}
       - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: reassignEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    post: {tags: [pbc], operationId: reassignEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/PreconditionFailed'}, '428': {$ref: '#/components/responses/PreconditionRequired'}}}
   /v1/pbc/requests/{request_id}/extend-due-date:
     parameters:
       - {$ref: '#/components/parameters/RequestID'}
       - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: extendEvidenceRequestDueDate, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    post: {tags: [pbc], operationId: extendEvidenceRequestDueDate, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/PreconditionFailed'}, '428': {$ref: '#/components/responses/PreconditionRequired'}}}
   /v1/pbc/requests/{request_id}/view:
-    parameters:
-      - {$ref: '#/components/parameters/RequestID'}
-      - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: viewEvidenceRequest, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: viewEvidenceRequest, description: 'The assignee opened it (SENT to VIEWED). Only the assignee, holding EVIDENCE_REQUEST_SUBMIT_RESPONSE at the request''s entity, records a view (D-ER-29); anyone else is 403 and the version is unchanged. No If-Match: an action on the request, not an edit of it; it bumps record_version.', responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '404': {$ref: '#/components/responses/Problem'}, '503': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/requests/{request_id}/responses:
-    parameters:
-      - {$ref: '#/components/parameters/RequestID'}
-      - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: submitEvidenceResponse, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Response recorded}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: submitEvidenceResponse, description: 'Appends a new response version. No If-Match; it bumps the request''s record_version.', requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Response recorded}, '409': {$ref: '#/components/responses/Problem'}, '422': {$ref: '#/components/responses/Problem'}, '503': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/requests/{request_id}/notes:
-    parameters:
-      - {$ref: '#/components/parameters/RequestID'}
-      - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: addEvidenceRequestNote, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Note added}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: addEvidenceRequestNote, description: 'Appends a note (append-only; no If-Match). A SHARED note may come from the assignee (EVIDENCE_REQUEST_SUBMIT_RESPONSE) or a manager (EVIDENCE_REQUEST_MANAGE); an AUDIT_ONLY note, hidden from the contributor, only from a manager. Both at the request''s entity (D-ER-29).', requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Note added}, '400': {$ref: '#/components/responses/Problem'}, '403': {$ref: '#/components/responses/Problem'}, '404': {$ref: '#/components/responses/Problem'}, '503': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/requests/{request_id}/clarify:
     parameters:
       - {$ref: '#/components/parameters/RequestID'}
       - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: requestEvidenceClarification, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    post: {tags: [pbc], operationId: requestEvidenceClarification, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/PreconditionFailed'}, '422': {$ref: '#/components/responses/Problem'}, '428': {$ref: '#/components/responses/PreconditionRequired'}}}
   /v1/pbc/requests/{request_id}/mark-satisfied:
     parameters:
       - {$ref: '#/components/parameters/RequestID'}
       - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: markEvidenceRequestSatisfied, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    post: {tags: [pbc], operationId: markEvidenceRequestSatisfied, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/PreconditionFailed'}, '422': {$ref: '#/components/responses/Problem'}, '428': {$ref: '#/components/responses/PreconditionRequired'}}}
   /v1/pbc/requests/{request_id}/close:
     parameters:
       - {$ref: '#/components/parameters/RequestID'}
       - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: closeEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    post: {tags: [pbc], operationId: closeEvidenceRequest, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/PreconditionFailed'}, '428': {$ref: '#/components/responses/PreconditionRequired'}}}
   /v1/pbc/responses/{response_id}/scan-result:
-    parameters:
-      - {$ref: '#/components/parameters/ResponseID'}
-      - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: recordScanResult, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {description: Scan result recorded}, '404': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    parameters: [{$ref: '#/components/parameters/ResponseID'}]
+    post: {tags: [pbc], operationId: recordScanResult, description: 'The scanner''s callback (EVIDENCE_REQUEST_MANAGE, interim, D-ER-2). Updates the response, not the request; no If-Match.', requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {description: Scan result recorded}, '403': {$ref: '#/components/responses/Problem'}, '404': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/responses/{response_id}/acknowledge:
-    parameters:
-      - {$ref: '#/components/parameters/ResponseID'}
-      - {$ref: '#/components/parameters/IfMatch'}
-    post: {tags: [pbc], operationId: acknowledgeEvidenceResponse, responses: {'201': {description: Receipt recorded}, '404': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/VersionMismatch'}}}
+    parameters: [{$ref: '#/components/parameters/ResponseID'}]
+    post: {tags: [pbc], operationId: acknowledgeEvidenceResponse, description: 'A manager acknowledges receipt of a response: EVIDENCE_REQUEST_MANAGE at the parent request''s entity (D-ER-29). Appends a receipt (append-only; no If-Match).', responses: {'201': {description: Receipt recorded}, '403': {$ref: '#/components/responses/Problem'}, '404': {$ref: '#/components/responses/Problem'}, '503': {$ref: '#/components/responses/Problem'}}}
   /healthz:
     get: {tags: [probes], operationId: liveness, security: [], responses: {'200': {description: Process up}}}
   /readyz:
@@ -319,11 +330,15 @@ paths:
 components:
   securitySchemes:
     identityEnvelope: {type: http, scheme: bearer, bearerFormat: JWT}
+  headers:
+    ETag: {description: 'The record_version as a strong ETag, "v<n>"; send it as If-Match on the next change', schema: {type: string}}
   parameters:
     IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string}}
     RequestID: {name: request_id, in: path, required: true, schema: {type: string}}
     ResponseID: {name: response_id, in: path, required: true, schema: {type: string}}
-    IfMatch: {name: If-Match, in: header, schema: {type: string}, description: Current record_version for optimistic concurrency control (API-3)}
+    IfMatch: {name: If-Match, in: header, required: true, schema: {type: string}, description: 'The ETag of the last read ("v<n>"), or "*" for an unconditional change (API-3)'}
+    PageSize: {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+    Cursor: {name: cursor, in: query, description: The next_cursor of the previous page, schema: {type: string}}
   requestBodies:
     PBCCommand:
       required: true
@@ -336,20 +351,29 @@ components:
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
+    Requirement:
+      description: The requirement after the change
+      headers: {ETag: {$ref: '#/components/headers/ETag'}}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Requirement'}
     EvidenceRequest:
       description: The evidence request
+      headers: {ETag: {$ref: '#/components/headers/ETag'}}
       content:
         application/json:
           schema: {$ref: '#/components/schemas/EvidenceRequest'}
-    VersionMismatch:
-      description: Optimistic concurrency conflict — the resource was modified since the client last read it
-      headers:
-        ETag: {description: Current record_version, schema: {type: string}}
+    PreconditionRequired:
+      description: 'precondition_required: If-Match is missing'
       content:
         application/problem+json:
-          schema:
-            $ref: '#/components/schemas/Problem'
-            description: code will be 'version_mismatch'
+          schema: {$ref: '#/components/schemas/Problem'}
+    PreconditionFailed:
+      description: 'precondition_failed: the record changed since the supplied ETag; current_version names it'
+      headers: {ETag: {$ref: '#/components/headers/ETag'}}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
   schemas:
     Problem:
       type: object
@@ -395,6 +419,7 @@ components:
         effective_to: {type: [string, 'null'], format: date-time}
         created_by_principal_id: {type: string}
         correlation_id: {type: string}
+        record_version: {type: integer, format: int64}
       additionalProperties: true
     Unmet:
       type: object
@@ -444,35 +469,48 @@ components:
         correlation_id: {type: string}
         created_at: {type: string, format: date-time}
         is_overdue: {type: boolean}
+        record_version: {type: integer, format: int64}
       additionalProperties: true
-    CursorPageRequirement:
+    RequirementPage:
       type: object
+      required: [items, page_size]
       properties:
-        items:
-          type: array
-          items: {$ref: '#/components/schemas/Requirement'}
-        next_cursor: {type: [string, 'null']}
-    CursorPageEvaluation:
+        items: {type: array, items: {$ref: '#/components/schemas/Requirement'}}
+        next_cursor: {type: string, description: Absent on the last page}
+        page_size: {type: integer}
+    EvaluationPage:
       type: object
+      required: [items, page_size]
       properties:
-        items:
-          type: array
-          items: {$ref: '#/components/schemas/Evaluation'}
-        next_cursor: {type: [string, 'null']}
-    CursorPageEvidenceRequest:
+        items: {type: array, items: {$ref: '#/components/schemas/Evaluation'}}
+        next_cursor: {type: string, description: Absent on the last page}
+        page_size: {type: integer}
+    EvidenceRequestPage:
       type: object
+      required: [items, page_size]
       properties:
-        items:
-          type: array
-          items: {$ref: '#/components/schemas/EvidenceRequest'}
-        next_cursor: {type: [string, 'null']}
+        items: {type: array, items: {$ref: '#/components/schemas/EvidenceRequest'}}
+        next_cursor: {type: string, description: Absent on the last page}
+        page_size: {type: integer}
     EvidenceSummary:
       type: object
       properties:
         active_requirements: {type: integer}
         evaluations_satisfied_30d: {type: integer}
         evaluations_missing_30d: {type: integer}
-        actions_with_no_requirements_30d: {type: integer}
+        evaluations_no_requirements_30d: {type: integer}
+        actions_with_no_requirements_30d: {type: integer, description: 'Distinct (domain_code, action_type) pairs evaluated with NO_REQUIREMENTS_DEFINED'}
         open_pbc_requests: {type: integer}
         overdue_pbc_requests: {type: integer}
-        unpublished_outbox_older_than_5_minutes: {type: integer}
+        unpublished_outbox_older_than_5_minutes: {type: integer, description: Platform-wide (the outbox has no tenant)}
+        requirements_by_evidence_type: {type: object, additionalProperties: {type: integer}}
+        requirements_by_domain: {type: object, additionalProperties: {type: integer}}
+        uncovered_actions:
+          type: array
+          items:
+            type: object
+            properties:
+              domain_code: {type: string}
+              action_type: {type: string}
+              evaluations: {type: integer}
+              last_evaluated_at: {type: string, format: date-time}

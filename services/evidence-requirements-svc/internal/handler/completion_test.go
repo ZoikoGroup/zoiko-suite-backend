@@ -70,7 +70,8 @@ func completionRouter(store handler.Store, az handler.AuthZClient, docs handler.
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
-	handler.RegisterRoutes(r, handler.New(store, az, docs, zap.NewNop()).WithRegistry(reg).WithGateModes(evalMode, readMode).WithManifestClient(manifests).WithEsignatureClient(esignatures))
+	handler.RegisterRoutes(r, handler.New(store, az, docs, zap.NewNop()).WithRegistry(reg).WithGateModes(evalMode, readMode).
+		WithManifestClient(manifests).WithEsignatureClient(esignatures).WithCursors(testCursors))
 	return r
 }
 
@@ -243,7 +244,7 @@ func TestReads_NeedAPrincipalAndAGrantAtTheEntity(t *testing.T) {
 	assert.Equal(t, []string{"EVIDENCE_EVALUATION_READ@" + testEntity}, az.asked)
 
 	az.asked = nil
-	rec = do(t, h, http.MethodGet, "/v1/evidence-requirements?legal_entity_id="+testEntity, nil, testTenant, testPrincipal)
+	rec = do(t, h, http.MethodGet, "/v1/evidence-requirements?filter[legal_entity_id]="+testEntity, nil, testTenant, testPrincipal)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	rec = do(t, h, http.MethodGet, "/v1/evidence-requirements", nil, testTenant, testPrincipal)
 	assert.Equal(t, http.StatusOK, rec.Code)

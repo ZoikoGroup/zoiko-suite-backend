@@ -20,6 +20,15 @@ type Worker struct {
 	pollInterval time.Duration
 	batchSize    int
 	stopCh       chan struct{}
+	// backlog, when set, receives the number of unpublished events after
+	// every poll (the evidence_outbox_unpublished gauge).
+	backlog func(int64)
+}
+
+// WithBacklogGauge reports the outbox backlog to set after every poll.
+func (w *Worker) WithBacklogGauge(set func(int64)) *Worker {
+	w.backlog = set
+	return w
 }
 
 // NewWorker creates a new outbox worker.
@@ -59,6 +68,7 @@ func (w *Worker) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			w.processBatch(ctx)
+			w.reportBacklog(ctx)
 		}
 	}
 }
@@ -193,6 +203,21 @@ func (w *Worker) claimEvents(ctx context.Context) ([]outboxRow, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// reportBacklog counts unpublished events through the SECURITY DEFINER
+// function of migration 000011 (the runtime role cannot SELECT the outbox).
+// A failed count leaves the gauge at its last value and is logged.
+func (w *Worker) reportBacklog(ctx context.Context) {
+	if w.backlog == nil {
+		return
+	}
+	var n int64
+	if err := w.pool.QueryRow(ctx, `SELECT outbox_unpublished_count()`).Scan(&n); err != nil {
+		w.log.Warn("outbox: backlog count failed", zap.Error(err))
+		return
+	}
+	w.backlog(n)
 }
 
 func (w *Worker) markPublished(ctx context.Context, ids []string) error {

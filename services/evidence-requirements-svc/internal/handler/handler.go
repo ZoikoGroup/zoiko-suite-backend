@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 
@@ -42,10 +41,11 @@ import (
 type Store interface {
 	CreateRequirement(ctx context.Context, r *domain.EvidenceRequirement) (created bool, err error)
 	GetRequirement(ctx context.Context, requirementID string) (*domain.EvidenceRequirement, error)
-	ListRequirements(ctx context.Context, filter domain.ListRequirementsFilter) ([]domain.EvidenceRequirement, error)
-	ListRequirementsCursor(ctx context.Context, filter domain.ListRequirementsFilter) (domain.CursorPage[domain.EvidenceRequirement], error)
 	EffectiveRequirements(ctx context.Context, tenantID, legalEntityID, domainCode, actionType string, asOf time.Time) ([]domain.EvidenceRequirement, error)
-	EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID, ifMatch string) (*domain.EvidenceRequirement, error)
+	// EndDateRequirement retires a requirement. expectedVersion is the API-3
+	// If-Match version (0 = "If-Match: *"); a stale one is a
+	// *domain.StaleVersionError.
+	EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID string, expectedVersion int64) (*domain.EvidenceRequirement, error)
 	// RecordEvaluation appends an evaluation record and optionally writes an
 	// outbox event atomically in the same transaction. If outboxEvent is non-nil,
 	// it is written to the outbox table only when the evaluation is newly created
@@ -53,9 +53,26 @@ type Store interface {
 	// is unavailable or the client disconnects.
 	RecordEvaluation(ctx context.Context, e *domain.EvidenceEvaluation, outboxEvent *domain.OutboxEvent) (created bool, err error)
 	GetEvaluation(ctx context.Context, evaluationID string) (*domain.EvidenceEvaluation, error)
-	ListEvaluationsCursor(ctx context.Context, filter domain.ListEvaluationsFilter) (domain.CursorPage[domain.EvidenceEvaluation], error)
+
+	// Console read models (handler_lists.go). Each list returns at most
+	// limit rows starting at offset.
+	ListRequirementsPage(ctx context.Context, tenantID string, f domain.ListRequirementsFilter, offset, limit int) ([]domain.EvidenceRequirement, error)
+	ListEvaluationsPage(ctx context.Context, tenantID string, f domain.ListEvaluationsFilter, offset, limit int) ([]domain.EvidenceEvaluation, error)
 	GetSummary(ctx context.Context, tenantID string) (*domain.EvidenceSummary, error)
 }
+
+// Recorder receives the domain metrics (ER-5): every recorded determination
+// by outcome, and every refusal caused by an owner that could not answer.
+// internal/telemetry.EvidenceMetrics implements it; the default is a no-op.
+type Recorder interface {
+	EvaluationRecorded(outcome string)
+	OwnerUnavailable(owner string)
+}
+
+type noopRecorder struct{}
+
+func (noopRecorder) EvaluationRecorded(string) {}
+func (noopRecorder) OwnerUnavailable(string)   {}
 
 // Publisher is the event-publishing contract the handler depends on.
 // DEPRECATED: Events are now published via transactional outbox.
@@ -142,14 +159,33 @@ type Handler struct {
 	registry     EntityChecker
 	evaluateMode GateMode
 	readMode     GateMode
+	cursors      *apicontract.CursorSigner
+	metrics      Recorder
 	log          *zap.Logger
 }
 
 // New builds a Handler with both gates enforcing and no registry check;
-// main.go adds the registry with WithRegistry.
+// main.go adds the registry with WithRegistry and the console read models
+// with WithCursors.
 func New(store Store, authz AuthZClient, docs DocumentVaultClient, log *zap.Logger) *Handler {
 	return &Handler{store: store, authz: authz, docs: docs, registry: noopChecker{},
-		evaluateMode: GateEnforce, readMode: GateEnforce, log: log}
+		evaluateMode: GateEnforce, readMode: GateEnforce, metrics: noopRecorder{}, log: log}
+}
+
+// WithCursors enables the console lists. Every next_cursor is signed with
+// this key and bound to the tenant, route and filter that produced it, so a
+// cursor replayed by another tenant or against another query is refused.
+func (h *Handler) WithCursors(c *apicontract.CursorSigner) *Handler {
+	h.cursors = c
+	return h
+}
+
+// WithMetrics sets the domain metrics recorder.
+func (h *Handler) WithMetrics(m Recorder) *Handler {
+	if m != nil {
+		h.metrics = m
+	}
+	return h
 }
 
 // WithManifestClient sets the manifest verification client.
@@ -215,13 +251,12 @@ func (h *Handler) checkEntity(w http.ResponseWriter, r *http.Request, tenantID, 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/evidence", func(r chi.Router) {
 		r.Post("/evaluate", h.Evaluate)
-		r.Get("/evaluations", h.ListEvaluationsCursor)
+		r.Get("/evaluations", h.ListEvaluations)
 		r.Get("/evaluations/{evaluation_id}", h.GetEvaluation)
 		r.Get("/summary", h.GetSummary)
 	})
 	r.Route("/v1/evidence-requirements", func(r chi.Router) {
 		r.Get("/", h.ListRequirements)
-		r.Get("/cursor", h.ListRequirementsCursor)
 		r.Get("/{evidence_requirement_id}", h.GetRequirement)
 	})
 	// Catalog mutation. Authorization-gated — see package doc.
@@ -330,8 +365,12 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	// returning an honest 503.
 	checked, err := h.checkArtifacts(r.Context(), tenantID, effectiveLegalEntityID, principalID, req.PresentArtifacts)
 	if err != nil {
-		h.log.Error("Evaluate: artifact verification unavailable — failing closed", zap.Error(err))
-		writeError(w, r, http.StatusServiceUnavailable, "document_service_unavailable", "")
+		owner, code := ownerOf(err)
+		h.metrics.OwnerUnavailable(owner)
+		h.log.Error("Evaluate: artifact verification unavailable — failing closed, nothing recorded",
+			zap.String("owner", owner), zap.Error(err))
+		writeError(w, r, http.StatusServiceUnavailable, code,
+			owner+" could not confirm an asserted artifact; no determination was recorded")
 		return
 	}
 
@@ -417,6 +456,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	if created {
 		// Event was written to outbox atomically; background worker will publish it.
 		// No direct Kafka publish here anymore.
+		h.metrics.EvaluationRecorded(string(eval.Outcome))
 	} else {
 		// Replay: return the ORIGINAL determination and do not republish.
 		// The stored unmet payload is authoritative �?" the catalog may have
@@ -712,87 +752,6 @@ func (h *Handler) GetEvaluation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, eval)
 }
 
-// ── GET /v1/evidence-requirements ──────────────────────────────────────────────
-
-// ListRequirements returns the caller's own tenant's requirement catalog.
-//
-// The scope comes from the verified X-Tenant-Id header. It used to come from
-// ?tenant_id=, which the store both filtered on AND set app.tenant_id from — so
-// `?tenant_id=<any-uuid>` returned that tenant's entire requirement catalog
-// while CreateRequirement, on the same service, had always insisted the body
-// agree with the header. The read side was the half nobody checked.
-func (h *Handler) ListRequirements(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	q := r.URL.Query()
-	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
-		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
-		return
-	}
-	// legal_entity_id is compared as `legal_entity_id::text = $n`, casting the
-	// COLUMN to text rather than the parameter to uuid — so a malformed value does
-	// not error, it silently matches nothing, and an empty catalog reads as "this
-	// entity has no requirements", which for an evidence gate reads as permission.
-	legalEntityID := q.Get("legal_entity_id")
-	if legalEntityID != "" && !isUUID(legalEntityID) {
-		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
-		return
-	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	readScope := platformScope
-	if legalEntityID != "" {
-		readScope = legalEntityID
-	}
-	if !h.gate(w, r, h.readMode, principalID, readScope, actionReadRequirement) {
-		return
-	}
-	filter := domain.ListRequirementsFilter{
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		DomainCode:    q.Get("domain_code"),
-		ActionType:    q.Get("action_type"),
-	}
-
-	// as_of=now is the common case (what is in force right now). Omitting it
-	// returns the full history including retired requirements, which is what
-	// an auditor reviewing a past decision needs.
-	switch v := q.Get("as_of"); v {
-	case "":
-	case "now":
-		filter.AsOf = time.Now().UTC()
-	default:
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			writeError(w, r, http.StatusBadRequest, "invalid_field", "as_of must be RFC3339 or 'now'")
-			return
-		}
-		filter.AsOf = t
-	}
-
-	list, err := h.store.ListRequirements(r.Context(), filter)
-	if err != nil {
-		// legal_entity_id is compared as text, so the verified tenant is the only
-		// uuid comparison left here. A gateway that forwarded a non-UUID tenant
-		// scope is a fault worth naming rather than reporting as a dead store.
-		if errors.Is(err, domain.ErrInvalidIdentifier) {
-			writeError(w, r, http.StatusBadRequest, "invalid_field", "tenant scope must be a UUID")
-			return
-		}
-		h.log.Error("ListRequirements: store unavailable", zap.Error(err))
-		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
-		return
-	}
-	if list == nil {
-		list = []domain.EvidenceRequirement{}
-	}
-	writeJSON(w, r, http.StatusOK, list)
-}
-
 // ── GET /v1/evidence-requirements/{evidence_requirement_id} ────────────────────
 
 func (h *Handler) GetRequirement(w http.ResponseWriter, r *http.Request) {
@@ -820,177 +779,8 @@ func (h *Handler) GetRequirement(w http.ResponseWriter, r *http.Request) {
 	if !h.gate(w, r, h.readMode, principalID, readScope, actionReadRequirement) {
 		return
 	}
+	apicontract.WriteETag(w, req.RecordVersion)
 	writeJSON(w, r, http.StatusOK, req)
-}
-
-// ── GET /v1/evidence-requirements (cursor-paginated) ────────────────────────────
-
-func (h *Handler) ListRequirementsCursor(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	q := r.URL.Query()
-	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
-		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
-		return
-	}
-	legalEntityID := q.Get("legal_entity_id")
-	if legalEntityID != "" && !isUUID(legalEntityID) {
-		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
-		return
-	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	readScope := platformScope
-	if legalEntityID != "" {
-		readScope = legalEntityID
-	}
-	if !h.gate(w, r, h.readMode, principalID, readScope, actionReadRequirement) {
-		return
-	}
-
-	filter := domain.ListRequirementsFilter{
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		DomainCode:    q.Get("domain_code"),
-		ActionType:    q.Get("action_type"),
-		Cursor:        q.Get("cursor"),
-		PageSize:      0,
-		Sort:          q.Get("sort"),
-	}
-
-	switch v := q.Get("as_of"); v {
-	case "":
-	case "now":
-		filter.AsOf = time.Now().UTC()
-	default:
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			writeError(w, r, http.StatusBadRequest, "invalid_field", "as_of must be RFC3339 or 'now'")
-			return
-		}
-		filter.AsOf = t
-	}
-
-	if ps := q.Get("page_size"); ps != "" {
-		n, err := strconv.Atoi(ps)
-		if err != nil || n < 1 || n > 200 {
-			writeError(w, r, http.StatusBadRequest, "invalid_page_size", "page_size must be between 1 and 200")
-			return
-		}
-		filter.PageSize = n
-	}
-
-	page, err := h.store.ListRequirementsCursor(r.Context(), filter)
-	if err != nil {
-		h.log.Error("ListRequirementsCursor: store unavailable", zap.Error(err))
-		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
-		return
-	}
-	if page.Items == nil {
-		page.Items = []domain.EvidenceRequirement{}
-	}
-	writeJSON(w, r, http.StatusOK, page)
-}
-
-// ── GET /v1/evidence/evaluations (cursor-paginated) ────────────────────────────
-
-func (h *Handler) ListEvaluationsCursor(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	q := r.URL.Query()
-	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
-		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
-		return
-	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	// Evaluations are read at the entity they are about (legal_entity_id).
-	// If no legal_entity_id filter, use PLATFORM scope for the gate.
-	legalEntityID := q.Get("legal_entity_id")
-	if legalEntityID != "" && !isUUID(legalEntityID) {
-		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
-		return
-	}
-	readScope := platformScope
-	if legalEntityID != "" {
-		readScope = legalEntityID
-	}
-	if !h.gate(w, r, h.readMode, principalID, readScope, actionReadEvaluation) {
-		return
-	}
-
-	filter := domain.ListEvaluationsFilter{
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		DomainCode:    q.Get("domain_code"),
-		ActionType:    q.Get("action_type"),
-		Outcome:       q.Get("outcome"),
-		Cursor:        q.Get("cursor"),
-		PageSize:      0,
-		Sort:          q.Get("sort"),
-	}
-
-	if since := q.Get("since"); since != "" {
-		t, err := time.Parse(time.RFC3339, since)
-		if err != nil {
-			writeError(w, r, http.StatusBadRequest, "invalid_field", "since must be RFC3339")
-			return
-		}
-		filter.Since = &t
-	}
-
-	if ps := q.Get("page_size"); ps != "" {
-		n, err := strconv.Atoi(ps)
-		if err != nil || n < 1 || n > 200 {
-			writeError(w, r, http.StatusBadRequest, "invalid_page_size", "page_size must be between 1 and 200")
-			return
-		}
-		filter.PageSize = n
-	}
-
-	page, err := h.store.ListEvaluationsCursor(r.Context(), filter)
-	if err != nil {
-		h.log.Error("ListEvaluationsCursor: store unavailable", zap.Error(err))
-		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
-		return
-	}
-	if page.Items == nil {
-		page.Items = []domain.EvidenceEvaluation{}
-	}
-	writeJSON(w, r, http.StatusOK, page)
-}
-
-// ── GET /v1/evidence/summary ────────────────────────────────────────────────────
-
-func (h *Handler) GetSummary(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	// Summary is tenant-scoped; use PLATFORM for the gate.
-	if !h.gate(w, r, h.readMode, principalID, platformScope, actionReadRequirement) {
-		return
-	}
-
-	summary, err := h.store.GetSummary(r.Context(), tenantID)
-	if err != nil {
-		h.log.Error("GetSummary: store unavailable", zap.Error(err))
-		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
-		return
-	}
-	writeJSON(w, r, http.StatusOK, summary)
 }
 
 // ── POST /v1/admin/evidence-requirements ───────────────────────────────────────
@@ -1137,6 +927,9 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 		w.Header().Set("Location", "/v1/evidence-requirements/"+er.EvidenceRequirementID)
 	}
+	if er.RecordVersion > 0 {
+		apicontract.WriteETag(w, er.RecordVersion)
+	}
 	writeJSON(w, r, status, er)
 }
 
@@ -1205,8 +998,12 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, r, err)
 		return
 	}
-
-	ifMatch := r.Header.Get("If-Match")
+	// API-3: retiring is a mutation of an existing aggregate, so it is
+	// conditional on the version the caller last read.
+	expected, ok := requireIfMatch(w, r)
+	if !ok {
+		return
+	}
 
 	effectiveTo := time.Now().UTC()
 	if req.EffectiveTo != nil {
@@ -1225,10 +1022,14 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.EndDateRequirement(r.Context(), tenantID, requirementID, effectiveTo, req.Reason, principalID, ifMatch)
+	updated, err := h.store.EndDateRequirement(r.Context(), tenantID, requirementID, effectiveTo, req.Reason, principalID, expected)
+	var stale *domain.StaleVersionError
 	switch {
 	case err == nil:
+		apicontract.WriteETag(w, updated.RecordVersion)
 		writeJSON(w, r, http.StatusOK, updated)
+	case errors.As(err, &stale):
+		writeStale(w, r, stale.Current)
 	case errors.Is(err, domain.ErrAlreadyRetired):
 		writeError(w, r, http.StatusUnprocessableEntity, "already_retired", domain.ErrAlreadyRetired.Error())
 	case errors.Is(err, domain.ErrRequirementNotFound):
@@ -1240,6 +1041,55 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+// requireIfMatch settles the version an API-3 mutation is conditional on,
+// from If-Match (the ETag "v<n>" of the caller's last read). Absent is 428
+// precondition_required; malformed is 400; "*" opts out and returns 0, which
+// the store reads as unconditional.
+func requireIfMatch(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	v, wildcard, present, err := apicontract.IfMatchVersion(r)
+	switch {
+	case !present:
+		writeError(w, r, http.StatusPreconditionRequired, "precondition_required",
+			"If-Match is required for a change to an existing record; send the ETag from your last read")
+		return 0, false
+	case err != nil:
+		writeError(w, r, http.StatusBadRequest, "invalid_if_match",
+			"If-Match must be a single ETag from the latest representation")
+		return 0, false
+	case wildcard:
+		return 0, true
+	default:
+		return v, true
+	}
+}
+
+// writeStale answers 412 for a stale If-Match, naming the current version in
+// both the problem and the ETag header so the caller can read again.
+func writeStale(w http.ResponseWriter, r *http.Request, current int64) {
+	apicontract.WriteETag(w, current)
+	cv := current
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:         http.StatusPreconditionFailed,
+		Code:           "precondition_failed",
+		Detail:         "the record has changed since the supplied ETag; read it again",
+		CurrentVersion: &cv,
+	})
+}
+
+// ownerOf names the service whose outage stopped an evaluation, and the
+// problem code the caller sees. document_service_unavailable is kept for the
+// document vault because callers already branch on it.
+func ownerOf(err error) (owner, code string) {
+	switch {
+	case errors.Is(err, domain.ErrManifestServiceUnavailable):
+		return "evidence-manifest-svc", "evidence_manifest_unavailable"
+	case errors.Is(err, domain.ErrEnvelopeServiceUnavailable):
+		return "esignature-integration-svc", "esignature_unavailable"
+	default:
+		return "document-vault-svc", "document_service_unavailable"
+	}
+}
 
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {

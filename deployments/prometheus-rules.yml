@@ -1091,3 +1091,37 @@ groups:
         annotations:
           summary: "general-ledger-svc: p95 posting latency is above 2 seconds"
           description: "Posting is one transaction; a slow one usually means lock contention on a period seal or an overloaded database."
+
+  # ---------------------------------------------------------------------------
+  # evidence-requirements-svc (Governance Platform 7/7)
+  # ---------------------------------------------------------------------------
+  #
+  # An owner outage is answered 503 and nothing is recorded, so callers see a
+  # refusal, not a wrong answer -- but every gated finalization behind it stops.
+  # The outbox backlog is invisible to callers entirely: decisions are recorded,
+  # their events are not reaching Kafka.
+  #
+  # Runbook: services/evidence-requirements-svc/RUNBOOK.md
+  - name: evidence-requirements
+    rules:
+      - alert: EvidenceOwnerUnavailable
+        expr: increase(evidence_owner_unavailable_total{service="evidence-requirements-svc"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "evidence-requirements-svc: {{ $labels.owner }} cannot confirm artifacts; evaluations are refused (503)"
+          description: >-
+            Evaluations that assert an artifact owned by {{ $labels.owner }} are refused and nothing is recorded, so every
+            finalization gated on that evidence is blocked. Restore the owner; callers retry with the same Idempotency-Key.
+
+      - alert: EvidenceOutboxBacklog
+        expr: evidence_outbox_unpublished{service="evidence-requirements-svc"} > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "evidence-requirements-svc: {{ $value }} evidence events have not reached Kafka for 10m"
+          description: >-
+            Determinations are recorded but their evidence.requirement.* events are waiting in the outbox. Check Kafka and the
+            outbox worker's log (outbox: failed to publish). Rows are retried every 5 seconds; nothing is lost.
