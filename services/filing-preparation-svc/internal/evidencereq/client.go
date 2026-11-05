@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
+	"go.uber.org/zap"
 	svcenvelope "zoiko.io/filing-preparation-svc/internal/envelope"
 )
 
@@ -46,6 +47,7 @@ type Artifact struct {
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
+	log        *zap.Logger
 }
 
 // NewClient creates a new evidence-requirements verification client.
@@ -53,7 +55,18 @@ func NewClient(baseURL string) *Client {
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{Timeout: 5 * time.Second},
+		log:        zap.NewNop(),
 	}
+}
+
+// WithLogger sets the logger the client warns on when the catalogue holds no
+// requirement for the action (NO_REQUIREMENTS_DEFINED, D-ER-5). A nil logger
+// keeps the no-op default.
+func (c *Client) WithLogger(log *zap.Logger) *Client {
+	if log != nil {
+		c.log = log
+	}
+	return c
 }
 
 type evaluateRequest struct {
@@ -70,8 +83,9 @@ type unmetRequirement struct {
 }
 
 type evaluateResponse struct {
-	Outcome string             `json:"outcome"`
-	Unmet   []unmetRequirement `json:"unmet"`
+	EvaluationID string             `json:"evaluation_id"`
+	Outcome      string             `json:"outcome"`
+	Unmet        []unmetRequirement `json:"unmet"`
 }
 
 // EvaluateResult carries the outcome plus a human-readable reason string
@@ -147,7 +161,18 @@ func (c *Client) Evaluate(ctx context.Context, tenantID, legalEntityID, domainCo
 
 	// Allow-list, not a deny-list: an empty or unknown outcome must not pass.
 	switch res.Outcome {
-	case "SATISFIED", "NO_REQUIREMENTS_DEFINED":
+	case "SATISFIED":
+		return EvaluateResult{Sufficient: true}, nil
+	case "NO_REQUIREMENTS_DEFINED":
+		// The catalogue holds no requirement for this action. That is not a
+		// verification: the calling service decides what it does with it
+		// (D-ER-5). This one lets the action proceed and says so loudly, so an
+		// unconfigured gate is visible rather than indistinguishable from a
+		// satisfied one.
+		c.log.Warn("no evidence requirements defined — action permitted by caller policy (D-ER-5)",
+			zap.String("tenant_id", tenantID), zap.String("legal_entity_id", legalEntityID),
+			zap.String("domain_code", domainCode), zap.String("action_type", actionType),
+			zap.String("evaluation_id", res.EvaluationID))
 		return EvaluateResult{Sufficient: true}, nil
 	case "MISSING":
 		reason := "Required evidence is missing."

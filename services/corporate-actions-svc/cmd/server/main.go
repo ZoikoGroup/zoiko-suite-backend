@@ -74,7 +74,7 @@ func main() {
 	} else {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
-	evidenceReqClient := evidencereq.NewClient(cfg.EvidenceReqURL)
+	evidenceReqClient := evidencereq.NewClient(cfg.EvidenceReqURL).WithLogger(logger)
 
 	h := handler.New(pgStore, publisher, authzClient, evidenceReqClient, logger)
 
