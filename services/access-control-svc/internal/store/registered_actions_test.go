@@ -65,6 +65,14 @@ var registeredActionMigrations = []struct {
 		"PARTY_SPLIT":             "HIGH",
 		"PARTY_RESOLUTION_DECIDE": "HIGH",
 	}},
+	{"000046_register_evidence_pbc_actions", "evidence-requirements-svc", map[string]string{
+		"EVIDENCE_REQUIREMENT_CREATE":      "HIGH",
+		"EVIDENCE_REQUIREMENT_RETIRE":      "HIGH",
+		"EVIDENCE_REQUEST_CREATE":          "STANDARD",
+		"EVIDENCE_REQUEST_MANAGE":          "STANDARD",
+		"EVIDENCE_REQUEST_SUBMIT_RESPONSE": "STANDARD",
+		"EVIDENCE_REQUEST_EVALUATE":        "STANDARD",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

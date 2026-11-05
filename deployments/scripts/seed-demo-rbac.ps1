@@ -152,7 +152,10 @@ $BUNDLES = @(
     @{
         Code    = "EVIDENCE_FULL"
         Service = "evidence-requirements-svc"
-        Actions = @("EVIDENCE_REQUIREMENT_CREATE", "EVIDENCE_REQUIREMENT_RETIRE")
+        Actions = @("EVIDENCE_EVALUATE", "EVIDENCE_REQUIREMENT_READ", "EVIDENCE_EVALUATION_READ",
+                    "EVIDENCE_REQUIREMENT_CREATE", "EVIDENCE_REQUIREMENT_RETIRE",
+                    "EVIDENCE_REQUEST_CREATE", "EVIDENCE_REQUEST_MANAGE",
+                    "EVIDENCE_REQUEST_SUBMIT_RESPONSE", "EVIDENCE_REQUEST_EVALUATE")
     },
     @{
         # accounts-payable-svc gates each lifecycle hop on its own action, so
