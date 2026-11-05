@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,7 +25,7 @@ type Memory struct {
 	flags       map[string]Flag
 	usage       map[string]int64
 	outbox      []OutboxEvent
-	published   map[int64]bool
+	published   map[int64]time.Time
 	nextOutbox  int64
 }
 
@@ -52,7 +53,7 @@ func NewMemory() *Memory {
 		conflicts:   map[string]Conflict{},
 		flags:       map[string]Flag{},
 		usage:       map[string]int64{},
-		published:   map[int64]bool{},
+		published:   map[int64]time.Time{},
 	}
 }
 
@@ -186,6 +187,9 @@ func (m *Memory) BeginTurn(_ context.Context, t Turn, lockUntil time.Time) (Begi
 func (m *Memory) CompleteTurn(_ context.Context, t Turn, buckets []string, tokens int64, events []OutboxEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s, ok := m.sessions[t.SessionID]; !ok || s.DeletedAt != nil || !time.Now().Before(s.ExpiresAt) {
+		return ErrSessionGone
+	}
 	cur, ok := m.turns[turnKey(t.SessionID, t.ClientTurnID)]
 	if !ok || cur.TurnID != t.TurnID {
 		return ErrNotFound
@@ -252,6 +256,22 @@ func (m *Memory) PurgeSessions(_ context.Context, cutoff time.Time) (int, error)
 			n++
 		}
 	}
+	// Doc 06 §17: delivered (or dead-lettered) events and old usage counters.
+	kept := m.outbox[:0]
+	for _, e := range m.outbox {
+		if at, done := m.published[e.OutboxID]; done && at.Before(cutoff) {
+			delete(m.published, e.OutboxID)
+			continue
+		}
+		kept = append(kept, e)
+	}
+	m.outbox = kept
+	day, month := UsageKeepFrom(time.Now().UTC())
+	for b := range m.usage {
+		if (strings.HasPrefix(b, "tokens:day:") && b < day) || (strings.HasPrefix(b, "tokens:month:") && b < month) {
+			delete(m.usage, b)
+		}
+	}
 	return n, nil
 }
 
@@ -309,7 +329,7 @@ func (m *Memory) AddRevocation(_ context.Context, r Revocation, events []OutboxE
 	defer m.mu.Unlock()
 	r.Watermark = int64(len(m.revocations) + 1)
 	m.revocations = append(m.revocations, r)
-	m.appendOutbox(events)
+	m.appendOutbox(stampRevocationEpoch(events, r.Watermark))
 	return r.Watermark, nil
 }
 
@@ -428,7 +448,7 @@ func (m *Memory) UnpublishedEvents(_ context.Context, limit int) ([]OutboxEvent,
 	defer m.mu.Unlock()
 	var out []OutboxEvent
 	for _, e := range m.outbox {
-		if !m.published[e.OutboxID] {
+		if _, done := m.published[e.OutboxID]; !done {
 			out = append(out, e)
 			if len(out) == limit {
 				break
@@ -438,11 +458,11 @@ func (m *Memory) UnpublishedEvents(_ context.Context, limit int) ([]OutboxEvent,
 	return out, nil
 }
 
-func (m *Memory) MarkPublished(_ context.Context, ids []int64, _ time.Time) error {
+func (m *Memory) MarkPublished(_ context.Context, ids []int64, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, id := range ids {
-		m.published[id] = true
+		m.published[id] = at
 	}
 	return nil
 }

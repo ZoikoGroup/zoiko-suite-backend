@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -50,5 +52,42 @@ func TestCanaryFailsClosed(t *testing.T) {
 	}
 	if last := rep.Steps[len(rep.Steps)-1]; last.ID != "session" || !strings.Contains(last.Error, "503") {
 		t.Fatalf("must stop at the failed session create: %+v", last)
+	}
+}
+
+// The textfile gives the canary alerts a series: success 0/1, the run
+// timestamp and per-step latency, with step ids as the only label.
+func TestCanaryMetricsFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "public_ai_canary.prom")
+	rep := Report{Pass: false, Steps: []Step{{ID: "ready", Pass: true, LatencyMS: 12}, {ID: "session", Pass: false, LatencyMS: 1500}}}
+	if err := WriteMetrics(path, rep, time.Unix(1700000000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	for _, want := range []string{
+		"# TYPE public_ai_canary_success gauge\npublic_ai_canary_success 0\n",
+		"public_ai_canary_last_run_timestamp_seconds 1700000000\n",
+		`public_ai_canary_step_latency_seconds{step="ready"} 0.012`,
+		`public_ai_canary_step_latency_seconds{step="session"} 1.5`,
+		`public_ai_canary_step_success{step="session"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics file lacks %q:\n%s", want, body)
+		}
+	}
+	rep.Pass = true
+	if err := WriteMetrics(path, rep, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), "public_ai_canary_success 1\n") {
+		t.Fatal("a passing run must write success 1")
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("temp file left behind")
 	}
 }

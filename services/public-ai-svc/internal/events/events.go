@@ -134,23 +134,40 @@ func HandoffClicked(routeKey, market string, consent bool, at time.Time) (store.
 
 type releasePromoted struct {
 	ReleaseID   string   `json:"release_id"`
+	Kind        string   `json:"kind"`
 	SignerRefs  []string `json:"signer_refs"`
 	Digest      string   `json:"digest"`
 	EffectiveAt string   `json:"effective_at"`
+	// ReleaseEpoch orders promotions of one kind (Doc 05 §22): consumers
+	// ignore an announcement older than the last one they applied.
+	ReleaseEpoch int64 `json:"release_epoch"`
 }
 
+// ReleasePromotedFor announces that the pointer for kind ("kb" or "claims")
+// moved to releaseID.
+func ReleasePromotedFor(kind, releaseID, digest string, signers []string, at time.Time) (store.OutboxEvent, error) {
+	return build(TopicGovernance, TypeReleasePromoted, releasePromoted{releaseID, kind, signers, digest, at.UTC().Format(time.RFC3339), at.UTC().UnixNano()}, at)
+}
+
+// ReleasePromoted is ReleasePromotedFor with the kind inferred from the id
+// prefix. Deprecated: callers that know the kind use ReleasePromotedFor.
 func ReleasePromoted(releaseID, digest string, signers []string, at time.Time) (store.OutboxEvent, error) {
-	return build(TopicGovernance, TypeReleasePromoted, releasePromoted{releaseID, signers, digest, at.UTC().Format(time.RFC3339)}, at)
+	return ReleasePromotedFor(kindOf(releaseID), releaseID, digest, signers, at)
 }
 
 type sourceRevoked struct {
 	SourceVersionID string `json:"source_version_id"`
 	ReasonCode      string `json:"reason_code"`
 	EffectiveAt     string `json:"effective_at"`
+	// RevocationEpoch is the revocation ledger watermark of this entry,
+	// filled in by the store in the same transaction (Doc 05 §18/§22).
+	RevocationEpoch int64 `json:"revocation_epoch"`
 }
 
+// SourceRevoked announces a revocation. Pass the event to the store call
+// that appends the ledger entry: it stamps revocation_epoch.
 func SourceRevoked(sourceVersionID, reason string, at time.Time) (store.OutboxEvent, error) {
-	return build(TopicGovernance, TypeSourceRevoked, sourceRevoked{sourceVersionID, reason, at.UTC().Format(time.RFC3339)}, at)
+	return build(TopicGovernance, TypeSourceRevoked, sourceRevoked{sourceVersionID, reason, at.UTC().Format(time.RFC3339), 0}, at)
 }
 
 type killSwitchChanged struct {

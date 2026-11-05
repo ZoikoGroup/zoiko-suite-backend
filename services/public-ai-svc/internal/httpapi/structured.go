@@ -120,7 +120,9 @@ func (s *Server) structure(env *contract.Envelope, market string) {
 			break
 		}
 		label := policy.RouteTitles[a.RouteKey]
-		if i == 0 && policy.IntentCTA[env.IntentID] != "" {
+		// Doc 02 §06: the intent's default CTA label names its default route;
+		// any other route keeps its own title (no "Compare plans" on a demo link).
+		if i == 0 && policy.IntentCTA[env.IntentID] != "" && a.RouteKey == policy.DefaultRoute[env.IntentID] {
 			label = policy.IntentCTA[env.IntentID]
 		}
 		if label == "" {

@@ -6,6 +6,8 @@ package eval
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,7 +21,13 @@ import (
 type Dataset struct {
 	DatasetVersion string `json:"dataset_version"`
 	Note           string `json:"note"`
-	Cases          []Case `json:"cases"`
+	// LaunchIntents are the intents in launch scope (Doc 07 §10): each one
+	// must have at least one labelled case, or intent accuracy across launch
+	// intents cannot be claimed.
+	LaunchIntents []string `json:"launch_intents,omitempty"`
+	Cases         []Case   `json:"cases"`
+	// SHA256 is the digest of the file as loaded (Doc 07 §19 evidence).
+	SHA256 string `json:"-"`
 }
 
 // Case is one fixture (Doc 07 App. A, deterministic lane).
@@ -85,6 +93,13 @@ type Report struct {
 	Flaky          int    `json:"flaky"`
 	Verdict        string `json:"verdict"` // PASS | NO_GO | BLOCK_RELEASE
 	GitSHA         string `json:"git_sha,omitempty"`
+	// Provenance (Doc 07 §06/§19, REL-QA-02): what exactly was evaluated.
+	PromptVersion   string `json:"prompt_version"`
+	PolicyVersion   string `json:"policy_version,omitempty"`
+	PolicyDigest    string `json:"policy_digest"`
+	ClaimsReleaseID string `json:"claims_release_id,omitempty"`
+	ModelID         string `json:"model_id"`
+	DatasetSHA256   string `json:"dataset_sha256,omitempty"`
 	// Partitions, Intents, Waivers and Regressions: Doc 07 §09-§11, App. B.
 	Partitions  map[string]PartitionSummary `json:"partitions"`
 	Intents     IntentMetrics               `json:"intents"`
@@ -105,6 +120,8 @@ func Load(path string) (Dataset, error) {
 	if err := dec.Decode(&d); err != nil {
 		return Dataset{}, fmt.Errorf("%s: %w", path, err)
 	}
+	sum := sha256.Sum256(b)
+	d.SHA256 = hex.EncodeToString(sum[:])
 	return d, nil
 }
 

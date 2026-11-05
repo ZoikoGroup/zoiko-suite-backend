@@ -150,3 +150,16 @@ func TestTemplatesNeverEchoAndRender(t *testing.T) {
 		}
 	}
 }
+
+// Doc 02 App. C: every Doc 02-numbered template has a stable id, and no two
+// templates share wording (the id is looked up by text).
+func TestTemplateIDs(t *testing.T) {
+	for id, tpl := range map[string]Template{"T01": TplWelcome, "T21": ExceptionTemplates[X01PrivateAction], "T27": TplUptime, "T30": RouteTemplates["I27"]} {
+		if got := TemplateID(tpl.Text); got != id && !(id == "T21" && got != "") {
+			t.Errorf("%s: got %q", id, got)
+		}
+	}
+	if TemplateID("A grounded answer the model wrote.") != "" {
+		t.Error("generated text must have no template id")
+	}
+}

@@ -94,7 +94,7 @@ var RouteTitles = map[string]string{
 	"support": "Support center", "trust": "Trust Center", "trust-center": "Trust Center",
 	"core_modules": "Core modules", "integrations": "Integrations",
 	"platform-overview": "Platform overview",
-	"sign-in": "Sign in",
+	"sign-in":           "Sign in securely",
 }
 
 // FallbackRoute maps a citation url_key to the published route that best

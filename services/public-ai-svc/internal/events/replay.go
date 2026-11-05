@@ -28,8 +28,8 @@ var typeTopics = map[string]struct {
 	TypeTurnCompleted:     {TopicTelemetry, []string{"request_id", "intent_id", "status", "latency_bucket", "release_id"}},
 	TypeHandoffClicked:    {TopicTelemetry, []string{"route_key", "market_code_if_explicit", "consent_flag"}},
 	TypeSecuritySignal:    {TopicTelemetry, []string{"reason_class", "request_id", "severity"}},
-	TypeReleasePromoted:   {TopicGovernance, []string{"release_id", "signer_refs", "digest", "effective_at"}},
-	TypeSourceRevoked:     {TopicGovernance, []string{"source_version_id", "reason_code", "effective_at"}},
+	TypeReleasePromoted:   {TopicGovernance, []string{"release_id", "kind", "signer_refs", "digest", "effective_at", "release_epoch"}},
+	TypeSourceRevoked:     {TopicGovernance, []string{"source_version_id", "reason_code", "effective_at", "revocation_epoch"}},
 	TypeKillSwitchChanged: {TopicControl, []string{"flag", "actor_ref", "approval_ref", "environment", "control_epoch"}},
 }
 
@@ -154,9 +154,16 @@ func (r *Replayer) check(ctx context.Context, raw []byte, now time.Time, maxAge 
 	case TypeReleasePromoted:
 		// An older release is never re-announced (CT-041): only the release
 		// that is still active may be replayed.
-		var id string
+		var id, kind string
 		_ = json.Unmarshal(env.Data["release_id"], &id)
-		cur, err := r.Store.GetPointer(ctx, kindOf(id))
+		_ = json.Unmarshal(env.Data["kind"], &kind)
+		switch {
+		case kind == "":
+			kind = kindOf(id) // dead-lettered before events carried their kind
+		case kind != knowledge.KindKB && kind != "claims":
+			return store.OutboxEvent{}, env.ID, fmt.Errorf("unknown release kind %q", kind)
+		}
+		cur, err := r.Store.GetPointer(ctx, kind)
 		if err != nil || cur != id {
 			return store.OutboxEvent{}, env.ID, errors.New("stale: release is no longer the active one")
 		}
@@ -179,14 +186,17 @@ func (r *Replayer) check(ctx context.Context, raw []byte, now time.Time, maxAge 
 	case TypeSourceRevoked:
 		// Only a revocation that is in the append-only ledger is replayed.
 		var target string
+		var epoch int64
 		_ = json.Unmarshal(env.Data["source_version_id"], &target)
+		_ = json.Unmarshal(env.Data["revocation_epoch"], &epoch)
 		revs, err := r.Store.Revocations(ctx, 0)
 		if err != nil {
 			return store.OutboxEvent{}, env.ID, fmt.Errorf("revocation ledger unavailable: %w", err)
 		}
 		found := false
 		for _, v := range revs {
-			found = found || v.TargetID == target
+			// With an epoch, it must be that very ledger entry.
+			found = found || (v.TargetID == target && (epoch == 0 || v.Watermark == epoch))
 		}
 		if !found {
 			return store.OutboxEvent{}, env.ID, errors.New("revocation is not in the ledger")
@@ -195,7 +205,8 @@ func (r *Replayer) check(ctx context.Context, raw []byte, now time.Time, maxAge 
 	return store.OutboxEvent{EventID: env.ID, Topic: spec.topic, EventType: env.Type, Payload: raw, CreatedAt: at.UTC()}, env.ID, nil
 }
 
-// kindOf is the release pointer a release id belongs to.
+// kindOf guesses the release pointer from a release id. Only for events that
+// predate the kind field.
 func kindOf(releaseID string) string {
 	if strings.HasPrefix(releaseID, "claims") {
 		return "claims"

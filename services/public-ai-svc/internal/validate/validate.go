@@ -12,8 +12,13 @@ import (
 	"zoiko.io/public-ai-svc/internal/model"
 )
 
-// MaxWords is the answer length before "expand" (Doc 01 §12).
-const MaxWords = 120
+// MaxWords is the answer length shown before "expand" (Doc 01 §12): the
+// first MaxWords words carry the complete core answer. MaxFullWords bounds
+// the whole answer, including the detail behind "Show more".
+const (
+	MaxWords     = 120
+	MaxFullWords = 240
+)
 
 var (
 	ErrEmpty            = errors.New("empty answer")
@@ -125,12 +130,23 @@ func Check(d model.Draft, claims []model.ClaimCard, evidence []model.Evidence) (
 		// system returned it, which a public chat answer never has.
 		return "", ErrFalseConfirmation
 	}
+	// Doc 03 §13: every figure must appear as a whole number in what the
+	// model was given ("4" is not supported by "49").
+	groundNums := numberSet(lowerGround)
 	for _, n := range numberRe.FindAllString(text, -1) {
-		if !strings.Contains(lowerGround, strings.ToLower(n)) {
+		if !groundNums[canonNumber(n)] {
 			return "", ErrUnsupportedFact
 		}
 	}
-	return truncateWords(text, MaxWords), nil
+	// Doc 03 §17: a price or trial length is a P1 fact. It may only repeat a
+	// verified claim card, never evidence text or the model's own wording.
+	claimNums := numberSet(claimText(claims))
+	for _, n := range p1Figures(text) {
+		if !claimNums[canonNumber(n)] {
+			return "", ErrUnsupportedFact
+		}
+	}
+	return truncateWords(text, MaxFullWords), nil
 }
 
 func claimAllows(claims []model.ClaimCard, phrase string) bool {
@@ -161,4 +177,59 @@ func truncateWords(s string, max int) string {
 		return strings.Join(strings.Fields(s)[:max], " ") + "…"
 	}
 	return strings.Join(out, " ")
+}
+
+var (
+	// currencyRe is an amount with a currency symbol or code on either side.
+	currencyRe = regexp.MustCompile(`(?i)(?:[$€£]|\b(?:XTS|USD|GBP|EUR)\b)\s?(\d+(?:[.,]\d+)*)|(\d+(?:[.,]\d+)*)\s?(?:\b(?:XTS|USD|GBP|EUR)\b|[€£])`)
+	// trialRe is a trial length: "14-day trial", "30 days free trial",
+	// "trial of 30 days", "trial lasts 14 days".
+	trialRe = regexp.MustCompile(`(?i)\b(\d+)[\s-]*days?[\s-]+(?:(?:free|self-serve)[\s-]+)?trial\b|\btrial\s+(?:period\s+)?(?:of|for|lasts?|is)\s+(\d+)\s+days?\b`)
+)
+
+// p1Figures returns the numbers in currency amounts and trial lengths.
+func p1Figures(text string) []string {
+	var out []string
+	for _, re := range []*regexp.Regexp{currencyRe, trialRe} {
+		for _, m := range re.FindAllStringSubmatch(text, -1) {
+			for _, g := range m[1:] {
+				if g != "" {
+					out = append(out, g)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func claimText(claims []model.ClaimCard) string {
+	var b strings.Builder
+	for _, c := range claims {
+		b.WriteString(strings.ToLower(c.Statement) + " ")
+	}
+	return b.String()
+}
+
+// numberSet holds every whole number token in s, canonicalised.
+func numberSet(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, n := range numberRe.FindAllString(s, -1) {
+		out[canonNumber(n)] = true
+	}
+	return out
+}
+
+// canonNumber makes "49.00" and "49", or "1,000" and "1000", the same token;
+// a percent sign stays significant.
+func canonNumber(n string) string {
+	pct := strings.HasSuffix(n, "%")
+	n = strings.TrimSuffix(n, "%")
+	if i := strings.LastIndexByte(n, '.'); i >= 0 && strings.Trim(n[i+1:], "0") == "" {
+		n = n[:i]
+	}
+	n = strings.ReplaceAll(n, ",", "")
+	if pct {
+		n += "%"
+	}
+	return n
 }

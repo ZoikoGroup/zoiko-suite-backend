@@ -10,7 +10,11 @@ import (
 )
 
 func main() {
-	addr := os.Getenv("PUBLIC_AI_HTTP_ADDR")
+	// Health endpoints move to the internal admin listener when it is set.
+	addr := os.Getenv("PUBLIC_AI_ADMIN_ADDR")
+	if addr == "" {
+		addr = os.Getenv("PUBLIC_AI_HTTP_ADDR")
+	}
 	if addr == "" {
 		addr = ":8080"
 	}

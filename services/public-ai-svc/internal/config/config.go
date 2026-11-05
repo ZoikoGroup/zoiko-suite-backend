@@ -8,6 +8,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -15,14 +16,19 @@ import (
 )
 
 type Config struct {
-	Enabled      bool
-	HTTPAddr     string
+	Enabled  bool
+	HTTPAddr string
+	// AdminAddr, when set, is a separate internal listener that serves
+	// /metrics and /health/* (Doc 06 §12); the public listener then serves
+	// only /public-ai/v1. Unset keeps both on HTTPAddr (dev, compose probes).
+	AdminAddr    string
 	DatabaseURL  string
 	KafkaBrokers []string
 
 	AllowedOrigins []string
 	// AllowedHosts, when set, restricts the Host header (Doc 04 §08, A02).
-	AllowedHosts  []string
+	AllowedHosts []string
+	// ModelProfile is derived: ModelProfile(ModelProvider, ModelID).
 	ModelProfile  string
 	PolicyVersion string
 	Region        string
@@ -77,6 +83,9 @@ type Config struct {
 	ModelTimeout              time.Duration
 	RateLimitPerIPPerMinute   int
 	RateLimitPerSessionPerMin int
+	// RateLimitSessionCreatePerMin is the tighter per-IP limit on new
+	// sessions (Doc 06 §13, SEC-T055).
+	RateLimitSessionCreatePerMin int
 	// TrustedProxies are the CIDRs whose X-Forwarded-For is believed when
 	// keying the per-IP limit (the console's same-origin proxy, the edge).
 	TrustedProxies      []string
@@ -103,50 +112,71 @@ func Load() (Config, error) {
 		// and off :8080, which local Docker stacks commonly hold. Containers set
 		// PUBLIC_AI_HTTP_ADDR explicitly.
 		HTTPAddr:                 env("PUBLIC_AI_HTTP_ADDR", devDefault(os.Getenv("PUBLIC_AI_ENVIRONMENT"), "127.0.0.1:8001", ":8080")),
+		AdminAddr:                os.Getenv("PUBLIC_AI_ADMIN_ADDR"),
 		DatabaseURL:              os.Getenv("PUBLIC_AI_DATABASE_URL"),
 		KafkaBrokers:             splitList(os.Getenv("PUBLIC_AI_KAFKA_BROKERS")),
 		AllowedOrigins:           splitList(env("PUBLIC_AI_ALLOWED_ORIGINS", "http://localhost:3000")),
 		AllowedHosts:             splitList(os.Getenv("PUBLIC_AI_ALLOWED_HOSTS")),
-		ModelProfile:             env("PUBLIC_AI_MODEL_PROFILE", "fake-v0"),
 		PolicyVersion:            env("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
 		Region:                   os.Getenv("PUBLIC_AI_REGION"),
 		TokenBudgetPerTurn:       envInt("PUBLIC_AI_TOKEN_BUDGET_PER_TURN", 2000),
 		MaxActiveTurnsPerSession: envInt("PUBLIC_AI_MAX_ACTIVE_TURNS_PER_SESSION", 1),
 		SessionTTL:               envDuration("PUBLIC_AI_SESSION_TTL", 30*time.Minute),
 		SessionIdleTTL:           envDuration("PUBLIC_AI_SESSION_IDLE_TTL", 15*time.Minute),
-		SessionTokenCap:          int64(envInt("PUBLIC_AI_SESSION_TOKEN_CAP", 20000)),
-		IdempotencyTTL:           envDuration("PUBLIC_AI_IDEMPOTENCY_TTL", 24*time.Hour),
-		Retention:                envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
+		// A grounded turn costs about 3k tokens (system prompt + evidence),
+		// so the dev default allows about 30 answers per conversation. The
+		// approved value is DEC-07/08; outside dev/test it must be set.
+		SessionTokenCap: int64(envInt("PUBLIC_AI_SESSION_TOKEN_CAP", 100000)),
+		IdempotencyTTL:  envDuration("PUBLIC_AI_IDEMPOTENCY_TTL", 24*time.Hour),
+		Retention:       envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
 		// Required and never assumed (SEC-P0-06): an unset value used to
 		// mean dev and switch the production gates off.
-		Environment:               os.Getenv("PUBLIC_AI_ENVIRONMENT"),
-		PolicyDigest:              os.Getenv("PUBLIC_AI_POLICY_DIGEST"),
-		ProviderApprovalRef:       os.Getenv("PUBLIC_AI_PROVIDER_APPROVAL_REF"),
-		ProviderRegion:            os.Getenv("PUBLIC_AI_REGION"),
-		ApprovedRegions:           splitList(os.Getenv("PUBLIC_AI_APPROVED_REGIONS")),
-		RetentionSet:              os.Getenv("PUBLIC_AI_RETENTION") != "",
-		ModelProvider:             env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock")),
-		ModelID:                   modelIDFor(env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock"))),
-		AllowedModelIDs:           splitList(env("PUBLIC_AI_ALLOWED_MODEL_IDS", "mock-extractive-v1,openai/gpt-oss-120b")),
-		GroqAPIKey:                os.Getenv("GROQ_API_KEY"),
-		Dataset:                   env("PUBLIC_AI_DATASET", "public-kb"),
-		KBAllowDraft:              envBool("KB_ALLOW_DRAFT", envDefaultDev()),
-		SeedOnStart:               envBool("PUBLIC_AI_SEED_ON_START", false),
-		StructuredResponseDev:     envBool("PUBLIC_AI_STRUCTURED_RESPONSE", envDefaultDev()),
-		MaxBodyBytes:              int64(envInt("PUBLIC_AI_MAX_BODY_BYTES", 16*1024)),
-		ModelTimeout:              envDuration("PUBLIC_AI_MODEL_TIMEOUT", 6*time.Second),
-		RateLimitPerIPPerMinute:   envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
-		RateLimitPerSessionPerMin: envInt("PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN", 20),
-		TrustedProxies:            splitList(env("PUBLIC_AI_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
-		DailyTokenCeiling:         int64(envInt("PUBLIC_AI_DAILY_TOKEN_CEILING", 2_000_000)),
-		MonthlyTokenCeiling:       int64(envInt("PUBLIC_AI_MONTHLY_TOKEN_CEILING", 40_000_000)),
-		LogRawPrompt:              envBool("PUBLIC_AI_LOG_RAW_PROMPT", false),
-		ProductionChatPIICapture:  envBool("PUBLIC_AI_PRODUCTION_CHAT_PII_CAPTURE", false),
-		SigningPublicKey:          os.Getenv("PUBLIC_AI_SIGNING_PUBLIC_KEY"),
-		SigningKey:                os.Getenv("PUBLIC_AI_SIGNING_KEY"),
+		Environment:                  os.Getenv("PUBLIC_AI_ENVIRONMENT"),
+		PolicyDigest:                 os.Getenv("PUBLIC_AI_POLICY_DIGEST"),
+		ProviderApprovalRef:          os.Getenv("PUBLIC_AI_PROVIDER_APPROVAL_REF"),
+		ProviderRegion:               os.Getenv("PUBLIC_AI_REGION"),
+		ApprovedRegions:              splitList(os.Getenv("PUBLIC_AI_APPROVED_REGIONS")),
+		RetentionSet:                 os.Getenv("PUBLIC_AI_RETENTION") != "",
+		ModelProvider:                env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock")),
+		ModelID:                      modelIDFor(env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock"))),
+		AllowedModelIDs:              splitList(env("PUBLIC_AI_ALLOWED_MODEL_IDS", "mock-extractive-v1,openai/gpt-oss-120b")),
+		GroqAPIKey:                   os.Getenv("GROQ_API_KEY"),
+		Dataset:                      env("PUBLIC_AI_DATASET", "public-kb"),
+		KBAllowDraft:                 envBool("KB_ALLOW_DRAFT", envDefaultDev()),
+		SeedOnStart:                  envBool("PUBLIC_AI_SEED_ON_START", false),
+		StructuredResponseDev:        envBool("PUBLIC_AI_STRUCTURED_RESPONSE", envDefaultDev()),
+		MaxBodyBytes:                 int64(envInt("PUBLIC_AI_MAX_BODY_BYTES", 16*1024)),
+		ModelTimeout:                 envDuration("PUBLIC_AI_MODEL_TIMEOUT", 6*time.Second),
+		RateLimitPerIPPerMinute:      envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
+		RateLimitPerSessionPerMin:    envInt("PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN", 20),
+		RateLimitSessionCreatePerMin: envInt("PUBLIC_AI_RATE_LIMIT_SESSION_CREATE_PER_MIN", 10),
+		TrustedProxies:               splitList(env("PUBLIC_AI_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
+		DailyTokenCeiling:            int64(envInt("PUBLIC_AI_DAILY_TOKEN_CEILING", 2_000_000)),
+		MonthlyTokenCeiling:          int64(envInt("PUBLIC_AI_MONTHLY_TOKEN_CEILING", 40_000_000)),
+		LogRawPrompt:                 envBool("PUBLIC_AI_LOG_RAW_PROMPT", false),
+		ProductionChatPIICapture:     envBool("PUBLIC_AI_PRODUCTION_CHAT_PII_CAPTURE", false),
+		SigningPublicKey:             os.Getenv("PUBLIC_AI_SIGNING_PUBLIC_KEY"),
+		SigningKey:                   os.Getenv("PUBLIC_AI_SIGNING_KEY"),
 	}
+	// The model profile is derived, never configured on its own, so the
+	// manifest, eval report and build_info name the model that actually runs.
+	c.ModelProfile = ModelProfile(c.ModelProvider, c.ModelID)
 	return c, c.Validate()
 }
+
+// ModelProfile is the release-tuple model identity "<provider>:<model id>"
+// (Doc 08 §06), e.g. "groq:openai/gpt-oss-120b" or "mock:mock-extractive-v1".
+func ModelProfile(provider, modelID string) string { return provider + ":" + modelID }
+
+// ModelProfileFromEnv derives the profile the server would run with from
+// the same variables Load reads (for offline tools such as kbctl).
+func ModelProfileFromEnv() string {
+	p := env("PUBLIC_AI_MODEL_PROVIDER", env("MODEL_PROVIDER", "mock"))
+	return ModelProfile(p, modelIDFor(p))
+}
+
+// MockModelID is the deterministic mock provider's model id.
+const MockModelID = "mock-extractive-v1"
 
 // Validate rejects configurations that would breach a non-waivable control.
 func (c Config) Validate() error {
@@ -214,6 +244,67 @@ func (c Config) Validate() error {
 	if c.SessionTTL <= 0 || c.IdempotencyTTL <= 0 || c.ModelTimeout <= 0 {
 		return fmt.Errorf("TTL and timeout values must be positive")
 	}
+	if c.ModelTimeout > MaxModelTimeout {
+		return fmt.Errorf("PUBLIC_AI_MODEL_TIMEOUT %s exceeds %s: drain (%s) + 2 x timeout + %s must fit the %s stop grace period (Doc 08 §11, OPR-012)",
+			c.ModelTimeout, MaxModelTimeout, DrainGrace, ShutdownSlack, StopGracePeriod)
+	}
+	if c.AdminAddr != "" && c.AdminAddr == c.HTTPAddr {
+		return fmt.Errorf("PUBLIC_AI_ADMIN_ADDR must differ from PUBLIC_AI_HTTP_ADDR")
+	}
+	if !devLike {
+		if err := validateProductionLimits(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Shutdown budget (Doc 08 §11, OPR-012): on SIGTERM the server reports
+// not-ready for DrainGrace, then waits 2 x ModelTimeout + ShutdownSlack for
+// in-flight turns. That must fit the orchestrator's stop grace period
+// (stop_grace_period: 45s in docker-compose.public-ai.yml; set
+// terminationGracePeriodSeconds to at least the same elsewhere), so the
+// model timeout is bounded by MaxModelTimeout = (45 - 5 - 15) / 2 = 12.5 s.
+const (
+	DrainGrace      = 5 * time.Second
+	ShutdownSlack   = 15 * time.Second
+	StopGracePeriod = 45 * time.Second
+	MaxModelTimeout = (StopGracePeriod - DrainGrace - ShutdownSlack) / 2
+)
+
+// validateProductionLimits: outside dev/test every abuse and cost limit is
+// set (zero or negative would mean "no limit") and every allowed origin is a
+// real https origin, never localhost (SEC-P0-09, D06-09).
+func validateProductionLimits(c Config) error {
+	for name, v := range map[string]int64{
+		"PUBLIC_AI_RATE_LIMIT_IP_PER_MIN":             int64(c.RateLimitPerIPPerMinute),
+		"PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN":        int64(c.RateLimitPerSessionPerMin),
+		"PUBLIC_AI_RATE_LIMIT_SESSION_CREATE_PER_MIN": int64(c.RateLimitSessionCreatePerMin),
+		"PUBLIC_AI_DAILY_TOKEN_CEILING":               c.DailyTokenCeiling,
+		"PUBLIC_AI_MONTHLY_TOKEN_CEILING":             c.MonthlyTokenCeiling,
+		"PUBLIC_AI_SESSION_TOKEN_CAP":                 c.SessionTokenCap,
+		"PUBLIC_AI_TOKEN_BUDGET_PER_TURN":             int64(c.TokenBudgetPerTurn),
+	} {
+		if v <= 0 {
+			return fmt.Errorf("%s must be > 0 outside dev/test (SEC-P0-09)", name)
+		}
+	}
+	if len(c.AllowedOrigins) == 0 {
+		return fmt.Errorf("PUBLIC_AI_ALLOWED_ORIGINS is required outside dev/test")
+	}
+	for _, o := range c.AllowedOrigins {
+		u, err := url.Parse(o)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.Path != "" || u.RawQuery != "" {
+			return fmt.Errorf("PUBLIC_AI_ALLOWED_ORIGINS: %q must be an https origin outside dev/test (SEC-P0-09)", o)
+		}
+		h := strings.ToLower(u.Hostname())
+		if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+			return fmt.Errorf("PUBLIC_AI_ALLOWED_ORIGINS: %q is localhost, not permitted outside dev/test", o)
+		}
+		if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+			return fmt.Errorf("PUBLIC_AI_ALLOWED_ORIGINS: %q is a loopback address, not permitted outside dev/test", o)
+		}
+	}
 	return nil
 }
 
@@ -244,7 +335,7 @@ func modelIDFor(provider string) string {
 	if provider == "groq" {
 		return env("GROQ_MODEL", "openai/gpt-oss-120b")
 	}
-	return "mock-extractive-v1"
+	return MockModelID
 }
 
 func devDefault(environment, dev, other string) string {
