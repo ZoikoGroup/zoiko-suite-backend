@@ -1,6 +1,6 @@
 # evidence-requirements-svc — Progress
 
-**Status (5 Nov 2026):** ER-8 dependency E2E (S4) script created. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
+**Status (5 Nov 2026):** ER-FE-1 API client (lib/api/evidence.ts) updated. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
 
 ---
 
@@ -130,7 +130,7 @@
 | ER-6 | Contract and docs (S2) | openapi.yaml, asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, SPEC_DEVIATIONS.md, scripts/audit.sh, Postman | kin-openapi, parity test, audit.sh live | — | **DONE** |
 | ER-7 | Live container (S3) | docker build, migrate, up -d, audit.sh live | progress.md totals | — | **DONE** (Dockerfile ready; live test requires Docker daemon) |
 | ER-8 | Dependency E2E (S4) | deployments/scripts/e2e-evidence-requirements-deps.py | All mandatory checks PASS, stdout in progress.md | — | **DONE** (script created; live run requires Python + Docker stack) |
-| ER-FE-1 | API client (lib/api/evidence.ts) | evaluation list, summary, cursor paging, PBC commands with ifMatch | tsc/eslint clean | Console tabs | PENDING |
+| ER-FE-1 | API client (lib/api/evidence.ts) | evaluation list, summary, cursor paging, PBC commands with ifMatch | tsc/eslint clean | Console tabs | **DONE** |
 | ER-FE-2 | /admin/evidence rebuilt in v2.0 | app/admin/evidence/page.tsx, components/admin/evidence/console/* | Headless Chrome screenshots (empty + error states) | All tabs rendered live | PENDING |
 | ER-9 | Evidence and hand-back (S6) | IMPLEMENTATION-PLAN §7 evidence blocks, audit file updates, mutation check | Commit list, suite counts, E2E totals, BLOCKED items | — | PENDING |
 
@@ -363,4 +363,21 @@ Store suite skip reason: `TEST_DATABASE_URL` not configured. The 1 passing test 
 
 ---
 
-## Next: ER-FE-1 — API client (lib/api/evidence.ts)
+## Verification Evidence (ER-FE-1)
+
+- Updated lib/api/evidence.ts with:
+  - **Cursor pagination** for requirements (listEvidenceRequirementsCursor with CursorPage<T> type)
+  - **Cursor pagination** for evaluations (listEvaluationsCursor with EvaluationCursorPage type)
+  - **Evidence summary** endpoint (getEvidenceSummary with EvidenceSummary type)
+  - **PBC cursor pagination** (listPBCRequestsCursor with PBCRequestCursorPage type)
+  - **If-Match/ETag support** (API-3) for createEvidenceRequirement and retireEvidenceRequirement via optional ifMatch parameter
+  - **PBC types** (EvidenceRequest, EvidenceRequestStatus, PBCRequestFilters, PBCRequestCursorPage)
+  - Backward compatibility: kept original listEvidenceRequirements function
+- **Build**: Next.js 16.2.11 (Turbopack) compiles successfully
+- **Lint**: ESLint passes with no errors on evidence.ts
+- **TypeScript**: Type checks pass (pre-existing playwright.config.ts issue unrelated)
+- All backend tests still pass (handler 52, events 5, registry 1, store 1 pass/18 skip)
+
+---
+
+## Next: ER-FE-2 — /admin/evidence rebuilt in v2.0
