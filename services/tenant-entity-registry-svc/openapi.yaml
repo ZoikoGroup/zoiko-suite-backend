@@ -3286,6 +3286,252 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { description: "FX_RATE_MISSING: a needed component has no approved rate", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
+  # ── REF-06 Accounting books ─────────────────────────────────────────────────
+  /v1/books:
+    post:
+      operationId: createAccountingBook
+      summary: REF-06 CreateAccountingBook - open a DRAFT book with its first basis
+      description: |
+        A book belongs to one legal entity or to a group (a group owns only consolidation and management books). Its code is
+        unique within its owner for ever: a retired code is not reused. The framework must be allowed for the book type (a
+        tax book is on a TAX_BASIS, not IFRS); LOCAL_GAAP and REGULATORY_BASIS name the standard in framework_detail. Both
+        currencies are confirmed with currency-registry-svc, read-only and fail-closed. There is no default book and no
+        default type. A book owns no ledger lines or balances and no accounting policy content.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateAccountingBookRequest" } } }
+      responses:
+        "201":
+          description: Book opened as DRAFT
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The book code is already used by this entity or group, or the entity is not operational", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+    get:
+      operationId: listGroupBooks
+      summary: REF-06 a group's books
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: group_code, in: query, required: true, schema: { type: string } }
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/BookType" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/BookStatus" } }
+      responses:
+        "200":
+          description: The group's books
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AccountingBook" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/entities/{entityID}/books:
+    get:
+      operationId: listEntityBooks
+      summary: REF-06 ListEntityBooks
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/BookType" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/BookStatus" } }
+      responses:
+        "200":
+          description: "The entity's books, which stay separate: statutory, management, tax, consolidation and regulatory"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AccountingBook" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/books/{bookID}:
+    get:
+      operationId: getAccountingBook
+      summary: REF-06 GetAccountingBook - the book as it was on as_of, with its status then, its basis then and whether it could post
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string }, description: "RFC3339 or YYYY-MM-DD; absent means now." }
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every status change." }
+      responses:
+        "200":
+          description: The book
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/books/{bookID}/as-of:
+    get:
+      operationId: getBookAsOf
+      summary: REF-06 GetBookAsOf - the same as getAccountingBook with the date required
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, required: true, schema: { type: string } }
+        - { name: history, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: The book as it was then; the historical basis version is reconstructed
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/books/{bookID}/posting-eligibility:
+    get:
+      operationId: getBookPostingEligibility
+      summary: REF-06 BookPostingEligibility - may this book take a posting on that date, and if not why
+      description: |
+        A posting service names the book explicitly and asks here; there is no default ledger. A book posts only when it
+        was ACTIVE on the date with a basis in force. A draft, a book whose posting is suspended, a retired book, a book
+        before it began, and a book with no basis in force all answer eligible=false with the reason.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The answer
+          content: { application/json: { schema: { $ref: "#/components/schemas/PostingEligibility" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/books/{bookID}/basis:
+    get:
+      operationId: explainBookBasis
+      summary: REF-06 ExplainBookBasis - the basis in force, every version, and how the book differs from its siblings
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The explanation
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookBasisExplanation" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      operationId: amendBookBasis
+      summary: REF-06 AmendBookBasis - add the next basis version; prospective, never rewriting earlier periods
+      description: |
+        expected_version is the book's record_version last read. For a book in use (anything but DRAFT) valid_from is today
+        or later and after the current basis began: a basis change cannot rewrite how earlier periods were booked. A DRAFT
+        book, never in use, may be corrected on or after the day its basis starts. The framework is checked against the
+        book's type. A retired book keeps its basis and takes no new one.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AmendBookBasisRequest" } } }
+      responses:
+        "201":
+          description: New basis version recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the book is retired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/books/{bookID}:activate:
+    post:
+      operationId: activateBook
+      summary: REF-06 ActivateBook - DRAFT or POSTING_SUSPENDED to ACTIVE
+      description: |
+        A statutory, tax or regulatory book is not activated by the principal who created it: 403 SOD_DENIED, held by the
+        table as well. A second live book of the same entity, type and framework is a 409: parallel books differ in framework,
+        so "the" book is never ambiguous.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/BookStatusRequest" } } }
+      responses:
+        "200":
+          description: Activated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, the lifecycle does not allow it, or a parallel live book has the same framework", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/books/{bookID}:suspend-posting:
+    post:
+      operationId: suspendBookPosting
+      summary: REF-06 SuspendPosting - ACTIVE to POSTING_SUSPENDED; reason required
+      description: The book stays readable and its history intact; it takes no new posting until activated again.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/BookStatusRequest" } } }
+      responses:
+        "200":
+          description: Posting suspended; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/books/{bookID}:retire:
+    post:
+      operationId: retireBook
+      summary: REF-06 RetireBook - to RETIRED (final); reason required
+      description: Retirement prevents new postings but retains historical retrieval and report lineage, including the basis versions.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/BookStatusRequest" } } }
+      responses:
+        "200":
+          description: Retired; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the book is already retired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -4079,6 +4325,176 @@ components:
         rounding: { type: string, description: "How a derived rate is rounded. Absent for a direct rate." }
         exact: { type: string, description: "The unrounded fraction of a derived rate, numerator/denominator." }
         components: { type: array, items: { $ref: "#/components/schemas/FXComponent" } }
+
+    BookType:
+      type: string
+      enum: [STATUTORY, MANAGEMENT, TAX, CONSOLIDATION, REGULATORY]
+      description: Books of different types stay separate even where their charts overlap. STATUTORY, TAX and REGULATORY are material.
+
+    BookStatus:
+      type: string
+      enum: [DRAFT, ACTIVE, POSTING_SUSPENDED, RETIRED]
+
+    BookFramework:
+      type: string
+      enum: [IFRS, IFRS_SME, US_GAAP, LOCAL_GAAP, TAX_BASIS, MANAGEMENT_BASIS, REGULATORY_BASIS]
+      description: |
+        STATUTORY: IFRS, IFRS_SME, US_GAAP, LOCAL_GAAP. MANAGEMENT: MANAGEMENT_BASIS, IFRS, US_GAAP, LOCAL_GAAP.
+        TAX: TAX_BASIS. CONSOLIDATION: IFRS, IFRS_SME, US_GAAP, LOCAL_GAAP. REGULATORY: REGULATORY_BASIS, LOCAL_GAAP.
+
+    BookBasisFields:
+      type: object
+      required: [framework, functional_currency, presentation_currency, evidence_ref]
+      properties:
+        framework: { $ref: "#/components/schemas/BookFramework" }
+        framework_detail: { type: string, description: "Names the standard behind LOCAL_GAAP or REGULATORY_BASIS, e.g. UK GAAP FRS 102. Required for those." }
+        functional_currency: { type: string, pattern: '^[A-Z]{3}$' }
+        presentation_currency: { type: string, pattern: '^[A-Z]{3}$' }
+        chart_ref: { type: string, description: "A reference to the chart of accounts; the chart itself is not held here." }
+        policy_ref: { type: string, description: "A reference to the accounting policy (REF-07); not held here." }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+
+    CreateAccountingBookRequest:
+      allOf:
+        - $ref: "#/components/schemas/BookBasisFields"
+        - type: object
+          required: [book_code, name, book_type, purpose]
+          description: Name exactly one owner, legal_entity_id or group_code.
+          properties:
+            legal_entity_id: { type: string, format: uuid }
+            group_code: { type: string, maxLength: 40 }
+            book_code: { type: string, pattern: '^[A-Z0-9][A-Z0-9_.-]{0,39}$' }
+            name: { type: string, maxLength: 200 }
+            book_type: { $ref: "#/components/schemas/BookType" }
+            purpose: { type: string, maxLength: 500 }
+            correlation_id: { type: string }
+
+    AmendBookBasisRequest:
+      allOf:
+        - $ref: "#/components/schemas/BookBasisFields"
+        - type: object
+          required: [expected_version, reason]
+          properties:
+            expected_version: { type: integer, minimum: 1 }
+            reason: { type: string }
+            correlation_id: { type: string }
+
+    BookStatusRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string, description: "Required to suspend posting or retire." }
+        evidence_ref: { type: string }
+        effective_date: { type: string, format: date, description: "Defaults to today. Not before the last change." }
+        correlation_id: { type: string }
+
+    AccountingBook:
+      type: object
+      required: [book_id, tenant_id, book_code, name, book_type, purpose, status, material, current_basis, record_version, created_by, created_at]
+      properties:
+        book_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        group_code: { type: string }
+        book_code: { type: string }
+        name: { type: string }
+        book_type: { $ref: "#/components/schemas/BookType" }
+        purpose: { type: string }
+        status: { $ref: "#/components/schemas/BookStatus" }
+        material: { type: boolean }
+        current_basis: { type: integer }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        activated_by: { type: string }
+
+    BookBasisVersion:
+      type: object
+      required: [version_no, framework, functional_currency, presentation_currency, valid_from, evidence_ref, recorded_by, recorded_at]
+      properties:
+        version_no: { type: integer }
+        framework: { $ref: "#/components/schemas/BookFramework" }
+        framework_detail: { type: string }
+        functional_currency: { type: string }
+        presentation_currency: { type: string }
+        chart_ref: { type: string }
+        policy_ref: { type: string }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        recorded_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+
+    BookTransition:
+      type: object
+      required: [seq, to_status, effective_date, command, evidence_ref, actor, version_after, occurred_at]
+      properties:
+        seq: { type: integer }
+        from_status: { $ref: "#/components/schemas/BookStatus" }
+        to_status: { $ref: "#/components/schemas/BookStatus" }
+        effective_date: { type: string, format: date }
+        command: { type: string }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        actor: { type: string }
+        version_before: { type: integer }
+        version_after: { type: integer }
+        occurred_at: { type: string, format: date-time }
+
+    BookOutcome:
+      type: object
+      required: [book, basis]
+      properties:
+        book: { $ref: "#/components/schemas/AccountingBook" }
+        basis: { $ref: "#/components/schemas/BookBasisVersion" }
+        transition: { $ref: "#/components/schemas/BookTransition" }
+
+    PostingEligibility:
+      type: object
+      required: [book_id, as_of, eligible]
+      properties:
+        book_id: { type: string, format: uuid }
+        as_of: { type: string, format: date }
+        eligible: { type: boolean }
+        reason: { type: string, enum: [NOT_ACTIVE, POSTING_SUSPENDED, RETIRED, NOT_YET_EFFECTIVE, NO_BASIS_IN_FORCE] }
+
+    BookView:
+      type: object
+      required: [book, as_of, status_as_of, basis, posting_eligibility]
+      properties:
+        book: { $ref: "#/components/schemas/AccountingBook" }
+        as_of: { type: string, format: date }
+        status_as_of: { type: string, description: "The book's status on as_of; empty before it began." }
+        basis: { nullable: true, allOf: [{ $ref: "#/components/schemas/BookBasisVersion" }] }
+        posting_eligibility: { $ref: "#/components/schemas/PostingEligibility" }
+        history: { type: array, items: { $ref: "#/components/schemas/BookTransition" } }
+
+    BookBasisExplanation:
+      type: object
+      required: [book, as_of, basis_in_force, versions, allowed_frameworks, parallel_books, notes]
+      properties:
+        book: { $ref: "#/components/schemas/AccountingBook" }
+        as_of: { type: string, format: date }
+        basis_in_force: { nullable: true, allOf: [{ $ref: "#/components/schemas/BookBasisVersion" }] }
+        versions: { type: array, items: { $ref: "#/components/schemas/BookBasisVersion" } }
+        allowed_frameworks: { type: array, items: { $ref: "#/components/schemas/BookFramework" } }
+        entity_default_currency: { type: string }
+        functional_matches_entity: { type: boolean, description: "Stated, not enforced: a parallel book may differ from its entity's currency." }
+        parallel_books:
+          type: array
+          items:
+            type: object
+            required: [book_id, book_code, book_type, status]
+            properties:
+              book_id: { type: string, format: uuid }
+              book_code: { type: string }
+              book_type: { $ref: "#/components/schemas/BookType" }
+              status: { $ref: "#/components/schemas/BookStatus" }
+              framework: { $ref: "#/components/schemas/BookFramework" }
+        notes: { type: array, items: { type: string } }
 
     IdentifierScheme:
       type: string

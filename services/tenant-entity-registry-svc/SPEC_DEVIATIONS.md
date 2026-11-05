@@ -311,3 +311,44 @@ Where the spec leaves a choice, the code chooses the safer reading:
   "calendar cutoff" and "source timezone" resolution is not built: the source's timezone is recorded, and the market date is
   as the source states it; REF-10 calendars are not consulted.
 - **`GET /v1/reference/{set}/{code}` is not built yet.** It is the last wave of ORG-8, over books, dimensions and units.
+
+### Accounting books (REF-06, ORG-8 wave 2)
+
+- **A book is an identity, and books stay separate.** Statutory, management, tax, consolidation and regulatory books are
+  never conflated, even where their charts overlap, and there is no default book and no default type. A book states a
+  basis. It holds no ledger lines or balances (ACC-05) and no accounting policy content (REF-07): `chart_ref` and
+  `policy_ref` are references.
+- **Owner and code.** A book belongs to a legal entity, or to a group (a `group_code`, not an entity id: the plan has no
+  group object to point at) for consolidation and management books only. A statutory, tax or regulatory book is an
+  entity's. The code is unique within its owner for ever, whatever the book's status: a retired code is not reused. There
+  is no `create_request_id`; a retried create is a 409 on the code.
+- **The basis is versioned and prospective.** Framework, functional and presentation currencies, chart and policy
+  references are a version, effective-dated, with one open version at a time. For a book in use a new version starts
+  today or later and after the current one began, so a basis change cannot rewrite how earlier periods were booked
+  (s4.16). A DRAFT book, never in use, may be corrected on or after the day its basis starts: the replaced version is then
+  zero-length and never in force. A retired book keeps its basis and takes no new one.
+- **Allowed frameworks are by book type.** Statutory: IFRS, IFRS_SME, US_GAAP, LOCAL_GAAP. Management: MANAGEMENT_BASIS,
+  IFRS, US_GAAP, LOCAL_GAAP. Tax: TAX_BASIS only. Consolidation: as statutory. Regulatory: REGULATORY_BASIS, LOCAL_GAAP.
+  LOCAL_GAAP and REGULATORY_BASIS name the standard (`framework_detail`). The spec says allowed frameworks are server
+  resolved; no policy source exists, so this table is the policy.
+- **Currencies are confirmed, not matched.** Functional and presentation currencies are checked with currency-registry-svc
+  like exchange rates (read-only, fail-closed). A functional currency different from the entity's default is not refused:
+  a parallel book may legitimately differ. `ExplainBookBasis` states whether it matches.
+- **Lifecycle and "could it post on that date".** DRAFT, ACTIVE, POSTING_SUSPENDED, RETIRED, each move a recorded
+  transition with its effective date, evidence and actor. A suspended book is activated again with `:activate`. Whether a
+  book could post on a date is reconstructed from the transitions and the basis versions, never from the current status:
+  `GET /v1/books/{id}/posting-eligibility?as_of=` answers eligible only for a book that was ACTIVE then with a basis in
+  force, and otherwise names the reason (NOT_ACTIVE, POSTING_SUSPENDED, RETIRED, NOT_YET_EFFECTIVE, NO_BASIS_IN_FORCE).
+  This service answers the question; the posting service must ask it for the book it names. It cannot stop a posting
+  itself.
+- **Segregation of duties, by type.** A statutory, tax or regulatory book is not activated by the principal who created it
+  (403 SOD_DENIED, and a table constraint). The spec says "controller-approved" for statutory and tax book activation;
+  there is no controller role to name here, so independence from the creator is what is enforced, and who may hold
+  `ACCOUNTING_BOOK_ACTIVATE` is a role-design decision.
+- **Parallel books differ in framework.** An entity cannot have two live (ACTIVE or POSTING_SUSPENDED) books of the same
+  type and framework for the three material types: a second would make "the" statutory book ambiguous. A parallel
+  statutory book on another framework, a tax book and any number of management books can be live beside it. Activations
+  of two such books are serialised so the check cannot be raced past. The consolidation-role rules the spec mentions are
+  not modelled.
+- **`GetBookAsOf` is `GetAccountingBook` with the date required**, at its own path; both return the book's status then,
+  the basis then and the eligibility then.

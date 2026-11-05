@@ -96,6 +96,13 @@ var registeredActionMigrations = []struct {
 		"FX_RATE_SET_APPROVE":      "HIGH",
 		"FX_RATE_SET_CLOSE":        "HIGH",
 	}},
+	{"000051_register_book_actions", "tenant-entity-registry-svc", map[string]string{
+		"ACCOUNTING_BOOK_CREATE":          "STANDARD",
+		"ACCOUNTING_BOOK_ACTIVATE":        "HIGH",
+		"ACCOUNTING_BOOK_AMEND_BASIS":     "HIGH",
+		"ACCOUNTING_BOOK_SUSPEND_POSTING": "HIGH",
+		"ACCOUNTING_BOOK_RETIRE":          "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

@@ -130,6 +130,12 @@ func codeEventNames() []string {
 		events.EventFXRateSetClosed,
 		events.EventFXRateSetSuperseded,
 		events.EventFXRateSuperseded,
+		// REF-06 accounting books (book_events.go).
+		events.EventBookCreated,
+		events.EventBookActivated,
+		events.EventBookBasisChanged,
+		events.EventBookPostingSuspend,
+		events.EventBookRetired,
 	}
 }
 

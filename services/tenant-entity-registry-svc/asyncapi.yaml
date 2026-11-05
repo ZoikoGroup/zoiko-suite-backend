@@ -129,6 +129,12 @@ channels:
           - $ref: "#/components/messages/FXRateSetClosed"
           - $ref: "#/components/messages/FXRateSetSuperseded"
           - $ref: "#/components/messages/FXRateSuperseded"
+          # ── REF-06 accounting books ───────────────────────────────────────
+          - $ref: "#/components/messages/AccountingBookCreated"
+          - $ref: "#/components/messages/AccountingBookActivated"
+          - $ref: "#/components/messages/AccountingBookBasisChanged"
+          - $ref: "#/components/messages/AccountingBookPostingSuspended"
+          - $ref: "#/components/messages/AccountingBookRetired"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -628,6 +634,55 @@ components:
         Replaced by another observation (`superseded_by_id`), or dropped by a superseding set (empty). Carries the reason.
         The superseded observation stays readable.
       x-spec-event: FXRateSuperseded
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookCreated:
+      name: accounting.book.created
+      title: An accounting book was opened as a draft
+      description: Carries the book's type, owner, status, basis version, framework and currencies.
+      x-spec-event: AccountingBookCreated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookActivated:
+      name: accounting.book.activated
+      title: An accounting book became ACTIVE and may take postings
+      description: |
+        Also published when a book whose posting was suspended is activated again. `effective_date` is when it took effect,
+        which can precede the time it was recorded.
+      x-spec-event: AccountingBookActivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookBasisChanged:
+      name: accounting.book.basis_changed
+      title: A book's basis changed from its effective date
+      description: |
+        Carries the new framework and currencies, the previous ones, and `effective_date`, the day the new basis starts.
+        A change is prospective: how earlier periods were booked is unchanged, and the previous basis stays retrievable.
+      x-spec-event: BookBasisChanged
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookPostingSuspended:
+      name: accounting.book.posting_suspended
+      title: Posting to a book was suspended
+      description: A posting service must stop posting to this book from `effective_date` until it is activated again.
+      x-spec-event: BookPostingSuspended
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookRetired:
+      name: accounting.book.retired
+      title: An accounting book was retired
+      description: Final. No new postings; history, basis versions and report lineage stay retrievable.
+      x-spec-event: null
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
