@@ -249,6 +249,11 @@ var TplCredentialShared = ExceptionTemplates[X03SensitiveInput]
 // CredentialSharedRe: "I pasted my bank password", "I shared my PIN".
 var CredentialSharedRe = regexp.MustCompile(`(?i)\b(?:i|we)(?:'ve| have)? (?:pasted|shared|typed|sent|posted|entered|included)\b.{0,30}\b(?:password|passcode|pin|otp|one-time code|card number|bank details|credentials?|api key|token)\b`)
 
+// TplSessionLimit: the conversation reached its per-session token cap
+// (Doc 06 §13). Only fixed content is served here; a new conversation has a
+// fresh cap. Not an outage, so not T24.
+var TplSessionLimit = Template{contract.Abstain, "This conversation has reached its length limit, so I can't add new answers here. Start a new conversation from the menu to keep asking; your earlier answers stay in your chat history.", "", false, contract.ReasonSpendCeiling}
+
 // TplUptime is Doc 02 T27: no uptime guarantee or SLA is inferred.
 var TplUptime = Template{contract.Abstain, "I cannot confirm a contractual uptime guarantee from the public information currently available. An agreed SLA, if offered, must be evidenced in the applicable approved contract.", "trust", false, contract.ReasonNoApprovedInfo}
 

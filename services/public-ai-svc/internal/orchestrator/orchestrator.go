@@ -23,6 +23,10 @@ type Input struct {
 	// Budget is the staged spend throttle (Doc 06 §13): "" normal,
 	// BudgetReduced (half output, no repair) or BudgetStatic (no model).
 	Budget string
+	// SessionCapped: this conversation reached its own token cap (as opposed
+	// to the service-wide ceiling); the reply says so and points to a new
+	// conversation instead of reporting an outage.
+	SessionCapped bool
 }
 
 // Spend stages (Doc 06 §13, SEC-P0-09).

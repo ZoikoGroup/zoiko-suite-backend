@@ -565,6 +565,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		// Signed claim statements are static, pre-approved content.
 		draft = model.Draft{ClaimRefs: refs(cards)}
 		text = joinStatements(cards)
+	case staticOnly && in.SessionCapped:
+		// Doc 06 §13: this conversation used its token cap. A new
+		// conversation starts a fresh cap, so say that rather than "outage".
+		return because(p.fromTemplate(policy.TplSessionLimit, intent, snap, market, now, releaseID), contract.ReasonSpendCeiling)
 	case staticOnly:
 		reason := contract.ReasonGenerationDisabled
 		if in.Budget == BudgetStatic {

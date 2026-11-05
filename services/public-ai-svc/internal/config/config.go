@@ -123,9 +123,12 @@ func Load() (Config, error) {
 		MaxActiveTurnsPerSession: envInt("PUBLIC_AI_MAX_ACTIVE_TURNS_PER_SESSION", 1),
 		SessionTTL:               envDuration("PUBLIC_AI_SESSION_TTL", 30*time.Minute),
 		SessionIdleTTL:           envDuration("PUBLIC_AI_SESSION_IDLE_TTL", 15*time.Minute),
-		SessionTokenCap:          int64(envInt("PUBLIC_AI_SESSION_TOKEN_CAP", 20000)),
-		IdempotencyTTL:           envDuration("PUBLIC_AI_IDEMPOTENCY_TTL", 24*time.Hour),
-		Retention:                envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
+		// A grounded turn costs about 3k tokens (system prompt + evidence),
+		// so the dev default allows about 30 answers per conversation. The
+		// approved value is DEC-07/08; outside dev/test it must be set.
+		SessionTokenCap: int64(envInt("PUBLIC_AI_SESSION_TOKEN_CAP", 100000)),
+		IdempotencyTTL:  envDuration("PUBLIC_AI_IDEMPOTENCY_TTL", 24*time.Hour),
+		Retention:       envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
 		// Required and never assumed (SEC-P0-06): an unset value used to
 		// mean dev and switch the production gates off.
 		Environment:                  os.Getenv("PUBLIC_AI_ENVIRONMENT"),

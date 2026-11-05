@@ -377,3 +377,14 @@ func TestCommercialRoutesFlag(t *testing.T) {
 		t.Fatalf("flag off: %q, want support", got)
 	}
 }
+
+// Doc 06 §13: at the conversation's own token cap the reply says so and
+// points to a new conversation; it is not reported as an outage.
+func TestSessionCapIsNotAnOutage(t *testing.T) {
+	e := newEnv(t)
+	r := e.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_cap", Message: "What does the tax module do?", Locale: "en-US",
+		Budget: orchestrator.BudgetStatic, SessionCapped: true})
+	if r.Status == contract.Unavailable || !strings.Contains(r.Text, "new conversation") {
+		t.Fatalf("got %s %q", r.Status, r.Text)
+	}
+}
