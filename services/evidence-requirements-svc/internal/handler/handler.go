@@ -71,6 +71,18 @@ type DocumentVaultClient interface {
 	VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID, principalID string) error
 }
 
+// ManifestClient is the artifact-verification contract for EVIDENCE_MANIFEST
+// references. See internal/manifest.
+type ManifestClient interface {
+	VerifyManifest(ctx context.Context, tenantID, legalEntityID, manifestID, principalID string) error
+}
+
+// EsignatureClient is the artifact-verification contract for SIGNATURE
+// references. See internal/esignature.
+type EsignatureClient interface {
+	VerifyEnvelope(ctx context.Context, tenantID, legalEntityID, envelopeID, principalID string) error
+}
+
 // Action types checked against authorization-svc.
 const (
 	actionCreateRequirement = "EVIDENCE_REQUIREMENT_CREATE"
@@ -121,6 +133,8 @@ type Handler struct {
 	store        Store
 	authz        AuthZClient
 	docs         DocumentVaultClient
+	manifests    ManifestClient
+	esignatures  EsignatureClient
 	registry     EntityChecker
 	evaluateMode GateMode
 	readMode     GateMode
@@ -132,6 +146,18 @@ type Handler struct {
 func New(store Store, authz AuthZClient, docs DocumentVaultClient, log *zap.Logger) *Handler {
 	return &Handler{store: store, authz: authz, docs: docs, registry: noopChecker{},
 		evaluateMode: GateEnforce, readMode: GateEnforce, log: log}
+}
+
+// WithManifestClient sets the manifest verification client.
+func (h *Handler) WithManifestClient(c ManifestClient) *Handler {
+	h.manifests = c
+	return h
+}
+
+// WithEsignatureClient sets the esignature verification client.
+func (h *Handler) WithEsignatureClient(c EsignatureClient) *Handler {
+	h.esignatures = c
+	return h
 }
 
 // WithRegistry confirms every legal entity a request names against
@@ -430,61 +456,114 @@ type checkedArtifact struct {
 
 // checkArtifacts verifies every asserted artifact that points at a
 // verifiable store. Returns a non-nil error only when verification could not
-// be performed at all (document-vault unreachable) — a document that is
+// be performed at all (owner service unreachable) — an artifact that is
 // genuinely absent or out of scope is reported as a non-counting artifact,
 // not an error.
 //
 // Results are memoised per artifact so a requirement set that names the same
-// document twice does not double-call document-vault. A duplicate is NOT
-// counted twice toward minimum_count (Gap 8). Duplicates are recognised by
+// reference twice does not double-call the owner service. A duplicate is NOT
+// counted twice toward minimum_count. Duplicates are recognised by
 // canonical reference (artifactKey), not by the exact string: "ABC…",
-// "abc…" and " abc… " name the same document-vault UUID, and comparing the
-// raw strings let one document satisfy minimum_count: 2.
+// "abc…" and " abc… " name the same UUID, and comparing the raw strings
+// let one document satisfy minimum_count: 2.
 func (h *Handler) checkArtifacts(ctx context.Context, tenantID, legalEntityID, principalID string, artifacts []domain.PresentArtifact) ([]checkedArtifact, error) {
 	out := make([]checkedArtifact, 0, len(artifacts))
 	seen := make(map[string]checkedArtifact, len(artifacts))
 
 	for _, a := range artifacts {
 		key := artifactKey(a.ReferenceID)
-		if a.EvidenceType != domain.EvidenceTypeSupportingDocument {
-			// Not a document-vault reference. Taken on the caller's word in
-			// v1 — there is no service that owns these references yet
-			// (context.md §11.2). Require a non-empty reference_id to count
-			// (prevents empty reference_id from satisfying minimum_count).
+
+		// EVIDENCE_MANIFEST: verify against evidence-manifest-svc
+		if a.EvidenceType == domain.EvidenceTypeEvidenceManifest {
 			if key == "" {
-				out = append(out, checkedArtifact{artifact: a, counts: false, rejectReason: "empty reference_id for non-document artifact"})
+				out = append(out, checkedArtifact{artifact: a, counts: false, rejectReason: "empty reference_id for evidence manifest"})
 				continue
 			}
-			// Deduplicate by reference for non-documents too
 			if _, ok := seen[key]; ok {
-				continue // the same artifact does not count again
+				continue
 			}
-			out = append(out, checkedArtifact{artifact: a, counts: true})
-			seen[key] = checkedArtifact{artifact: a, counts: true}
+			if h.manifests == nil {
+				// Unconfigured: verify as unavailable (503), never silently count.
+				return nil, domain.ErrManifestServiceUnavailable
+			}
+			c := checkedArtifact{artifact: a, counts: true}
+			switch err := h.manifests.VerifyManifest(ctx, tenantID, legalEntityID, a.ReferenceID, principalID); {
+			case err == nil:
+			case errors.Is(err, domain.ErrManifestNotFound):
+				c.counts, c.rejectReason = false, "referenced evidence manifest does not exist in evidence-manifest-svc"
+			case errors.Is(err, domain.ErrManifestMismatch):
+				c.counts, c.rejectReason = false, "referenced evidence manifest belongs to a different tenant or legal entity"
+			default:
+				return nil, err
+			}
+			seen[key] = c
+			out = append(out, c)
 			continue
 		}
-		// Supporting document: require reference_id
+
+		// SIGNATURE: verify against esignature-integration-svc
+		if a.EvidenceType == domain.EvidenceTypeSignature {
+			if key == "" {
+				out = append(out, checkedArtifact{artifact: a, counts: false, rejectReason: "empty reference_id for signature envelope"})
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			if h.esignatures == nil {
+				// Unconfigured: verify as unavailable (503), never silently count.
+				return nil, domain.ErrEnvelopeServiceUnavailable
+			}
+			c := checkedArtifact{artifact: a, counts: true}
+			switch err := h.esignatures.VerifyEnvelope(ctx, tenantID, legalEntityID, a.ReferenceID, principalID); {
+			case err == nil:
+			case errors.Is(err, domain.ErrEnvelopeNotFound):
+				c.counts, c.rejectReason = false, "referenced esignature envelope does not exist in esignature-integration-svc"
+			case errors.Is(err, domain.ErrEnvelopeMismatch):
+				c.counts, c.rejectReason = false, "referenced esignature envelope belongs to a different tenant or legal entity"
+			default:
+				return nil, err
+			}
+			seen[key] = c
+			out = append(out, c)
+			continue
+		}
+
+		// SUPPORTING_DOCUMENT: verify against document-vault-svc
+		if a.EvidenceType == domain.EvidenceTypeSupportingDocument {
+			if key == "" {
+				out = append(out, checkedArtifact{artifact: a, counts: false, rejectReason: "empty reference_id for supporting document"})
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			c := checkedArtifact{artifact: a, counts: true}
+			switch err := h.docs.VerifyDocument(ctx, tenantID, legalEntityID, a.ReferenceID, principalID); {
+			case err == nil:
+			case errors.Is(err, domain.ErrDocumentNotFound):
+				c.counts, c.rejectReason = false, "referenced document does not exist in document-vault-svc"
+			case errors.Is(err, domain.ErrDocumentMismatch):
+				c.counts, c.rejectReason = false, "referenced document belongs to a different tenant or legal entity"
+			default:
+				return nil, err
+			}
+			seen[key] = c
+			out = append(out, c)
+			continue
+		}
+
+		// Other evidence types: taken on caller's word in v1 (no owning service
+		// yet). Require non-empty reference_id to count.
 		if key == "" {
-			out = append(out, checkedArtifact{artifact: a, counts: false, rejectReason: "empty reference_id for supporting document"})
+			out = append(out, checkedArtifact{artifact: a, counts: false, rejectReason: "empty reference_id for non-verifiable artifact"})
 			continue
 		}
 		if _, ok := seen[key]; ok {
-			continue // the same document does not count again
+			continue
 		}
-
-		c := checkedArtifact{artifact: a, counts: true}
-		switch err := h.docs.VerifyDocument(ctx, tenantID, legalEntityID, a.ReferenceID, principalID); {
-		case err == nil:
-		case errors.Is(err, domain.ErrDocumentNotFound):
-			c.counts, c.rejectReason = false, "referenced document does not exist in document-vault-svc"
-		case errors.Is(err, domain.ErrDocumentMismatch):
-			c.counts, c.rejectReason = false, "referenced document belongs to a different tenant or legal entity"
-		default:
-			// Unreachable / unexpected response: cannot determine.
-			return nil, err
-		}
-		seen[key] = c
-		out = append(out, c)
+		out = append(out, checkedArtifact{artifact: a, counts: true})
+		seen[key] = checkedArtifact{artifact: a, counts: true}
 	}
 	return out, nil
 }

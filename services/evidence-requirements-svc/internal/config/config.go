@@ -37,6 +37,20 @@ type Config struct {
 	// context.md §11.2 for why this decision went the strict way).
 	DocumentVaultServiceURL string
 
+	// EvidenceManifestServiceURL is evidence-manifest-svc's base URL.
+	// Artifacts asserted with evidence_type EVIDENCE_MANIFEST are verified
+	// against the real Manifest record before they count as evidence.
+	// Required outside local/dev; unset locally means the type is verified
+	// as unavailable (503). It never silently counts.
+	EvidenceManifestServiceURL string
+
+	// EsignatureServiceURL is esignature-integration-svc's base URL.
+	// Artifacts asserted with evidence_type SIGNATURE are verified against
+	// the real Envelope record before they count as evidence.
+	// Required outside local/dev; unset locally means the type is verified
+	// as unavailable (503). It never silently counts.
+	EsignatureServiceURL string
+
 	// TenantRegistryURL is tenant-entity-registry-svc's base URL: the legal
 	// entity an evaluation or requirement names is confirmed there (exists,
 	// in the caller's tenant), fail-closed. Required outside local/dev.
@@ -103,15 +117,17 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "evidence-requirements-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.evidence-requirements.events"),
 		},
-		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
-		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
-		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
-		DocumentVaultServiceURL:  env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
-		TenantRegistryURL:        os.Getenv("TENANT_REGISTRY_URL"),
-		EvaluateAuthzMode:        strings.ToLower(env("EVIDENCE_EVALUATE_AUTHZ", "enforce")),
-		ReadAuthzMode:            strings.ToLower(env("EVIDENCE_READ_AUTHZ", "enforce")),
-		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		AuthZServiceURL:            env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:           env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:               env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL:   env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		DocumentVaultServiceURL:    env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		EvidenceManifestServiceURL: env("EVIDENCE_MANIFEST_SERVICE_URL", ""),
+		EsignatureServiceURL:       env("ESIGNATURE_SERVICE_URL", ""),
+		TenantRegistryURL:          os.Getenv("TENANT_REGISTRY_URL"),
+		EvaluateAuthzMode:          strings.ToLower(env("EVIDENCE_EVALUATE_AUTHZ", "enforce")),
+		ReadAuthzMode:              strings.ToLower(env("EVIDENCE_READ_AUTHZ", "enforce")),
+		OTELExporterEndpoint:       env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

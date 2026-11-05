@@ -142,6 +142,14 @@ type PresentArtifact struct {
 // in this service enumerates the permitted set.
 const EvidenceTypeSupportingDocument = "SUPPORTING_DOCUMENT"
 
+// EvidenceTypeEvidenceManifest references an evidence-manifest-svc manifest.
+// Verified against evidence-manifest-svc GET /v1/evidence-manifests/{id}.
+const EvidenceTypeEvidenceManifest = "EVIDENCE_MANIFEST"
+
+// EvidenceTypeSignature references an esignature-integration-svc envelope.
+// Verified against esignature-integration-svc GET /v1/esignature/envelopes/{id}.
+const EvidenceTypeSignature = "SIGNATURE"
+
 // EvaluateRequest is the body of POST /v1/evidence/evaluate.
 type EvaluateRequest struct {
 	LegalEntityID    string            `json:"legal_entity_id"`
@@ -272,6 +280,16 @@ var (
 	ErrDocumentNotFound           = errorString("referenced document not found")
 	ErrDocumentMismatch           = errorString("referenced document belongs to a different tenant or legal entity")
 	ErrDocumentServiceUnavailable = errorString("document-vault-svc unavailable")
+
+	// Evidence-manifest verification errors. Fail closed on all of them.
+	ErrManifestNotFound           = errorString("referenced evidence manifest not found")
+	ErrManifestMismatch           = errorString("referenced evidence manifest belongs to a different tenant or legal entity")
+	ErrManifestServiceUnavailable = errorString("evidence-manifest-svc unavailable")
+
+	// Esignature verification errors. Fail closed on all of them.
+	ErrEnvelopeNotFound           = errorString("referenced esignature envelope not found")
+	ErrEnvelopeMismatch           = errorString("referenced esignature envelope belongs to a different tenant or legal entity")
+	ErrEnvelopeServiceUnavailable = errorString("esignature-integration-svc unavailable")
 
 	// The legal entity is not held by tenant-entity-registry-svc in the
 	// caller's tenant, or the registry could not answer (fail-closed).

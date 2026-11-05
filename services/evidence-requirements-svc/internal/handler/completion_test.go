@@ -46,11 +46,31 @@ func (c *capturingStore) RecordEvaluation(ctx context.Context, e *domain.Evidenc
 	return c.stubStore.RecordEvaluation(ctx, e, ev)
 }
 
-func completionRouter(store handler.Store, az handler.AuthZClient, docs handler.DocumentVaultClient, reg handler.EntityChecker, evalMode, readMode handler.GateMode) http.Handler {
+type stubManifest struct {
+	err   error
+	calls int
+}
+
+func (m *stubManifest) VerifyManifest(_ context.Context, _, _, _, _ string) error {
+	m.calls++
+	return m.err
+}
+
+type stubEsignature struct {
+	err   error
+	calls int
+}
+
+func (e *stubEsignature) VerifyEnvelope(_ context.Context, _, _, _, _ string) error {
+	e.calls++
+	return e.err
+}
+
+func completionRouter(store handler.Store, az handler.AuthZClient, docs handler.DocumentVaultClient, manifests handler.ManifestClient, esignatures handler.EsignatureClient, reg handler.EntityChecker, evalMode, readMode handler.GateMode) http.Handler {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
-	handler.RegisterRoutes(r, handler.New(store, az, docs, zap.NewNop()).WithRegistry(reg).WithGateModes(evalMode, readMode))
+	handler.RegisterRoutes(r, handler.New(store, az, docs, zap.NewNop()).WithRegistry(reg).WithGateModes(evalMode, readMode).WithManifestClient(manifests).WithEsignatureClient(esignatures))
 	return r
 }
 
@@ -68,7 +88,7 @@ func problemOf(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 func TestEvaluate_IsAuthorizedAtTheEntity(t *testing.T) {
 	st := &stubStore{evalCreated: true}
 	az := &recordingAuthz{deny: map[string]error{"EVIDENCE_EVALUATE": domain.ErrAuthorizationDenied}}
-	h := completionRouter(st, az, &stubDocs{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
+	h := completionRouter(st, az, &stubDocs{}, &stubManifest{}, &stubEsignature{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 
 	rec := do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(), testTenant, testPrincipal)
 	assert.Equal(t, http.StatusForbidden, rec.Code)
@@ -78,7 +98,7 @@ func TestEvaluate_IsAuthorizedAtTheEntity(t *testing.T) {
 	assert.Empty(t, st.recordedEvals, "a refused evaluation must not write a governance record")
 
 	// warn mode: logged and admitted.
-	h = completionRouter(st, az, &stubDocs{}, stubRegistry{}, handler.GateWarn, handler.GateEnforce)
+	h = completionRouter(st, az, &stubDocs{}, &stubManifest{}, &stubEsignature{}, stubRegistry{}, handler.GateWarn, handler.GateEnforce)
 	rec = do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(), testTenant, testPrincipal)
 	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 }
@@ -92,7 +112,7 @@ func TestEvaluate_LegalEntityMustExistInTheTenant(t *testing.T) {
 		{domain.ErrRegistryUnavailable, http.StatusServiceUnavailable},
 	} {
 		st := &stubStore{evalCreated: true}
-		h := completionRouter(st, &recordingAuthz{}, &stubDocs{}, stubRegistry{err: tc.err}, handler.GateEnforce, handler.GateEnforce)
+		h := completionRouter(st, &recordingAuthz{}, &stubDocs{}, &stubManifest{}, &stubEsignature{}, stubRegistry{err: tc.err}, handler.GateEnforce, handler.GateEnforce)
 		rec := do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(), testTenant, testPrincipal)
 		assert.Equal(t, tc.code, rec.Code, rec.Body.String())
 		assert.Empty(t, st.recordedEvals)
@@ -104,7 +124,7 @@ func TestEvaluate_TheSameDocumentInAnotherCaseCountsOnce(t *testing.T) {
 		requirement(domain.EvidenceTypeSupportingDocument, domain.RequirementSpec{MinimumCount: 2}),
 	}}
 	docs := &stubDocs{}
-	h := completionRouter(st, &recordingAuthz{}, docs, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
+	h := completionRouter(st, &recordingAuthz{}, docs, &stubManifest{}, &stubEsignature{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 	const doc = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	rec := do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(
 		domain.PresentArtifact{EvidenceType: domain.EvidenceTypeSupportingDocument, ReferenceID: strings.ToUpper(doc)},
@@ -116,20 +136,24 @@ func TestEvaluate_TheSameDocumentInAnotherCaseCountsOnce(t *testing.T) {
 	assert.Equal(t, 1, docs.calls)
 
 	// Non-document references are canonicalised the same way.
-	st.effective = []domain.EvidenceRequirement{requirement("SIGNATURE", domain.RequirementSpec{MinimumCount: 2})}
+	st.effective = []domain.EvidenceRequirement{requirement(domain.EvidenceTypeSignature, domain.RequirementSpec{MinimumCount: 2})}
+	esig := &stubEsignature{}
+	h = completionRouter(st, &recordingAuthz{}, &stubDocs{}, &stubManifest{}, esig, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 	rec = do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(
-		domain.PresentArtifact{EvidenceType: "SIGNATURE", ReferenceID: "SIG-1"},
-		domain.PresentArtifact{EvidenceType: "SIGNATURE", ReferenceID: "sig-1"},
+		domain.PresentArtifact{EvidenceType: domain.EvidenceTypeSignature, ReferenceID: "SIG-1"},
+		domain.PresentArtifact{EvidenceType: domain.EvidenceTypeSignature, ReferenceID: "sig-1"},
 	), testTenant, testPrincipal)
 	assert.Equal(t, domain.OutcomeMissing, decodeEvaluate(t, rec).Outcome)
+	assert.Equal(t, 1, esig.calls)
 }
 
 func TestEvaluate_EventCarriesTheGoverningReferences(t *testing.T) {
 	inner := &stubStore{evalCreated: true, effective: []domain.EvidenceRequirement{
-		requirement("SIGNATURE", domain.RequirementSpec{MinimumCount: 1}),
+		requirement(domain.EvidenceTypeSignature, domain.RequirementSpec{MinimumCount: 1}),
 	}}
 	st := &capturingStore{stubStore: inner}
-	h := completionRouter(st, &recordingAuthz{}, &stubDocs{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
+	esig := &stubEsignature{}
+	h := completionRouter(st, &recordingAuthz{}, &stubDocs{}, &stubManifest{}, esig, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 	var buf bytes.Buffer
 	require.NoError(t, json.NewEncoder(&buf).Encode(evaluateBody(domain.PresentArtifact{EvidenceType: "SIGNATURE", ReferenceID: "sig-1"})))
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence/evaluate", &buf)
@@ -152,7 +176,7 @@ func TestEvaluate_EventCarriesTheGoverningReferences(t *testing.T) {
 func TestEvaluate_AVerifiedPeerWorkloadIsTheCaller(t *testing.T) {
 	st := &stubStore{evalCreated: true}
 	az := &recordingAuthz{}
-	h := completionRouter(st, az, &stubDocs{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
+	h := completionRouter(st, az, &stubDocs{}, &stubManifest{}, &stubEsignature{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 	var buf bytes.Buffer
 	require.NoError(t, json.NewEncoder(&buf).Encode(evaluateBody()))
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence/evaluate", &buf)
@@ -178,7 +202,7 @@ func TestEvaluate_AVerifiedPeerWorkloadIsTheCaller(t *testing.T) {
 func TestCreateRequirement_TenantWideIsAuthorizedAtPlatformScope(t *testing.T) {
 	st := &stubStore{created: true}
 	az := &recordingAuthz{}
-	h := completionRouter(st, az, &stubDocs{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
+	h := completionRouter(st, az, &stubDocs{}, &stubManifest{}, &stubEsignature{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 	body := map[string]any{"tenant_id": testTenant, "domain_code": "FINANCE", "action_type": "JOURNAL_POST",
 		"evidence_type": "SIGNATURE", "correlation_id": "c", "requirement_payload": map[string]any{"minimum_count": 1}}
 	rec := do(t, h, http.MethodPost, "/v1/admin/evidence-requirements", body, testTenant, testPrincipal)
@@ -197,7 +221,7 @@ func TestCreateRequirement_PayloadMustMatchTheRuleShape(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			st := &stubStore{created: true}
-			h := completionRouter(st, &recordingAuthz{}, &stubDocs{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
+			h := completionRouter(st, &recordingAuthz{}, &stubDocs{}, &stubManifest{}, &stubEsignature{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 			body := map[string]any{"tenant_id": testTenant, "domain_code": "FINANCE", "action_type": "JOURNAL_POST",
 				"evidence_type": "SIGNATURE", "correlation_id": "c", "requirement_payload": payload}
 			rec := do(t, h, http.MethodPost, "/v1/admin/evidence-requirements", body, testTenant, testPrincipal)
@@ -210,7 +234,7 @@ func TestReads_NeedAPrincipalAndAGrantAtTheEntity(t *testing.T) {
 	eval := &domain.EvidenceEvaluation{EvaluationID: "e-1", TenantID: testTenant, LegalEntityID: testEntity}
 	st := &stubStore{evaluation: eval}
 	az := &recordingAuthz{deny: map[string]error{"EVIDENCE_EVALUATION_READ": domain.ErrAuthorizationDenied}}
-	h := completionRouter(st, az, &stubDocs{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
+	h := completionRouter(st, az, &stubDocs{}, &stubManifest{}, &stubEsignature{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 
 	rec := do(t, h, http.MethodGet, "/v1/evidence/evaluations/e-1", nil, testTenant, "")
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
