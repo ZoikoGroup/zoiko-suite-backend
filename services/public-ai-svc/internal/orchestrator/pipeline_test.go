@@ -388,3 +388,14 @@ func TestSessionCapIsNotAnOutage(t *testing.T) {
 		t.Fatalf("got %s %q", r.Status, r.Text)
 	}
 }
+
+// Doc 03 §2, KB-004: a regional tax, payroll or legal question for a market
+// with no signed MARKET_AVAILABILITY claim is not answered as covered, even
+// when a page is tagged with that market.
+func TestRegionalCoverageNeedsMarketClaim(t *testing.T) {
+	e := newEnv(t)
+	r := ask(e, "Do you handle VAT filing in Ireland?", "IE")
+	if r.Status == contract.Answered {
+		t.Fatalf("IE has no market claim, yet answered: %q", r.Text)
+	}
+}

@@ -209,6 +209,8 @@ func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now ti
 		RedactionPolicy: "public-only-v1", AllowedHosts: cfg.AllowedHosts, Routes: validRoutes(cfg),
 		Sources: []Source{}, Chunks: []Chunk{}, Synonyms: screenSynonyms(cfg.Synonyms), Synthetic: cfg.Synthetic,
 		CompatiblePolicyVersions: cfg.CompatiblePolicyVersions,
+		// Doc 03 §11: the public assistant serves one product to one audience.
+		ProductID: "zoikosuite", Audience: Audience,
 	}
 	caps := map[string]bool{}
 	for _, c := range cfg.CapabilityIDs {

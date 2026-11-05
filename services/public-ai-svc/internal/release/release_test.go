@@ -358,3 +358,19 @@ func TestIncompatibleReleaseRefusedAtLoad(t *testing.T) {
 		t.Fatalf("release without a range outside dev/test: got %v", err)
 	}
 }
+
+// Doc 03 §11: a KB release names its product, audience and signing time.
+func TestKBReleaseIdentityFields(t *testing.T) {
+	_, key, _ := signing.GenerateKey()
+	body, _, _, err := BuildKB(filepath.Join(fixtures, "kb"), "kb-identity-1", now, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m knowledge.Manifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.ProductID != "zoikosuite" || m.Audience != knowledge.Audience || !m.SignedAt.Equal(now) {
+		t.Fatalf("identity: product=%q audience=%q signed=%v", m.ProductID, m.Audience, m.SignedAt)
+	}
+}

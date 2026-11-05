@@ -211,4 +211,10 @@ type Manifest struct {
 	// CompatiblePolicyVersions lists the prompt/policy versions this release
 	// was evaluated with (Doc 08 OPR-004); the runtime refuses any other.
 	CompatiblePolicyVersions []string `json:"compatible_policy_versions,omitempty"`
+	// Doc 03 §11 release identity: the product and audience the release is
+	// for, and when it was signed. Optional on load, so releases published
+	// before these fields still verify.
+	ProductID string    `json:"product_id,omitempty"`
+	Audience  string    `json:"audience,omitempty"`
+	SignedAt  time.Time `json:"signed_at,omitempty"`
 }

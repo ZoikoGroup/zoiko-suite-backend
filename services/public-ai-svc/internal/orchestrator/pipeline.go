@@ -495,7 +495,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			res.Diag = diag
 			return res
 		}
-		if t, ok := policy.BoundaryTemplates[intent]; ok && !anyTagged(r.Hits, intent) && r.Answerability != knowledge.Revoked {
+		// I25 (availability "today", roadmap, release dates) is a status
+		// question: without a signed feature-release claim it always gets
+		// Doc 02 T18, never an article that describes the capability (S02).
+		if t, ok := policy.BoundaryTemplates[intent]; ok && (intent == "I25" || !anyTagged(r.Hits, intent)) && r.Answerability != knowledge.Revoked {
 			res := p.fromTemplate(t, intent, snap, market, now, releaseID)
 			res.Diag = diag
 			return res
@@ -508,7 +511,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				return p.fromTemplate(policy.TplOutOfScope, intent, snap, market, now, releaseID)
 			}
 			hits = withNeighbor(snap.KB, r.Hits, kq, snap)
-			if regionalIntents[intent] && market != "" && !hasMarketEvidence(hits, market) {
+			// Doc 03 §2, KB-004: a page tagged with a country is not proof that
+			// the country is covered; a signed MARKET_AVAILABILITY claim is.
+			if regionalIntents[intent] && market != "" && (!hasMarketEvidence(hits, market) ||
+				!snap.Claims.HasVerified(claims.MarketAvailability, market, now, snap)) {
 				// G12/G13: a named country needs country-specific evidence; never assume coverage.
 				return regionalCoverage(p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID))
 			}

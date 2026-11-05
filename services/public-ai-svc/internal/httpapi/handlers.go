@@ -258,7 +258,19 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 			pending = &pd
 		}
 	}
-	res := s.deps.Answerer.Answer(runCtx, orchestrator.Input{
+	// Doc 05 §12: the visitor's Stop (the request is cancelled) cancels the
+	// model call. Only the answer is cancelled: the turn is still committed
+	// on runCtx, so the slot is released and nothing is left half-done.
+	answerCtx, stopAnswer := context.WithCancel(runCtx)
+	defer stopAnswer()
+	go func() {
+		select {
+		case <-ctx.Done():
+			stopAnswer()
+		case <-answerCtx.Done():
+		}
+	}()
+	res := s.deps.Answerer.Answer(answerCtx, orchestrator.Input{
 		RequestID: rid, SessionID: sess.SessionID, TurnID: turnID, Message: req.Message, Pending: pending,
 		Locale: firstNonEmpty(req.Locale, sess.Locale), MarketCode: firstNonEmpty(req.MarketCode, sess.MarketCode),
 		PageContext:   firstNonEmpty(req.PageContext, sess.PageContext),
