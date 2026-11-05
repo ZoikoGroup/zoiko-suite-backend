@@ -155,4 +155,3 @@ func TestCommittedFrontendReferences(t *testing.T) {
 		}
 	}
 }
-

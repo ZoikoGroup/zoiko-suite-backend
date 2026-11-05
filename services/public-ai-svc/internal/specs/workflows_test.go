@@ -39,4 +39,3 @@ func TestWorkflowsArePinned(t *testing.T) {
 		}
 	}
 }
-

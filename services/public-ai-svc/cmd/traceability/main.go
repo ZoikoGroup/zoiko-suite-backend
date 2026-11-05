@@ -3,12 +3,12 @@
 // mapped to Go tests has one that failed or did not run. A skipped test is
 // reported and fails only with -fail-on-skip.
 //
-// It also keeps the matrix honest:
-//   - every row whose status is not Built is listed as OPEN, so a Blocked or
-//     Partial P0 row is never reported as passing (-fail-on-open makes it fatal);
-//   - a Built row with no Go test and no checkable frontend reference fails;
-//   - with -frontend, each frontend reference (frontend:<path> "<test title>")
-//     must name an existing file that contains that test title.
+// It also keeps the matrix honest. Every row whose status is not Built is
+// listed as OPEN, so a Blocked or Partial P0 row is never reported as passing
+// (-fail-on-open makes it fatal). A Built row with no Go test and no checkable
+// frontend reference fails. With -frontend, each frontend reference
+// (frontend:<path> "<test title>") must name an existing file that contains
+// that test title.
 //
 //	go test -json ./... > test.json
 //	go run ./cmd/traceability -csv ../../docs/suivo/sec-t-traceability.csv -json test.json [-frontend <frontend repo>]
