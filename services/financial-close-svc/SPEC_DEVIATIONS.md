@@ -56,6 +56,14 @@ with `TEST_DATABASE_URL` pointed at a real, disposable Postgres instance so
 it could not silently skip; the full `internal/store` `-tags=integration`
 suite was re-run the same way afterward.
 
+Update (2026-11-05, ACC-06 governance pass): narrows A1. The exception
+lifecycle, certification/rejection, maker-checker and the three missing
+queries are implemented by migration 000025; the asynchronous
+Planned/Running/Reperformed state model remains open. The plain and
+integration-tagged suites were re-run against a fresh embedded Postgres 16
+(migrations 000001–000025 applied from empty); every package passed and the
+store integration tests ran rather than skipping.
+
 ## Verified controls
 
 Checked against code and schema, not comments:
@@ -109,7 +117,7 @@ Checked against code and schema, not comments:
 
 ## A. Not implemented, weaker than the spec, or still open
 
-### A1. ACC-06 has no control-run lifecycle, certification or maker-checker
+### A1. ACC-06 has no control-run lifecycle, certification or maker-checker — partially closed 2026-11-05
 
 §9 requires:
 
@@ -152,6 +160,33 @@ On the two questions this survey was asked:
 Building the ACC-06 lifecycle (with financial-control-svc's
 exception/certification model as the obvious reference) is the largest open
 item in this register.
+
+**Update (2026-11-05, ACC-06 governance pass).** The exception, certification,
+maker-checker and query gaps are closed; the asynchronous state model is not.
+
+- Migration 000025 adds `control_exceptions` (one companion row per run,
+  OPEN → ASSIGNED → RESOLVED, resolution note mandatory) and the
+  certification columns on `subledger_control_runs` (`CERTIFIED`/`FAILED`,
+  certifier, timestamp and note). The run's own finding stays append-only:
+  the 000004 trigger now permits only certification-column updates, and still
+  refuses finding changes and deletes.
+- `AssignException`, `RecordResolution`, `CertifyControl` and `RejectControl`
+  are implemented. Certification refuses the run's author and the exception's
+  resolver (maker-checker), refuses `CERTIFIED` while its exception is
+  unresolved, and refuses a second certification. `FAILED` is the explicit
+  reject path and is allowed without resolving the exception.
+- `ListOpenExceptions`, `GetCloseBlockingControls` and `ExplainVariance` are
+  implemented. The blocking query and close readiness share one
+  classification, so they cannot disagree about whether a run blocks.
+- `RemoveCloseRequirement` now refuses (422
+  `control_has_unresolved_exception`) to remove a `SUBLEDGER_CONTROL`
+  requirement whose latest run carries an OPEN/ASSIGNED exception, closing
+  finding 2 above. The AR/AP baseline remains unremovable, and
+  `SUBLEDGER_CONTROL_GATE_MODE=off` still exists (finding 3).
+- Still open: `StartControlRun`/`ReperformControl` and the full
+  Planned/Running/Reperformed state model are not implemented; re-running a
+  control appends a new run rather than transitioning a planned one. A2
+  (period/cutoff population assertion) is unchanged.
 
 ### A2. ACC-06 compares live subledger totals to a period balance, with no population assertion
 

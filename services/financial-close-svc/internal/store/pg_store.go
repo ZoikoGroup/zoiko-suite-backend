@@ -534,9 +534,40 @@ func (s *PgStore) CreateControlRun(ctx context.Context, run *domain.SubledgerCon
 			}); err != nil {
 				return err
 			}
+			// ACC-06 governance (migration 000025): a run that lands
+			// EXCEPTION gets its own resolution-workflow companion row,
+			// OPEN until AssignException/RecordResolution move it.
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO control_exceptions (
+					control_exception_id, tenant_id, control_run_id, legal_entity_id,
+					fiscal_period, subledger, book_id, status, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, $9)
+			`, uuid.NewString(), tenantID, run.ControlRunID, run.LegalEntityID,
+				run.FiscalPeriod, run.Subledger, run.BookID, domain.ControlExceptionStatusOpen, run.RunAt); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
+}
+
+const subledgerControlRunColumns = `
+	control_run_id, tenant_id, legal_entity_id, fiscal_period, subledger,
+	control_account_code, subledger_total_amount, gl_control_balance_amount,
+	difference_amount, status, run_at, run_by_principal_id, COALESCE(book_id, ''),
+	certification_status, certified_at, certified_by_principal_id, COALESCE(certification_note, '')`
+
+func scanSubledgerControlRun(row pgx.Row) (*domain.SubledgerControlRun, error) {
+	var run domain.SubledgerControlRun
+	if err := row.Scan(
+		&run.ControlRunID, &run.TenantID, &run.LegalEntityID, &run.FiscalPeriod, &run.Subledger,
+		&run.ControlAccountCode, &run.SubledgerTotalAmount, &run.GLControlBalanceAmount,
+		&run.DifferenceAmount, &run.Status, &run.RunAt, &run.RunByPrincipalID, &run.BookID,
+		&run.CertificationStatus, &run.CertifiedAt, &run.CertifiedByPrincipalID, &run.CertificationNote,
+	); err != nil {
+		return nil, err
+	}
+	return &run, nil
 }
 
 func (s *PgStore) ListControlRuns(ctx context.Context, legalEntityID, fiscalPeriod string) ([]domain.SubledgerControlRun, error) {
@@ -548,9 +579,7 @@ func (s *PgStore) ListControlRuns(ctx context.Context, legalEntityID, fiscalPeri
 	var out []domain.SubledgerControlRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT control_run_id, tenant_id, legal_entity_id, fiscal_period, subledger,
-			       control_account_code, subledger_total_amount, gl_control_balance_amount,
-			       difference_amount, status, run_at, run_by_principal_id, COALESCE(book_id, '')
+			SELECT `+subledgerControlRunColumns+`
 			FROM subledger_control_runs
 			WHERE tenant_id = $1 AND legal_entity_id = $2 AND fiscal_period = $3
 			ORDER BY run_at DESC
@@ -560,17 +589,378 @@ func (s *PgStore) ListControlRuns(ctx context.Context, legalEntityID, fiscalPeri
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var run domain.SubledgerControlRun
-			if err := rows.Scan(
-				&run.ControlRunID, &run.TenantID, &run.LegalEntityID, &run.FiscalPeriod, &run.Subledger,
-				&run.ControlAccountCode, &run.SubledgerTotalAmount, &run.GLControlBalanceAmount,
-				&run.DifferenceAmount, &run.Status, &run.RunAt, &run.RunByPrincipalID, &run.BookID,
-			); err != nil {
+			run, err := scanSubledgerControlRun(rows)
+			if err != nil {
 				return err
 			}
-			out = append(out, run)
+			out = append(out, *run)
 		}
 		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetControlRun fetches one run by id — ACC-06's own GetControlRun query.
+func (s *PgStore) GetControlRun(ctx context.Context, controlRunID string) (*domain.SubledgerControlRun, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var run *domain.SubledgerControlRun
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		run, err = scanSubledgerControlRun(tx.QueryRow(ctx, `
+			SELECT `+subledgerControlRunColumns+`
+			FROM subledger_control_runs WHERE tenant_id = $1 AND control_run_id = $2
+		`, tenantID, controlRunID))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNoControlRunForScope
+	}
+	if err != nil {
+		return nil, err
+	}
+	return run, nil
+}
+
+// GetLatestControlRun answers "what is the most recent finding for this
+// control" — the same scope GetCloseBlockingControls and the close-readiness
+// check already use (legal entity, subledger, book). An empty fiscalPeriod
+// means "any period", which is what the entity-wide blocking-controls read
+// needs; a non-empty one narrows to that period's own run.
+func (s *PgStore) GetLatestControlRun(ctx context.Context, legalEntityID, fiscalPeriod, subledger, bookID string) (*domain.SubledgerControlRun, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var run *domain.SubledgerControlRun
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		run, err = scanSubledgerControlRun(tx.QueryRow(ctx, `
+			SELECT `+subledgerControlRunColumns+`
+			FROM subledger_control_runs
+			WHERE tenant_id = $1 AND legal_entity_id = $2
+			  AND ($3 = '' OR fiscal_period = $3) AND subledger = $4
+			  AND COALESCE(book_id, '') = $5
+			ORDER BY run_at DESC, control_run_id DESC
+			LIMIT 1
+		`, tenantID, legalEntityID, fiscalPeriod, subledger, bookID))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNoControlRunForScope
+	}
+	if err != nil {
+		return nil, err
+	}
+	return run, nil
+}
+
+const controlExceptionColumns = `
+	control_exception_id, tenant_id, control_run_id, legal_entity_id, fiscal_period,
+	subledger, COALESCE(book_id, ''), status,
+	COALESCE(assigned_to_principal_id, ''), assigned_at,
+	COALESCE(resolution_note, ''), resolved_at, COALESCE(resolved_by_principal_id, ''), created_at`
+
+func scanControlException(row pgx.Row) (*domain.ControlException, error) {
+	var e domain.ControlException
+	if err := row.Scan(
+		&e.ControlExceptionID, &e.TenantID, &e.ControlRunID, &e.LegalEntityID, &e.FiscalPeriod,
+		&e.Subledger, &e.BookID, &e.Status,
+		&e.AssignedToPrincipalID, &e.AssignedAt,
+		&e.ResolutionNote, &e.ResolvedAt, &e.ResolvedByPrincipalID, &e.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+func (s *PgStore) GetControlException(ctx context.Context, controlExceptionID string) (*domain.ControlException, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var e *domain.ControlException
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		e, err = scanControlException(tx.QueryRow(ctx, `
+			SELECT `+controlExceptionColumns+` FROM control_exceptions
+			WHERE tenant_id = $1 AND control_exception_id = $2
+		`, tenantID, controlExceptionID))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrControlExceptionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+func (s *PgStore) GetControlExceptionByRun(ctx context.Context, controlRunID string) (*domain.ControlException, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var e *domain.ControlException
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		e, err = scanControlException(tx.QueryRow(ctx, `
+			SELECT `+controlExceptionColumns+` FROM control_exceptions
+			WHERE tenant_id = $1 AND control_run_id = $2
+		`, tenantID, controlRunID))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrControlExceptionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// AssignException advances OPEN/ASSIGNED -> ASSIGNED, giving the exception a
+// real owner — ACC-06's own "no resolution, owner or approval is recorded"
+// gap. Reassignable (OPEN or already-ASSIGNED), never from RESOLVED.
+func (s *PgStore) AssignException(ctx context.Context, controlExceptionID, assignedToPrincipalID, actorID, correlationID string) (*domain.ControlException, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.ControlException
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		e, err := scanControlException(tx.QueryRow(ctx, `
+			SELECT `+controlExceptionColumns+` FROM control_exceptions
+			WHERE tenant_id = $1 AND control_exception_id = $2 FOR UPDATE
+		`, tenantID, controlExceptionID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrControlExceptionNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if e.Status == domain.ControlExceptionStatusResolved {
+			return domain.ErrControlExceptionNotOpenOrAssigned
+		}
+		now := time.Now().UTC()
+		if _, err := tx.Exec(ctx, `
+			UPDATE control_exceptions
+			SET status = $1, assigned_to_principal_id = $2, assigned_at = $3
+			WHERE tenant_id = $4 AND control_exception_id = $5
+		`, domain.ControlExceptionStatusAssigned, assignedToPrincipalID, now, tenantID, controlExceptionID); err != nil {
+			return err
+		}
+		e.Status = domain.ControlExceptionStatusAssigned
+		e.AssignedToPrincipalID = assignedToPrincipalID
+		e.AssignedAt = &now
+		out = e
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RecordResolution advances OPEN/ASSIGNED -> RESOLVED with a mandatory
+// note — the real resolution, owner and approval evidence ACC-06 requires
+// instead of "resolved by re-running until it matches."
+func (s *PgStore) RecordResolution(ctx context.Context, controlExceptionID, resolutionNote, actorID, correlationID string) (*domain.ControlException, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	// Mandatory evidence, not an optional comment: a resolution without a
+	// note is the same unsupported "it's fixed" the old re-run-until-match
+	// workflow produced. The handler trims first; this is the store's own
+	// guard for every other caller.
+	if strings.TrimSpace(resolutionNote) == "" {
+		return nil, domain.ErrResolutionNoteRequired
+	}
+	var out *domain.ControlException
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		e, err := scanControlException(tx.QueryRow(ctx, `
+			SELECT `+controlExceptionColumns+` FROM control_exceptions
+			WHERE tenant_id = $1 AND control_exception_id = $2 FOR UPDATE
+		`, tenantID, controlExceptionID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrControlExceptionNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if e.Status == domain.ControlExceptionStatusResolved {
+			return domain.ErrControlExceptionNotOpenOrAssigned
+		}
+		now := time.Now().UTC()
+		if _, err := tx.Exec(ctx, `
+			UPDATE control_exceptions
+			SET status = $1, resolution_note = $2, resolved_at = $3, resolved_by_principal_id = $4
+			WHERE tenant_id = $5 AND control_exception_id = $6
+		`, domain.ControlExceptionStatusResolved, resolutionNote, now, actorID, tenantID, controlExceptionID); err != nil {
+			return err
+		}
+		e.Status = domain.ControlExceptionStatusResolved
+		e.ResolutionNote = resolutionNote
+		e.ResolvedAt = &now
+		e.ResolvedByPrincipalID = actorID
+		out = e
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListOpenExceptions answers ACC-06's own ListOpenExceptions query: every
+// OPEN or ASSIGNED exception for a legal entity, newest first.
+func (s *PgStore) ListOpenExceptions(ctx context.Context, legalEntityID string) ([]domain.ControlException, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.ControlException
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+controlExceptionColumns+` FROM control_exceptions
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND status IN ($3, $4)
+			ORDER BY created_at DESC
+		`, tenantID, legalEntityID, domain.ControlExceptionStatusOpen, domain.ControlExceptionStatusAssigned)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			e, err := scanControlException(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// HasUnresolvedException is ACC-06's own negative-path guard, "Certify with
+// unresolved material break," reused by RemoveCloseRequirement: a
+// checklist-added SUBLEDGER_CONTROL requirement may not be removed while its
+// latest run carries an OPEN or ASSIGNED exception (closing the doc's own
+// "a close-adjacent role waiving an unresolved mandatory break" finding).
+func (s *PgStore) HasUnresolvedException(ctx context.Context, legalEntityID, subledger, bookID string) (bool, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return false, domain.ErrIdentityMissing
+	}
+	var exists bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// control_exceptions holds tenant_id/legal_entity_id as UUID while
+		// subledger_control_runs holds them as VARCHAR (their original
+		// shapes). One parameter used against both must be cast explicitly,
+		// or Postgres infers UUID for the first use and then refuses
+		// "character varying = uuid" in the subquery.
+		return tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM control_exceptions ce
+				WHERE ce.tenant_id = $1::uuid AND ce.legal_entity_id = $2::uuid AND ce.subledger = $3
+				  AND COALESCE(ce.book_id, '') = $4
+				  AND ce.status IN ($5, $6)
+				  AND ce.control_run_id = (
+					SELECT control_run_id FROM subledger_control_runs
+					WHERE tenant_id = ($1::uuid)::text AND legal_entity_id = ($2::uuid)::text AND subledger = $3 AND COALESCE(book_id, '') = $4
+					ORDER BY run_at DESC, control_run_id DESC LIMIT 1
+				  )
+			)
+		`, tenantID, legalEntityID, subledger, bookID, domain.ControlExceptionStatusOpen, domain.ControlExceptionStatusAssigned).Scan(&exists)
+	})
+	return exists, err
+}
+
+// CertifyControlRun advances a control run to CERTIFIED or FAILED
+// (certificationStatus is the caller's choice: CertifyControl passes
+// CERTIFIED, RejectControl passes FAILED). Requires no OPEN/ASSIGNED
+// exception on this exact run, and maker-checker: principalID must differ
+// from who ran it and from who resolved its exception, if any.
+func (s *PgStore) CertifyControlRun(ctx context.Context, controlRunID, certificationStatus, note, principalID, actorID, correlationID string) (*domain.SubledgerControlRun, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.SubledgerControlRun
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		run, err := scanSubledgerControlRun(tx.QueryRow(ctx, `
+			SELECT `+subledgerControlRunColumns+` FROM subledger_control_runs
+			WHERE tenant_id = $1 AND control_run_id = $2 FOR UPDATE
+		`, tenantID, controlRunID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNoControlRunForScope
+		}
+		if err != nil {
+			return err
+		}
+		if run.CertificationStatus != nil {
+			return domain.ErrControlAlreadyCertified
+		}
+		if run.RunByPrincipalID == principalID {
+			return domain.ErrControlSelfCertification
+		}
+		if run.Status == "EXCEPTION" {
+			exc, eerr := scanControlException(tx.QueryRow(ctx, `
+				SELECT `+controlExceptionColumns+` FROM control_exceptions
+				WHERE tenant_id = $1 AND control_run_id = $2
+			`, tenantID, controlRunID))
+			if eerr != nil && !errors.Is(eerr, pgx.ErrNoRows) {
+				return eerr
+			}
+			if exc != nil {
+				if exc.Status != domain.ControlExceptionStatusResolved && certificationStatus == domain.ControlCertificationCertified {
+					return domain.ErrControlHasUnresolvedException
+				}
+				if exc.ResolvedByPrincipalID == principalID {
+					return domain.ErrControlSelfCertification
+				}
+			}
+		}
+		now := time.Now().UTC()
+		if _, err := tx.Exec(ctx, `
+			UPDATE subledger_control_runs
+			SET certification_status = $1, certified_at = $2, certified_by_principal_id = $3, certification_note = NULLIF($4, '')
+			WHERE tenant_id = $5 AND control_run_id = $6
+		`, certificationStatus, now, principalID, note, tenantID, controlRunID); err != nil {
+			return err
+		}
+		fact, legacyType := "control-certified", "control.certified"
+		if certificationStatus == domain.ControlCertificationFailed {
+			fact, legacyType = "control-failed", "control.failed"
+		}
+		if err := s.enqueuePeriodEvent(ctx, tx, fact, legacyType, tenantID, run.LegalEntityID, controlRunID, actorID, correlationID, map[string]any{
+			"control_run_id":            controlRunID,
+			"legal_entity_id":           run.LegalEntityID,
+			"fiscal_period":             run.FiscalPeriod,
+			"subledger":                 run.Subledger,
+			"certification_status":      certificationStatus,
+			"certified_by_principal_id": principalID,
+			"timestamp":                 now,
+		}); err != nil {
+			return err
+		}
+		certStatus := certificationStatus
+		run.CertificationStatus = &certStatus
+		run.CertifiedAt = &now
+		run.CertifiedByPrincipalID = &principalID
+		run.CertificationNote = note
+		out = run
+		return nil
 	})
 	if err != nil {
 		return nil, err

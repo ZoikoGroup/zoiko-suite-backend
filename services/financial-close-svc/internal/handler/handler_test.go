@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +37,7 @@ type stubStore struct {
 	reopenRequests []*domain.ReopenRequest
 
 	controlRuns         []domain.SubledgerControlRun
+	controlExceptions   map[string]*domain.ControlException // control_exception_id -> row
 	closeRequirements   []*domain.CloseRequirement
 	listRequirementsErr error
 	createRunErr        error
@@ -134,6 +136,7 @@ func (s *stubStore) recordClaim(key, command, hash, id string) {
 func newStubStore() *stubStore {
 	return &stubStore{
 		periods:                make(map[string]*domain.FiscalPeriod),
+		controlExceptions:      make(map[string]*domain.ControlException),
 		schedules:              make(map[string]*domain.AccrualSchedule),
 		recognitions:           make(map[string][]domain.RecognitionInstance),
 		prepaymentSchedules:    make(map[string]*domain.PrepaymentSchedule),
@@ -421,11 +424,48 @@ func (s *stubStore) RemoveCloseRequirement(_ context.Context, id, principalID, r
 	return nil, domain.ErrCloseRequirementNotFound
 }
 
+func cloneControlException(e *domain.ControlException) *domain.ControlException {
+	cp := *e
+	return &cp
+}
+
+func (s *stubStore) findControlRun(id string) *domain.SubledgerControlRun {
+	for i := range s.controlRuns {
+		if s.controlRuns[i].ControlRunID == id {
+			return &s.controlRuns[i]
+		}
+	}
+	return nil
+}
+
+func (s *stubStore) findControlException(id string) *domain.ControlException {
+	if s.controlExceptions == nil {
+		s.controlExceptions = make(map[string]*domain.ControlException)
+	}
+	return s.controlExceptions[id]
+}
+
 func (s *stubStore) CreateControlRun(_ context.Context, run *domain.SubledgerControlRun, correlationID, actorID string) error {
 	if s.createRunErr != nil {
 		return s.createRunErr
 	}
 	s.controlRuns = append(s.controlRuns, *run)
+	// Mirror the real store's transaction: a run that lands EXCEPTION gets
+	// exactly one OPEN resolution-workflow row.
+	if run.Status == "EXCEPTION" {
+		exc := &domain.ControlException{
+			ControlExceptionID: uuid.NewString(),
+			TenantID:           run.TenantID,
+			ControlRunID:       run.ControlRunID,
+			LegalEntityID:      run.LegalEntityID,
+			FiscalPeriod:       run.FiscalPeriod,
+			Subledger:          run.Subledger,
+			BookID:             run.BookID,
+			Status:             domain.ControlExceptionStatusOpen,
+			CreatedAt:          run.RunAt,
+		}
+		s.controlExceptions[exc.ControlExceptionID] = exc
+	}
 	return nil
 }
 
@@ -440,6 +480,154 @@ func (s *stubStore) ListControlRuns(_ context.Context, legalEntityID, fiscalPeri
 		}
 	}
 	return out, nil
+}
+
+func (s *stubStore) GetControlRun(_ context.Context, controlRunID string) (*domain.SubledgerControlRun, error) {
+	run := s.findControlRun(controlRunID)
+	if run == nil {
+		return nil, domain.ErrNoControlRunForScope
+	}
+	cp := *run
+	return &cp, nil
+}
+
+func (s *stubStore) GetLatestControlRun(_ context.Context, legalEntityID, fiscalPeriod, subledger, bookID string) (*domain.SubledgerControlRun, error) {
+	var latest *domain.SubledgerControlRun
+	for i := range s.controlRuns {
+		run := &s.controlRuns[i]
+		if run.LegalEntityID != legalEntityID || run.Subledger != subledger || run.BookID != bookID {
+			continue
+		}
+		if fiscalPeriod != "" && run.FiscalPeriod != fiscalPeriod {
+			continue
+		}
+		if latest == nil || run.RunAt.After(latest.RunAt) ||
+			(run.RunAt.Equal(latest.RunAt) && run.ControlRunID > latest.ControlRunID) {
+			latest = run
+		}
+	}
+	if latest == nil {
+		return nil, domain.ErrNoControlRunForScope
+	}
+	cp := *latest
+	return &cp, nil
+}
+
+func (s *stubStore) GetControlException(_ context.Context, controlExceptionID string) (*domain.ControlException, error) {
+	exc := s.findControlException(controlExceptionID)
+	if exc == nil {
+		return nil, domain.ErrControlExceptionNotFound
+	}
+	return cloneControlException(exc), nil
+}
+
+func (s *stubStore) GetControlExceptionByRun(_ context.Context, controlRunID string) (*domain.ControlException, error) {
+	for _, exc := range s.controlExceptions {
+		if exc.ControlRunID == controlRunID {
+			return cloneControlException(exc), nil
+		}
+	}
+	return nil, domain.ErrControlExceptionNotFound
+}
+
+func (s *stubStore) AssignException(_ context.Context, controlExceptionID, assignedToPrincipalID, actorID, correlationID string) (*domain.ControlException, error) {
+	exc := s.findControlException(controlExceptionID)
+	if exc == nil {
+		return nil, domain.ErrControlExceptionNotFound
+	}
+	if exc.Status == domain.ControlExceptionStatusResolved {
+		return nil, domain.ErrControlExceptionNotOpenOrAssigned
+	}
+	now := time.Now().UTC()
+	exc.Status = domain.ControlExceptionStatusAssigned
+	exc.AssignedToPrincipalID = assignedToPrincipalID
+	exc.AssignedAt = &now
+	return cloneControlException(exc), nil
+}
+
+func (s *stubStore) RecordResolution(_ context.Context, controlExceptionID, resolutionNote, actorID, correlationID string) (*domain.ControlException, error) {
+	if strings.TrimSpace(resolutionNote) == "" {
+		return nil, domain.ErrResolutionNoteRequired
+	}
+	exc := s.findControlException(controlExceptionID)
+	if exc == nil {
+		return nil, domain.ErrControlExceptionNotFound
+	}
+	if exc.Status == domain.ControlExceptionStatusResolved {
+		return nil, domain.ErrControlExceptionNotOpenOrAssigned
+	}
+	now := time.Now().UTC()
+	exc.Status = domain.ControlExceptionStatusResolved
+	exc.ResolutionNote = resolutionNote
+	exc.ResolvedAt = &now
+	exc.ResolvedByPrincipalID = actorID
+	return cloneControlException(exc), nil
+}
+
+func (s *stubStore) ListOpenExceptions(_ context.Context, legalEntityID string) ([]domain.ControlException, error) {
+	var out []domain.ControlException
+	for _, exc := range s.controlExceptions {
+		if exc.LegalEntityID == legalEntityID &&
+			(exc.Status == domain.ControlExceptionStatusOpen || exc.Status == domain.ControlExceptionStatusAssigned) {
+			out = append(out, *exc)
+		}
+	}
+	return out, nil
+}
+
+// HasUnresolvedException mirrors the real query: only the LATEST run for the
+// (legal entity, subledger, book) pair counts, across every period. An old
+// EXCEPTION superseded by a later MATCHED run does not block forever.
+func (s *stubStore) HasUnresolvedException(_ context.Context, legalEntityID, subledger, bookID string) (bool, error) {
+	latest, err := s.GetLatestControlRun(context.Background(), legalEntityID, "", subledger, bookID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNoControlRunForScope) {
+			return false, nil
+		}
+		return false, err
+	}
+	if latest.Status != "EXCEPTION" {
+		return false, nil
+	}
+	exc, err := s.GetControlExceptionByRun(context.Background(), latest.ControlRunID)
+	if err != nil {
+		return false, nil
+	}
+	return exc.Status == domain.ControlExceptionStatusOpen || exc.Status == domain.ControlExceptionStatusAssigned, nil
+}
+
+func (s *stubStore) CertifyControlRun(_ context.Context, controlRunID, certificationStatus, note, principalID, actorID, correlationID string) (*domain.SubledgerControlRun, error) {
+	run := s.findControlRun(controlRunID)
+	if run == nil {
+		return nil, domain.ErrNoControlRunForScope
+	}
+	if run.CertificationStatus != nil {
+		return nil, domain.ErrControlAlreadyCertified
+	}
+	if run.RunByPrincipalID == principalID {
+		return nil, domain.ErrControlSelfCertification
+	}
+	if run.Status == "EXCEPTION" {
+		exc, err := s.GetControlExceptionByRun(context.Background(), controlRunID)
+		if err == nil {
+			if exc.Status != domain.ControlExceptionStatusResolved && certificationStatus == domain.ControlCertificationCertified {
+				return nil, domain.ErrControlHasUnresolvedException
+			}
+			if exc.ResolvedByPrincipalID == principalID {
+				return nil, domain.ErrControlSelfCertification
+			}
+		} else if !errors.Is(err, domain.ErrControlExceptionNotFound) {
+			return nil, err
+		}
+	}
+	now := time.Now().UTC()
+	status := certificationStatus
+	run.CertificationStatus = &status
+	run.CertifiedAt = &now
+	run.CertifiedByPrincipalID = &principalID
+	run.CertificationNote = note
+	cp := *run
+	return &cp, nil
 }
 
 func (s *stubStore) CreateAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, key, hash string) (bool, error) {
