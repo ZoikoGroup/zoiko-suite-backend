@@ -89,6 +89,13 @@ var registeredActionMigrations = []struct {
 	{"000049_register_identifier_verify_action", "tenant-entity-registry-svc", map[string]string{
 		"PARTY_IDENTIFIER_VERIFY": "HIGH",
 	}},
+	{"000050_register_fx_actions", "tenant-entity-registry-svc", map[string]string{
+		"FX_SOURCE_MANAGE":         "HIGH",
+		"FX_OBSERVATION_INGEST":    "STANDARD",
+		"FX_OBSERVATION_SUPERSEDE": "HIGH",
+		"FX_RATE_SET_APPROVE":      "HIGH",
+		"FX_RATE_SET_CLOSE":        "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

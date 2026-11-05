@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/handler"
 	"zoiko.io/tenant-entity-registry-svc/internal/health"
 	"zoiko.io/tenant-entity-registry-svc/internal/idempotency"
+	"zoiko.io/tenant-entity-registry-svc/internal/currency"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/tenant-entity-registry-svc/internal/middleware"
 	"zoiko.io/tenant-entity-registry-svc/internal/mtlslistener"
@@ -186,6 +188,19 @@ func main() {
 	svc := registry.NewService(pgStore, authzClient, jurisdValidator, cfg.AuthZPlatformScopeID, log)
 	svc.ConfigureMakerChecker(cfg.MakerCheckerLegacyBodyApprover, time.Duration(cfg.ApprovalTTLHours)*time.Hour)
 	svc.ConfigureCompatibility(cfg.LegacyEntityCreateActive, cfg.OnboardingKeyOptional)
+
+	// REF-03: currency codes are checked against currency-registry-svc, read-only and fail-closed. Outside development
+	// and test, no registry means no exchange-rate ingestion, never an unconfirmed currency.
+	var currencyValidator currency.Validator
+	switch {
+	case cfg.CurrencyRegistryURL != "":
+		currencyValidator = currency.NewHTTP(cfg.CurrencyRegistryURL, log)
+	case strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging"):
+		currencyValidator = currency.Unavailable{}
+	default:
+		currencyValidator = currency.NewStub(log)
+	}
+	svc.WithCurrencyValidator(currencyValidator)
 
 	// ORG-02 §4.2 server-resolved provisioning context: plan entitlement from
 	// commercial-account-svc and the restricted-jurisdiction list.

@@ -124,6 +124,12 @@ func codeEventNames() []string {
 		events.EventRegistrationSuperseded,
 		// ORG-09 / MDM-03 identifier verification (identifier_events.go).
 		events.EventPartyIdentifierVerified,
+		// REF-03 exchange rates (fx_events.go).
+		events.EventFXRateObserved,
+		events.EventFXRateApproved,
+		events.EventFXRateSetClosed,
+		events.EventFXRateSetSuperseded,
+		events.EventFXRateSuperseded,
 	}
 }
 

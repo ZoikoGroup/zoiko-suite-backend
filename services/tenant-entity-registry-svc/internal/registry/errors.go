@@ -42,3 +42,8 @@ var ErrCreateRequestMismatch error = &kindError{"idempotency mismatch: this crea
 // ErrMergeProhibited — a merge MDM-05 forbids: it would collapse two distinct legal entities, it would chain, or a
 // party involved is not live. 409, MERGE_PROHIBITED.
 var ErrMergeProhibited error = &kindError{"merge prohibited", ErrConflict}
+
+// ErrRateMissing — no approved exchange rate exists for the pair, type, date and set asked for, and none was derived.
+// There is no fallback to an older date or to an unapproved observation: an authoritative calculation needing the rate
+// is blocked, or routed to an explicit exception. 404, FX_RATE_MISSING.
+var ErrRateMissing error = &kindError{"no approved exchange rate for that pair, type and market date", ErrNotFound}

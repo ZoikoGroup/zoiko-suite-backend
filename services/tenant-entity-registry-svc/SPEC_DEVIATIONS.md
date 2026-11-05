@@ -271,3 +271,43 @@ Where the spec leaves a choice, the code chooses the safer reading:
   never written over. GLEIF relationship observations (parent and ultimate parent) are not ingested.
 - **Existing identifiers.** Identifiers already VERIFIED when the migration ran are backfilled with the source that linked
   them, and a trigger records it for every later insert, so no linking code changed.
+
+### Exchange rates (REF-03, ORG-8 wave 1)
+
+- **Where it lives.** REF-03 is built as a module of this service, like MDM-01 to MDM-05, because the plan puts the
+  reference sets here. Currency identity is not owned here: currency-registry-svc (REF-02) is.
+- **Exact decimals.** A rate is a string at every boundary (`^(0|[1-9][0-9]{0,19})(\.[0-9]{1,18})?$`), `NUMERIC(38,18)` in
+  the table and `math/big` in code. No float touches a rate. A derived inverse or cross rate is exact arithmetic on its
+  components, rounded half up to 18 decimals with the exact fraction returned beside it (`1.1 x 0.8` is `0.88`, `22/25`).
+- **Currencies are confirmed read-only and fail closed.** Before an observation is accepted both codes are checked with
+  currency-registry-svc (`GET /v1/currencies:validate?operation=read`: a rate is a reference fact, not a posting, so any
+  currency that ever existed is acceptable for the record). An unknown code is 400 REFERENCE_RETIRED; a registry that
+  cannot answer is 503 and the rate is not accepted. `CURRENCY_REGISTRY_URL` selects the client; unset, development and test
+  use a shape-only stub and staging and production refuse ingestion rather than accept an unconfirmed currency. Config
+  validation does not yet require it, so an unset URL in production is a refused command, not a refused start.
+- **Rate type is mandatory and never conflated.** Outlier history, rate sets and reads are all per type. There is no
+  default type.
+- **Lifecycle.** OBSERVED, VALIDATED, APPROVED, SUPERSEDED. The spec's REJECTED has no command and no state here: an
+  observation that fails validation is refused (4xx), not stored as rejected, and one that is wrong is superseded.
+  Ingestion checks the source is approved, then duplicates (a provider observation id, or the same source, pair, type and
+  instant: a replay returns the first, a different rate under the same key is 409), then the outlier check against the
+  last accepted rate of the pair and type, and keeps every result as `checks`. A manual (MANUAL_EXCEPTION source) or
+  outlying rate stays OBSERVED and needs independent approval; everything else is VALIDATED.
+- **Outlier threshold is one constant.** A move of more than 10% from the last accepted rate of the pair and type. The spec
+  says outlier policy is server resolved; no policy source exists yet, so one threshold applies to every pair.
+- **Segregation of duties.** The principal who ingested a manual or outlying rate cannot approve it into a set (403
+  SOD_DENIED, and a table trigger holds it if the service is bypassed). Including such a rate needs an `override_reason`.
+  Registering and withdrawing a source is a single HIGH permission step, with no second approver: the spec names none.
+- **Rate sets and certification.** `POST /v1/fx/rate-sets` creates a set already approved (the spec's ApproveFXRateSet):
+  one rate per pair, all of the set's rate type and market date. `:close` certifies it. A closed set is immutable at the
+  table. Several named sets can exist for one type and date (`set_name`, default `DEFAULT`); a read names the set.
+- **Corrections are superseding sets.** A rate in a set is never edited or replaced in place. A correction is a new set
+  with `supersedes_set_id`: the old set becomes SUPERSEDED and stays readable, rates the correction drops stop being in
+  force, and `GetHistoricalRate` with `known_at` returns what was in force then. `SupersedeRateObservation` replaces only an
+  observation not yet in a set.
+- **No fallback, ever.** `GetRate` returns the approved direct rate or 404 `FX_RATE_MISSING`: never an older date, another
+  type, another set or an unapproved observation. `ExplainDerivedCrossRate` tries direct, then inverse, then a cross
+  through a pivot (`via`, default USD) and nothing else, and lists every component with its direction and set. The spec's
+  "calendar cutoff" and "source timezone" resolution is not built: the source's timezone is recorded, and the market date is
+  as the source states it; REF-10 calendars are not consulted.
+- **`GET /v1/reference/{set}/{code}` is not built yet.** It is the last wave of ORG-8, over books, dimensions and units.

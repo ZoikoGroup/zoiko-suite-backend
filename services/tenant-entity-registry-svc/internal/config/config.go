@@ -31,6 +31,11 @@ type Config struct {
 	// on EntityJurisdictionAssignment creation (Q2 resolution).
 	JurisdictionRulesURL string
 
+	// CurrencyRegistryURL is currency-registry-svc, which owns currency identity. Exchange-rate commands check currency
+	// codes against it, read-only and fail-closed. Unset, development and test use a shape-only stub and every other
+	// environment refuses exchange-rate ingestion rather than accept an unconfirmed currency.
+	CurrencyRegistryURL string
+
 	// AuthZServiceURL is the base URL of the Authorization Service.
 	// Every mutating API call must be authorized before proceeding.
 	AuthZServiceURL string
@@ -210,6 +215,7 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.entity.events"),
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc"),
+		CurrencyRegistryURL:  env("CURRENCY_REGISTRY_URL", ""),
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),

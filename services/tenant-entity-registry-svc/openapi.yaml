@@ -3002,6 +3002,290 @@ paths:
                   items: { type: array, items: { $ref: "#/components/schemas/IdentifierObservation" } }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  # ── REF-03 Foreign exchange rates ───────────────────────────────────────────
+  /v1/fx/sources:
+    post:
+      operationId: createFxSource
+      summary: REF-03 register and approve a source of exchange rates
+      description: Only an active, registered source can feed rates. FXSource is owned here; currency identity is not.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateFXSourceRequest" } } }
+      responses:
+        "201":
+          description: Source registered
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXSource" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "A source with that code exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listFxSources
+      summary: REF-03 the tenant's exchange-rate sources
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Sources
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/FXSource" } }
+
+  /v1/fx/sources/{sourceID}:withdraw:
+    post:
+      operationId: withdrawFxSource
+      summary: "REF-03 withdraw a source: no new rates from it; existing rates stay"
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: sourceID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/WithdrawFXSourceRequest" } } }
+      responses:
+        "200":
+          description: Withdrawn
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXSource" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or already withdrawn", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/sources/{sourceID}/rates:
+    get:
+      operationId: listFxRatesBySource
+      summary: REF-03 ListRatesBySource - a source's observations by market date, newest first
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: sourceID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Observations, with next_cursor when more remain
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/FXObservation" } }
+                  next_cursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/fx/observations:
+    post:
+      operationId: ingestFxObservation
+      summary: REF-03 IngestFXObservation - record one rate a source reported, with the evidence it came with
+      description: |
+        The rate is an exact decimal string (at most 20 integer digits and 18 decimals): never a float. Rate type is
+        mandatory and types are never conflated. Both currencies are confirmed with currency-registry-svc, read-only and
+        fail-closed: an unknown currency is 400 REFERENCE_RETIRED and an unreachable registry is 503, never an assumed
+        currency. The observation is checked for duplicates (a provider observation id, or the same source, pair, type and
+        instant: a replay returns the first, a different rate under the same key is 409) and for outliers against the last
+        accepted rate of the pair and type; the results are kept as `checks`. A manual (MANUAL_EXCEPTION source) or
+        outlying rate stays OBSERVED and needs independent approval; the rest are VALIDATED.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/IngestFXObservationRequest" } } }
+      responses:
+        "201":
+          description: Observation recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXIngestOutcome" } } }
+        "200":
+          description: Replay of an observation already recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXIngestOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The same key was recorded with a different rate, or the source is withdrawn", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/fx/observations/{observationID}:supersede:
+    post:
+      operationId: supersedeFxObservation
+      summary: REF-03 SupersedeRateObservation - replace an observation that is not yet in a rate set
+      description: |
+        The replacement is for the same pair, rate type and market date and is validated like any ingestion. A rate that is
+        in a set is never edited or replaced in place: it is corrected by a superseding set (`approveFxRateSet` with
+        supersedes_set_id).
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: observationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/SupersedeFXObservationRequest" } } }
+      responses:
+        "201":
+          description: Replaced; the old observation is SUPERSEDED
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXIngestOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The observation is in a rate set or already superseded", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/fx/rate-sets:
+    post:
+      operationId: approveFxRateSet
+      summary: REF-03 ApproveFXRateSet - approve observations into a rate set for a rate type and market date
+      description: |
+        One rate per pair; every observation is of the set's rate type and market date. A manual or outlying observation
+        needs override_reason and is not approved by the principal who ingested it (403 SOD_DENIED; the table holds it too).
+        An observation already approved in another set is a 409. supersedes_set_id makes the set a correction of an
+        APPROVED or CLOSED one of the same name, type and date: the old set is SUPERSEDED but stays readable, and rates the
+        correction drops stop being in force.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ApproveFXRateSetRequest" } } }
+      responses:
+        "201":
+          description: Rate set approved
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRateSet" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "A live set of that name, type and date exists, or an observation is already approved or superseded", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/rate-sets/{setID}:
+    get:
+      operationId: getFxRateSet
+      summary: REF-03 GetRateSet - a set with its member observations
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The set
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRateSet" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/fx/rate-sets/{setID}:close:
+    post:
+      operationId: closeFxRateSet
+      summary: REF-03 CloseRateSet - certify an APPROVED set; it is then immutable
+      description: A certified set is never edited. A correction is a superseding set.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CloseFXRateSetRequest" } } }
+      responses:
+        "200":
+          description: Closed
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRateSet" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The set is not APPROVED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/rates:
+    get:
+      operationId: getFxRate
+      summary: REF-03 GetRate - the approved direct rate for a pair, rate type and market date
+      description: |
+        Nothing is inverted, crossed or substituted: if there is no approved rate the answer is 404 FX_RATE_MISSING, never
+        an older date, another rate type or an unapproved observation. An authoritative calculation that needs the rate is
+        blocked or routed to an explicit exception. `rates:explain` derives an inverse or cross rate, openly.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: base, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: quote, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: rate_type, in: query, required: true, schema: { $ref: "#/components/schemas/FXRateType" } }
+        - { name: market_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: set_name, in: query, schema: { type: string, default: DEFAULT } }
+      responses:
+        "200":
+          description: The rate and the observation it came from
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRate" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { description: "FX_RATE_MISSING: no approved rate", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/rates:history:
+    get:
+      operationId: getFxHistoricalRate
+      summary: REF-03 GetHistoricalRate - the rate as it was known at known_at
+      description: |
+        Answers with the rate set that was live at known_at, so a rate that a later correction replaced still answers "what
+        was in force then". A historical rate is never silently replaced.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: base, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: quote, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: rate_type, in: query, required: true, schema: { $ref: "#/components/schemas/FXRateType" } }
+        - { name: market_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: set_name, in: query, schema: { type: string, default: DEFAULT } }
+      responses:
+        "200":
+          description: The rate as known then
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRate" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { description: "FX_RATE_MISSING: no approved rate was in force at known_at", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/rates:explain:
+    get:
+      operationId: explainDerivedFxCrossRate
+      summary: REF-03 ExplainDerivedCrossRate - the rate, how it was reached, and from which approved observations
+      description: |
+        Tries the direct rate, then the inverse, then a cross through a pivot currency (via, default USD): nothing else.
+        A derived rate is exact arithmetic on approved components, rounded half up to 18 decimals with the exact fraction
+        returned beside it, and lists every component with its direction and set.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: base, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: quote, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: rate_type, in: query, required: true, schema: { $ref: "#/components/schemas/FXRateType" } }
+        - { name: market_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: set_name, in: query, schema: { type: string, default: DEFAULT } }
+        - { name: via, in: query, schema: { type: string, minLength: 3, maxLength: 3 }, description: "Pivot currency for a cross rate. Default USD." }
+        - { name: known_at, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: The rate, the method and its components
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRate" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { description: "FX_RATE_MISSING: a needed component has no approved rate", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3606,6 +3890,195 @@ components:
         party: { $ref: "#/components/schemas/Party" }
         case: { $ref: "#/components/schemas/ResolutionCase" }
         lei_alignment: { type: string, enum: [ALIGNED, PROFILE_ABSENT, DIFFERS, NOT_LINKED, NOT_APPLICABLE] }
+
+    FXRateType:
+      type: string
+      enum: [SPOT, AVERAGE, CLOSING, TAX, CONTRACTUAL, OTHER_GOVERNED]
+      description: Mandatory. Types are never conflated.
+
+    FXDecimal:
+      type: string
+      pattern: '^(0|[1-9][0-9]{0,19})(\.[0-9]{1,18})?$'
+      description: An exact decimal as a string. Never a JSON number, so no float ever touches a rate.
+
+    FXSourceClass:
+      type: string
+      enum: [PROVIDER, CENTRAL_BANK, INTERNAL_TREASURY, MANUAL_EXCEPTION]
+
+    CreateFXSourceRequest:
+      type: object
+      required: [source_code, name, source_class]
+      properties:
+        source_code: { type: string, minLength: 1, maxLength: 40 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        source_class: { $ref: "#/components/schemas/FXSourceClass" }
+        timezone: { type: string, description: "IANA zone of the source, so a market date and its cutoff read the same to everyone. Default UTC." }
+        correlation_id: { type: string }
+
+    WithdrawFXSourceRequest:
+      type: object
+      required: [expected_version, reason]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string }
+        correlation_id: { type: string }
+
+    FXSource:
+      type: object
+      required: [source_id, tenant_id, source_code, name, source_class, timezone, status, record_version, created_by, created_at]
+      properties:
+        source_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        source_code: { type: string }
+        name: { type: string }
+        source_class: { $ref: "#/components/schemas/FXSourceClass" }
+        timezone: { type: string }
+        status: { type: string, enum: [ACTIVE, WITHDRAWN] }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        withdrawn_by: { type: string }
+        withdrawn_at: { type: string, format: date-time }
+
+    IngestFXObservationRequest:
+      type: object
+      required: [source_id, base_currency, quote_currency, rate_type, rate, market_date, observed_at, payload_ref]
+      properties:
+        source_id: { type: string, format: uuid }
+        base_currency: { type: string, pattern: '^[A-Z]{3}$' }
+        quote_currency: { type: string, pattern: '^[A-Z]{3}$', description: "Units of quote currency per one unit of base currency." }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        rate: { $ref: "#/components/schemas/FXDecimal" }
+        market_date: { type: string, format: date }
+        observed_at: { type: string, format: date-time }
+        provider_observation_id: { type: string }
+        payload_ref: { type: string, description: "Reference to the raw provider payload. Required." }
+        payload_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        reason: { type: string, description: "Required, with evidence_ref, for a MANUAL_EXCEPTION source." }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    SupersedeFXObservationRequest:
+      allOf:
+        - $ref: "#/components/schemas/IngestFXObservationRequest"
+        - type: object
+          required: [reason]
+          properties:
+            reason: { type: string }
+
+    FXCheck:
+      type: object
+      required: [check, result]
+      properties:
+        check: { type: string, description: "source_approved, duplicate, outlier or manual_exception." }
+        result: { type: string, enum: [PASS, FLAGGED] }
+        detail: { type: string }
+
+    FXObservation:
+      type: object
+      required: [observation_id, tenant_id, source_id, base_currency, quote_currency, rate_type, rate, market_date, observed_at, payload_ref, status, manual, outlier, needs_independent_approval, checks, ingested_by, ingested_at]
+      properties:
+        observation_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        source_id: { type: string, format: uuid }
+        base_currency: { type: string }
+        quote_currency: { type: string }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        rate: { $ref: "#/components/schemas/FXDecimal" }
+        market_date: { type: string, format: date }
+        observed_at: { type: string, format: date-time }
+        provider_observation_id: { type: string }
+        payload_ref: { type: string }
+        payload_hash: { type: string }
+        status: { type: string, enum: [OBSERVED, VALIDATED, APPROVED, SUPERSEDED] }
+        manual: { type: boolean }
+        outlier: { type: boolean }
+        needs_independent_approval: { type: boolean }
+        checks: { type: array, items: { $ref: "#/components/schemas/FXCheck" } }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        ingested_by: { type: string }
+        ingested_at: { type: string, format: date-time }
+        superseded_by_id: { type: string, format: uuid }
+        superseded_at: { type: string, format: date-time }
+
+    FXIngestOutcome:
+      type: object
+      required: [observation]
+      properties:
+        observation: { $ref: "#/components/schemas/FXObservation" }
+        superseded: { $ref: "#/components/schemas/FXObservation" }
+
+    ApproveFXRateSetRequest:
+      type: object
+      required: [rate_type, market_date, observation_ids, evidence_ref]
+      properties:
+        set_name: { type: string, maxLength: 40, description: "Default DEFAULT." }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        market_date: { type: string, format: date }
+        observation_ids: { type: array, minItems: 1, maxItems: 500, items: { type: string, format: uuid } }
+        override_reason: { type: string, description: "Required when the set includes a manual or outlying observation." }
+        evidence_ref: { type: string }
+        supersedes_set_id: { type: string, format: uuid }
+        correlation_id: { type: string }
+
+    CloseFXRateSetRequest:
+      type: object
+      required: [evidence_ref]
+      properties:
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    FXRateSet:
+      type: object
+      required: [set_id, tenant_id, set_name, rate_type, market_date, set_version, status, evidence_ref, approved_by, approved_at]
+      properties:
+        set_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        set_name: { type: string }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        market_date: { type: string, format: date }
+        set_version: { type: integer }
+        status: { type: string, enum: [APPROVED, CLOSED, SUPERSEDED] }
+        supersedes_set_id: { type: string, format: uuid }
+        superseded_by_set_id: { type: string, format: uuid }
+        override_reason: { type: string }
+        evidence_ref: { type: string }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+        closed_by: { type: string }
+        closed_at: { type: string, format: date-time }
+        superseded_at: { type: string, format: date-time }
+        members: { type: array, items: { $ref: "#/components/schemas/FXObservation" } }
+
+    FXComponent:
+      type: object
+      required: [observation_id, base_currency, quote_currency, rate, direction, source_id, set_id, set_version, market_date]
+      properties:
+        observation_id: { type: string, format: uuid }
+        base_currency: { type: string }
+        quote_currency: { type: string }
+        rate: { $ref: "#/components/schemas/FXDecimal" }
+        direction: { type: string, enum: [DIRECT, INVERTED], description: "INVERTED when the reciprocal of the observed rate is used." }
+        source_id: { type: string, format: uuid }
+        set_id: { type: string, format: uuid }
+        set_version: { type: integer }
+        market_date: { type: string, format: date }
+
+    FXRate:
+      type: object
+      required: [base_currency, quote_currency, rate_type, market_date, rate, method, formula, components]
+      properties:
+        base_currency: { type: string }
+        quote_currency: { type: string }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        market_date: { type: string, format: date }
+        rate: { $ref: "#/components/schemas/FXDecimal" }
+        method: { type: string, enum: [DIRECT, INVERSE, CROSS] }
+        formula: { type: string }
+        rounding: { type: string, description: "How a derived rate is rounded. Absent for a direct rate." }
+        exact: { type: string, description: "The unrounded fraction of a derived rate, numerator/denominator." }
+        components: { type: array, items: { $ref: "#/components/schemas/FXComponent" } }
 
     IdentifierScheme:
       type: string

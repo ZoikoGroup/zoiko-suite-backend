@@ -123,6 +123,12 @@ channels:
           - $ref: "#/components/messages/RegistrationExpired"
           - $ref: "#/components/messages/RegistrationRevoked"
           - $ref: "#/components/messages/RegistrationSuperseded"
+          # ── REF-03 exchange rates ─────────────────────────────────────────
+          - $ref: "#/components/messages/FXRateObserved"
+          - $ref: "#/components/messages/FXRateApproved"
+          - $ref: "#/components/messages/FXRateSetClosed"
+          - $ref: "#/components/messages/FXRateSetSuperseded"
+          - $ref: "#/components/messages/FXRateSuperseded"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -570,6 +576,58 @@ components:
         scheme, scope, source class and reference, source version, observation id and observed_at, never the value.
         A dispute by a higher authority is published as master.conflict.opened instead.
       x-spec-event: identifier_verified
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateObserved:
+      name: fx.rate.observed
+      title: An exchange-rate observation was recorded
+      description: |
+        Carries the pair, rate type, rate (an exact decimal string), market date, source, status and outlier/manual flags,
+        and the reference and hash of the raw payload, never the payload. VALIDATED means it passed its checks; OBSERVED
+        means it is manual or outlying and needs independent approval before use.
+      x-spec-event: FXRateObserved
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateApproved:
+      name: fx.rate.approved
+      title: A rate set was approved
+      description: |
+        Carries the set, its version, rate type, market date and every member's pair and rate. A superseding set names
+        `supersedes_set_id`: a consumer that read the old set re-reads.
+      x-spec-event: FXRateApproved
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateSetClosed:
+      name: fx.rate_set.closed
+      title: A rate set was certified and is now immutable
+      description: A certified set is never edited; a correction is a superseding set.
+      x-spec-event: FXRateSetClosed
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateSetSuperseded:
+      name: fx.rate_set.superseded
+      title: A rate set was corrected by a superseding set
+      description: Carries `superseded_by_set_id`. The old set stays readable as of the time before the correction.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateSuperseded:
+      name: fx.rate.superseded
+      title: An exchange-rate observation was superseded
+      description: |
+        Replaced by another observation (`superseded_by_id`), or dropped by a superseding set (empty). Carries the reason.
+        The superseded observation stays readable.
+      x-spec-event: FXRateSuperseded
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"

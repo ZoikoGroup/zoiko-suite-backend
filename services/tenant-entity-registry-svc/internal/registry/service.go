@@ -22,6 +22,7 @@ import (
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/classification"
+	"zoiko.io/tenant-entity-registry-svc/internal/currency"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
 	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
 	"zoiko.io/tenant-entity-registry-svc/internal/events"
@@ -83,6 +84,8 @@ type Service struct {
 
 	// expectedVersionOptional — dev-only, see ConfigureConcurrency.
 	expectedVersionOptional bool
+	// currencies validates currency codes against currency-registry-svc, read-only (REF-03). Nil fails closed.
+	currencies currency.Validator
 
 	log *zap.Logger
 }

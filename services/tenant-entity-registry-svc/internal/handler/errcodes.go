@@ -41,6 +41,8 @@ const (
 	CodeNotEntitled            = "NOT_ENTITLED"
 	// ORG-07 MDM-05: a merge the matching rules forbid.
 	CodeMergeProhibited = "MERGE_PROHIBITED"
+	// REF-03: no approved rate, and no fallback to another one.
+	CodeRateMissing = "FX_RATE_MISSING"
 	CodeInternal        = "INTERNAL_ERROR"
 )
 
@@ -57,6 +59,7 @@ var errorCodes = []struct {
 	{registry.ErrOnboardingKeyMismatch, CodeIdempotencyMismatch},
 	{registry.ErrCreateRequestMismatch, CodeIdempotencyMismatch},
 	{registry.ErrMergeProhibited, CodeMergeProhibited},
+	{registry.ErrRateMissing, CodeRateMissing},
 	{registry.ErrRegistryConflict, CodeDuplicateCandidate},
 	{registry.ErrApprovalPending, CodeDuplicateCandidate},
 	{registry.ErrJurisdictionRestricted, CodeJurisdictionRestricted},
