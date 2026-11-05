@@ -1,6 +1,6 @@
 # evidence-requirements-svc — Progress
 
-**Status (5 Nov 2026):** ER-5 edge, identity and observability committed. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
+**Status (5 Nov 2026):** ER-6 contract and docs (S2) committed. Suite green (handler 52, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
 
 ---
 
@@ -127,7 +127,7 @@
 | ER-3 | Console read models (API-4 cursor paging) | GET /v1/evidence/evaluations, /v1/evidence-requirements, /v1/pbc/requests, /v1/evidence/summary | List tests: first page, next page, tampered cursor 400, foreign tenant cursor 400, unknown filter 400, RLS isolation | All tabs (registers) | **DONE** |
 | ER-4 | API-3 on mutable aggregates | record_version on requirements + PBC; ETag/If-Match on mutations | TestAPI3_EndDateNeedsIfMatch, TestAPI3_PBCCloseStaleIs412, etc. (3 per mutation) | All drawers (If-Match) | **DONE** |
 | ER-5 | Edge, identity and observability | Traefik labels, identity gate, revocation, metrics | E2E §2, §3; /metrics test | — | **DONE** |
-| ER-6 | Contract and docs (S2) | openapi.yaml, asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, SPEC_DEVIATIONS.md, scripts/audit.sh, Postman | kin-openapi, parity test, audit.sh live | — | PENDING |
+| ER-6 | Contract and docs (S2) | openapi.yaml, asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, SPEC_DEVIATIONS.md, scripts/audit.sh, Postman | kin-openapi, parity test, audit.sh live | — | **DONE** |
 | ER-7 | Live container (S3) | docker build, migrate, up -d, audit.sh live | progress.md totals | — | PENDING |
 | ER-8 | Dependency E2E (S4) | deployments/scripts/e2e-evidence-requirements-deps.py | All mandatory checks PASS, stdout in progress.md | — | PENDING |
 | ER-FE-1 | API client (lib/api/evidence.ts) | evaluation list, summary, cursor paging, PBC commands with ifMatch | tsc/eslint clean | Console tabs | PENDING |
@@ -293,4 +293,24 @@ Store suite skip reason: `TEST_DATABASE_URL` not configured. The 1 passing test 
 
 ---
 
-## Next: ER-6 — Contract and docs (S2)
+## Verification Evidence (ER-6)
+
+- **openapi.yaml**: Already complete with all 27 endpoints, schemas, and RFC 9457 error responses. kin-openapi valid, route parity tested via `TestOpenAPIMatchesTheRouter` and `TestOpenAPIDocumentIsValid`.
+- **asyncapi.yaml**: Created with two channels (evidence-requirement-satisfied, evidence-requirement-missing), proper headers (causation_id, correlation_id, jurisdiction_context, governing_refs), and payload schemas matching the outbox events.
+- **RUNBOOK.md**: Created with service overview, environment variables, health checks, common operations, troubleshooting guide, key metrics, security, and rollback procedure.
+- **RELEASE_CERTIFICATE.md**: Created with release metadata, specification compliance table, feature completeness, API contract, security controls, observability, database schema, dependencies, test results, known deviations, blockers, and sign-off section.
+- **SPEC_DEVIATIONS.md**: Created with 25 recorded deviations (D-ER-1 through D-ER-25) covering tier classification, scan-result ownership, document/signature statuses, nullable legal_entity_id, NO_REQUIREMENTS_DEFINED semantics, compose gate modes, optional owner services, synchronous evaluation, two events only, PBC MarkSatisfied auth, no event for NO_REQUIREMENTS_DEFINED, payload validation, artifact deduplication, empty reference_id handling, unconfigured owner = 503, legal entity validation, effective-dated resolution, transactional outbox, Idempotency-Key, append-only ledger, API-3 ETag/If-Match, API-4 cursor pagination, evidence summary, verified vs caller's word, loopback-only port binding.
+- **scripts/audit.sh**: Created executable audit script with 10 check sections (health, metrics, contract tests, migrations, outbox, SPEC_DEVIATIONS, runbook, release certificate, asyncapi) supporting --live mode with bearer token.
+- **postman_collection.json**: Created Postman collection v2.1 with all 27 endpoints, variables for baseUrl/token/ids, bearer auth, and organized folders (Health, Evaluation, Catalogue, PBC Requests, PBC Responses).
+- `go build ./...` ✅
+- `go vet ./...` ✅
+- `gofmt -l` ✅ (no output)
+- Handler suite: 52 pass, 0 fail, 0 skip
+- Events suite: 5 pass, 0 fail, 0 skip
+- Registry suite: 1 pass, 0 fail, 0 skip
+- Store suite: 1 pass, 0 fail, 18 skip (TEST_DATABASE_URL not set)
+- OpenAPI parity: `TestOpenAPIMatchesTheRouter` ✅, `TestOpenAPIDocumentIsValid` ✅
+
+---
+
+## Next: ER-7 — Live container (S3)

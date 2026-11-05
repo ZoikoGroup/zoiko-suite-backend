@@ -1,0 +1,170 @@
+asyncapi: '3.0.0'
+info:
+  title: evidence-requirements-svc Events
+  version: '1.0.0'
+  description: |
+    Transactional outbox events published to Kafka topic `zoiko.evidence-requirements.events`.
+    Key: `<tenant>/<evaluation_id>` for ordering per evaluation.
+    Published after the evaluation record is committed (000008 outbox table).
+servers:
+  production:
+    url: kafka:9094
+    protocol: kafka
+    protocolVersion: '3.6'
+    description: Kafka broker
+channels:
+  evidence-requirement-satisfied:
+    address: zoiko.evidence-requirements.events
+    messages:
+      evidence.requirement.satisfied:
+        name: evidence.requirement.satisfied
+        title: Evidence Requirement Satisfied
+        summary: Published when all effective requirements for an action are met.
+        payload:
+          $ref: '#/components/schemas/SatisfiedPayload'
+        headers:
+          $ref: '#/components/schemas/EventHeaders'
+  evidence-requirement-missing:
+    address: zoiko.evidence-requirements.events
+    messages:
+      evidence.requirement.missing:
+        name: evidence.requirement.missing
+        title: Evidence Requirement Missing
+        summary: Published when one or more effective requirements are unmet.
+        payload:
+          $ref: '#/components/schemas/MissingPayload'
+        headers:
+          $ref: '#/components/schemas/EventHeaders'
+components:
+  schemas:
+    EventHeaders:
+      type: object
+      required:
+        - causation_id
+        - correlation_id
+        - jurisdiction_context
+        - governing_refs
+      properties:
+        causation_id:
+          type: string
+          format: uuid
+          description: The evaluation_id that caused this event
+        correlation_id:
+          type: string
+          format: uuid
+          description: The Idempotency-Key from the evaluate request
+        jurisdiction_context:
+          type: string
+          description: The resolved jurisdiction from tenant-entity-registry-svc
+        governing_refs:
+          type: object
+          required:
+            - requirement_ids
+            - manifest_ids
+            - signature_ids
+          properties:
+            requirement_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+              description: The evidence_requirement_ids that were effective for this evaluation
+            manifest_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+              description: Evidence-manifest IDs that were presented and verified
+            signature_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+              description: Esignature envelope IDs that were presented and verified
+    SatisfiedPayload:
+      type: object
+      required:
+        - evaluation_id
+        - tenant_id
+        - legal_entity_id
+        - domain_code
+        - action_type
+        - evaluated_at
+      properties:
+        evaluation_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        legal_entity_id:
+          type: string
+          format: uuid
+        domain_code:
+          type: string
+        action_type:
+          type: string
+        outcome:
+          type: string
+          enum: [SATISFIED]
+        evaluated_at:
+          type: string
+          format: date-time
+        present_artifacts:
+          type: array
+          items:
+            type: object
+            required:
+              - evidence_type
+              - reference_id
+            properties:
+              evidence_type:
+                type: string
+              reference_id:
+                type: string
+    MissingPayload:
+      type: object
+      required:
+        - evaluation_id
+        - tenant_id
+        - legal_entity_id
+        - domain_code
+        - action_type
+        - evaluated_at
+        - unmet
+      properties:
+        evaluation_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        legal_entity_id:
+          type: string
+          format: uuid
+        domain_code:
+          type: string
+        action_type:
+          type: string
+        outcome:
+          type: string
+          enum: [MISSING]
+        evaluated_at:
+          type: string
+          format: date-time
+        unmet:
+          type: array
+          items:
+            type: object
+            required:
+              - evidence_requirement_id
+              - evidence_type
+              - reason
+            properties:
+              evidence_requirement_id:
+                type: string
+                format: uuid
+              evidence_type:
+                type: string
+              reason:
+                type: string

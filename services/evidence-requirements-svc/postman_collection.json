@@ -1,0 +1,344 @@
+{
+  "info": {
+    "name": "evidence-requirements-svc API",
+    "description": "Evidence Requirements Service API — Governance Platform 7/7. Determines what supporting evidence must exist before an action may be completed.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "zoiko-suite"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8130", "type": "string" },
+    { "key": "token", "value": "", "type": "string" },
+    { "key": "tenantId", "value": "", "type": "string" },
+    { "key": "legalEntityId", "value": "", "type": "string" },
+    { "key": "correlationId", "value": "", "type": "string" },
+    { "key": "idempotencyKey", "value": "", "type": "string" },
+    { "key": "ifMatch", "value": "", "type": "string" },
+    { "key": "requirementId", "value": "", "type": "string" },
+    { "key": "requestId", "value": "", "type": "string" },
+    { "key": "responseId", "value": "", "type": "string" }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }]
+  },
+  "item": [
+    {
+      "name": "Health & Readiness",
+      "item": [
+        {
+          "name": "Liveness",
+          "request": { "method": "GET", "url": "{{baseUrl}}/healthz" }
+        },
+        {
+          "name": "Readiness",
+          "request": { "method": "GET", "url": "{{baseUrl}}/readyz" }
+        },
+        {
+          "name": "Metrics",
+          "request": { "method": "GET", "url": "{{baseUrl}}/metrics" }
+        }
+      ]
+    },
+    {
+      "name": "Evidence Evaluation",
+      "item": [
+        {
+          "name": "Evaluate Evidence",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/evidence/evaluate",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "X-Legal-Entity-Id", "value": "{{legalEntityId}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"domain_code\": \"FINANCE\",\n  \"action_type\": \"JOURNAL_POST\",\n  \"correlation_id\": \"{{correlationId}}\",\n  \"present_artifacts\": [\n    { \"evidence_type\": \"SUPPORTING_DOCUMENT\", \"reference_id\": \"<document-id>\" }\n  ]\n}"
+            }
+          }
+        },
+        {
+          "name": "Evaluate — Idempotency Replay",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/evidence/evaluate",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "X-Legal-Entity-Id", "value": "{{legalEntityId}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"domain_code\": \"FINANCE\",\n  \"action_type\": \"JOURNAL_POST\",\n  \"correlation_id\": \"{{correlationId}}\",\n  \"present_artifacts\": [\n    { \"evidence_type\": \"SUPPORTING_DOCUMENT\", \"reference_id\": \"<document-id>\" }\n  ]\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Evaluation",
+          "request": { "method": "GET", "url": "{{baseUrl}}/v1/evidence/evaluations/{{evaluationId}}" }
+        },
+        {
+          "name": "List Evaluations (Cursor)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/evidence/evaluations?page_size=20&cursor={{cursor}}"
+          }
+        },
+        {
+          "name": "Evidence Summary",
+          "request": { "method": "GET", "url": "{{baseUrl}}/v1/evidence/summary" }
+        }
+      ]
+    },
+    {
+      "name": "Requirement Catalogue",
+      "item": [
+        {
+          "name": "List Requirements",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/evidence-requirements?page_size=20&legal_entity_id={{legalEntityId}}"
+          }
+        },
+        {
+          "name": "List Requirements (Cursor)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/evidence-requirements/cursor?page_size=20&cursor={{cursor}}"
+          }
+        },
+        {
+          "name": "Get Requirement",
+          "request": { "method": "GET", "url": "{{baseUrl}}/v1/evidence-requirements/{{requirementId}}" }
+        },
+        {
+          "name": "Create Requirement",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/admin/evidence-requirements",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"domain_code\": \"FINANCE\",\n  \"action_type\": \"JOURNAL_POST\",\n  \"evidence_type\": \"SUPPORTING_DOCUMENT\",\n  \"requirement_payload\": { \"minimum_count\": 1 },\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "End-Date Requirement",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/admin/evidence-requirements/{{requirementId}}/end-date",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"superseded by new policy\",\n  \"effective_to\": \"2026-12-31T23:59:59Z\",\n  \"if_match\": \"{{ifMatch}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "PBC Requests",
+      "item": [
+        {
+          "name": "Create PBC Request",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"requirement_id\": \"{{requirementId}}\",\n  \"title\": \"Provide supporting documentation\",\n  \"description\": \"Please provide the signed contract and bank statements for the period.\",\n  \"assigned_to_principal_id\": \"<assignee-principal-id>\",\n  \"due_at\": \"2026-12-31T23:59:59Z\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Open Requests",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/pbc/requests"
+          }
+        },
+        {
+          "name": "List Open Requests (Cursor)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/pbc/requests/cursor?page_size=20&cursor={{cursor}}"
+          }
+        },
+        {
+          "name": "Get Request",
+          "request": { "method": "GET", "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}" }
+        },
+        {
+          "name": "Send Request",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/send",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        },
+        {
+          "name": "Reassign Request",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/reassign",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_assignee_principal_id\": \"<new-assignee-principal-id>\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Extend Due Date",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/extend-due-date",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_due_at\": \"2027-01-31T23:59:59Z\"\n}"
+            }
+          }
+        },
+        {
+          "name": "View Request",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/view",
+            "header": [
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false }
+            ],
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        },
+        {
+          "name": "Submit Response",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/responses",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"artifact_document_id\": \"<document-id>\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Add Note",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/notes",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"body\": \"Please see the attached documents.\",\n  \"visibility\": \"SHARED\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Request Clarification",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/clarify",
+            "header": [
+              { "key": "Idempotency-Key", "value": "{{idempotencyKey}}", "disabled": false },
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"The bank statement is missing page 3.\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Mark Satisfied",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/mark-satisfied",
+            "header": [
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false }
+            ],
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        },
+        {
+          "name": "Close Request",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/requests/{{requestId}}/close",
+            "header": [
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false }
+            ],
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "PBC Responses",
+      "item": [
+        {
+          "name": "Record Scan Result",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/responses/{{responseId}}/scan-result",
+            "header": [
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"result\": \"CLEAN\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Acknowledge Receipt",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/pbc/responses/{{responseId}}/acknowledge",
+            "header": [
+              { "key": "If-Match", "value": "{{ifMatch}}", "disabled": false }
+            ],
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        }
+      ]
+    }
+  ]
+}
