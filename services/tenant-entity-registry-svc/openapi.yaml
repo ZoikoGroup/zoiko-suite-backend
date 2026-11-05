@@ -2317,6 +2317,184 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
 
 
+  # ── ORG-08 Addresses ────────────────────────────────────────────────────────
+  /v1/addresses:
+    post:
+      operationId: createAddress
+      summary: ORG-08 CreateAddress - a structured address; the source value is kept
+      description: |
+        The structured fields are stored exactly as entered, with a normalized comparison form beside them.
+        create_request_id makes a retry return the first result; the same id with different content is a 409
+        IDEMPOTENCY_MISMATCH. A REGISTERED address is a legal assertion and is recorded only with
+        source_class AUTHORITY_REGISTRY or AUTHORITY_DOCUMENT (400 SOURCE_UNVERIFIED otherwise): a valid postal
+        address is not a legally registered one.
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateAddressRequest" } } }
+      responses:
+        "201":
+          description: Address recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressOutcome" } } }
+        "200":
+          description: Replay of an earlier create_request_id
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "create_request_id was used for a different address", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: searchAddresses
+      summary: ORG-08 SearchAddresses - over the normalized comparison form
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: "Words of the address; street and st. compare equal." }
+        - { name: country, in: query, schema: { type: string, minLength: 2, maxLength: 2 } }
+        - { name: postal_code, in: query, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Addresses, with next_cursor when more remain
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AddressSummary" } }
+                  next_cursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/addresses/{addressID}:
+    get:
+      operationId: getAddress
+      summary: ORG-08 GetAddress - the version in force at as_of
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: addressID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string }, description: "RFC3339 or YYYY-MM-DD; absent means now." }
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every version." }
+      responses:
+        "200":
+          description: The address; version is null when nothing was in force at as_of
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/addresses/{addressID}/versions:
+    post:
+      operationId: amendAddress
+      summary: ORG-08 AmendAddress - add a version; the prior one is superseded, never edited
+      description: |
+        expected_version is the current_version last read. The address type never changes. A new version starts
+        UNVERIFIED. Identical content is a 200 no-op.
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: addressID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AmendAddressRequest" } } }
+      responses:
+        "201":
+          description: New version recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressOutcome" } } }
+        "200":
+          description: Nothing changed
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/addresses/{addressID}:verify:
+    post:
+      operationId: verifyAddress
+      summary: ORG-08 VerifyAddress - record what a verifier observed
+      description: |
+        An observation, not a certificate. Only a confident PASSED moves the version to VERIFIED; LOW_CONFIDENCE
+        and FAILED are recorded and surfaced and the address is left as it was. Verification never makes an address
+        a registered office. The local rules verifier is available; EXTERNAL_PROVIDER is BLOCKED (503).
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: addressID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VerifyAddressRequest" } } }
+      responses:
+        "200":
+          description: The observation and the version it was made on
+          content: { application/json: { schema: { $ref: "#/components/schemas/VerifyOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/parties/{partyID}/addresses:
+    post:
+      operationId: linkAddressToParty
+      summary: ORG-08 LinkAddressToParty - use an address for a party in the address's own capacity
+      description: |
+        link_type must equal the address type. A new REGISTERED link ends the party's previous one on its start
+        date; both stay queryable. A party has one live registered office.
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/LinkAddressRequest" } } }
+      responses:
+        "201":
+          description: Linked
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressLinkOutcome" } } }
+        "200":
+          description: Already linked
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressLinkOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_master_version, or the party is not live", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listPartyAddresses
+      summary: ORG-08 a party's addresses, current or historical
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: include_ended, in: query, schema: { type: boolean }, description: "Include links that have ended." }
+      responses:
+        "200":
+          description: Links with the address version in force at as_of
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/PartyAddress" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2495,6 +2673,176 @@ components:
         resolves_to: { type: string, format: uuid, description: "The survivor this id resolves to; itself when it was not merged away." }
         alias_ids: { type: array, items: { type: string, format: uuid } }
         lineage: { type: array, items: { $ref: "#/components/schemas/LineageEvent" } }
+
+    AddressType:
+      type: string
+      description: "REGISTERED, PRINCIPAL_PLACE, OPERATING, BILLING, REMITTANCE, TAX, EMPLOYMENT_ESTABLISHMENT or a custom X_UPPER_CASE type."
+      pattern: '^(REGISTERED|PRINCIPAL_PLACE|OPERATING|BILLING|REMITTANCE|TAX|EMPLOYMENT_ESTABLISHMENT|X_[A-Z0-9_]{1,30})$'
+
+    AddressFields:
+      type: object
+      required: [lines, locality, country, source_class, evidence_ref]
+      properties:
+        lines: { type: array, minItems: 1, maxItems: 4, items: { type: string, minLength: 1, maxLength: 200 } }
+        locality: { type: string }
+        subdivision: { type: string }
+        postal_code: { type: string, maxLength: 20 }
+        country: { type: string, minLength: 2, maxLength: 2, description: "ISO 3166-1 alpha-2. A well-shaped but unassigned code is recorded and fails verification." }
+        formatted: { type: string, description: "Free-text rendering as supplied, kept apart from the structured fields." }
+        valid_from: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    CreateAddressRequest:
+      allOf:
+        - $ref: "#/components/schemas/AddressFields"
+        - type: object
+          required: [address_type]
+          properties:
+            create_request_id: { type: string, maxLength: 128 }
+            address_type: { $ref: "#/components/schemas/AddressType" }
+
+    AmendAddressRequest:
+      allOf:
+        - $ref: "#/components/schemas/AddressFields"
+        - type: object
+          required: [expected_version, reason]
+          properties:
+            expected_version: { type: integer, minimum: 1 }
+            reason: { type: string }
+
+    VerifyAddressRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        verifier: { type: string, enum: [LOCAL_RULES, EXTERNAL_PROVIDER], description: "EXTERNAL_PROVIDER is BLOCKED and answers 503." }
+        correlation_id: { type: string }
+
+    LinkAddressRequest:
+      type: object
+      required: [address_id, link_type, evidence_ref, expected_master_version]
+      properties:
+        address_id: { type: string, format: uuid }
+        link_type: { $ref: "#/components/schemas/AddressType" }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        expected_master_version: { type: integer, minimum: 1 }
+        correlation_id: { type: string }
+
+    Address:
+      type: object
+      required: [address_id, tenant_id, address_type, current_version, created_by, created_at]
+      properties:
+        address_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        address_type: { $ref: "#/components/schemas/AddressType" }
+        current_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    AddressVersion:
+      type: object
+      required: [version_no, lines, locality, country, normalized, valid_from, verification_state, source_class, evidence_ref, recorded_by, recorded_at]
+      properties:
+        version_no: { type: integer }
+        lines: { type: array, items: { type: string } }
+        locality: { type: string }
+        subdivision: { type: string }
+        postal_code: { type: string }
+        country: { type: string }
+        formatted: { type: string }
+        normalized: { type: string, description: "Comparison form; never replaces the source fields." }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        verification_state: { type: string, enum: [UNVERIFIED, VERIFIED, SUPERSEDED] }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        recorded_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+        superseded_at: { type: string, format: date-time }
+        reason: { type: string }
+
+    AddressObservation:
+      type: object
+      required: [version_no, verifier, result, confidence, findings, normalized_seen, observed_at]
+      properties:
+        verification_id: { type: string, format: uuid }
+        version_no: { type: integer }
+        verifier: { type: string }
+        result: { type: string, enum: [PASSED, LOW_CONFIDENCE, FAILED] }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        findings: { type: array, items: { type: string } }
+        normalized_seen: { type: string }
+        observed_by: { type: string }
+        observed_at: { type: string, format: date-time }
+
+    AddressOutcome:
+      type: object
+      required: [address, version]
+      properties:
+        address: { $ref: "#/components/schemas/Address" }
+        version: { $ref: "#/components/schemas/AddressVersion" }
+
+    VerifyOutcome:
+      type: object
+      required: [address, version, observation]
+      properties:
+        address: { $ref: "#/components/schemas/Address" }
+        version: { $ref: "#/components/schemas/AddressVersion" }
+        observation: { $ref: "#/components/schemas/AddressObservation" }
+
+    AddressView:
+      type: object
+      required: [address, version, verifications]
+      properties:
+        address: { $ref: "#/components/schemas/Address" }
+        version: { nullable: true, allOf: [{ $ref: "#/components/schemas/AddressVersion" }] }
+        verifications: { type: array, items: { $ref: "#/components/schemas/AddressObservation" } }
+        history: { type: array, items: { $ref: "#/components/schemas/AddressVersion" } }
+
+    AddressSummary:
+      type: object
+      required: [address_id, address_type, version_no, locality, country, verification_state, normalized]
+      properties:
+        address_id: { type: string, format: uuid }
+        address_type: { $ref: "#/components/schemas/AddressType" }
+        version_no: { type: integer }
+        locality: { type: string }
+        postal_code: { type: string }
+        country: { type: string }
+        verification_state: { type: string }
+        normalized: { type: string }
+
+    AddressLink:
+      type: object
+      required: [link_id, address_id, party_id, link_type, valid_from, evidence_ref, linked_by, linked_at]
+      properties:
+        link_id: { type: string, format: uuid }
+        address_id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        link_type: { $ref: "#/components/schemas/AddressType" }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        evidence_ref: { type: string }
+        linked_by: { type: string }
+        linked_at: { type: string, format: date-time }
+
+    AddressLinkOutcome:
+      type: object
+      required: [link, party]
+      properties:
+        link: { $ref: "#/components/schemas/AddressLink" }
+        party: { $ref: "#/components/schemas/Party" }
+        ended: { $ref: "#/components/schemas/AddressLink" }
+
+    PartyAddress:
+      type: object
+      required: [link, version]
+      properties:
+        link: { $ref: "#/components/schemas/AddressLink" }
+        version: { nullable: true, allOf: [{ $ref: "#/components/schemas/AddressVersion" }] }
 
     IdentifierScheme:
       type: string

@@ -103,6 +103,11 @@ func codeEventNames() []string {
 		events.EventPartiesMerged,
 		events.EventPartySplit,
 		events.EventMasterConflictResolved,
+		// ORG-08 addresses (address_events.go).
+		events.EventAddressCreated,
+		events.EventAddressVerified,
+		events.EventAddressSuperseded,
+		events.EventAddressLinked,
 	}
 }
 

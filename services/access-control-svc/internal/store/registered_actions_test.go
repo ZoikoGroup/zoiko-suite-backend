@@ -65,6 +65,12 @@ var registeredActionMigrations = []struct {
 		"PARTY_SPLIT":             "HIGH",
 		"PARTY_RESOLUTION_DECIDE": "HIGH",
 	}},
+	{"000046_register_address_actions", "tenant-entity-registry-svc", map[string]string{
+		"ADDRESS_CREATE": "STANDARD",
+		"ADDRESS_AMEND":  "STANDARD",
+		"ADDRESS_VERIFY": "STANDARD",
+		"ADDRESS_LINK":   "STANDARD",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

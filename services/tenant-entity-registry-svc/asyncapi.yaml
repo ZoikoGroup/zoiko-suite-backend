@@ -103,6 +103,11 @@ channels:
           - $ref: "#/components/messages/PartiesMerged"
           - $ref: "#/components/messages/PartySplit"
           - $ref: "#/components/messages/MasterConflictResolved"
+          # ── ORG-08 addresses ─────────────────────────────────────────────
+          - $ref: "#/components/messages/AddressCreated"
+          - $ref: "#/components/messages/AddressVerified"
+          - $ref: "#/components/messages/AddressSuperseded"
+          - $ref: "#/components/messages/AddressLinked"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -384,6 +389,44 @@ components:
       name: master.conflict.resolved
       title: A stewardship case was decided
       description: Carries the case id, conflict_type, decision and the party the decision settled on.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AddressCreated:
+      name: address.created
+      title: An address was recorded
+      description: Carries identifiers, the address type, country and source class, never the address itself.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AddressVerified:
+      name: address.verified
+      title: An address version passed a verification observation
+      description: |
+        Emitted only when a version reaches VERIFIED. It says an observation passed, not that the address is
+        a legal registered office or still current. Carries verifier, result and confidence.
+      x-spec-event: AddressVerified
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AddressSuperseded:
+      name: address.superseded
+      title: An address version was replaced by a newer one
+      description: Carries superseded_version_no and the new version's valid_from. Historical versions stay readable.
+      x-spec-event: AddressSuperseded
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AddressLinked:
+      name: address.linked
+      title: An address was linked to a party
+      description: Carries party_id, link_id, link_type and valid_from.
       x-spec-event: null
       x-delivery: outbox
       payload:

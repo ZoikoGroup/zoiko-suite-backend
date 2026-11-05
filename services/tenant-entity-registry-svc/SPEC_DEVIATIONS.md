@@ -164,3 +164,24 @@ Where the spec leaves a choice, the code chooses the safer reading:
   `KEEP_HOLDER` and `MOVE_TO_REQUESTER` settle the other cases. Accepting a proposed fact supersedes the verified one
   rather than editing it, and records the accepted fact as verified at decision time, so "what did we know then" still
   has its answer.
+
+### Addresses (ORG-08 and MDM-03, wave 1)
+
+- **An address is an identity with append-only versions.** `POST /v1/addresses` records one; `POST .../versions`
+  amends it by closing the prior version and adding the next. Nothing is edited or deleted (database guards), and
+  `GET /v1/addresses/{id}?as_of=` returns the version in force then. The structured fields are kept exactly as
+  entered; the normalized form beside them only aids matching and search.
+- **Verification is an observation, not a certificate.** `:verify` runs a deterministic local rule check (country is
+  an assigned ISO 3166-1 code, required fields present, postal code fits the published format where one is fixed) and
+  appends the result. Only a confident PASSED moves a version to VERIFIED; a country with no rule is surfaced as
+  LOW_CONFIDENCE, a violation is FAILED, and neither changes the address. It never reports full confidence, because it
+  does not geocode or confirm delivery. The external provider verifier is BLOCKED (503) until the external data feed
+  service exists; it never falls back silently to the local rules.
+- **A postal address is not a registered office (MDM s14.2).** A REGISTERED address is recorded, or amended, only with
+  source_class AUTHORITY_REGISTRY or AUTHORITY_DOCUMENT; verifying never changes an address's type, and an address is
+  linked to a party only in its own capacity. A party has one live registered-office link; a new one ends the old on its
+  start date and the old stays queryable (`GET /v1/parties/{id}/addresses?as_of=&include_ended=`).
+- **Country and subdivision are resolved against a built-in ISO 3166 list, not MDM-04 reference ids.** The reference
+  module (ORG-8) is not built yet; when it is, the verifier should resolve through it.
+- **Establishments and the registered-office route are wave 2.** `POST /v1/entities/{id}/registered-office` still
+  stores opaque JSON until it is moved onto this model.

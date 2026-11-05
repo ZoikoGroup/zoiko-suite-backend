@@ -55,6 +55,7 @@ func registerPartyRoutes(r chi.Router, h *Handler) {
 	r.Get("/identifiers:find", h.FindByExternalIdentifier)
 	r.Get("/resolution-cases/{caseID}", h.GetResolutionCase)
 	registerPartyResolutionRoutes(r, h)
+	registerAddressRoutes(r, h)
 }
 
 func (h *Handler) parties() PartyService {
