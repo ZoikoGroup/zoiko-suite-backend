@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
+	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 )
 
 const evidenceRequestColumns = `request_id, tenant_id, legal_entity_id, requirement_id, title, description, assigned_to_principal_id,
@@ -160,6 +163,161 @@ func (s *PgStore) ListOpenEvidenceRequests(ctx context.Context, tenantID, legalE
 	if err != nil {
 		return nil, storeWrap(err)
 	}
+	return out, nil
+}
+
+// ListOpenEvidenceRequestsCursor returns a cursor-paginated page of PBC requests.
+func (s *PgStore) ListOpenEvidenceRequestsCursor(ctx context.Context, filter domain.ListPBCRequestsFilter) (domain.CursorPage[*domain.EvidenceRequest], error) {
+	var out domain.CursorPage[*domain.EvidenceRequest]
+	out.Items = []*domain.EvidenceRequest{}
+	var cursor apicontract.Cursor
+
+	allowedFilters := []string{"legal_entity_id", "status"}
+	allowedSort := []string{"due_at", "created_at", "status", "title"}
+
+	pageFilters := map[string]string{}
+	if filter.LegalEntityID != "" {
+		pageFilters["filter[legal_entity_id]"] = filter.LegalEntityID
+	}
+	if filter.Status != "" {
+		pageFilters["filter[status]"] = filter.Status
+	}
+
+	page, err := parsePageFromFilter(pageFilters, allowedFilters, allowedSort, "due_at")
+	if err != nil {
+		return out, err
+	}
+
+	if filter.PageSize > 0 {
+		page.PageSize = filter.PageSize
+	}
+	if filter.Cursor != "" {
+		page.Cursor = filter.Cursor
+	}
+	if filter.Sort != "" {
+		page.Sort = nil
+		for _, part := range strings.Split(filter.Sort, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			term := apicontract.SortTerm{Field: strings.TrimPrefix(part, "-"), Desc: strings.HasPrefix(part, "-")}
+			page.Sort = append(page.Sort, term)
+		}
+	}
+
+	var signer *apicontract.CursorSigner
+	signer, err = apicontract.NewCursorSigner([]byte("evidence-requirements-svc-local-dev-cursor-key-16-bytes-min"))
+	if err != nil {
+		return out, err
+	}
+
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return out, fmt.Errorf("tenant not in context")
+	}
+
+	route := apicontract.ScopedRoute("/v1/pbc/requests")
+	filterKey := buildFilterKey(page.Filters)
+	sortKey := buildSortKey(page.Sort)
+
+	var cur apicontract.Cursor
+	if signer != nil && page.Cursor != "" {
+		cur, err = signer.Verify(page.Cursor, tenantID, route, filterKey, sortKey)
+	} else if page.Cursor != "" {
+		err = errors.New("cursor signer unavailable")
+	}
+	if err != nil {
+		return out, err
+	}
+	cursor = cur
+	if err != nil {
+		return out, err
+	}
+
+	where := "WHERE tenant_id = $1 AND status NOT IN ('SATISFIED','CLOSED')"
+	args := []any{tenantID}
+	argIdx := 2
+
+	if filter.LegalEntityID != "" {
+		where += fmt.Sprintf(" AND legal_entity_id::text = $%d", argIdx)
+		args = append(args, filter.LegalEntityID)
+		argIdx++
+	}
+	if filter.Status != "" {
+		where += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, filter.Status)
+		argIdx++
+	}
+
+	if cursor.LastID != "" {
+		where += fmt.Sprintf(" AND request_id < $%d", argIdx)
+		args = append(args, cursor.LastID)
+		argIdx++
+	}
+
+	orderBy := "ORDER BY "
+	sortParts := []string{}
+	for _, t := range page.Sort {
+		dir := "ASC"
+		if t.Desc {
+			dir = "DESC"
+		}
+		sortParts = append(sortParts, t.Field+" "+dir)
+	}
+	if len(sortParts) == 0 {
+		sortParts = append(sortParts, "due_at ASC")
+	}
+	orderBy += strings.Join(sortParts, ", ")
+
+	limit := page.PageSize + 1
+	where += fmt.Sprintf(" LIMIT $%d", argIdx)
+	args = append(args, limit)
+
+	query := fmt.Sprintf("SELECT %s FROM evidence_requests %s %s", evidenceRequestColumns, where, orderBy)
+
+	var items []*domain.EvidenceRequest
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, err := scanEvidenceRequest(rows)
+			if err != nil {
+				return err
+			}
+			items = append(items, r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return out, err
+	}
+
+	hasNext := len(items) > page.PageSize
+	if hasNext {
+		items = items[:page.PageSize]
+	}
+
+	if hasNext && len(items) > 0 {
+		last := items[len(items)-1]
+		nextCursor, err := signer.Sign(apicontract.Cursor{
+			TenantID: tenantID,
+			Route:    route,
+			Filter:   filterKey,
+			Sort:     sortKey,
+			Offset:   cursor.Offset + len(items),
+			LastID:   last.RequestID,
+		})
+		if err != nil {
+			return out, err
+		}
+		out.NextCursor = nextCursor
+	}
+
+	out.Items = items
 	return out, nil
 }
 

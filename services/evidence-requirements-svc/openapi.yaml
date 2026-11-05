@@ -83,6 +83,32 @@ paths:
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
+  /v1/evidence/evaluations:
+    get:
+      tags: [evaluation]
+      operationId: listEvaluationsCursor
+      parameters:
+        - {name: legal_entity_id, in: query, schema: {type: string, format: uuid}}
+        - {name: domain_code, in: query, schema: {type: string}}
+        - {name: action_type, in: query, schema: {type: string}}
+        - {name: outcome, in: query, schema: {type: string}}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: sort, in: query, schema: {type: string}}
+      responses:
+        '200': {description: Cursor-paginated evaluations, content: {application/json: {schema: {$ref: '#/components/schemas/CursorPageEvaluation'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+  /v1/evidence/summary:
+    get:
+      tags: [evaluation]
+      operationId: getEvidenceSummary
+      responses:
+        '200': {description: Evidence summary counts, content: {application/json: {schema: {$ref: '#/components/schemas/EvidenceSummary'}}}}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
   /v1/evidence-requirements:
     get:
       tags: [catalogue]
@@ -93,8 +119,29 @@ paths:
         - {name: action_type, in: query, schema: {type: string}}
         - {name: as_of, in: query, description: "RFC 3339 or 'now'; omitted returns the full history", schema: {type: string}}
         - {name: tenant_id, in: query, description: May only repeat the caller's tenant, schema: {type: string}}
+        - {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: sort, in: query, schema: {type: string}}
       responses:
         '200': {description: The caller's tenant catalogue, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Requirement'}}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+  /v1/evidence-requirements/cursor:
+    get:
+      tags: [catalogue]
+      operationId: listRequirementsCursor
+      parameters:
+        - {name: legal_entity_id, in: query, schema: {type: string, format: uuid}}
+        - {name: domain_code, in: query, schema: {type: string}}
+        - {name: action_type, in: query, schema: {type: string}}
+        - {name: as_of, in: query, description: "RFC 3339 or 'now'; omitted returns the full history", schema: {type: string}}
+        - {name: tenant_id, in: query, description: May only repeat the caller's tenant, schema: {type: string}}
+        - {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: sort, in: query, schema: {type: string}}
+      responses:
+        '200': {description: Cursor-paginated requirements, content: {application/json: {schema: {$ref: '#/components/schemas/CursorPageRequirement'}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -183,6 +230,21 @@ paths:
       operationId: listOpenEvidenceRequests
       responses:
         '200': {description: Open requests, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/EvidenceRequest'}}}}}
+  /v1/pbc/requests/cursor:
+    get:
+      tags: [pbc]
+      operationId: listOpenEvidenceRequestsCursor
+      parameters:
+        - {name: legal_entity_id, in: query, schema: {type: string, format: uuid}}
+        - {name: status, in: query, schema: {type: string}}
+        - {name: page_size, in: query, schema: {type: integer, minimum: 1, maximum: 200}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: sort, in: query, schema: {type: string}}
+      responses:
+        '200': {description: Cursor-paginated PBC requests, content: {application/json: {schema: {$ref: '#/components/schemas/CursorPageEvidenceRequest'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
   /v1/pbc/requests/{request_id}:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
     get:
@@ -347,3 +409,34 @@ components:
         created_at: {type: string, format: date-time}
         is_overdue: {type: boolean}
       additionalProperties: true
+    CursorPageRequirement:
+      type: object
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Requirement'}
+        next_cursor: {type: [string, 'null']}
+    CursorPageEvaluation:
+      type: object
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Evaluation'}
+        next_cursor: {type: [string, 'null']}
+    CursorPageEvidenceRequest:
+      type: object
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/EvidenceRequest'}
+        next_cursor: {type: [string, 'null']}
+    EvidenceSummary:
+      type: object
+      properties:
+        active_requirements: {type: integer}
+        evaluations_satisfied_30d: {type: integer}
+        evaluations_missing_30d: {type: integer}
+        actions_with_no_requirements_30d: {type: integer}
+        open_pbc_requests: {type: integer}
+        overdue_pbc_requests: {type: integer}
+        unpublished_outbox_older_than_5_minutes: {type: integer}

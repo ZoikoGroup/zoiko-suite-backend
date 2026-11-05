@@ -66,6 +66,11 @@ type stubStore struct {
 	// test can assert the catalog was read in the caller's verified tenant
 	// rather than in whatever ?tenant_id= named.
 	listFilter domain.ListRequirementsFilter
+
+	// For cursor pagination
+	listRequirementsCursorResult domain.CursorPage[domain.EvidenceRequirement]
+	listEvaluationsCursorResult  domain.CursorPage[domain.EvidenceEvaluation]
+	summaryResult                *domain.EvidenceSummary
 }
 
 func (s *stubStore) CreateRequirement(_ context.Context, r *domain.EvidenceRequirement) (bool, error) {
@@ -111,6 +116,18 @@ func (s *stubStore) RecordEvaluation(_ context.Context, e *domain.EvidenceEvalua
 
 func (s *stubStore) GetEvaluation(_ context.Context, _ string) (*domain.EvidenceEvaluation, error) {
 	return s.evaluation, nil
+}
+
+func (s *stubStore) ListRequirementsCursor(_ context.Context, _ domain.ListRequirementsFilter) (domain.CursorPage[domain.EvidenceRequirement], error) {
+	return s.listRequirementsCursorResult, nil
+}
+
+func (s *stubStore) ListEvaluationsCursor(_ context.Context, _ domain.ListEvaluationsFilter) (domain.CursorPage[domain.EvidenceEvaluation], error) {
+	return s.listEvaluationsCursorResult, nil
+}
+
+func (s *stubStore) GetSummary(_ context.Context, _ string) (*domain.EvidenceSummary, error) {
+	return s.summaryResult, nil
 }
 
 // stubPublisher collects the evaluations whose event reached the outbox.

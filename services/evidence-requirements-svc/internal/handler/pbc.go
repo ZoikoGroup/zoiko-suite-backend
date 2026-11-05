@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -29,6 +30,7 @@ type PBCStore interface {
 	GetEvidenceRequest(ctx context.Context, tenantID, requestID string) (*domain.EvidenceRequest, error)
 	GetResponseRequest(ctx context.Context, tenantID, responseID string) (*domain.EvidenceRequest, error)
 	ListOpenEvidenceRequests(ctx context.Context, tenantID, legalEntityID string) ([]*domain.EvidenceRequest, error)
+	ListOpenEvidenceRequestsCursor(ctx context.Context, filter domain.ListPBCRequestsFilter) (domain.CursorPage[*domain.EvidenceRequest], error)
 	SendEvidenceRequest(ctx context.Context, p domain.SendEvidenceRequestParams) (*domain.EvidenceRequest, error)
 	ReassignEvidenceRequest(ctx context.Context, p domain.ReassignEvidenceRequestParams) (*domain.EvidenceRequest, error)
 	ExtendDueDate(ctx context.Context, p domain.ExtendDueDateParams) (*domain.EvidenceRequest, error)
@@ -47,6 +49,7 @@ func RegisterPBCRoutes(r chi.Router, h *Handler, pbcStore PBCStore) {
 	r.Route("/v1/pbc/requests", func(r chi.Router) {
 		r.Post("/", ph.CreateRequest)
 		r.Get("/", ph.ListOpenRequests)
+		r.Get("/cursor", ph.ListOpenRequestsCursor)
 		r.Get("/{request_id}", ph.GetRequest)
 		r.Post("/{request_id}/send", ph.SendRequest)
 		r.Post("/{request_id}/reassign", ph.ReassignRequest)
@@ -174,6 +177,49 @@ func (h *pbcHandler) ListOpenRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, r, http.StatusOK, reqs)
+}
+
+func (h *pbcHandler) ListOpenRequestsCursor(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+
+	filter := domain.ListPBCRequestsFilter{
+		TenantID:      tenantID,
+		LegalEntityID: r.URL.Query().Get("legal_entity_id"),
+		Status:        r.URL.Query().Get("status"),
+		Cursor:        r.URL.Query().Get("cursor"),
+		PageSize:      0,
+		Sort:          r.URL.Query().Get("sort"),
+	}
+
+	if filter.LegalEntityID != "" && !isUUID(filter.LegalEntityID) {
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+
+	if ps := r.URL.Query().Get("page_size"); ps != "" {
+		n, err := strconv.Atoi(ps)
+		if err != nil || n < 1 || n > 200 {
+			writeError(w, r, http.StatusBadRequest, "invalid_page_size", "page_size must be between 1 and 200")
+			return
+		}
+		filter.PageSize = n
+	}
+
+	page, err := h.store.ListOpenEvidenceRequestsCursor(r.Context(), filter)
+	if err != nil {
+		h.writePBCErr(w, r, err)
+		return
+	}
+	if page.Items == nil {
+		page.Items = []*domain.EvidenceRequest{}
+	}
+	writeJSON(w, r, http.StatusOK, page)
 }
 
 // requireManageAuthz fetches the request (to learn its own legal entity)

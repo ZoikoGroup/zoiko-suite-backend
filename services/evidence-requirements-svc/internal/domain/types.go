@@ -212,6 +212,55 @@ type ListRequirementsFilter struct {
 	// Zero value means "no effective-date filter — return all, including
 	// retired ones", which is what an auditor reviewing history needs.
 	AsOf time.Time
+
+	// Cursor pagination fields (API-4)
+	Cursor   string
+	PageSize int
+	Sort     string
+}
+
+// ListEvaluationsFilter holds filters for querying evaluations.
+type ListEvaluationsFilter struct {
+	TenantID      string
+	LegalEntityID string
+	DomainCode    string
+	ActionType    string
+	Outcome       string
+	Since         *time.Time
+
+	// Cursor pagination fields (API-4)
+	Cursor   string
+	PageSize int
+	Sort     string
+}
+
+// ListPBCRequestsFilter holds filters for querying PBC requests.
+type ListPBCRequestsFilter struct {
+	TenantID      string
+	LegalEntityID string
+	Status        string
+
+	// Cursor pagination fields (API-4)
+	Cursor   string
+	PageSize int
+	Sort     string
+}
+
+// CursorPage is a generic cursor-paginated response.
+type CursorPage[T any] struct {
+	Items      []T    `json:"items"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+// EvidenceSummary is the response for GET /v1/evidence/summary.
+type EvidenceSummary struct {
+	ActiveRequirements                 int `json:"active_requirements"`
+	EvaluationsSatisfied30d            int `json:"evaluations_satisfied_30d"`
+	EvaluationsMissing30d              int `json:"evaluations_missing_30d"`
+	ActionsWithNoRequirements30d       int `json:"actions_with_no_requirements_30d"`
+	OpenPBCRequests                    int `json:"open_pbc_requests"`
+	OverduePBCRequests                 int `json:"overdue_pbc_requests"`
+	UnpublishedOutboxOlderThan5Minutes int `json:"unpublished_outbox_older_than_5_minutes"`
 }
 
 // OutboxEvent represents an event to be written to the outbox table.

@@ -69,6 +69,11 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// CursorSigningKey is the HMAC key for signing API-4 cursors.
+	// Must be at least 16 bytes. In local/dev a deterministic default is
+	// used; outside local/dev it MUST be set via env.
+	CursorSigningKey string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -128,6 +133,7 @@ func Load() (*Config, error) {
 		EvaluateAuthzMode:          strings.ToLower(env("EVIDENCE_EVALUATE_AUTHZ", "enforce")),
 		ReadAuthzMode:              strings.ToLower(env("EVIDENCE_READ_AUTHZ", "enforce")),
 		OTELExporterEndpoint:       env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		CursorSigningKey:           env("CURSOR_SIGNING_KEY", ""),
 	}, nil
 }
 

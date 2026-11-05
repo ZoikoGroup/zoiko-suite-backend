@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,7 @@ type Store interface {
 	CreateRequirement(ctx context.Context, r *domain.EvidenceRequirement) (created bool, err error)
 	GetRequirement(ctx context.Context, requirementID string) (*domain.EvidenceRequirement, error)
 	ListRequirements(ctx context.Context, filter domain.ListRequirementsFilter) ([]domain.EvidenceRequirement, error)
+	ListRequirementsCursor(ctx context.Context, filter domain.ListRequirementsFilter) (domain.CursorPage[domain.EvidenceRequirement], error)
 	EffectiveRequirements(ctx context.Context, tenantID, legalEntityID, domainCode, actionType string, asOf time.Time) ([]domain.EvidenceRequirement, error)
 	EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID string) (*domain.EvidenceRequirement, error)
 	// RecordEvaluation appends an evaluation record and optionally writes an
@@ -51,6 +53,8 @@ type Store interface {
 	// is unavailable or the client disconnects.
 	RecordEvaluation(ctx context.Context, e *domain.EvidenceEvaluation, outboxEvent *domain.OutboxEvent) (created bool, err error)
 	GetEvaluation(ctx context.Context, evaluationID string) (*domain.EvidenceEvaluation, error)
+	ListEvaluationsCursor(ctx context.Context, filter domain.ListEvaluationsFilter) (domain.CursorPage[domain.EvidenceEvaluation], error)
+	GetSummary(ctx context.Context, tenantID string) (*domain.EvidenceSummary, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -211,10 +215,13 @@ func (h *Handler) checkEntity(w http.ResponseWriter, r *http.Request, tenantID, 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/evidence", func(r chi.Router) {
 		r.Post("/evaluate", h.Evaluate)
+		r.Get("/evaluations", h.ListEvaluationsCursor)
 		r.Get("/evaluations/{evaluation_id}", h.GetEvaluation)
+		r.Get("/summary", h.GetSummary)
 	})
 	r.Route("/v1/evidence-requirements", func(r chi.Router) {
 		r.Get("/", h.ListRequirements)
+		r.Get("/cursor", h.ListRequirementsCursor)
 		r.Get("/{evidence_requirement_id}", h.GetRequirement)
 	})
 	// Catalog mutation. Authorization-gated — see package doc.
@@ -814,6 +821,176 @@ func (h *Handler) GetRequirement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, r, http.StatusOK, req)
+}
+
+// ── GET /v1/evidence-requirements (cursor-paginated) ────────────────────────────
+
+func (h *Handler) ListRequirementsCursor(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID != "" && !isUUID(legalEntityID) {
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	readScope := platformScope
+	if legalEntityID != "" {
+		readScope = legalEntityID
+	}
+	if !h.gate(w, r, h.readMode, principalID, readScope, actionReadRequirement) {
+		return
+	}
+
+	filter := domain.ListRequirementsFilter{
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		DomainCode:    q.Get("domain_code"),
+		ActionType:    q.Get("action_type"),
+		Cursor:        q.Get("cursor"),
+		PageSize:      0,
+		Sort:          q.Get("sort"),
+	}
+
+	switch v := q.Get("as_of"); v {
+	case "":
+	case "now":
+		filter.AsOf = time.Now().UTC()
+	default:
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid_field", "as_of must be RFC3339 or 'now'")
+			return
+		}
+		filter.AsOf = t
+	}
+
+	if ps := q.Get("page_size"); ps != "" {
+		n, err := strconv.Atoi(ps)
+		if err != nil || n < 1 || n > 200 {
+			writeError(w, r, http.StatusBadRequest, "invalid_page_size", "page_size must be between 1 and 200")
+			return
+		}
+		filter.PageSize = n
+	}
+
+	page, err := h.store.ListRequirementsCursor(r.Context(), filter)
+	if err != nil {
+		h.log.Error("ListRequirementsCursor: store unavailable", zap.Error(err))
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if page.Items == nil {
+		page.Items = []domain.EvidenceRequirement{}
+	}
+	writeJSON(w, r, http.StatusOK, page)
+}
+
+// ── GET /v1/evidence/evaluations (cursor-paginated) ────────────────────────────
+
+func (h *Handler) ListEvaluationsCursor(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// Evaluations are read at the entity they are about (legal_entity_id).
+	// If no legal_entity_id filter, use PLATFORM scope for the gate.
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID != "" && !isUUID(legalEntityID) {
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+	readScope := platformScope
+	if legalEntityID != "" {
+		readScope = legalEntityID
+	}
+	if !h.gate(w, r, h.readMode, principalID, readScope, actionReadEvaluation) {
+		return
+	}
+
+	filter := domain.ListEvaluationsFilter{
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		DomainCode:    q.Get("domain_code"),
+		ActionType:    q.Get("action_type"),
+		Outcome:       q.Get("outcome"),
+		Cursor:        q.Get("cursor"),
+		PageSize:      0,
+		Sort:          q.Get("sort"),
+	}
+
+	if since := q.Get("since"); since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid_field", "since must be RFC3339")
+			return
+		}
+		filter.Since = &t
+	}
+
+	if ps := q.Get("page_size"); ps != "" {
+		n, err := strconv.Atoi(ps)
+		if err != nil || n < 1 || n > 200 {
+			writeError(w, r, http.StatusBadRequest, "invalid_page_size", "page_size must be between 1 and 200")
+			return
+		}
+		filter.PageSize = n
+	}
+
+	page, err := h.store.ListEvaluationsCursor(r.Context(), filter)
+	if err != nil {
+		h.log.Error("ListEvaluationsCursor: store unavailable", zap.Error(err))
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if page.Items == nil {
+		page.Items = []domain.EvidenceEvaluation{}
+	}
+	writeJSON(w, r, http.StatusOK, page)
+}
+
+// ── GET /v1/evidence/summary ────────────────────────────────────────────────────
+
+func (h *Handler) GetSummary(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// Summary is tenant-scoped; use PLATFORM for the gate.
+	if !h.gate(w, r, h.readMode, principalID, platformScope, actionReadRequirement) {
+		return
+	}
+
+	summary, err := h.store.GetSummary(r.Context(), tenantID)
+	if err != nil {
+		h.log.Error("GetSummary: store unavailable", zap.Error(err))
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, r, http.StatusOK, summary)
 }
 
 // ── POST /v1/admin/evidence-requirements ───────────────────────────────────────
