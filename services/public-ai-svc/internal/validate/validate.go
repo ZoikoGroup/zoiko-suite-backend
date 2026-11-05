@@ -12,8 +12,13 @@ import (
 	"zoiko.io/public-ai-svc/internal/model"
 )
 
-// MaxWords is the answer length before "expand" (Doc 01 §12).
-const MaxWords = 120
+// MaxWords is the answer length shown before "expand" (Doc 01 §12): the
+// first MaxWords words carry the complete core answer. MaxFullWords bounds
+// the whole answer, including the detail behind "Show more".
+const (
+	MaxWords     = 120
+	MaxFullWords = 240
+)
 
 var (
 	ErrEmpty            = errors.New("empty answer")
@@ -141,7 +146,7 @@ func Check(d model.Draft, claims []model.ClaimCard, evidence []model.Evidence) (
 			return "", ErrUnsupportedFact
 		}
 	}
-	return truncateWords(text, MaxWords), nil
+	return truncateWords(text, MaxFullWords), nil
 }
 
 func claimAllows(claims []model.ClaimCard, phrase string) bool {

@@ -291,11 +291,12 @@ func joinParts(parts []string) string {
 	return b.String()
 }
 
-// answerWords is Doc 01 §12's default answer length before "expand";
-// fillWords is where adding context stops.
+// answerWords bounds an answer including the detail behind "Show more"
+// (validate.MaxFullWords); fillWords is where adding context stops. The best
+// passage's own sentences come first, so the first 120 words carry the core.
 const (
-	answerWords = 110
-	fillWords   = 80
+	answerWords = 220
+	fillWords   = 170
 )
 
 func wordCount(s string) int { return len(strings.Fields(s)) }

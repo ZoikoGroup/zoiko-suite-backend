@@ -66,7 +66,7 @@ func TestTruncatesToWholeSentences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(strings.Fields(out)); n > MaxWords || !strings.HasSuffix(out, ".") {
+	if n := len(strings.Fields(out)); n > MaxFullWords || !strings.HasSuffix(out, ".") {
 		t.Fatalf("got %d words, %q", n, out[len(out)-20:])
 	}
 }

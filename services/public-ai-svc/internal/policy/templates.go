@@ -221,6 +221,34 @@ func SupportTemplate(text string) (Template, bool) {
 	return Template{}, false
 }
 
+// TplSecurityReview routes a security or procurement review (Doc 02 §22
+// Trust chip, CTA "Start security review"); no evidence is supplied here.
+var TplSecurityReview = Template{contract.Handoff, "Security and procurement reviews run through the official Trust Center, where you can request scoped evidence for the deployment you are evaluating. I can describe ZoikoSuite's published security capabilities here, but I cannot supply review evidence in this chat.", "trust", false, contract.ReasonRouteOnly}
+
+// SecurityReviewRe asks to start a security or procurement review.
+var SecurityReviewRe = regexp.MustCompile(`(?i)^\s*(?:start (?:a )?)?security review\s*[.!?]?\s*$|\b(?:start|request|run|begin|arrange) (?:a |an )?(?:security|procurement|vendor) (?:review|assessment|questionnaire)\b|\bsecurity (?:and|&) procurement review\b`)
+
+// TplPartnership routes partner, reseller and referral interest (Doc 10
+// COM-10): the official contact route; nothing is recorded here.
+var TplPartnership = Template{contract.Handoff, "Partnership enquiries, including integration, referral and reseller interest, go through ZoikoSuite's official contact route, where you can choose the partnership purpose. Nothing is recorded or sent from this chat.", "support", false, contract.ReasonRouteOnly}
+
+// PartnershipRe marks partner, reseller or referral interest.
+var PartnershipRe = regexp.MustCompile(`(?i)\b(?:become|be|becoming) (?:an? )?(?:integration |technology |referral |reseller |channel |agency )?partners?\b|\bpartnership\b|\breseller\b|\breferral partner\b`)
+
+// TplNoTools refuses browsing and tool use (Doc 07 QA-T041, Doc 04 §07: the
+// model has no tools).
+var TplNoTools = Template{contract.RefusedAction, "I can't browse the web, call other systems or use external tools. I answer only from approved, public ZoikoSuite information.", "", false, contract.ReasonActionDenied}
+
+// ToolRequestRe asks the assistant to browse, search the web or run a tool.
+var ToolRequestRe = regexp.MustCompile(`(?i)\b(?:search|browse|google|look up) (?:the )?(?:web|internet|online)\b|\b(?:use|run|call|invoke) (?:an? )?(?:external |third-party )?(?:tool|plugin|api|function)s?\b|\bweb search\b`)
+
+// TplCredentialShared answers a visitor who says they shared a secret
+// (Doc 06 §20, Doc 02 T22) without the secret itself being in the message.
+var TplCredentialShared = ExceptionTemplates[X03SensitiveInput]
+
+// CredentialSharedRe: "I pasted my bank password", "I shared my PIN".
+var CredentialSharedRe = regexp.MustCompile(`(?i)\b(?:i|we)(?:'ve| have)? (?:pasted|shared|typed|sent|posted|entered|included)\b.{0,30}\b(?:password|passcode|pin|otp|one-time code|card number|bank details|credentials?|api key|token)\b`)
+
 // TplUptime is Doc 02 T27: no uptime guarantee or SLA is inferred.
 var TplUptime = Template{contract.Abstain, "I cannot confirm a contractual uptime guarantee from the public information currently available. An agreed SLA, if offered, must be evidenced in the applicable approved contract.", "trust", false, contract.ReasonNoApprovedInfo}
 

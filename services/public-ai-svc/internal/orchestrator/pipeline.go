@@ -241,6 +241,25 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		res.Suggestions = chips
 		return res
 	}
+	if policy.CredentialSharedRe.MatchString(dec.Redaction.Text) {
+		// Doc 06 §20: a visitor who says they shared a secret is told not to,
+		// even when the secret itself is not in this message.
+		res := p.fromTemplate(policy.TplCredentialShared, policy.X03SensitiveInput, snap, market, now, releaseID)
+		res.SecuritySignal = SignalSensitive
+		return res
+	}
+	if policy.ToolRequestRe.MatchString(dec.Redaction.Text) {
+		// Doc 07 QA-T041: no browsing or tool use; the model has no tools.
+		return p.fromTemplate(policy.TplNoTools, policy.X02ActionDenied, snap, market, now, releaseID)
+	}
+	if policy.PartnershipRe.MatchString(dec.Redaction.Text) {
+		// Doc 10 COM-10: partner interest goes to the official contact route.
+		return p.fromTemplate(policy.TplPartnership, "I24", snap, market, now, releaseID)
+	}
+	if policy.SecurityReviewRe.MatchString(dec.Redaction.Text) {
+		// Doc 02 §22: "Security review" starts the Trust Center route.
+		return p.fromTemplate(policy.TplSecurityReview, "I12", snap, market, now, releaseID)
+	}
 	if policy.UptimeQuestionRe.MatchString(dec.Redaction.Text) {
 		// Doc 02 T27: an uptime or SLA figure is never inferred.
 		return p.fromTemplate(policy.TplUptime, "I12", snap, market, now, releaseID)
@@ -354,7 +373,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				verified = append(verified, d.Verified...)
 			}
 		}
-	} else if reqs := claimRequests(intent, plansAndTrial, dec, in.Message, snap.Claims, market, now, carried); len(reqs) > 0 && !overview {
+	} else if reqs := p.planRequests(intent, plansAndTrial, dec, in, snap, market, now, carried); len(reqs) > 0 && !overview {
 		for _, req := range reqs {
 			if (req.Subject == claims.Price || req.Subject == claims.Trial) && !fv.PricingClaimsEnabled {
 				return because(p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, "pricing"), intent, snap, market, now, releaseID), contract.ReasonPricingDisabled)
@@ -1020,6 +1039,24 @@ var (
 // claimRequests lists the typed claims an intent needs, in answer order.
 // A plans-and-trial question needs plan availability and trial terms for
 // the same market; anything else needs at most one claim.
+// myMarketRe: the visitor ties the question to their own market (Doc 01
+// AT-01 "Which plans are available in my market?").
+var myMarketRe = regexp.MustCompile(`(?i)(?:my|our) (?:market|country|region|location|jurisdiction)|where (?:i|we) (?:am|are|operate|live)`)
+
+// planRequests is claimRequests plus the plan-availability rule: a plans
+// question with no market asks for one (Doc 02 T05) when the visitor refers
+// to their own market, or when no approved pricing page exists to answer it
+// generally; the signed PLAN_AVAILABILITY claim then answers per market.
+func (p *Pipeline) planRequests(intent string, plansAndTrial bool, dec policy.Decision, in Input, snap *release.Snapshot, market string, now time.Time, carried bool) []claims.Request {
+	if intent == "I05" && !plansAndTrial && !carried && !policy.AsksPrice(in.Message) && dec.Slots.BillingCadence == "" {
+		pricingPage := snap.Retriever.ByIntent(knowledge.Query{IntentID: "I05", Locale: in.Locale, Now: now, MaxChunks: 1}, snap).Answerability == knowledge.Answerable
+		if myMarketRe.MatchString(dec.Redaction.Text) || !pricingPage || market != "" {
+			return []claims.Request{{Subject: claims.PlanAvailability, Market: market, AsOf: now}}
+		}
+	}
+	return claimRequests(intent, plansAndTrial, dec, in.Message, snap.Claims, market, now, carried)
+}
+
 func claimRequests(intent string, plansAndTrial bool, dec policy.Decision, msg string, reg *claims.Resolver, market string, now time.Time, carried bool) []claims.Request {
 	if plansAndTrial {
 		return []claims.Request{
@@ -1140,6 +1177,11 @@ func withNeighbor(kb *knowledge.Index, hits []knowledge.Hit, q knowledge.Query, 
 func offersDemo(r Result) bool {
 	if r.Status != contract.Handoff && r.IntentID != "I08" {
 		return false
+	}
+	// The demo reply itself is the offer (Doc 02 S10), even where the
+	// release publishes no demo page and so no CTA is attached.
+	if r.Status == contract.Handoff && r.IntentID == "I08" {
+		return true
 	}
 	for _, a := range r.Actions {
 		if a.RouteKey == "demo" {
