@@ -71,6 +71,9 @@ func (p *Pipeline) now() time.Time {
 	return time.Now().UTC()
 }
 
+// EffectivePolicyVersion is the policy version this pipeline sends and records.
+func (p *Pipeline) EffectivePolicyVersion() string { return p.policyVersion() }
+
 func (p *Pipeline) policyVersion() string {
 	if p.PolicyVersion != "" {
 		return p.PolicyVersion

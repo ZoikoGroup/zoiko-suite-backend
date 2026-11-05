@@ -145,6 +145,37 @@ textfile collector).
    (RB-04) and the abstain-rate panel (RB-02). A failing `ready`/`session` step is RB-09.
 3. `PublicAICanaryStale` means the scheduler or the textfile collector stopped: fix the job, not the service.
 
+## RB-11 Rotating secrets and keys
+
+Doc 06 §12. Rotate on schedule (set by Security, DEC-09), on staff departure, and at once on any
+suspected exposure. Every rotation is a change with an approval reference; record it with
+`kbctl audit` and check `kbctl audit -verify` afterwards.
+
+| Secret | Where | Rotation |
+|---|---|---|
+| Release signing key (Ed25519) | private key offline with the release signers; public key in `PUBLIC_AI_SIGNING_PUBLIC_KEY` | Below. Tested by `release.TestSigningKeyRotation`. |
+| Model provider key (`GROQ_API_KEY`) | secret manager → service env | Issue the new key at the provider, deploy it, confirm `public_ai_model_requests_total{outcome="ok"}` rises, then revoke the old key at the provider. |
+| Database password (`PUBLIC_AI_DB_PASSWORD`) | secret manager → compose / service env | `ALTER ROLE public_ai_app PASSWORD …` in a transaction, deploy the new value, restart replicas one by one (each reconnects), confirm readiness. |
+| Rate-limit salt (`PUBLIC_AI_RATE_KEY_SALT`) | secret manager → every replica | Deploy the same new value to all replicas together. Counts restart from zero for one minute; nothing else changes. |
+| Policy digest (`PUBLIC_AI_POLICY_DIGEST`) | release record | Not a secret: it changes with an approved policy bundle (RB-04). |
+
+Session grants are random tokens with no signing key: ending every session (`kbctl` maintenance or a
+restart with an empty session table) is the only "rotation", and visitors simply start a new chat.
+
+**Release signing key:**
+
+1. `kbctl keygen` on the signers' offline machine. Store the new private key under the same custody
+   as the old one (DEC-09).
+2. Re-sign the current content as **new release ids**: releases are immutable (migration 000007), so
+   `kbctl build-kb`/`build-claims` with the new key, then
+   `PUBLIC_AI_SIGNING_PUBLIC_KEY=<new public key> kbctl publish -file …` (publish verifies with that key).
+3. `kbctl promote` the new KB and claims releases. Running replicas (old key) refuse them and keep
+   serving the last good snapshot: this is expected for the few minutes of the switch.
+4. Deploy `PUBLIC_AI_SIGNING_PUBLIC_KEY=<new public key>` and restart replicas. Readiness returns once the
+   rotated releases load.
+5. Retire the old private key. Rolling back to a release signed with it now fails closed; to roll
+   back content, re-sign the older content with the new key (step 2) and promote that.
+
 ## Alert → runbook map
 
 Every alert in `deployments/prometheus-rules-public-ai.yml` carries `runbook` and `runbook_url` annotations.

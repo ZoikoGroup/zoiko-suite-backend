@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // Fault makes the Fake provider misbehave, for tests of the controls around
@@ -28,14 +29,14 @@ const (
 // extractive answer from the given claims and evidence and never adds facts.
 type Fake struct {
 	Fault Fault
-	calls int
+	calls atomic.Int64 // safe under concurrent load tests
 }
 
 func (f *Fake) Name() string { return "fake-v0" }
 
 // Calls reports how many times Generate ran (tests prove refusals and
 // sensitive input never reach the model).
-func (f *Fake) Calls() int { return f.calls }
+func (f *Fake) Calls() int { return int(f.calls.Load()) }
 
 var (
 	sentenceRe = regexp.MustCompile(`[^.!?]+[.!?]`)
@@ -46,7 +47,7 @@ var (
 )
 
 func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
-	f.calls++
+	n := f.calls.Add(1)
 	switch f.Fault {
 	case FaultTimeout:
 		<-ctx.Done()
@@ -54,7 +55,7 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 	case FaultError:
 		return Draft{}, errPermanent
 	case FaultTransientOnce:
-		if f.calls == 1 {
+		if n == 1 {
 			return Draft{}, ErrTransient
 		}
 	}

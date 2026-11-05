@@ -14,6 +14,7 @@ import (
 	"os"
 	"time"
 
+	"zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/config"
 	"zoiko.io/public-ai-svc/internal/eval"
 	"zoiko.io/public-ai-svc/internal/fixtureenv"
@@ -43,7 +44,12 @@ func main() {
 	// names it the way the server and the release manifest do, so kbctl
 	// manifest refuses this report for any other model (Doc 08 §06).
 	profile := config.ModelProfile("mock", config.MockModelID)
-	opts := eval.Options{Repeats: *repeats, ModelProfile: profile, ModelID: config.MockModelID, GitSHA: *sha}
+	opts := eval.Options{Repeats: *repeats, ModelProfile: profile, ModelID: config.MockModelID, GitSHA: *sha,
+		// Doc 07 §06/§19: the report names the policy and claims release it ran on.
+		PolicyVersion: env.Pipeline.EffectivePolicyVersion()}
+	if id, err := env.Store.GetPointer(ctx, claims.KindClaims); err == nil {
+		opts.ClaimsReleaseID = id
+	}
 	if *waivers != "" {
 		if err := readJSON(*waivers, &opts.Waivers); err != nil {
 			fmt.Fprintln(os.Stderr, "evalrun: waivers:", err)
