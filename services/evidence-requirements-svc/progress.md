@@ -1,6 +1,6 @@
 # evidence-requirements-svc — Progress
 
-**Status (5 Nov 2026):** ER-0 baseline and feature matrix committed. Suite green (handler 45, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
+**Status (5 Nov 2026):** ER-1 grants by migration committed. Suite green (handler 45, events 5, registry 1, store 18 skipped without TEST_DATABASE_URL). gofmt and go vet clean.
 
 ---
 
@@ -54,7 +54,7 @@
 | GA-17 | Idempotency-Key mandatory; IDEMPOTENCY_MISMATCH | — | TestEvaluate_IdempotencyMismatch_Returns409, TestCreateRequirement_IdempotencyMismatch_Returns409 | — | ❌ / BUILT-THIS-PASS (ER-4) |
 | GA-18 | Idempotent requirement create | — | TestCreateRequirement_Idempotent_ReplayReturns200 | — | ✅ / DONE |
 | GA-19 | Catalogue mutation authorized; fail-closed | — | TestCreateRequirement_CallsAuthorization, TestCreateRequirement_AuthzUnavailable_FailsClosed | — | ✅ / DONE |
-| GA-20 | Legal entity validated by server | — | TestEvaluate_LegalEntityMustExistInTheTenant | — | ❌ / BUILT-THIS-PASS (ER-1/ER-5) |
+| GA-20 | Legal entity validated by server | — | TestEvaluate_LegalEntityMustExistInTheTenant | — | ⚠️ / BUILT-THIS-PASS (ER-1 wired, ER-5 for edge) |
 | GA-21 | Read contracts strongly scoped | — | TestReads_NeedAPrincipalAndAGrantAtTheEntity | — | ⚠️ / BUILT-THIS-PASS (ER-3/ER-4) |
 | GA-22 | tenant_id from gateway, never trusted | — | E2E §3 | — | ⚠️ / BUILT-THIS-PASS (ER-5) |
 | GA-23 | Canonical service input contract enforced | — | TestAPI2_EnvelopeRefusalIsAProblem | — | ✅ / DONE |
@@ -122,7 +122,7 @@
 
 | **Plan Tasks (ER-0 … ER-9, ER-FE-1, ER-FE-2)** |
 | ER-0 | Baseline and feature matrix (S0) | — | Suite counts recorded, matrix committed | — | **DONE (this commit)** |
-| ER-1 | Grants by migration (R5) and demo seed | access-control migration + seed-demo-rbac.ps1 | TestR5_EvidenceActionsRegistered, TestR5_EvidenceTemplateGrantsEveryAction | — | PENDING |
+| ER-1 | Grants by migration (R5) and demo seed | access-control migration + seed-demo-rbac.ps1 | TestRegisteredPermissionDefinitions (covers 000046), TestEvidenceActionsAreRegisteredAndCarriedByTemplates | — | **DONE** |
 | ER-2 | Verify manifest and signature references | internal/manifest/client.go, internal/esignature/client.go, handler.checkArtifacts | TestER02_ManifestOutsideTenantDoesNotCount, TestER02_ManifestUnknownIsUnmet, TestER02_ManifestServiceDownIs503NoRow, TestER02_SignatureUnknownIsUnmet, TestER02_SignatureServiceDownIs503NoRow, TestER02_SameManifestTwiceCountsOnce, TestER02_UnconfiguredOwnerNeverCounts | Evidence types panel | PENDING |
 | ER-3 | Console read models (API-4 cursor paging) | GET /v1/evidence/evaluations, /v1/evidence-requirements, /v1/pbc/requests, /v1/evidence/summary | List tests: first page, next page, tampered cursor 400, foreign tenant cursor 400, unknown filter 400, RLS isolation | All tabs (registers) | PENDING |
 | ER-4 | API-3 on mutable aggregates | record_version on requirements + PBC; ETag/If-Match on mutations | TestAPI3_EndDateNeedsIfMatch, TestAPI3_PBCCloseStaleIs412, etc. (3 per mutation) | All drawers (If-Match) | PENDING |
@@ -189,4 +189,21 @@ Store suite skip reason: `TEST_DATABASE_URL` not configured. The 1 passing test 
 
 ---
 
-## Next: ER-1 — Grants by migration (R5) and demo seed
+## Verification Evidence (ER-1)
+
+- Access-control migration 000046_register_evidence_pbc_actions.up.sql created with .down.sql
+- Registered 6 missing EVIDENCE actions in permission_definitions
+- Added EVIDENCE_REQUEST_MANAGER template (v1)
+- Upgraded COMPLIANCE_CATALOGUE_ADMINISTRATOR to v2 (grants CREATE/RETIRE)
+- Upgraded OBLIGATION_MANAGER to v2 (adds EVIDENCE_REQUEST_EVALUATE)
+- Guard test: all template actions exist in permission_definitions
+- TestRegisteredPermissionDefinitions covers migration 000046
+- TestEvidenceActionsAreRegisteredAndCarriedByTemplates verifies templates
+- seed-demo-rbac.ps1 EVIDENCE_FULL bundle updated with all 9 evidence actions
+- `go build ./...` ✅ (access-control-svc)
+- `go vet ./...` ✅
+- `gofmt -l` ✅
+
+---
+
+## Next: ER-2 — Verify manifest and signature references
