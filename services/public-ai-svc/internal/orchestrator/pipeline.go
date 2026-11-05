@@ -103,9 +103,11 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	if injected && r.SecuritySignal == "" {
 		r.SecuritySignal = SignalInjection
 	}
-	if d := policy.Classify(original); d.Exception != policy.X03SensitiveInput && d.Slots.MarketCode != "" && r.Status != contract.Unavailable {
+	d := policy.Classify(original)
+	if d.Exception != policy.X03SensitiveInput && d.Slots.MarketCode != "" && r.Status != contract.Unavailable {
 		r.RememberMarket = d.Slots.MarketCode
 	}
+	r.Confidence = d.Confidence
 	if r.Pending == nil && offersDemo(r) {
 		r.Pending = &Pending{Offer: "demo"}
 	}
@@ -123,7 +125,9 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		zap.Strings("claim_ids", claimIDs), zap.Strings("source_version_ids", sourceIDs), zap.String("handoff_route", route),
 		zap.Int64("tokens", r.Tokens),
 		// Doc 02 App. C: the template a reply came from, by id and locale.
-		zap.String("template_id", policy.TemplateID(r.Text)), zap.String("template_locale", policy.TemplateLocale))
+		zap.String("template_id", firstNonEmpty(policy.TemplateID(r.Text), r.QualifierID)), zap.String("template_locale", policy.TemplateLocale),
+		zap.String("template_version", policy.TemplateVersion()), zap.String("intent_version", policy.IntentVersion()),
+		zap.String("confidence", r.Confidence))
 	if policy.HasContact(in.Message) && r.Status != contract.Unavailable && !strings.Contains(r.Text, policy.ContactNotice) {
 		// Doc 10 §21: contact details were masked, not kept; say so.
 		r.Text = strings.TrimSpace(r.Text + "\n\n" + policy.ContactNotice)
@@ -355,7 +359,16 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		}
 	}
 	if tpl, ok := policy.RouteTemplates[intent]; ok {
+		ask := false
+		if intent == "I08" {
+			// Doc 01 FR-04, Doc 02 S10: the area the visitor named, else
+			// one optional qualification question with its answers as chips.
+			tpl, ask = policy.DemoReply(dec.Redaction.Text, dec.Slots.Workstream)
+		}
 		res := p.fromTemplate(tpl, intent, snap, market, now, releaseID)
+		if ask {
+			res.Suggestions = policy.DemoAreaChips
+		}
 		if intent == "I24" {
 			// Doc 02 T26 asks which team; the three answers are chips.
 			res.Suggestions = policy.SuggestTeams
@@ -396,8 +409,9 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 					Integration: dec.Slots.Integration, Clarifications: clarifications + 1}
 				return res
 			case claims.Contradicted:
-				p.recordConflict(ctx, req, d, now)
+				conflictID, owner := p.recordConflict(ctx, req, d, now)
 				res := p.fromTemplate(withRoute(policy.TplAbstainConflict, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
+				res.ConflictID, res.ConflictOwner = conflictID, owner
 				return keepAsking(res, snap, market, &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName,
 					BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications})
 			case claims.RevokedDecision, claims.ExpiredDecision:
@@ -626,6 +640,8 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		Tokens: int64(draft.InputTokens + draft.OutputTokens), Reason: contract.ReasonAnswered, SecondaryIntentID: secondary,
 	}
 	res.AnswerClass, res.StatusLabel, res.MarketCode = qualify(verified, market)
+	// Doc 02 §17: the template's fixed qualifier line, in approved wording.
+	res.Text, res.QualifierID = policy.WithQualifier(intent, dec.Redaction.Text, res.Text, dec.Slots, validate.MaxFullWords)
 	if chip, ok := policy.ChipFor(secondaryChip); ok {
 		res.SecondaryIntentID, res.Suggestions = secondaryChip, []contract.Chip{chip}
 	}
@@ -761,10 +777,11 @@ func (p *Pipeline) citations(snap *release.Snapshot, verified []claims.Claim, hi
 		}
 		bySource[key] = len(out)
 		seenSource[svid] = true
-		out = append(out, c)
 		if s, ok := snap.KB.Source(svid); ok {
 			ids = append(ids, s.SourceID)
+			c.ReviewedAt = reviewedAt(s)
 		}
+		out = append(out, c)
 		ids = append(ids, svid)
 	}
 	used := map[string]bool{}
@@ -863,7 +880,8 @@ func supportOnly(intent string) string {
 func slotMap(s policy.Slots, market string) map[string]string {
 	m := map[string]string{}
 	for k, v := range map[string]string{"market_code": market, "plan": s.PlanName, "billing_cadence": s.BillingCadence,
-		"entity_band": s.EntityBand, "integration": s.Integration} {
+		"entity_band": s.EntityBand, "integration": s.Integration, "persona": s.Persona, "workstream": s.Workstream,
+		"support_topic": s.SupportTopic, "jurisdiction": s.Jurisdiction, "handoff_intent": s.HandoffIntent} {
 		if v != "" {
 			m[k] = v
 		}
@@ -958,10 +976,7 @@ func (p *Pipeline) fromTemplate(t policy.Template, intent string, snap *release.
 	return res
 }
 
-func (p *Pipeline) recordConflict(ctx context.Context, req claims.Request, d claims.Decision, now time.Time) {
-	if p.Store == nil {
-		return
-	}
+func (p *Pipeline) recordConflict(ctx context.Context, req claims.Request, d claims.Decision, now time.Time) (string, string) {
 	// Doc 03 §16: the claim stays blocked and the case has an owner. The id
 	// and detection type match the load-time scan (release.ScanConflicts), so
 	// the same problem is one case, not two.
@@ -991,14 +1006,19 @@ func (p *Pipeline) recordConflict(ctx context.Context, req claims.Request, d cla
 	if key == "" {
 		key = strings.Join([]string{req.Subject, req.SubjectID, req.Market, req.BillingTerm}, "|")
 	}
+	id, owner := release.ConflictID(kind, key, ids), release.OwnerFor(req.Subject, "")
+	if p.Store == nil {
+		return id, owner
+	}
 	err := p.Store.RecordConflict(ctx, store.Conflict{
-		ConflictID: release.ConflictID(kind, key, ids), SubjectKey: key, ClaimIDs: ids,
+		ConflictID: id, SubjectKey: key, ClaimIDs: ids,
 		DetectionType: kind, Severity: "HIGH", ResolutionState: "OPEN", DetectedAt: now,
-		BlockedClaim: true, AssignedOwner: release.OwnerFor(req.Subject, ""),
+		BlockedClaim: true, AssignedOwner: owner,
 	})
 	if err != nil {
 		p.log().Error("conflict record failed", zap.Error(err))
 	}
+	return id, owner
 }
 
 func withRoute(t policy.Template, route string) policy.Template {
@@ -1051,7 +1071,7 @@ var (
 // the same market; anything else needs at most one claim.
 // myMarketRe: the visitor ties the question to their own market (Doc 01
 // AT-01 "Which plans are available in my market?").
-var myMarketRe = regexp.MustCompile(`(?i)(?:my|our) (?:market|country|region|location|jurisdiction)|where (?:i|we) (?:am|are|operate|live)`)
+var myMarketRe = regexp.MustCompile(`(?i)\b(?:my|our) (?:market|country|region|location|jurisdiction)\b|\bwhere (?:i|we) (?:am|are|operate|live)\b`)
 
 // planRequests is claimRequests plus the plan-availability rule: a plans
 // question with no market asks for one (Doc 02 T05) when the visitor refers
@@ -1199,4 +1219,22 @@ func offersDemo(r Result) bool {
 		}
 	}
 	return false
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// reviewedAt is the date a source was last approved, else its effective
+// date (Doc 01 FR-03: cite a dated source).
+func reviewedAt(s knowledge.Source) string {
+	for _, t := range []*time.Time{s.ApprovalTS, s.EffectiveFrom} {
+		if t != nil && !t.IsZero() {
+			return t.UTC().Format("2006-01-02")
+		}
+	}
+	return ""
 }

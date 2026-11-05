@@ -186,10 +186,19 @@ func TestAsyncAPIMatchesEventPayloads(t *testing.T) {
 			return events.ReleasePromotedFor("kb", "kb-1", "d", []string{"s"}, at0)
 		},
 		"sourceRevoked": func() (store.OutboxEvent, error) { return events.SourceRevoked("s-v1", "WITHDRAWN", at0) },
+		// Every optional field set, so each must be in the schema.
+		"analytics": func() (store.OutboxEvent, error) {
+			return events.AnalyticsEvent(events.Analytics{Name: events.AnswerDelivered, RouteID: "home", Locale: "en-US",
+				ReleaseVersion: "r", IntentID: "I01", ConfidenceBucket: "high", SafetyDisposition: "ALLOW", SlotName: "market_code",
+				ReasonCode: "ANSWERED", AnswerClass: "VERIFIED_FACT", SourceCount: events.IntPtr(0), StatusClass: "ANSWERED",
+				LatencyBucket: "<2s", LinkID: "pricing", ActionID: "demo", HandoffCategory: "demo", RouteAvailable: events.BoolPtr(false),
+				Helpfulness: "useful", FeedbackReason: "unclear", SeverityBucket: "medium", ConflictIDs: []string{"c"}, OwnerQueueID: "q"}, at0)
+		},
 	}
 	msgs := at(t, doc, "components", "messages").(map[string]any)
 	sameSet(t, "AsyncAPI messages", keys(msgs), keys(map[string]any{
-		"turnCompleted": 0, "handoffClicked": 0, "securitySignal": 0, "killSwitchChanged": 0, "releasePromoted": 0, "sourceRevoked": 0}))
+		"turnCompleted": 0, "handoffClicked": 0, "securitySignal": 0, "killSwitchChanged": 0, "releasePromoted": 0, "sourceRevoked": 0,
+		"analytics": 0}))
 	for name, mk := range build {
 		ev, err := mk()
 		if err != nil {
@@ -231,4 +240,16 @@ func TestAsyncAPIMatchesEventPayloads(t *testing.T) {
 			t.Errorf("security signal %s is emitted but missing from reason_class", s)
 		}
 	}
+}
+
+// The analytics name enum in AsyncAPI is exactly the code's allowlist.
+func TestAsyncAPIAnalyticsNames(t *testing.T) {
+	doc := load(t, "../../api/asyncapi.yaml")
+	data := at(t, at(t, doc, "components", "messages", "analytics", "payload", "allOf").([]any)[1], "properties", "data")
+	var code []string
+	for n := range events.AnalyticsNames {
+		code = append(code, n)
+	}
+	sort.Strings(code)
+	sameSet(t, "analytics names", strs(at(t, data, "properties", "name", "enum")), code)
 }

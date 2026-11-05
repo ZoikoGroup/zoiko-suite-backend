@@ -81,6 +81,7 @@ components:
         title: {type: string, description: "Structured responses only (ADR-008): approved source or official page title."}
         route_key: {type: string, description: "Structured responses only: set when the citation is an official route."}
         url: {type: string, format: uri, description: "Structured responses only: omitted until a real, allowlisted page exists."}
+        reviewed_at: {type: string, format: date, description: "Date the cited source was last approved (else its effective date), so the visitor can judge currency (Doc 01 FR-03, AT-01)."}
     FollowUp:
       type: object
       additionalProperties: false
@@ -126,7 +127,7 @@ components:
       title: zs-public-answer-v1
       type: object
       additionalProperties: false
-      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version, answer_class]
+      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version, answer_class, safety_disposition]
       properties:
         schema_version: {const: "1.0"}
         turn_id: {type: string}
@@ -145,8 +146,12 @@ components:
             requires_human: {type: boolean}
         answer_class:
           type: string
-          enum: [VERIFIED_FACT, STATUS_QUALIFIED, PROCESS_EXPLANATION, HANDOFF_UNKNOWN]
-          description: ANSWERED is never HANDOFF_UNKNOWN; refusals, abstentions and outages always are.
+          enum: [VERIFIED_FACT, STATUS_QUALIFIED, PROCESS_EXPLANATION, HANDOFF_UNKNOWN, SAFE_REFUSAL]
+          description: ANSWERED is never HANDOFF_UNKNOWN; REFUSED_ACTION is always SAFE_REFUSAL; abstentions, handoffs and outages are HANDOFF_UNKNOWN.
+        safety_disposition:
+          type: string
+          enum: [ALLOW, CLARIFY, DENY, ESCALATE, RETRY]
+          description: "Doc 02 §15: ANSWERED=ALLOW, CLARIFY=CLARIFY, REFUSED_ACTION=DENY, ABSTAIN/HANDOFF=ESCALATE, UNAVAILABLE=RETRY. The UI shows no CTA or tool button the disposition does not allow."
         status_label:
           type: string
           description: Governed status from the signed claim registry only; never inferred or upgraded.
@@ -398,6 +403,36 @@ paths:
         "401": {$ref: "#/components/responses/Problem"}
         "403": {$ref: "#/components/responses/Problem"}
         "404": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "415": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
+  /analytics:
+    post:
+      summary: >-
+        Doc 02 §27 events only the browser observes (chat_opened, source_opened). Enums and ids only.
+        A session grant is optional (chat_opened happens before a session exists); when sent it must match session_id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema_version, event]
+              properties:
+                schema_version: {const: "1.0"}
+                event: {type: string, enum: [chat_opened, source_opened]}
+                session_id: {type: string}
+                page_context: {$ref: "#/components/schemas/PageContext"}
+                locale: {type: string}
+                link_id: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,63}$"}
+                intent_id: {type: string}
+      responses:
+        "204": {description: Recorded}
+        "400": {$ref: "#/components/responses/Problem"}
+        "401": {$ref: "#/components/responses/Problem"}
+        "403": {$ref: "#/components/responses/Problem"}
         "413": {$ref: "#/components/responses/Problem"}
         "415": {$ref: "#/components/responses/Problem"}
         "422": {$ref: "#/components/responses/Problem"}

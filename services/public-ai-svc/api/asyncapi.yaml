@@ -3,7 +3,7 @@ info:
   title: public-ai-svc events (zoikosuite-public-ai)
   version: "1.0"
   description: >
-    The six R0 events (Doc 05 §21), CloudEvents 1.0 structured JSON, published at-least-once from a
+    The six R0 events (Doc 05 §21) and the Doc 02 §27 analytics events, CloudEvents 1.0 structured JSON, published at-least-once from a
     transactional outbox (Doc 05 §20). Consumers must be idempotent on the CloudEvents id, tolerate
     out-of-order delivery and re-check the revocation epoch on replay. Payloads carry identifiers, enums
     and coarse buckets only, never visitor text, prompts, model output, grants or contact data. Events that
@@ -17,6 +17,7 @@ channels:
       turnCompleted: {$ref: "#/components/messages/turnCompleted"}
       handoffClicked: {$ref: "#/components/messages/handoffClicked"}
       securitySignal: {$ref: "#/components/messages/securitySignal"}
+      analytics: {$ref: "#/components/messages/analytics"}
   control:
     address: publicai.control.v1
     messages:
@@ -97,6 +98,45 @@ components:
                   reason_class: {type: string, enum: [PROMPT_INJECTION, SENSITIVE_INPUT, SECURITY_REPORT, TOOL_INSTRUCTION]}
                   request_id: {type: string}
                   severity: {type: string, enum: [LOW, MEDIUM, HIGH]}
+    analytics:
+      name: chat.analytics.v1
+      summary: >-
+        Doc 02 §27 analytics events (one type, enum name). Only the fields the name permits are set;
+        raw questions, URLs, IPs, contact details, evidence snippets and model output are never carried.
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [name]
+                properties:
+                  name:
+                    type: string
+                    enum: [chat_opened, intent_classified, clarification_shown, answer_delivered, source_opened,
+                      cta_opened, handoff_offered, feedback_submitted, safety_intercepted, source_conflict]
+                  route_id: {type: string, description: "chat_opened: the page_context enum"}
+                  locale: {type: string}
+                  release_version: {type: string}
+                  intent_id: {type: string}
+                  confidence_bucket: {type: string, enum: [high, medium, low, none]}
+                  safety_disposition: {type: string, enum: [ALLOW, CLARIFY, DENY, ESCALATE, RETRY]}
+                  slot_name: {type: string}
+                  reason_code: {type: string}
+                  answer_class: {type: string}
+                  source_count: {type: integer, minimum: 0}
+                  status_class: {type: string}
+                  latency_bucket: {type: string, enum: ["<2s", "2s-5s", "5s-15s", ">15s"]}
+                  link_id: {type: string, description: "source_opened: the approved citation url_key"}
+                  action_id: {type: string, description: "cta_opened: the official route key"}
+                  handoff_category: {type: string}
+                  route_available: {type: boolean}
+                  helpfulness: {type: string, enum: [useful, not_useful]}
+                  feedback_reason: {type: string}
+                  severity_bucket: {type: string, enum: [low, medium, high]}
+                  conflict_ids: {type: array, items: {type: string}}
+                  owner_queue_id: {type: string}
     killSwitchChanged:
       name: publicai.kill_switch.changed.v1
       payload:

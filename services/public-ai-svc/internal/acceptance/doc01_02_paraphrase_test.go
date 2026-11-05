@@ -19,8 +19,9 @@ func TestDoc01Doc02Paraphrases(t *testing.T) {
 		route     string // "" = any
 		lacks     string
 	}{
-		// AT-01: plans depend on market; no unqualified global answer.
-		{"AT-01", "Which plans are available in my market?", contract.Answered, "I05", "pricing", ""},
+		// AT-01: plans depend on market; "my market" names none, so it asks
+		// which (Doc 02 T05) instead of giving an unqualified global answer.
+		{"AT-01", "Which plans are available in my market?", contract.Clarify, "I05", "", "available in all"},
 		// AT-02: the assistant never acts.
 		{"AT-02 ordinary", "Can the chatbot pay my invoices?", contract.RefusedAction, "X02", "sign-in", ""},
 		{"AT-02 ambiguous", "Can you pay vendor bills?", contract.RefusedAction, "X02", "sign-in", ""},
