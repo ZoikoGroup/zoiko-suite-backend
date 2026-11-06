@@ -2140,15 +2140,53 @@ func (s *PgStore) MarkAllocationRunCalculated(ctx context.Context, runID string,
 	})
 }
 
-func (s *PgStore) MarkAllocationRunPosted(ctx context.Context, runID, journalID string, at time.Time) error {
+// MarkAllocationRunPosted marks the run POSTED and, in the same transaction,
+// enqueues ACC-09's AllocationPosted event (SPEC_DEVIATIONS A12, §23: "ACC-09
+// | Recognition/AllocationDue; Recognition/AllocationPosted"). run is the
+// run as it stood before this call (POSTED fields are not yet set on it);
+// the event itself carries the final journalID/postedAt this call records.
+func (s *PgStore) MarkAllocationRunPosted(ctx context.Context, run *domain.AllocationRun, journalID string, at time.Time, correlationID, actorID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE allocation_runs SET status = $1, journal_id = $2, posted_at = $3 WHERE run_id = $4`,
-			domain.AllocationRunStatusPosted, journalID, at, runID)
-		return mapPgError(err)
+		if _, err := tx.Exec(ctx, `UPDATE allocation_runs SET status = $1, journal_id = $2, posted_at = $3 WHERE run_id = $4`,
+			domain.AllocationRunStatusPosted, journalID, at, run.RunID); err != nil {
+			return mapPgError(err)
+		}
+		env, err := envelope.New(envelope.Spec{
+			Type:            "com.zoikosuite.accounting.allocation-run.posted",
+			Service:         "financial-close-svc",
+			SchemaVersion:   "1.0.0",
+			OccurredAt:      at,
+			TenantID:        tenantID,
+			LegalEntityID:   run.LegalEntityID,
+			AggregateType:   "allocation-run",
+			AggregateID:     run.RunID,
+			CorrelationID:   correlationID,
+			ActorID:         actorID,
+			ResidencyRegion: s.eventRegion,
+			Classification:  envelope.Confidential,
+			Data: map[string]any{
+				"run_id":              run.RunID,
+				"rule_id":             run.RuleID,
+				"rule_version_id":     run.RuleVersionID,
+				"legal_entity_id":     run.LegalEntityID,
+				"fiscal_period":       run.FiscalPeriod,
+				"source_account_code": run.SourceAccountCode,
+				"source_amount":       run.SourceAmount,
+				"journal_id":          journalID,
+				"posted_at":           at,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("build allocation-run.posted event: %w", err)
+		}
+		if err := outbox.Enqueue(ctx, tx, env); err != nil {
+			return fmt.Errorf("enqueue allocation-run.posted event: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -2431,7 +2469,12 @@ func (s *PgStore) ApproveFXRevaluationRun(ctx context.Context, run *domain.FXRev
 		})
 }
 
-func (s *PgStore) MarkFXRevaluationPosted(ctx context.Context, runID, journalID, principalID string, at time.Time) error {
+// MarkFXRevaluationPosted marks the run POSTED and, in the same transaction,
+// enqueues ACC-10's RevaluationPosted event (SPEC_DEVIATIONS A12, §23:
+// "ACC-10 | RevaluationCalculated; RevaluationPosted"). legalEntityID is
+// the run's own (not caller input) — passed in because the handler already
+// has it loaded and this call is keyed on runID alone.
+func (s *PgStore) MarkFXRevaluationPosted(ctx context.Context, runID, legalEntityID, journalID, principalID string, at time.Time, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
@@ -2446,6 +2489,32 @@ func (s *PgStore) MarkFXRevaluationPosted(ctx context.Context, runID, journalID,
 		}
 		if tag.RowsAffected() == 0 {
 			return domain.ErrInvalidFXRevaluationTransition
+		}
+		env, err := envelope.New(envelope.Spec{
+			Type:            "com.zoikosuite.accounting.fx-revaluation-run.posted",
+			Service:         "financial-close-svc",
+			SchemaVersion:   "1.0.0",
+			OccurredAt:      at,
+			TenantID:        tenantID,
+			LegalEntityID:   legalEntityID,
+			AggregateType:   "fx-revaluation-run",
+			AggregateID:     runID,
+			CorrelationID:   correlationID,
+			ActorID:         principalID,
+			ResidencyRegion: s.eventRegion,
+			Classification:  envelope.Confidential,
+			Data: map[string]any{
+				"run_id":          runID,
+				"legal_entity_id": legalEntityID,
+				"journal_id":      journalID,
+				"posted_at":       at,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("build fx-revaluation-run.posted event: %w", err)
+		}
+		if err := outbox.Enqueue(ctx, tx, env); err != nil {
+			return fmt.Errorf("enqueue fx-revaluation-run.posted event: %w", err)
 		}
 		return nil
 	})

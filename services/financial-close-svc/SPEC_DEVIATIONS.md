@@ -567,7 +567,7 @@ instead of the original result, or a duplicate append-only row:
 `expected_version` is not implemented on any command. ACC-16's snapshot
 creates have no claim either (outside this survey).
 
-### A12. Most ACC-06..18 domain events are not emitted
+### A12. Most ACC-06..18 domain events are not emitted — partially closed 2026-11-06
 
 §23 lists, among others:
 
@@ -582,9 +582,24 @@ creates have no claim either (outside this survey).
 > "ACC-18 | LineageGapDetected; LineageVerificationFailed"
 
 The outbox carries the period lifecycle events, the subledger-control
-exception and the snapshot integrity failure. No ACC-07/08/09/10/17/18
-lifecycle event is emitted, so consumers named in §23 (close dashboard,
-evidence, reporting) cannot react to them.
+exception and the snapshot integrity failure. ACC-09's `AllocationPosted`
+and ACC-10's `RevaluationPosted` are now emitted too:
+`MarkAllocationRunPosted` and `MarkFXRevaluationPosted` enqueue
+`com.zoikosuite.accounting.allocation-run.posted` /
+`com.zoikosuite.accounting.fx-revaluation-run.posted` to the transactional
+outbox in the same transaction as the POSTED status write — both call sites
+(the first-execution path and the FAILED-run reprocess path for allocation;
+the net-zero no-journal path and the ordinary posting path for FX), so the
+event fires exactly once per run regardless of which path reached POSTED.
+No *Due event precedes either (there is no separate "due" state in this v1's
+collapsed Planned/Calculated model — see each capability's own state-model
+note). Still open: ACC-06's ControlCertified (ACC-06's ControlExceptionRaised
+equivalent, `subledger-control-exception`, was already emitted before this
+pass), and every ACC-17/ACC-18 event listed above.
+
+Evidence: `internal/store/posted_events_integration_test.go` (real-Postgres:
+one `allocation-run.posted` / `fx-revaluation-run.posted` outbox row per
+posted run, keyed by the run's own aggregate_id).
 
 ### A13. Every journal this service posted was refused by general-ledger-svc — closed 2026-10-24
 

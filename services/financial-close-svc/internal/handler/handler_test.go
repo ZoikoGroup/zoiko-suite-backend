@@ -1151,11 +1151,11 @@ func (s *stubStore) MarkAllocationRunCalculated(_ context.Context, runID string,
 	return nil
 }
 
-func (s *stubStore) MarkAllocationRunPosted(_ context.Context, runID, journalID string, at time.Time) error {
+func (s *stubStore) MarkAllocationRunPosted(_ context.Context, r *domain.AllocationRun, journalID string, at time.Time, _, _ string) error {
 	if s.markPostedErr != nil {
 		return s.markPostedErr
 	}
-	run, ok := s.allocationRuns[runID]
+	run, ok := s.allocationRuns[r.RunID]
 	if !ok {
 		return domain.ErrAllocationRunNotFound
 	}
@@ -1274,7 +1274,7 @@ func (s *stubStore) ApproveFXRevaluationRun(_ context.Context, run *domain.FXRev
 	return false, nil
 }
 
-func (s *stubStore) MarkFXRevaluationPosted(_ context.Context, runID, journalID, principalID string, at time.Time) error {
+func (s *stubStore) MarkFXRevaluationPosted(_ context.Context, runID, _, journalID, principalID string, at time.Time, _ string) error {
 	if s.markFXPostedErr != nil {
 		return s.markFXPostedErr
 	}

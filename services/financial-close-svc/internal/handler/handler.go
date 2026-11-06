@@ -136,7 +136,9 @@ type Store interface {
 	GetAllocationRunByRuleAndPeriod(ctx context.Context, ruleID, fiscalPeriod string) (*domain.AllocationRun, error)
 	GetAllocationRun(ctx context.Context, runID string) (*domain.AllocationRun, error)
 	MarkAllocationRunCalculated(ctx context.Context, runID string, sourceAmount float64, at time.Time) error
-	MarkAllocationRunPosted(ctx context.Context, runID, journalID string, at time.Time) error
+	// MarkAllocationRunPosted also enqueues ACC-09's AllocationPosted event
+	// (SPEC_DEVIATIONS A12) in the same transaction.
+	MarkAllocationRunPosted(ctx context.Context, run *domain.AllocationRun, journalID string, at time.Time, correlationID, actorID string) error
 	MarkAllocationRunFailed(ctx context.Context, runID, reason string) error
 	CreateAllocationResultLines(ctx context.Context, runID string, lines []domain.AllocationResultLine) error
 	ListAllocationExceptions(ctx context.Context, legalEntityID string) ([]domain.AllocationRun, error)
@@ -153,7 +155,9 @@ type Store interface {
 	// (SPEC_DEVIATIONS A11); PostRevaluation's own already-POSTED check
 	// (not a claim) covers Post, as the doc comment there explains.
 	ApproveFXRevaluationRun(ctx context.Context, run *domain.FXRevaluationRun, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
-	MarkFXRevaluationPosted(ctx context.Context, runID, journalID, principalID string, at time.Time) error
+	// MarkFXRevaluationPosted also enqueues ACC-10's RevaluationPosted event
+	// (SPEC_DEVIATIONS A12) in the same transaction.
+	MarkFXRevaluationPosted(ctx context.Context, runID, legalEntityID, journalID, principalID string, at time.Time, correlationID string) error
 
 	// ACC-17 (Opening Balance & Migration) — see domain.MigrationBatch's
 	// doc comment for the authority boundary these implement.
@@ -3728,7 +3732,7 @@ func (h *Handler) ExecuteAllocation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
 		return
 	}
-	if err := h.store.MarkAllocationRunPosted(r.Context(), run.RunID, journalID, time.Now().UTC()); err != nil {
+	if err := h.store.MarkAllocationRunPosted(r.Context(), run, journalID, time.Now().UTC(), correlationIDOf(r), principalID); err != nil {
 		h.log.Error("allocation journal posted but the run could not be marked POSTED",
 			zap.String("run_id", run.RunID), zap.String("journal_id", journalID), zap.Error(err))
 	}
@@ -3801,7 +3805,7 @@ func (h *Handler) ReprocessAllocationRun(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
 		return
 	}
-	if err := h.store.MarkAllocationRunPosted(r.Context(), run.RunID, journalID, time.Now().UTC()); err != nil {
+	if err := h.store.MarkAllocationRunPosted(r.Context(), run, journalID, time.Now().UTC(), correlationIDOf(r), principalID); err != nil {
 		h.log.Error("allocation journal posted but the run could not be marked POSTED", zap.String("run_id", run.RunID), zap.Error(err))
 	}
 	h.recordLineageEdge(r.Context(), rule.LegalEntityID, "allocation_run", run.RunID, "journal", journalID)
@@ -4162,7 +4166,7 @@ func (h *Handler) PostRevaluation(w http.ResponseWriter, r *http.Request) {
 		// performed and found no material movement. Marked POSTED with no
 		// journal rather than forced to invent one.
 		now := time.Now().UTC()
-		if err := h.store.MarkFXRevaluationPosted(r.Context(), id, "", principalID, now); err != nil {
+		if err := h.store.MarkFXRevaluationPosted(r.Context(), id, run.LegalEntityID, "", principalID, now, correlationIDOf(r)); err != nil {
 			h.writeFXRevaluationErr(w, err)
 			return
 		}
@@ -4188,7 +4192,7 @@ func (h *Handler) PostRevaluation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	if err := h.store.MarkFXRevaluationPosted(r.Context(), id, journalID, principalID, now); err != nil {
+	if err := h.store.MarkFXRevaluationPosted(r.Context(), id, run.LegalEntityID, journalID, principalID, now, correlationIDOf(r)); err != nil {
 		h.log.Error("FX revaluation journal posted but the run could not be marked POSTED",
 			zap.String("run_id", id), zap.String("journal_id", journalID), zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "run_not_recorded",
