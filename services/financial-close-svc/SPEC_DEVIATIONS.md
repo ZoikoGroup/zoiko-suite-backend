@@ -481,8 +481,15 @@ real (B6, B1). Still open:
   `MigrationAccountingCertified` (A12).
 - **Certification is not tied to a migration certificate.** It records a
   certifier and a reason only; see migration-integrity-svc A3.
-- **Two concurrent creates for one source system** race on the batch's
-  unique key, and the loser gets 503 instead of the existing batch.
+- **Two concurrent creates for one source system** — closed 2026-11-06. The
+  store's `mapPgError` now recognizes a unique-violation on `migration_batches`
+  (`domain.ErrMigrationBatchRaceLost`) and `CreateMigrationAccountingBatch`
+  re-reads and answers the actual winner (200) instead of a 503 that told the
+  loser to retry a request that would just lose again. Evidence:
+  `internal/store/migration_batch_race_integration_test.go` (real-Postgres:
+  a genuine concurrent-style insert against the live UNIQUE constraint),
+  `internal/handler/acc17_open_item_test.go`
+  (`TestCreateMigrationAccountingBatch_ConcurrentCreateLoses_ReturnsWinner`).
 
 ### A10. ACC-18 lineage is one hop and has no report-fact trace
 

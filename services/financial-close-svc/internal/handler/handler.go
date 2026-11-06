@@ -4420,6 +4420,19 @@ func (h *Handler) CreateMigrationAccountingBatch(w http.ResponseWriter, r *http.
 		Entries:              entries,
 	}
 	if err := h.store.CreateMigrationBatch(r.Context(), batch); err != nil {
+		if errors.Is(err, domain.ErrMigrationBatchRaceLost) {
+			// A concurrent create for the same source system won the race
+			// (SPEC_DEVIATIONS A9); answer with that winner instead of a 503
+			// that tells a loser to retry a request that would just lose again.
+			existing, getErr := h.store.GetMigrationBatchBySourceSystem(r.Context(), req.LegalEntityID, req.FiscalPeriod, req.SourceSystemName)
+			if getErr != nil {
+				h.log.Error("CreateMigrationAccountingBatch: lost the create race but could not load the winner", zap.Error(getErr))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", getErr.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
 		h.log.Error("failed to create migration batch", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return

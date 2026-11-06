@@ -1347,6 +1347,12 @@ var (
 	ErrPriorRevaluationNotPosted = errorString("prior revaluation run is not POSTED and cannot be reversed")
 
 	ErrMigrationBatchNotFound          = errorString("migration batch not found")
+	// ErrMigrationBatchRaceLost (SPEC_DEVIATIONS A9): two concurrent creates
+	// for the same (legal_entity_id, fiscal_period, source_system_name) race
+	// past the handler's own existence check; the migration_batches UNIQUE
+	// constraint still decides a single winner, and the handler re-reads and
+	// returns that winner rather than answering the loser 503.
+	ErrMigrationBatchRaceLost          = errorString("a concurrent create for this legal entity, period and source system already won")
 	ErrNoMigrationEntries              = errorString("a migration batch must include at least one crosswalk entry")
 	ErrInvalidMigrationBatchTransition = errorString("migration batch is not in a status that allows this action")
 

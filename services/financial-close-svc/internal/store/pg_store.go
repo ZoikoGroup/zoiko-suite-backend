@@ -41,6 +41,14 @@ func mapPgError(err error) error {
 	if errors.As(err, &pgErr) && pgErr.Code == "23514" && strings.HasPrefix(pgErr.ConstraintName, "sod_") {
 		return domain.ErrSelfApproval
 	}
+	// Two concurrent CreateMigrationAccountingBatch calls for the same
+	// source system can both pass the handler's own existence check; the
+	// migration_batches UNIQUE(tenant_id, legal_entity_id, fiscal_period,
+	// source_system_name) constraint still decides one winner (SPEC_DEVIATIONS
+	// A9) rather than leaving the loser only a 503.
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.TableName == "migration_batches" {
+		return domain.ErrMigrationBatchRaceLost
+	}
 	// Migration 000022's journal-currency guards.
 	if errors.As(err, &pgErr) {
 		switch {
