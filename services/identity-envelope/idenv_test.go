@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/require"
 )
 
 var testKey, _ = rsa.GenerateKey(rand.Reader, 2048)
@@ -504,3 +505,75 @@ func TestRequestIDAdoptsAndMints(t *testing.T) {
 }
 
 var _ crypto.PublicKey = (*rsa.PublicKey)(nil)
+
+// TestIAM01_EnvelopeForPolicyRefusedByWorkflow proves IAM-1 / AU-12:
+// an envelope exchanged for one service's audience must be rejected by a
+// different service's verifier. This is the core property that per-service
+// audiences enforce — a token for authorization-svc cannot be replayed at
+// policy-svc.
+func TestIAM01_EnvelopeForPolicyRefusedByWorkflow(t *testing.T) {
+	// Generate a proper JWT for the exchanged token with audience="authorization-svc"
+	exchangedClaims := jwt.MapClaims{
+		"iss":       "identity-context-svc",
+		"aud":       "authorization-svc",
+		"iat":       time.Now().Unix(),
+		"exp":       time.Now().Add(5 * time.Minute).Unix(),
+		"tenant_id": "t1",
+		"principal": map[string]any{"principal_id": "p1", "tenant_id": "t1"},
+	}
+	exchangedTok := jwt.NewWithClaims(jwt.SigningMethodRS256, exchangedClaims)
+	exchangedTok.Header["kid"] = testKid
+	exchangedToken, err := exchangedTok.SignedString(testKey)
+	require.NoError(t, err)
+
+	// Simulate the token exchange: gateway receives a "zoiko-internal" envelope
+	// and exchanges it for "authorization-svc" audience.
+	exchangeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		require.Equal(t, "authorization-svc", r.PostForm.Get("audience"), "exchange request must specify target audience")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// The exchanged token has audience="authorization-svc"
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": exchangedToken, "expires_in": 300, "token_type": "N_A"})
+	}))
+	defer exchangeSrv.Close()
+
+	// Original wide envelope (audience=zoiko-internal)
+	wide := envelope(t, nil, nil)
+
+	// Gateway exchanges it for authorization-svc
+	c, _ := verifier(t, true).Verify(context.Background(), wide)
+	ctx := WithIdentity(context.Background(), &Identity{Basis: BasisEnvelope, PrincipalID: "p1", TenantID: "t1", Claims: c, Token: wide})
+	ex := NewExchanger(exchangeSrv.URL, "", "", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://authorization-svc/", nil)
+	if err := ForwardTo(ctx, req, ex, "authorization-svc"); err != nil {
+		t.Fatal(err)
+	}
+	gotExchangedToken := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+	require.Equal(t, exchangedToken, gotExchangedToken, "exchanged token must have target audience")
+
+	// Now verify that the exchanged token is ACCEPTED by authorization-svc's verifier
+	authzVerifier := newVerifierForAudience(t, "authorization-svc", false)
+	_, err = authzVerifier.Verify(context.Background(), exchangedToken)
+	if err != nil {
+		t.Fatalf("authorization-svc verifier should accept its own audience: %v", err)
+	}
+
+	// But the SAME exchanged token must be REJECTED by policy-svc's verifier
+	policyVerifier := newVerifierForAudience(t, "policy-svc", false)
+	_, err = policyVerifier.Verify(context.Background(), exchangedToken)
+	if !errors.Is(err, ErrWrongAudience) {
+		t.Fatalf("policy-svc verifier must reject authorization-svc's audience: got %v, want ErrWrongAudience", err)
+	}
+}
+
+// newVerifierForAudience creates a verifier for a specific audience.
+func newVerifierForAudience(t *testing.T, audience string, legacy bool) *Verifier {
+	t.Helper()
+	v, err := NewVerifier(VerifierOptions{Keys: StaticKeys{testKid: &testKey.PublicKey}, Issuer: "identity-context-svc",
+		Audience: audience, AcceptLegacyAudience: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
