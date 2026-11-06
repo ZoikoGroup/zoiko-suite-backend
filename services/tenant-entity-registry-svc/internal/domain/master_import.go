@@ -329,7 +329,7 @@ type Reconciliation struct {
 // is imported, a conflict, failed or invalid, with none left unresolved. Matched is false if not.
 func Reconcile(sourceRows, staged, invalid, imported, conflicts, failed, unresolved int) Reconciliation {
 	r := Reconciliation{SourceRows: sourceRows, StagedRows: staged, Invalid: invalid, Imported: imported, Conflicts: conflicts, Failed: failed, Unresolved: unresolved}
-	r.Matched = sourceRows == staged && imported+conflicts+failed+invalid == staged
+	r.Matched = sourceRows == staged && unresolved == 0 && imported+conflicts+failed+invalid == staged
 	return r
 }
 

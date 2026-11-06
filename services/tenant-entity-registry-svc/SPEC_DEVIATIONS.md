@@ -457,3 +457,29 @@ Where the spec leaves a choice, the code chooses the safer reading:
   A cancel requested before start cancels an APPROVED import.
 - **No startup resume sweeper.** An import interrupted by a process restart is not resumed automatically; it needs an operator to re-run it (the row request
   ids make that safe).
+
+### Master imports (ORG-9)
+
+- **Flow.** `POST /v1/master-imports` records the rows as received (SHA-256 over the compacted rows, checked against
+  `manifest_sha256` when given) and starts validation; `:approve` starts the import; `GET /v1/master-imports/{id}` shows status,
+  counts and reconciliation. Both POSTs are always asynchronous (ZS-API-001 s18): 202, `Location: /v1/operations/{id}`, poll with
+  `GET /v1/operations/{id}`, `POST /v1/operations/{id}:cancel`. The same `Idempotency-Key` from the same principal on the same route
+  is the same operation (a different request under it is 409 IDEMPOTENCY_MISMATCH); approving twice is one operation.
+- **Per-record outcomes are kept.** Every row has a verdict and every problem of every row is recorded (malformed, unknown field,
+  invalid party request, duplicate row reference, duplicate identifier within the file). The row as received is never returned
+  (it can carry identifiers); `GET .../rows` returns verdicts, errors, outcomes, party and case ids.
+- **A bad row blocks approval.** Any INVALID row makes the import BLOCKED: approval is 409, and a table CHECK holds it. Correcting
+  means uploading a corrected file. The uploader cannot approve (403 SOD_DENIED, and a table CHECK).
+- **No blind overwrite.** Importing creates parties through the ordinary `CreateParty` path as the uploader (so PARTY_CREATE is also
+  needed). A row matching an existing party or needing review is a CONFLICT row left to stewardship (NP-57), never an overwrite or an
+  automatic link. A row the party path refuses is FAILED with its error. The row's request id is `imp:{import}:{row}`, so repeating a
+  row never makes a second party.
+- **Reconciliation.** Counted from the rows themselves, never the running counters: rows received = rows staged, each imported,
+  conflict, failed or invalid, none unresolved. Otherwise the import is FAILED.
+- **Cancel and the point of no return.** Cancel is accepted while queued or validating, and after approval until the import starts; once
+  parties are being created the operation is no longer cancelable (409).
+- **Not built.** Only PARTY imports; rows are a JSON array in the request body, not a file or multipart upload (limit 10,000 rows,
+  64 KiB per row); no startup sweeper that resumes imports interrupted by a restart (re-running the import operation is safe and
+  resumes, but nothing triggers it); the shared `asyncpgx` store is not used because it queries without the tenant GUC this service's
+  FORCE RLS needs, so the service holds its own `apicontract.OperationStore`; no cursor pagination (API-4) on rows, `after_row` is a
+  keyset by row number.
