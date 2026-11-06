@@ -29,6 +29,10 @@ A person starts invited and activates from their link. A workload, such as an in
 
 Authentication and federation shows how principals prove who they are: signing in directly or through a federated identity provider, and whether a second factor is in place. Current identity assurance shows who has a second factor, who would need one, and who is stopped.
 
-## Sessions and support access
+## Live sessions
 
-Live sessions show who is signed in and with what assurance. Support access and password resets need a second person to approve them, privileged changes need a step-up check, every change records a reason, and sessions end when an identity is disabled or merged. Tenant isolation keeps each organization's identities separate.
+Live sessions show who is signed in and with what assurance. Sessions end when an identity is disabled or merged, and tenant isolation keeps each organization's identities separate.
+
+## How support access and password resets work
+
+Support access is temporary access granted to help an organization with an issue. Support access and password resets each need a second person to approve them, so no one can grant or use support access alone. Privileged changes need a step-up check, and every change records a reason, so each support session can be traced afterwards.

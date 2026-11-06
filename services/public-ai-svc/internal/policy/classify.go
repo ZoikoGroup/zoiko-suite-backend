@@ -216,7 +216,20 @@ var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|paymen
 	// Console areas of My Work and Identity, Scope & Foundation (KB articles
 	// kb-my-work, kb-identity-context, kb-identity-foundation).
 	`|my work|tasks?(?: and approvals)?|approvals?|exceptions?|assigned actions?|identity(?: context)?|authentication|federation|federated|sign-?on|sso|mfa|second factor|sessions?|support access|password resets?` +
-	`|tenants? and entities|legal entit(?:y|ies)|feature flags?|config(?:uration)?|secret vault|secrets?|gateway(?: authentication)?|notifications?|roles?(?: and access)?|access control|permission bundles?|foundation)\b`)
+	`|tenants? and entities|legal entit(?:y|ies)|feature flags?|config(?:uration)?|secret vault|secrets?|gateway(?: authentication)?|notifications?|roles?(?: and access)?|access control|permission bundles?|foundation` +
+	// Governance Platform and Overview console areas.
+	`|jurisdictions?(?: and rules)?|rule packs?|governance log|polic(?:y|ies)|obligations?|authori[sz]ation|segregation of duties|workflows?(?: and approvals)?|executive dashboard|domain health|dashboard)\b`)
+
+// areaDefinitionRe asks what a console area is or does.
+var areaDefinitionRe = regexp.MustCompile(`(?i)^\s*(?:what\s+(?:is|are|does)|what's|explain|describe|define|tell me about|use of|how does)\s+(?:the\s+)?(?:domain health|executive dashboard|dashboards?|governance log)\b`)
+
+// ownDataRe names the visitor's own data.
+var ownDataRe = regexp.MustCompile(`(?i)\b(?:my|our|mine|ours)\b`)
+
+// consoleJurisdictionRe is a question about the Jurisdictions & Rules area
+// (registering, rules, rule packs), not about which markets ZoikoSuite is
+// offered in (I04).
+var consoleJurisdictionRe = regexp.MustCompile(`(?i)\b(?:register(?:ing|ed)?|add(?:ing)?|creat(?:e|ing)|delet\w*|remov\w*|deactivat\w*|resolv\w*|nest\w*|rule packs?|rules|jurisdictions?\s*(?:&|and)\s*rules|legal drift|effective[- ]dated)\b`)
 
 // IsModuleQuestion reports whether a message names a known area, module or
 // alias.
@@ -355,6 +368,11 @@ func Classify(msg string) Decision {
 			}
 		}
 	}
+	if d.Exception == X01PrivateAction && areaDefinitionRe.MatchString(text) && !ownDataRe.MatchString(text) {
+		// "What is Domain Health?" asks what a console area is, not for live
+		// figures; "show our domain health" stays refused.
+		d.Exception = ""
+	}
 	if d.Exception == "" && recordIDRe.MatchString(text) {
 		// Doc 02 S04/G32: a record number is a request for that record, even
 		// without "my" ("Can I see invoice 4519?").
@@ -366,6 +384,10 @@ func Classify(msg string) Decision {
 	case d.Primary == "I26" && len(planRe.FindAllString(text, -1)) > 0 && !competitorRe.MatchString(text):
 		// "Compare Starter and Growth" compares ZoikoSuite plans (Doc 02 §08).
 		d.Primary, d.Secondary = "I05", ""
+	case d.Primary == "I04" && d.Slots.MarketCode == "" && consoleJurisdictionRe.MatchString(text):
+		// "How to register a jurisdiction" is about the Jurisdictions &
+		// Rules area, never a market-availability question (no country named).
+		d.Primary, d.Secondary = "I02", ""
 	case d.Primary == "I04" && plansRe.MatchString(text) && !AsksPrice(text):
 		// "Which plans are available in my market?" is plan availability (Doc 01 AT-01).
 		d.Primary = "I05"

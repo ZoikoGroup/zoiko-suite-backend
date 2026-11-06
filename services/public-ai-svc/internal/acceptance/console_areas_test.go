@@ -22,6 +22,23 @@ func TestConsoleAreasAreAnswered(t *testing.T) {
 		"what is Gateway Authentication":          "kb-identity-foundation",
 		"what is Roles & Access":                  "kb-identity-foundation",
 		"what is Tenants & Entities":              "kb-identity-foundation",
+		"how to Register a jurisdiction":          "kb-jurisdictions-rules",
+		"can I delete a jurisdiction":             "kb-jurisdictions-rules",
+		"how does support access work":            "kb-identity-context",
+		"what is Notifications":                   "kb-identity-foundation",
+		"what is Assigned Actions":                "kb-my-work",
+		"what is Jurisdictions & Rules":           "kb-jurisdictions-rules",
+		"how do I resolve a rule pack":            "kb-jurisdictions-rules",
+		"what is the Governance Log":              "kb-governance-log-policies",
+		"how to change an approval limit policy":  "kb-governance-log-policies|kb-delegated-authority",
+		"how do policy versions work":             "kb-governance-log-policies",
+		"what are Obligations":                    "kb-obligations",
+		"how to raise an obligation":              "kb-obligations",
+		"what is Authorization":                   "kb-authorization-workflows",
+		"what is segregation of duties":           "kb-authorization-workflows|kb-security-trust",
+		"what is Workflows & Approvals":           "kb-authorization-workflows|kb-governance",
+		"what is the Executive Dashboard":         "kb-console-overview",
+		"what is Domain Health":                   "kb-console-overview",
 	} {
 		r := x.env.Pipeline.Answer(ctx, inputFor(q))
 		if r.Status != contract.Answered {
@@ -30,9 +47,11 @@ func TestConsoleAreasAreAnswered(t *testing.T) {
 		}
 		cited := false
 		for _, c := range r.Citations {
-			cited = cited || strings.HasPrefix(c.SourceVersionID, want+"-")
+			for _, w := range strings.Split(want, "|") {
+				cited = cited || strings.HasPrefix(c.SourceVersionID, w+"-")
+			}
 		}
-		if !cited || strings.Contains(r.Text, "I'm here to help with ZoikoSuite capabilities") {
+		if !cited || strings.Contains(r.Text, "I'm here to help with ZoikoSuite capabilities") || strings.Contains(r.Text, "SYNTHETIC") {
 			t.Errorf("%q: cites %v, want %s: %q", q, r.Citations, want, r.Text)
 		}
 	}
@@ -40,4 +59,13 @@ func TestConsoleAreasAreAnswered(t *testing.T) {
 
 func inputFor(q string) orchestrator.Input {
 	return orchestrator.Input{RequestID: "req_console", Message: q, Locale: "en-US"}
+}
+
+// A jurisdiction question with a country is still market availability.
+func TestJurisdictionWithCountryStaysMarketQuestion(t *testing.T) {
+	x := publicKBServer(t)
+	r := x.env.Pipeline.Answer(ctx, inputFor("Do you support the UK jurisdiction?"))
+	if r.IntentID != "I04" {
+		t.Fatalf("intent %s: %q", r.IntentID, r.Text)
+	}
 }
