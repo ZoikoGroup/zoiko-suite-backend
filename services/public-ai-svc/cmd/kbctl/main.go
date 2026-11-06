@@ -292,7 +292,13 @@ func dlqReplay(ctx context.Context, args []string) error {
 	logger, _ := zap.NewProduction()
 	var pub events.Publisher = events.LogPublisher{Log: logger}
 	if brokers := os.Getenv("PUBLIC_AI_KAFKA_BROKERS"); brokers != "" {
-		k := events.NewKafkaPublisher(strings.Split(brokers, ","))
+		k, err := events.NewKafkaPublisher(strings.Split(brokers, ","), events.KafkaOptions{
+			TLS: os.Getenv("PUBLIC_AI_KAFKA_TLS") == "true", SASLMechanism: os.Getenv("PUBLIC_AI_KAFKA_SASL_MECHANISM"),
+			Username: os.Getenv("PUBLIC_AI_KAFKA_USERNAME"), Password: os.Getenv("PUBLIC_AI_KAFKA_PASSWORD"),
+			SigningKey: os.Getenv("PUBLIC_AI_EVENT_SIGNING_KEY"), SignerID: os.Getenv("PUBLIC_AI_EVENT_SIGNER_ID")})
+		if err != nil {
+			return err
+		}
 		defer k.Close() //nolint:errcheck
 		pub = k
 	}

@@ -73,3 +73,18 @@ func TestIdempotentReplayBoundToOriginAndWindow(t *testing.T) {
 		}
 	}
 }
+
+// Doc 04 §16: a new session records the KB release active when it started.
+func TestSessionRecordsRelease(t *testing.T) {
+	st := store.NewMemory()
+	s := New(st, time.Hour)
+	s.ReleaseID = func() string { return "kb-2026-11-06" }
+	_, err := s.Create(context.Background(), "key-release-01", []byte("h"), "en-US", "", "", "http://localhost:3000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := st.SessionByIdempotencyKey(context.Background(), "key-release-01")
+	if err != nil || got.ReleaseID != "kb-2026-11-06" {
+		t.Fatalf("release %q %v", got.ReleaseID, err)
+	}
+}

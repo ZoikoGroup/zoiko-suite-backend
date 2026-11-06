@@ -8,8 +8,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"regexp"
+	"strings"
 	"time"
 
+	"zoiko.io/public-ai-svc/internal/metrics"
+	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/store"
 )
 
@@ -84,6 +89,10 @@ func Backoff(base time.Duration, attempt int) time.Duration {
 }
 
 func build(topic, typ string, data any, at time.Time) (store.OutboxEvent, error) {
+	if err := dlpCheck(data); err != nil {
+		metrics.EventDLPBlocked(typ)
+		return store.OutboxEvent{}, err
+	}
 	env := Envelope{SpecVersion: "1.0", ID: newID(), Source: sourceOf(typ), Type: typ,
 		Time: at.UTC().Format(time.RFC3339Nano), DataContentType: "application/json", Data: data}
 	b, err := json.Marshal(env)
@@ -193,4 +202,58 @@ type securitySignal struct {
 // SecuritySignal carries a reason class only, never the prompt body.
 func SecuritySignal(reasonClass, requestID, severity string, at time.Time) (store.OutboxEvent, error) {
 	return build(TopicTelemetry, TypeSecuritySignal, securitySignal{reasonClass, requestID, severity}, at)
+}
+
+// ErrEventDLP: an event field carried free text or personal data. Events are
+// ids, enums and buckets only (Doc 05 §21, CT-045); such an event is never
+// written to the outbox, and the refusal is counted and alerted on.
+var ErrEventDLP = errors.New("events: a field carries free text or personal data")
+
+var (
+	identRe  = regexp.MustCompile(`^[A-Za-z0-9_:.<>+\-]{1,160}$`)
+	digitsRe = regexp.MustCompile(`^\+?[0-9][0-9 ()-]{6,}$`)
+)
+
+// dlpCheck scans every string in an event payload: anything long, spaced
+// like prose, or matching a sensitive-data or contact pattern is refused.
+func dlpCheck(data any) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	var bad bool
+	var walk func(any)
+	walk = func(x any) {
+		switch t := x.(type) {
+		case map[string]any:
+			for _, y := range t {
+				walk(y)
+			}
+		case []any:
+			for _, y := range t {
+				walk(y)
+			}
+		case string:
+			switch {
+			case len(t) > 160 || strings.Count(t, " ") >= 6:
+				bad = true // prose, not an id or enum
+			case digitsRe.MatchString(t):
+				bad = true // a bare long number (phone, account, card)
+			case identRe.MatchString(t):
+				// ids, enums, buckets and timestamps: random ids would only
+				// trip the contact patterns by chance
+			case policy.Redact(t).Found() || policy.HasContact(t):
+				bad = true
+			}
+		}
+	}
+	walk(v)
+	if bad {
+		return ErrEventDLP
+	}
+	return nil
 }

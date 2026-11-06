@@ -146,3 +146,21 @@ func TestConditionalAndTargetClaimsAreQualified(t *testing.T) {
 		t.Fatal("a HOLD claim is never shown")
 	}
 }
+
+// Doc 05 §17: currency narrows the request; a verified decision says when
+// it expires; a miss names the missing key; the release signature is carried.
+func TestDecisionFields(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	c := completePriceClaim()
+	due := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	c.ReviewDueAt = &due
+	r := NewResolver(Manifest{ReleaseID: "claims-1", Claims: []Claim{c}}).WithSignatureRef("ed25519:abcd").WithDisputes(nil)
+	d := r.Resolve(Request{Subject: Price, SubjectID: "PLAN", Market: "US", Currency: "xts", AsOf: now}, nil)
+	if d.Decision != Verified || d.ExpiresAt == nil || !d.ExpiresAt.Equal(due) || d.SignatureRef != "ed25519:abcd" || len(d.MissingClaimKeys) != 0 {
+		t.Fatalf("verified: %+v", d)
+	}
+	d = r.Resolve(Request{Subject: Price, SubjectID: "PLAN", Market: "US", Currency: "EUR", AsOf: now}, nil)
+	if d.Decision == Verified || len(d.MissingClaimKeys) != 1 || d.MissingClaimKeys[0] != "PRICE|PLAN|US||EUR" {
+		t.Fatalf("other currency: %+v", d)
+	}
+}

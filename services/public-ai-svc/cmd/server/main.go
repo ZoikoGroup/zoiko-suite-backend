@@ -152,7 +152,12 @@ func main() {
 		rt.RequireCompatibility = cfg.Environment != "dev" && cfg.Environment != "test"
 		fl = flags.NewLoader(st)
 		if len(cfg.KafkaBrokers) > 0 {
-			pub = events.NewKafkaPublisher(cfg.KafkaBrokers)
+			kp, err := events.NewKafkaPublisher(cfg.KafkaBrokers, events.KafkaOptions{TLS: cfg.KafkaTLS, SASLMechanism: cfg.KafkaSASLMechanism,
+				Username: cfg.KafkaUsername, Password: cfg.KafkaPassword, SigningKey: cfg.EventSigningKey, SignerID: cfg.EventSignerID})
+			if err != nil {
+				log.Fatal("kafka publisher", zap.Error(err))
+			}
+			pub = kp
 		}
 	}
 	defer pub.Close() //nolint:errcheck
@@ -207,8 +212,10 @@ func main() {
 	// SEC-T046: idle rate-limit buckets are dropped, so no visitor key lives
 	// past its window (Doc 06 §17).
 	go guard.RunSweeper(ctx, time.Minute)
+	sessions := session.New(st, cfg.SessionTTL).WithIdleTTL(cfg.SessionIdleTTL).WithIdempotencyTTL(cfg.IdempotencyTTL)
+	sessions.ReleaseID = rt.KBReleaseID // Doc 04 §16: the release each session started on
 	api := httpapi.New(cfg, log, httpapi.Deps{
-		Store: st, Sessions: session.New(st, cfg.SessionTTL).WithIdleTTL(cfg.SessionIdleTTL).WithIdempotencyTTL(cfg.IdempotencyTTL), Answerer: guard.Wrap(pipeline), Config: rt, Routes: rt, Flags: kill,
+		Store: st, Sessions: sessions, Answerer: guard.Wrap(pipeline), Config: rt, Routes: rt, Flags: kill,
 		Limiter:      guard.Middleware,
 		Ready:        readiness(func() bool { return rt.Ready(3 * refreshInterval) }, fl.Healthy),
 		ReleaseReady: func() bool { return rt.Ready(3 * refreshInterval) },

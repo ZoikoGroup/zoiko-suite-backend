@@ -152,7 +152,7 @@ func init() {
 	Registry.MustRegister(httpRequests, httpDuration, turns, turnDuration, modelRequests, modelTokens,
 		rateLimited, eventsPublished, eventsDeadLettered, releaseReady, buildInfo,
 		ctaOffered, handoffClicked, feedback, securitySignals, spendRatio, stageDuration, turnsCancelled, turnOutcomes, outboxOldest, commitRevocations,
-		indexHealth,
+		indexHealth, eventsDLPBlocked,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 }
 
@@ -182,6 +182,15 @@ func OutboxOldest(age time.Duration) { outboxOldest.Set(age.Seconds()) }
 
 // CommitRevocation counts an answer withheld by the revocation check at commit.
 func CommitRevocation() { commitRevocations.Inc() }
+
+// eventsDLPBlocked counts events refused because a field carried free text
+// or personal data (Doc 05 CT-045): it must stay at zero.
+var eventsDLPBlocked = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "public_ai_events_dlp_blocked_total", Help: "Events refused by the outbox DLP check (Doc 05 CT-045).",
+}, []string{"type"})
+
+// EventDLPBlocked records one refused event.
+func EventDLPBlocked(eventType string) { eventsDLPBlocked.WithLabelValues(eventType).Inc() }
 
 // TurnCancelled counts a turn the visitor cancelled.
 func TurnCancelled() { turnsCancelled.Inc() }

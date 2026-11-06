@@ -43,6 +43,8 @@ type Session struct {
 	LastSeenAt time.Time
 	TokensUsed int64
 	Origin     string
+	// ReleaseID is the KB release active when the session started (Doc 04 §16).
+	ReleaseID string
 	// PendingContext is the JSON carry-over after a clarifying question:
 	// intent and slots only, never visitor text.
 	PendingContext []byte

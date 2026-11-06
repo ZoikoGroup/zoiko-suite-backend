@@ -9,6 +9,10 @@ info:
     and coarse buckets only, never visitor text, prompts, model output, grants or contact data. Events that
     fail 10 times are diverted to "<topic>.dlq". The browser never publishes events. The payload
     version is the ".vN" suffix of the CloudEvents type; a breaking change is a new type.
+    Producers connect over TLS with SASL/SCRAM. Each Kafka message carries headers ce_type, content-type and,
+    outside dev/test, ce_signature (base64 Ed25519 over the exact message value) and ce_signer (key id):
+    consumers verify the signature before acting. Events never carry free text or personal data; the
+    outbox refuses any that would (public_ai_events_dlp_blocked_total).
 defaultContentType: application/cloudevents+json
 channels:
   telemetry:

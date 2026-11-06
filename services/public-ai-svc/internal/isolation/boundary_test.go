@@ -29,6 +29,9 @@ func TestT12_NoRouteToPrivateSystems(t *testing.T) {
 		"GroqAPIKey": true,
 		// The HMAC salt for shared rate-limit keys: a local secret, not a route (Doc 06 §13).
 		"RateKeySalt": true,
+		// Its own event broker's TLS/SASL credentials and its event signing key.
+		"KafkaTLS": true, "KafkaSASLMechanism": true, "KafkaUsername": true, "KafkaPassword": true,
+		"EventSigningKey": true, "EventSignerID": true,
 	}
 	ct := reflect.TypeOf(config.Config{})
 	for i := 0; i < ct.NumField(); i++ {

@@ -7,6 +7,8 @@ package release
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -232,6 +234,10 @@ func (r *Runtime) refresh(ctx context.Context) error {
 			return fmt.Errorf("release %s: %w", newClaims, err)
 		}
 		next.Claims = claims.NewResolver(m)
+		if rel, err := r.store.GetRelease(ctx, newClaims); err == nil {
+			sum := sha256.Sum256(rel.Signature)
+			next.Claims = next.Claims.WithSignatureRef("ed25519:" + hex.EncodeToString(sum[:8]))
+		}
 		next.claimsChanged = true
 	}
 	if next.claimsChanged || newKB != kbID {
@@ -558,4 +564,11 @@ func (r *Runtime) VectorError() error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.vecErr
+}
+
+// KBReleaseID is the active knowledge release id ("" before the first load).
+func (r *Runtime) KBReleaseID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.kbID
 }

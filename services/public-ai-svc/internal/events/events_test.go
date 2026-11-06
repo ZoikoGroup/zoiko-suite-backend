@@ -2,12 +2,14 @@ package events
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
 )
 
@@ -92,5 +94,56 @@ func TestRelayDeliversOnceAndDivertsToDLQ(t *testing.T) {
 	}
 	if pending, _ := st.UnpublishedEvents(ctx, 10); len(pending) != 0 {
 		t.Fatal("DLQ'd event must leave the outbox")
+	}
+}
+
+// Doc 05 CT-045: an event field carrying prose, a contact detail or a bare
+// long number is refused before it reaches the outbox; ids and enums pass.
+func TestEventDLP(t *testing.T) {
+	now := time.Now()
+	for _, bad := range []string{"call me on +44 7700 900123", "jane@example.com", "07700900123",
+		"what is the price of the growth plan for my company please"} {
+		if _, err := TurnCompleted("req_1", bad, "ANSWERED", time.Second, "kb", now); !errors.Is(err, ErrEventDLP) {
+			t.Errorf("%q: %v", bad, err)
+		}
+	}
+	for i := 0; i < 200; i++ {
+		if _, err := TurnCompleted("req_"+strings.Repeat("9", i%30)+"ab12cd34ef56", "I05", "ANSWERED", time.Second, "kb-fixture-1", now); err != nil {
+			t.Fatalf("an id was refused: %v", err)
+		}
+	}
+}
+
+// Doc 05 CT-040/043: with a signing key every event carries an Ed25519
+// signature over the exact payload, verifiable with the public key.
+func TestKafkaEventsAreSigned(t *testing.T) {
+	pub, priv, err := signing.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := NewKafkaPublisher([]string{"127.0.0.1:1"}, KafkaOptions{TLS: true, SASLMechanism: "SCRAM-SHA-512", Username: "u", Password: "p",
+		SigningKey: priv, SignerID: "events-2026-11"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	ev, _ := TurnCompleted("req_1", "I05", "ANSWERED", time.Second, "kb", time.Now())
+	h, err := k.Headers(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, x := range h {
+		got[x.Key] = string(x.Value)
+	}
+	sig, err := base64.StdEncoding.DecodeString(got["ce_signature"])
+	if err != nil || got["ce_signer"] != "events-2026-11" {
+		t.Fatalf("headers %v", got)
+	}
+	if err := signing.Verify(pub, ev.Payload, sig); err != nil {
+		t.Fatalf("signature does not verify: %v", err)
+	}
+	if signing.Verify(pub, append([]byte(nil), append(ev.Payload, ' ')...), sig) == nil {
+		t.Fatal("a changed payload must not verify")
 	}
 }

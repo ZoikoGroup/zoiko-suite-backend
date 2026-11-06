@@ -170,7 +170,9 @@ type Request struct {
 	SubjectID   string // plan code, integration name or framework; "" = any
 	Market      string
 	BillingTerm string
-	AsOf        time.Time
+	// Currency narrows a price question to one currency (Doc 05 §17).
+	Currency string
+	AsOf     time.Time
 }
 
 // Decision is the resolver outcome.
@@ -184,6 +186,12 @@ type Decision struct {
 	Qualified    []Claim
 	ReasonCode   string
 	ConflictKeys []string // claim ids in conflict, for the conflict record
+	// Doc 05 §17 decision fields: when a VERIFIED answer stops being valid,
+	// the claim key(s) that had no verified record, and the signature of the
+	// claims release the decision came from.
+	ExpiresAt        *time.Time
+	MissingClaimKeys []string
+	SignatureRef     string
 }
 
 // RevocationSet reports revoked claim ids.
@@ -218,10 +226,19 @@ type Resolver struct {
 	m Manifest
 	// disputed are plan codes whose public page states a different price
 	// than the signed claim (KB-003, A08): never quoted until resolved.
-	disputed map[string]bool
+	disputed     map[string]bool
+	signatureRef string
 }
 
 func NewResolver(m Manifest) *Resolver { return &Resolver{m: m} }
+
+// WithSignatureRef records the signature fingerprint of the release the
+// resolver was loaded from; it is copied onto every decision.
+func (r *Resolver) WithSignatureRef(ref string) *Resolver {
+	c := *r
+	c.signatureRef = ref
+	return &c
+}
 
 func (r *Resolver) ReleaseID() string { return r.m.ReleaseID }
 
@@ -231,7 +248,7 @@ func (r *Resolver) Manifest() Manifest { return r.m }
 // WithDisputes returns a resolver that treats prices for these plan codes
 // as contradicted.
 func (r *Resolver) WithDisputes(plans map[string]bool) *Resolver {
-	return &Resolver{m: r.m, disputed: plans}
+	return &Resolver{m: r.m, disputed: plans, signatureRef: r.signatureRef}
 }
 
 // Disputed reports whether a plan's price is disputed by a public page.
@@ -269,14 +286,34 @@ func (r *Resolver) matches(c Claim, q Request) bool {
 	if q.BillingTerm != "" && c.BillingTerm != "" && c.BillingTerm != q.BillingTerm {
 		return false
 	}
+	if q.Currency != "" && c.Currency != "" && !strings.EqualFold(c.Currency, q.Currency) {
+		return false
+	}
 	return true
 }
 
 // Resolve applies the §17 decision rules. Precedence: a missing market asks
 // for clarification; a contradiction always abstains; only then is a
 // consistent, active, in-window, unrevoked set VERIFIED.
-func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
-	d := Decision{ReleaseID: r.m.ReleaseID}
+func (r *Resolver) Resolve(q Request, rev RevocationSet) (d Decision) {
+	d = Decision{ReleaseID: r.m.ReleaseID, SignatureRef: r.signatureRef}
+	defer func() {
+		// Doc 05 §17: when the answer stops being valid, and which typed
+		// claim was missing when there is none.
+		for _, c := range d.Verified {
+			end := c.ValidUntil
+			if c.ReviewDueAt != nil && c.ReviewDueAt.Before(end) {
+				end = *c.ReviewDueAt
+			}
+			if d.ExpiresAt == nil || end.Before(*d.ExpiresAt) {
+				e := end
+				d.ExpiresAt = &e
+			}
+		}
+		if d.Decision != Verified {
+			d.MissingClaimKeys = []string{strings.Join([]string{q.Subject, q.SubjectID, q.Market, q.BillingTerm, q.Currency}, "|")}
+		}
+	}()
 	if needsMarket[q.Subject] && q.Market == "" {
 		d.Decision, d.ReasonCode = MarketRequired, "MARKET_REQUIRED"
 		return d

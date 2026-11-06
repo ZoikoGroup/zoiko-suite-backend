@@ -193,3 +193,21 @@ func TestAdminAddr(t *testing.T) {
 		t.Fatal("admin addr equal to the public addr must be refused")
 	}
 }
+
+// Doc 05 §20-22: outside dev/test a broker connection needs TLS, SASL and
+// an event signing key.
+func TestKafkaSecurityRequiredInProduction(t *testing.T) {
+	c := validProduction(t)
+	c.KafkaBrokers = []string{"kafka-1:9093"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_KAFKA_TLS") {
+		t.Fatalf("plain brokers accepted: %v", err)
+	}
+	c.KafkaTLS, c.KafkaSASLMechanism, c.EventSigningKey = true, "SCRAM-SHA-512", "key"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("secured brokers refused: %v", err)
+	}
+	c.KafkaSASLMechanism = "PLAIN"
+	if err := c.Validate(); err == nil {
+		t.Fatal("an unsupported SASL mechanism must be refused")
+	}
+}

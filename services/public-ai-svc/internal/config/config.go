@@ -24,6 +24,15 @@ type Config struct {
 	AdminAddr    string
 	DatabaseURL  string
 	KafkaBrokers []string
+	// Kafka producer security (Doc 05 §20-22): TLS, SASL/SCRAM producer
+	// authentication and Ed25519-signed events; required outside dev/test
+	// whenever brokers are configured.
+	KafkaTLS           bool
+	KafkaSASLMechanism string
+	KafkaUsername      string
+	KafkaPassword      string
+	EventSigningKey    string
+	EventSignerID      string
 
 	AllowedOrigins []string
 	// AllowedHosts, when set, restricts the Host header (Doc 04 §08, A02).
@@ -119,6 +128,12 @@ func Load() (Config, error) {
 		AdminAddr:                os.Getenv("PUBLIC_AI_ADMIN_ADDR"),
 		DatabaseURL:              os.Getenv("PUBLIC_AI_DATABASE_URL"),
 		KafkaBrokers:             splitList(os.Getenv("PUBLIC_AI_KAFKA_BROKERS")),
+		KafkaTLS:                 os.Getenv("PUBLIC_AI_KAFKA_TLS") == "true",
+		KafkaSASLMechanism:       os.Getenv("PUBLIC_AI_KAFKA_SASL_MECHANISM"),
+		KafkaUsername:            os.Getenv("PUBLIC_AI_KAFKA_USERNAME"),
+		KafkaPassword:            os.Getenv("PUBLIC_AI_KAFKA_PASSWORD"),
+		EventSigningKey:          os.Getenv("PUBLIC_AI_EVENT_SIGNING_KEY"),
+		EventSignerID:            os.Getenv("PUBLIC_AI_EVENT_SIGNER_ID"),
 		AllowedOrigins:           splitList(env("PUBLIC_AI_ALLOWED_ORIGINS", "http://localhost:3000")),
 		AllowedHosts:             splitList(os.Getenv("PUBLIC_AI_ALLOWED_HOSTS")),
 		PolicyVersion:            env("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
@@ -242,6 +257,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("PUBLIC_AI_STRUCTURED_RESPONSE is dev/test only: elsewhere set structured_response_enabled with an approval")
 	case !devLike && c.DatabaseURL == "":
 		return fmt.Errorf("PUBLIC_AI_DATABASE_URL is required outside dev/test: refusing to fall back to in-memory storage")
+	case !devLike && len(c.KafkaBrokers) > 0 && (!c.KafkaTLS || c.KafkaSASLMechanism == "" || c.EventSigningKey == ""):
+		return fmt.Errorf("with PUBLIC_AI_KAFKA_BROKERS outside dev/test, PUBLIC_AI_KAFKA_TLS=true, PUBLIC_AI_KAFKA_SASL_MECHANISM and PUBLIC_AI_EVENT_SIGNING_KEY are required (Doc 05 §20-22)")
+	case c.KafkaSASLMechanism != "" && c.KafkaSASLMechanism != "SCRAM-SHA-512" && c.KafkaSASLMechanism != "SCRAM-SHA-256":
+		return fmt.Errorf("PUBLIC_AI_KAFKA_SASL_MECHANISM must be SCRAM-SHA-512 or SCRAM-SHA-256")
 	case !devLike && c.AdminAddr == "":
 		return fmt.Errorf("PUBLIC_AI_ADMIN_ADDR is required outside dev/test: /metrics and /health stay off the public listener (Doc 06 §12)")
 	case !devLike && len(c.RateKeySalt) < 32:
