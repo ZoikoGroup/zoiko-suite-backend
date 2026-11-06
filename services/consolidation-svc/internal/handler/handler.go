@@ -500,19 +500,26 @@ func (h *Handler) eliminateInScope(ctx context.Context, tenantID string, run *do
 
 // ── GET /v1/consolidation/runs ────────────────────────────────────────────────────
 
+// ListRuns requires group_legal_entity_id (SPEC_DEVIATIONS A13): without
+// it, the authorization check had nothing to check against and was skipped
+// entirely, returning every run in the tenant to any caller with an
+// X-Principal-Id. No other service calls this endpoint — checked across
+// the repository.
 func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	groupLegalEntityID := r.URL.Query().Get("group_legal_entity_id")
+	if groupLegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "group_legal_entity_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 
-	if groupLegalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, groupLegalEntityID, actionRunView); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, groupLegalEntityID, actionRunView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListRuns(r.Context(), groupLegalEntityID)
@@ -788,20 +795,24 @@ func (h *Handler) CreateEliminationProposal(w http.ResponseWriter, r *http.Reque
 
 // ── GET /v1/consolidation/adjustments ─────────────────────────────────────────────
 
+// ListAdjustments requires group_legal_entity_id (SPEC_DEVIATIONS A13): the
+// same unscoped-read gap ListRuns had.
 func (h *Handler) ListAdjustments(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	groupLegalEntityID := q.Get("group_legal_entity_id")
 	fiscalPeriod := q.Get("fiscal_period")
+	if groupLegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "group_legal_entity_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	if groupLegalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, groupLegalEntityID, actionAdjustmentView); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, groupLegalEntityID, actionAdjustmentView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListAdjustments(r.Context(), groupLegalEntityID, fiscalPeriod)

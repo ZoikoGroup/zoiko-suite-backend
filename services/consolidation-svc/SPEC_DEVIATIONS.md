@@ -200,13 +200,20 @@ consolidation entries in a group entity's statutory ledger.
   no integrity evidence. The payload also formats the balance with `%f`.
   Scope: a managed signing key (the platform's open "Snapshot signature/key
   profile" decision, §29) or drop the claim and rely on ACC-16.
-- **A13. List endpoints skip authorization when unfiltered.** `GET
-  /v1/consolidation/runs` and `GET /v1/consolidation/adjustments` check
-  authorization only when `group_legal_entity_id` is supplied; without it they
-  return every run or adjustment in the tenant to any caller with an
-  `X-Principal-Id`. No other service calls these endpoints (checked across
-  the repository), so requiring the filter is safe, but it is an API contract
-  change and is left for an explicit decision.
+- **A13. List endpoints skip authorization when unfiltered. — Closed
+  2026-11-06.** `GET /v1/consolidation/runs` and `GET
+  /v1/consolidation/adjustments` used to check authorization only when
+  `group_legal_entity_id` was supplied; without it they returned every run
+  or adjustment in the tenant to any caller with an `X-Principal-Id`. No
+  other service calls these endpoints (checked across the repository, same
+  check repeated at the time of this fix), so `group_legal_entity_id` is now
+  required (400 `missing_fields` without it) and the authorization check is
+  unconditional.
+  - *Manual check:* `internal/handler/handler_test.go` —
+    `TestListRuns_NoGroupFilter_Refused`/`TestListAdjustments_NoGroupFilter_Refused`
+    (400), `TestListRuns_GroupFilter_Authorized`/`TestListAdjustments_GroupFilter_Authorized`
+    (200 with the filter), `TestListRuns_AuthzDenied_Refused` (403 is still
+    reachable, not bypassed).
 - **A14. No `Idempotency-Key`/`expected_version`, and `StartRun` was not
   idempotent. — Closed for `Idempotency-Key` (B11).** Every mutating command
   now requires an `Idempotency-Key` and records it in `command_idempotency`
