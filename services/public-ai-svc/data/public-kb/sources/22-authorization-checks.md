@@ -23,7 +23,7 @@ What you can do lists your own permissions in your current legal entity, as the 
 
 ## Check a permission
 
-Check a permission asks exactly what a service asks before it acts: may this person take this action, such as approving an invoice, for this legal entity? The answer is recorded in the decision log.
+To check whether someone has access, use Check a permission. It asks exactly what a service asks before it acts: may this person take this action, such as approving an invoice, for this legal entity? The answer is recorded in the decision log.
 
 ## Maker and checker
 

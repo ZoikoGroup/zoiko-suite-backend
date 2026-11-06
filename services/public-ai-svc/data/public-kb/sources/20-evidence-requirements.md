@@ -9,7 +9,7 @@ owner: owner-product
 effective_from: 2026-01-01
 expires_at: 2027-12-31
 locale: en-US
-intent_ids: I02
+intent_ids: I16,I02
 market_codes: ALL
 classification: PUBLIC_APPROVED
 pii_state: CLEAR

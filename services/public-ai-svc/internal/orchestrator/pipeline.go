@@ -284,9 +284,13 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		// Doc 02 §23: English fallback where the language has no approved content.
 		return p.fromTemplate(policy.TplNonEnglish, intent, snap, market, now, releaseID)
 	}
+	// rerouted: the question names no area but one KB section covers it, so
+	// it is ranked on content alone, not towards articles tagged I02.
+	rerouted := false
 	if intent == "I29" && (policy.IsModuleQuestion(dec.Redaction.Text) || (snap.KB != nil && snap.KB.Covers(dec.Redaction.Text))) {
 		// Fallback ladder: rules -> (model classifier, none in R0) -> a named
 		// area, module or alias -> only then out of scope.
+		rerouted = !policy.IsModuleQuestion(dec.Redaction.Text)
 		intent = "I02"
 	}
 	diag := Diag{Slots: slotMap(dec.Slots, market)}
@@ -501,6 +505,9 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			plan = snap.Claims.PlanCode(dec.Slots.PlanName)
 		}
 		kq := knowledge.Query{Text: qtext, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4, IntentID: intent, Plan: plan}
+		if rerouted {
+			kq.IntentID = ""
+		}
 		searchStart := time.Now()
 		r := snap.Retriever.Retrieve(ctx, kq, snap)
 		metrics.ObserveStage("retrieval", time.Since(searchStart))

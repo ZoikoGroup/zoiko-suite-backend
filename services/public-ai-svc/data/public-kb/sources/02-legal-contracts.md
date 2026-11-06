@@ -19,11 +19,11 @@ signing_ref: kbctl-dev
 
 ## Legal and Contracts
 
-Legal and Contracts governs commercial agreements, corporate actions, board resolutions and legal obligations. Agreements and resolutions move through approval-bound execution: each step is approved by the right people before it is executed, and the record of approvals is kept.
+The Legal module, Legal and Contracts, governs commercial agreements, corporate actions, board resolutions and legal obligations. Agreements and resolutions move through approval-bound execution: each step is approved by the right people before it is executed, and the record of approvals is kept.
 
 ## Contract lifecycle
 
-Contracts are drafted, negotiated, executed and renewed within one tracked lifecycle, using standard clause libraries and approved templates. A contract becomes active only after governed approval and validation of its signatories. Counterparties are recorded with their validation status and risk information.
+Contract management follows one tracked lifecycle: contracts are drafted, negotiated, executed and renewed within it, using standard clause libraries and approved templates. A contract becomes active only after governed approval and validation of its signatories. Counterparties are recorded with their validation status and risk information.
 
 ## Obligations from contracts
 

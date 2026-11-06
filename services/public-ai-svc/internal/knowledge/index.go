@@ -261,6 +261,7 @@ func (x *Index) score(i int, qtoks []string) (float64, int) {
 func (x *Index) Search(q Query, rev Revocations) Result {
 	res := Result{Answerability: NotFound, ReleaseID: x.releaseID, Mode: "lexical"}
 	qtoks := uniq(Tokens(x.expand(q.Text)))
+	rawToks := uniq(Tokens(q.Text)) // as asked, before synonyms
 	if len(qtoks) == 0 || len(x.chunks) == 0 {
 		return res
 	}
@@ -283,6 +284,9 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 			sc *= intentBoost
 		}
 		if x.titleNamed(c, qtoks) {
+			sc *= titleBoost
+		}
+		if sectionNamed(c, rawToks) {
 			sc *= titleBoost
 		}
 		if sc < minScore || matched < need {
@@ -363,6 +367,22 @@ func (x *Index) titleNamed(c Chunk, qtoks []string) bool {
 	return true
 }
 
+// sectionNamed reports whether the query names this section: every word of
+// its heading (at least two) is in the query, as in "How do I start an
+// approval workflow?" for "Start a workflow".
+func sectionNamed(c Chunk, qtoks []string) bool {
+	h := Tokens(c.DisplayTitle)
+	if len(h) < 2 {
+		return false
+	}
+	for _, w := range h {
+		if !anyLike(qtoks, w) {
+			return false
+		}
+	}
+	return true
+}
+
 // intentBoost favours sources tagged for the visitor's intent, so "How is
 // data secured?" lands on the trust page rather than any page saying "data".
 const intentBoost = 2.0
@@ -382,7 +402,14 @@ func (x *Index) expand(text string) string {
 		return text
 	}
 	out := text
-	for _, w := range tokenRe.FindAllString(strings.ToLower(text), -1) {
+	lower := strings.ToLower(text)
+	for k, alts := range x.synonyms {
+		// A phrase key ("my work") is a name made of stopwords.
+		if strings.Contains(k, " ") && strings.Contains(lower, k) {
+			out += " " + strings.Join(alts, " ")
+		}
+	}
+	for _, w := range tokenRe.FindAllString(lower, -1) {
 		for _, alt := range x.synonyms[w] {
 			out += " " + alt
 		}
@@ -477,39 +504,98 @@ func (x *Index) NamesSection(question string) bool {
 // Covers reports whether one article section in this release plainly covers
 // the question, so a question about any part of the platform is answered
 // rather than treated as off-topic. It holds when the question names a
-// section heading (NamesSection), or when a single section contains at least
-// two thirds of the question's words, one of them in that section's heading.
-// A one-word question must be the whole heading ("Lifecycle"). Words found
-// only in passing in an article body never count on their own, so "write a
-// poem about money" is not taken for a product question.
+// section heading (NamesSection), or when a single section contains the
+// question's topic words: all of them, or at least two thirds with one of
+// them in that section's heading. A one-word topic must appear in a section
+// heading ("How does search work?"). Words are compared by stem prefix, so
+// "controlled" meets "control" and "revoked" meets "revocation", and filler
+// verbs ("manage", "happen") are not topic words. A word found only in
+// passing in an article body never counts on its own, so "write a poem about
+// money" is not taken for a product question.
 func (x *Index) Covers(question string) bool {
 	if x.NamesSection(question) {
 		return true
 	}
-	q := uniq(Tokens(question))
+	var q []string
+	for _, t := range uniq(Tokens(question)) {
+		if !coverFiller[t] {
+			q = append(q, t)
+		}
+	}
 	if len(q) == 0 {
 		return false
 	}
 	need := (2*len(q) + 2) / 3
 	for i, c := range x.chunks {
-		h := map[string]bool{}
-		for _, w := range Tokens(c.DisplayTitle) {
-			h[w] = true
+		h := Tokens(c.DisplayTitle)
+		matched, inHeading := 0, false
+		for _, t := range q {
+			if x.hasLike(i, t) {
+				matched++
+				inHeading = inHeading || anyLike(h, t)
+			}
 		}
 		if len(q) == 1 {
-			if len(h) == 1 && h[q[0]] {
+			if inHeading {
 				return true
 			}
 			continue
 		}
-		matched, inHeading := 0, false
-		for _, t := range q {
-			if x.tf[i][t] > 0 {
-				matched++
-				inHeading = inHeading || h[t]
-			}
+		if matched >= 2 && (matched == len(q) || (inHeading && matched >= need)) {
+			return true
 		}
-		if inHeading && matched >= need && matched >= 2 {
+	}
+	return false
+}
+
+// coverFiller are stems that say nothing about which part of the platform a
+// question is about.
+var coverFiller = map[string]bool{}
+
+func init() {
+	for _, w := range strings.Fields(`manage happen several two give way mean kind thing someone something anyone
+		everything everyone able let make done really much many lot good best new`) {
+		coverFiller[stem(w)] = true
+	}
+}
+
+// likeWords reports whether two stems are the same word: equal, or sharing
+// their first five letters ("controll"/"control", "revok"/"revoc" share
+// "revo" only and are joined by the shorter rule below).
+func likeWords(a, b string) bool {
+	if a == b {
+		return true
+	}
+	n := 5
+	if len(a) < n || len(b) < n {
+		return false
+	}
+	if a[:n] == b[:n] {
+		return true
+	}
+	// revoke/revocation, invoke/invocation: k and c alternate after a
+	// shared four-letter root.
+	return a[:4] == b[:4] && (a[4] == 'k' && b[4] == 'c' || a[4] == 'c' && b[4] == 'k')
+}
+
+func anyLike(words []string, t string) bool {
+	for _, w := range words {
+		if likeWords(w, t) {
+			return true
+		}
+	}
+	return false
+}
+
+func (x *Index) hasLike(i int, t string) bool {
+	if x.tf[i][t] > 0 {
+		return true
+	}
+	if len(t) < 5 {
+		return false
+	}
+	for w := range x.tf[i] {
+		if likeWords(w, t) {
 			return true
 		}
 	}

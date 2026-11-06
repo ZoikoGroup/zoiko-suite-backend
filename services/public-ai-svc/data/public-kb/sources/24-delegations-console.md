@@ -23,7 +23,7 @@ The Delegation register lists every delegation you are entitled to see. With per
 
 ## Grant a delegation
 
-Grant a delegation hands one of your own authorities to another person for a fixed window. The platform first confirms that you actually hold the action, so a delegation can never create authority that did not already exist. Submitting the same form twice repeats the first grant rather than creating a second.
+To delegate your approval authority, use Grant a delegation: it hands one of your own authorities to another person for a fixed window. The platform first confirms that you actually hold the action, so a delegation can never create authority that did not already exist. Submitting the same form twice repeats the first grant rather than creating a second.
 
 ## What this register will refuse
 

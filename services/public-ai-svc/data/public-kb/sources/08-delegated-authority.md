@@ -27,7 +27,7 @@ A delegate never receives more authority than the person delegating it holds. A 
 
 ## Revocation and expiry
 
-A grant can be revoked, and it lapses when its period ends. When authority is revoked, expires or is suspended, pending approvals that depend on it are checked again and escalated if the approver may no longer approve.
+A delegation can be revoked at any time, and it lapses when its period ends. When authority is revoked, expires or is suspended, pending approvals that depend on it are checked again and escalated if the approver may no longer approve.
 
 ## How the register is used
 

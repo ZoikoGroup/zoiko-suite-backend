@@ -27,7 +27,7 @@ Every obligation is bound to an entity and a jurisdiction and can point back to 
 
 ## Exceptions and risk
 
-Missed or blocked items become governed exception cases with escalation routing. Risk scoring ranks obligations, filings and control exposures by severity, proximity and entity impact, and anomaly detection can flag unusual patterns without changing operational records.
+Compliance exceptions are handled as governed cases: missed or blocked items become governed exception cases with escalation routing. Compliance risk is managed through risk scoring, which ranks obligations, filings and control exposures by severity, proximity and entity impact, and anomaly detection can flag unusual patterns without changing operational records.
 
 ## What depends on your setup
 

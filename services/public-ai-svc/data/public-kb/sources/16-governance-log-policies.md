@@ -43,7 +43,11 @@ Check an amount asks whether an amount needs approving. It is compared against w
 
 ## What is in force right now
 
-What is in force right now shows the rules that would decide for a kind of rule and a scope, such as this organization. Choose the kind of rule and who it applies to, then show them. The narrowest rule wins, so the top row is the one that actually decides.
+What is in force right now shows the rules that would decide for a kind of rule and a scope, such as this organization. Choose the kind of rule and who it applies to, then show them. When two rules apply to the same thing, the narrowest rule decides, so the top row is the one that actually decides.
+
+## Approval thresholds
+
+An approval threshold is the most an action may be worth before it needs approving: anything at or under the threshold goes ahead, and anything above it is sent for approval. Thresholds are the kind of rule the platform acts on today, and they are set and brought into force in Policies.
 
 ## Create a rule
 

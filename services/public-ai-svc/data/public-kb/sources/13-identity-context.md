@@ -27,7 +27,7 @@ A person starts invited and activates from their link. A workload, such as an in
 
 ## Authentication and federation
 
-Authentication and federation shows how principals prove who they are: signing in directly or through a federated identity provider, and whether a second factor is in place. Current identity assurance shows who has a second factor, who would need one, and who is stopped.
+Authentication and federation shows how principals prove who they are: signing in directly or through single sign-on with a federated identity provider, and whether a second factor is in place. Current identity assurance shows who has a second factor, who would need one, and who is stopped.
 
 ## Live sessions
 

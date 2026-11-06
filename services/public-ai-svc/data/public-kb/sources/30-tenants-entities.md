@@ -17,6 +17,10 @@ license: OWNED_PUBLIC
 signing_ref: kbctl-dev
 ---
 
+## Tenants
+
+A tenant is your organization in ZoikoSuite. Each tenant holds its own legal entities, workspaces and settings, and nothing in one tenant is visible to another tenant.
+
 ## This tenant
 
 This tenant shows your own organization's record. Status and lifecycle are separate: a new tenant is ACTIVE in status while still ONBOARDING in its lifecycle, and only the lifecycle moves through defined stages.

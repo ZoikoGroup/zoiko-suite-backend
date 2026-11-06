@@ -19,7 +19,7 @@ signing_ref: kbctl-dev
 
 ## Record a journal
 
-To record a journal, enter the fiscal period (YYYY-MM), a description of why the posting exists, the journal type, such as Standard, the transaction date, the posting date, which may be later than the transaction date but never earlier, the currency (a three-letter code such as GBP), an optional accounting book, and the lines: an account code, an optional note, and a debit or credit amount. A journal moves through three stages, PENDING, VALIDATED and FINALIZED. Validation enforces double entry, so debits must equal credits. After posting a journal cannot be edited; the only correction is a reversal that posts a separate inverse entry.
+To record a journal, enter the fiscal period (YYYY-MM), a description of why the posting exists, the journal type, such as Standard, the transaction date, the posting date, which may be later than the transaction date but never earlier, the currency (a three-letter code such as GBP), an optional accounting book, and the lines: an account code, an optional note, and a debit or credit amount. A journal moves through three stages, PENDING, VALIDATED and FINALIZED. Validation enforces double entry, so debits must equal credits. After posting a journal cannot be edited; to reverse a journal, post a reversal, a separate inverse entry.
 
 ## Journal register
 

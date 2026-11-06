@@ -23,7 +23,7 @@ Integrations connect ZoikoSuite to external systems through connectors, includin
 
 ## Banking, HRIS and tax authority
 
-Banking connectivity covers payment rails, bank statement intake and treasury connectivity. An HRIS connection supports keeping a retained HRIS platform during phased adoption. A tax authority interface supports filing submission and status confirmation.
+Banking connectivity covers payment rails, bank statement intake and treasury connectivity. An HRIS connection connects ZoikoSuite to your HR system and supports keeping a retained HRIS platform during phased adoption. A tax authority interface supports filing submission and status confirmation.
 
 ## eSignature and data feeds
 

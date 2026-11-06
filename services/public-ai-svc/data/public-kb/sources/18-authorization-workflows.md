@@ -19,7 +19,7 @@ signing_ref: kbctl-dev
 
 ## Authorization
 
-Authorization answers the question every service asks before it acts: may this person do this, for this entity, now? Each answer is recorded in the decision log. Conditions can only take an action away, never grant one, and privileged roles are held for an independent approver before they grant anything.
+Authorization is how access is controlled. It answers the question every service asks before it acts: may this person do this, for this entity, now? Each answer is recorded in the decision log. Conditions can only take an action away, never grant one, and privileged roles are held for an independent approver before they grant anything.
 
 ## Segregation of duties
 
@@ -43,7 +43,7 @@ Elevated access covers just-in-time, emergency and support sessions. Each is req
 
 ## Workflows & Approvals
 
-Workflows & Approvals runs multi-stage approvals for actions that need more than one person. An approval adds to authorization and never replaces it: an approver must also be authorized, and every step is recorded as evidence. Three rules hold whatever anyone's grants say: the person who started a workflow never decides it, nobody decides two stages of the same workflow, and a service account never decides one. A workflow past its deadline expires and a stage past its deadline escalates.
+Workflows & Approvals runs multi-stage approvals for actions that need more than one person. An approval adds to authorization and never replaces it: an approver must also be authorized, and every step is recorded as evidence. Three rules hold whatever anyone's grants say: the person who started a workflow never decides it, nobody decides two stages of the same workflow, and a service account never decides one. When an approval deadline passes, the workflow expires; when a stage deadline passes, that stage escalates.
 
 ## Start a workflow
 
@@ -51,7 +51,7 @@ Start a workflow opens an approval for something that needs one. Enter the workf
 
 ## Decide the current stage
 
-The stage's named approver, their delegate, a holder of the stage's role or the person it was escalated to records Approve or Reject, and a reason is required to reject. Each decision is checked against authorization and recorded. Escalate, cancel, reopen or invalidate changes a workflow without deciding it, and each needs its own permission.
+A workflow stage can be decided by the stage's named approver, their delegate, a holder of the stage's role or the person it was escalated to, who records Approve or Reject, and a reason is required to reject. Each decision is checked against authorization and recorded. Escalate, cancel, reopen or invalidate changes a workflow without deciding it, and each needs its own permission.
 
 ## Waiting for a decision
 

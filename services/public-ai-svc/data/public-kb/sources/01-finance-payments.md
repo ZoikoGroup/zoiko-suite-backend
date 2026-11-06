@@ -27,8 +27,8 @@ Payments and postings follow approval steps and keep their supporting evidence, 
 
 ## Ledger and close
 
-Journal postings move from pending to validated to finalized, and a finalized journal is never edited directly; corrections are made through a reversal or an adjustment. Period close checks readiness, locks the period and keeps a record of the close.
+The general ledger records every posting as a journal. Journal postings move from pending to validated to finalized, and a finalized journal is never edited directly; corrections are made through a reversal or an adjustment. Period close checks readiness, locks the period and keeps a record of the close.
 
 ## Receivables, liquidity and reconciliation
 
-Receivables reconcile to the general ledger. A governed liquidity view across entities and bank accounts takes account of pending payables, upcoming obligations, tax liabilities and approved items not yet settled. Bank reconciliation can suggest matches, while the final reconciliation stays governed and recorded.
+Receivables reconcile to the general ledger. A governed cash and liquidity view across entities and bank accounts takes account of pending payables, upcoming obligations, tax liabilities and approved items not yet settled. Bank reconciliation can suggest matches, while the final reconciliation stays governed and recorded.

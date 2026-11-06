@@ -19,7 +19,7 @@ signing_ref: kbctl-dev
 
 ## Privacy & Cross-Border Data Transfer Governance
 
-The privacy area records consent, privacy notices and preferences, and governs when personal data may be transferred to another country.
+The privacy area records consent, privacy notices and preferences, and governs when personal data may be transferred to another country. A cross-border data transfer needs a legal transfer mechanism, a registered processor relationship and a transfer risk assessment, and the runtime transfer gate checks all three before data leaves.
 
 ## Record Subject Consent
 

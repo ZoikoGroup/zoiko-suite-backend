@@ -27,7 +27,7 @@ Tax rules are kept as effective-dated rule libraries, and the applicable treatme
 
 ## Filing preparation
 
-Filing preparation assembles a filing before submission and checks that its supporting evidence is complete. Each filing is tracked from due-date planning through submission and confirmation.
+Tax returns and other filings are prepared before submission: filing preparation assembles the filing and checks that its supporting evidence is complete. Each filing and its deadline is tracked from due-date planning through submission and confirmation.
 
 ## Jurisdictions
 

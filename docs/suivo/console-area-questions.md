@@ -54,3 +54,13 @@ The assistant cannot see the console's live data.
 
 A jurisdiction question that names a country, such as "Do you support the UK jurisdiction?", is still
 answered as market availability (I04).
+
+## Platform question bank
+
+`services/public-ai-svc/testdata/platform-questions.tsv` holds visitor questions area by area: Overview,
+Tax, Governance, Finance, Legal, Commercial Ops, Purchase Requests, Compliance, Evidence, Delegated
+Authority, Reporting, Security, Integrations, Workforce, Multi-entity, Migration, Jurisdictions,
+Authorization, Workflows, My Work, Identity, Privacy, Search, Source Authority and Tenants. Each
+line names the articles that may answer it. `acceptance.TestPlatformQuestionBank` asks every one
+and fails if a question gets the off-topic reply, is answered from an unrelated article, or shows
+a heading marker. To cover a new question, add a line to the file.

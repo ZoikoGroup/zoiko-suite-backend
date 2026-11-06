@@ -40,7 +40,8 @@ func (f *Fake) Calls() int { return int(f.calls.Load()) }
 
 var (
 	sentenceRe = regexp.MustCompile(`[^.!?]+[.!?]`)
-	headingRe  = regexp.MustCompile(`^\x{00a7}([^\x{00a7}]*)\x{00a7}\s*(.*)$`)
+	// headingRe is a section heading marker (knowledge.HeadingPrefix).
+	headingRe = regexp.MustCompile(`\x{00a7}([^\x{00a7}]*)\x{00a7}\s*`)
 	// qualifierRe marks availability caveats that must stay with the answer
 	// they qualify (Doc 02 T02, G01: no claim of universal availability).
 	qualifierRe = regexp.MustCompile(`(?i)\b(?:depends? on|depending on|varies|vary by|subject to|not available everywhere)\b`)
@@ -76,17 +77,15 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 		q := queryWords(req.Message)
 		top := req.Evidence[0]
 		var sentences, headings []string
-		heading := top.Title
-		for _, s := range sentenceRe.FindAllString(top.Text, -1) {
-			s = strings.TrimSpace(s)
-			if m := headingRe.FindStringSubmatch(s); m != nil {
-				heading, s = m[1], strings.TrimSpace(m[2])
+		for _, sec := range sections(top.Text, top.Title) {
+			for _, s := range sentenceRe.FindAllString(sec.body, -1) {
+				s = strings.TrimSpace(s)
+				if strings.HasPrefix(s, "TEST-ONLY") || strings.HasPrefix(s, "Not ZoikoSuite fact") || s == "" {
+					continue
+				}
+				sentences = append(sentences, s)
+				headings = append(headings, sec.heading)
 			}
-			if strings.HasPrefix(s, "TEST-ONLY") || strings.HasPrefix(s, "Not ZoikoSuite fact") || s == "" {
-				continue
-			}
-			sentences = append(sentences, s)
-			headings = append(headings, heading)
 		}
 		type cand struct {
 			s     string
@@ -309,13 +308,12 @@ const shortPassage = 3
 // when it is short, else its opening sentence.
 func passageText(text string) string {
 	var out []string
-	for _, s := range sentenceRe.FindAllString(text, -1) {
-		s = strings.TrimSpace(s)
-		if m := headingRe.FindStringSubmatch(s); m != nil {
-			s = strings.TrimSpace(m[2])
-		}
-		if s != "" && !strings.HasPrefix(s, "TEST-ONLY") && !strings.HasPrefix(s, "Not ZoikoSuite fact") {
-			out = append(out, s)
+	for _, sec := range sections(text, "") {
+		for _, s := range sentenceRe.FindAllString(sec.body, -1) {
+			s = strings.TrimSpace(s)
+			if s != "" && !strings.HasPrefix(s, "TEST-ONLY") && !strings.HasPrefix(s, "Not ZoikoSuite fact") {
+				out = append(out, s)
+			}
 		}
 	}
 	if len(out) > shortPassage {
@@ -344,3 +342,23 @@ func words(s string) map[string]bool {
 
 var commonWords = map[string]bool{"the": true, "and": true, "for": true, "does": true, "what": true, "which": true, "with": true,
 	"how": true, "are": true, "you": true, "your": true, "can": true, "this": true, "that": true, "from": true, "zoikosuite": true}
+
+type section struct{ heading, body string }
+
+// sections splits chunk text at its heading markers before sentences are
+// split, so a heading that ends in "?" ("Where can someone act?") is never
+// cut in two and its marker never reaches an answer.
+func sections(text, title string) []section {
+	var out []section
+	heading, last := title, 0
+	for _, m := range headingRe.FindAllStringSubmatchIndex(text, -1) {
+		if body := text[last:m[0]]; strings.TrimSpace(body) != "" {
+			out = append(out, section{heading, body})
+		}
+		heading, last = text[m[2]:m[3]], m[1]
+	}
+	if body := text[last:]; strings.TrimSpace(body) != "" {
+		out = append(out, section{heading, body})
+	}
+	return out
+}

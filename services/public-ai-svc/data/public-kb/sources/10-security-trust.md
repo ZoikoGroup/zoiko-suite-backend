@@ -19,7 +19,7 @@ signing_ref: kbctl-dev
 
 ## Security and Trust
 
-Security and Trust covers capabilities such as mTLS certificates, SIEM integrations, key lifecycle management and cap tables. This describes capabilities only. Certification status is published only through the official trust information and is never stated by this assistant without a verified claim.
+Security and Trust covers how ZoikoSuite keeps data secure, with capabilities such as mTLS certificates, SIEM integrations, key lifecycle management and cap tables. This describes capabilities only. Certification status is published only through the official trust information and is never stated by this assistant without a verified claim.
 
 ## Service identity and keys
 

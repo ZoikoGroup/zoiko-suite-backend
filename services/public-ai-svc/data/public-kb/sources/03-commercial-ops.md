@@ -23,7 +23,7 @@ Commercial Ops covers procurement, vendor approvals and invoice workflows. It li
 
 ## Vendor and invoice workflows
 
-Vendors are approved before they are used, and supplier invoices follow approval workflows before they are paid. Vendor due diligence covers validation, onboarding checks, and sanctions and risk status, and keeps the evidence of those checks. An invoice's approval state is settled before it is released for payment.
+Vendors are approved before they are used, and supplier invoices follow approval workflows before they are paid. Vendor due diligence covers validation, onboarding checks, and screening for sanctions and risk status, and keeps the evidence of those checks. An invoice's approval state is settled before it is released for payment.
 
 ## Procurement and spend controls
 

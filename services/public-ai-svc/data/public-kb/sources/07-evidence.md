@@ -23,7 +23,7 @@ Evidence keeps filing evidence and preparation records together with the work th
 
 ## Audit-ready records
 
-Because evidence is captured as work is done, reviewers and auditors can see what was prepared, by whom and when. Audit events are stored as append-only records linked to the action that produced them, and they can be searched by actor, entity, action, workflow or time range.
+Because evidence is captured as work is done, reviewers and auditors can see what was prepared, by whom and when. Audit events and evidence are stored as append-only records, never edited or deleted, linked to the action that produced them, and they can be searched by actor, entity, action, workflow or time range.
 
 ## Requirements before completion
 

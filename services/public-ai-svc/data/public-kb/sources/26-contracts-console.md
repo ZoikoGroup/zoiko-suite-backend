@@ -35,4 +35,4 @@ Terms shows the contract's terms as currently stored, at its current version.
 
 ## Version history
 
-Version history shows permanent snapshots of a contract, oldest first. A snapshot is added on drafting, revision, activation and termination, so every earlier state of the contract can still be read.
+Old contract versions are kept: Version history shows permanent snapshots of a contract, oldest first. A snapshot is added on drafting, revision, activation and termination, so every earlier state of the contract can still be read.
