@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"math/rand/v2"
 	"time"
 	"zoiko.io/public-ai-svc/internal/metrics"
 
@@ -98,8 +99,10 @@ func (r *Relay) Once(ctx context.Context) (int, error) {
 	return len(evs), r.Store.MarkPublished(ctx, ids, time.Now().UTC())
 }
 
-// Run relays until ctx ends, backing off with jitter-free doubling on error.
+// Run relays until ctx ends. On error it backs off by doubling, capped at a
+// minute, with jitter so replicas that failed together do not retry in step.
 func (r *Relay) Run(ctx context.Context, interval time.Duration) {
+	backoff := interval
 	wait := interval
 	for {
 		select {
@@ -109,13 +112,20 @@ func (r *Relay) Run(ctx context.Context, interval time.Duration) {
 		}
 		if _, err := r.Once(ctx); err != nil {
 			r.logger().Warn("outbox relay failed", zap.Error(err))
-			if wait *= 2; wait > time.Minute {
-				wait = time.Minute
+			if backoff *= 2; backoff > time.Minute {
+				backoff = time.Minute
 			}
+			wait = Jitter(backoff, rand.Float64()) // #nosec G404 -- backoff jitter, not a security value
 			continue
 		}
-		wait = interval
+		backoff, wait = interval, interval
 	}
+}
+
+// Jitter spreads d over [d/2, d) ("equal jitter"); u is uniform in [0, 1).
+func Jitter(d time.Duration, u float64) time.Duration {
+	half := d / 2
+	return half + time.Duration(u*float64(d-half))
 }
 
 func (r *Relay) batch() int {

@@ -14,8 +14,16 @@ intent_ids: I19,I02
 
 ## Legal and Contracts
 
-Legal and Contracts governs commercial agreements, corporate actions, board resolutions and legal obligations.
+Legal and Contracts governs commercial agreements, corporate actions, board resolutions and legal obligations. Agreements and resolutions move through approval-bound execution: each step is approved by the right people before it is executed, and the record of approvals is kept.
 
-## Approval-bound execution
+## Contract lifecycle
 
-Agreements and resolutions move through approval-bound execution: each step is approved by the right people before it is executed, and the record of approvals is kept.
+Contracts are drafted, negotiated, executed and renewed within one tracked lifecycle, using standard clause libraries and approved templates. A contract becomes active only after governed approval and validation of its signatories. Counterparties are recorded with their validation status and risk information.
+
+## Obligations from contracts
+
+Obligations that come from a contract are tracked as separate items, each linked back to the clause and contract version it came from. This lets a team see what was agreed, who owns each obligation and when it is due.
+
+## Board resolutions and corporate actions
+
+Board resolutions are tracked from draft through approval, execution and archiving. Corporate actions, such as officer changes, filings and board-authorized entity events, follow the same governed path. The workflows available to you depend on market, plan and deployment status.

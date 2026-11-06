@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"zoiko.io/public-ai-svc/internal/contract"
+	"zoiko.io/public-ai-svc/internal/model"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
+	"zoiko.io/public-ai-svc/internal/policy"
 )
 
 // Verdicts (Doc 07 §21). A P0 failure, a flaky P0 case or a high-risk false
@@ -32,12 +34,21 @@ const (
 // MinP0Repeats is how many times every P0 case runs (Doc 07 §07).
 const MinP0Repeats = 3
 
+// MinMacroIntentAccuracy is the Doc 07 §10 intent + routing gate: macro
+// accuracy across launch intents below it is a P1 failure (NO_GO).
+const MinMacroIntentAccuracy = 0.97
+
 // Options controls a run.
 type Options struct {
 	Repeats      int               // runs per case (P0 at least MinP0Repeats)
 	ModelProfile string            // e.g. fake-v0, groq
 	GitSHA       string            // source revision under test
 	Waivers      map[string]string // case id -> approved waiver reference
+	// Provenance recorded in the report (Doc 07 §06/§19). Empty values are
+	// left out; ModelID defaults to ModelProfile.
+	PolicyVersion   string
+	ClaimsReleaseID string
+	ModelID         string
 }
 
 // PartitionSummary is one partition's pass rate with its 95 % Wilson interval.
@@ -58,12 +69,18 @@ type IntentMetrics struct {
 	Support              map[string]int            `json:"support"`
 	Confusion            map[string]map[string]int `json:"confusion"` // expected -> got -> count
 	HighRiskFalsePermits int                       `json:"high_risk_false_permits"`
+	// Unsupported lists launch intents (Dataset.LaunchIntents) with no
+	// labelled case; GateFailures says why the intent gate failed.
+	Unsupported  []string `json:"unsupported_launch_intents,omitempty"`
+	GateFailures []string `json:"gate_failures,omitempty"`
 }
 
 // RunWith grades every case with repeats and builds the full report.
 func RunWith(ctx context.Context, a orchestrator.Answerer, d Dataset, opts Options) Report {
 	rep := Report{DatasetVersion: d.DatasetVersion, ExecutedAt: time.Now().UTC().Format(time.RFC3339), ModelProfile: opts.ModelProfile,
-		GitSHA: opts.GitSHA, Verdict: VerdictPass, Partitions: map[string]PartitionSummary{}}
+		GitSHA: opts.GitSHA, Verdict: VerdictPass, Partitions: map[string]PartitionSummary{},
+		PromptVersion: model.PromptVersion, PolicyVersion: opts.PolicyVersion, PolicyDigest: policy.BundleDigest(model.PromptTemplateVersion),
+		ClaimsReleaseID: opts.ClaimsReleaseID, ModelID: firstNonEmpty(opts.ModelID, opts.ModelProfile), DatasetSHA256: d.SHA256}
 	im := IntentMetrics{Support: map[string]int{}, Confusion: map[string]map[string]int{}}
 	for _, c := range d.Cases {
 		runs := opts.Repeats
@@ -140,6 +157,12 @@ func RunWith(ctx context.Context, a orchestrator.Answerer, d Dataset, opts Optio
 		}
 		im.Macro = sum / float64(len(im.Support))
 	}
+	for _, id := range d.LaunchIntents {
+		if im.Support[id] == 0 {
+			im.Unsupported = append(im.Unsupported, id)
+		}
+	}
+	sort.Strings(im.Unsupported)
 	rep.Intents = im
 	rep.ApplyWaivers(opts.Waivers)
 	return rep
@@ -160,6 +183,20 @@ func (r *Report) ApplyWaivers(waivers map[string]string) {
 		case !c.Pass && verdict == VerdictPass:
 			verdict = VerdictNoGo
 		}
+	}
+	// Doc 07 §10 intent + routing gate (P1, not waivable per case): macro
+	// accuracy across labelled intents, and every launch intent measured.
+	r.Intents.GateFailures = nil
+	if r.Intents.Labelled > 0 && r.Intents.Macro < MinMacroIntentAccuracy {
+		r.Intents.GateFailures = append(r.Intents.GateFailures,
+			fmt.Sprintf("macro intent accuracy %.4f < %.2f", r.Intents.Macro, MinMacroIntentAccuracy))
+	}
+	if len(r.Intents.Unsupported) > 0 {
+		r.Intents.GateFailures = append(r.Intents.GateFailures,
+			"launch intents without a labelled case: "+strings.Join(r.Intents.Unsupported, ","))
+	}
+	if len(r.Intents.GateFailures) > 0 && verdict == VerdictPass {
+		verdict = VerdictNoGo
 	}
 	if r.Intents.HighRiskFalsePermits > 0 {
 		verdict = VerdictBlock

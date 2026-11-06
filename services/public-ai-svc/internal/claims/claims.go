@@ -291,10 +291,11 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 			eligible = append(eligible, c)
 		}
 	}
-	// Two active values for the same key that disagree → CONTRADICTED.
+	// Two active values for the same key that disagree → CONTRADICTED. Every
+	// eligible claim is in force at AsOf, so their windows overlap.
 	byKey := map[string]string{}
 	for _, c := range eligible {
-		k := strings.Join([]string{c.ClaimType, c.SubjectID, c.Predicate, c.Market, c.BillingTerm, c.Segment}, "|")
+		k := ConflictKey(c)
 		if v, ok := byKey[k]; ok && v != c.NormalizedValue {
 			sawConflict = true
 			d.ConflictKeys = append(d.ConflictKeys, c.ClaimID)
@@ -335,24 +336,40 @@ func distinct(xs []string) int {
 	return len(seen)
 }
 
-// Validate checks a manifest before it is signed.
 // ClaimConflict is a set of ACTIVE claims for one key whose values disagree
-// (KB-005). SubjectKey starts with the claim type.
+// while their validity windows overlap (KB-005). SubjectKey starts with the
+// claim type.
 type ClaimConflict struct {
 	SubjectKey string
 	ClaimIDs   []string
 	OwnerID    string
 }
 
-// Conflicts lists every key with two or more ACTIVE claims that disagree,
-// in key order, with the first named owner among them.
+// ConflictKey is the scope two claims must share to contradict each other
+// (Doc 03 §16, Doc 05 §17): a different currency, plan or locale is a
+// different fact, not a conflict.
+func ConflictKey(c Claim) string {
+	return strings.Join([]string{c.ClaimType, c.SubjectID, c.Predicate, c.Market, c.BillingTerm, c.Segment, c.Currency, c.Plan, c.Locale}, "|")
+}
+
+// windowsOverlap reports whether two [from, until) validity windows share an
+// instant. A zero until is open-ended.
+func windowsOverlap(a, b Claim) bool {
+	return (a.ValidUntil.IsZero() || b.ValidFrom.Before(a.ValidUntil)) &&
+		(b.ValidUntil.IsZero() || a.ValidFrom.Before(b.ValidUntil))
+}
+
+// Conflicts lists every key with two or more ACTIVE claims that disagree in
+// overlapping validity windows, in key order, with the first named owner
+// among them. A value that replaces another at a later date is succession,
+// not a conflict.
 func (m Manifest) Conflicts() []ClaimConflict {
 	groups := map[string][]Claim{}
 	for _, c := range m.Claims {
 		if c.Status != StatusActive {
 			continue
 		}
-		k := strings.Join([]string{c.ClaimType, c.SubjectID, c.Predicate, c.Market, c.BillingTerm, c.Segment}, "|")
+		k := ConflictKey(c)
 		groups[k] = append(groups[k], c)
 	}
 	keys := make([]string, 0, len(groups))
@@ -363,15 +380,22 @@ func (m Manifest) Conflicts() []ClaimConflict {
 	var out []ClaimConflict
 	for _, k := range keys {
 		g := groups[k]
-		values := map[string]bool{}
-		for _, c := range g {
-			values[c.NormalizedValue] = true
+		in := map[int]bool{}
+		for i := range g {
+			for j := i + 1; j < len(g); j++ {
+				if g[i].NormalizedValue != g[j].NormalizedValue && windowsOverlap(g[i], g[j]) {
+					in[i], in[j] = true, true
+				}
+			}
 		}
-		if len(values) < 2 {
+		if len(in) == 0 {
 			continue
 		}
 		cc := ClaimConflict{SubjectKey: k}
-		for _, c := range g {
+		for i, c := range g {
+			if !in[i] {
+				continue
+			}
 			cc.ClaimIDs = append(cc.ClaimIDs, c.ClaimID)
 			if cc.OwnerID == "" {
 				cc.OwnerID = c.OwnerID
@@ -383,7 +407,24 @@ func (m Manifest) Conflicts() []ClaimConflict {
 	return out
 }
 
+// Validate checks a manifest before it is signed: the registry structure
+// plus per-claim completeness (Doc 03 §17).
 func (m Manifest) Validate() []string {
+	problems := m.StructuralProblems()
+	for _, c := range m.Claims {
+		if c.ClaimID != "" && c.Status == StatusActive && !c.Synthetic && !c.Complete() {
+			problems = append(problems, "ACTIVE price/trial claim missing typed fields (Doc 03 §17): "+c.ClaimID)
+		}
+	}
+	return problems
+}
+
+// StructuralProblems are the registry-integrity failures a runtime refuses
+// at load (Doc 03 §6/§12, CT-043): missing identity, duplicate ids, missing
+// two-person approval or owner, an empty validity window. An incomplete
+// price/trial claim is not one of them: the resolver already abstains on
+// that claim alone (CLAIM_INCOMPLETE), so it never takes the release down.
+func (m Manifest) StructuralProblems() []string {
 	var problems []string
 	seen := map[string]bool{}
 	for _, c := range m.Claims {
@@ -398,8 +439,6 @@ func (m Manifest) Validate() []string {
 			problems = append(problems, "ACTIVE claim needs an accountable owner (Doc 03 §10): "+c.ClaimID)
 		case c.Status == StatusActive && !c.ValidUntil.After(c.ValidFrom):
 			problems = append(problems, "invalid validity window: "+c.ClaimID)
-		case c.Status == StatusActive && !c.Synthetic && !c.Complete():
-			problems = append(problems, "ACTIVE price/trial claim missing typed fields (Doc 03 §17): "+c.ClaimID)
 		}
 		seen[c.ClaimID] = true
 	}

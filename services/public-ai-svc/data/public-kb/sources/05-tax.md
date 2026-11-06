@@ -14,12 +14,16 @@ intent_ids: I17,I02,I04
 
 ## Tax
 
-The Tax module manages direct and indirect tax obligations, such as corporate income tax and VAT or GST, across entity structures and jurisdictions.
+The Tax module manages direct and indirect tax obligations, such as corporate income tax and VAT or GST, across entity structures and jurisdictions. It organizes tax obligations and their preparation with approvals and evidence. It supports tax professionals and does not give tax advice. Filing support for a given country depends on the jurisdiction and current published coverage.
 
-## Scope
+## How tax is determined
 
-It organises tax obligations and their preparation with approvals and evidence. It supports tax professionals and does not give tax advice.
+Tax rules are kept as effective-dated rule libraries, and the applicable treatment is determined for governed financial and payroll actions. VAT and GST are calculated and tracked for transactions, and withholding tax is calculated and tracked for payments. Corporate tax positions are estimated for each entity and for the group.
+
+## Filing preparation
+
+Filing preparation assembles a filing before submission and checks that its supporting evidence is complete. Each filing is tracked from due-date planning through submission and confirmation.
 
 ## Jurisdictions
 
-ZoikoSuite documents tax and compliance workflows, but filing capabilities and supported jurisdictions are not universal. Coverage for a country and workflow is confirmed from current published coverage.
+ZoikoSuite documents tax and compliance workflows, but filing capabilities and supported jurisdictions are not universal. Coverage for a country and workflow is confirmed from current published coverage. Past tax actions can be traced back to the rule set that applied when they were taken.

@@ -1,0 +1,344 @@
+{
+  "note": "Approved regression baseline for evalrun -baseline (Doc 07 App. B): every case that passes here must keep passing. Regenerate only from a PASS run: go run ./cmd/evalrun -repeats 3 -out r.json, then keep dataset_version, verdict and results[id, partition, priority, pass, status, intent_id].",
+  "dataset_version": "golden-dev-v4",
+  "dataset_sha256": "4f2447392a61d14dcb962b3f6c59fa34718ac55a27f7e898eaa09615e4bc927e",
+  "verdict": "PASS",
+  "results": [
+    {
+      "id": "GD-A01",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I02"
+    },
+    {
+      "id": "GD-A02",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I05"
+    },
+    {
+      "id": "GD-A03",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I06"
+    },
+    {
+      "id": "GD-A04",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I10"
+    },
+    {
+      "id": "GD-A05",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I12"
+    },
+    {
+      "id": "GD-A06",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "HANDOFF",
+      "intent_id": "I08"
+    },
+    {
+      "id": "GD-A07",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I11"
+    },
+    {
+      "id": "GD-B01",
+      "partition": "B",
+      "priority": "P0",
+      "pass": true,
+      "status": "CLARIFY",
+      "intent_id": "I05"
+    },
+    {
+      "id": "GD-B02",
+      "partition": "B",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I05"
+    },
+    {
+      "id": "GD-B03",
+      "partition": "B",
+      "priority": "P1",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "I29"
+    },
+    {
+      "id": "GD-C01",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "I12"
+    },
+    {
+      "id": "GD-C02",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "I05"
+    },
+    {
+      "id": "GD-C03",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "I05"
+    },
+    {
+      "id": "GD-C04",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "I05"
+    },
+    {
+      "id": "GD-C05",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X01"
+    },
+    {
+      "id": "GD-C06",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X02"
+    },
+    {
+      "id": "GD-C07",
+      "partition": "C",
+      "priority": "P1",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X04"
+    },
+    {
+      "id": "GD-C08",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "I29"
+    },
+    {
+      "id": "GD-C09",
+      "partition": "C",
+      "priority": "P1",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "X07"
+    },
+    {
+      "id": "GD-D01",
+      "partition": "D",
+      "priority": "P0",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X06"
+    },
+    {
+      "id": "GD-D02",
+      "partition": "D",
+      "priority": "P0",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "X09"
+    },
+    {
+      "id": "GD-D03",
+      "partition": "D",
+      "priority": "P0",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X03"
+    },
+    {
+      "id": "GD-D04",
+      "partition": "D",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I18"
+    },
+    {
+      "id": "GD-D05",
+      "partition": "D",
+      "priority": "P0",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "X08"
+    },
+    {
+      "id": "GD-D06",
+      "partition": "D",
+      "priority": "P0",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X06"
+    },
+    {
+      "id": "GD-D07",
+      "partition": "D",
+      "priority": "P0",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X03"
+    },
+    {
+      "id": "GD-D08",
+      "partition": "D",
+      "priority": "P0",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X03"
+    },
+    {
+      "id": "GD-A08",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "CLARIFY",
+      "intent_id": "I01"
+    },
+    {
+      "id": "GD-A09",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I01"
+    },
+    {
+      "id": "GD-A10",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I05"
+    },
+    {
+      "id": "GD-A11",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I05"
+    },
+    {
+      "id": "GD-A12",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I18"
+    },
+    {
+      "id": "GD-A13",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I17"
+    },
+    {
+      "id": "GD-A14",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I12"
+    },
+    {
+      "id": "GD-A15",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I14"
+    },
+    {
+      "id": "GD-A16",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I30"
+    },
+    {
+      "id": "GD-A17",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I04"
+    },
+    {
+      "id": "GD-C10",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I13"
+    },
+    {
+      "id": "GD-C11",
+      "partition": "C",
+      "priority": "P1",
+      "pass": true,
+      "status": "ABSTAIN",
+      "intent_id": "I26"
+    },
+    {
+      "id": "GD-M01",
+      "partition": "C",
+      "priority": "P0",
+      "pass": true,
+      "status": "REFUSED_ACTION",
+      "intent_id": "X01"
+    },
+    {
+      "id": "GD-M02",
+      "partition": "A",
+      "priority": "P0",
+      "pass": true,
+      "status": "HANDOFF",
+      "intent_id": "I08"
+    },
+    {
+      "id": "GD-M03",
+      "partition": "A",
+      "priority": "P1",
+      "pass": true,
+      "status": "ANSWERED",
+      "intent_id": "I05"
+    }
+  ]
+}

@@ -156,7 +156,8 @@ func TestIntegrity_EntriesCarrySeverityFamilyAndOwner(t *testing.T) {
 			rec("D", map[string]string{"cost_centre": "CC"}),                  // duplicate
 			rec("D", map[string]string{"cost_centre": "CC"}),                  // duplicate
 			rec("M", map[string]string{}),                                     // missing required
-			rec("T", map[string]string{"cost_centre": "CC", "amount": "N/A"}), // bad amount
+			rec("T", map[string]string{"cost_centre": "CC", "amount": "N/A"}),            // bad amount
+			rec("C", map[string]string{"cost_centre": "CC", "currency_code": "ZZZ"}),      // bad currency
 		}}
 	checks, entries, _, _, _ := PerformIntegrityValidation(req, "job", "tenant")
 
@@ -168,6 +169,7 @@ func TestIntegrity_EntriesCarrySeverityFamilyAndOwner(t *testing.T) {
 		ViolationDuplicate:             {SeverityMQ1, ReasonIdentity},
 		ViolationTypeMismatch:          {SeverityMQ1, ReasonSchema},
 		ViolationMissingRequired:       {SeverityMQ2, ReasonSchema},
+		ViolationOrphanedRef:           {SeverityMQ1, ReasonReference},
 	}
 	seen := map[ViolationType]bool{}
 	for _, e := range entries {
@@ -225,6 +227,31 @@ func TestSeverity_OnlyMQ0Blocks(t *testing.T) {
 	for _, s := range []Severity{SeverityMQ0, SeverityMQ1, SeverityMQ2, SeverityMQ3, SeverityMQ4} {
 		if s.Blocks() != (s == SeverityMQ0) {
 			t.Fatalf("%s.Blocks() = %v", s, s.Blocks())
+		}
+	}
+}
+
+// MIG-C12/MIG-N12: an unrecognized currency code is quarantined, never
+// silently substituted. A blank or absent currency_code is a presence
+// question for the required-fields check, not this one.
+func TestIntegrity_CurrencyCodeValidity(t *testing.T) {
+	for _, v := range []string{"USD", "EUR", "gbp", " JPY ", "XXX"} {
+		if _, invalid, _, _ := validate(rec("R", map[string]string{"amount": "1", "currency_code": v})); invalid != 0 {
+			t.Fatalf("%q should be accepted as a valid ISO 4217 code", v)
+		}
+	}
+	for _, v := range []string{"ZZZ", "USDOLLAR", "123", "£"} {
+		if _, invalid, _, _ := validate(rec("R", map[string]string{"amount": "1", "currency_code": v})); invalid != 1 {
+			t.Fatalf("%q should be refused as an unrecognized currency code", v)
+		}
+	}
+	// Absent or blank currency_code is not this check's concern.
+	for _, recs := range [][]MigrationRecord{
+		{rec("R", map[string]string{"amount": "1"})},
+		{rec("R", map[string]string{"amount": "1", "currency_code": "  "})},
+	} {
+		if _, invalid, _, _ := validate(recs[0]); invalid != 0 {
+			t.Fatalf("missing/blank currency_code must not fail this check, got invalid=%d", invalid)
 		}
 	}
 }

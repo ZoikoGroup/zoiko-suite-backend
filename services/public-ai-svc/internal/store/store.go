@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -18,6 +19,9 @@ var (
 	ErrAuditIncomplete     = errors.New("a control action needs an actor and an approval reference")
 	ErrTurnConflict        = errors.New("a turn is already in progress for this session")
 	ErrIdempotencyMismatch = errors.New("idempotency key reused with a different request")
+	// ErrSessionGone: the session expired or was deleted while its turn ran;
+	// the turn is not completed (SEC-T057).
+	ErrSessionGone = errors.New("session expired or deleted")
 )
 
 // Session is an anonymous public chat session. The grant itself is never
@@ -177,7 +181,8 @@ type Store interface {
 	// lockUntil and allocates the next turn_sequence.
 	BeginTurn(ctx context.Context, t Turn, lockUntil time.Time) (BeginResult, error)
 	// CompleteTurn stores the response, releases the slot, adds usage and
-	// writes outbox events in one transaction.
+	// writes outbox events in one transaction. It refuses (ErrSessionGone)
+	// when the session has expired or was deleted (SEC-T057).
 	CompleteTurn(ctx context.Context, t Turn, usageBuckets []string, tokens int64, events []OutboxEvent) error
 	// AbortTurn releases the slot and forgets an unfinished turn so the
 	// client can retry with the same key.
@@ -187,6 +192,8 @@ type Store interface {
 	SetFeedback(ctx context.Context, sessionID, turnID, rating, reason string, at time.Time) error
 	// PurgeSessions deletes sessions (and their turns) that expired or were
 	// deleted before cutoff, returning how many were removed (retention).
+	// It also drops outbox rows delivered (or dead-lettered) before cutoff
+	// and usage counters older than the previous month (Doc 06 §17).
 	PurgeSessions(ctx context.Context, cutoff time.Time) (int, error)
 	// AppendEvents writes events to the outbox on their own.
 	AppendEvents(ctx context.Context, events []OutboxEvent) error
@@ -215,4 +222,44 @@ type Store interface {
 	UnpublishedEvents(ctx context.Context, limit int) ([]OutboxEvent, error)
 	MarkPublished(ctx context.Context, outboxIDs []int64, at time.Time) error
 	MarkAttempt(ctx context.Context, outboxIDs []int64) error
+}
+
+// UsageKeepFrom returns the oldest day and month usage buckets kept at now:
+// the current and the previous calendar month (Doc 06 §17). Bucket names
+// are "tokens:day:YYYY-MM-DD" and "tokens:month:YYYY-MM" (limits.UsageBuckets);
+// they sort lexically by date.
+func UsageKeepFrom(now time.Time) (day, month string) {
+	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -1, 0)
+	return "tokens:day:" + first.Format("2006-01-02"), "tokens:month:" + first.Format("2006-01")
+}
+
+// RevocationEpochField is the kb.source.revoked.v1 data field the store
+// fills with the ledger watermark it assigns, in the same transaction
+// (Doc 05 §22).
+const RevocationEpochField = "revocation_epoch"
+
+// stampRevocationEpoch sets data.revocation_epoch to wm on every event that
+// carries the field; other events are returned unchanged.
+func stampRevocationEpoch(events []OutboxEvent, wm int64) []OutboxEvent {
+	out := make([]OutboxEvent, len(events))
+	for i, e := range events {
+		out[i] = e
+		var env map[string]json.RawMessage
+		if json.Unmarshal(e.Payload, &env) != nil {
+			continue
+		}
+		var data map[string]json.RawMessage
+		if json.Unmarshal(env["data"], &data) != nil {
+			continue
+		}
+		if _, ok := data[RevocationEpochField]; !ok {
+			continue
+		}
+		data[RevocationEpochField], _ = json.Marshal(wm)
+		env["data"], _ = json.Marshal(data)
+		if b, err := json.Marshal(env); err == nil {
+			out[i].Payload = b
+		}
+	}
+	return out
 }

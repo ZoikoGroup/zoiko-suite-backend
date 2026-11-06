@@ -26,7 +26,10 @@ type Service struct {
 	store store.Store
 	ttl   time.Duration
 	idle  time.Duration // 0: no idle expiry
-	now   func() time.Time
+	// idem is how long a session Idempotency-Key may be replayed
+	// (PUBLIC_AI_IDEMPOTENCY_TTL).
+	idem time.Duration
+	now  func() time.Time
 }
 
 // WithIdleTTL ends a session that has had no completed turn for d, before
@@ -36,8 +39,20 @@ func (s *Service) WithIdleTTL(d time.Duration) *Service {
 	return s
 }
 
+// DefaultIdempotencyTTL matches the config default for PUBLIC_AI_IDEMPOTENCY_TTL.
+const DefaultIdempotencyTTL = 24 * time.Hour
+
+// WithIdempotencyTTL bounds how long a create-session Idempotency-Key can be
+// replayed (Doc 05 §12). d <= 0 keeps the default.
+func (s *Service) WithIdempotencyTTL(d time.Duration) *Service {
+	if d > 0 {
+		s.idem = d
+	}
+	return s
+}
+
 func New(s store.Store, ttl time.Duration) *Service {
-	return &Service{store: s, ttl: ttl, now: func() time.Time { return time.Now().UTC() }}
+	return &Service{store: s, ttl: ttl, idem: DefaultIdempotencyTTL, now: func() time.Time { return time.Now().UTC() }}
 }
 
 // Issued is a newly created (or replayed) session and its plaintext grant.
@@ -69,6 +84,12 @@ func newGrant() string { return "pgr_" + base64.RawURLEncoding.EncodeToString(ra
 func (s *Service) Create(ctx context.Context, key string, requestHash []byte, locale, market, page, origin string) (Issued, error) {
 	if prev, hash, err := s.store.SessionByIdempotencyKey(ctx, key); err == nil {
 		if !bytes.Equal(hash, requestHash) {
+			return Issued{}, ErrMismatch
+		}
+		// Doc 05 §12: key reuse is not a credential. Only the same site
+		// origin, within the idempotency window, gets the replay; anyone
+		// else holding the key cannot mint a grant for this session.
+		if prev.Origin != origin || !s.now().Before(prev.CreatedAt.Add(s.idem)) {
 			return Issued{}, ErrMismatch
 		}
 		if prev.DeletedAt != nil || !s.now().Before(prev.ExpiresAt) {

@@ -1,0 +1,122 @@
+# promtool unit tests for prometheus-rules-public-ai.yml (Doc 08 §13,
+# OPR-020/021/022). Run from the repo root:
+#   promtool test rules deployments/prometheus-rules-public-ai.test.yml
+# Traffic is 1 turn/s unless stated; the objective is 99.9 % (budget 0.1 %).
+rule_files:
+  - prometheus-rules-public-ai.yml
+
+evaluation_interval: 1m
+
+tests:
+  # 14.4x: 5 % of turns UNAVAILABLE pages within the hour and freezes promotion.
+  - interval: 1m
+    input_series:
+      - series: 'public_ai_turns_total{status="ANSWERED",reason="ANSWERED"}'
+        values: '0+57x120'
+      - series: 'public_ai_turns_total{status="UNAVAILABLE",reason="MODEL_UNAVAILABLE"}'
+        values: '0+3x120'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: PublicAIErrorBudgetFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              freeze_promotion: "true"
+            exp_annotations:
+              summary: "Assistant: error budget burning 14.4x (1h and 5m windows)"
+              runbook: "RB-01"
+              runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-01-model-provider-degraded-doc-08-16"
+
+  # 6x: 1 % UNAVAILABLE for 7 h is a sustained burn: it pages and freezes
+  # promotion, while the 14.4x fast-burn alert stays quiet.
+  - interval: 5m
+    input_series:
+      - series: 'public_ai_turns_total{status="ANSWERED",reason="ANSWERED"}'
+        values: '0+297x90'
+      - series: 'public_ai_turns_total{status="UNAVAILABLE",reason="MODEL_TIMEOUT"}'
+        values: '0+3x90'
+    alert_rule_test:
+      - eval_time: 7h
+        alertname: PublicAIErrorBudgetSlowBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              freeze_promotion: "true"
+            exp_annotations:
+              summary: "Assistant: error budget burning 6x (6h and 30m windows); promotion frozen"
+              runbook: "RB-01"
+              runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-01-model-provider-degraded-doc-08-16"
+      - eval_time: 7h
+        alertname: PublicAIErrorBudgetFastBurn
+        exp_alerts: []
+
+  # The kill switch is an operator decision, not an error (OPR-011): every
+  # turn UNAVAILABLE with reason KILL_SWITCH burns no budget.
+  - interval: 1m
+    input_series:
+      - series: 'public_ai_turns_total{status="UNAVAILABLE",reason="KILL_SWITCH"}'
+        values: '0+60x120'
+      - series: 'public_ai_release_ready'
+        values: '1x120'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: PublicAIErrorBudgetFastBurn
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: PublicAIUnavailableTurns
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: PublicAIReleaseNotReady
+        exp_alerts: []
+
+  # Absent data: silence is never health. No build_info and no canary
+  # series alert once their "for" has elapsed.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="public-ai-svc"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PublicAIMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "Assistant: no build_info series for 10m (service down or not scraped)"
+              runbook: "RB-09"
+              runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-09-service-health-and-missing-telemetry"
+      - eval_time: 15m
+        alertname: PublicAIScrapeDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: public-ai-svc
+            exp_annotations:
+              summary: "Assistant: /metrics not scrapeable for 5m"
+              runbook: "RB-09"
+              runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-09-service-health-and-missing-telemetry"
+      - eval_time: 20m
+        alertname: PublicAICanaryStale
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: "Assistant: synthetic canary has not reported for 30m"
+              runbook: "RB-10"
+              runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-10-synthetic-canary-failing"
+
+  # A failing canary pages after 10 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'public_ai_canary_success'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PublicAICanaryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "Assistant: synthetic canary failing for 10m"
+              runbook: "RB-10"
+              runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-10-synthetic-canary-failing"

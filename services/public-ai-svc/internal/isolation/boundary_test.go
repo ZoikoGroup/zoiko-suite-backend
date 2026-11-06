@@ -20,6 +20,7 @@ func TestT12_NoRouteToPrivateSystems(t *testing.T) {
 	endpointish := regexp.MustCompile(`(?i)(url|uri|endpoint|host|addr|broker|token|secret|key|password|credential)`)
 	allowedOther := map[string]bool{
 		"HTTPAddr": true, "AllowedOrigins": true, "AllowedHosts": true, // its own listener and allowlists
+		"AdminAddr":        true,                     // its own internal metrics/health listener (Doc 06 §12)
 		"SigningPublicKey": true, "SigningKey": true, // release signatures, not access to other systems
 		"LogRawPrompt": true, // a refused switch, not a route
 		// Model token budgets, not access tokens.

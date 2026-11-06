@@ -24,7 +24,7 @@ func approvedKernelRun(t *testing.T, ledger *stubLedger) (*stubStore, chi.Router
 			t.Fatalf("schedule: %d %s", rr.Code, rr.Body.String())
 		}
 	}
-	runReq := domain.CreateDepreciationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-01", DepreciationExpenseAccountCode: "6400", AccumulatedDepreciationAccountCode: "1590"}
+	runReq := domain.CreateDepreciationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-01"}
 	rr := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
 	var run domain.DepreciationRun
 	_ = json.NewDecoder(rr.Body).Decode(&run)

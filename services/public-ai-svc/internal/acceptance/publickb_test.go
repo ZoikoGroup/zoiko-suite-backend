@@ -19,6 +19,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/orchestrator"
 	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/release"
+	"zoiko.io/public-ai-svc/internal/validate"
 )
 
 type kb struct {
@@ -57,7 +58,7 @@ func answered(t *testing.T, r orchestrator.Result, source string) {
 	if !r.Draft {
 		t.Fatal("answers from DRAFT_PENDING_REVIEW articles must be flagged draft")
 	}
-	if n := len(strings.Fields(r.Text)); n > 120 || len(r.Citations) > 3 || len(r.Actions) > 1 {
+	if n := len(strings.Fields(r.Text)); n > validate.MaxFullWords || len(r.Citations) > 3 || len(r.Actions) > 1 {
 		t.Fatalf("format: %d words, %d sources, %d actions", n, len(r.Citations), len(r.Actions))
 	}
 }

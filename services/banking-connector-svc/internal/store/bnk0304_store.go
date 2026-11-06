@@ -551,3 +551,218 @@ func (p *PgStore) GetCanonicalTransaction(ctx context.Context, tenantID, transac
 	}
 	return &t, nil
 }
+
+// listCanonicalTransactionsSQL is BNK-04 ListTransactions. bank_account_id
+// lives only on bank_connections, so a transaction reaches it through its
+// statement line and statement:
+//
+//	bank_transactions_canonical.statement_line_id -> bank_statement_lines.line_id
+//	bank_statement_lines.statement_id             -> bank_statements.statement_id
+//	bank_statements.connection_id                 -> bank_connections.connection_id
+//
+// There is no tenant predicate: all four tables are FORCE ROW LEVEL SECURITY
+// on tenant_id = app.tenant_id, which withTenant sets from the verified
+// request, so the read sees one tenant's rows by construction and cannot
+// disagree with the policy. An empty tenant matches nothing.
+//
+// Only NORMALIZED rows: a SUPERSEDED version was replaced by a correction and
+// a QUARANTINED one is not current truth. amount is cast to text in SQL — a
+// NUMERIC(18,4) renders with exactly four places — and scanned into a string,
+// so it never passes through float64. Dates bound transaction_date half-open
+// in UTC ($4 inclusive, $5 exclusive), which keeps the predicate sargable.
+// Keyset by transaction_id in byte order; $7 = limit + 1 tells the caller
+// whether another page exists.
+const listCanonicalTransactionsSQL = `
+	SELECT t.transaction_id, t.tenant_id, c.legal_entity_id, c.connection_id, c.bank_account_id,
+	       t.statement_line_id, t.mapping_version, t.transaction_date, t.amount::text,
+	       t.currency, t.category, t.counterparty, t.status
+	FROM bank_transactions_canonical t
+	JOIN bank_statement_lines l ON l.line_id = t.statement_line_id
+	JOIN bank_statements s ON s.statement_id = l.statement_id
+	JOIN bank_connections c ON c.connection_id = s.connection_id
+	WHERE t.status = 'NORMALIZED'
+	  AND c.legal_entity_id = $1
+	  AND ($2::text = '' OR c.bank_account_id = $2::text)
+	  AND ($3::text = '' OR t.currency = $3::text)
+	  AND ($4::timestamptz IS NULL OR t.transaction_date >= $4::timestamptz)
+	  AND ($5::timestamptz IS NULL OR t.transaction_date < $5::timestamptz)
+	  AND ($6::text = '' OR t.transaction_id COLLATE "C" > $6::text COLLATE "C")
+	ORDER BY t.transaction_id COLLATE "C"
+	LIMIT $7`
+
+// ListCanonicalTransactions returns one keyset page of q's NORMALIZED canonical
+// transactions. When more rows exist, NextCursor is the last returned
+// transaction_id (the handler makes it opaque); it is empty only when this
+// page ends the result.
+func (p *PgStore) ListCanonicalTransactions(ctx context.Context, q domain.ListTransactionsQuery) (*domain.CanonicalTransactionPage, error) {
+	if q.LegalEntityID == "" {
+		return nil, fmt.Errorf("legal_entity_id is required")
+	}
+	if q.Limit < 1 {
+		return nil, fmt.Errorf("limit must be positive")
+	}
+	page := &domain.CanonicalTransactionPage{Transactions: []domain.CanonicalTransactionListItem{}}
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, listCanonicalTransactionsSQL,
+			q.LegalEntityID, q.BankAccountID, q.Currency, q.From, q.ToExclusive, q.AfterTransactionID, q.Limit+1)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var it domain.CanonicalTransactionListItem
+			var bankAccountID string
+			if err := rows.Scan(&it.TransactionID, &it.TenantID, &it.LegalEntityID, &it.ConnectionID, &bankAccountID,
+				&it.StatementLineID, &it.MappingVersion, &it.TransactionDate, &it.Amount,
+				&it.Currency, &it.Category, &it.Counterparty, &it.Status); err != nil {
+				return err
+			}
+			if bankAccountID != "" {
+				it.BankAccountID = &bankAccountID
+			}
+			page.Transactions = append(page.Transactions, it)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(page.Transactions) > q.Limit {
+		page.Transactions = page.Transactions[:q.Limit]
+		page.NextCursor = page.Transactions[q.Limit-1].TransactionID
+	}
+	return page, nil
+}
+
+// rawLineageSQL joins a canonical transaction back through its immutable
+// statement line to the statement and connection it arrived on — the same
+// join path as listCanonicalTransactionsSQL, read for one row instead of a
+// page. Tenant isolation is RLS's (every table here is FORCE ROW LEVEL
+// SECURITY), reinforced by the explicit tenant_id predicate, the same
+// belt-and-suspenders posture GetCanonicalTransaction already uses.
+const rawLineageSQL = `
+	SELECT t.transaction_id, t.tenant_id, t.status, t.mapping_version, t.superseded_by,
+	       l.line_id, l.line_seq, l.raw_reference, l.bank_code, l.posted_date,
+	       s.statement_id, s.content_hash, s.source_id,
+	       c.connection_id, c.legal_entity_id, c.bank_account_id
+	FROM bank_transactions_canonical t
+	JOIN bank_statement_lines l ON l.line_id = t.statement_line_id
+	JOIN bank_statements s ON s.statement_id = l.statement_id
+	JOIN bank_connections c ON c.connection_id = s.connection_id
+	WHERE t.transaction_id = $1 AND t.tenant_id = $2`
+
+// GetRawLineage is BNK-04's GetRawLineage (table 23/25): the raw evidence
+// one canonical transaction was derived from, plus enough of its own
+// identity to tie the two together. The caller never supplies a legal
+// entity — it isn't known until this row is loaded — so the handler
+// authorizes against LegalEntityID only after this returns, the same
+// load-then-authorize order requireLegalEntityAuthz uses elsewhere in this
+// package.
+func (p *PgStore) GetRawLineage(ctx context.Context, tenantID, transactionID string) (*domain.RawLineage, error) {
+	var l domain.RawLineage
+	var supersededBy *string
+	var bankAccountID string
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, rawLineageSQL, transactionID, tenantID)
+		return row.Scan(&l.TransactionID, &l.TenantID, &l.Status, &l.MappingVersion, &supersededBy,
+			&l.StatementLineID, &l.LineSeq, &l.RawReference, &l.BankCode, &l.PostedDate,
+			&l.StatementID, &l.StatementContentHash, &l.StatementSourceID,
+			&l.ConnectionID, &l.LegalEntityID, &bankAccountID)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrTransactionNotFound
+		}
+		return nil, err
+	}
+	if supersededBy != nil {
+		l.SupersededBy = *supersededBy
+	}
+	if bankAccountID != "" {
+		l.BankAccountID = &bankAccountID
+	}
+	return &l, nil
+}
+
+const normalizationVersionSQL = `
+	SELECT t.transaction_id, t.tenant_id, t.status, t.mapping_version, c.legal_entity_id
+	FROM bank_transactions_canonical t
+	JOIN bank_statement_lines l ON l.line_id = t.statement_line_id
+	JOIN bank_statements s ON s.statement_id = l.statement_id
+	JOIN bank_connections c ON c.connection_id = s.connection_id
+	WHERE t.transaction_id = $1 AND t.tenant_id = $2`
+
+// GetNormalizationVersion is BNK-04's GetNormalizationVersion (table 23/25).
+// See domain.MappingVersionCaveat / A19 (SPEC_DEVIATIONS.md): mapping_version
+// is a per-line re-normalization counter, not a mapping-dictionary/parser/
+// schema version, and that limitation rides along in the response itself.
+func (p *PgStore) GetNormalizationVersion(ctx context.Context, tenantID, transactionID string) (*domain.NormalizationVersion, error) {
+	var v domain.NormalizationVersion
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, normalizationVersionSQL, transactionID, tenantID)
+		return row.Scan(&v.TransactionID, &v.TenantID, &v.Status, &v.MappingVersion, &v.LegalEntityID)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrTransactionNotFound
+		}
+		return nil, err
+	}
+	v.Caveat = domain.MappingVersionCaveat
+	return &v, nil
+}
+
+// listMappingExceptionsSQL has no tenant predicate for the same reason
+// listCanonicalTransactionsSQL doesn't: mapping_exceptions is FORCE ROW
+// LEVEL SECURITY (migration 004) and withTenant has already set
+// app.tenant_id for this session. Keyset by exception_id in byte order,
+// same pagination shape as ListCanonicalTransactions.
+const listMappingExceptionsSQL = `
+	SELECT exception_id, tenant_id, statement_line_id, reason, status, raised_by_principal_id,
+	       resolved_transaction_id, resolved_by_principal_id, resolved_at, created_at
+	FROM mapping_exceptions
+	WHERE ($1::text = '' OR status = $1::text)
+	  AND ($2::text = '' OR exception_id COLLATE "C" > $2::text COLLATE "C")
+	ORDER BY exception_id COLLATE "C"
+	LIMIT $3`
+
+// ListMappingExceptions is BNK-04's ListNormalizationExceptions (table 23).
+func (p *PgStore) ListMappingExceptions(ctx context.Context, q domain.ListMappingExceptionsQuery) (*domain.MappingExceptionPage, error) {
+	if q.Limit < 1 {
+		return nil, fmt.Errorf("limit must be positive")
+	}
+	page := &domain.MappingExceptionPage{Exceptions: []domain.MappingException{}}
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, listMappingExceptionsSQL, q.Status, q.AfterExceptionID, q.Limit+1)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e domain.MappingException
+			var resolvedTxnID, resolvedBy *string
+			var resolvedAt *time.Time
+			if err := rows.Scan(&e.ExceptionID, &e.TenantID, &e.StatementLineID, &e.Reason, &e.Status, &e.RaisedByPrincipalID,
+				&resolvedTxnID, &resolvedBy, &resolvedAt, &e.CreatedAt); err != nil {
+				return err
+			}
+			if resolvedTxnID != nil {
+				e.ResolvedTransactionID = *resolvedTxnID
+			}
+			if resolvedBy != nil {
+				e.ResolvedByPrincipalID = *resolvedBy
+			}
+			e.ResolvedAt = resolvedAt
+			page.Exceptions = append(page.Exceptions, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(page.Exceptions) > q.Limit {
+		page.Exceptions = page.Exceptions[:q.Limit]
+		page.NextCursor = page.Exceptions[q.Limit-1].ExceptionID
+	}
+	return page, nil
+}

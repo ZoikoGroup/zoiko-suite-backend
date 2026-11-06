@@ -7,7 +7,12 @@
 //	go run ./cmd/canary -base http://127.0.0.1:8001 -origin http://localhost:3000 -out canary-report.json
 //
 // It exits 1 when any step fails, so it can gate a canary stage or run on a
-// schedule as a synthetic probe.
+// schedule as a synthetic probe. With -metrics-file it also writes a
+// Prometheus textfile (node exporter textfile collector format) with
+// public_ai_canary_success, per-step latency and the run timestamp, so the
+// PublicAICanaryFailing / PublicAICanaryStale alerts have a series. With
+// -admin-base the readiness probe goes to the admin listener
+// (PUBLIC_AI_ADMIN_ADDR) instead of -base.
 package main
 
 import (
@@ -95,9 +100,17 @@ func main() {
 	origin := flag.String("origin", "http://localhost:3000", "allowed Origin to send")
 	out := flag.String("out", "", "write the JSON report here (default: stdout)")
 	timeout := flag.Duration("timeout", 20*time.Second, "per-request timeout")
+	metricsFile := flag.String("metrics-file", "", "also write a Prometheus textfile here (e.g. /var/lib/node_exporter/textfile/public_ai_canary.prom)")
+	adminBase := flag.String("admin-base", "", "admin listener base URL for /health/ready (default: -base)")
 	flag.Parse()
 
-	rep := Run(context.Background(), &http.Client{Timeout: *timeout}, *base, *origin)
+	rep := RunWith(context.Background(), &http.Client{Timeout: *timeout}, *base, *adminBase, *origin)
+	if *metricsFile != "" {
+		if err := WriteMetrics(*metricsFile, rep, time.Now()); err != nil {
+			fmt.Fprintln(os.Stderr, "metrics file:", err)
+			os.Exit(1)
+		}
+	}
 	b, _ := json.MarshalIndent(rep, "", "  ")
 	if *out != "" {
 		if err := os.WriteFile(*out, b, 0o644); err != nil {
@@ -122,12 +135,21 @@ func main() {
 // Run executes the journey against base. It stops after a failed session
 // create, since no turn can run without one.
 func Run(ctx context.Context, c *http.Client, base, origin string) Report {
+	return RunWith(ctx, c, base, "", origin)
+}
+
+// RunWith is Run with the readiness probe sent to adminBase when set.
+func RunWith(ctx context.Context, c *http.Client, base, adminBase, origin string) Report {
 	base = strings.TrimRight(base, "/")
 	p := prober{c: c, base: base, origin: origin}
 	rep := Report{Base: base, StartedAt: time.Now().UTC()}
 	add := func(s Step) { rep.Steps = append(rep.Steps, s) }
 
-	add(p.expect(ctx, "ready", "readiness is 200", http.MethodGet, "/health/ready", nil, nil, http.StatusOK))
+	ap := p
+	if adminBase != "" {
+		ap.base = strings.TrimRight(adminBase, "/")
+	}
+	add(ap.expect(ctx, "ready", "readiness is 200", http.MethodGet, "/health/ready", nil, nil, http.StatusOK))
 	add(p.expect(ctx, "config", "public config is served", http.MethodGet, "/public-ai/v1/config", nil, nil, http.StatusOK))
 
 	var sess contract.SessionResponse
@@ -172,6 +194,43 @@ func Run(ctx context.Context, c *http.Client, base, origin string) Report {
 		rep.Pass = rep.Pass && s.Pass
 	}
 	return rep
+}
+
+// WriteMetrics writes the run as a Prometheus textfile: success 0/1, the
+// run timestamp and each step's latency and result. Labels are the fixed
+// step ids only. The file is written to a temp name and renamed, so a
+// collector never reads a partial file.
+func WriteMetrics(path string, rep Report, now time.Time) error {
+	var b strings.Builder
+	ok := 0
+	if rep.Pass {
+		ok = 1
+	}
+	b.WriteString("# HELP public_ai_canary_success 1 when every canary step passed in the last run, else 0.\n")
+	b.WriteString("# TYPE public_ai_canary_success gauge\n")
+	fmt.Fprintf(&b, "public_ai_canary_success %d\n", ok)
+	b.WriteString("# HELP public_ai_canary_last_run_timestamp_seconds Unix time of the last canary run.\n")
+	b.WriteString("# TYPE public_ai_canary_last_run_timestamp_seconds gauge\n")
+	fmt.Fprintf(&b, "public_ai_canary_last_run_timestamp_seconds %d\n", now.Unix())
+	b.WriteString("# HELP public_ai_canary_step_latency_seconds Latency of each canary step in the last run.\n")
+	b.WriteString("# TYPE public_ai_canary_step_latency_seconds gauge\n")
+	for _, s := range rep.Steps {
+		fmt.Fprintf(&b, "public_ai_canary_step_latency_seconds{step=%q} %g\n", s.ID, float64(s.LatencyMS)/1000)
+	}
+	b.WriteString("# HELP public_ai_canary_step_success 1 when the step passed in the last run, else 0.\n")
+	b.WriteString("# TYPE public_ai_canary_step_success gauge\n")
+	for _, s := range rep.Steps {
+		v := 0
+		if s.Pass {
+			v = 1
+		}
+		fmt.Fprintf(&b, "public_ai_canary_step_success{step=%q} %d\n", s.ID, v)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 type prober struct {

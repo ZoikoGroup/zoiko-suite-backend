@@ -150,20 +150,78 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   permissive. Migration 000027's down migration refuses while any row still
   carries a designation, so the evidence cannot be erased while a journal
   depends on it.
-- **A15. `QueryLedger` has no cursor and returns float amounts.** ACC-05's
-  read contract is a bounded list.
-  - *No cursor.* It is capped at 1000 entries, and a larger `limit` is
-    silently replaced by the default of 200. A reader cannot tell a full
-    page from a truncated one. reconciliation-intelligence-svc therefore
-    asks for exactly 1000 and refuses a full page (422) rather than trust
-    it.
-  - *Float amounts.* `LedgerEntry.debit_amount`/`credit_amount` are float64
-    on the wire. The columns are exact NUMERIC. A reader that needs
-    exactness parses the JSON number text directly, never through float64.
-    That is exact for any amount below about 2^53 minor units; this read
-    does not offer the exact decimal string `LedgerBalance` already does.
-  - *Needed:* a keyset cursor (`after_entry_seq`) and exact decimal strings
-    on `LedgerEntry`.
+- **A15. `QueryLedger` had no cursor and returned float amounts — both closed
+  (2026-10-30, 2026-11-01).** ACC-05's read contract is a bounded list.
+  - *No cursor — closed 2026-10-30.* `GET /v1/ledger/entries` now takes
+    `after_entry_seq` and its response is `{"entries": [...],
+    "next_cursor": <entry_seq>}` (was a bare array): `next_cursor` is the
+    last returned entry's own `entry_seq`, present exactly when more rows
+    exist past the page, same keyset-pagination shape used elsewhere in
+    this codebase (e.g. banking-connector-svc's `ListTransactions`). The
+    store always fetches `limit+1` rows and trims the extra one, so
+    truncation is never inferred from `len(entries) == limit` alone.
+    `GET /v1/ledger/as-of` (`QueryLedgerAsOf`) is unchanged — still a bare
+    array capped at `limit` — because a point-in-time snapshot read has no
+    pending continuation to cursor through; it shares `QueryLedgerFilter`
+    and `PgStore.QueryLedger` but ignores the new `hasMore` return.
+    `limit > MaxListLimit` (1000) is still silently replaced by the
+    default (200) rather than clamped or refused — unrelated to this
+    close, left as found.
+    - *Only known caller.* `reconciliation-intelligence-svc/internal/ledger`
+      was the sole consumer of the old bare-array shape (checked by
+      grepping every service for `v1/ledger/entries`); it is updated in the
+      same pass (A2b part 4) to decode the new envelope and actually follow
+      `next_cursor` instead of refusing a full page.
+    - *Tests:* `internal/handler/acc05_ledger_test.go`
+      (`TestQueryLedger_CursorSignalsTruncationAndPagesForward`,
+      `TestQueryLedger_MalformedCursor_Returns400`, and the pre-existing
+      scope test updated for the new envelope);
+      `internal/store/ledger_window_pg_smoke_test.go`
+      (`TestPgStore_QueryLedger_CursorPagesThroughEveryEntryExactlyOnce`,
+      real Postgres: every entry returned exactly once, in increasing
+      `entry_seq` order, across a page boundary that falls inside one
+      journal's own two lines).
+  - *Float amounts — closed 2026-11-01.* `LedgerEntry.DebitAmount`/
+    `CreditAmount` are now exact decimal strings on the wire (`type string`,
+    same `json:"debit_amount"`/`"credit_amount"` tags), the same change
+    `LedgerBalance` already had. `ledger_entries.debit_amount`/
+    `credit_amount` are NUMERIC(18,2); pgx already scans NUMERIC into a Go
+    `string` exactly (proven in production by `QueryAccountBalance`'s
+    `LedgerBalance.DebitTotal` et al.), so `QueryLedger` and
+    `QuerySourceEntries` needed no SQL change — only the struct field type,
+    in `internal/domain/types.go`. NUMERIC(18,2)'s own range reaches above
+    2^53 minor units (e.g. $90,071,992,547,409.93 is 9,007,199,254,740,993
+    cents, one more than 2^53), the exact magnitude at which a float64
+    wire value stops round-tripping exactly — this closes that gap for any
+    amount the column can hold, not just the sub-2^53 range the old
+    json-number-text workaround covered.
+    - *Consumer.* reconciliation-intelligence-svc's `internal/ledger`
+      client already decodes these fields as `json.Number` and parses them
+      exactly via `exactAmount`/`big.Rat`. `encoding/json` accepts a quoted
+      numeric string into a `json.Number` field exactly as it accepts a
+      bare number (verified: `TestListCashAccountEntries_OutOfScopeRowFailsClosed`'s
+      pre-existing `"unparseable money"` case already fed a quoted JSON
+      string through this same field), so the client needed no code
+      change — only a locked-down regression test pinning that behavior
+      down.
+    - *Scope.* `JournalLine.DebitAmount`/`CreditAmount` (the create-journal
+      request/response shape) and `appendLedgerEntries`'s own internal
+      float64 hop from `journal_lines` into `ledger_entries` are unchanged
+      and out of scope here — A15 names `LedgerEntry`'s wire shape
+      specifically, and `journal_lines.debit_amount`/`credit_amount` are
+      NUMERIC(18,2) same as `ledger_entries`, but every write path into
+      them still carries a float64 in Go first. Fixing that would be a
+      second, separate, larger change (every `CreateJournalRequest`
+      caller), not attempted here.
+    - *Tests:* `internal/handler/acc05_ledger_test.go`
+      (`TestQueryLedger_AmountsAreExactDecimalStringsOnTheWire` — decodes
+      the response as raw JSON and asserts `debit_amount` is the quoted
+      string token, not a bare number); `internal/store/
+      ledger_entry_exact_amount_pg_smoke_test.go` (real Postgres: a row
+      inserted directly at $90,071,992,547,409.93 — one cent past 2^53 —
+      round-trips through `QueryLedger` as the exact same string);
+      reconciliation-intelligence-svc's `internal/ledger/client_test.go`
+      (`TestListCashAccountEntries_AcceptsQuotedDecimalStringAmount`).
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 

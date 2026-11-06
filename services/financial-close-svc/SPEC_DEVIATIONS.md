@@ -47,6 +47,15 @@ A5 remains open and now records the new GL column a future DB-level guard must
 consult. Verification is under A4; the full plain and integration-tagged
 suites were re-run against a fresh disposable `postgres:16` container.
 
+Update (2026-11-03, A11 pass): closes A11's accrual (B10), prepayment (B11)
+and allocation-rule (B12) lifecycle slices, and corrects a real bug found
+while doing so — `transitionWithClaim` never refreshed the caller's struct
+after a genuinely new, successful transition, only on replay (see the
+correction note under B11/B12). Every claim-chain test in this pass was run
+with `TEST_DATABASE_URL` pointed at a real, disposable Postgres instance so
+it could not silently skip; the full `internal/store` `-tags=integration`
+suite was re-run the same way afterward.
+
 ## Verified controls
 
 Checked against code and schema, not comments:
@@ -443,22 +452,32 @@ recorded under that id in the tenant.
 
 Every command row of the §9–§21 wireframes carries "Idempotency-Key;
 expected_version where stateful". B3 adds claims to the four creates that
-mint an aggregate with no natural key. The remaining commands rely on natural
+mint an aggregate with no natural key. B10 closes the accrual lifecycle slice
+(Submit/Approve/Amend/Cancel); B11 closes the mirror prepayment slice
+(Approve/Modify/Terminate); B12 closes the ACC-09 allocation rule slice
+(Approve/Supersede); B13 closes ACC-10's Approve (Post already answers a
+replay with the run's current state via its own status check, not a claim);
+B14 closes ACC-17's Approve and Certify, and records why Validate is left
+open — it has two possible terminal outcomes (VALIDATED or QUARANTINED)
+that this house pattern does not yet model; B15 closes ACC-14's two simple
+period transitions below (StartSoftClose, EnterCloseReview) and corrects a
+stale claim this table made about HardClose/Reclose. The remaining
+commands rely on natural
 keys or status guards, so a retry after a lost response returns a 4xx
 instead of the original result, or a duplicate append-only row:
 
 | Command | Replay today |
 |---|---|
-| Accrual submit/approve/amend/cancel | 422 `invalid_transition` |
+| Accrual submit/approve/amend/cancel | original result (B10, claimed) |
 | Accrual recognize / reverse | original result (natural key) |
-| Prepayment approve/modify/terminate | 422 |
+| Prepayment approve/modify/terminate | original result (B11, claimed) |
 | Prepayment recognize | original result (natural key) |
-| Allocation approve/supersede | 422 |
+| Allocation approve/supersede | original result (B12, claimed) |
 | Allocation execute / reprocess | original run (natural key / status) |
-| FX approve | 422; post: original (status) |
-| Migration validate/approve/certify | 422; commit: original (status), now also retries reconciliation |
-| Period soft-close / close-review | 409 `invalid_period_transition` |
-| Period hard-close / reclose | 200 with current state |
+| FX approve | original result (B13, claimed); post: original (status) |
+| Migration validate/approve/certify | validate: still 422 (A11 residual, see B14); approve/certify: original result (B14, claimed); commit: original (status), now also retries reconciliation |
+| Period soft-close / close-review | original result (B15, claimed) |
+| Period hard-close / reclose | 422 `period_already_locked` if already at the target state (corrected from this table's prior "200 with current state" claim, which did not match the code; not claimed this pass — see B15) |
 | Reopen request | 409 `reopen_request_pending` |
 | RunSubledgerControl | a second append-only run |
 | VerifyTracePath | a second verification record |
@@ -790,3 +809,267 @@ currency, and the platform has nothing to backfill it from.
 - **B9. Housekeeping.** The duplicated `/v1/close/workflow-refs/{ref}` route
   registration was removed. gofmt corrected three small pre-existing
   misalignments in code this pass edited.
+- **B10. The accrual lifecycle claims an Idempotency-Key (closes A11's
+  accrual row).** `SubmitAccrual`, `ApproveAccrual`, `AmendFutureSchedule`
+  and `CancelFutureAccrual` now require `Idempotency-Key` and claim it in
+  `command_idempotency` (the same table B3 added) in the same transaction as
+  the guarded status UPDATE, via a new `transitionWithClaim` — `createWithClaim`
+  applied to a command that moves an existing resource instead of minting
+  one. A retry returns the schedule as it now stands (200) instead of 422
+  `invalid_transition` on a transition that already happened; the same key
+  reused for a different command or a different schedule is 409. The request
+  hash folds in the schedule id (these commands are addressed by URL path,
+  not body, so the id is the only thing distinguishing "the same request" for
+  the bodyless three; Amend's hash also folds in the request body).
+  - *A real bug found while doing this, not assumed:* `CancelFutureAccrual`'s
+    handler-level pre-check (refuse if the schedule is COMPLETED or
+    CANCELLED) read the schedule's status from the GET that preceded the
+    idempotency claim lookup. On a retry of an already-succeeded cancel, that
+    snapshot is CANCELLED, so the pre-check would have rejected a legitimate
+    replay with 422 before the claim lookup ever ran. The store's
+    `CancelAccrualSchedule` no longer trusts a caller-supplied `fromStatus` as
+    its guard (the old signature took one, defeating the point of a fixed
+    disallowed set — a stale `fromStatus` argument equal to the current status
+    would let the UPDATE succeed from any status); it now refuses COMPLETED
+    and CANCELLED unconditionally in the UPDATE's WHERE clause, and the
+    handler's pre-check was removed so the claim lookup runs first.
+  - *What did not change:* `AmendFutureSchedule`'s handler-level
+    `would_drop_recognized_periods` check still reads the *current* count of
+    recognized periods before the claim lookup. A retry made after more
+    periods were recognized since the first (successful) amend can therefore
+    be rejected even though the original call is replayable — a narrower,
+    pre-existing-shape version of the same ordering issue, left open because
+    fixing it needs the claim lookup to run before the recognized-period
+    count is read, which only the store can do and `AmendAccrualSchedule`
+    does not currently expose that count to its own guard.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestSubmitAccrual_RetryUnderSameKeyReplays`,
+    `TestSubmitAccrual_NoIdempotencyKey_Returns400`,
+    `TestCancelFutureAccrual_RetryAfterSuccess_Replays`) and
+    `internal/store/accrual_lifecycle_idempotency_integration_test.go`
+    (replay for submit/amend/cancel, and same-key-different-schedule
+    conflict), run against a real, disposable Postgres container. The
+    existing `TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB` and
+    `TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB` were updated for
+    the new signatures and now also prove a *second, newly-keyed* cancel
+    attempt on an already-cancelled schedule is still refused (as distinct
+    from a replay of the same key).
+- **B11. The prepayment lifecycle claims an Idempotency-Key (closes A11's
+  prepayment row), mirroring B10.** `ApprovePrepayment`, `ModifyPrepayment`
+  and `TerminatePrepayment` now require `Idempotency-Key` and claim it via the
+  same `transitionWithClaim`, targeting `targetPrepaymentSchedule`.
+  - *Terminate's guard, not its journal path, is what changed.*
+    `TerminatePrepaymentSchedule` no longer takes a caller-supplied
+    `fromStatus`; like `CancelAccrualSchedule` it now refuses COMPLETED and
+    TERMINATED unconditionally in the UPDATE's own WHERE clause. The
+    handler's `COMPLETED/TERMINATED` pre-check (reading the GET's stale
+    `sch.Status`) was removed for the same reason B10 removed
+    `CancelFutureAccrual`'s: it would have rejected a legitimate replay
+    before the claim lookup ran. The RECOGNIZE_REMAINING branch above the
+    store call is unaffected and was not made claim-aware itself — it is
+    already replay-safe without one: general-ledger-svc dedups the final
+    settlement journal on the `schedule:TerminationPseudoPeriod` correlation
+    id, and `CreatePrepaymentRecognition` dedups the evidence row on its own
+    `UNIQUE(schedule_id, fiscal_period)` constraint, so a retried Terminate
+    re-reads both instead of duplicating either, exactly as the handler's own
+    pre-existing doc comment on that branch describes.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestApprovePrepayment_RetryUnderSameKeyReplays`,
+    `TestTerminatePrepayment_RetryAfterSuccess_Replays`) and
+    `internal/store/prepayment_lifecycle_idempotency_integration_test.go`
+    (replay for approve/modify/terminate, and a freshly-keyed terminate
+    attempt on an already-terminated schedule still refused), run against a
+    real, disposable Postgres container. The existing
+    `TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB` and
+    `TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB` were updated
+    for the new signatures.
+
+- **Correction to B10/B11 found while adding B12 (`transitionWithClaim` never
+  refreshed the caller's struct on a genuinely new, successful transition).**
+  `transitionWithClaim` originally just called `createWithClaim`.
+  `createWithClaim`'s own non-replay path never calls its `load` callback —
+  correct for a create, whose caller-supplied struct already holds exactly
+  what it is about to insert — but wrong for a transition, whose
+  caller-supplied struct reflects the resource's state *before* the
+  transition. The result: a genuinely new (non-replay) Submit, Approve,
+  Amend or Cancel left the handler's in-memory schedule exactly as the GET
+  had returned it — e.g. still `DRAFT` after a successful Submit — so a real
+  client's first call to any of these got back a response whose status had
+  not moved, even though the row in the database had. Only a *replay* (the
+  second call under the same key) ever returned the correct, current state,
+  because only the replay path calls `load`.
+  - *Why the stub-backed handler tests never caught it.* Every stub
+    implementation in `handler_test.go` explicitly copies the updated row
+    back into the caller's struct on its own first-success path (`*sch =
+    *s.schedules[...]`), independently of the claim/replay machinery. That
+    was written to match the *intended* behavior, which happened to diverge
+    from what `PgStore` actually did — a test double drifting from the real
+    implementation it stands in for.
+  - *How it surfaced.* Running the `openTestPool`-based integration suites
+    (`acc_controls_hardening_pg_smoke_test.go`,
+    `accrual_lifecycle_idempotency_integration_test.go`, and this pass's own
+    new tests) against a real, disposable Postgres with `TEST_DATABASE_URL`
+    exported — not the `tenant_isolation_test.go` `TestMain`, which starts
+    its own embedded Postgres for a *different* set of tests and does not
+    export `TEST_DATABASE_URL`, so every `openTestPool`-based test silently
+    skips unless the variable is set from outside the test binary. The B10
+    and B11 commits had only ever been verified with it unset, so this
+    defect shipped in both without a real-database test ever having run
+    against the new code paths.
+  - *The fix.* `transitionWithClaim` is no longer a one-line call to
+    `createWithClaim`; it has its own full attempt/retry loop that calls
+    `load(tx, targetID)` once more, in the same transaction, immediately
+    after a successful `perform` and claim insert — so both the replay path
+    and the genuinely-new-success path now leave the caller's struct current.
+    `createWithClaim` itself is untouched: the four aggregate creates (B3)
+    never needed this and still don't.
+  - *Verification.* Every B10/B11/B12 test was re-run with
+    `TEST_DATABASE_URL` pointed at a real, disposable Postgres instance (not
+    skipped), and the whole `internal/store` package's `-tags=integration`
+    suite was run the same way afterward — all pass. This is now the
+    standard this register holds every future `A11` pass to: a claim-chain
+    test that only ever ran skipped is not verification.
+
+- **B12. The ACC-09 allocation rule lifecycle claims an Idempotency-Key
+  (closes A11's allocation row).** `ApproveAllocationRule` and
+  `SupersedeAllocationRule` now require `Idempotency-Key`.
+  - *Two different claim shapes, same table.* `ApproveAllocationRule` is a
+    transition — it claims the EXISTING `rule_version_id` via
+    `transitionWithClaim`, the same shape B10/B11 use. `SupersedeAllocationRule`
+    is not: it mints a brand-new `rule_version_id` on every call (the handler
+    generates a fresh UUID even on a retry), so it uses `createWithClaim`
+    directly, exactly like `CreateAllocationRule` (B3) — the claim's target is
+    the *new* version's id, and `requestHash` is computed from the request
+    body plus the path's `rule_id` (never from the freshly-minted version id,
+    which would make a retry's own fresh id fail to match its first attempt's
+    hash). Both claim `targetAllocationRule` (`allocation_rule_version_id`);
+    the `command` column disambiguates which of the two (or `CreateAllocationRule`)
+    a given key was used for.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestApproveAllocationRule_RetryUnderSameKeyReplays`,
+    `TestSupersedeAllocationRule_RetryUnderSameKeyReplays`, the latter also
+    proving a retry mints no second version and a genuinely new key against
+    an already-superseded rule is refused) and
+    `internal/store/allocation_rule_idempotency_integration_test.go` (replay
+    for both commands, and the same already-superseded refusal), run against
+    a real, disposable Postgres container per the verification note above.
+- **B13. ACC-10's Approve claims an Idempotency-Key; Post is deliberately
+  left as it was (closes A11's FX row).** `ApproveFXRevaluationRun` is a
+  transition, claimed via `transitionWithClaim` exactly like B10/B11/B12's
+  approve commands, targeting `targetFXRevaluationRun`. `PostRevaluation`
+  is NOT given a claim: its own handler-level check — a run already POSTED
+  returns its current state untouched, before any journal-posting work runs
+  — already gives a retry the original result without a second journal,
+  which is the same outcome a claim would produce, and predates this A11
+  pass (it is the spec's own negative path, "Revaluation replay duplicates
+  journal"). Adding `command_idempotency` on top would duplicate, not
+  strengthen, a guard that already works correctly.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestApproveRevaluation_RetryUnderSameKeyReplays`) and
+    `internal/store/fx_revaluation_idempotency_integration_test.go` (replay
+    for Approve), run against a real, disposable Postgres container per the
+    verification note above.
+- **B14. ACC-17's Approve and Certify claim an Idempotency-Key; Commit and
+  Validate are deliberately not given one (closes A11's migration row for
+  two of its three named commands).**
+  - *Schema.* `command_idempotency` had no column for a migration batch.
+    Migration `000023` adds `migration_batch_id` (a real FK to
+    `migration_batches`), widens `chk_command_idempotency_one_target` to the
+    five columns, and adds the matching lookup index — the same shape B3's
+    four columns already have. The down migration refuses while any claim
+    names a batch, same posture as every other `command_idempotency` change
+    in this register.
+  - *Approve and Certify.* Both are plain transitions —
+    `ApproveMigrationBatch` (VALIDATED → APPROVED) and `CertifyMigrationBatch`
+    (RECONCILED → CERTIFIED) — claimed via `transitionWithClaim` exactly like
+    B10-B13's approve commands, targeting the new `targetMigrationBatch`.
+    `loadMigrationBatch` is the tx-scoped counterpart of `GetMigrationBatch`
+    (batch header plus crosswalk entries), used as the load callback so a
+    replay — and, per the B10/B11/B12/B13 correction note, a genuinely new
+    success too — carries the entries, not just the header.
+  - *Commit is unaffected.* `CommitOpeningPosting`'s own
+    RECONCILED/CERTIFIED/POSTED switch already answers a retry with the
+    batch's current state before doing any journal-posting work, predating
+    this pass (the spec's own negative path, "Commit repeated after
+    timeout"). Adding a claim on top would duplicate, not strengthen, a
+    guard that already works.
+  - *Validate is NOT claimed — left open.* Unlike every other command this
+    A11 pass closes, `ValidateOpeningBalances` does not have one fixed
+    success transition: it ends in VALIDATED (`MarkMigrationBatchValidated`)
+    or, on any of several validation failures, QUARANTINED
+    (`QuarantineMigrationBatch`), and both are reached only after real
+    external-dependency work (a chart-of-accounts read, and an AR/AP
+    existence check per open-item crosswalk entry). `transitionWithClaim`
+    and `createWithClaim` both assume one fixed target transition decided
+    before the claim is recorded; Validate would need the claim lookup to
+    gate entry to that external work BEFORE either branch runs, then record
+    the claim against whichever of the two transitions actually happened —
+    a different shape from every command this register has closed so far,
+    and not one to retrofit without its own design pass. Today a retry of
+    Validate still 422s regardless of which terminal state the first
+    attempt reached, exactly as before this pass; the only change is that it
+    is now a documented, scoped gap rather than an unexamined one.
+  - *Tests:* `internal/handler/handler_test.go`
+    (`TestApproveMigrationBatch_RetryUnderSameKeyReplays`,
+    `TestCertifyMigrationBatch_RetryUnderSameKeyReplays`) and
+    `internal/store/migration_batch_idempotency_integration_test.go` (replay
+    for both commands, the latter also proving the crosswalk entries survive
+    a replay), run against a real, disposable Postgres container per the
+    verification note above. Migration `000023`'s down/up round-trip was
+    also checked by hand against the same running instance, per this
+    register's established convention for a schema change (A4, B4).
+- **B15. ACC-14's two simple period transitions claim an Idempotency-Key;
+  HardClose/Reclose/Reopen are deliberately not given one, and this table's
+  prior claim about HardClose/Reclose was wrong (closes A11's period row
+  for StartSoftClose/EnterCloseReview).**
+  - *Schema.* Migration `000024` adds `fiscal_period_id` to
+    `command_idempotency`, widens `chk_command_idempotency_one_target` to
+    six columns, and adds the matching lookup index — same shape as B14's
+    `000023` for migration batches.
+  - *Why only two of the period commands.* `ApplyPeriodTransition` is the
+    one function behind every period transition (soft-close, close-review,
+    hard-close, reclose, and the reopen commands), but StartSoftClose and
+    EnterCloseReview are the only callers that do nothing beyond that one
+    guarded UPDATE. `HardClosePeriod`/`ReclosePeriod` (`closeWithEvidence`)
+    run readiness checks, seal the period in the accounting kernel, and
+    build and sign an evidence manifest before ever calling it; the reopen
+    commands have their own request/approval object. Wrapping either in a
+    claim is a separate, larger design question (where does the claim lookup
+    sit relative to a kernel seal that already happened?), not a drop-in
+    extension of this pass's pattern — so this closes only the two commands
+    that fit the house shape.
+  - *The new store methods.* `StartSoftCloseTransition` and
+    `EnterCloseReviewTransition` each call a shared, unexported
+    `periodTransitionWithClaim` — `transitionWithClaim` wrapping the
+    existing `applyPeriodTransition` — with their own fixed `allowedFrom`
+    and target state (`u.To` is set inside the method, not by the caller:
+    the whole point of having two methods instead of one parameterised by
+    target state). On a refusal (`ErrInvalidPeriodTransition`), the period
+    as it actually stands is still returned, matching
+    `ApplyPeriodTransition`'s own existing contract, so
+    `writeTransitionErr`'s "the period is X, this needs Y" message needs no
+    second read.
+  - *The handler.* `simpleTransition` now takes the claimed store method as
+    a function value (`apply`) instead of the `to` state string, since each
+    of the two store methods already knows its own target; this avoids
+    giving the `handler` package a dependency on the `store` package's
+    exported command-name constants, which nothing else in this codebase
+    does either.
+  - *The stale claim corrected.* This table previously said "Period
+    hard-close / reclose | 200 with current state". Reading
+    `closeWithEvidence` while scoping this pass found that is not what the
+    code does: a hard-close/reclose attempt against a period already at the
+    target state answers 422 `period_already_locked`, not 200. The table
+    now says what the code actually does; the behavior itself is unchanged
+    by this pass.
+  - *Tests:* `internal/handler/period_close_test.go`
+    (`TestStartSoftClose_RetryUnderSameKeyReplays`,
+    `TestEnterCloseReview_RetryUnderSameKeyReplays`, the former also proving
+    a freshly-keyed soft-close attempt on an already-SOFT_CLOSE period is
+    still refused) and
+    `internal/store/period_transition_idempotency_integration_test.go`
+    (replay for both commands; the refusal case also proves the current
+    period is still returned on a real refusal, not just a replay), run
+    against a real, disposable Postgres container per the verification note
+    above. Migration `000024`'s down/up round-trip was also checked by hand
+    against the same running instance.

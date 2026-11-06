@@ -125,3 +125,47 @@ func TestResolveRejectsIncompleteHighImpactClaims(t *testing.T) {
 		})
 	}
 }
+
+// Doc 03 §16, Doc 05 §17: claims conflict only within one full scope
+// (currency, plan and locale included) and only while both are in force.
+func TestConflictsNeedSameScopeAndOverlappingWindows(t *testing.T) {
+	day := func(m time.Month) time.Time { return time.Date(2026, m, 1, 0, 0, 0, 0, time.UTC) }
+	base := completePriceClaim()
+	base.NormalizedValue = "10"
+	other := func(id string, mut func(*Claim)) Claim {
+		c := base
+		c.ClaimID, c.NormalizedValue = id, "12"
+		mut(&c)
+		return c
+	}
+	cases := []struct {
+		name  string
+		other Claim
+		want  bool
+	}{
+		{"same scope, overlapping", other("c2", func(*Claim) {}), true},
+		{"different currency", other("c2", func(c *Claim) { c.Currency = "XTT" }), false},
+		{"different plan", other("c2", func(c *Claim) { c.Plan = "OTHER" }), false},
+		{"different locale", other("c2", func(c *Claim) { c.Locale = "fr-FR" }), false},
+		{"succession, no overlap", other("c2", func(c *Claim) { c.ValidFrom = c.ValidUntil }), false},
+		{"partial overlap", other("c2", func(c *Claim) { c.ValidFrom, c.ValidUntil = day(3), day(9) }), true},
+	}
+	for _, c := range cases {
+		a := base
+		a.ValidFrom, a.ValidUntil = day(1), day(6)
+		if c.name == "succession, no overlap" {
+			c.other.ValidFrom, c.other.ValidUntil = day(6), day(12)
+		}
+		got := Manifest{Claims: []Claim{a, c.other}}.Conflicts()
+		if (len(got) == 1) != c.want {
+			t.Errorf("%s: conflicts = %+v, want conflict %v", c.name, got, c.want)
+		}
+	}
+	// The resolver uses the same key: two currencies are two facts.
+	usd := base
+	xtt := other("c2", func(c *Claim) { c.Currency = "XTT" })
+	d := NewResolver(Manifest{Claims: []Claim{usd, xtt}}).Resolve(Request{Subject: Price, Market: "US", AsOf: day(6)}, nil)
+	if d.Decision != Verified {
+		t.Fatalf("different currencies must not contradict: %+v", d)
+	}
+}

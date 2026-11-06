@@ -18,4 +18,8 @@ ZoikoSuite's core modules are grouped into domains: Finance (Accounting and Gene
 
 ## Governance Platform and Platform Foundation
 
-Alongside the core modules, ZoikoSuite organizes its published capabilities into a Governance Platform, which provides shared approvals, evidence and audit across the modules, and a Platform Foundation.
+Alongside the core modules, ZoikoSuite organizes its published capabilities into a Governance Platform, which provides shared approvals, evidence and audit across the modules, and a Platform Foundation. The Governance Platform holds policies, approval workflows, delegated authority, obligations, evidence requirements and a log of governance decisions. The Platform Foundation provides identity, tenant and legal entity structure, access control, configuration and notifications.
+
+## Shared records and controls
+
+Each area owns its own records, and other areas use those records rather than keeping separate copies. Every material record belongs to a legal entity, so a group of companies can operate on one platform while keeping each company's records distinct. A material action anywhere goes through the same governance checks before it proceeds.

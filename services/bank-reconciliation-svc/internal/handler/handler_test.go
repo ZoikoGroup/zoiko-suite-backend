@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/bank-reconciliation-svc/internal/close"
@@ -202,6 +203,27 @@ func (s *stubStore) ProposeMatch(_ context.Context, _, statementLineID, journalI
 	return nil
 }
 
+func (s *stubStore) ProposeMultiMatch(_ context.Context, _, statementLineID string, allocations []domain.JournalAllocation, proposedByPrincipalID string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	if len(allocations) < 2 {
+		return domain.ErrInvalidJournalIDs
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok || (l.Status != domain.StatementLineStatusUnmatched && l.Status != domain.StatementLineStatusException) {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusPendingConfirmation
+	ids := make([]string, len(allocations))
+	for i, a := range allocations {
+		ids[i] = a.JournalID
+	}
+	l.ProposedJournalIDs = ids
+	l.ProposedByPrincipalID = &proposedByPrincipalID
+	return nil
+}
+
 func (s *stubStore) ConfirmMatch(_ context.Context, _, statementLineID, confirmingPrincipalID string) (*domain.StatementLine, error) {
 	if s.transitionErr != nil {
 		return nil, s.transitionErr
@@ -218,6 +240,7 @@ func (s *stubStore) ConfirmMatch(_ context.Context, _, statementLineID, confirmi
 	}
 	l.Status = domain.StatementLineStatusMatched
 	l.MatchedJournalID = l.ProposedJournalID
+	l.MatchedJournalIDs = l.ProposedJournalIDs
 	l.MatchedByPrincipalID = &confirmingPrincipalID
 	return l, nil
 }
@@ -234,6 +257,7 @@ func (s *stubStore) RejectProposedMatch(_ context.Context, _, statementLineID, r
 	l.ExceptionReason = &reason
 	l.FlaggedByPrincipalID = &actorPrincipalID
 	l.ProposedJournalID = nil
+	l.ProposedJournalIDs = nil
 	l.ProposedByPrincipalID = nil
 	return nil
 }
@@ -427,13 +451,28 @@ type stubAuthZ struct {
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
 // stubLedger lets each test control what general-ledger-svc "returns"
-// without booting a real service.
+// without booting a real service. byID, when non-nil, answers per
+// journal_id instead of the single journal/err below — a multi-journal
+// match (A2b part 2) needs a different journal for each id in one request.
 type stubLedger struct {
+	journal *ledger.Journal
+	err     error
+	byID    map[string]stubLedgerEntry
+}
+
+type stubLedgerEntry struct {
 	journal *ledger.Journal
 	err     error
 }
 
-func (l *stubLedger) GetJournal(_ context.Context, _, _ string) (*ledger.Journal, error) {
+func (l *stubLedger) GetJournal(_ context.Context, _, journalID string) (*ledger.Journal, error) {
+	if l.byID != nil {
+		e, ok := l.byID[journalID]
+		if !ok {
+			return nil, ledger.ErrJournalNotFound
+		}
+		return e.journal, e.err
+	}
 	return l.journal, l.err
 }
 
@@ -857,6 +896,51 @@ func TestListStatementLines_RequiresVerifiedTenantScope(t *testing.T) {
 	rec := doRequestAs(r, http.MethodGet, "/v1/statement-lines/", nil, "", "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with no verified tenant scope, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ?journal_ids is A2b part 3's lookup-by-journal-id capability: a caller
+// (reconciliation-intelligence-svc) asks "has any of these journals already
+// been claimed" without naming a bank account, date or status.
+func TestListStatementLines_JournalIDsFilter_WiresDistinctValidIDs(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	j1, j2 := uuid.NewString(), uuid.NewString()
+	rec := doRequest(r, http.MethodGet, "/v1/statement-lines/?journal_ids="+j1+","+j2, nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.lastListFilter.JournalIDs) != 2 || s.lastListFilter.JournalIDs[0] != j1 || s.lastListFilter.JournalIDs[1] != j2 {
+		t.Fatalf("expected JournalIDs [%s %s], got %v", j1, j2, s.lastListFilter.JournalIDs)
+	}
+}
+
+func TestListStatementLines_JournalIDsFilter_RefusesMalformedOrDuplicateIDs(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	j1 := uuid.NewString()
+	for name, raw := range map[string]string{
+		"not a uuid":  "not-a-journal-id",
+		"empty entry": j1 + ",",
+		"duplicate":   j1 + "," + j1,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := doRequest(r, http.MethodGet, "/v1/statement-lines/?journal_ids="+raw, nil, "")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestListStatementLines_NoJournalIDsParam_LeavesFilterNil(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodGet, "/v1/statement-lines/", nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.lastListFilter.JournalIDs != nil {
+		t.Fatalf("expected a nil JournalIDs filter, got %v", s.lastListFilter.JournalIDs)
 	}
 }
 

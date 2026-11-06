@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 type Config struct {
@@ -25,6 +26,14 @@ type Config struct {
 	ProviderCallbacksJSON string
 	VaultURL              string
 	VaultWorkloadID       string
+
+	// BNK-06 event consumer (SPEC_DEVIATIONS A4): consumes
+	// payment-initiation-adapter-svc's PAYMENT_SUBMITTED /
+	// PAYMENT_SUBMISSION_AMBIGUOUS so this service can reach SUBMITTED and
+	// PENDING_UNKNOWN. KafkaBrokers (above) is reused as the broker list;
+	// these name the inbound topic and this consumer's own group id.
+	BNK06EventTopics  []string
+	BNK06EventGroupID string
 }
 
 func Load() (*Config, error) {
@@ -52,6 +61,8 @@ func Load() (*Config, error) {
 		ProviderCallbacksJSON: os.Getenv("PROVIDER_CALLBACKS_JSON"),
 		VaultURL:              getEnvOrDefault("VAULT_SERVICE_URL", "http://secret-vault-integration-svc:8087"),
 		VaultWorkloadID:       getEnvOrDefault("VAULT_WORKLOAD_ID", "payment-status-svc"),
+		BNK06EventTopics:      strings.Split(getEnvOrDefault("BNK06_EVENT_TOPICS", "zoiko.payment-initiation.events"), ","),
+		BNK06EventGroupID:     getEnvOrDefault("BNK06_EVENT_GROUP_ID", "payment-status-svc-bnk06-events"),
 	}, nil
 }
 

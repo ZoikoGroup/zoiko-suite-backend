@@ -25,8 +25,8 @@ Last updated 2026-10-30.
 | H13 | WCAG 2.2 AA journeys and accessible states tested | Partial | Playwright axe/keyboard, reduced-motion typing; manual screen-reader pass open |
 | H14 | Golden corpus, holdouts, adjudication, P0 gates signed | Partial | `evalrun` verdicts and CI gate (`qa-t-traceability.md`); holdout and human grading need reviewers |
 | H15 | Load, resilience and provider-offline fallback approved | Partial | `TestA29`–`TestA31`, `TestProviderFailuresFallBackSafely`; load needs DEC-08 and staging |
-| H16 | Four-artifact manifest and independent rollback demonstrated | Partial | `release.BuildManifest`, `TestKB011`, audited `kbctl promote -rollback`; compatibility ranges (OPR-004) open |
-| H17 | SLIs, dashboards, alerts, incident and abuse runbooks linked | Partial | `/metrics` (`TestMetricsEndpoint`), alert rules, RUNBOOK RB-01…05; dashboards and paging need SRE |
+| H16 | Four-artifact manifest and independent rollback demonstrated | Partial | `release.BuildManifest` (image digest required, model profile must match the eval report, evidence recorded by sha256: `TestManifest*`), `TestKB011`, audited `kbctl promote -rollback`; compatibility ranges built (OPR-004: `compatible_policy_versions`, `release.TestIncompatibleReleaseRefusedAtLoad`); releases immutable in the database (migration 007); restore drill DR-06; staging demonstration open |
+| H17 | SLIs, dashboards, alerts, incident and abuse runbooks linked | Partial | `/metrics` (`TestMetricsEndpoint`), multi-window burn-rate alert rules unit-tested with promtool in CI, every alert annotated with its RB-xx runbook (RUNBOOK RB-01…10 and alert map), Grafana dashboard `public-ai-svc.json`, canary textfile metric; paging targets and SLO approval need SRE |
 | H18 | Support destinations route-only, no false ticket acknowledgement | Evidence ready | `TestFalseConfirmationsRejected`, `TestDemoIsRouteOnly`; real URLs need DEC-10 |
 | H19 | R1 staff roles and cases only after RBAC audit | Open (R1) | No staff console in R0 |
 | H20 | R1 lead, CRM and booking only after vendor and privacy gates | Evidence ready (gate) | Doc 10 flags hard-off (`TestDoc10GatesAreHardOff`) |
@@ -45,7 +45,7 @@ Last updated 2026-10-30.
 | R-04 | HIGH | Production repo differs from architecture | ADR delta; DEC-01 open | Architect |
 | R-05 | HIGH | AI supplier transfer/retention unresolved | Provider approval + region allowlist gate (`TestA40`); DEC-05 open | DPO |
 | R-06 | HIGH | False lead, case or booking confirmation | Output validator (`TestFalseConfirmationsRejected`); route-only handoff | CRM + Support |
-| R-07 | HIGH | Four artifacts mutually incompatible | Manifest digests; compatibility validator open (OPR-004) | SRE |
+| R-07 | HIGH | Four artifacts mutually incompatible | Manifest digests; releases name `compatible_policy_versions` and an incompatible release is refused at load (OPR-004, `TestIncompatibleReleaseRefusedAtLoad`); manifest refuses an eval report for another model profile | SRE |
 | R-08 | HIGH | Admin role leaks PII or edits + approves | No admin role in R0; promotion gate enforces two approvers and an independent promoter | IAM + AppSec |
 | R-09 | MEDIUM | Prompt/model update degrades quality | Golden set in CI, repeats, baseline regression (NO_GO) | AI Eval |
 | R-10 | MEDIUM | Unsupported market or taxonomy copy | Doc 02 menu from canonical intents; DEC-02 open | Product + KB |

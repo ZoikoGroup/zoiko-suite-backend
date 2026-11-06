@@ -175,6 +175,10 @@ type Capabilities struct {
 	LeadCapture   bool  `json:"lead_capture"`
 	FileUpload    bool  `json:"file_upload"`
 	Authenticated *bool `json:"authenticated,omitempty"`
+	// ChatEnabled is false while the kill switch (public_ai_enabled) is off,
+	// so the widget can show the closed state up front (Doc 08 §26). Only
+	// set on GET /config.
+	ChatEnabled *bool `json:"chat_enabled,omitempty"`
 }
 
 // SessionResponse is the 201 body of POST /sessions.

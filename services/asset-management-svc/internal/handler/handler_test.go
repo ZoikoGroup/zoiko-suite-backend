@@ -713,6 +713,21 @@ func (l *stubLedger) CheckPeriodOpen(_ context.Context, _, _, _ string) error {
 }
 
 func newRouterWithLedger(s *stubStore, pub *stubPublisher, authz *stubAuthZ, ledger *stubLedger) chi.Router {
+	return newRouterWithMappingKeys(s, pub, authz, ledger,
+		handler.MappingKeyPair{Debit: "DEPRECIATION_EXPENSE", Credit: "ACCUMULATED_DEPRECIATION"},
+		handler.MappingKeyPair{},
+		handler.MappingKeyPair{Debit: "IMPAIRMENT_LOSS", Credit: "ACCUMULATED_DEPRECIATION"},
+		handler.MappingKeyPair{Debit: "FIXED_ASSET_COST", Credit: "REVALUATION_SURPLUS"},
+		handler.MappingKeyPair{Debit: "ASSET_CLEARING", Credit: "FIXED_ASSET_COST"},
+	)
+}
+
+func newRouterWithNoMappingKeys(s *stubStore, pub *stubPublisher, authz *stubAuthZ, ledger *stubLedger) chi.Router {
+	return newRouterWithMappingKeys(s, pub, authz, ledger, handler.MappingKeyPair{}, handler.MappingKeyPair{}, handler.MappingKeyPair{}, handler.MappingKeyPair{}, handler.MappingKeyPair{})
+}
+
+func newRouterWithMappingKeys(s *stubStore, pub *stubPublisher, authz *stubAuthZ, ledger *stubLedger,
+	depreciation, defaultEvent, impairment, revaluation, disposal handler.MappingKeyPair) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -720,7 +735,10 @@ func newRouterWithLedger(s *stubStore, pub *stubPublisher, authz *stubAuthZ, led
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, zap.NewNop()).WithLedgerClient(ledger)
+	h := handler.New(s, pub, authz, zap.NewNop()).
+		WithLedgerClient(ledger).
+		WithDepreciationMappingKeys(depreciation.Debit, depreciation.Credit).
+		WithAssetEventMappingKeys(defaultEvent, impairment, revaluation, disposal)
 	handler.RegisterRoutes(r, h)
 	return r
 }

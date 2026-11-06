@@ -86,6 +86,7 @@ func (h *Handler) VerifyBankAccountOwnership(w http.ResponseWriter, r *http.Requ
 	evidence, err := h.store.VerifyBankAccountOwnership(r.Context(), domain.VerifyOwnershipParams{
 		BankAccountID: accountID, TenantID: tenantID, VerificationMethod: req.VerificationMethod,
 		EvidenceRef: req.EvidenceRef, VerifiedByPrincipalID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeBankAccountErr(w, err)
@@ -381,6 +382,7 @@ func (h *Handler) AmendBankAccountMetadata(w http.ResponseWriter, r *http.Reques
 	updated, err := h.store.AmendBankAccountMetadata(r.Context(), domain.AmendBankAccountMetadataParams{
 		BankAccountID: accountID, TenantID: tenantID, AccountName: req.AccountName, BranchRef: req.BranchRef,
 		Country: req.Country, AccountType: req.AccountType, ActorPrincipalID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeBankAccountErr(w, err)
@@ -419,6 +421,7 @@ func (h *Handler) ChangeOperationalUse(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	updated, err := h.store.ChangeOperationalUse(r.Context(), domain.ChangeOperationalUseParams{
 		BankAccountID: accountID, TenantID: tenantID, RequestedOperationalUse: req.RequestedOperationalUse, ActorPrincipalID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeBankAccountErr(w, err)
@@ -452,7 +455,7 @@ func (h *Handler) SuspendBankAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	updated, err := h.store.SuspendBankAccount(r.Context(), domain.SuspendAccountParams{BankAccountID: accountID, TenantID: tenantID, Reason: req.Reason, ActorPrincipalID: principalID})
+	updated, err := h.store.SuspendBankAccount(r.Context(), domain.SuspendAccountParams{BankAccountID: accountID, TenantID: tenantID, Reason: req.Reason, ActorPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")})
 	if err != nil {
 		h.writeBankAccountErr(w, err)
 		return
@@ -479,7 +482,7 @@ func (h *Handler) ReactivateBankAccount(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	updated, err := h.store.ReactivateBankAccount(r.Context(), domain.ReactivateAccountParams{BankAccountID: accountID, TenantID: tenantID, ActorPrincipalID: principalID})
+	updated, err := h.store.ReactivateBankAccount(r.Context(), domain.ReactivateAccountParams{BankAccountID: accountID, TenantID: tenantID, ActorPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")})
 	if err != nil {
 		h.writeBankAccountErr(w, err)
 		return
@@ -508,7 +511,7 @@ func (h *Handler) CloseBankAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	updated, err := h.store.CloseBankAccount(r.Context(), domain.CloseAccountParams{BankAccountID: accountID, TenantID: tenantID, Reason: req.Reason, ActorPrincipalID: principalID})
+	updated, err := h.store.CloseBankAccount(r.Context(), domain.CloseAccountParams{BankAccountID: accountID, TenantID: tenantID, Reason: req.Reason, ActorPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")})
 	if err != nil {
 		h.writeBankAccountErr(w, err)
 		return
@@ -556,6 +559,7 @@ func (h *Handler) RotateAccountIdentifierToken(w http.ResponseWriter, r *http.Re
 	updated, err := h.store.RotateAccountIdentifierToken(r.Context(), domain.RotateAccountTokenParams{
 		BankAccountID: accountID, TenantID: tenantID, NewMaskedAccountNumber: req.NewMaskedAccountNumber,
 		NewBankIdentifier: newBankIdentifier, ActorPrincipalID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeBankAccountErr(w, err)

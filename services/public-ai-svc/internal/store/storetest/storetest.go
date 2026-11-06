@@ -23,6 +23,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("FeedbackPurge", func(t *testing.T) { testFeedbackPurge(t, newStore(t)) })
 	t.Run("ControlAudit", func(t *testing.T) { testControlAudit(t, newStore(t)) })
 	t.Run("ConflictCases", func(t *testing.T) { testConflictCases(t, newStore(t)) })
+	t.Run("CompleteTurnNeedsLiveSession", func(t *testing.T) { testCompleteTurnNeedsLiveSession(t, newStore(t)) })
+	t.Run("RetentionPurge", func(t *testing.T) { testRetentionPurge(t, newStore(t)) })
 }
 
 var ctx = context.Background()
@@ -331,5 +333,95 @@ func testFlagsUsageOutbox(t *testing.T, s store.Store) {
 	}
 	if n, _ := s.Usage(ctx, "never-used"); n != 0 {
 		t.Fatal("unknown bucket must be 0")
+	}
+}
+
+// SEC-T057: a turn whose session expired or was deleted while it ran is
+// never completed: no response, usage or events are stored.
+func testCompleteTurnNeedsLiveSession(t *testing.T, s store.Store) {
+	lock := time.Now().Add(time.Minute)
+	expired := store.Session{SessionID: "pub_s_expired00000", GrantHash: []byte("grant-exp"),
+		CreatedAt: time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond),
+		ExpiresAt: time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond), Locale: "en-US"}
+	if err := s.CreateSession(ctx, expired, "idem-exp", []byte("h")); err != nil {
+		t.Fatal(err)
+	}
+	deleted := mkSession(t, s, "pub_s_deleted00000")
+	for _, id := range []string{expired.SessionID, deleted.SessionID} {
+		b, err := s.BeginTurn(ctx, turn(id, "pub_t_"+id, "c-"+id, "h"), lock)
+		if err != nil {
+			t.Fatalf("%s: begin: %v", id, err)
+		}
+		if id == deleted.SessionID {
+			if err := s.DeleteSession(ctx, id, time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		done := b.Turn
+		done.Status, done.Response = "ANSWERED", []byte(`{}`)
+		ev := store.OutboxEvent{EventID: "ev-" + id, Topic: "t", EventType: "chat.turn.completed.v1", Payload: []byte(`{}`), CreatedAt: time.Now()}
+		if err := s.CompleteTurn(ctx, done, []string{"gone:" + id}, 7, []store.OutboxEvent{ev}); !errors.Is(err, store.ErrSessionGone) {
+			t.Fatalf("%s: complete = %v, want ErrSessionGone", id, err)
+		}
+		if n, _ := s.Usage(ctx, "gone:"+id); n != 0 {
+			t.Fatalf("%s: usage recorded for a refused turn", id)
+		}
+	}
+	if pending, _ := s.UnpublishedEvents(ctx, 10); len(pending) != 0 {
+		t.Fatalf("events written for refused turns: %+v", pending)
+	}
+}
+
+// Doc 06 §17: retention also drops outbox rows delivered before the cutoff
+// and usage counters older than the previous month.
+func testRetentionPurge(t *testing.T, s store.Store) {
+	now := time.Now().UTC()
+	ev := func(id string) store.OutboxEvent {
+		return store.OutboxEvent{EventID: id, Topic: "t", EventType: "chat.handoff.clicked.v1", Payload: []byte(`{}`), CreatedAt: now}
+	}
+	if err := s.AppendEvents(ctx, []store.OutboxEvent{ev("old-delivered"), ev("new-delivered"), ev("undelivered")}); err != nil {
+		t.Fatal(err)
+	}
+	pending, _ := s.UnpublishedEvents(ctx, 10)
+	ids := map[string]int64{}
+	for _, e := range pending {
+		ids[e.EventID] = e.OutboxID
+	}
+	_ = s.MarkPublished(ctx, []int64{ids["old-delivered"]}, now.Add(-3*time.Hour))
+	_ = s.MarkPublished(ctx, []int64{ids["new-delivered"]}, now)
+
+	sess := mkSession(t, s, "pub_s_usage0000000")
+	b, err := s.BeginTurn(ctx, turn(sess.SessionID, "pub_t_u1", "cu1", "h"), now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keepDay, keepMonth := store.UsageKeepFrom(now)
+	oldDay, oldMonth := "tokens:day:2001-01-01", "tokens:month:2001-01"
+	curDay, curMonth := "tokens:day:"+now.Format("2006-01-02"), "tokens:month:"+now.Format("2006-01")
+	done := b.Turn
+	done.Status, done.Response = "ANSWERED", []byte(`{}`)
+	if err := s.CompleteTurn(ctx, done, []string{oldDay, oldMonth, curDay, curMonth, keepDay, keepMonth}, 5, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.PurgeSessions(ctx, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for b, want := range map[string]int64{oldDay: 0, oldMonth: 0, curDay: 5, curMonth: 5, keepDay: 5, keepMonth: 5} {
+		if n, _ := s.Usage(ctx, b); n != want {
+			t.Errorf("usage %s = %d, want %d", b, n, want)
+		}
+	}
+	// A purged row no longer dedupes its event id; a kept one still does.
+	if err := s.AppendEvents(ctx, []store.OutboxEvent{ev("old-delivered"), ev("new-delivered")}); err != nil {
+		t.Fatal(err)
+	}
+	pending, _ = s.UnpublishedEvents(ctx, 10)
+	got := map[string]bool{}
+	for _, e := range pending {
+		got[e.EventID] = true
+	}
+	if !got["old-delivered"] || got["new-delivered"] || !got["undelivered"] {
+		t.Fatalf("after purge, unpublished = %v", got)
 	}
 }

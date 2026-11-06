@@ -39,6 +39,13 @@ func TestSessionTokenCapStages(t *testing.T) {
 	h := &harness{t: t, h: New(cfg, nil, Deps{Store: st, Sessions: session.New(st, time.Hour), Answerer: ans}).Router(), store: st}
 	s := h.newSession("key-tokencap-01")
 	ids := []string{"0a1c2a52-3c1e-4b5e-9a7f-0c1d2e3f4a5b", "1a1c2a52-3c1e-4b5e-9a7f-0c1d2e3f4a5b", "2a1c2a52-3c1e-4b5e-9a7f-0c1d2e3f4a5b"}
+	var capped []bool
+	ans2 := ans
+	ans = answererFunc(func(ctx context.Context, in orchestrator.Input) orchestrator.Result {
+		capped = append(capped, in.SessionCapped)
+		return ans2.Answer(ctx, in)
+	})
+	h = &harness{t: t, h: New(cfg, nil, Deps{Store: st, Sessions: session.New(st, time.Hour), Answerer: ans}).Router(), store: st}
 	for i, used := range []int64{0, 850, 1000} {
 		sess, _ := st.SessionByGrant(context.Background(), session.HashGrant(s.SessionGrant))
 		st.SetTokensUsedForTest(sess.SessionID, used)
@@ -49,5 +56,9 @@ func TestSessionTokenCapStages(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("stages %v, want %v", got, want)
 		}
+	}
+	// Only the session's own cap is reported as a session limit.
+	if len(capped) != 3 || capped[0] || capped[1] || !capped[2] {
+		t.Fatalf("session capped %v, want [false false true]", capped)
 	}
 }

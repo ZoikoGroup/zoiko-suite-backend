@@ -14,8 +14,12 @@ intent_ids: I02
 
 ## Areas in the ZoikoSuite console
 
-The ZoikoSuite console organizes work into areas including Finance and Payments, Legal and Contracts, Commercial Ops, Purchase Requests, Tax, Compliance, Evidence, Delegated Authority, Intelligence and Reporting, Security and Trust, and Integrations.
+The ZoikoSuite console organizes work into areas including Finance and Payments, Legal and Contracts, Commercial Ops, Purchase Requests, Tax, Compliance, Evidence, Delegated Authority, Intelligence and Reporting, Security and Trust, and Integrations. Each area brings one part of business operations under the same governed controls, so work in one area can rely on approvals, authority and evidence recorded in another.
+
+## What each area is for
+
+Finance and Payments, Legal and Contracts, Commercial Ops, Purchase Requests and Tax hold day-to-day operational work. Compliance, Evidence and Delegated Authority describe what must be met, what proof each action carries and who may act for whom. Intelligence and Reporting, Security and Trust, and Integrations cover reporting, platform protection and connections to external systems.
 
 ## How the areas are grouped
 
-How these console areas map to the core modules is still being reconciled, so no fixed count is quoted. Each area works with shared approvals and evidence.
+How these console areas map to the core modules is still being reconciled, so no fixed count is quoted. Each area works with shared approvals and evidence. The areas available to you depend on market, plan and deployment status.

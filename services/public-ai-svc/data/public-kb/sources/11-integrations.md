@@ -14,11 +14,19 @@ intent_ids: I10,I11
 
 ## Integrations
 
-Integrations connect ZoikoSuite to external systems through connectors, including banking, HRIS, tax authority, eSignature and data feeds.
+Integrations connect ZoikoSuite to external systems through connectors, including banking, HRIS, tax authority, eSignature and data feeds. ZoikoSuite describes API and integration pathways. A specific connector or version is confirmed only when it is in the current approved integration matrix.
 
-## APIs and connectors
+## Banking, HRIS and tax authority
 
-ZoikoSuite describes API and integration pathways. A specific connector or version is confirmed only when it is in the current approved integration matrix.
+Banking connectivity covers payment rails, bank statement intake and treasury connectivity. An HRIS connection supports keeping a retained HRIS platform during phased adoption. A tax authority interface supports filing submission and status confirmation.
+
+## eSignature and data feeds
+
+eSignature integration supports governed external execution of contracts, board resolutions and other legal documents. External data feeds bring in regulatory, market and jurisdictional data that helps show when stored rules drift from current requirements.
+
+## How external data is governed
+
+Data from external systems is normalized into governed workflows and keeps a record of its origin. Imported data passes through the same governance as other data before it is used.
 
 ## Connector status
 

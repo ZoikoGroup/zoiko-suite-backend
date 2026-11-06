@@ -48,6 +48,7 @@ func BuildKBWith(dir, releaseID string, now time.Time, privKey string, opts know
 	if err := m.Validate(); err != nil {
 		return nil, nil, reports, err
 	}
+	m.SignedAt = now.UTC() // Doc 03 §11: signed_at
 	body, err := json.Marshal(m)
 	if err != nil {
 		return nil, nil, nil, err

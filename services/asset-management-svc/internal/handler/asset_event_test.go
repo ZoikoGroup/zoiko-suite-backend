@@ -253,7 +253,7 @@ func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testi
 	effDate := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{BookID: "book-1", 
 		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1", Currency: "EUR", EffectiveDate: &effDate,
-		DebitAccountCode: "IMPAIRMENT-EXPENSE", CreditAccountCode: "ACCUM-IMPAIRMENT",
+		DebitMappingKey: "IMPAIRMENT_LOSS", CreditMappingKey: "ACCUMULATED_DEPRECIATION",
 	})
 	walkToApproved(t, r, e.EventID)
 	callsBeforeApply := pub.calls
@@ -292,7 +292,7 @@ func TestApplyAssetEvent_AmountWithoutCurrency_Returns422AndNeverPosts(t *testin
 	amount := 250.0
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{BookID: "book-1", 
 		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1",
-		DebitAccountCode: "IMPAIRMENT-EXPENSE", CreditAccountCode: "ACCUM-IMPAIRMENT",
+		DebitMappingKey: "IMPAIRMENT_LOSS", CreditMappingKey: "ACCUMULATED_DEPRECIATION",
 	})
 	walkToApproved(t, r, e.EventID)
 
@@ -354,7 +354,7 @@ func TestAssetEvent_PublishesRemainingLifecycleEvents(t *testing.T) {
 	callsBeforeCreate := pub.calls
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeRevaluation, domain.CreateAssetEventRequest{BookID: "book-1", 
 		Amount: &amount, Currency: "USD", ValuationEvidenceRef: "APPRAISAL-2",
-		DebitAccountCode: "FIXED-ASSETS", CreditAccountCode: "REVALUATION-SURPLUS",
+		DebitMappingKey: "FIXED_ASSET_COST", CreditMappingKey: "REVALUATION_SURPLUS",
 	})
 	if pub.calls != callsBeforeCreate+1 {
 		t.Fatalf("expected 1 new publish call (AssetEventCreated), got %d", pub.calls-callsBeforeCreate)
@@ -404,7 +404,7 @@ func TestReverseAssetEvent_Disposal_RevertsAssetToActive(t *testing.T) {
 	id := createActiveAsset(t, s, r, "le-1")
 	proceeds, amount := 500.0, 100.0
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeDisposal, domain.CreateAssetEventRequest{
-		ProceedsAmount: &proceeds, Amount: &amount, Currency: "USD", DebitAccountCode: "DISPOSAL-CLEARING", CreditAccountCode: "FIXED-ASSETS",
+		ProceedsAmount: &proceeds, Amount: &amount, Currency: "USD", DebitMappingKey: "ASSET_CLEARING", CreditMappingKey: "FIXED_ASSET_COST",
 	})
 	walkToApproved(t, r, e.EventID)
 	apply := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/apply", nil, "approver-1")

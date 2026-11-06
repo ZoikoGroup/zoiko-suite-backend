@@ -129,6 +129,20 @@ func (s *PgStore) Monitoring(ctx context.Context, tenantID, legalEntityID, perio
 			}
 		}
 
+		// Matching: automatic (match_results) versus human-asserted (manual_matches)
+		// pairings over the same latest-run scope (SPEC_DEVIATIONS A5).
+		if err := tx.QueryRow(ctx, `
+			WITH latest AS (
+				SELECT DISTINCT ON (control_definition_id) run_id FROM control_runs
+				WHERE tenant_id = $1 AND legal_entity_id = $2 AND ($3 = '' OR period_id = $3)
+				ORDER BY control_definition_id, created_at DESC, run_id DESC)
+			SELECT
+			  (SELECT COUNT(*) FROM match_results mr JOIN latest l ON l.run_id = mr.run_id WHERE mr.tenant_id = $1),
+			  (SELECT COUNT(*) FROM manual_matches mm JOIN latest l ON l.run_id = mm.run_id WHERE mm.tenant_id = $1)`,
+			tenantID, legalEntityID, periodID).Scan(&m.Matching.Automatic, &m.Matching.Manual); err != nil {
+			return err
+		}
+
 		// Certification latency: READY_TO_CERTIFY -> CERTIFIED, over certified runs in scope.
 		return tx.QueryRow(ctx, `
 			SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (c.occurred_at - rdy.occurred_at))),0)::float8, COUNT(*)

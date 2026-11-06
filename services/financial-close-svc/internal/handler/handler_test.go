@@ -252,6 +252,38 @@ func (s *stubStore) ApplyPeriodTransition(_ context.Context, id string, allowedF
 	return &out, nil
 }
 
+// startSoftCloseOrCloseReview is the claim-aware shared body behind
+// StartSoftCloseTransition and EnterCloseReviewTransition: look up the
+// claim first (replaying if found), otherwise apply the transition via the
+// same logic ApplyPeriodTransition uses and record the claim.
+func (s *stubStore) startSoftCloseOrCloseReview(ctx context.Context, command string, id string, allowedFrom []string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	if claimedID, replay, err := s.lookupClaim(key, command, hash); err != nil || replay {
+		if replay {
+			if found := s.periods[claimedID]; found != nil {
+				out := *found
+				return &out, true, nil
+			}
+		}
+		return nil, replay, err
+	}
+	fp, err := s.ApplyPeriodTransition(ctx, id, allowedFrom, u, fact, legacyType, correlationID, actorID)
+	if err != nil {
+		return fp, false, err
+	}
+	s.recordClaim(key, command, hash, id)
+	return fp, false, nil
+}
+
+func (s *stubStore) StartSoftCloseTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodSoftClose
+	return s.startSoftCloseOrCloseReview(ctx, "StartSoftClose", id, []string{domain.PeriodOpen}, u, fact, legacyType, correlationID, actorID, key, hash)
+}
+
+func (s *stubStore) EnterCloseReviewTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodCloseReview
+	return s.startSoftCloseOrCloseReview(ctx, "EnterCloseReview", id, []string{domain.PeriodSoftClose}, u, fact, legacyType, correlationID, actorID, key, hash)
+}
+
 func (s *stubStore) CreateReopenRequest(_ context.Context, req *domain.ReopenRequest, correlationID, actorID string) error {
 	fp, ok := s.periods[req.FiscalPeriodID]
 	if !ok {
@@ -460,20 +492,36 @@ func (s *stubStore) transitionAccrual(scheduleID, fromStatus, toStatus string) e
 	return nil
 }
 
-func (s *stubStore) SubmitAccrualSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval); err != nil {
-		return err
+func (s *stubStore) SubmitAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "SubmitAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].SubmittedAt, s.schedules[scheduleID].SubmittedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionAccrual(sch.ScheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval); err != nil {
+		return false, err
+	}
+	s.schedules[sch.ScheduleID].SubmittedAt, s.schedules[sch.ScheduleID].SubmittedByPrincipalID = &at, &principalID
+	*sch = *s.schedules[sch.ScheduleID]
+	s.recordClaim(key, "SubmitAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) ApproveAccrualSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved); err != nil {
-		return err
+func (s *stubStore) ApproveAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].ApprovedAt, s.schedules[scheduleID].ApprovedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionAccrual(sch.ScheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved); err != nil {
+		return false, err
+	}
+	s.schedules[sch.ScheduleID].ApprovedAt, s.schedules[sch.ScheduleID].ApprovedByPrincipalID = &at, &principalID
+	*sch = *s.schedules[sch.ScheduleID]
+	s.recordClaim(key, "ApproveAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) ActivateAccrualSchedule(_ context.Context, scheduleID string) error {
@@ -494,27 +542,48 @@ func (s *stubStore) CompleteAccrualSchedule(_ context.Context, scheduleID string
 	return s.transitionAccrual(scheduleID, domain.AccrualStatusActive, domain.AccrualStatusCompleted)
 }
 
-func (s *stubStore) CancelAccrualSchedule(_ context.Context, scheduleID, fromStatus, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, fromStatus, domain.AccrualStatusCancelled); err != nil {
-		return err
+func (s *stubStore) CancelAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "CancelAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].CancelledAt, s.schedules[scheduleID].CancelledByPrincipalID = &at, &principalID
-	return nil
+	existing, ok := s.schedules[sch.ScheduleID]
+	if !ok {
+		return false, domain.ErrAccrualNotFound
+	}
+	if existing.Status == domain.AccrualStatusCompleted || existing.Status == domain.AccrualStatusCancelled {
+		return false, domain.ErrInvalidAccrualTransition
+	}
+	existing.Status = domain.AccrualStatusCancelled
+	existing.CancelledAt, existing.CancelledByPrincipalID = &at, &principalID
+	*sch = *existing
+	s.recordClaim(key, "CancelAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) AmendAccrualSchedule(_ context.Context, scheduleID string, totalAmount float64, periodCount int) error {
+func (s *stubStore) AmendAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, totalAmount float64, periodCount int, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "AmendFutureSchedule", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
+	}
 	if s.amendAccrualErr != nil {
-		return s.amendAccrualErr
+		return false, s.amendAccrualErr
 	}
-	sch, ok := s.schedules[scheduleID]
+	existing, ok := s.schedules[sch.ScheduleID]
 	if !ok {
-		return domain.ErrAccrualNotFound
+		return false, domain.ErrAccrualNotFound
 	}
-	if sch.Status != domain.AccrualStatusApproved && sch.Status != domain.AccrualStatusActive {
-		return domain.ErrInvalidAccrualTransition
+	if existing.Status != domain.AccrualStatusApproved && existing.Status != domain.AccrualStatusActive {
+		return false, domain.ErrInvalidAccrualTransition
 	}
-	sch.TotalAmount, sch.PeriodCount = totalAmount, periodCount
-	return nil
+	existing.TotalAmount, existing.PeriodCount = totalAmount, periodCount
+	*sch = *existing
+	s.recordClaim(key, "AmendFutureSchedule", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) CreateRecognitionInstance(_ context.Context, inst *domain.RecognitionInstance) (bool, error) {
@@ -624,12 +693,20 @@ func (s *stubStore) transitionPrepayment(scheduleID, fromStatus, toStatus string
 	return nil
 }
 
-func (s *stubStore) ApprovePrepaymentSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionPrepayment(scheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved); err != nil {
-		return err
+func (s *stubStore) ApprovePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApprovePrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
 	}
-	s.prepaymentSchedules[scheduleID].ApprovedAt, s.prepaymentSchedules[scheduleID].ApprovedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionPrepayment(sch.ScheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved); err != nil {
+		return false, err
+	}
+	s.prepaymentSchedules[sch.ScheduleID].ApprovedAt, s.prepaymentSchedules[sch.ScheduleID].ApprovedByPrincipalID = &at, &principalID
+	*sch = *s.prepaymentSchedules[sch.ScheduleID]
+	s.recordClaim(key, "ApprovePrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) ActivatePrepaymentSchedule(_ context.Context, scheduleID string) error {
@@ -650,29 +727,49 @@ func (s *stubStore) CompletePrepaymentSchedule(_ context.Context, scheduleID str
 	return s.transitionPrepayment(scheduleID, domain.PrepaymentStatusActive, domain.PrepaymentStatusCompleted)
 }
 
-func (s *stubStore) TerminatePrepaymentSchedule(_ context.Context, scheduleID, fromStatus, principalID, reason, treatment string, at time.Time) error {
-	if err := s.transitionPrepayment(scheduleID, fromStatus, domain.PrepaymentStatusTerminated); err != nil {
-		return err
+func (s *stubStore) TerminatePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, principalID, reason, treatment, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "TerminatePrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
 	}
-	sch := s.prepaymentSchedules[scheduleID]
-	sch.TerminatedAt, sch.TerminatedByPrincipalID = &at, &principalID
-	sch.TerminationReason, sch.TerminationFinalTreatment = &reason, &treatment
-	return nil
+	existing, ok := s.prepaymentSchedules[sch.ScheduleID]
+	if !ok {
+		return false, domain.ErrPrepaymentNotFound
+	}
+	if existing.Status == domain.PrepaymentStatusCompleted || existing.Status == domain.PrepaymentStatusTerminated {
+		return false, domain.ErrInvalidPrepaymentTransition
+	}
+	existing.Status = domain.PrepaymentStatusTerminated
+	existing.TerminatedAt, existing.TerminatedByPrincipalID = &at, &principalID
+	existing.TerminationReason, existing.TerminationFinalTreatment = &reason, &treatment
+	*sch = *existing
+	s.recordClaim(key, "TerminatePrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) ModifyFuturePrepaymentSchedule(_ context.Context, scheduleID string, totalAmount float64, periodCount int) error {
+func (s *stubStore) ModifyFuturePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, totalAmount float64, periodCount int, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ModifyPrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
+	}
 	if s.modifyPrepaymentErr != nil {
-		return s.modifyPrepaymentErr
+		return false, s.modifyPrepaymentErr
 	}
-	sch, ok := s.prepaymentSchedules[scheduleID]
+	existing, ok := s.prepaymentSchedules[sch.ScheduleID]
 	if !ok {
-		return domain.ErrPrepaymentNotFound
+		return false, domain.ErrPrepaymentNotFound
 	}
-	if sch.Status != domain.PrepaymentStatusApproved && sch.Status != domain.PrepaymentStatusActive {
-		return domain.ErrInvalidPrepaymentTransition
+	if existing.Status != domain.PrepaymentStatusApproved && existing.Status != domain.PrepaymentStatusActive {
+		return false, domain.ErrInvalidPrepaymentTransition
 	}
-	sch.TotalAmount, sch.PeriodCount = totalAmount, periodCount
-	return nil
+	existing.TotalAmount, existing.PeriodCount = totalAmount, periodCount
+	*sch = *existing
+	s.recordClaim(key, "ModifyPrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) CreatePrepaymentRecognition(_ context.Context, inst *domain.PrepaymentRecognitionInstance) (bool, error) {
@@ -741,30 +838,60 @@ func (s *stubStore) ListAllocationRules(_ context.Context, legalEntityID string)
 	return out, nil
 }
 
-func (s *stubStore) ApproveAllocationRule(_ context.Context, ruleVersionID, principalID string, at time.Time) error {
-	if s.approveRuleErr != nil {
-		return s.approveRuleErr
-	}
+// findAllocationRuleVersion searches the current-version-only map by
+// rule_version_id, since a superseded (non-current) version is never stored
+// — real enough for these stub tests, which never replay against a version
+// that has since been superseded again.
+func (s *stubStore) findAllocationRuleVersion(id string) *domain.AllocationRule {
 	for _, rule := range s.allocationRules {
-		if rule.RuleVersionID == ruleVersionID {
-			if rule.Status != domain.AllocationRuleStatusDraft {
-				return domain.ErrInvalidAllocationRuleTransition
-			}
-			rule.Status = domain.AllocationRuleStatusApproved
-			rule.ApprovedAt, rule.ApprovedByPrincipalID = &at, &principalID
-			return nil
+		if rule.RuleVersionID == id {
+			return rule
 		}
 	}
-	return domain.ErrAllocationRuleNotFound
+	return nil
 }
 
-func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error {
+func (s *stubStore) ApproveAllocationRule(_ context.Context, rule *domain.AllocationRule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveAllocationRule", hash); err != nil || replay {
+		if replay {
+			if found := s.findAllocationRuleVersion(id); found != nil {
+				*rule = *found
+			}
+		}
+		return replay, err
+	}
+	if s.approveRuleErr != nil {
+		return false, s.approveRuleErr
+	}
+	existing := s.findAllocationRuleVersion(rule.RuleVersionID)
+	if existing == nil {
+		return false, domain.ErrAllocationRuleNotFound
+	}
+	if existing.Status != domain.AllocationRuleStatusDraft {
+		return false, domain.ErrInvalidAllocationRuleTransition
+	}
+	existing.Status = domain.AllocationRuleStatusApproved
+	existing.ApprovedAt, existing.ApprovedByPrincipalID = &at, &principalID
+	*rule = *existing
+	s.recordClaim(key, "ApproveAllocationRule", hash, rule.RuleVersionID)
+	return false, nil
+}
+
+func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "SupersedeAllocationRule", hash); err != nil || replay {
+		if replay {
+			if found := s.findAllocationRuleVersion(id); found != nil {
+				*newVersion = *found
+			}
+		}
+		return replay, err
+	}
 	if s.supersedeRuleErr != nil {
-		return s.supersedeRuleErr
+		return false, s.supersedeRuleErr
 	}
 	current, ok := s.allocationRules[ruleID]
 	if !ok || (current.Status != domain.AllocationRuleStatusApproved && current.Status != domain.AllocationRuleStatusActive) {
-		return domain.ErrNoCurrentRuleToSupersede
+		return false, domain.ErrNoCurrentRuleToSupersede
 	}
 	newVersion.Version = current.Version + 1
 	newVersion.RuleID = ruleID
@@ -772,7 +899,8 @@ func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, ne
 	newVersion.Status = domain.AllocationRuleStatusDraft
 	cp := *newVersion
 	s.allocationRules[ruleID] = &cp
-	return nil
+	s.recordClaim(key, "SupersedeAllocationRule", hash, newVersion.RuleVersionID)
+	return false, nil
 }
 
 func (s *stubStore) ActivateAllocationRule(_ context.Context, ruleVersionID string) error {
@@ -922,20 +1050,30 @@ func (s *stubStore) ListFXRevaluationRuns(_ context.Context, legalEntityID, fisc
 	return out, nil
 }
 
-func (s *stubStore) ApproveFXRevaluationRun(_ context.Context, runID, principalID string, at time.Time) error {
+func (s *stubStore) ApproveFXRevaluationRun(_ context.Context, run *domain.FXRevaluationRun, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveFXRevaluation", hash); err != nil || replay {
+		if replay {
+			if found := s.fxRuns[id]; found != nil {
+				*run = *found
+			}
+		}
+		return replay, err
+	}
 	if s.approveFXErr != nil {
-		return s.approveFXErr
+		return false, s.approveFXErr
 	}
-	run, ok := s.fxRuns[runID]
+	existing, ok := s.fxRuns[run.RunID]
 	if !ok {
-		return domain.ErrFXRevaluationRunNotFound
+		return false, domain.ErrFXRevaluationRunNotFound
 	}
-	if run.Status != domain.FXRevaluationStatusReview {
-		return domain.ErrInvalidFXRevaluationTransition
+	if existing.Status != domain.FXRevaluationStatusReview {
+		return false, domain.ErrInvalidFXRevaluationTransition
 	}
-	run.Status = domain.FXRevaluationStatusApproved
-	run.ApprovedAt, run.ApprovedByPrincipalID = &at, &principalID
-	return nil
+	existing.Status = domain.FXRevaluationStatusApproved
+	existing.ApprovedAt, existing.ApprovedByPrincipalID = &at, &principalID
+	*run = *existing
+	s.recordClaim(key, "ApproveFXRevaluation", hash, run.RunID)
+	return false, nil
 }
 
 func (s *stubStore) MarkFXRevaluationPosted(_ context.Context, runID, journalID, principalID string, at time.Time) error {
@@ -1012,12 +1150,22 @@ func (s *stubStore) QuarantineMigrationBatch(_ context.Context, batchID, fromSta
 	return nil
 }
 
-func (s *stubStore) ApproveMigrationBatch(_ context.Context, batchID, principalID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusValidated, domain.MigrationBatchStatusApproved); err != nil {
-		return err
+func (s *stubStore) ApproveMigrationBatch(_ context.Context, batch *domain.MigrationBatch, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveMigrationBatch", hash); err != nil || replay {
+		if replay {
+			if found := s.migrationBatches[id]; found != nil {
+				*batch = *found
+			}
+		}
+		return replay, err
 	}
-	s.migrationBatches[batchID].ApprovedAt, s.migrationBatches[batchID].ApprovedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionMigration(batch.BatchID, domain.MigrationBatchStatusValidated, domain.MigrationBatchStatusApproved); err != nil {
+		return false, err
+	}
+	s.migrationBatches[batch.BatchID].ApprovedAt, s.migrationBatches[batch.BatchID].ApprovedByPrincipalID = &at, &principalID
+	*batch = *s.migrationBatches[batch.BatchID]
+	s.recordClaim(key, "ApproveMigrationBatch", hash, batch.BatchID)
+	return false, nil
 }
 
 func (s *stubStore) MarkMigrationBatchPosted(_ context.Context, batchID, journalID string, at time.Time) error {
@@ -1036,13 +1184,23 @@ func (s *stubStore) MarkMigrationBatchReconciled(_ context.Context, batchID stri
 	return nil
 }
 
-func (s *stubStore) CertifyMigrationBatch(_ context.Context, batchID, principalID, reason string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified); err != nil {
-		return err
+func (s *stubStore) CertifyMigrationBatch(_ context.Context, batch *domain.MigrationBatch, principalID, reason, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "CertifyMigrationBatch", hash); err != nil || replay {
+		if replay {
+			if found := s.migrationBatches[id]; found != nil {
+				*batch = *found
+			}
+		}
+		return replay, err
 	}
-	b := s.migrationBatches[batchID]
+	if err := s.transitionMigration(batch.BatchID, domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified); err != nil {
+		return false, err
+	}
+	b := s.migrationBatches[batch.BatchID]
 	b.CertifiedAt, b.CertifiedByPrincipalID, b.CertificationReason = &at, &principalID, &reason
-	return nil
+	*batch = *b
+	s.recordClaim(key, "CertifyMigrationBatch", hash, batch.BatchID)
+	return false, nil
 }
 
 func (s *stubStore) ListQuarantinedMigrationBatches(_ context.Context, legalEntityID string) ([]domain.MigrationBatch, error) {
@@ -2626,6 +2784,82 @@ func TestAccrualLifecycle_CreateSubmitApprove(t *testing.T) {
 	}
 }
 
+// TestSubmitAccrual_RetryUnderSameKeyReplays proves SPEC_DEVIATIONS A11 for
+// the accrual lifecycle: a lost-response retry of Submit (or Approve, Amend,
+// Cancel) must return the schedule as it now stands, not a second attempt at
+// a transition that already happened (which would 422 since the schedule is
+// no longer DRAFT).
+func TestSubmitAccrual_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	req := domain.CreateAccrualRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Description: "x", PolicyVersion: "v1",
+		TotalAmount: 100, StartFiscalPeriod: "2026-01", PeriodCount: 2,
+		DebitAccountCode: "6100", CreditAccountCode: "2100",
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/accruals/", req, "preparer-1")
+	var sch domain.AccrualSchedule
+	_ = json.NewDecoder(createRR.Body).Decode(&sch)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/accruals/"+sch.ScheduleID+"/submit", nil, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first submit: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/accruals/"+sch.ScheduleID+"/submit", nil, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried submit under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AccrualSchedule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.AccrualStatusPendingApproval {
+		t.Fatalf("replay status = %q, want PENDING_APPROVAL (not a failed re-transition)", replayed.Status)
+	}
+}
+
+// TestSubmitAccrual_NoIdempotencyKey_Returns400 proves the command is
+// mandatory, per ZS-SVC-B-001 §22.
+func TestSubmitAccrual_NoIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	s.schedules["sch-1"] = &domain.AccrualSchedule{ScheduleID: "sch-1", LegalEntityID: "le-1", Status: domain.AccrualStatusDraft}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	rr := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/submit", nil, "preparer-1", testTenantID, "")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestCancelFutureAccrual_RetryAfterSuccess_Replays is the A11 regression
+// this pass's CancelAccrualSchedule rewrite exists for: before it, a retried
+// cancel under the same key would have reached a handler-side
+// COMPLETED/CANCELLED pre-check using the GET's stale snapshot and only then
+// the store, and either path risked 422ing a legitimate replay. The claim
+// lookup must short-circuit before either guard runs.
+func TestCancelFutureAccrual_RetryAfterSuccess_Replays(t *testing.T) {
+	s := newStubStore()
+	s.schedules["sch-1"] = &domain.AccrualSchedule{ScheduleID: "sch-1", LegalEntityID: "le-1", Status: domain.AccrualStatusApproved}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first cancel: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried cancel under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+
+	// A genuinely new attempt (a different key) against the now-CANCELLED
+	// schedule must still be refused.
+	again := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, uuid.NewString())
+	if again.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("new cancel attempt on an already-cancelled schedule: want 422, got %d %s", again.Code, again.Body.String())
+	}
+}
+
 func TestApproveAccrual_UsesDistinctAuthorizationAction(t *testing.T) {
 	s := newStubStore()
 	s.schedules["sch-1"] = &domain.AccrualSchedule{ScheduleID: "sch-1", LegalEntityID: "le-1", Status: domain.AccrualStatusPendingApproval}
@@ -2869,6 +3103,63 @@ func TestPrepaymentLifecycle_CreateApprove(t *testing.T) {
 	}
 }
 
+// TestApprovePrepayment_RetryUnderSameKeyReplays and
+// TestTerminatePrepayment_RetryAfterSuccess_Replays are the ACC-08 mirror of
+// the ACC-07 accrual tests above (SPEC_DEVIATIONS A11).
+func TestApprovePrepayment_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	req := domain.CreatePrepaymentRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Description: "x",
+		TotalAmount: 1200, StartFiscalPeriod: "2026-01", PeriodCount: 12,
+		DebitAccountCode: "6200-Insurance", CreditAccountCode: "1400-PrepaidInsurance",
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/prepayments/", req, "preparer-1")
+	var sch domain.PrepaymentSchedule
+	_ = json.NewDecoder(createRR.Body).Decode(&sch)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/prepayments/"+sch.ScheduleID+"/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/prepayments/"+sch.ScheduleID+"/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.PrepaymentSchedule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.PrepaymentStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
+func TestTerminatePrepayment_RetryAfterSuccess_Replays(t *testing.T) {
+	s := newStubStore()
+	s.prepaymentSchedules["ppy-1"] = &domain.PrepaymentSchedule{ScheduleID: "ppy-1", LegalEntityID: "le-1", Status: domain.PrepaymentStatusActive}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	termReq := domain.TerminatePrepaymentRequest{Reason: "contract ended", FinalBalanceTreatment: domain.TerminationTreatmentWriteOff}
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first terminate: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried terminate under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+
+	// A genuinely new attempt (a different key) against the now-TERMINATED
+	// schedule must still be refused.
+	again := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, uuid.NewString())
+	if again.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("new terminate attempt on an already-terminated schedule: want 422, got %d %s", again.Code, again.Body.String())
+	}
+}
+
 func TestApprovePrepayment_UsesDistinctAuthorizationAction(t *testing.T) {
 	s := newStubStore()
 	s.prepaymentSchedules["ppy-1"] = &domain.PrepaymentSchedule{ScheduleID: "ppy-1", LegalEntityID: "le-1", Status: domain.PrepaymentStatusDraft}
@@ -3063,6 +3354,79 @@ func createApprovedAllocationRule(t *testing.T, s *stubStore, cl *stubClients, r
 		t.Fatalf("approve rule failed: %d %s", rr.Code, rr.Body.String())
 	}
 	return rule.RuleID
+}
+
+// TestApproveAllocationRule_RetryUnderSameKeyReplays and
+// TestSupersedeAllocationRule_RetryUnderSameKeyReplays are the ACC-09 mirror
+// of the ACC-07/ACC-08 lifecycle tests above (SPEC_DEVIATIONS A11).
+func TestApproveAllocationRule_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE", "6200-Ops": "ACTIVE"}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	req := domain.CreateAllocationRuleRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Name: "IT shared cost", SourceAccountCode: "5000-IT",
+		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 60}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 40}},
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/allocation-rules/", req, "preparer-1")
+	var rule domain.AllocationRule
+	_ = json.NewDecoder(createRR.Body).Decode(&rule)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+rule.RuleID+"/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+rule.RuleID+"/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AllocationRule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.AllocationRuleStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
+func TestSupersedeAllocationRule_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE", "6200-Ops": "ACTIVE"}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	ruleID := createApprovedAllocationRule(t, s, cl, r, []domain.AllocationDriver{
+		{RecipientAccountCode: "6100-Sales", WeightPercentage: 60}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 40},
+	})
+
+	req := domain.SupersedeAllocationRuleRequest{
+		CurrencyCode: testCurrency, Name: "IT shared cost (revised)", SourceAccountCode: "5000-ITSharedCost",
+		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 50}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 50}},
+	}
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first supersede: %d %s", first.Code, first.Body.String())
+	}
+	var firstVersion domain.AllocationRule
+	_ = json.NewDecoder(first.Body).Decode(&firstVersion)
+
+	retry := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried supersede under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AllocationRule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.RuleVersionID != firstVersion.RuleVersionID {
+		t.Fatalf("retry minted a second version: first %s, retry %s", firstVersion.RuleVersionID, replayed.RuleVersionID)
+	}
+
+	// A genuinely new attempt (a different key) must mint its own, distinct
+	// version rather than ever colliding with the replay logic above.
+	other := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, uuid.NewString())
+	if other.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("second genuine supersede attempt (rule already superseded by the first): want 422, got %d %s", other.Code, other.Body.String())
+	}
 }
 
 func evenDrivers() []domain.AllocationDriver {
@@ -3405,6 +3769,32 @@ func TestStartRevaluation_AssetGain_ComputesCorrectAdjustment(t *testing.T) {
 	}
 }
 
+// TestApproveRevaluation_RetryUnderSameKeyReplays is the ACC-10 mirror of
+// the ACC-07/08/09 lifecycle tests above (SPEC_DEVIATIONS A11).
+func TestApproveRevaluation_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1",
+		Status: domain.FXRevaluationStatusReview, CreatedByPrincipalID: "preparer-1"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/fx-revaluations/run-1/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/fx-revaluations/run-1/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.FXRevaluationRun
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.FXRevaluationStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
 func TestApproveRevaluation_UsesDistinctAuthorizationAction(t *testing.T) {
 	s := newStubStore()
 	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1", Status: domain.FXRevaluationStatusReview}
@@ -3672,6 +4062,58 @@ func TestValidateOpeningBalances_ControlTotalsMismatch_QuarantinesBatch(t *testi
 	validateRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1")
 	if validateRR.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 got %d: %s", validateRR.Code, validateRR.Body.String())
+	}
+}
+
+// TestApproveMigrationBatch_RetryUnderSameKeyReplays and
+// TestCertifyMigrationBatch_RetryUnderSameKeyReplays are the ACC-17 mirror of
+// the ACC-07/08/09/10 lifecycle tests above (SPEC_DEVIATIONS A11).
+func TestApproveMigrationBatch_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
+		Status: domain.MigrationBatchStatusValidated, CreatedByPrincipalID: "preparer-1"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.MigrationBatch
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.MigrationBatchStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
+func TestCertifyMigrationBatch_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
+		Status: domain.MigrationBatchStatusReconciled, CreatedByPrincipalID: "preparer-1"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	certReq := domain.CertifyMigrationBatchRequest{Reason: "cutover signed"}
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/certify", certReq, "certifier-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first certify: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/certify", certReq, "certifier-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried certify under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.MigrationBatch
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.MigrationBatchStatusCertified {
+		t.Fatalf("replay status = %q, want CERTIFIED", replayed.Status)
 	}
 }
 

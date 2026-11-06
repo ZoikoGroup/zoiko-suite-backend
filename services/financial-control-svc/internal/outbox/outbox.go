@@ -119,6 +119,18 @@ type Publisher interface {
 	PublishOutbox(ctx context.Context, d Delivery) error
 }
 
+// Prober reports whether the Kafka broker backing this relay's publisher is
+// currently reachable. The Relay uses it to tell "the broker is down" apart
+// from "this specific event was rejected": without that distinction, a
+// broker outage spends every event's publish_attempts on retries that can
+// never succeed, and the first events to reach MaxPublishAttempts are
+// permanently dead-lettered financial control facts (run certifications,
+// exceptions) that were never actually malformed — only unlucky enough to
+// be polled during the outage.
+type Prober interface {
+	Probe(ctx context.Context) error
+}
+
 // PgxPool defines the database interface needed by the Relay.
 type PgxPool interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
@@ -133,7 +145,16 @@ type Relay struct {
 	publisher Publisher
 	interval  time.Duration
 	batchSize int
+	prober    Prober
 	log       *zap.Logger
+}
+
+// WithProber attaches a broker-reachability check. Without one, the Relay
+// keeps its original behaviour of charging every failed publish against the
+// event's attempt budget.
+func (r *Relay) WithProber(p Prober) *Relay {
+	r.prober = p
+	return r
 }
 
 // NewRelay constructs a new outbox Relay worker.
@@ -227,7 +248,15 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 		return
 	}
 
-	for _, e := range pending {
+	brokerDown := false
+	for i, e := range pending {
+		if brokerDown {
+			// Already confirmed down this tick: every remaining event would fail
+			// for the same reason. Leave them untouched for the next tick rather
+			// than spending each one's own probe and attempt budget.
+			continue
+		}
+
 		actor := ""
 		if e.ActorID != nil {
 			actor = *e.ActorID
@@ -237,37 +266,55 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 			correlation = *e.CorrelationID
 		}
 
-		if pubErr := r.publisher.PublishOutbox(ctx, Delivery{OutboxEventID: e.OutboxEventID, AggregateType: e.AggregateType,
+		pubErr := r.publisher.PublishOutbox(ctx, Delivery{OutboxEventID: e.OutboxEventID, AggregateType: e.AggregateType,
 			AggregateID: e.AggregateID, EventType: e.EventType, CorrelationID: correlation, TenantID: e.TenantID,
-			LegalEntityID: e.LegalEntityID, ActorID: actor, OccurredAt: e.CreatedAt, Payload: e.Payload}); pubErr != nil {
-			newAttempts := e.Attempts + 1
-			_, _ = tx.Exec(ctx, `
-				UPDATE outbox_events
-				SET publish_attempts = publish_attempts + 1, last_error = $2
-				WHERE outbox_event_id = $1
-			`, e.OutboxEventID, pubErr.Error())
-			if newAttempts >= MaxPublishAttempts {
-				r.log.Error("outbox relay: event reached dead-letter ceiling, moving to dead-letter",
-					zap.String("outbox_event_id", e.OutboxEventID),
-					zap.String("event_type", e.EventType),
-					zap.Int("publish_attempts", newAttempts),
-					zap.Int("max_publish_attempts", MaxPublishAttempts),
-					zap.Error(pubErr),
-				)
-			} else {
-				r.log.Warn("outbox relay: publish failed, will retry",
-					zap.String("outbox_event_id", e.OutboxEventID),
-					zap.String("event_type", e.EventType),
-					zap.Int("publish_attempts", newAttempts),
-					zap.Error(pubErr),
-				)
-			}
-		} else {
+			LegalEntityID: e.LegalEntityID, ActorID: actor, OccurredAt: e.CreatedAt, Payload: e.Payload})
+		if pubErr == nil {
 			_, _ = tx.Exec(ctx, `
 				UPDATE outbox_events
 				SET published_at = NOW()
 				WHERE outbox_event_id = $1
 			`, e.OutboxEventID)
+			continue
+		}
+
+		if r.prober != nil {
+			if probeErr := r.prober.Probe(ctx); probeErr != nil {
+				// The broker itself is unreachable, not just this event. Charging
+				// publish_attempts here would eventually dead-letter a genuine,
+				// well-formed control fact purely because of an outage's timing.
+				// Release this and every remaining event in the batch uncharged;
+				// they are retried from scratch next tick.
+				brokerDown = true
+				r.log.Warn("outbox relay: broker unreachable, releasing batch without charging attempts",
+					zap.Int("released", len(pending)-i),
+					zap.Error(probeErr),
+				)
+				continue
+			}
+		}
+
+		newAttempts := e.Attempts + 1
+		_, _ = tx.Exec(ctx, `
+			UPDATE outbox_events
+			SET publish_attempts = publish_attempts + 1, last_error = $2
+			WHERE outbox_event_id = $1
+		`, e.OutboxEventID, pubErr.Error())
+		if newAttempts >= MaxPublishAttempts {
+			r.log.Error("outbox relay: event reached dead-letter ceiling, moving to dead-letter",
+				zap.String("outbox_event_id", e.OutboxEventID),
+				zap.String("event_type", e.EventType),
+				zap.Int("publish_attempts", newAttempts),
+				zap.Int("max_publish_attempts", MaxPublishAttempts),
+				zap.Error(pubErr),
+			)
+		} else {
+			r.log.Warn("outbox relay: publish failed, will retry",
+				zap.String("outbox_event_id", e.OutboxEventID),
+				zap.String("event_type", e.EventType),
+				zap.Int("publish_attempts", newAttempts),
+				zap.Error(pubErr),
+			)
 		}
 	}
 

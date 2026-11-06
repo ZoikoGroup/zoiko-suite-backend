@@ -254,10 +254,11 @@ type TolerancePolicy struct {
 	Currency            string    `json:"currency"`
 	PermittedContexts   []string  `json:"permitted_contexts"`
 	Rationale           string    `json:"rationale"`
-	EffectiveFrom       string    `json:"effective_from"`
-	ApprovedBy          string    `json:"approved_by"`
-	CreatedBy           string    `json:"created_by"`
-	CreatedAt           time.Time `json:"created_at"`
+	EffectiveFrom       string     `json:"effective_from"`
+	ApprovedBy          *string    `json:"approved_by,omitempty"`
+	ApprovedAt          *time.Time `json:"approved_at,omitempty"`
+	CreatedBy           string     `json:"created_by"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 type CreateTolerancePolicyRequest struct {
@@ -272,11 +273,9 @@ type CreateTolerancePolicyRequest struct {
 	PermittedContexts   []string `json:"permitted_contexts"`
 	Rationale           string   `json:"rationale"`
 	EffectiveFrom       string   `json:"effective_from"`
-	// ApprovedBy is the independent approver; it must differ from the caller.
-	ApprovedBy string `json:"approved_by"`
 }
 
-func (r *CreateTolerancePolicyRequest) Validate(actor string) error {
+func (r *CreateTolerancePolicyRequest) Validate() error {
 	bad := func(msg string) error { return fmt.Errorf("%w: %s", ErrInvalidArgument, msg) }
 	if strings.TrimSpace(r.Metric) == "" {
 		return bad("metric is required")
@@ -311,12 +310,6 @@ func (r *CreateTolerancePolicyRequest) Validate(actor string) error {
 	if _, err := time.Parse("2006-01-02", r.EffectiveFrom); err != nil {
 		return bad("effective_from must be YYYY-MM-DD")
 	}
-	if strings.TrimSpace(r.ApprovedBy) == "" {
-		return bad("approved_by is required: tolerance changes are independently approved (§27)")
-	}
-	if r.ApprovedBy == actor {
-		return ErrSelfApproval
-	}
 	return nil
 }
 
@@ -331,10 +324,11 @@ type MaterialityPolicy struct {
 	Currency            string    `json:"currency"`
 	QualitativeTriggers []string  `json:"qualitative_triggers"`
 	AggregationBasis    string    `json:"aggregation_basis"`
-	EffectiveFrom       string    `json:"effective_from"`
-	ApprovedBy          string    `json:"approved_by"`
-	CreatedBy           string    `json:"created_by"`
-	CreatedAt           time.Time `json:"created_at"`
+	EffectiveFrom       string     `json:"effective_from"`
+	ApprovedBy          *string    `json:"approved_by,omitempty"`
+	ApprovedAt          *time.Time `json:"approved_at,omitempty"`
+	CreatedBy           string     `json:"created_by"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 type CreateMaterialityPolicyRequest struct {
@@ -346,10 +340,9 @@ type CreateMaterialityPolicyRequest struct {
 	QualitativeTriggers []string `json:"qualitative_triggers"`
 	AggregationBasis    string   `json:"aggregation_basis"`
 	EffectiveFrom       string   `json:"effective_from"`
-	ApprovedBy          string   `json:"approved_by"`
 }
 
-func (r *CreateMaterialityPolicyRequest) Validate(actor string) error {
+func (r *CreateMaterialityPolicyRequest) Validate() error {
 	bad := func(msg string) error { return fmt.Errorf("%w: %s", ErrInvalidArgument, msg) }
 	if strings.TrimSpace(r.ReportingBasis) == "" {
 		return bad("reporting_basis is required")
@@ -375,12 +368,6 @@ func (r *CreateMaterialityPolicyRequest) Validate(actor string) error {
 	}
 	if _, err := time.Parse("2006-01-02", r.EffectiveFrom); err != nil {
 		return bad("effective_from must be YYYY-MM-DD")
-	}
-	if strings.TrimSpace(r.ApprovedBy) == "" {
-		return bad("approved_by is required")
-	}
-	if r.ApprovedBy == actor {
-		return ErrSelfApproval
 	}
 	return nil
 }

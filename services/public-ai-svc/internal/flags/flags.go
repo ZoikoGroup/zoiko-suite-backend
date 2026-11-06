@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -37,7 +38,19 @@ const (
 	CRMSyncEnabled            = "crm_sync_enabled"
 	BookingSyncEnabled        = "booking_sync_enabled"
 	ThirdPartyTrackingEnabled = "third_party_tracking_enabled"
+	// CommercialRoutesEnabled gates official-route CTAs (demo, trial,
+	// contact) in answers (Doc 10 App. B). On by default; turning it off
+	// removes commercial routes without touching the answers themselves.
+	CommercialRoutesEnabled = "commercial_routes_enabled"
 )
+
+// dualControl are the flags whose re-enable after a disable needs a second
+// person: the actor turning it back on must differ from the one who turned
+// it off (Doc 09 ADM-T046, Doc 08 §04 dual control).
+var dualControl = map[string]bool{PublicAIEnabled: true, ModelGenerationEnabled: true}
+
+// ErrSameActor refuses a re-enable by the actor who disabled the flag.
+var ErrSameActor = errors.New("re-enabling needs a different actor from the one who disabled it (dual control)")
 
 // hardOff are the gates that may only be recorded as false in R0.
 var hardOff = map[string]bool{StreamEnabled: true, SecureLeadIntakeEnabled: true, CRMSyncEnabled: true,
@@ -54,12 +67,14 @@ type Values struct {
 	FallbackMode           string // "" or "static"
 	MaxConcurrentTurns     int
 	StructuredResponse     bool
+	// CommercialRoutes allows official-route CTAs in answers (Doc 10 App. B).
+	CommercialRoutes bool
 }
 
 // Defaults apply when a flag was never set.
 func Defaults() Values {
 	return Values{PublicAIEnabled: true, ModelGenerationEnabled: true, PricingClaimsEnabled: true, TrialCTAEnabled: true,
-		DisabledIntents: map[string]bool{}, MaxConcurrentTurns: 200}
+		CommercialRoutes: true, DisabledIntents: map[string]bool{}, MaxConcurrentTurns: 200}
 }
 
 // FailClosed is used when flags cannot be read: the assistant is off.
@@ -110,6 +125,8 @@ func apply(v *Values, name string, raw []byte) error {
 		return nil
 	case StructuredResponseEnabled:
 		return json.Unmarshal(raw, &v.StructuredResponse)
+	case CommercialRoutesEnabled:
+		return json.Unmarshal(raw, &v.CommercialRoutes)
 	case MaxConcurrentTurns:
 		if err := json.Unmarshal(raw, &v.MaxConcurrentTurns); err != nil {
 			return err
@@ -136,12 +153,60 @@ func Set(ctx context.Context, st store.Store, name string, value []byte, actor, 
 	if err := json.Compact(&compact, value); err != nil {
 		return err
 	}
+	if name == MaxConcurrentTurns && v.MaxConcurrentTurns == 0 && (environment == "staging" || environment == "production") {
+		// 0 means "no cap"; outside dev/test every limit is set (SEC-P0-09).
+		return fmt.Errorf("max_concurrent_turns must be > 0 in %s", environment)
+	}
+	if dualControl[name] && string(compact.Bytes()) == "true" {
+		if err := checkDualControl(ctx, st, name, actor); err != nil {
+			return err
+		}
+	}
 	now := time.Now().UTC()
 	ev, err := events.KillSwitchChanged(name, actor, approval, environment, now)
 	if err != nil {
 		return err
 	}
 	return st.SetFlag(ctx, store.Flag{Name: name, Value: compact.Bytes(), ActorRef: actor, ApprovalRef: approval, UpdatedAt: now, Environment: environment}, []store.OutboxEvent{ev})
+}
+
+// auditScan bounds how far back the control audit is read for the disable.
+const auditScan = 1000
+
+// checkDualControl refuses re-enabling name when its current value is false
+// and the last control_audit entry that set it was made by actor. The
+// ledger is append-only, so its newest flag.set entry for name is the one
+// that produced the current value; the flag row's actor is the fallback when
+// the entry is beyond the scan window.
+func checkDualControl(ctx context.Context, st store.Store, name, actor string) error {
+	fs, err := st.Flags(ctx)
+	if err != nil {
+		return fmt.Errorf("read flags for dual control: %w", err)
+	}
+	var cur *store.Flag
+	for i := range fs {
+		if fs[i].Name == name {
+			cur = &fs[i]
+		}
+	}
+	if cur == nil || string(cur.Value) != "false" {
+		return nil // never disabled, or already on: not a re-enable
+	}
+	disabledBy := cur.ActorRef
+	audit, err := st.ListAudit(ctx, auditScan)
+	if err != nil {
+		return fmt.Errorf("read control audit for dual control: %w", err)
+	}
+	for _, e := range audit { // newest first
+		if e.Action == "flag.set" && e.Target == name {
+			disabledBy = e.Actor
+			break
+		}
+	}
+	if disabledBy == actor {
+		return fmt.Errorf("%s: %w (disabled by %s)", name, ErrSameActor, disabledBy)
+	}
+	return nil
 }
 
 // Loader caches the effective values and refreshes them.
