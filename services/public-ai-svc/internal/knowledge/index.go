@@ -473,3 +473,45 @@ func (x *Index) NamesSection(question string) bool {
 	}
 	return false
 }
+
+// Covers reports whether one article section in this release plainly covers
+// the question, so a question about any part of the platform is answered
+// rather than treated as off-topic. It holds when the question names a
+// section heading (NamesSection), or when a single section contains at least
+// two thirds of the question's words, one of them in that section's heading.
+// A one-word question must be the whole heading ("Lifecycle"). Words found
+// only in passing in an article body never count on their own, so "write a
+// poem about money" is not taken for a product question.
+func (x *Index) Covers(question string) bool {
+	if x.NamesSection(question) {
+		return true
+	}
+	q := uniq(Tokens(question))
+	if len(q) == 0 {
+		return false
+	}
+	need := (2*len(q) + 2) / 3
+	for i, c := range x.chunks {
+		h := map[string]bool{}
+		for _, w := range Tokens(c.DisplayTitle) {
+			h[w] = true
+		}
+		if len(q) == 1 {
+			if len(h) == 1 && h[q[0]] {
+				return true
+			}
+			continue
+		}
+		matched, inHeading := 0, false
+		for _, t := range q {
+			if x.tf[i][t] > 0 {
+				matched++
+				inHeading = inHeading || h[t]
+			}
+		}
+		if inHeading && matched >= need && matched >= 2 {
+			return true
+		}
+	}
+	return false
+}

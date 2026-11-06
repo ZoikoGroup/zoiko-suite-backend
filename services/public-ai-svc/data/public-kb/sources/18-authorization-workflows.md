@@ -53,6 +53,26 @@ Start a workflow opens an approval for something that needs one. Enter the workf
 
 The stage's named approver, their delegate, a holder of the stage's role or the person it was escalated to records Approve or Reject, and a reason is required to reject. Each decision is checked against authorization and recorded. Escalate, cancel, reopen or invalidate changes a workflow without deciding it, and each needs its own permission.
 
+## Waiting for a decision
+
+Waiting for a decision lists pending and escalated workflows in your organization. Without permission to list them all, you can still open any workflow you started or are due to decide. View a workflow shows its stages, decisions and current state.
+
+## Escalate, cancel, reopen or invalidate
+
+These change a workflow without deciding it. Escalate passes the current stage to the escalation contact, cancel stops a workflow, reopen returns a closed one for a fresh decision, and invalidate voids an approval whose subject has changed. Each needs its own permission.
+
+## Can this approval still be released against?
+
+An approval is tied to a fingerprint of what was approved. Before anything is released against it, the platform checks that the subject has not changed since, so an approval cannot be reused for something different.
+
 ## Workflow definitions
 
 Workflow definitions are versioned routes a workflow can start from: a type, a version, a name and its stages. A running workflow keeps the route it started with, so changing a definition never changes a decision already in progress.
+
+## Register a definition
+
+Register a definition saves a new route: the workflow type, its version, a name and its stages.
+
+## Activate, suspend, retire or supersede
+
+Activate, suspend, retire or supersede moves a definition through its lifecycle; only an active definition can start new workflows, and a superseded one is replaced by a newer version while workflows already running keep the version they started with.

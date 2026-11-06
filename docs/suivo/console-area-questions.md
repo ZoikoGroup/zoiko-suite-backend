@@ -22,8 +22,28 @@ local/dev, and need owner approval before production (Doc 03 §10, Doc 09 §16).
 | Evidence Requirements | "what does NO_REQUIREMENTS_DEFINED mean", "use of the Requirement catalog", "how do I withdraw a requirement" | `kb-evidence-requirements` |
 | Finance & Payments (journals) | "how do I record a journal", "how do I ingest a statement line", "what is the Reconciliation register" | `kb-finance-journals` |
 
-Any question that names a section heading of these pages (all of its words) is treated as a product
-question, so it is answered rather than given the generic "I'm here to help with…" reply.
+| Authorization checks | "what is Maker and checker", "where can someone act", "what is Effective access", "what is Borrowed authority" | `kb-authorization-checks` |
+| Commercial Ops | "how do I screen a counterparty", "use of the Amendment ledger", "how do I check a spend before committing it" | `kb-procurement-console` |
+| Delegations | "how do I grant a delegation", "what is the Delegation register" | `kb-delegations-console` (or `kb-delegated-authority`) |
+| Gateway, Secrets, Settings, Notifications, Roles | "what each refusal means", "how does secret access actually work", "what is the Delivery register", "how do I retire a role" | `kb-access-settings-console` |
+| Contracts | "how do I draft a contract", "what is Version history" | `kb-contracts-console` |
+| Privacy | "how do I withdraw consent", "what is a transfer mechanism", "what is a transfer risk assessment" | `kb-privacy-transfers` |
+| Search | "what is Restriction propagation", "how do I build a generation", "how do I request an export" | `kb-search-admin` |
+| Source Authority | "how do I resolve a value", "what is the Precedence register" | `kb-source-authority` |
+| Tenants & Entities | "how do I provision a tenant", "what is Registry integrity", "what are Workspaces" | `kb-tenants-entities` |
+
+**Every section of every article is answered.** `acceptance.TestEveryKBHeadingIsAnswered` asks
+"what is <heading>" and "tell me about <heading>" for every `##` heading in the public KB (over 400
+questions). A question that names a section, or whose words are mostly in one section including its
+heading, is treated as a product question rather than given the generic "I'm here to help with…" reply.
+A "how do I approve an invoice" style question is answered as a how-to; "approve my invoice" is still
+refused (X02). `acceptance.TestOffTopicStillRefused` keeps unrelated questions out of scope.
+
+Deliberately not answered by heading (see `headingExceptions`): "Sign-in security" (routed to account
+support), "Create a data residency policy" (approved claims only), "Capabilities, not certifications"
+(claims path), and two headings too generic to name an article. Console sections that are test
+harnesses or placeholders (QA test matrices, "Rest of the domain") have no article, and live status
+("Domain Operational Status") is refused as live data.
 
 Still refused, by design (Doc 02 X01, live data):
 - "show our domain health"

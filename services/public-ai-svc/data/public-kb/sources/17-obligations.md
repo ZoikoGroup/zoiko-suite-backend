@@ -27,7 +27,7 @@ Raise an obligation against the legal entity that owes it and the jurisdiction i
 
 ## Read this register knowing three things
 
-Nothing moves an obligation to OVERDUE automatically when its due date passes, so the register counts past-due items separately rather than trusting the status. The legal entity filter narrows the view; it is not an isolation boundary. Obligation codes are global, and reusing a code returns the stored record instead of writing a new one.
+Nothing moves an obligation to OVERDUE automatically when its due date passes, so the register counts past-due items separately rather than trusting the status. Obligation codes are global, and reusing a code returns the stored record instead of writing a new one.
 
 ## Obligation register
 

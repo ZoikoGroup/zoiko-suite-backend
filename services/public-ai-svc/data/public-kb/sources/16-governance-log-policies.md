@@ -25,9 +25,21 @@ The Governance Log is the append-only evidence store behind every governed decis
 
 The Decision log lists governed decisions, newest first, for your own organization only. Each row records a governed action being allowed, refused or sent for review, together with the rule that settled it. You can filter it by action type, such as PAYROLL_RELEASE, by the person who acted, by legal entity, by the rule basis (a policy code and version) and by a date range, then choose how many rows to show per page. Filters combine, and an invalid date is reported as an error rather than as an empty result.
 
+## What you are looking at
+
+Every row in the Governance Log records a governed action being allowed, refused or sent for review, together with the rule that settled it. Records are written automatically by the areas that make those decisions, nothing can be edited or deleted, and you see only your own organization's decisions. Look up a decision opens one record by its reference, and Record a decision files a decision an area must be able to justify later.
+
 ## Policies
 
 Policies are the rules that decide whether something needs approving, and the limits they set. A policy rule is only a name: its limits live on its versions, and a version applies to nothing until it is brought into force. This keeps every change to an approval limit reviewable and dated. Only approval thresholds are acted on today; other kinds of rule can be recorded but are not yet consulted. Changing a rule needs permission, and a change that cannot be confirmed is refused rather than waved through.
+
+## Three things this page cannot do for you
+
+First, only approval thresholds are acted on: other kinds of rule can be created, given limits and brought into force, but the platform does not consult them yet, so a rule being in force is not the same as a rule being applied. Second, changing a rule needs permission, and if that permission check cannot be carried out the change is refused, so a refusal can mean the permission service is unreachable. Third, every check is filed in the Governance Log, but an answer on this page does not by itself prove it was recorded; look the reference up in the log when it matters.
+
+## Check an amount
+
+Check an amount asks whether an amount needs approving. It is compared against whichever limit is in force, and the answer is filed for the record. The history of one rule lists every version of a rule and when each applied.
 
 ## What is in force right now
 

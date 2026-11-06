@@ -32,3 +32,7 @@ Ingest a statement line records what the bank says happened: the bank reference,
 ## Reconciliation register
 
 The Reconciliation register lists statement lines, newest first, with only the actions that are valid for each. MATCHED is final. A statement is reconciled per bank account and date once every line is either matched or recorded as an exception.
+
+## Issue a customer invoice
+
+Issue a customer invoice records money owed to you. An invoice starts ISSUED and moves to SENT, then to OVERDUE or PAID; PAID is final, and an invoice paid on time never passes through OVERDUE. Each step needs its own permission, and recording a payment also needs a finalized ledger journal linked to the invoice, so cash is never recognised against a receivable the books do not carry. The Receivables register lists customer invoices.

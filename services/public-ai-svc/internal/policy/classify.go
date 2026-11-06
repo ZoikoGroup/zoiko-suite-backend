@@ -268,7 +268,7 @@ func LooksLikeInjection(text string) bool {
 // "my", "our" or "for me": a question about the product, not a request to
 // act on the visitor's records (Doc 02 G12: "Tax filing in Germany" is I17).
 var (
-	capabilityRe = regexp.MustCompile(`(?i)^\s*(?:do you|does (?:it|zoikosuite|zoiko suite|the platform)|can (?:it|zoikosuite|zoiko suite|the platform)|is (?:it|zoikosuite) able to)\b`)
+	capabilityRe = regexp.MustCompile(`(?i)^\s*(?:do you|does (?:it|zoikosuite|zoiko suite|the platform)|can (?:it|zoikosuite|zoiko suite|the platform)|is (?:it|zoikosuite) able to|how (?:do (?:i|you|we)|does one|to|can (?:i|you))|what (?:is|does)|tell me about|use of)\b`)
 	personalRe   = regexp.MustCompile(`(?i)\b(?:my|our|mine|for me|for us)\b`)
 )
 
