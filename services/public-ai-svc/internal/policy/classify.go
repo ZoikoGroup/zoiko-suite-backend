@@ -212,7 +212,11 @@ func IsLivePlatform(text string) bool { return livePlatformRe.MatchString(text) 
 
 // moduleTermRe names ZoikoSuite areas, modules and their aliases. A question
 // that names one is never "out of scope" (classifier fallback ladder).
-var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|payments?|legal|contracts?|commercial ops|commercial operations|purchase requests?|purchase orders?|procurement|requisitions?|tax(?:es)?|vat|gst|compliance|evidence|delegated authority|delegation of authority|board resolutions?|corporate actions?|intelligence|reporting|security|trust|integrations?|connectors?|banking|hris|e-?signatures?|siem|mtls|cap tables?|ar|ap|gl|general ledger|payables|receivables|payroll|workforce|hr|modules?)\b`)
+var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|payments?|legal|contracts?|commercial ops|commercial operations|purchase requests?|purchase orders?|procurement|requisitions?|tax(?:es)?|vat|gst|compliance|evidence|delegated authority|delegation of authority|board resolutions?|corporate actions?|intelligence|reporting|security|trust|integrations?|connectors?|banking|hris|e-?signatures?|siem|mtls|cap tables?|ar|ap|gl|general ledger|payables|receivables|payroll|workforce|hr|modules?` +
+	// Console areas of My Work and Identity, Scope & Foundation (KB articles
+	// kb-my-work, kb-identity-context, kb-identity-foundation).
+	`|my work|tasks?(?: and approvals)?|approvals?|exceptions?|assigned actions?|identity(?: context)?|authentication|federation|federated|sign-?on|sso|mfa|second factor|sessions?|support access|password resets?` +
+	`|tenants? and entities|legal entit(?:y|ies)|feature flags?|config(?:uration)?|secret vault|secrets?|gateway(?: authentication)?|notifications?|roles?(?: and access)?|access control|permission bundles?|foundation)\b`)
 
 // IsModuleQuestion reports whether a message names a known area, module or
 // alias.
