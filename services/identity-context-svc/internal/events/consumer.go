@@ -369,8 +369,7 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 	}
 
 	switch ev.EventType {
-	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated",
-		"iam.assignment.revoked", "iam.assignment.expired", "iam.assignment.suspended":
+	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated":
 		if c.stale(ev) {
 			return nil
 		}
@@ -543,6 +542,10 @@ func (c *Consumer) handleRoleUpdated(ctx context.Context, ev inbound) error {
 // principal whose assignment was just revoked is no longer among them, so the
 // one session that most needs ending was the one it could never find. The
 // subject is payload.principal_id; ev.ActorID is the revoker and is never used.
+//
+// IC-11 (S1-9 K-1): The projection (EndRoleAssignment + tombstone) is ALWAYS
+// written, even for events older than the revocation horizon. Only session
+// eviction is skipped for stale events.
 func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) error {
 	var p struct {
 		PrincipalID       string `json:"principal_id"`
@@ -565,6 +568,7 @@ func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) erro
 	}
 	// Close the projection first, so the re-resolve the eviction forces does
 	// not frame the revoked role back into the next envelope.
+	// IC-11: ALWAYS write the projection, even for stale events.
 	if proj, ok := c.roles.(RoleAssignmentProjector); ok && p.AssignmentID != "" {
 		if err := proj.EndRoleAssignment(ctx, ev.TenantID, p.AssignmentID, c.now()); err != nil {
 			c.log.Error("failed to close projected role assignment — will retry",
@@ -572,20 +576,29 @@ func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) erro
 			return c.retry(ctx, ev, err)
 		}
 	}
-	n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
-	if err != nil {
-		c.log.Error("failed to revoke sessions after assignment revocation — will retry",
+	// IC-11: Only evict sessions if the event is NOT stale (within horizon).
+	// For stale events, the projection is still closed but sessions are not evicted.
+	if !c.stale(ev) {
+		n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
+		if err != nil {
+			c.log.Error("failed to revoke sessions after assignment revocation — will retry",
+				zap.String("principal_id", principalID),
+				zap.String("role_id", p.RoleID),
+				zap.String("correlation_id", ev.CorrelationID),
+				zap.Error(err))
+			return c.retry(ctx, ev, err)
+		}
+		c.log.Warn("assignment revoked — sessions revoked",
 			zap.String("principal_id", principalID),
 			zap.String("role_id", p.RoleID),
-			zap.String("correlation_id", ev.CorrelationID),
-			zap.Error(err))
-		return c.retry(ctx, ev, err)
+			zap.Int("sessions_revoked", n),
+			zap.String("correlation_id", ev.CorrelationID))
+	} else {
+		c.log.Info("assignment revoked — projection closed (stale event, sessions not evicted)",
+			zap.String("principal_id", principalID),
+			zap.String("role_id", p.RoleID),
+			zap.String("correlation_id", ev.CorrelationID))
 	}
-	c.log.Warn("assignment revoked — sessions revoked",
-		zap.String("principal_id", principalID),
-		zap.String("role_id", p.RoleID),
-		zap.Int("sessions_revoked", n),
-		zap.String("correlation_id", ev.CorrelationID))
 	return nil
 }
 

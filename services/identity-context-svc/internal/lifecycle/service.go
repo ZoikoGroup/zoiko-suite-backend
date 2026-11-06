@@ -434,6 +434,13 @@ func (s *Service) RequestReset(ctx context.Context, a Actor, principalID, reason
 // DecideReset records an approver's decision. The approver is neither the
 // requester nor the subject and holds a recent second-factor authentication;
 // the link is issued and delivered when the approvals are complete.
+//
+// IC-13 (S1-13 K-7):
+// - Metric incremented AFTER commit
+// - Store outages map to 503 (service unavailable)
+// - Expiry committed before refusing (handled in store)
+// - Event emitted for every decision (handled in store)
+// - Link delivery failure returns 502/503
 func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision, reason string) (*domain.PasswordResetRequest, error) {
 	decision = strings.ToUpper(strings.TrimSpace(decision))
 	if reason = strings.TrimSpace(reason); len(reason) > 500 {
@@ -462,9 +469,6 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision,
 	if err != nil {
 		return nil, err
 	}
-	if ic8 := metrics.Default(); ic8 != nil {
-		ic8.PasswordResets.WithLabelValues(decision).Inc()
-	}
 	out, err := s.store.DecideResetRequest(ctx, a.TenantID, requestID,
 		domain.ResetApproval{ApproverID: a.PrincipalID, At: s.now(), Decision: decision, Reason: reason},
 		func(ctx context.Context, tx pgx.Tx, rr *domain.PasswordResetRequest) error {
@@ -474,16 +478,25 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision,
 				RequestID: rr.RequestID, ExpiresAt: s.now().Add(s.cfg.ResetTTL)})
 		}, rec)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrConflict, err)
+		// IC-13: Map store outages to service unavailable (503), not conflict (409)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("password reset decision unavailable: %w", err)
+	}
+	// IC-13: Metric incremented AFTER successful commit
+	if ic8 := metrics.Default(); ic8 != nil {
+		ic8.PasswordResets.WithLabelValues(decision).Inc()
 	}
 	if out != nil && out.Status == "ISSUED" && issued != "" {
 		if s.notifier == nil {
 			return out, ErrNotifierUnconfigured
 		}
+		// IC-13: Link delivery failure returns error (502/503), not silent warn
 		if err := s.notifier.Notify(ctx, Notice{TenantID: out.TenantID, PrincipalID: out.PrincipalID, Intent: s.cfg.IntentReset,
 			Link: s.linkFor(domain.CredentialTokenReset, issued), ExpiresAt: s.now().Add(s.cfg.ResetTTL),
 			SourceEventID: "reset-" + out.RequestID, CorrelationID: a.CorrelationID}); err != nil {
-			s.log.Warn("approved reset link not delivered", zap.String("request_id", requestID), zap.Error(err))
+			return nil, fmt.Errorf("password reset link delivery failed: %w", err)
 		}
 	}
 	return out, nil

@@ -19,35 +19,6 @@ import (
 // ends the subject's sessions and holds the assignment back from resolution; a
 // resume lifts the hold and ends nothing.
 
-type suspendCall struct {
-	tenantID, assignmentID string
-	at                     time.Time
-}
-
-// suspendableRoles is fakeRoles plus the suspension projection.
-type suspendableRoles struct {
-	*fakeRoles
-	suspended, resumed []suspendCall
-	suspendErr         error
-	order              *[]string
-}
-
-func (f *suspendableRoles) SuspendRoleAssignment(_ context.Context, tenantID, id string, at time.Time) error {
-	if f.order != nil {
-		*f.order = append(*f.order, "suspend")
-	}
-	if f.suspendErr != nil {
-		return f.suspendErr
-	}
-	f.suspended = append(f.suspended, suspendCall{tenantID, id, at})
-	return nil
-}
-
-func (f *suspendableRoles) ResumeRoleAssignment(_ context.Context, tenantID, id string, at time.Time) error {
-	f.resumed = append(f.resumed, suspendCall{tenantID, id, at})
-	return nil
-}
-
 type orderedRevoker struct {
 	*fakeRevoker
 	order *[]string
@@ -58,10 +29,10 @@ func (f *orderedRevoker) EvictAllForPrincipal(ctx context.Context, p, t string, 
 	return f.fakeRevoker.EvictAllForPrincipal(ctx, p, t, r)
 }
 
-func suspHarness() (*events.Consumer, *fakeRevoker, *suspendableRoles, *[]string) {
+func suspHarness() (*events.Consumer, *fakeRevoker, *fakeRoles, *[]string) {
 	order := &[]string{}
 	sessions := &fakeRevoker{}
-	roles := &suspendableRoles{fakeRoles: &fakeRoles{byRole: map[string][]string{}}, order: order}
+	roles := &fakeRoles{byRole: map[string][]string{}, order: order}
 	c := events.NewConsumer(zap.NewNop(), &orderedRevoker{sessions, order}, roles, &fakeRisk{}, &fakeHolds{}, newFakeDeduper())
 	return c, sessions, roles, order
 }
@@ -159,26 +130,83 @@ func TestAssignmentResumed_LiftsTheHoldAndEndsNothing(t *testing.T) {
 	c.Handle(context.Background(), assignmentEvent(t, "iam.assignment.resumed", "r1", at, "admin-2",
 		map[string]any{"principal_role_assignment_id": "a-1", "principal_id": "p-subject"}))
 
-	require.Len(t, roles.resumed, 1)
-	assert.Equal(t, suspendCall{"tenant-1", "a-1", at}, roles.resumed[0])
+	// Suspension record should be removed
+	assert.Empty(t, roles.suspended, "resume must remove the suspension hold")
 	assert.Empty(t, sessions.principals, "a resume only adds access")
-	assert.Empty(t, roles.suspended)
 }
 
 func TestAssignmentResumed_NamingNoAssignmentIsIgnored(t *testing.T) {
 	c, _, roles, _ := suspHarness()
 	c.Handle(context.Background(), assignmentEvent(t, "iam.assignment.resumed", "r2", time.Now().UTC(), "admin",
 		map[string]any{"principal_id": "p-1"}))
-	assert.Empty(t, roles.resumed)
+	assert.Empty(t, roles.suspended)
 }
 
 // A suspended event older than any live session is skipped like a stale
 // revocation: ending sessions that cannot exist is noise.
+//
+// IC-11: The projection (suspension hold) is STILL recorded, but sessions
+// are not evicted.
 func TestAssignmentSuspended_ADeliveryLongAfterTheFactIsSkipped(t *testing.T) {
 	c, sessions, roles, _ := suspHarness()
 	c.WithRevocationHorizon(time.Hour)
 	c.Handle(context.Background(), assignmentEvent(t, "iam.assignment.suspended", "old-1", time.Now().Add(-48*time.Hour).UTC(), "admin",
 		map[string]any{"principal_role_assignment_id": "a-8", "principal_id": "p-8"}))
-	assert.Empty(t, sessions.principals)
-	assert.Empty(t, roles.suspended)
+	assert.Empty(t, sessions.principals, "sessions must NOT be evicted for old suspension")
+	require.Len(t, roles.suspended, 1, "projection hold MUST be recorded even for stale suspension")
+}
+
+// ── IC-12: S1-10 (K-2) suspension before grant ──────────────────────────────────
+//
+// A suspension that arrives before its grant must be recorded (like a tombstone)
+// so that when the grant eventually arrives, the assignment is suspended from
+// the start. The grant must not frame the role until a resume arrives.
+
+func TestIC12_SuspendThenGrantNotFramed(t *testing.T) {
+	c, sessions, roles, _ := suspHarness()
+	c.WithRevocationHorizon(time.Hour)
+
+	// First, suspend an assignment that doesn't exist yet
+	at := time.Date(2026, 6, 1, 9, 30, 0, 0, time.UTC)
+	c.Handle(context.Background(), assignmentEvent(t, "iam.assignment.suspended", "s1", at, "admin",
+		map[string]any{"principal_role_assignment_id": "a-1", "principal_id": "p-1", "role_id": "role-9"}))
+
+	// The suspension should be recorded even without a projection row
+	require.Len(t, roles.suspended, 1, "suspension must be recorded even without existing projection")
+	assert.Equal(t, "a-1", roles.suspended[0].assignmentID)
+
+	// Now the grant arrives for the suspended assignment
+	c.Handle(context.Background(), assignmentEvent(t, "iam.assignment.granted", "g1", at.Add(time.Minute), "admin",
+		map[string]any{"assignment_id": "a-1", "principal_id": "p-1", "role_id": "role-9", "effective_from": at.Add(time.Minute)}))
+
+	// The role must NOT be framed (holder not added) because it's suspended
+	assert.Empty(t, roles.byRole["role-9"], "suspended assignment must not frame the role")
+	assert.Empty(t, sessions.principals, "no sessions to evict for a role that was never framed")
+
+	// The suspension record must still exist
+	require.Len(t, roles.suspended, 1, "suspension must persist after grant")
+}
+
+func TestIC12_SuspendGrantResumeFramed(t *testing.T) {
+	c, _, roles, _ := suspHarness()
+	c.WithRevocationHorizon(time.Hour)
+
+	// Suspend before grant
+	at := time.Date(2026, 6, 1, 9, 30, 0, 0, time.UTC)
+	c.Handle(context.Background(), assignmentEvent(t, "iam.assignment.suspended", "s1", at, "admin",
+		map[string]any{"principal_role_assignment_id": "a-1", "principal_id": "p-1", "role_id": "role-9"}))
+
+	// Grant arrives
+	c.Handle(context.Background(), assignmentEvent(t, "iam.assignment.granted", "g1", at.Add(time.Minute), "admin",
+		map[string]any{"assignment_id": "a-1", "principal_id": "p-1", "role_id": "role-9", "effective_from": at.Add(time.Minute)}))
+
+	// Role is still not framed
+	assert.Empty(t, roles.byRole["role-9"])
+
+	// Now resume
+	c.Handle(context.Background(), assignmentEvent(t, "iam.assignment.resumed", "r1", at.Add(2*time.Minute), "admin",
+		map[string]any{"principal_role_assignment_id": "a-1", "principal_id": "p-1", "role_id": "role-9"}))
+
+	// After resume, the role should be framed (holder added)
+	require.Contains(t, roles.byRole["role-9"], "p-1", "resume must allow the role to be framed")
 }

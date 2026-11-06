@@ -33,6 +33,10 @@ var ErrUnknownPrincipal = domain.ErrUnknownPrincipal
 // (revoked_role_assignments, 000010): a grant delivered after its revoke — a
 // reorder, a retry or a replay — is projected already ended. effective_to only
 // ever moves earlier, here as in EndRoleAssignment.
+//
+// IC-12 (S1-10 K-2): If a suspension was recorded before the grant (suspension
+// before grant), the suspension is applied by setting suspended_at. The grant
+// does not frame the role until a resume arrives.
 func (s *PgStore) UpsertRoleAssignment(ctx context.Context, tenantID string, a domain.PrincipalRoleAssignment) error {
 	if tenantID == "" || a.AssignmentID == "" || a.PrincipalID == "" || a.RoleID == "" {
 		return errors.New("UpsertRoleAssignment: tenant_id, assignment_id, principal_id and role_id are required")
@@ -42,21 +46,41 @@ func (s *PgStore) UpsertRoleAssignment(ctx context.Context, tenantID string, a d
 		effectiveTo = a.EffectiveTo
 	}
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		// Check if there's a pending suspension for this assignment
+		var existingSuspendedAt *time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT suspended_at FROM principal_role_assignments
+			 WHERE assignment_id = $1 AND tenant_id = $2
+			   AND suspended_at IS NOT NULL
+			   AND (resumed_at IS NULL OR suspended_at > resumed_at)
+		`, a.AssignmentID, tenantID).Scan(&existingSuspendedAt)
+		if err != nil && err.Error() != "no rows in result set" {
+			return err
+		}
+
+		var suspendedAt any
+		if existingSuspendedAt != nil {
+			suspendedAt = *existingSuspendedAt
+		}
+
+		_, err = tx.Exec(ctx, `
 			INSERT INTO principal_role_assignments
-				(assignment_id, principal_id, tenant_id, role_id, legal_entity_id, effective_from, effective_to, assigned_by)
+				(assignment_id, principal_id, tenant_id, role_id, legal_entity_id, effective_from, effective_to, assigned_by, suspended_at)
 			VALUES ($1,$2,$3,$4,$5,$6,
 				LEAST($7::timestamptz, COALESCE(
 					(SELECT revoked_at FROM revoked_role_assignments WHERE tenant_id = $9::text AND assignment_id = $10::text),
 					'infinity'::timestamptz)),
-				$8)
+				$8, $11)
 			ON CONFLICT (assignment_id) DO UPDATE SET
 				role_id = EXCLUDED.role_id,
 				legal_entity_id = EXCLUDED.legal_entity_id,
 				effective_from = EXCLUDED.effective_from,
-				effective_to = LEAST(principal_role_assignments.effective_to, EXCLUDED.effective_to)`,
+				effective_to = LEAST(principal_role_assignments.effective_to, EXCLUDED.effective_to),
+				principal_id = EXCLUDED.principal_id,
+				assigned_by = EXCLUDED.assigned_by,
+				suspended_at = COALESCE(principal_role_assignments.suspended_at, EXCLUDED.suspended_at)`,
 			a.AssignmentID, a.PrincipalID, tenantID, a.RoleID, a.LegalEntityID, a.EffectiveFrom, effectiveTo, a.AssignedBy,
-			tenantID, a.AssignmentID)
+			tenantID, a.AssignmentID, suspendedAt)
 		return err
 	})
 	var pgErr *pgconn.PgError

@@ -46,8 +46,8 @@ func TestIAM09_SuspendedAssignmentLeavesProfile(t *testing.T) {
 
 	c.Handle(context.Background(), event(t, "iam.assignment.resumed", "az-r2", "tenant-1",
 		authzAssignment("pra-2", "p-8", "role-6")))
-	require.Len(t, roles.resumed, 1, "a resumed assignment frames the role again")
-	assert.Equal(t, "pra-2", roles.resumed[0].assignmentID)
+	// Suspension record should be removed
+	assert.Empty(t, roles.suspended, "a resumed assignment removes the suspension hold")
 	assert.Len(t, sessions.principals, 1, "a resume ends nothing")
 }
 

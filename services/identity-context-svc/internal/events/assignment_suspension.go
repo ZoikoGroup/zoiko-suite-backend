@@ -54,6 +54,15 @@ func (c *Consumer) eventTime(ev inbound) time.Time {
 // the re-resolve that eviction forces must not frame the suspended role back
 // into the next envelope. Unlike a revocation nothing is tombstoned, because a
 // suspension is reversible.
+//
+// IC-11 (S1-9 K-1): The projection (SuspendRoleAssignment) is ALWAYS written,
+// even for events older than the revocation horizon. Only session eviction is
+// skipped for stale events.
+//
+// IC-12 (S1-10 K-2): A suspension is recorded even when the assignment has no
+// projection row yet (suspension before grant). The suspension acts like a
+// tombstone — when the grant arrives, UpsertRoleAssignment checks for existing
+// suspensions and applies them.
 func (c *Consumer) handleAssignmentSuspended(ctx context.Context, ev inbound) error {
 	var p assignmentRef
 	_ = json.Unmarshal(ev.Payload, &p)
@@ -66,6 +75,8 @@ func (c *Consumer) handleAssignmentSuspended(ctx context.Context, ev inbound) er
 	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
 		return nil
 	}
+	// IC-11 + IC-12: ALWAYS write the suspension projection, even for stale
+	// events and even when the assignment has no projection row yet.
 	if s, ok := c.roles.(RoleAssignmentSuspender); ok && p.assignment() != "" {
 		if err := s.SuspendRoleAssignment(ctx, ev.TenantID, p.assignment(), c.eventTime(ev)); err != nil {
 			c.log.Error("failed to suspend projected role assignment — will retry",
@@ -73,20 +84,28 @@ func (c *Consumer) handleAssignmentSuspended(ctx context.Context, ev inbound) er
 			return c.retry(ctx, ev, err)
 		}
 	}
-	n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
-	if err != nil {
-		c.log.Error("failed to revoke sessions after assignment suspension — will retry",
+	// IC-11: Only evict sessions if the event is NOT stale (within horizon).
+	if !c.stale(ev) {
+		n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
+		if err != nil {
+			c.log.Error("failed to revoke sessions after assignment suspension — will retry",
+				zap.String("principal_id", principalID),
+				zap.String("role_id", p.RoleID),
+				zap.String("correlation_id", ev.CorrelationID),
+				zap.Error(err))
+			return c.retry(ctx, ev, err)
+		}
+		c.log.Warn("assignment suspended — sessions revoked",
 			zap.String("principal_id", principalID),
 			zap.String("role_id", p.RoleID),
-			zap.String("correlation_id", ev.CorrelationID),
-			zap.Error(err))
-		return c.retry(ctx, ev, err)
+			zap.Int("sessions_revoked", n),
+			zap.String("correlation_id", ev.CorrelationID))
+	} else {
+		c.log.Info("assignment suspended — projection held (stale event, sessions not evicted)",
+			zap.String("principal_id", principalID),
+			zap.String("role_id", p.RoleID),
+			zap.String("correlation_id", ev.CorrelationID))
 	}
-	c.log.Warn("assignment suspended — sessions revoked",
-		zap.String("principal_id", principalID),
-		zap.String("role_id", p.RoleID),
-		zap.Int("sessions_revoked", n),
-		zap.String("correlation_id", ev.CorrelationID))
 	return nil
 }
 
