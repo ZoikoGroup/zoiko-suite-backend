@@ -348,19 +348,43 @@ needs GL to check period state transactionally, for example a period-version
 token re-checked at commit, or a local period mirror read under a row lock.
 That is a general-ledger-svc change.
 
-### A6. ACC-14 does not separate the close certifier from the preparers
+### A6. ACC-14 does not separate the close certifier from the preparers — partially closed 2026-11-06
 
 §17:
 
 > "Segregation of duties | Requester cannot unilaterally reopen hard-closed
 > material book; close certifier independent from preparers where required."
 
-The first clause is enforced (see Verified controls). The second is not.
-`HardClosePeriod` and `ReclosePeriod` require `PERIOD_CLOSE_APPROVE` only, so
-one principal holding both grants can soft-close, enter review and hard-close
-the same period. There is no "where required" policy to switch independence
-on. Reopen scope is also always the whole period: `RequestReopen` takes no
-book or module scope, and §17's evidence list includes "reopen scope".
+The first clause is enforced (see Verified controls). The second clause's
+independence is now enforced too, unconditionally rather than behind a
+materiality switch — the same interpretation B1 already made for every other
+maker-checker gate in this service (see B1's own note on why: applying it to
+every item avoids building a materiality model this spec never defines).
+
+`HardClosePeriod` and `ReclosePeriod` now also require the certifier to differ
+from the preparer — the principal who most recently performed the transition
+into the state being closed from (`EnterCloseReview` for a hard close, the
+reopen approval into `AUTHORIZED_REOPEN` for a reclose). `GetLatestTransitionPrincipal`
+reads this from `period_state_transitions`, the same append-evidence table
+`GetCloseHistory` already serves from. A period with no such transition on
+record (constructed directly rather than through the tracked lifecycle, e.g.
+a pre-existing or test-seeded row) has no identifiable preparer and the check
+is a no-op for it — in production every period reaches CLOSE_REVIEW or
+AUTHORIZED_REOPEN only through the tracked transition, so this is not a real
+bypass, only a graceful default for untracked history.
+
+Still open: Reopen scope is always the whole period — `RequestReopen` takes
+no book or module scope, and §17's evidence list includes "reopen scope".
+That needs a scoping model this service does not have yet (which books or
+modules a reopen covers), left for a separate pass.
+
+Evidence: `internal/handler/period_close_test.go`
+(`TestHardClose_SamePrincipalAsCloseReviewPreparer_Refused`,
+`TestReclose_SamePrincipalAsReopenApprover_Refused`, plus the existing
+state-machine and kernel-seal tests updated to use independent principals),
+`internal/store/certifier_independence_integration_test.go` (real-Postgres:
+no prior transition, a tracked SOFT_CLOSE preparer, a tracked CLOSE_REVIEW
+preparer, each independently addressable by `toState`).
 
 ### A7. ACC-09 posts on execution with no review, and its drivers are static percentages
 

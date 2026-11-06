@@ -3647,6 +3647,34 @@ func (s *PgStore) RejectReopenRequest(ctx context.Context, requestID, deciderID,
 }
 
 // GetCloseHistory returns a period's transitions and reopen requests, oldest first.
+// GetLatestTransitionPrincipal answers who most recently moved fp into
+// toState — the preparer A6 (SPEC_DEVIATIONS) needs the certifier to be
+// independent of. Returns "" (no error) when no such transition is on
+// record: a period that reached this state without ever going through the
+// tracked transition path (pre-existing data, a direct seed) has no known
+// preparer to compare against, so the independence check is a no-op rather
+// than a hard refusal of every such period.
+func (s *PgStore) GetLatestTransitionPrincipal(ctx context.Context, fiscalPeriodID, toState string) (string, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return "", domain.ErrIdentityMissing
+	}
+	var principalID string
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT principal_id FROM period_state_transitions
+			 WHERE tenant_id = $1 AND fiscal_period_id::text = $2 AND to_state = $3
+			 ORDER BY occurred_at DESC, transition_id DESC LIMIT 1`, tenantID, fiscalPeriodID, toState).Scan(&principalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return principalID, nil
+}
+
 func (s *PgStore) GetCloseHistory(ctx context.Context, fiscalPeriodID string) (*domain.CloseHistory, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {

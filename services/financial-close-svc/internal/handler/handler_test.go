@@ -379,6 +379,16 @@ func (s *stubStore) GetCloseHistory(_ context.Context, periodID string) (*domain
 	return h, nil
 }
 
+func (s *stubStore) GetLatestTransitionPrincipal(_ context.Context, periodID, toState string) (string, error) {
+	for i := len(s.transitions) - 1; i >= 0; i-- {
+		t := s.transitions[i]
+		if t.FiscalPeriodID == periodID && t.ToState == toState {
+			return t.PrincipalID, nil
+		}
+	}
+	return "", nil
+}
+
 func (s *stubStore) CreateCloseRequirement(_ context.Context, cr *domain.CloseRequirement) (bool, error) {
 	for _, ex := range s.closeRequirements {
 		if ex.RemovedAt == nil && ex.LegalEntityID == cr.LegalEntityID && ex.Kind == cr.Kind &&

@@ -50,6 +50,10 @@ type Store interface {
 	ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, *domain.FiscalPeriod, error)
 	RejectReopenRequest(ctx context.Context, requestID, deciderID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, error)
 	GetCloseHistory(ctx context.Context, fiscalPeriodID string) (*domain.CloseHistory, error)
+	// GetLatestTransitionPrincipal answers who most recently moved a period
+	// into toState (SPEC_DEVIATIONS A6: the close certifier must differ from
+	// this preparer).
+	GetLatestTransitionPrincipal(ctx context.Context, fiscalPeriodID, toState string) (string, error)
 	CreateCloseEvidence(ctx context.Context, evidence *domain.CloseEvidence, correlationID, actorID string, periodName, legalEntityID string) error
 	ListCloseEvidence(ctx context.Context, fiscalPeriodID string) ([]domain.CloseEvidence, error)
 	// CreateControlRun persists one ACC-06 subledger-to-GL reconciliation
@@ -1115,6 +1119,19 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 		}
 		writeError(w, http.StatusConflict, "invalid_period_transition",
 			fmt.Sprintf("%s; the period is %s and this command needs %s", domain.ErrInvalidPeriodTransition, fp.CloseStatus, mode.from))
+		return
+	}
+
+	// A6: the certifier must be independent from the preparer — the
+	// principal who most recently brought the period into mode.from
+	// (CLOSE_REVIEW for a hard close, AUTHORIZED_REOPEN for a reclose).
+	preparerID, err := h.store.GetLatestTransitionPrincipal(r.Context(), fp.FiscalPeriodID, mode.from)
+	if err != nil {
+		h.writeStoreErr(w, err, "period_not_found")
+		return
+	}
+	if preparerID == principalID {
+		writeError(w, http.StatusForbidden, "certifier_not_independent", string(domain.ErrCertifierNotIndependent))
 		return
 	}
 
