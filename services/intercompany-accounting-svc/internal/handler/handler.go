@@ -363,10 +363,21 @@ func resolvePairSides(req domain.CreateEntryRequest) (pairSides, string, error) 
 
 // ── GET /v1/intercompany/entries ─────────────────────────────────────────────────
 
+// ListEntries requires at least one of source_legal_entity_id/
+// target_legal_entity_id (SPEC_DEVIATIONS A2): without one, the
+// authorization check had nothing to check against and was skipped
+// entirely, returning every entry in the tenant to any caller with an
+// X-Principal-Id. No caller anywhere in the platform depends on the
+// unfiltered form — consolidation-svc's own elimination/match fetches
+// (its A5) already pass source_legal_entity_id per child entity.
 func (h *Handler) ListEntries(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	sourceEntityID := q.Get("source_legal_entity_id")
 	targetEntityID := q.Get("target_legal_entity_id")
+	if sourceEntityID == "" && targetEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "source_legal_entity_id or target_legal_entity_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -377,11 +388,9 @@ func (h *Handler) ListEntries(w http.ResponseWriter, r *http.Request) {
 	if entityForAuthz == "" {
 		entityForAuthz = targetEntityID
 	}
-	if entityForAuthz != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, entityForAuthz, actionViewEntry); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entityForAuthz, actionViewEntry); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListEntries(r.Context(), sourceEntityID, targetEntityID)
