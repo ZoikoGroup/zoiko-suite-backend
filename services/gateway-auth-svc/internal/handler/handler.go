@@ -75,16 +75,19 @@ type DomainMetrics interface {
 	// one that does not block and STEP_UP_MFA, which is enforced as 401
 	// step_up_required (AU-23).
 	CartaDecision(decision string)
+	// ExchangeFailure records a token exchange failure for the given audience.
+	ExchangeFailure(audience string)
 }
 
 // nopMetrics is the default, so a Handler built without metrics — every
 // handler unit test — behaves identically and needs no wiring.
 type nopMetrics struct{}
 
-func (nopMetrics) VerifyDecision(string) {}
-func (nopMetrics) JWKSError(string)      {}
-func (nopMetrics) TenantContext(string)  {}
-func (nopMetrics) CartaDecision(string)  {}
+func (nopMetrics) VerifyDecision(string)     {}
+func (nopMetrics) JWKSError(string)          {}
+func (nopMetrics) TenantContext(string)      {}
+func (nopMetrics) CartaDecision(string)      {}
+func (nopMetrics) ExchangeFailure(string)    {}
 
 // New builds the ForwardAuth handler. tenantResolver may be nil, which disables
 // GOV-01 context resolution — see config.TenantRegistryURL.
@@ -490,6 +493,48 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		h.metrics.TenantContext("disabled")
 	}
 
+	// GW-5 / IAM-1 / AU-12: per-service audience exchange.
+	// If the target route has a configured audience different from the edge
+	// audience, exchange the token. Unknown protected routes fail closed.
+	forwardedURI := r.Header.Get("X-Forwarded-Uri")
+	if forwardedURI != "" && h.cfg.GatewayAudienceRoutes != nil {
+		targetAudience := h.lookupAudience(forwardedURI)
+		if targetAudience != "" && targetAudience != h.cfg.ExpectedAudience {
+			// This route requires audience exchange. If no exchanger is configured, fail closed.
+			if h.exchanger == nil {
+				h.log.Error("audience exchange required but exchanger not configured",
+					zap.String("target_audience", targetAudience),
+					zap.String("forwarded_uri", forwardedURI),
+				)
+				h.metrics.ExchangeFailure(targetAudience)
+				h.refuse(w, r, rc, refusal{
+					outcome: outcomeOverloaded, code: "auth_denied", status: http.StatusServiceUnavailable,
+					detail: "audience exchange not configured", retryable: true,
+				})
+				return
+			}
+			exchangedToken, err := h.exchanger.Exchange(ctx, rawToken, targetAudience)
+			if err != nil {
+				h.log.Error("token exchange failed",
+					zap.String("target_audience", targetAudience),
+					zap.String("forwarded_uri", forwardedURI),
+					zap.Error(err),
+				)
+				h.metrics.ExchangeFailure(targetAudience)
+				h.refuse(w, r, rc, refusal{
+					outcome: outcomeOverloaded, code: "auth_denied", status: http.StatusServiceUnavailable,
+					detail: "token exchange failed", retryable: true,
+				})
+				return
+			}
+			// Set the exchanged token in a header that Traefik forwards to the backend.
+			// The backend's gate middleware must be configured to read this header.
+			w.Header().Set("X-Identity-Envelope", exchangedToken)
+			// Also set the target audience for debugging/observability.
+			w.Header().Set("X-Token-Audience", targetAudience)
+		}
+	}
+
 	h.metrics.VerifyDecision(outcomeAllowed)
 	h.rec.Allowed(claims.TenantID)
 	w.WriteHeader(http.StatusOK)
@@ -873,4 +918,24 @@ func setAuthnAge(w http.ResponseWriter, authTime int64, now time.Time) {
 		age = 0
 	}
 	w.Header().Set("X-Authn-Age-Seconds", strconv.FormatInt(age, 10))
+}
+
+// lookupAudience finds the target audience for the given forwarded URI.
+// It matches the longest path prefix in GatewayAudienceRoutes.
+func (h *Handler) lookupAudience(forwardedURI string) string {
+	if h.cfg.GatewayAudienceRoutes == nil {
+		return ""
+	}
+	// Match the longest prefix.
+	var bestMatch string
+	var bestAudience string
+	for prefix, audience := range h.cfg.GatewayAudienceRoutes {
+		if strings.HasPrefix(forwardedURI, prefix) {
+			if len(prefix) > len(bestMatch) {
+				bestMatch = prefix
+				bestAudience = audience
+			}
+		}
+	}
+	return bestAudience
 }

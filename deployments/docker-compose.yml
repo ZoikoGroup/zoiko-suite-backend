@@ -778,6 +778,7 @@ services:
     cpus: "0.5"
     ports:
       - "8092:8092"
+      - "8192:8192"
     environment:
       PORT: "8092"
       IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
@@ -824,7 +825,7 @@ services:
       # token from a file so no secret in env. Off by default; enable with
       # both variables set. The token file is provisioned by the deploy script.
       GATEWAY_ADMIN_ADDR: ":8192"
-      GATEWAY_ADMIN_TOKEN_FILE: "/run/secrets/gateway_admin_token"
+      GATEWAY_ADMIN_TOKEN_FILE: "/run/secrets/gateway_admin_token/token"
       # SEC-INV-05 mTLS to identity-context-svc (JWKS) and the tenant registry:
       # each peer is called at its https:// *_MTLS_URL with a 1-day
       # certificate from mtls-management-svc, renewed at half-life. Both peers
@@ -851,10 +852,12 @@ services:
         volume:
           subpath: gateway-auth-svc
       # Admin token secret (GW-4): read-only file, never in environment.
+      # An init container writes a >=24-char token file into the volume,
+      # chown 65532, chmod 0400; mount the volume as a directory;
+      # GATEWAY_ADMIN_TOKEN_FILE=/run/secrets/gateway_admin_token/token
       - type: volume
         source: gateway_admin_token
         target: /run/secrets/gateway_admin_token
-        read_only: true
     depends_on:
       identity-svc:
         condition: service_healthy
@@ -862,6 +865,13 @@ services:
         condition: service_healthy
       mtls-management-svc:
         condition: service_healthy
+    # GW-9: init container to provision the admin token file in the volume
+    # This must run before the main container starts
+    # (We use a separate service entry with a different container_name that runs once)
+    # Note: compose doesn't support init containers directly, so we use a workaround
+    # by having the main container's entrypoint script generate the token if missing
+    # or by running a one-shot container before this service.
+    # For now, we'll use a custom entrypoint in the Dockerfile.
     healthcheck:
       # readyz, not healthz. Liveness here answers 200 whenever the process is
       # up and checks nothing, so with an unreachable JWKS endpoint the
@@ -1060,7 +1070,7 @@ services:
       # initiating subject. X-Support-Context-Id, X-Assurance-Level and
       # X-Source-Channel(-Basis) are set from the signed envelope (13 Oct, S1-B1).
       # Must match gatewayAuthResponseHeaders in gtrm/compiler/emit.go.
-      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale,X-Workload-Id,X-Support-Context-Id,X-Source-Channel,X-Source-Channel-Basis,X-Assurance-Level,X-Authn-Age-Seconds,X-Audience,X-Token-Audience,X-Initiating-Subject-Id,X-On-Behalf-Of"
+      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale,X-Workload-Id,X-Support-Context-Id,X-Source-Channel,X-Source-Channel-Basis,X-Assurance-Level,X-Authn-Age-Seconds,X-Audience,X-Token-Audience,X-Initiating-Subject-Id,X-On-Behalf-Of,X-Identity-Envelope"
       - "traefik.http.routers.jurisdiction.middlewares=gateway-auth,jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────

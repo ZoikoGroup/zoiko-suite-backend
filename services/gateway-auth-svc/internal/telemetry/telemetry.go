@@ -113,6 +113,11 @@ type Metrics struct {
 	// retry (AU-23) — so this counter also tracks how often the step-up flow
 	// is being demanded.
 	CartaDecisionsTotal *prometheus.CounterVec
+
+	// ExchangeFailuresTotal counts token exchange failures by target audience.
+	// A failure results in a 503 response (fail closed) so the request is not
+	// forwarded with the wrong audience.
+	ExchangeFailuresTotal *prometheus.CounterVec
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -153,11 +158,17 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "Continuous risk assessment decisions, by decision.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}, []string{"decision"}),
+		ExchangeFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "gateway_auth_exchange_failures_total",
+			Help:        "Token exchange failures, by target audience.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"audience"}),
 	}
 	prometheus.MustRegister(
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp,
 		m.VerifyDecisionsTotal, m.JWKSErrorsTotal,
 		m.TenantContextTotal, m.CartaDecisionsTotal,
+		m.ExchangeFailuresTotal,
 	)
 	// Counters are invisible in Prometheus until first incremented, so an alert
 	// written against rate(...) over a label that has never been hit evaluates
@@ -273,6 +284,10 @@ func (m *Metrics) TenantContext(outcome string) {
 
 func (m *Metrics) CartaDecision(decision string) {
 	m.CartaDecisionsTotal.WithLabelValues(decision).Inc()
+}
+
+func (m *Metrics) ExchangeFailure(audience string) {
+	m.ExchangeFailuresTotal.WithLabelValues(audience).Inc()
 }
 
 type statusRecorder struct {

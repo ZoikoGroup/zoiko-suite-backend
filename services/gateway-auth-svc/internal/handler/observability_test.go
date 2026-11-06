@@ -34,11 +34,12 @@ import (
 // thing that separates them, so a test that checks only the code cannot tell
 // whether the separation works.
 type recordingMetrics struct {
-	mu        sync.Mutex
-	outcomes  []string
-	jwksOps   []string
-	tenantCtx []string
-	carta     []string
+	mu           sync.Mutex
+	outcomes     []string
+	jwksOps      []string
+	tenantCtx    []string
+	carta        []string
+	exchangeFail []string
 }
 
 func (m *recordingMetrics) VerifyDecision(o string) {
@@ -65,13 +66,20 @@ func (m *recordingMetrics) CartaDecision(d string) {
 	m.carta = append(m.carta, d)
 }
 
-func (m *recordingMetrics) snapshot() ([]string, []string, []string, []string) {
+func (m *recordingMetrics) ExchangeFailure(audience string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.exchangeFail = append(m.exchangeFail, audience)
+}
+
+func (m *recordingMetrics) snapshot() ([]string, []string, []string, []string, []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]string(nil), m.outcomes...),
 		append([]string(nil), m.jwksOps...),
 		append([]string(nil), m.tenantCtx...),
-		append([]string(nil), m.carta...)
+		append([]string(nil), m.carta...),
+		append([]string(nil), m.exchangeFail...)
 }
 
 // TestVerify_EveryTerminalPathRecordsItsOutcome walks the outcomes reachable
@@ -151,7 +159,7 @@ func TestVerify_EveryTerminalPathRecordsItsOutcome(t *testing.T) {
 			h.Verify(rec, tc.build(t, key))
 
 			assert.Equal(t, tc.wantWWW, rec.Code)
-			outcomes, _, _, _ := m.snapshot()
+outcomes, _, _, _, _ := m.snapshot()
 			require.Len(t, outcomes, 1, "exactly one terminal outcome per request")
 			assert.Equal(t, tc.want, outcomes[0])
 			// The reason reaches the caller too. Traefik returns an
@@ -202,7 +210,7 @@ func TestVerify_JWKSOutageIsNotReportedAsABadToken(t *testing.T) {
 	h.Verify(rec, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code, "the caller still cannot be verified")
-	_, jwksOps, _, _ := m.snapshot()
+	_, jwksOps, _, _, _ := m.snapshot()
 	require.Len(t, jwksOps, 1, "a key-retrieval failure must be recorded as one")
 	assert.Equal(t, "fetch", jwksOps[0], "an unreachable JWKS endpoint is a fetch failure, not a key miss")
 }
@@ -221,7 +229,7 @@ func TestVerify_UnknownKidIsAKeyMissNotAnOutage(t *testing.T) {
 	h.Verify(rec, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
-	_, jwksOps, _, _ := m.snapshot()
+	_, jwksOps, _, _, _ := m.snapshot()
 	require.Len(t, jwksOps, 1)
 	assert.Equal(t, "key_lookup", jwksOps[0])
 }
@@ -346,7 +354,7 @@ func TestVerify_CartaAllowIsStillCounted(t *testing.T) {
 	h.Verify(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code, "ALLOW does not block")
-	_, _, _, decisions := m.snapshot()
+	_, _, _, decisions, _ := m.snapshot()
 	require.Len(t, decisions, 1)
 	assert.Equal(t, "ALLOW", decisions[0])
 }
@@ -364,7 +372,7 @@ func TestVerify_CartaStepUpMFA_Returns401AndCounted(t *testing.T) {
 	h.Verify(rec, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code, "STEP_UP_MFA asks for a step-up")
-	_, _, _, decisions := m.snapshot()
+	_, _, _, decisions, _ := m.snapshot()
 	require.Len(t, decisions, 1)
 	assert.Equal(t, "STEP_UP_MFA", decisions[0])
 }
@@ -414,7 +422,7 @@ func TestOutcomeConstantsMatchTelemetry(t *testing.T) {
 		h.Verify(httptest.NewRecorder(), req)
 	}
 
-	outcomes, _, _, _ := m.snapshot()
+	outcomes, _, _, _, _ := m.snapshot()
 	require.NotEmpty(t, outcomes)
 	for _, o := range outcomes {
 		assert.True(t, known[o], "handler emitted outcome %q, which telemetry does not pre-initialise", o)

@@ -409,3 +409,164 @@ func TestVerify_MissingPrincipalID_Returns401(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
+
+// TestVerify_ExchangesForRouteAudience proves GW-5 / IAM-1 / AU-12:
+// when the target route has a configured audience, the gateway exchanges the
+// incoming zoiko-internal envelope for the route's audience and forwards the
+// exchanged token in X-Identity-Envelope.
+func TestVerify_ExchangesForRouteAudience(t *testing.T) {
+	// Use a fake token exchange endpoint that returns a token for the target audience.
+	exchangeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access_token":"exchanged-token-for-authorization-svc","expires_in":300}`))
+	}))
+	t.Cleanup(exchangeSrv.Close)
+
+	cfg := &config.Config{
+		ExpectedIssuer:                "identity-context-svc",
+		ExpectedAudience:              "zoiko-internal",
+		JWKSCacheTTL:                  time.Minute,
+		IdentityTokenExchangeURL:      exchangeSrv.URL,
+		IdentityTokenExchangeClientID: "gateway-auth-svc",
+		IdentityTokenExchangeClientSecret: "test-secret",
+		GatewayAudienceRoutes: map[string]string{
+			"/authorization-svc": "authorization-svc",
+		},
+	}
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	jwksSrv := httptest.NewServer(jwksHandler(&privateKey.PublicKey, testKid))
+	t.Cleanup(jwksSrv.Close)
+	cfg.JWKSURL = jwksSrv.URL
+
+	jwksClient := jwks.NewClient(cfg.JWKSURL, cfg.JWKSCacheTTL)
+	log := zap.NewNop()
+
+	siemClient := siem.New("", "gateway-auth-svc", log)
+	tenantResolver := tenantctx.New("", time.Minute, time.Minute)
+
+	h := handler.New(cfg, jwksClient, nil, siemClient, tenantResolver, log)
+
+	tok := mintEnvelope(t, privateKey, testKid, validClaims())
+
+	req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Forwarded-Uri", "/authorization-svc/v1/authorize")
+	rec := httptest.NewRecorder()
+
+	h.Verify(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	// The exchanged token should be in X-Identity-Envelope
+	assert.Equal(t, "exchanged-token-for-authorization-svc", rec.Header().Get("X-Identity-Envelope"))
+	// The target audience should be in X-Token-Audience
+	assert.Equal(t, "authorization-svc", rec.Header().Get("X-Token-Audience"))
+	// The original identity headers should still be set
+	assert.Equal(t, "principal-xyz", rec.Header().Get("X-Principal-Id"))
+	assert.Equal(t, "tenant-abc", rec.Header().Get("X-Tenant-Id"))
+}
+
+// TestVerify_UnknownRouteFailsClosed proves that an unknown protected route
+// (a route that is in the audience map but has no audience configured, or a
+// route that requires exchange but the exchanger is not configured) fails
+// closed with 503.
+func TestVerify_UnknownRouteFailsClosed(t *testing.T) {
+	// Configure audience routes but no exchanger
+	cfg := &config.Config{
+		ExpectedIssuer:   "identity-context-svc",
+		ExpectedAudience: "zoiko-internal",
+		JWKSCacheTTL:     time.Minute,
+		GatewayAudienceRoutes: map[string]string{
+			"/authorization-svc": "authorization-svc",
+		},
+		// No IdentityTokenExchangeURL = no exchanger
+	}
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	jwksSrv := httptest.NewServer(jwksHandler(&privateKey.PublicKey, testKid))
+	t.Cleanup(jwksSrv.Close)
+	cfg.JWKSURL = jwksSrv.URL
+
+	jwksClient := jwks.NewClient(cfg.JWKSURL, cfg.JWKSCacheTTL)
+	log := zap.NewNop()
+
+	siemClient := siem.New("", "gateway-auth-svc", log)
+	tenantResolver := tenantctx.New("", time.Minute, time.Minute)
+
+	h := handler.New(cfg, jwksClient, nil, siemClient, tenantResolver, log)
+
+	tok := mintEnvelope(t, privateKey, testKid, validClaims())
+
+	req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Forwarded-Uri", "/authorization-svc/v1/authorize")
+	rec := httptest.NewRecorder()
+
+	h.Verify(rec, req)
+
+	// Should fail closed with 503 because exchange is required but not configured
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "overloaded", rec.Header().Get("X-Auth-Denial-Reason"))
+}
+
+// TestVerify_ExchangeFailureIs503NotPassThrough proves that when the token
+// exchange fails (e.g., identity-context-svc is down), the gateway returns 503
+// and does NOT pass through the original token.
+func TestVerify_ExchangeFailureIs503NotPassThrough(t *testing.T) {
+	// Use a fake token exchange endpoint that returns an error
+	exchangeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"server_error","error_description":"exchange unavailable"}`))
+	}))
+	t.Cleanup(exchangeSrv.Close)
+
+	cfg := &config.Config{
+		ExpectedIssuer:                "identity-context-svc",
+		ExpectedAudience:              "zoiko-internal",
+		JWKSCacheTTL:                  time.Minute,
+		IdentityTokenExchangeURL:      exchangeSrv.URL,
+		IdentityTokenExchangeClientID: "gateway-auth-svc",
+		IdentityTokenExchangeClientSecret: "test-secret",
+		GatewayAudienceRoutes: map[string]string{
+			"/authorization-svc": "authorization-svc",
+		},
+	}
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	jwksSrv := httptest.NewServer(jwksHandler(&privateKey.PublicKey, testKid))
+	t.Cleanup(jwksSrv.Close)
+	cfg.JWKSURL = jwksSrv.URL
+
+	jwksClient := jwks.NewClient(cfg.JWKSURL, cfg.JWKSCacheTTL)
+	log := zap.NewNop()
+
+	siemClient := siem.New("", "gateway-auth-svc", log)
+	tenantResolver := tenantctx.New("", time.Minute, time.Minute)
+
+	h := handler.New(cfg, jwksClient, nil, siemClient, tenantResolver, log)
+
+	tok := mintEnvelope(t, privateKey, testKid, validClaims())
+
+	req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Forwarded-Uri", "/authorization-svc/v1/authorize")
+	rec := httptest.NewRecorder()
+
+	h.Verify(rec, req)
+
+	// Should fail closed with 503
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "overloaded", rec.Header().Get("X-Auth-Denial-Reason"))
+	// The exchanged token should NOT be set
+	assert.Empty(t, rec.Header().Get("X-Identity-Envelope"))
+	// The target audience should NOT be set
+	assert.Empty(t, rec.Header().Get("X-Token-Audience"))
+}
