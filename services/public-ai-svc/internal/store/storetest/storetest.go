@@ -238,6 +238,30 @@ func testConflictCases(t *testing.T, s store.Store) {
 	if err != nil || len(got) != 1 || !got[0].BlockedClaim || got[0].AssignedOwner != "commercial-ops" {
 		t.Fatalf("conflicts: %+v %v", got, err)
 	}
+	// Doc 03 §16: closing needs evidence and an audited actor; only OPEN closes.
+	audit := store.AuditEntry{Actor: "ops-1", Approval: "CHG-9", At: time.Now().UTC()}
+	if err := s.ResolveConflict(ctx, c.ConflictID, store.ConflictResolved, "", audit); err == nil {
+		t.Fatal("resolution without evidence must be refused")
+	}
+	if err := s.ResolveConflict(ctx, "missing", store.ConflictResolved, "PB-2026-11", audit); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown case: %v", err)
+	}
+	if err := s.ResolveConflict(ctx, c.ConflictID, store.ConflictResolved, "PB-2026-11", store.AuditEntry{At: time.Now().UTC()}); err == nil {
+		t.Fatal("resolution without actor and approval must be refused")
+	}
+	if err := s.ResolveConflict(ctx, c.ConflictID, store.ConflictResolved, "PB-2026-11", audit); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResolveConflict(ctx, c.ConflictID, store.ConflictDismissed, "x", audit); !errors.Is(err, store.ErrConflictState) {
+		t.Fatalf("a closed case must stay closed: %v", err)
+	}
+	got, _ = s.Conflicts(ctx)
+	if got[0].ResolutionState != store.ConflictResolved || got[0].ResolutionEvidenceRef != "PB-2026-11" {
+		t.Fatalf("resolved: %+v", got[0])
+	}
+	if a, _ := s.ListAudit(ctx, 1); len(a) != 1 || a[0].Action != "conflict.resolved" || a[0].Target != c.ConflictID {
+		t.Fatalf("resolution not audited: %+v", a)
+	}
 }
 
 func testFeedbackPurge(t *testing.T, s store.Store) {

@@ -61,6 +61,8 @@ func main() {
 		err = manifest(ctx, os.Args[2:])
 	case "audit":
 		err = audit(ctx, os.Args[2:])
+	case "conflicts":
+		err = conflicts(ctx, os.Args[2:])
 	case "dlq-replay":
 		err = dlqReplay(ctx, os.Args[2:])
 	default:
@@ -73,7 +75,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest|audit|dlq-replay [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest|audit|conflicts|dlq-replay [flags]")
 	os.Exit(2)
 }
 
@@ -446,4 +448,40 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// conflicts lists conflict cases, or closes one with its evidence (Doc 03
+// §16). Closing does not unblock a claim: a corrected, signed release does.
+//
+//	kbctl conflicts
+//	kbctl conflicts -resolve kb-conf-1 -state RESOLVED -evidence PB-2026-11 -actor ops-1 -approval CHG-9
+func conflicts(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("conflicts", flag.ExitOnError)
+	id := fs.String("resolve", "", "conflict id to close")
+	state := fs.String("state", store.ConflictResolved, "RESOLVED or DISMISSED")
+	evidence := fs.String("evidence", "", "reference to the approved correction (required to close)")
+	op, _, _ := operatorFlags(fs)
+	_ = fs.Parse(args)
+	st, err := openStore(ctx)
+	if err != nil {
+		return err
+	}
+	if *id != "" {
+		o := op()
+		if err := st.ResolveConflict(ctx, *id, *state, *evidence, store.AuditEntry{Actor: o.Actor, Approval: o.Approval, Reason: o.Reason,
+			Environment: o.Environment, At: time.Now().UTC()}); err != nil {
+			return err
+		}
+		fmt.Println("closed", *id, *state)
+		return nil
+	}
+	cs, err := st.Conflicts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range cs {
+		fmt.Printf("%s %-9s %-6s %-22s owner=%s blocked=%t subject=%s claims=%v evidence=%s\n", c.DetectedAt.UTC().Format(time.RFC3339),
+			c.ResolutionState, c.Severity, c.DetectionType, c.AssignedOwner, c.BlockedClaim, c.SubjectKey, c.ClaimIDs, c.ResolutionEvidenceRef)
+	}
+	return nil
 }

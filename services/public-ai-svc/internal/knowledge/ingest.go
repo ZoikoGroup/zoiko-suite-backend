@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -64,6 +65,9 @@ type IngestConfig struct {
 	// (Doc 03 §05). Unmapped or inconsistent entries block publication.
 	Crosswalk []CrosswalkEntry `json:"capability_crosswalk,omitempty"`
 	Synthetic bool             `json:"synthetic,omitempty"`
+	// PlanCodes is the plan registry a source's plan_codes must come from
+	// (Doc 03 §06).
+	PlanCodes []string `json:"plan_codes,omitempty"`
 	// CompatiblePolicyVersions is copied into the signed manifest (OPR-004).
 	CompatiblePolicyVersions []string `json:"compatible_policy_versions,omitempty"`
 }
@@ -74,6 +78,10 @@ type CrosswalkEntry struct {
 	CapabilityID   string `json:"capability_id"`
 	Domain         string `json:"domain"`
 	PublicRouteKey string `json:"public_route_key"`
+	// DomainViewID and SidebarRouteID complete the Doc 03 §03 crosswalk
+	// (homepage theme and console sidebar); optional until v2.1 (DEC-02).
+	DomainViewID   string `json:"domain_view_id,omitempty"`
+	SidebarRouteID string `json:"sidebar_route_id,omitempty"`
 	Synthetic      bool   `json:"synthetic,omitempty"`
 }
 
@@ -212,6 +220,7 @@ func Ingest(cfg IngestConfig, inputs []namedSource, releaseID string, now time.T
 func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now time.Time, opts IngestOptions) (Manifest, []Report) {
 	m := Manifest{
 		ReleaseID: releaseID, Kind: KindKB, IndexSchemaVersion: SchemaVersion, CreatedAt: now.UTC(),
+		EmbeddingModel: "none", Tokenizer: TokenizerVersion,
 		ApprovedBy: cfg.ApprovedBy, EvalRunID: cfg.EvalRunID, ChunkPolicy: fmt.Sprintf("section-boundaries; tokens<=%d overlap=%d min=%d; tokenizer=estimate(%.2f words/token)", chunkMaxTokens, chunkOverlapTokens, chunkMinTokens, wordsPerToken),
 		RedactionPolicy: "public-only-v1", AllowedHosts: cfg.AllowedHosts, Routes: validRoutes(cfg),
 		Sources: []Source{}, Chunks: []Chunk{}, Synonyms: screenSynonyms(cfg.Synonyms), Synthetic: cfg.Synthetic,
@@ -258,7 +267,32 @@ func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now ti
 		rep.State, rep.Reason = state, reason
 		reports = append(reports, rep)
 	}
-	return withoutOverlaps(m, reports, stagedAt), reports
+	return withoutOverlaps(endSuperseded(m), reports, stagedAt), reports
+}
+
+// endSuperseded applies supersedes (Doc 03 §06): a version that names an
+// earlier one ends it at its own effective_from, so the two never overlap
+// and the replacement takes over exactly then. Without it, overlapping
+// versions are a review conflict (withoutOverlaps).
+func endSuperseded(m Manifest) Manifest {
+	ends := map[string]time.Time{}
+	for _, s := range m.Sources {
+		if s.Supersedes != "" && s.Supersedes != s.SourceVersionID && s.EffectiveFrom != nil {
+			ends[s.Supersedes] = *s.EffectiveFrom
+		}
+	}
+	for i, s := range m.Sources {
+		if end, ok := ends[s.SourceVersionID]; ok && end.Before(validUntil(s)) {
+			e := end
+			m.Sources[i].EffectiveUntil = &e
+		}
+	}
+	for i, c := range m.Chunks {
+		if end, ok := ends[c.SourceVersionID]; ok && end.Before(c.ValidUntil) {
+			m.Chunks[i].ValidUntil = end
+		}
+	}
+	return m
 }
 
 // withoutOverlaps removes versions of one source whose validity windows
@@ -312,7 +346,7 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 		"origin_uri": s.OriginURI, "url_key": s.URLKey, "title": s.Title, "product_id": s.ProductID,
 		"audience": s.Audience, "classification": s.Classification, "pii_state": s.PIIState,
 		"authority_tier": s.AuthorityTier, "subject_type": s.SubjectType, "owner_id": s.OwnerID,
-		"locale": s.Locale, "approval_state": s.ApprovalState, "license": s.License,
+		"locale": s.Locale, "approval_state": s.ApprovalState, "license": s.License, "signing_ref": s.SigningRef,
 	} {
 		if strings.TrimSpace(v) == "" {
 			missing = append(missing, name)
@@ -351,6 +385,15 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 		if !caps[c] {
 			return StateReviewUnmapped, "capability_id not in taxonomy: " + c
 		}
+	}
+	// Doc 03 §06: plan scope names registered plans only.
+	for _, pc := range s.PlanCodes {
+		if !slices.Contains(cfg.PlanCodes, pc) {
+			return StateReviewUnmapped, "plan_code not in the plan registry: " + pc
+		}
+	}
+	if s.ApprovalState == "REVOKED" && strings.TrimSpace(s.RevocationReason) == "" {
+		return StateRejectUnregistered, "a revoked source needs a revocation_reason"
 	}
 	switch {
 	case draft && !opts.AllowDraft:
@@ -524,7 +567,8 @@ func chunkSource(src Source, text, releaseID string) []Chunk {
 				PlainText: body, TextSHA256: sha256Hex(body), Classification: src.Classification, Audience: src.Audience,
 				AuthorityTier: src.AuthorityTier, MarketCodes: src.MarketCodes, Locale: src.Locale, PlanCodes: src.PlanCodes,
 				IntentIDs: src.IntentIDs, ValidFrom: *src.EffectiveFrom, ValidUntil: validUntil(src), ReleaseID: releaseID,
-				Draft: src.Draft,
+				Draft: src.Draft, SubjectType: src.SubjectType, CapabilityIDs: src.CapabilityIDs,
+				HighImpact: src.AuthorityTier == "P1" || highImpactSubjects[src.SubjectType], ReviewDueAt: src.ReviewDueAt,
 			})
 			if end == len(words) {
 				break

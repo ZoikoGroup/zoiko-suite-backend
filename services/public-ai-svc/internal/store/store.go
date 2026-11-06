@@ -104,7 +104,20 @@ type Conflict struct {
 	// is resolved, and the accountable owner (migration 005).
 	BlockedClaim  bool
 	AssignedOwner string
+	// ResolutionEvidenceRef is the approved correction that closed the case.
+	ResolutionEvidenceRef string
 }
+
+// Conflict resolution states. A closed case does not unblock a claim by
+// itself: the claim is served again only from a corrected, signed release.
+const (
+	ConflictOpen      = "OPEN"
+	ConflictResolved  = "RESOLVED"
+	ConflictDismissed = "DISMISSED"
+)
+
+// ErrConflictState: the case is not OPEN, or the new state is not a closing one.
+var ErrConflictState = errors.New("conflict case is not open, or the state is not RESOLVED or DISMISSED")
 
 // Flag is one feature flag / kill-switch value.
 type Flag struct {
@@ -216,6 +229,9 @@ type Store interface {
 	SetFlag(ctx context.Context, f Flag, events []OutboxEvent) error
 	// Conflicts lists recorded conflict cases, oldest first.
 	Conflicts(ctx context.Context) ([]Conflict, error)
+	// ResolveConflict closes an OPEN case with its evidence (Doc 03 §16),
+	// recording the control action in the audit in the same transaction.
+	ResolveConflict(ctx context.Context, id, state, evidenceRef string, audit AuditEntry) error
 	// AppendAudit records a control action; it fails if actor or approval
 	// is missing. ListAudit returns the newest entries first.
 	AppendAudit(ctx context.Context, e AuditEntry) error

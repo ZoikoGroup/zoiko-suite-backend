@@ -130,7 +130,7 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		// Doc 02 App. C: the template a reply came from, by id and locale.
 		zap.String("template_id", firstNonEmpty(policy.TemplateID(r.Text), r.QualifierID)), zap.String("template_locale", policy.TemplateLocale),
 		zap.String("template_version", policy.TemplateVersion()), zap.String("intent_version", policy.IntentVersion()),
-		zap.String("confidence", r.Confidence))
+		zap.String("confidence", r.Confidence), zap.String("conflict_id", r.ConflictID))
 	if policy.HasContact(in.Message) && r.Status != contract.Unavailable && !strings.Contains(r.Text, policy.ContactNotice) {
 		// Doc 10 §21: contact details were masked, not kept; say so.
 		r.Text = strings.TrimSpace(r.Text + "\n\n" + policy.ContactNotice)
@@ -291,6 +291,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	}
 	diag := Diag{Slots: slotMap(dec.Slots, market)}
 	unverifiedConnector := false
+	qualifiedLabel := "" // Doc 03 §08: answered only from CONDITIONAL/TARGET claims
 	clarifications := 0
 	carried := false
 	secondary := dec.Secondary
@@ -425,6 +426,15 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				}
 				return keepAsking(because(p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), d.ReasonCode), snap, market, pd)
 			case claims.InsufficientEvidence:
+				if len(d.Qualified) > 0 {
+					// Only CONDITIONAL/TARGET claims: their approved wording is
+					// shown with the governed label, never as a current fact.
+					verified = append(verified, d.Qualified...)
+					if qualifiedLabel == "" {
+						qualifiedLabel = claims.StatusLabelFor(d.Qualified[0])
+					}
+					continue
+				}
 				if d.ReasonCode == claims.ReasonIncomplete {
 					tpl := policy.TplPriceIncomplete
 					if req.Subject == claims.Trial {
@@ -651,6 +661,8 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	switch {
 	case overview:
 		res.StatusLabel = "MARKET_DEPENDENT" // the general answer; terms depend on the country
+	case qualifiedLabel != "":
+		res.StatusLabel, res.AnswerClass = qualifiedLabel, contract.StatusQualified
 	case unverifiedConnector:
 		res.StatusLabel, res.AnswerClass = "Unverified", contract.StatusQualified
 	}

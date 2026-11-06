@@ -56,7 +56,7 @@ func TestPlanScopeFilter(t *testing.T) {
 func TestIngestCheckApproversAndScope(t *testing.T) {
 	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 	at := func(y int) *time.Time { v := time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC); return &v }
-	base := Source{SourceID: "s", SourceVersionID: "s-v1", SourceType: "WEB_PAGE", OriginURI: "https://example.invalid/x",
+	base := Source{SigningRef: "kbctl-dev", SourceID: "s", SourceVersionID: "s-v1", SourceType: "WEB_PAGE", OriginURI: "https://example.invalid/x",
 		URLKey: "x", Title: "Overview", ProductID: ProductID, Audience: Audience, Classification: Classification, PIIState: PIIClear,
 		AuthorityTier: "P1", SubjectType: "OVERVIEW", OwnerID: "owner", ApproverIDs: []string{"a", "b"},
 		MarketCodes: []string{"ALL"}, Locale: "en-US", ApprovalState: "APPROVED", ApprovalTS: at(2026),

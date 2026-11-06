@@ -417,15 +417,39 @@ func (p *Postgres) RecordConflict(ctx context.Context, c Conflict) error {
 	return err
 }
 
+func (p *Postgres) ResolveConflict(ctx context.Context, id, state, evidenceRef string, audit AuditEntry) error {
+	if (state != ConflictResolved && state != ConflictDismissed) || strings.TrimSpace(evidenceRef) == "" {
+		return ErrConflictState
+	}
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE public_ai.conflicts SET resolution_state = $2, resolution_evidence_ref = $3
+			WHERE conflict_id = $1 AND resolution_state = 'OPEN'`, id, state, evidenceRef)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM public_ai.conflicts WHERE conflict_id = $1`, id).Scan(&n); err == nil && n == 0 {
+				return ErrNotFound
+			}
+			return ErrConflictState
+		}
+		audit.Action, audit.Target = "conflict."+strings.ToLower(state), id
+		return appendAudit(ctx, tx, audit)
+	})
+}
+
 func (p *Postgres) Conflicts(ctx context.Context) ([]Conflict, error) {
-	rows, err := p.pool.Query(ctx, `SELECT conflict_id, subject_key, claim_ids, detection_type, severity, resolution_state, detected_at, blocked_claim, assigned_owner
+	rows, err := p.pool.Query(ctx, `SELECT conflict_id, subject_key, claim_ids, detection_type, severity, resolution_state, detected_at, blocked_claim, assigned_owner,
+		COALESCE(resolution_evidence_ref, '')
 		FROM public_ai.conflicts ORDER BY detected_at, conflict_id`)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Conflict, error) {
 		var c Conflict
-		err := row.Scan(&c.ConflictID, &c.SubjectKey, &c.ClaimIDs, &c.DetectionType, &c.Severity, &c.ResolutionState, &c.DetectedAt, &c.BlockedClaim, &c.AssignedOwner)
+		err := row.Scan(&c.ConflictID, &c.SubjectKey, &c.ClaimIDs, &c.DetectionType, &c.Severity, &c.ResolutionState, &c.DetectedAt, &c.BlockedClaim, &c.AssignedOwner,
+			&c.ResolutionEvidenceRef)
 		return c, err
 	})
 }

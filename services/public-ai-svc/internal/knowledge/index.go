@@ -186,6 +186,11 @@ func (x *Index) eligibilityOf(c Chunk, q Query, rev Revocations) eligibility {
 	if q.Now.Before(c.ValidFrom) || !q.Now.Before(c.ValidUntil) {
 		return expired
 	}
+	// Doc 03 §12/§26: high-impact content past its review deadline stops
+	// being served, even inside its validity window.
+	if c.HighImpact && c.ReviewDueAt != nil && !q.Now.Before(*c.ReviewDueAt) {
+		return expired
+	}
 	if !marketOK(c.MarketCodes, q.Market) {
 		return denied
 	}
@@ -266,6 +271,13 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 	bestIneligible := eligible
 	bestIneligibleScore := 0.0
 	for i, c := range x.chunks {
+		// Doc 05 §18, Doc 03 §14: filter before ranking. Chunks the visitor
+		// may not see are never scored; expired and revoked ones are scored
+		// only to explain a stale answer, never returned.
+		el := x.eligibilityOf(c, q, rev)
+		if el == denied {
+			continue
+		}
 		sc, matched := x.score(i, qtoks)
 		if q.IntentID != "" && hasIntent(c.IntentIDs, q.IntentID) {
 			sc *= intentBoost
@@ -277,7 +289,7 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 			continue
 		}
 		res.CandidatesBeforeACL++
-		switch el := x.eligibilityOf(c, q, rev); el {
+		switch el {
 		case eligible:
 			res.CandidatesAfterACL++
 			res.Hits = append(res.Hits, Hit{Chunk: c, Score: sc})

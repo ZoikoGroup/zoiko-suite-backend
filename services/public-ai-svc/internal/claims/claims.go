@@ -36,6 +36,15 @@ const (
 	IntegrationStatus  = "INTEGRATION_STATUS"
 	// PlanAvailability states which plans are offered in a market.
 	PlanAvailability = "PLAN_AVAILABILITY"
+	// Doc 03 §17/§18 claim types. Until signed records exist (D03-04) the
+	// resolver finds none, so these topics route instead of answering, and
+	// validate refuses any capacity figure not on a claim card.
+	Entitlement     = "ENTITLEMENT"      // included users/entities per plan
+	Allowance       = "ALLOWANCE"        // AI/API/integration meters and quotas
+	EnterpriseFloor = "ENTERPRISE_FLOOR" // published enterprise starting price
+	CommercialTerms = "COMMERCIAL_TERMS" // downgrade, cancellation, post-trial data
+	FilingCoverage  = "FILING_COVERAGE"  // tax/payroll level of service per country
+	RoadmapStatus   = "ROADMAP_STATUS"   // approved, dated public roadmap entries
 )
 
 // Claim statuses (Doc 03 §08). Only ACTIVE claims are answerable.
@@ -56,6 +65,8 @@ const (
 	ExpiredDecision      = "EXPIRED"
 	MarketRequired       = "MARKET_REQUIRED" // not a §17 decision: tells the orchestrator to CLARIFY
 	ReasonIncomplete     = "CLAIM_INCOMPLETE"
+	// ReasonStatusQualified: only CONDITIONAL/TARGET claims answer (Decision.Qualified).
+	ReasonStatusQualified = "STATUS_QUALIFIED"
 )
 
 // Claim is one registry entry. Absent scope means unknown, never global:
@@ -164,9 +175,13 @@ type Request struct {
 
 // Decision is the resolver outcome.
 type Decision struct {
-	Decision     string
-	ReleaseID    string
-	Verified     []Claim
+	Decision  string
+	ReleaseID string
+	Verified  []Claim
+	// Qualified are CONDITIONAL or TARGET claims (Doc 03 §08): never stated
+	// as current fact, but shown with their governed status label
+	// (StatusLabelFor) when no ACTIVE claim answers.
+	Qualified    []Claim
 	ReasonCode   string
 	ConflictKeys []string // claim ids in conflict, for the conflict record
 }
@@ -266,7 +281,7 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 		d.Decision, d.ReasonCode = MarketRequired, "MARKET_REQUIRED"
 		return d
 	}
-	var eligible []Claim
+	var eligible, qualified []Claim
 	sawRevoked, sawExpired, sawConflict, sawIncomplete := false, false, false, false
 	for _, c := range r.m.Claims {
 		if !r.matches(c, q) {
@@ -275,8 +290,12 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 		switch {
 		case rev != nil && (rev.ClaimRevoked(c.ClaimID) || evidenceRevoked(rev, c)):
 			sawRevoked = true
+		case (c.Status == StatusConditional || c.Status == StatusTarget) && c.PubliclyPublishable &&
+			!q.AsOf.Before(c.ValidFrom) && q.AsOf.Before(c.ValidUntil) && strings.TrimSpace(c.PublicStatement) != "" &&
+			len(c.EvidenceSourceVersionIDs) > 0 && c.CitationURLKey != "" && !HasPlaceholder(c.PublicStatement):
+			qualified = append(qualified, c)
 		case c.Status != StatusActive || !c.PubliclyPublishable || !c.OperationallyEnabled:
-			// HOLD/TARGET/RETIRED/CONDITIONAL or unpublished: never stated as fact.
+			// HOLD/RETIRED or unpublished: never stated at all.
 		case q.AsOf.Before(c.ValidFrom) || !q.AsOf.Before(c.ValidUntil) || (c.ReviewDueAt != nil && !q.AsOf.Before(*c.ReviewDueAt)):
 			sawExpired = true
 		case len(c.ConflictIDs) > 0 || (c.ClaimType == Price && r.disputed[c.SubjectID]):
@@ -320,6 +339,9 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 		d.Decision, d.ReasonCode = ExpiredDecision, "EXPIRED_SOURCE"
 	case sawIncomplete:
 		d.Decision, d.ReasonCode = InsufficientEvidence, ReasonIncomplete
+	case len(qualified) > 0:
+		sort.Slice(qualified, func(i, j int) bool { return qualified[i].ClaimID < qualified[j].ClaimID })
+		d.Decision, d.ReasonCode, d.Qualified = InsufficientEvidence, ReasonStatusQualified, qualified
 	default:
 		d.Decision, d.ReasonCode = InsufficientEvidence, "CLAIM_NOT_PUBLISHED"
 	}
@@ -457,4 +479,16 @@ func (m Manifest) StructuralProblems() []string {
 		seen[c.ClaimID] = true
 	}
 	return problems
+}
+
+// StatusLabelFor is the governed label a qualified claim is shown with:
+// CONDITIONAL is Limited, TARGET is Planned (Doc 03 §08, Doc 02 §15).
+func StatusLabelFor(c Claim) string {
+	switch c.Status {
+	case StatusConditional:
+		return "Limited"
+	case StatusTarget:
+		return "Planned"
+	}
+	return ""
 }

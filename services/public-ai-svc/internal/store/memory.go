@@ -355,6 +355,25 @@ func (m *Memory) RecordConflict(_ context.Context, c Conflict) error {
 	return nil
 }
 
+func (m *Memory) ResolveConflict(_ context.Context, id, state, evidenceRef string, audit AuditEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.conflicts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if c.ResolutionState != ConflictOpen || (state != ConflictResolved && state != ConflictDismissed) || strings.TrimSpace(evidenceRef) == "" {
+		return ErrConflictState
+	}
+	audit.Action, audit.Target = "conflict."+strings.ToLower(state), id
+	if err := m.appendAudit(audit); err != nil {
+		return err
+	}
+	c.ResolutionState, c.ResolutionEvidenceRef = state, evidenceRef
+	m.conflicts[id] = c
+	return nil
+}
+
 func (m *Memory) Conflicts(context.Context) ([]Conflict, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

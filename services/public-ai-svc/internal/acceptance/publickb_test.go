@@ -161,8 +161,10 @@ func TestK9_LiveStatusQuarantined(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Join(dir, "sources"), 0o755))
 	must(t, os.WriteFile(filepath.Join(dir, "release.json"), []byte(`{"allowed_hosts":["pending-review.invalid"],"capability_ids":[],"approved_by":["a","b"],"eval_run_id":"x","routes":[]}`), 0o644))
 	article := func(id, body string) string {
-		return "---\nsource_id: " + id + "\ntitle: Status\ndomain: Platform\nmodule_id: status\naudience: PUBLIC_ANONYMOUS\nstatus: DRAFT_PENDING_REVIEW\nowner: o\neffective_from: 2026-01-01\nexpires_at: 2027-12-31\nlocale: en-US\n---\n\n## Status\n\n" + body + "\n"
+		return "---\nsource_id: " + id + "\ntitle: Status\ndomain: Platform\nmodule_id: status\naudience: PUBLIC_ANONYMOUS\nstatus: DRAFT_PENDING_REVIEW\nowner: o\neffective_from: 2026-01-01\nexpires_at: 2027-12-31\nlocale: en-US\nmarket_codes: ALL\nclassification: PUBLIC_APPROVED\npii_state: CLEAR\nlicense: OWNED_PUBLIC\nsigning_ref: kbctl-dev\n---\n\n## Status\n\n" + body + "\n"
 	}
+	// Doc 03 §06: scope is never defaulted; an article without market_codes is not parsed.
+	must(t, os.WriteFile(filepath.Join(dir, "sources", "d.md"), []byte(strings.Replace(article("no-market", "A capability."), "market_codes: ALL\n", "", 1)), 0o644))
 	must(t, os.WriteFile(filepath.Join(dir, "sources", "a.md"), []byte(article("live-a", "0/55 services ready across the estate.")), 0o644))
 	must(t, os.WriteFile(filepath.Join(dir, "sources", "b.md"), []byte(article("live-b", "Legal and Contracts: Action required on two services.")), 0o644))
 	must(t, os.WriteFile(filepath.Join(dir, "sources", "c.md"), []byte(article("ok-c", "A public description of a capability.")), 0o644))
@@ -173,6 +175,15 @@ func TestK9_LiveStatusQuarantined(t *testing.T) {
 	states := map[string]string{}
 	for _, r := range reports {
 		states[r.SourceID] = r.State
+	}
+	parseFailed := 0
+	for _, r := range reports {
+		if r.State == knowledge.StateQuarantineParse {
+			parseFailed++
+		}
+	}
+	if parseFailed != 1 {
+		t.Fatalf("an article without market_codes must fail parsing: %+v", reports)
 	}
 	if states["live-a"] != knowledge.StateQuarantinePrivate || states["live-b"] != knowledge.StateQuarantinePrivate || states["ok-c"] != knowledge.StateStaged {
 		t.Fatalf("states %v", states)
