@@ -36,7 +36,7 @@ func TestProductionGates(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Fatal("production without a policy digest must refuse to start")
 	}
-	c.PolicyDigest = "abc"
+	c.PolicyDigest, c.PolicySignature = "abc", "c2ln"
 	if err := c.Validate(); err == nil {
 		t.Fatal("a remote provider without approval must refuse to start")
 	}
@@ -45,6 +45,11 @@ func TestProductionGates(t *testing.T) {
 		t.Fatalf("production without a Host allowlist must refuse to start: %v", err)
 	}
 	c.AllowedHosts = []string{"assistant.example.test"}
+	c.PolicySignature = ""
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_POLICY_SIGNATURE") {
+		t.Fatalf("an unsigned policy digest must refuse to start: %v", err)
+	}
+	c.PolicySignature = "c2ln"
 	if err := c.Validate(); err != nil && containsAny(err.Error(), "POLICY_DIGEST", "PROVIDER_APPROVAL_REF", "ALLOWED_HOSTS") {
 		t.Fatalf("all gates satisfied but still refused for them: %v", err)
 	}
@@ -82,7 +87,7 @@ func TestNonDevRequiresDatabase(t *testing.T) {
 	c.Environment, c.RetentionSet = "production", true
 	c.ModelProvider, c.GroqAPIKey = "groq", "test-key"
 	c.ModelID = c.AllowedModelIDs[0]
-	c.PolicyDigest = "policy-digest"
+	c.PolicyDigest, c.PolicySignature = "policy-digest", "c2ln"
 	c.AllowedHosts = []string{"assistant.example.test"}
 	c.ProviderApprovalRef, c.ProviderRegion, c.ApprovedRegions = "DPA-2026-01", "eu-west", []string{"eu-west"}
 	c.KBAllowDraft, c.SeedOnStart, c.StructuredResponseDev = false, false, false
@@ -115,7 +120,7 @@ func validProduction(t *testing.T) Config {
 	c.Environment, c.RetentionSet = "production", true
 	c.ModelProvider, c.GroqAPIKey = "groq", "test-key"
 	c.ModelID = c.AllowedModelIDs[0]
-	c.PolicyDigest = "policy-digest"
+	c.PolicyDigest, c.PolicySignature = "policy-digest", "c2ln"
 	c.AllowedHosts = []string{"assistant.example.test"}
 	c.ProviderApprovalRef, c.ProviderRegion, c.ApprovedRegions = "DPA-2026-01", "eu-west", []string{"eu-west"}
 	c.KBAllowDraft, c.SeedOnStart, c.StructuredResponseDev = false, false, false

@@ -108,7 +108,7 @@ func main() {
 	}()
 	log.Info("tracing", zap.Bool("otlp_export", telemetry.Enabled()))
 	// Doc 06 §08: only the approved policy runs.
-	if err := policy.CheckDigest(cfg.PolicyDigest, model.PromptTemplateVersion); err != nil {
+	if err := policy.CheckSignedDigest(cfg.PolicyDigest, cfg.PolicySignature, cfg.SigningPublicKey, model.PromptTemplateVersion); err != nil {
 		log.Fatal("policy digest", zap.Error(err))
 	}
 

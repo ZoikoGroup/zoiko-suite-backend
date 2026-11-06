@@ -158,6 +158,21 @@ textfile collector).
    (RB-04) and the abstain-rate panel (RB-02). A failing `ready`/`session` step is RB-09.
 3. `PublicAICanaryStale` means the scheduler or the textfile collector stopped: fix the job, not the service.
 
+## RB-12 Release record, sign-offs and audit export
+
+Doc 08 §06/§33, OPR-002/048, Doc 09 ADM-T006, Doc 11 §24.
+
+1. **Policy bundle:** `kbctl policy-sign` (signers' key) prints `PUBLIC_AI_POLICY_DIGEST` and
+   `PUBLIC_AI_POLICY_SIGNATURE`; deploy both. Outside dev/test the server refuses to start unless the
+   running policy matches the digest and the signature verifies with the release signing key.
+2. **Manifest:** `kbctl manifest … -actor <you> -approval <change>` writes the signed manifest and records
+   its fingerprint in the hash-chained control audit.
+3. **Sign-offs:** each approver runs `kbctl signoff -file release-manifest.json -role <product|cto|security|dpo|qa|sre|founder> -actor <name> -approval <ref>`.
+4. **Deploy check:** `kbctl verify-manifest -file release-manifest.json -require-all` must pass before
+   production: signature valid, exact bytes recorded, every role signed.
+5. **Audit export:** `kbctl audit -export <file> -purpose "<why>" -actor <you> -approval <ref>`. The export
+   is recorded in the audit first, includes the chain check, and is written with owner-only permissions.
+
 ## RB-11 Rotating secrets and keys
 
 Doc 06 §12. Rotate on schedule (set by Security, DEC-09), on staff departure, and at once on any

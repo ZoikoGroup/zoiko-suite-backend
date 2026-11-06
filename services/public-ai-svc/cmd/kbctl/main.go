@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,6 +32,8 @@ import (
 	"zoiko.io/public-ai-svc/internal/events"
 	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/model"
+	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/release"
 	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
@@ -63,6 +66,12 @@ func main() {
 		err = audit(ctx, os.Args[2:])
 	case "conflicts":
 		err = conflicts(ctx, os.Args[2:])
+	case "policy-sign":
+		err = policySign()
+	case "signoff":
+		err = signoff(ctx, os.Args[2:])
+	case "verify-manifest":
+		err = verifyManifest(ctx, os.Args[2:])
 	case "dlq-replay":
 		err = dlqReplay(ctx, os.Args[2:])
 	default:
@@ -75,7 +84,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest|audit|conflicts|dlq-replay [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest|audit|conflicts|policy-sign|signoff|verify-manifest|dlq-replay [flags]")
 	os.Exit(2)
 }
 
@@ -318,10 +327,44 @@ func audit(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	limit := fs.Int("n", 20, "number of entries")
 	verify := fs.Bool("verify", false, "verify the whole hash chain (Doc 06 §21) instead of listing")
+	export := fs.String("export", "", "write the whole audit (oldest first) and its chain check to this JSON file")
+	purpose := fs.String("purpose", "", "why the export is needed (required with -export, Doc 09 ADM-T006)")
+	op, _, _ := operatorFlags(fs)
 	_ = fs.Parse(args)
 	st, err := openStore(ctx)
 	if err != nil {
 		return err
+	}
+	if *export != "" {
+		// Doc 09 §21, ADM-T006: an export is purpose-bound, approved and
+		// itself recorded in the audit before the file is written.
+		o := op()
+		if strings.TrimSpace(*purpose) == "" {
+			return fmt.Errorf("-purpose is required for an audit export")
+		}
+		if err := st.AppendAudit(ctx, store.AuditEntry{Action: "audit.exported", Target: *export, Actor: o.Actor, Approval: o.Approval,
+			Reason: *purpose, Environment: o.Environment, At: time.Now().UTC()}); err != nil {
+			return err
+		}
+		all, err := st.ListAudit(ctx, 1<<30)
+		if err != nil {
+			return err
+		}
+		chain := make([]store.AuditEntry, 0, len(all))
+		for i := len(all) - 1; i >= 0; i-- {
+			chain = append(chain, all[i])
+		}
+		check := "intact"
+		if err := store.VerifyAuditChain(chain); err != nil {
+			check = "BROKEN: " + err.Error()
+		}
+		b, _ := json.MarshalIndent(map[string]any{"purpose": *purpose, "exported_by": o.Actor, "approval": o.Approval,
+			"exported_at": time.Now().UTC(), "chain": check, "entries": chain}, "", "  ")
+		if err := os.WriteFile(*export, append(b, '\n'), 0o600); err != nil {
+			return err
+		}
+		fmt.Printf("exported %d audit rows to %s (chain %s)\n", len(chain), *export, check)
+		return nil
 	}
 	if *verify {
 		all, err := st.ListAudit(ctx, 1<<30)
@@ -412,6 +455,7 @@ func manifest(ctx context.Context, args []string) error {
 	prevKB := fs.String("previous-kb", "", "knowledge release id this release replaces")
 	prevClaims := fs.String("previous-claims", "", "claim release id this release replaces")
 	out := fs.String("out", "release-manifest.json", "output file")
+	op, _, _ := operatorFlags(fs)
 	_ = fs.Parse(args)
 	key, err := privKey()
 	if err != nil {
@@ -443,6 +487,10 @@ func manifest(ctx context.Context, args []string) error {
 	}
 	if err := signing.WriteFile(*out, rec.ReleaseID, "release_manifest", body, sig); err != nil {
 		return err
+	}
+	// Doc 08 §06, OPR-048: the manifest is recorded in the hash-chained audit.
+	if err := release.RecordManifest(ctx, st, *op(), rec.ReleaseID, body); err != nil {
+		return fmt.Errorf("record manifest: %w", err)
 	}
 	fmt.Println(string(body))
 	fmt.Printf("wrote signed manifest %s (decision %s)\n", *out, rec.Decision)
@@ -489,5 +537,80 @@ func conflicts(ctx context.Context, args []string) error {
 		fmt.Printf("%s %-9s %-6s %-22s owner=%s blocked=%t subject=%s claims=%v evidence=%s\n", c.DetectedAt.UTC().Format(time.RFC3339),
 			c.ResolutionState, c.Severity, c.DetectionType, c.AssignedOwner, c.BlockedClaim, c.SubjectKey, c.ClaimIDs, c.ResolutionEvidenceRef)
 	}
+	return nil
+}
+
+// policySign prints the running build's policy digest and the signers'
+// signature over it (Doc 08 OPR-002). Deploy both as PUBLIC_AI_POLICY_DIGEST
+// and PUBLIC_AI_POLICY_SIGNATURE; the server refuses to start otherwise.
+func policySign() error {
+	key, err := privKey()
+	if err != nil {
+		return err
+	}
+	digest := policy.BundleDigest(model.PromptTemplateVersion)
+	sig, err := signing.Sign(key, []byte(policy.PolicySigningPayload(digest)))
+	if err != nil {
+		return err
+	}
+	fmt.Println("PUBLIC_AI_POLICY_DIGEST=" + digest)
+	fmt.Println("PUBLIC_AI_POLICY_SIGNATURE=" + base64.StdEncoding.EncodeToString(sig))
+	return nil
+}
+
+// signoff records a named approver's sign-off on a recorded manifest
+// (Doc 08 §33, Doc 11 §24).
+//
+//	kbctl signoff -file release-manifest.json -role sre -actor <name> -approval <ref>
+func signoff(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("signoff", flag.ExitOnError)
+	file := fs.String("file", "release-manifest.json", "signed release manifest")
+	role := fs.String("role", "", "approver role: "+strings.Join(release.SignoffRoles, ", "))
+	op, _, _ := operatorFlags(fs)
+	_ = fs.Parse(args)
+	f, body, _, err := signing.ReadFile(*file)
+	if err != nil {
+		return err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return err
+	}
+	if err := release.SignOff(ctx, st, *op(), *role, f.ReleaseID, body); err != nil {
+		return err
+	}
+	fmt.Println("signed off", f.ReleaseID, "as", *role)
+	return nil
+}
+
+// verifyManifest is the deploy-time check: signature, recorded bytes and
+// sign-offs. With -require-all it fails until every role has signed.
+func verifyManifest(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("verify-manifest", flag.ExitOnError)
+	file := fs.String("file", "release-manifest.json", "signed release manifest")
+	all := fs.Bool("require-all", false, "fail unless every role has signed off")
+	_ = fs.Parse(args)
+	f, body, sig, err := signing.ReadFile(*file)
+	if err != nil {
+		return err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return err
+	}
+	signed, missing, err := release.VerifyDeployManifest(ctx, st, os.Getenv("PUBLIC_AI_SIGNING_PUBLIC_KEY"), f.ReleaseID, body, sig)
+	if err != nil {
+		return err
+	}
+	for _, s := range signed {
+		fmt.Printf("signed  %-8s %s (%s) %s\n", s.Role, s.Actor, s.Approval, s.At.UTC().Format(time.RFC3339))
+	}
+	for _, r := range missing {
+		fmt.Printf("PENDING %s\n", r)
+	}
+	if *all && len(missing) > 0 {
+		return fmt.Errorf("%d sign-offs missing", len(missing))
+	}
+	fmt.Println("manifest verified and recorded:", f.ReleaseID)
 	return nil
 }

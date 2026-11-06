@@ -47,6 +47,9 @@ services:
       # Required, never assumed (Doc 06 SEC-P0-06): dev, test, staging or production.
       PUBLIC_AI_ENVIRONMENT: ${PUBLIC_AI_ENVIRONMENT:?set PUBLIC_AI_ENVIRONMENT (dev, test, staging or production)}
       PUBLIC_AI_POLICY_DIGEST: ${PUBLIC_AI_POLICY_DIGEST:-}
+      # Doc 08 OPR-002: the release signers' signature over the digest
+      # (kbctl policy-sign); required outside dev/test.
+      PUBLIC_AI_POLICY_SIGNATURE: ${PUBLIC_AI_POLICY_SIGNATURE:-}
       PUBLIC_AI_ALLOWED_HOSTS: ${PUBLIC_AI_ALLOWED_HOSTS:-}
       PUBLIC_AI_HTTP_ADDR: ":8080"
       # Doc 06 §12: /metrics and /health on an internal listener only

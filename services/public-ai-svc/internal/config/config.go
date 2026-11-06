@@ -48,7 +48,10 @@ type Config struct {
 	// PolicyDigest is the approved policy fingerprint (required outside
 	// dev/test, Doc 06 §08). ProviderApprovalRef and ProviderRegion record
 	// the DPA/transfer approval for a remote model provider (SEC-P0-06).
-	PolicyDigest        string
+	PolicyDigest string
+	// PolicySignature is the signers' Ed25519 signature over the digest
+	// (kbctl policy-sign); required with the digest outside dev/test.
+	PolicySignature     string
 	ProviderApprovalRef string
 	ProviderRegion      string
 	ApprovedRegions     []string // DPA/transfer-approved regions (DEC-05)
@@ -152,6 +155,7 @@ func Load() (Config, error) {
 		// mean dev and switch the production gates off.
 		Environment:                  os.Getenv("PUBLIC_AI_ENVIRONMENT"),
 		PolicyDigest:                 os.Getenv("PUBLIC_AI_POLICY_DIGEST"),
+		PolicySignature:              os.Getenv("PUBLIC_AI_POLICY_SIGNATURE"),
 		ProviderApprovalRef:          os.Getenv("PUBLIC_AI_PROVIDER_APPROVAL_REF"),
 		ProviderRegion:               os.Getenv("PUBLIC_AI_REGION"),
 		ApprovedRegions:              splitList(os.Getenv("PUBLIC_AI_APPROVED_REGIONS")),
@@ -241,6 +245,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("a remote model provider outside dev/test needs PUBLIC_AI_PROVIDER_APPROVAL_REF (DPA/transfer approval, SEC-P0-06)")
 	case c.ModelProvider != "mock" && !devLike && (c.ProviderRegion == "" || !contains(c.ApprovedRegions, c.ProviderRegion)):
 		return fmt.Errorf("PUBLIC_AI_REGION %q is not in PUBLIC_AI_APPROVED_REGIONS: no provider request without an approved region (SEC-P0-06)", c.ProviderRegion)
+	case !devLike && c.PolicyDigest != "" && c.PolicySignature == "":
+		return fmt.Errorf("PUBLIC_AI_POLICY_SIGNATURE is required outside dev/test: the policy digest must be signed by the release signers (Doc 08 OPR-002)")
 	case !devLike && c.PolicyDigest == "":
 		return fmt.Errorf("PUBLIC_AI_POLICY_DIGEST is required outside dev/test: the service runs only the approved policy (Doc 06 A08)")
 	case !devLike && len(c.AllowedHosts) == 0:
