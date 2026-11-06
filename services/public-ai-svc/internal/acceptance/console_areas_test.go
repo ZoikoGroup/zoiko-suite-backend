@@ -39,6 +39,25 @@ func TestConsoleAreasAreAnswered(t *testing.T) {
 		"what is Workflows & Approvals":           "kb-authorization-workflows|kb-governance",
 		"what is the Executive Dashboard":         "kb-console-overview",
 		"what is Domain Health":                   "kb-console-overview",
+		// Section titles from the console pages (screenshots, 2026-11-06).
+		"use of the Decision log":                "kb-governance-log-policies",
+		"What is in force right now":             "kb-governance-log-policies",
+		"use of the create rule":                 "kb-governance-log-policies",
+		"Set the limit":                          "kb-governance-log-policies",
+		"how do I bring a limit into force":      "kb-governance-log-policies",
+		"how do I move an obligation's status":   "kb-obligations",
+		"what is a filing requirement":           "kb-obligations",
+		"how is a permission check decided":      "kb-authorization-workflows",
+		"how do I start a workflow":              "kb-authorization-workflows",
+		"how do I decide the current stage":      "kb-authorization-workflows",
+		"what are workflow definitions":          "kb-authorization-workflows",
+		"what is the elevated access lifecycle":  "kb-authorization-workflows",
+		"what does NO_REQUIREMENTS_DEFINED mean": "kb-evidence-requirements",
+		"use of the Requirement catalog":         "kb-evidence-requirements",
+		"how do I withdraw a requirement":        "kb-evidence-requirements",
+		"how do I record a journal":              "kb-finance-journals",
+		"how do I ingest a statement line":       "kb-finance-journals",
+		"what is the Reconciliation register":    "kb-finance-journals",
 	} {
 		r := x.env.Pipeline.Answer(ctx, inputFor(q))
 		if r.Status != contract.Answered {

@@ -284,7 +284,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		// Doc 02 §23: English fallback where the language has no approved content.
 		return p.fromTemplate(policy.TplNonEnglish, intent, snap, market, now, releaseID)
 	}
-	if intent == "I29" && policy.IsModuleQuestion(dec.Redaction.Text) {
+	if intent == "I29" && (policy.IsModuleQuestion(dec.Redaction.Text) || (snap.KB != nil && snap.KB.NamesSection(dec.Redaction.Text))) {
 		// Fallback ladder: rules -> (model classifier, none in R0) -> a named
 		// area, module or alias -> only then out of scope.
 		intent = "I02"

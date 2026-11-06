@@ -218,7 +218,7 @@ var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|paymen
 	`|my work|tasks?(?: and approvals)?|approvals?|exceptions?|assigned actions?|identity(?: context)?|authentication|federation|federated|sign-?on|sso|mfa|second factor|sessions?|support access|password resets?` +
 	`|tenants? and entities|legal entit(?:y|ies)|feature flags?|config(?:uration)?|secret vault|secrets?|gateway(?: authentication)?|notifications?|roles?(?: and access)?|access control|permission bundles?|foundation` +
 	// Governance Platform and Overview console areas.
-	`|jurisdictions?(?: and rules)?|rule packs?|governance log|polic(?:y|ies)|obligations?|authori[sz]ation|segregation of duties|workflows?(?: and approvals)?|executive dashboard|domain health|dashboard)\b`)
+	`|jurisdictions?(?: and rules)?|rule packs?|governance log|polic(?:y|ies)|obligations?|authori[sz]ation|segregation of duties|workflows?(?: and approvals)?|executive dashboard|domain health|dashboard|filing requirements?|evidence requirements?|requirement catalog|no_requirements_defined|journals?|statement lines?|reconciliation)\b`)
 
 // areaDefinitionRe asks what a console area is or does.
 var areaDefinitionRe = regexp.MustCompile(`(?i)^\s*(?:what\s+(?:is|are|does)|what's|explain|describe|define|tell me about|use of|how does)\s+(?:the\s+)?(?:domain health|executive dashboard|dashboards?|governance log)\b`)

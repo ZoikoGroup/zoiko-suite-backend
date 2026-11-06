@@ -442,3 +442,34 @@ func (x *Index) Neighbor(c Chunk, q Query, rev Revocations) (Chunk, bool) {
 	}
 	return Chunk{}, false
 }
+
+// NamesSection reports whether the question names a section heading of an
+// article in this release (all of the heading's words, at least two), for
+// example "Set the limit" or "Decision log". Questions about a console page
+// section are then answered from that article rather than treated as off-topic.
+func (x *Index) NamesSection(question string) bool {
+	q := map[string]bool{}
+	for _, t := range Tokens(question) {
+		q[t] = true
+	}
+	if len(q) == 0 {
+		return false
+	}
+	for _, c := range x.chunks {
+		h := Tokens(c.DisplayTitle)
+		if len(h) < 2 {
+			continue
+		}
+		all := true
+		for _, w := range h {
+			if !q[w] {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
