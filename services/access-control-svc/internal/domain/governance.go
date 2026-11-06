@@ -150,8 +150,8 @@ type CreateAssignmentRequest struct {
 	// Origin names the automation that raised the request. FEDERATION (an identity-provider mapping, INT-10) is
 	// held to baseline access: a request that would be HIGH or CRITICAL risk, or need any approver, is refused
 	// outright. Empty is an ordinary governed request.
-	Origin            string     `json:"origin,omitempty"`
-	CorrelationID     string     `json:"correlation_id"`
+	Origin        string `json:"origin,omitempty"`
+	CorrelationID string `json:"correlation_id"`
 }
 
 // AssignmentDecisionRequest carries approve / reject / cancel / revoke.
