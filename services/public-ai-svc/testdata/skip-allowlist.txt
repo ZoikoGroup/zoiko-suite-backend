@@ -12,3 +12,4 @@ TestPostgresMigrationsRoundTrip          needs TEST_DATABASE_URL
 TestPostgresRevocationsAppendOnly        needs TEST_DATABASE_URL
 TestLatencyBudgetGate                    skipped only with -short
 TestK12_ExpiredMarketOffersNextSteps     skips only if the public KB's GB trial claims stop being expired (test data changed)
+TestCommittedFrontendReferences          needs the frontend repository checked out next to this one (local check; CI has only this repo)
