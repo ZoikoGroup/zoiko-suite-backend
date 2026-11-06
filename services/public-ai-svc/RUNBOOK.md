@@ -28,6 +28,19 @@ reference and writes `publicai.kill_switch.changed.v1` to the outbox.
 Each artifact rolls back independently (Doc 08 §01): app image, prompt/policy (ships with the app
 image; see `artifacts.prompt_policy` in the manifest), knowledge release, claim release.
 
+## Promotion freeze (Doc 08 §13, OPR-021/029)
+
+Alerts labelled `freeze_promotion="true"` (error-budget burns, a revocation caught at commit) mean
+no new release may be promoted until the incident is closed. The on-call sets the freeze:
+`kbctl flag -name promotion_frozen -value true -actor <you> -approval <incident>`. While it is on,
+`kbctl promote` refuses every promotion; `kbctl promote -rollback` still works, because rollback is the
+recovery. Clear it with `-value false` and a second approval once the incident is resolved.
+
+Dashboards: the isolated stack's Grafana is `public-ai-grafana` (127.0.0.1:3002), whose only data
+source is `public-ai-prometheus`. The "Useful grounded resolution", "tokens per 1,000 useful
+resolutions", "Knowledge index health" and "Privacy and revocation integrity" panels read the
+recording rules and gauges added for Doc 08 §12/§15/§25 and Doc 03 §22.
+
 ## RB-01 Model provider degraded (Doc 08 §16)
 
 Providers: the deterministic mock (dev/test only) and Groq (`MODEL_PROVIDER=groq`, which outside dev/test

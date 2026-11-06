@@ -26,6 +26,7 @@ func TestAlertRulesUseExportedMetrics(t *testing.T) {
 	OutboxOldest(time.Second)
 	CommitRevocation()
 	EventDLPBlocked("rules-test")
+	IndexHealth(1, 1, 0, 0, 1)
 	CTAOffered("rules-test")
 	HandoffClicked("rules-test")
 	Feedback("useful", "")

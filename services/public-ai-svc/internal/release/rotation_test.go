@@ -1,10 +1,13 @@
 package release
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 
+	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/signing"
+	"zoiko.io/public-ai-svc/internal/store"
 )
 
 // Doc 06 §12 (RUNBOOK RB-11): rotating the release signing key. Releases are
@@ -61,5 +64,21 @@ func TestSigningKeyRotation(t *testing.T) {
 	stale, staleSig, _, _ := BuildKB(filepath.Join(fixtures, "kb"), "kb-stale-1", now, e.key)
 	if err := Publish(ctx, e.st, newPub, "kb-stale-1", "kb", stale, staleSig); err == nil {
 		t.Fatal("a release signed with the retired key must not publish under the new key")
+	}
+}
+
+// Doc 08 §13, OPR-021/029: while promotion_frozen is on, promotion is
+// refused and rollback still works.
+func TestPromotionFreeze(t *testing.T) {
+	e := setup(t)
+	op := Operator{Actor: "sre-1", Approval: "CHG-1", Environment: "test"}
+	if err := e.st.SetFlag(ctx, store.Flag{Name: flags.PromotionFrozen, Value: []byte("true"), ActorRef: "oncall", ApprovalRef: "INC-7", UpdatedAt: now}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := PromotionGateAudited(ctx, e.st, "kb", "kb-test-1", nil, op, nil, false); !errors.Is(err, ErrPromotionFrozen) {
+		t.Fatalf("promotion during a freeze: %v", err)
+	}
+	if err := PromotionGateAudited(ctx, e.st, "kb", "kb-test-1", nil, op, nil, true); errors.Is(err, ErrPromotionFrozen) {
+		t.Fatal("rollback must stay available during a freeze")
 	}
 }

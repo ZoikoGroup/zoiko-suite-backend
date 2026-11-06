@@ -42,6 +42,10 @@ const (
 	// contact) in answers (Doc 10 App. B). On by default; turning it off
 	// removes commercial routes without touching the answers themselves.
 	CommercialRoutesEnabled = "commercial_routes_enabled"
+	// PromotionFrozen blocks promotion (not rollback) while an error-budget
+	// burn or a P0 incident is open (Doc 08 §13, OPR-021/029). The alerts
+	// carry freeze_promotion="true"; the on-call sets this flag (RB-01).
+	PromotionFrozen = "promotion_frozen"
 )
 
 // dualControl are the flags whose re-enable after a disable needs a second
@@ -69,6 +73,8 @@ type Values struct {
 	StructuredResponse     bool
 	// CommercialRoutes allows official-route CTAs in answers (Doc 10 App. B).
 	CommercialRoutes bool
+	// PromotionFrozen: see the flag of the same name.
+	PromotionFrozen bool
 }
 
 // Defaults apply when a flag was never set.
@@ -127,6 +133,8 @@ func apply(v *Values, name string, raw []byte) error {
 		return json.Unmarshal(raw, &v.StructuredResponse)
 	case CommercialRoutesEnabled:
 		return json.Unmarshal(raw, &v.CommercialRoutes)
+	case PromotionFrozen:
+		return json.Unmarshal(raw, &v.PromotionFrozen)
 	case MaxConcurrentTurns:
 		if err := json.Unmarshal(raw, &v.MaxConcurrentTurns); err != nil {
 			return err
