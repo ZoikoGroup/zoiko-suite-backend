@@ -118,7 +118,7 @@ Authorization	kb-authorization-checks	What is maker and checker?
 Workflows	kb-authorization-workflows|kb-governance	What are Workflows & Approvals?
 Workflows	kb-authorization-workflows	How do I start an approval workflow?
 Workflows	kb-authorization-workflows	Who can decide a workflow stage?
-Workflows	kb-authorization-workflows	Is a reason needed to reject?
+Workflows	kb-authorization-workflows|kb-purchase-requests	Is a reason needed to reject?
 Workflows	kb-authorization-workflows	What is a workflow definition?
 My Work	kb-my-work	What is My Work?
 My Work	kb-my-work	Where do I see tasks waiting for me?

@@ -68,6 +68,11 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 			parts = append(parts, c.Statement)
 			d.ClaimRefs = append(d.ClaimRefs, c.Ref)
 		}
+	} else if p := procedure(req.Evidence); p != "" {
+		// The best passage is a how-to written as numbered steps: answer with
+		// those steps as a list, its lead line and note, and nothing else.
+		parts = append(parts, p)
+		d.EvidenceRefs = append(d.EvidenceRefs, req.Evidence[0].Ref)
 	} else if len(req.Evidence) > 0 {
 		// Extractive answer (evidence arrives in rank order). Doc 01 §12 / Doc
 		// 02 §16: a direct answer of up to answerWords before "expand": the
@@ -361,4 +366,51 @@ func sections(text, title string) []section {
 		out = append(out, section{heading, body})
 	}
 	return out
+}
+
+// stepRe is one numbered step of a how-to passage ("2. Open Policies.").
+var stepRe = regexp.MustCompile(`^\d+\.\s+\S`)
+
+// procedure is the best passage's how-to, when it is written as numbered
+// steps: the line that introduces the steps, each step on its own line, and
+// the one note that follows them. "" when the passage has no steps.
+func procedure(evidence []Evidence) string {
+	if len(evidence) == 0 {
+		return ""
+	}
+	for _, sec := range sections(evidence[0].Text, "") {
+		lines := strings.Split(strings.TrimSpace(sec.body), "\n")
+		first, last := -1, -1
+		for i, l := range lines {
+			if stepRe.MatchString(strings.TrimSpace(l)) {
+				if first < 0 {
+					first = i
+				}
+				last = i
+			} else if first >= 0 {
+				break
+			}
+		}
+		if first < 0 || last == first {
+			continue
+		}
+		// The section's own lead: what it is for (a short line or two) and
+		// the line that introduces the steps.
+		var out []string
+		for _, l := range lines[:first] {
+			if l = strings.TrimSpace(l); l != "" && (strings.HasSuffix(l, ":") || wordCount(l) <= 60) {
+				out = append(out, l)
+			}
+		}
+		for _, l := range lines[first : last+1] {
+			out = append(out, strings.TrimSpace(l))
+		}
+		if last+1 < len(lines) {
+			if note := strings.TrimSpace(lines[last+1]); note != "" && wordCount(note) <= 45 {
+				out = append(out, note)
+			}
+		}
+		return strings.Join(out, "\n")
+	}
+	return ""
 }

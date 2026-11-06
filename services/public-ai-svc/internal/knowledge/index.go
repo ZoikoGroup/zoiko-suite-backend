@@ -32,6 +32,9 @@ type Query struct {
 	Plan string
 	// IntentID boosts chunks whose source is tagged for the classified intent.
 	IntentID string
+	// HowTo marks a question asking how to do something: sections written
+	// as console steps are preferred.
+	HowTo bool
 }
 
 // Hit is one eligible chunk with its score.
@@ -111,7 +114,7 @@ func NewIndex(m Manifest) *Index {
 	}
 	total := 0
 	for _, c := range m.Chunks {
-		toks := Tokens(c.DisplayTitle + " " + c.PlainText)
+		toks := Tokens(c.DisplayTitle + " " + indexText(c.PlainText))
 		tf := map[string]int{}
 		for _, t := range toks {
 			tf[t]++
@@ -289,6 +292,12 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 		if sectionNamed(c, rawToks) {
 			sc *= titleBoost
 		}
+		if q.HowTo && strings.Contains(c.PlainText, signInStep) {
+			sc *= howToBoost
+			if introNamed(c.PlainText, rawToks) {
+				sc *= titleBoost
+			}
+		}
 		if sc < minScore || matched < need {
 			continue
 		}
@@ -382,6 +391,11 @@ func sectionNamed(c Chunk, qtoks []string) bool {
 	}
 	return true
 }
+
+// howToBoost favours a section written as console steps for a question
+// asking how to do something, above an overview that merely names the area
+// (titleBoost).
+const howToBoost = 3.0
 
 // intentBoost favours sources tagged for the visitor's intent, so "How is
 // data secured?" lands on the trust page rather than any page saying "data".
@@ -598,6 +612,52 @@ func (x *Index) hasLike(i int, t string) bool {
 		if likeWords(w, t) {
 			return true
 		}
+	}
+	return false
+}
+
+// signInStep is the first step of every console how-to. It is shown in
+// answers but not indexed: repeated in every procedure, its words ("access",
+// "account") would otherwise pull unrelated questions to them.
+const signInStep = "1. Sign in to your ZoikoSuite account."
+
+// navStepRe is the second step of a console how-to: where to find the page.
+// Like the sign-in step it repeats across procedures and is not indexed.
+var navStepRe = regexp.MustCompile(`^2\. (?:In the left menu, open|Open \*\*)`)
+
+// indexText is chunk text without the sign-in and navigation step lines.
+func indexText(text string) string {
+	if !strings.Contains(text, signInStep) {
+		return text
+	}
+	var keep []string
+	for _, l := range strings.Split(text, "\n") {
+		if t := strings.TrimSpace(l); !strings.HasPrefix(t, signInStep) && !navStepRe.MatchString(t) {
+			keep = append(keep, l)
+		}
+	}
+	return strings.Join(keep, "\n")
+}
+
+// introNamed reports whether the question carries every word of the line
+// that introduces a section's steps ("To delegate your approval authority:"),
+// the way a visitor asks for that task.
+func introNamed(text string, qtoks []string) bool {
+	for _, l := range strings.Split(text, "\n") {
+		l = strings.TrimSpace(l)
+		if !strings.HasPrefix(l, "To ") || !strings.HasSuffix(l, ":") {
+			continue
+		}
+		words := Tokens(l)
+		if len(words) == 0 {
+			return false
+		}
+		for _, w := range words {
+			if !anyLike(qtoks, w) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }

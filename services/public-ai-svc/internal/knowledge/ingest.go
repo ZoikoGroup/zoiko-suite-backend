@@ -561,6 +561,11 @@ func chunkSource(src Source, text, releaseID string) []Chunk {
 			}
 			seg++
 			body := strings.Join(words[start:end], " ")
+			if start == 0 && end == len(words) {
+				// A section that fits keeps its line breaks, so a numbered
+				// list of steps is still a list when it is answered from.
+				body = keepLines(sec.text)
+			}
 			out = append(out, Chunk{
 				ChunkID: fmt.Sprintf("%s#%03d", src.SourceVersionID, seg), SourceID: src.SourceID, SourceVersionID: src.SourceVersionID,
 				SegmentNumber: seg, DocumentAnchor: sec.anchor, DisplayTitle: sec.title, URLKey: src.URLKey,
@@ -628,4 +633,16 @@ func badScope(s Source) string {
 		return "locale is not a BCP-47 tag: " + s.Locale
 	}
 	return ""
+}
+
+// keepLines is section text with blank lines and repeated spaces removed and
+// line breaks kept.
+func keepLines(s string) string {
+	var lines []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.Join(strings.Fields(l), " "); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, "\n")
 }

@@ -9,7 +9,7 @@ owner: owner-product
 effective_from: 2026-01-01
 expires_at: 2027-12-31
 locale: en-US
-intent_ids: I02
+intent_ids:
 market_codes: ALL
 classification: PUBLIC_APPROVED
 pii_state: CLEAR
@@ -27,7 +27,14 @@ When the gateway refuses a request it names its reason, and the same status code
 
 ## How access actually works
 
-Secret access takes four steps: register the path, which grants nothing on its own; add a version saying which workloads may use it and for how long a lease may live; activate the version, until which the secret is invisible; and seed the material into the vault. An unconfigured secret is an inaccessible one, and the platform refuses rather than guessing.
+Secret access takes four steps, and an unconfigured secret is an inaccessible one: the platform refuses rather than guessing.
+To provision a secret:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Secret Vault**.
+3. Register the path: enter the **Scope**, **Secret class**, **Data classification** and **Secret path**, then select **Register path**.
+4. Add a version: enter the **Secret policy ID**, **Max lease duration**, **Effective from** and **Allowed workloads**, then select **Create draft version**.
+5. Enter the **Version ID** and select **Activate version**; until then the secret is invisible.
+6. Enter the **Secret material** and select **Store material**.
 
 ## Version history and issued leases
 
@@ -39,11 +46,24 @@ Settings brings together your current session, your identity and the platform co
 
 ## Settings services read at runtime
 
-Settings services read at runtime are named values the rest of the platform reads to decide how to behave, such as a cutoff hour, a limit or an address. Features that can be switched on and off use the same scoping and history: nothing is overwritten, and every value is shown in plain words.
+Settings services read at runtime are named values the platform reads to decide how to behave, such as a cutoff hour, a limit or an address.
+To change a setting:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Feature Flags & Config**.
+3. Go to **Settings services read at runtime**.
+4. Choose **Which setting**, **Where it applies** and **Who it applies to**, and enter **What it should be set to**.
+5. Select **Save this setting**.
+Nothing is overwritten: every earlier value stays in the history.
 
 ## Check exactly what a service would see
 
-Check exactly what a service would see answers one precise question: for this name, this environment and this group, what is in force? Finding nothing means the setting is unset for that combination only, not everywhere.
+Check exactly what a service would see answers one precise question: for this name, this environment and this group, what is in force?
+To check one setting:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Feature Flags & Config**.
+3. Go to **Check exactly what a service would see**.
+4. Choose **Is a feature switched on?** or **What is a setting set to?**, and enter the name, environment and group.
+Finding nothing means the setting is unset for that combination only, not everywhere.
 
 ## Delivery register
 
@@ -51,4 +71,73 @@ The Delivery register lists a legal entity's notifications, newest first. Each r
 
 ## Retire, reactivate, or rename
 
-In Roles & Access Control, retiring a role is a real control, not a label: a retired role grants nothing on the next permission check. It is also reversible, because assignments are left intact, so reactivating a role restores them. Define a role, attach a permission bundle, and see who holds a role from the same page.
+Retiring a role is a real control: a retired role grants nothing on the next permission check. It is reversible, because assignments are left intact.
+To retire, reactivate or rename a role:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Roles & Access**.
+3. Go to **Retire, reactivate, or rename**.
+4. Choose the **Role** and its new **Status**, or enter a **New display name**.
+5. Select **Apply change**.
+
+## Would the gateway let me through?
+
+Would the gateway let me through checks your own session against the gateway's rules, and names the reason for any refusal.
+To check your session:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Gateway Authentication**.
+3. Go to **Would the gateway let me through?**.
+4. Enter the **Method** and the **Path, as it would arrive at the gateway**.
+5. Select **Check my session**.
+
+## Request access to a secret
+
+Request access to a secret asks for a short-lived lease on it. A refused request never becomes a lease and appears in the access audit log instead.
+To request access to a secret:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Secret Vault**.
+3. Go to **Request access**.
+4. Enter the **Secret path** and the **Requesting principal**.
+5. Select **Request access**.
+
+## Rotate a secret
+
+Rotate a secret replaces the secret material without exposing the old value.
+To rotate a secret:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Secret Vault**.
+3. Go to **Rotate a secret**.
+4. Enter the **Secret policy ID** and the **Request ID**.
+5. Select **Rotate secret**.
+
+## Features that can be switched on and off
+
+Features can be switched on for a scope and a group of people, and every change is kept in history rather than overwritten.
+To switch a feature on or off:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Feature Flags & Config**.
+3. Go to **Features that can be switched on and off**.
+4. Choose **Which feature**, **Where it applies** and **Who it applies to**, and the **Share of people who get it**.
+5. Select **Save this setting**.
+
+## Send a notification
+
+Send a notification delivers a notice to one person through a chosen channel.
+To send a notification:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Notifications**.
+3. Go to **Send a notification**.
+4. Enter the **Recipient principal id**, the **Channel** and the **Template**, then the **Subject** and **Body**.
+5. Optionally add a **Recipient address override**, the **Source event type** and a **Source reference**.
+6. Select **Send notification**.
+The Delivery register shows each notice; FAILED rows are recorded proof that a notice did not go out.
+
+## Define a role
+
+Define a role creates a role that people can then be granted.
+To define a role:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Identity, Scope & Foundation**, then select **Roles & Access**.
+3. Go to **Define a role**.
+4. Enter the **Role code**, the **Display name**, the **Scope** and the **Legal entity**.
+5. Select **Define role**.
+6. To give the role permissions, use **Attach a permission bundle**: choose the **Role**, enter the **Bundle code** and **Permitted actions**, and select **Attach bundle**.

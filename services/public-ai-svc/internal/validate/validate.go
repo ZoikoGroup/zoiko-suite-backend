@@ -33,9 +33,11 @@ var (
 )
 
 var (
-	urlRe    = regexp.MustCompile(`(?i)\b(?:https?://|www\.)\S+|\b[a-z0-9-]+\.(?:com|net|org|io|ai|co|uk|example|invalid)(?:/\S*)?`)
-	emailRe  = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
-	phoneRe  = regexp.MustCompile(`\+?\d[\d\s().-]{7,}\d`)
+	urlRe   = regexp.MustCompile(`(?i)\b(?:https?://|www\.)\S+|\b[a-z0-9-]+\.(?:com|net|org|io|ai|co|uk|example|invalid)(?:/\S*)?`)
+	emailRe = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+	// phoneRe never spans a line break: "10000).\n5. Select" is the end of
+	// one numbered step and the start of the next, not a phone number.
+	phoneRe  = regexp.MustCompile(`\+?\d[\d \t().-]{7,}\d`)
 	markupRe = regexp.MustCompile(`(?i)<\s*/?\s*[a-z][^>]*>|javascript:|on[a-z]+\s*=|\]\(|!\[`)
 	numberRe = regexp.MustCompile(`\d+(?:[.,]\d+)*%?`)
 	toolRe   = regexp.MustCompile(`(?i)tool_call|function_call|"tool"\s*:|<\s*tool|call_tool|execute_action|"arguments"\s*:`)

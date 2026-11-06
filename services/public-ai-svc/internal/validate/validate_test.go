@@ -112,3 +112,15 @@ func TestClaimToSpan(t *testing.T) {
 		t.Fatalf("short sentences are not scored: %v", err)
 	}
 }
+
+// A number at the end of one step and the next step's number are not a
+// phone number: line breaks in a numbered list survive validation.
+func TestStepNumbersAreNotPhones(t *testing.T) {
+	text := "To set the limit:\n4. Enter the Limit (such as 10000).\n5. Select Save the limit."
+	if phoneRe.ReplaceAllString(text, "") != text {
+		t.Fatalf("steps were stripped as a phone number: %q", phoneRe.ReplaceAllString(text, ""))
+	}
+	if phoneRe.ReplaceAllString("call +1 415 555 0100 today", "") == "call +1 415 555 0100 today" {
+		t.Fatal("a phone number on one line is no longer stripped")
+	}
+}

@@ -23,11 +23,24 @@ The privacy area records consent, privacy notices and preferences, and governs w
 
 ## Record Subject Consent
 
-Record subject consent stores a person's consent for a stated purpose, with a receipt that later decisions can be checked against. Resolve consent status shows whether consent currently holds and the evidence behind it.
+Record subject consent stores a person's consent for a stated purpose, with a receipt that later decisions can be checked against.
+To record consent:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. Open the **Privacy & Cross-Border Data Transfer Governance** page of the console.
+3. Go to **Record Subject Consent**.
+4. Enter the **Data Subject Reference**, the **Purpose ID**, the **Consent Decision**, the **Capture Channel** and the **Linked Privacy Notice Version ID**.
+5. Submit the form.
+Resolve consent status shows whether consent currently holds and the evidence behind it.
 
 ## Withdraw Consent (Right to Revoke)
 
-Withdrawing consent never deletes past evidence. It adds a permanent withdrawal receipt, and every later decision for that consent resolves to WITHDRAWN. Record the consent receipt being withdrawn and the channel where the person asked.
+Withdrawing consent never deletes past evidence. It adds a permanent withdrawal receipt, and every later decision for that consent resolves to WITHDRAWN.
+To withdraw consent:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. Open the **Privacy & Cross-Border Data Transfer Governance** page of the console.
+3. Go to **Withdraw Consent (Right to Revoke)**.
+4. Enter the **Consent Receipt ID** being withdrawn and the **Revocation Channel** where the person asked.
+5. Submit the form.
 
 ## Subject Preference Assertion
 
@@ -39,16 +52,46 @@ Register a privacy notice records the version of the notice a person was shown, 
 
 ## Register Transfer Mechanism
 
-A transfer mechanism is the legal basis for sending personal data across borders: standard contractual clauses, binding corporate rules, an adequacy decision or a specific derogation. Record its evidence reference, the conditions and safeguards, and when it expires.
+A transfer mechanism is the legal basis for sending personal data across borders: standard contractual clauses, binding corporate rules, an adequacy decision or a specific derogation.
+To register a transfer mechanism:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. Open the **Privacy & Cross-Border Data Transfer Governance** page of the console.
+3. Go to **Register Transfer Mechanism**.
+4. Choose the **Mechanism Type** and enter the **Evidence Reference / Legal Instrument**.
+5. Add the **Conditions & Safeguards Summary** and the **Valid Until** date.
+6. Select **Create Mechanism**.
 
 ## Register Processor Relationship
 
-A processor relationship records which controller hands data to which processor, for what service, under which data processing agreement, in which jurisdictions, and for which data categories and people. Downstream subprocessors are attached to it.
+A processor relationship records which controller hands data to which processor, for what service and under which data processing agreement.
+To register a processor relationship:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. Open the **Privacy & Cross-Border Data Transfer Governance** page of the console.
+3. Go to **Register Processor Relationship**.
+4. Enter the **Data Controller Ref**, the **Data Processor Ref**, the **Service Scope** and the **Processing Instructions**.
+5. Add the **DPA Contract Reference**, the **Governing Jurisdictions**, the **Data Categories** and the **Data Subject Classes**.
+6. Select **Create Processor Relationship**.
+Downstream subprocessors are attached to the relationship afterwards.
 
 ## Record Transfer Risk Assessment
 
-A transfer risk assessment records the outcome for a processor relationship: approve, remediate (human review required) or reject. It includes the residual risk analysis, an evidence reference and a review date.
+A transfer risk assessment records the outcome for a processor relationship: approve, remediate (human review required) or reject.
+To record a transfer risk assessment:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. Open the **Privacy & Cross-Border Data Transfer Governance** page of the console.
+3. Go to **Record Transfer Risk Assessment**.
+4. Choose the **Target Relationship** and the **Evaluation Outcome**.
+5. Enter the **Residual Risk Analysis**, the **Assessment Evidence Reference** and the **Review Trigger / Expiry Date**.
+6. Select **Record Assessment**.
 
 ## Runtime transfer evaluation
 
-The runtime transfer gate decides whether a transfer may happen now. It checks the relationship's status, whether the safeguard is still valid, and the risk assessment outcome, and it fails closed: a missing or rejected safeguard blocks the transfer. Each decision produces a receipt with its reason codes.
+The runtime transfer gate decides whether a transfer may happen now, and fails closed: a missing or rejected safeguard blocks the transfer.
+To evaluate a transfer:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. Open the **Privacy & Cross-Border Data Transfer Governance** page of the console.
+3. Go to the runtime transfer evaluation gate.
+4. Choose the **Processor Relationship**, the **Transfer Mechanism** and the **Destination Jurisdiction**.
+5. Choose whether to **Enforce Assessment Requirement**.
+6. Select **Evaluate Transfer Decision**.
+Each decision produces a receipt with its reason codes.

@@ -27,20 +27,53 @@ A check has three possible answers. SATISFIED means everything required is on fi
 
 ## Requirement catalog
 
-The Requirement catalog lists what each action requires, filtered by business area and action, such as INVOICE_APPROVAL. Withdrawn requirements are shown too, so an audit can see what used to be required.
+The Requirement catalog lists what each action requires. Withdrawn requirements are shown too, so an audit can see what used to be required.
+To filter the catalog:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Evidence**.
+3. Go to the **Requirement catalog**.
+4. Enter the **Business area** and the **Action**, such as INVOICE_APPROVAL.
+5. Select **Filter catalog**.
 
 ## Check an action
 
-Check an action is the gate itself. Choose the business area and the action, then list the evidence you hold, one item per line: the kind, such as SUPPORTING_DOCUMENT, SIGNATURE, APPROVAL_RECORD, RECONCILIATION_PROOF or THIRD_PARTY_CONFIRMATION, and its reference. Leave it blank to see what would be required. Documents are looked up to confirm they exist.
+Check an action is the gate itself: it says whether the paperwork an action needs is on file.
+To check an action:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Evidence**.
+3. Go to **Check an action**.
+4. Enter the **Action to check**.
+5. In **Evidence you say exists**, list the evidence you hold, one item per line, with its kind (such as SIGNATURE or SUPPORTING_DOCUMENT) and reference. Leave it blank to see what would be required.
+6. Select **Check this action**.
+The answer is SATISFIED, MISSING (with what to produce) or NO_REQUIREMENTS_DEFINED, which is not an approval.
 
 ## Look up a past check
 
-Every check is kept exactly as it was made and never rewritten, so an old check still shows what was required and supplied at that moment, even after the requirements change.
+Every check is kept exactly as it was made, so an old check still shows what was required and supplied at that moment.
+To look up a past check:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Evidence**.
+3. Go to **Look up a past check**.
+4. Enter the **Reference for a past check**, or a **Reference for a requirement**.
 
 ## Add a requirement
 
-Add a requirement saves straight away: choose the business area, the action to gate, who it applies to, the evidence needed, how many are needed, an optional narrower kind such as SIGNED_CONTRACT, and what to produce, which is shown to anyone it stops.
+Add a requirement sets out what evidence an action needs, and saves straight away.
+To add a requirement:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Evidence**.
+3. Go to **Add a requirement**.
+4. Enter the **Business area**, the **Action to gate** and **Who it applies to**.
+5. Choose the **Evidence needed** and **How many are needed**, and optionally **Narrow it to one kind**, such as SIGNED_CONTRACT.
+6. Enter **What to produce**, which is shown to anyone it stops.
+7. Select **Add requirement**.
 
 ## Withdraw a requirement
 
-Withdrawing sets the date a requirement stopped applying and needs a reason. Nothing is deleted, so past decisions can still be checked against what applied then.
+Withdrawing sets the date a requirement stopped applying. Nothing is deleted, so past decisions can still be checked against what applied then.
+To withdraw a requirement:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Evidence**.
+3. Go to **Withdraw a requirement**.
+4. Enter the **Requirement reference** and **Why** it is withdrawn.
+5. Select **Withdraw requirement**.

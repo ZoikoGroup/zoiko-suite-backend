@@ -185,6 +185,10 @@
                                      "approvals",
                                      "exceptions"
                                  ],
+                     "support access":  [
+                                           "temporary",
+                                           "password"
+                                       ],
                      "logs":  [
                                   "evidence",
                                   "records"

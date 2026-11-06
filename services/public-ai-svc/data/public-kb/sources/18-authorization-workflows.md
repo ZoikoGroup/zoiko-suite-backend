@@ -35,11 +35,26 @@ Check access asks exactly what a service asks before it acts, for a person, an a
 
 ## Grant role
 
-Grant role gives a person a role for a legal entity from a start date. A privileged role is held for an independent approver unless you have approval rights, and it grants nothing until approved. Revoking a grant takes effect on the next permission check.
+Grant role gives a person a role for a legal entity from a start date.
+To grant a role:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Authorization**.
+3. Select **Grant role**.
+4. Enter the **Person (principal ID)**, the **Role**, what it **Applies to** and the **Legal entity**.
+5. Set **Starts** and, if the grant should end, **Ends**, and add an **Approval reference** if you have one.
+6. Select **Grant**.
+A privileged role is held for an independent approver and grants nothing until approved. Revoking a grant takes effect on the next permission check.
 
 ## Elevated access lifecycle
 
-Elevated access covers just-in-time, emergency and support sessions. Each is requested, becomes active, names exact actions, ends on its own, and is then due for review until someone attests to what was done with it.
+Elevated access covers just-in-time, emergency and support sessions. Each is requested, becomes active, names exact actions, ends on its own, and is then reviewed until someone attests to what was done with it.
+To request just-in-time access:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Authorization**.
+3. Select **Request JIT access**.
+4. Enter the **Actions**, **For (principal ID)**, the **Ticket**, the **Resource**, the **Environment**, the **Hours** needed and a **Reason**.
+5. Select **Request**.
+Emergency access uses **Break glass** with an incident reference and is reviewed after it ends.
 
 ## Workflows & Approvals
 
@@ -47,11 +62,28 @@ Workflows & Approvals runs multi-stage approvals for actions that need more than
 
 ## Start a workflow
 
-Start a workflow opens an approval for something that needs one. Enter the workflow type, the legal entity, what is being approved, such as a purchase order and its ID, an optional person to escalate to, and either a saved route or the stages: for each stage, who decides and a deadline in hours. You cannot approve your own workflow.
+Start a workflow opens an approval for something that needs one.
+To start a workflow:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Workflows & Approvals**.
+3. Go to **Start a workflow**.
+4. Enter the **Workflow type**, the **Legal entity** and **What is being approved**, such as a purchase order and its ID.
+5. Optionally choose who to **Escalate to**.
+6. Pick a saved **Route**, or add stages: for each, **Who decides**, the approver or approver pool, the **Approvals needed** and a **Deadline**.
+7. Select **Start workflow**.
+You cannot approve a workflow you started, and nobody decides two stages of the same workflow.
 
 ## Decide the current stage
 
-A workflow stage can be decided by the stage's named approver, their delegate, a holder of the stage's role or the person it was escalated to, who records Approve or Reject, and a reason is required to reject. Each decision is checked against authorization and recorded. Escalate, cancel, reopen or invalidate changes a workflow without deciding it, and each needs its own permission.
+A workflow stage can be decided by the stage's named approver, their delegate, a holder of the stage's role or the person it was escalated to.
+To decide the current stage:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Workflows & Approvals**.
+3. Go to **Decide the current stage**.
+4. Enter the **Workflow ID** and choose Approve or Reject.
+5. Give a **Reason**; a reason is required to reject.
+6. Select **Record decision**.
+Each decision is checked against authorization and recorded.
 
 ## Waiting for a decision
 
@@ -59,11 +91,25 @@ Waiting for a decision lists pending and escalated workflows in your organizatio
 
 ## Escalate, cancel, reopen or invalidate
 
-These change a workflow without deciding it. Escalate passes the current stage to the escalation contact, cancel stops a workflow, reopen returns a closed one for a fresh decision, and invalidate voids an approval whose subject has changed. Each needs its own permission.
+These change a workflow without deciding it. Escalate passes the current stage on, cancel stops a workflow, reopen returns a closed one for a fresh decision, and invalidate voids an approval whose subject has changed.
+To change a workflow:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Workflows & Approvals**.
+3. Go to **Escalate, cancel, reopen or invalidate**.
+4. Enter the **Workflow ID** and choose the **Action**.
+5. When escalating, enter who to **Escalate to (principal ID)**.
+6. Add a **Reason code**, a **Reason** and the **Version you last read**, then submit.
+Each of these actions needs its own permission.
 
 ## Can this approval still be released against?
 
-An approval is tied to a fingerprint of what was approved. Before anything is released against it, the platform checks that the subject has not changed since, so an approval cannot be reused for something different.
+An approval is tied to a fingerprint of what was approved, so it cannot be reused for something that has changed since.
+To check an approval:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Workflows & Approvals**.
+3. Go to **Can this approval still be released against?**.
+4. Enter the **Workflow ID**, the **Subject fingerprint now** and the **Subject version now**.
+5. Select **Check**.
 
 ## Workflow definitions
 
@@ -71,8 +117,22 @@ Workflow definitions are versioned routes a workflow can start from: a type, a v
 
 ## Register a definition
 
-Register a definition saves a new route: the workflow type, its version, a name and its stages.
+Register a definition saves a new versioned route a workflow can start from.
+To register a definition:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Workflows & Approvals**.
+3. Go to **Register a definition**.
+4. Enter the **Workflow type**, the **Version**, a **Name** and a **Description**, and add its stages.
+5. Select **Register definition**.
+Workflows already running keep the version they started with.
 
 ## Activate, suspend, retire or supersede
 
-Activate, suspend, retire or supersede moves a definition through its lifecycle; only an active definition can start new workflows, and a superseded one is replaced by a newer version while workflows already running keep the version they started with.
+Only an active definition can start new workflows; a superseded one is replaced by a newer version.
+To change a definition's state:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Workflows & Approvals**.
+3. Go to **Workflow definitions**.
+4. Choose the **Definition** and the **Action**, and when superseding, what it is **Replaced by**.
+5. Select **Apply**.
+Workflows already running keep the version they started with.

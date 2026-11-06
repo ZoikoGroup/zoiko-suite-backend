@@ -23,7 +23,15 @@ Obligations tracks the statutory, regulatory and contractual duties of each orga
 
 ## How to raise an obligation
 
-Raise an obligation against the legal entity that owes it and the jurisdiction it is owed to. Enter an obligation code, such as VAT-RETURN-2026-Q3, the obligation type, such as FILING, the jurisdiction, the due date, the severity, the responsible function, such as Finance, the source type and source ID, and a source reference. Every field is required, because a duty without a deadline, an owner or a traceable source cannot be acted on. The jurisdiction must already exist in Jurisdictions & Rules, so an obligation can never point at a jurisdiction that is not recorded.
+Raise an obligation records a duty against the legal entity that owes it and the jurisdiction it is owed to.
+To raise an obligation:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Obligations**.
+3. Go to **Raise an obligation**.
+4. Enter the **Obligation code** (such as VAT-RETURN-2026-Q3), the **Obligation type** (such as FILING), the jurisdiction and the **Due date**.
+5. Enter the **Severity**, the **Responsible function** (such as Finance), the **Source type**, the **Source ID** and the **Source reference**.
+6. Select **Raise obligation**.
+Every field is required, and the jurisdiction must already exist in Jurisdictions & Rules.
 
 ## Read this register knowing three things
 
@@ -31,16 +39,41 @@ Nothing moves an obligation to OVERDUE automatically when its due date passes, s
 
 ## Obligation register
 
-The Obligation register lists obligations for your legal entity. Filter it by status, type, due-after and due-before dates and scope.
+The Obligation register lists obligations for your legal entity.
+To filter the register:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Obligations**.
+3. Go to the **Obligation register**.
+4. Choose any of **Status**, **Type**, **Due after**, **Due before** and **Scope**.
+5. Select **Filter register**.
 
 ## Move an obligation's status
 
-An obligation moves from OPEN to IN_PROGRESS, OVERDUE or CLOSED; from IN_PROGRESS to OVERDUE or CLOSED; and from OVERDUE to CLOSED. CLOSED is final: nothing reopens a discharged obligation. Asking for the status an obligation already has changes nothing, and any other move is refused.
+An obligation moves from OPEN to IN_PROGRESS, OVERDUE or CLOSED; from IN_PROGRESS to OVERDUE or CLOSED; and from OVERDUE to CLOSED.
+To move an obligation's status:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Obligations**.
+3. Go to **Move an obligation's status**.
+4. Enter the **Obligation ID** and choose the **New status**.
+5. Select **Update status**.
+CLOSED is final: nothing reopens a discharged obligation, and any other move is refused.
 
 ## Record a filing requirement
 
-A filing requirement sits beneath an obligation: choose the obligation, the filing type, such as VAT_RETURN, the filing authority, such as HMRC, and the submission channel, such as API. Filing requirements are recorded as PENDING and stay PENDING, so they record that a filing is required, never that it was made.
+A filing requirement sits beneath an obligation and records that a filing is required, never that it was made.
+To record a filing requirement:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Obligations**.
+3. Go to **Record a filing requirement**.
+4. Enter the **Obligation ID**, the **Filing type** (such as VAT_RETURN), the **Filing authority** (such as HMRC) and the **Submission channel** (such as API).
+5. Select **Record filing requirement**.
+Filing requirements are recorded as PENDING and stay PENDING.
 
 ## Read a stored record
 
-Read a stored record looks up one obligation by its ID, including when it closed and its source references, or lists the filing requirements recorded for an obligation.
+Read a stored record looks up one obligation, including when it closed and its source references, or the filing requirements recorded for it.
+To read a stored record:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Governance Platform**, then select **Obligations**.
+3. Go to **Read a stored record**.
+4. Enter the **Obligation ID**, or use **Filing requirements for an obligation** to list its filing requirements.

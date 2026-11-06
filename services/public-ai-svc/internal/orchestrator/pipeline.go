@@ -508,6 +508,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		if rerouted {
 			kq.IntentID = ""
 		}
+		kq.HowTo = howToRe.MatchString(dec.Redaction.Text)
 		searchStart := time.Now()
 		r := snap.Retriever.Retrieve(ctx, kq, snap)
 		metrics.ObserveStage("retrieval", time.Since(searchStart))
@@ -1260,3 +1261,7 @@ func reviewedAt(s knowledge.Source) string {
 	}
 	return ""
 }
+
+// howToRe asks how to do something in the product: such a question is
+// answered from a section written as steps when one matches.
+var howToRe = regexp.MustCompile(`(?i)^\s*(?:how\s+(?:do|can|should|would)\s+(?:i|we|you|one)\b|how\s+to\b|what\s+are\s+the\s+steps\b|steps?\s+(?:to|for)\b|walk\s+me\s+through\b|guide\s+me\b|use\s+of\b)`)
