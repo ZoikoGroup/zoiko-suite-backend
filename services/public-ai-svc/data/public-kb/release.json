@@ -163,8 +163,7 @@
                                          "request"
                                      ],
                      "order":  [
-                                   "purchase",
-                                   "request"
+                                   "purchase"
                                ],
                      "connectors":  [
                                         "integrations"
@@ -180,6 +179,16 @@
                      "admissible":  [
                                         "admissibility"
                                     ],
+                     "my work":  [
+                                     "assigned",
+                                     "tasks",
+                                     "approvals",
+                                     "exceptions"
+                                 ],
+                     "support access":  [
+                                           "temporary",
+                                           "password"
+                                       ],
                      "logs":  [
                                   "evidence",
                                   "records"

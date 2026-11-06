@@ -28,6 +28,19 @@ reference and writes `publicai.kill_switch.changed.v1` to the outbox.
 Each artifact rolls back independently (Doc 08 §01): app image, prompt/policy (ships with the app
 image; see `artifacts.prompt_policy` in the manifest), knowledge release, claim release.
 
+## Promotion freeze (Doc 08 §13, OPR-021/029)
+
+Alerts labelled `freeze_promotion="true"` (error-budget burns, a revocation caught at commit) mean
+no new release may be promoted until the incident is closed. The on-call sets the freeze:
+`kbctl flag -name promotion_frozen -value true -actor <you> -approval <incident>`. While it is on,
+`kbctl promote` refuses every promotion; `kbctl promote -rollback` still works, because rollback is the
+recovery. Clear it with `-value false` and a second approval once the incident is resolved.
+
+Dashboards: the isolated stack's Grafana is `public-ai-grafana` (127.0.0.1:3002), whose only data
+source is `public-ai-prometheus`. The "Useful grounded resolution", "tokens per 1,000 useful
+resolutions", "Knowledge index health" and "Privacy and revocation integrity" panels read the
+recording rules and gauges added for Doc 08 §12/§15/§25 and Doc 03 §22.
+
 ## RB-01 Model provider degraded (Doc 08 §16)
 
 Providers: the deterministic mock (dev/test only) and Groq (`MODEL_PROVIDER=groq`, which outside dev/test
@@ -144,6 +157,52 @@ textfile collector).
 2. A failing `citation`/`abstain`/`boundary` step is a behaviour change: compare with the last release
    (RB-04) and the abstain-rate panel (RB-02). A failing `ready`/`session` step is RB-09.
 3. `PublicAICanaryStale` means the scheduler or the textfile collector stopped: fix the job, not the service.
+
+## RB-12 Release record, sign-offs and audit export
+
+Doc 08 §06/§33, OPR-002/048, Doc 09 ADM-T006, Doc 11 §24.
+
+1. **Policy bundle:** `kbctl policy-sign` (signers' key) prints `PUBLIC_AI_POLICY_DIGEST` and
+   `PUBLIC_AI_POLICY_SIGNATURE`; deploy both. Outside dev/test the server refuses to start unless the
+   running policy matches the digest and the signature verifies with the release signing key.
+2. **Manifest:** `kbctl manifest … -actor <you> -approval <change>` writes the signed manifest and records
+   its fingerprint in the hash-chained control audit.
+3. **Sign-offs:** each approver runs `kbctl signoff -file release-manifest.json -role <product|cto|security|dpo|qa|sre|founder> -actor <name> -approval <ref>`.
+4. **Deploy check:** `kbctl verify-manifest -file release-manifest.json -require-all` must pass before
+   production: signature valid, exact bytes recorded, every role signed.
+5. **Audit export:** `kbctl audit -export <file> -purpose "<why>" -actor <you> -approval <ref>`. The export
+   is recorded in the audit first, includes the chain check, and is written with owner-only permissions.
+
+## RB-11 Rotating secrets and keys
+
+Doc 06 §12. Rotate on schedule (set by Security, DEC-09), on staff departure, and at once on any
+suspected exposure. Every rotation is a change with an approval reference; record it with
+`kbctl audit` and check `kbctl audit -verify` afterwards.
+
+| Secret | Where | Rotation |
+|---|---|---|
+| Release signing key (Ed25519) | private key offline with the release signers; public key in `PUBLIC_AI_SIGNING_PUBLIC_KEY` | Below. Tested by `release.TestSigningKeyRotation`. |
+| Model provider key (`GROQ_API_KEY`) | secret manager → service env | Issue the new key at the provider, deploy it, confirm `public_ai_model_requests_total{outcome="ok"}` rises, then revoke the old key at the provider. |
+| Database password (`PUBLIC_AI_DB_PASSWORD`) | secret manager → compose / service env | `ALTER ROLE public_ai_app PASSWORD …` in a transaction, deploy the new value, restart replicas one by one (each reconnects), confirm readiness. |
+| Rate-limit salt (`PUBLIC_AI_RATE_KEY_SALT`) | secret manager → every replica | Deploy the same new value to all replicas together. Counts restart from zero for one minute; nothing else changes. |
+| Policy digest (`PUBLIC_AI_POLICY_DIGEST`) | release record | Not a secret: it changes with an approved policy bundle (RB-04). |
+
+Session grants are random tokens with no signing key: ending every session (`kbctl` maintenance or a
+restart with an empty session table) is the only "rotation", and visitors simply start a new chat.
+
+**Release signing key:**
+
+1. `kbctl keygen` on the signers' offline machine. Store the new private key under the same custody
+   as the old one (DEC-09).
+2. Re-sign the current content as **new release ids**: releases are immutable (migration 000007), so
+   `kbctl build-kb`/`build-claims` with the new key, then
+   `PUBLIC_AI_SIGNING_PUBLIC_KEY=<new public key> kbctl publish -file …` (publish verifies with that key).
+3. `kbctl promote` the new KB and claims releases. Running replicas (old key) refuse them and keep
+   serving the last good snapshot: this is expected for the few minutes of the switch.
+4. Deploy `PUBLIC_AI_SIGNING_PUBLIC_KEY=<new public key>` and restart replicas. Readiness returns once the
+   rotated releases load.
+5. Retire the old private key. Rolling back to a release signed with it now fails closed; to roll
+   back content, re-sign the older content with the new key (step 2) and promote that.
 
 ## Alert → runbook map
 

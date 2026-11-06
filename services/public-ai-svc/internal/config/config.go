@@ -24,6 +24,15 @@ type Config struct {
 	AdminAddr    string
 	DatabaseURL  string
 	KafkaBrokers []string
+	// Kafka producer security (Doc 05 §20-22): TLS, SASL/SCRAM producer
+	// authentication and Ed25519-signed events; required outside dev/test
+	// whenever brokers are configured.
+	KafkaTLS           bool
+	KafkaSASLMechanism string
+	KafkaUsername      string
+	KafkaPassword      string
+	EventSigningKey    string
+	EventSignerID      string
 
 	AllowedOrigins []string
 	// AllowedHosts, when set, restricts the Host header (Doc 04 §08, A02).
@@ -39,7 +48,10 @@ type Config struct {
 	// PolicyDigest is the approved policy fingerprint (required outside
 	// dev/test, Doc 06 §08). ProviderApprovalRef and ProviderRegion record
 	// the DPA/transfer approval for a remote model provider (SEC-P0-06).
-	PolicyDigest        string
+	PolicyDigest string
+	// PolicySignature is the signers' Ed25519 signature over the digest
+	// (kbctl policy-sign); required with the digest outside dev/test.
+	PolicySignature     string
 	ProviderApprovalRef string
 	ProviderRegion      string
 	ApprovedRegions     []string // DPA/transfer-approved regions (DEC-05)
@@ -86,6 +98,10 @@ type Config struct {
 	// RateLimitSessionCreatePerMin is the tighter per-IP limit on new
 	// sessions (Doc 06 §13, SEC-T055).
 	RateLimitSessionCreatePerMin int
+	// RateKeySalt (PUBLIC_AI_RATE_KEY_SALT) is the secret shared by every
+	// replica: limit keys are HMACs with it, so all replicas count the same
+	// visitor in one shared window (Doc 06 §13). Empty: per-replica only.
+	RateKeySalt string
 	// TrustedProxies are the CIDRs whose X-Forwarded-For is believed when
 	// keying the per-IP limit (the console's same-origin proxy, the edge).
 	TrustedProxies      []string
@@ -115,6 +131,12 @@ func Load() (Config, error) {
 		AdminAddr:                os.Getenv("PUBLIC_AI_ADMIN_ADDR"),
 		DatabaseURL:              os.Getenv("PUBLIC_AI_DATABASE_URL"),
 		KafkaBrokers:             splitList(os.Getenv("PUBLIC_AI_KAFKA_BROKERS")),
+		KafkaTLS:                 os.Getenv("PUBLIC_AI_KAFKA_TLS") == "true",
+		KafkaSASLMechanism:       os.Getenv("PUBLIC_AI_KAFKA_SASL_MECHANISM"),
+		KafkaUsername:            os.Getenv("PUBLIC_AI_KAFKA_USERNAME"),
+		KafkaPassword:            os.Getenv("PUBLIC_AI_KAFKA_PASSWORD"),
+		EventSigningKey:          os.Getenv("PUBLIC_AI_EVENT_SIGNING_KEY"),
+		EventSignerID:            os.Getenv("PUBLIC_AI_EVENT_SIGNER_ID"),
 		AllowedOrigins:           splitList(env("PUBLIC_AI_ALLOWED_ORIGINS", "http://localhost:3000")),
 		AllowedHosts:             splitList(os.Getenv("PUBLIC_AI_ALLOWED_HOSTS")),
 		PolicyVersion:            env("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
@@ -133,6 +155,7 @@ func Load() (Config, error) {
 		// mean dev and switch the production gates off.
 		Environment:                  os.Getenv("PUBLIC_AI_ENVIRONMENT"),
 		PolicyDigest:                 os.Getenv("PUBLIC_AI_POLICY_DIGEST"),
+		PolicySignature:              os.Getenv("PUBLIC_AI_POLICY_SIGNATURE"),
 		ProviderApprovalRef:          os.Getenv("PUBLIC_AI_PROVIDER_APPROVAL_REF"),
 		ProviderRegion:               os.Getenv("PUBLIC_AI_REGION"),
 		ApprovedRegions:              splitList(os.Getenv("PUBLIC_AI_APPROVED_REGIONS")),
@@ -150,6 +173,7 @@ func Load() (Config, error) {
 		RateLimitPerIPPerMinute:      envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
 		RateLimitPerSessionPerMin:    envInt("PUBLIC_AI_RATE_LIMIT_SESSION_PER_MIN", 20),
 		RateLimitSessionCreatePerMin: envInt("PUBLIC_AI_RATE_LIMIT_SESSION_CREATE_PER_MIN", 10),
+		RateKeySalt:                  os.Getenv("PUBLIC_AI_RATE_KEY_SALT"),
 		TrustedProxies:               splitList(env("PUBLIC_AI_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
 		DailyTokenCeiling:            int64(envInt("PUBLIC_AI_DAILY_TOKEN_CEILING", 2_000_000)),
 		MonthlyTokenCeiling:          int64(envInt("PUBLIC_AI_MONTHLY_TOKEN_CEILING", 40_000_000)),
@@ -221,6 +245,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("a remote model provider outside dev/test needs PUBLIC_AI_PROVIDER_APPROVAL_REF (DPA/transfer approval, SEC-P0-06)")
 	case c.ModelProvider != "mock" && !devLike && (c.ProviderRegion == "" || !contains(c.ApprovedRegions, c.ProviderRegion)):
 		return fmt.Errorf("PUBLIC_AI_REGION %q is not in PUBLIC_AI_APPROVED_REGIONS: no provider request without an approved region (SEC-P0-06)", c.ProviderRegion)
+	case !devLike && c.PolicyDigest != "" && c.PolicySignature == "":
+		return fmt.Errorf("PUBLIC_AI_POLICY_SIGNATURE is required outside dev/test: the policy digest must be signed by the release signers (Doc 08 OPR-002)")
 	case !devLike && c.PolicyDigest == "":
 		return fmt.Errorf("PUBLIC_AI_POLICY_DIGEST is required outside dev/test: the service runs only the approved policy (Doc 06 A08)")
 	case !devLike && len(c.AllowedHosts) == 0:
@@ -237,6 +263,14 @@ func (c Config) Validate() error {
 		return fmt.Errorf("PUBLIC_AI_STRUCTURED_RESPONSE is dev/test only: elsewhere set structured_response_enabled with an approval")
 	case !devLike && c.DatabaseURL == "":
 		return fmt.Errorf("PUBLIC_AI_DATABASE_URL is required outside dev/test: refusing to fall back to in-memory storage")
+	case !devLike && len(c.KafkaBrokers) > 0 && (!c.KafkaTLS || c.KafkaSASLMechanism == "" || c.EventSigningKey == ""):
+		return fmt.Errorf("with PUBLIC_AI_KAFKA_BROKERS outside dev/test, PUBLIC_AI_KAFKA_TLS=true, PUBLIC_AI_KAFKA_SASL_MECHANISM and PUBLIC_AI_EVENT_SIGNING_KEY are required (Doc 05 §20-22)")
+	case c.KafkaSASLMechanism != "" && c.KafkaSASLMechanism != "SCRAM-SHA-512" && c.KafkaSASLMechanism != "SCRAM-SHA-256":
+		return fmt.Errorf("PUBLIC_AI_KAFKA_SASL_MECHANISM must be SCRAM-SHA-512 or SCRAM-SHA-256")
+	case !devLike && c.AdminAddr == "":
+		return fmt.Errorf("PUBLIC_AI_ADMIN_ADDR is required outside dev/test: /metrics and /health stay off the public listener (Doc 06 §12)")
+	case !devLike && len(c.RateKeySalt) < 32:
+		return fmt.Errorf("PUBLIC_AI_RATE_KEY_SALT (at least 32 characters, the same on every replica) is required outside dev/test: quotas must hold across replicas (Doc 06 §13)")
 	}
 	if err := validateRetention(c); err != nil {
 		return err

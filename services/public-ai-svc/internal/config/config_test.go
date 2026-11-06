@@ -36,7 +36,7 @@ func TestProductionGates(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Fatal("production without a policy digest must refuse to start")
 	}
-	c.PolicyDigest = "abc"
+	c.PolicyDigest, c.PolicySignature = "abc", "c2ln"
 	if err := c.Validate(); err == nil {
 		t.Fatal("a remote provider without approval must refuse to start")
 	}
@@ -45,6 +45,11 @@ func TestProductionGates(t *testing.T) {
 		t.Fatalf("production without a Host allowlist must refuse to start: %v", err)
 	}
 	c.AllowedHosts = []string{"assistant.example.test"}
+	c.PolicySignature = ""
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_POLICY_SIGNATURE") {
+		t.Fatalf("an unsigned policy digest must refuse to start: %v", err)
+	}
+	c.PolicySignature = "c2ln"
 	if err := c.Validate(); err != nil && containsAny(err.Error(), "POLICY_DIGEST", "PROVIDER_APPROVAL_REF", "ALLOWED_HOSTS") {
 		t.Fatalf("all gates satisfied but still refused for them: %v", err)
 	}
@@ -82,7 +87,7 @@ func TestNonDevRequiresDatabase(t *testing.T) {
 	c.Environment, c.RetentionSet = "production", true
 	c.ModelProvider, c.GroqAPIKey = "groq", "test-key"
 	c.ModelID = c.AllowedModelIDs[0]
-	c.PolicyDigest = "policy-digest"
+	c.PolicyDigest, c.PolicySignature = "policy-digest", "c2ln"
 	c.AllowedHosts = []string{"assistant.example.test"}
 	c.ProviderApprovalRef, c.ProviderRegion, c.ApprovedRegions = "DPA-2026-01", "eu-west", []string{"eu-west"}
 	c.KBAllowDraft, c.SeedOnStart, c.StructuredResponseDev = false, false, false
@@ -92,6 +97,14 @@ func TestNonDevRequiresDatabase(t *testing.T) {
 	}
 	c.DatabaseURL = "postgres://example/public_ai"
 	c.AllowedOrigins = []string{"https://www.zoikosuite.example"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_ADMIN_ADDR") {
+		t.Fatalf("non-dev must keep /metrics and /health off the public listener: %v", err)
+	}
+	c.AdminAddr = ":9091"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_RATE_KEY_SALT") {
+		t.Fatalf("non-dev must share rate limits across replicas: %v", err)
+	}
+	c.RateKeySalt = strings.Repeat("s", 32)
 	if err := c.Validate(); err != nil {
 		t.Fatalf("valid production config refused: %v", err)
 	}
@@ -107,12 +120,14 @@ func validProduction(t *testing.T) Config {
 	c.Environment, c.RetentionSet = "production", true
 	c.ModelProvider, c.GroqAPIKey = "groq", "test-key"
 	c.ModelID = c.AllowedModelIDs[0]
-	c.PolicyDigest = "policy-digest"
+	c.PolicyDigest, c.PolicySignature = "policy-digest", "c2ln"
 	c.AllowedHosts = []string{"assistant.example.test"}
 	c.ProviderApprovalRef, c.ProviderRegion, c.ApprovedRegions = "DPA-2026-01", "eu-west", []string{"eu-west"}
 	c.KBAllowDraft, c.SeedOnStart, c.StructuredResponseDev = false, false, false
 	c.DatabaseURL = "postgres://example/public_ai"
 	c.AllowedOrigins = []string{"https://www.zoikosuite.example"}
+	c.AdminAddr = ":9091"
+	c.RateKeySalt = strings.Repeat("s", 32)
 	if err := c.Validate(); err != nil {
 		t.Fatalf("baseline production config refused: %v", err)
 	}
@@ -181,5 +196,23 @@ func TestAdminAddr(t *testing.T) {
 	c.AdminAddr = c.HTTPAddr
 	if err := c.Validate(); err == nil {
 		t.Fatal("admin addr equal to the public addr must be refused")
+	}
+}
+
+// Doc 05 §20-22: outside dev/test a broker connection needs TLS, SASL and
+// an event signing key.
+func TestKafkaSecurityRequiredInProduction(t *testing.T) {
+	c := validProduction(t)
+	c.KafkaBrokers = []string{"kafka-1:9093"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "PUBLIC_AI_KAFKA_TLS") {
+		t.Fatalf("plain brokers accepted: %v", err)
+	}
+	c.KafkaTLS, c.KafkaSASLMechanism, c.EventSigningKey = true, "SCRAM-SHA-512", "key"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("secured brokers refused: %v", err)
+	}
+	c.KafkaSASLMechanism = "PLAIN"
+	if err := c.Validate(); err == nil {
+		t.Fatal("an unsupported SASL mechanism must be refused")
 	}
 }

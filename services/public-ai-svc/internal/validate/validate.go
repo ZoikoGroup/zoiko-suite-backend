@@ -6,6 +6,7 @@ package validate
 import (
 	"errors"
 	"regexp"
+	"slices"
 	"strings"
 
 	claimreg "zoiko.io/public-ai-svc/internal/claims"
@@ -32,9 +33,11 @@ var (
 )
 
 var (
-	urlRe    = regexp.MustCompile(`(?i)\b(?:https?://|www\.)\S+|\b[a-z0-9-]+\.(?:com|net|org|io|ai|co|uk|example|invalid)(?:/\S*)?`)
-	emailRe  = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
-	phoneRe  = regexp.MustCompile(`\+?\d[\d\s().-]{7,}\d`)
+	urlRe   = regexp.MustCompile(`(?i)\b(?:https?://|www\.)\S+|\b[a-z0-9-]+\.(?:com|net|org|io|ai|co|uk|example|invalid)(?:/\S*)?`)
+	emailRe = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+	// phoneRe never spans a line break: "10000).\n5. Select" is the end of
+	// one numbered step and the start of the next, not a phone number.
+	phoneRe  = regexp.MustCompile(`\+?\d[\d \t().-]{7,}\d`)
 	markupRe = regexp.MustCompile(`(?i)<\s*/?\s*[a-z][^>]*>|javascript:|on[a-z]+\s*=|\]\(|!\[`)
 	numberRe = regexp.MustCompile(`\d+(?:[.,]\d+)*%?`)
 	toolRe   = regexp.MustCompile(`(?i)tool_call|function_call|"tool"\s*:|<\s*tool|call_tool|execute_action|"arguments"\s*:`)
@@ -146,7 +149,80 @@ func Check(d model.Draft, claims []model.ClaimCard, evidence []model.Evidence) (
 			return "", ErrUnsupportedFact
 		}
 	}
+	// Doc 03 §19 claim-to-span check (citation laundering): each substantive
+	// sentence must be supported by what the draft itself cites, not merely
+	// by something else it was shown.
+	if !spansSupported(text, citedText(d, claims, evidence)) {
+		return "", ErrUnsupportedSpan
+	}
 	return truncateWords(text, MaxFullWords), nil
+}
+
+// ErrUnsupportedSpan: a sentence is not supported by the sources it cites.
+var ErrUnsupportedSpan = errors.New("a sentence is not supported by its cited sources")
+
+func citedText(d model.Draft, claims []model.ClaimCard, evidence []model.Evidence) string {
+	var b strings.Builder
+	for _, c := range claims {
+		if slices.Contains(d.ClaimRefs, c.Ref) {
+			b.WriteString(c.Statement + " ")
+		}
+	}
+	for _, e := range evidence {
+		if slices.Contains(d.EvidenceRefs, e.Ref) {
+			b.WriteString(e.Title + " " + e.Text + " ")
+		}
+	}
+	return b.String()
+}
+
+var (
+	sentenceSplitRe = regexp.MustCompile(`[^.!?\n]+[.!?]?`)
+	wordRe          = regexp.MustCompile(`[\p{L}\p{N}]+`)
+	stopwords       = map[string]bool{"about": true, "after": true, "also": true, "because": true, "before": true, "being": true,
+		"between": true, "could": true, "does": true, "each": true, "from": true, "have": true, "into": true, "more": true,
+		"most": true, "other": true, "over": true, "such": true, "than": true, "that": true, "their": true, "them": true,
+		"then": true, "there": true, "these": true, "they": true, "this": true, "those": true, "through": true, "under": true,
+		"what": true, "when": true, "where": true, "which": true, "while": true, "with": true, "within": true, "would": true,
+		"your": true, "zoikosuite": true, "will": true, "can't": true, "cannot": true, "should": true, "some": true, "only": true}
+)
+
+// stem is a crude prefix stem: "approvals", "approved" and "approval" match.
+func stem(w string) string {
+	if len(w) > 5 {
+		return w[:5]
+	}
+	return w
+}
+
+// spansSupported reports whether every sentence with at least five content
+// words has at least half of them in the cited text.
+func spansSupported(text, cited string) bool {
+	have := map[string]bool{}
+	for _, w := range wordRe.FindAllString(strings.ToLower(cited), -1) {
+		have[stem(w)] = true
+	}
+	for _, sent := range sentenceSplitRe.FindAllString(text, -1) {
+		var words []string
+		for _, w := range wordRe.FindAllString(strings.ToLower(sent), -1) {
+			if len(w) >= 4 && !stopwords[w] {
+				words = append(words, w)
+			}
+		}
+		if len(words) < 5 {
+			continue
+		}
+		hit := 0
+		for _, w := range words {
+			if have[stem(w)] {
+				hit++
+			}
+		}
+		if hit*2 < len(words) {
+			return false
+		}
+	}
+	return true
 }
 
 func claimAllows(claims []model.ClaimCard, phrase string) bool {
@@ -184,13 +260,17 @@ var (
 	currencyRe = regexp.MustCompile(`(?i)(?:[$€£]|\b(?:XTS|USD|GBP|EUR)\b)\s?(\d+(?:[.,]\d+)*)|(\d+(?:[.,]\d+)*)\s?(?:\b(?:XTS|USD|GBP|EUR)\b|[€£])`)
 	// trialRe is a trial length: "14-day trial", "30 days free trial",
 	// "trial of 30 days", "trial lasts 14 days".
-	trialRe = regexp.MustCompile(`(?i)\b(\d+)[\s-]*days?[\s-]+(?:(?:free|self-serve)[\s-]+)?trial\b|\btrial\s+(?:period\s+)?(?:of|for|lasts?|is)\s+(\d+)\s+days?\b`)
+	// capacityRe: user, seat or entity counts (Doc 03 §17 "included
+	// users/entities": avoid an absolute capacity promise without a claim).
+	capacityRe = regexp.MustCompile(`(?i)\b(\d[\d,]*)\s+(?:legal\s+)?(?:entities|entity|users|seats|companies|subsidiaries)\b`)
+	trialRe    = regexp.MustCompile(`(?i)\b(\d+)[\s-]*days?[\s-]+(?:(?:free|self-serve)[\s-]+)?trial\b|\btrial\s+(?:period\s+)?(?:of|for|lasts?|is)\s+(\d+)\s+days?\b`)
 )
 
-// p1Figures returns the numbers in currency amounts and trial lengths.
+// p1Figures returns the numbers in currency amounts, trial lengths and
+// user/entity capacities: only a signed claim card may state them.
 func p1Figures(text string) []string {
 	var out []string
-	for _, re := range []*regexp.Regexp{currencyRe, trialRe} {
+	for _, re := range []*regexp.Regexp{currencyRe, trialRe, capacityRe} {
 		for _, m := range re.FindAllStringSubmatch(text, -1) {
 			for _, g := range m[1:] {
 				if g != "" {

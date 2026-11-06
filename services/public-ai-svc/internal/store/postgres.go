@@ -95,9 +95,9 @@ func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
 func (p *Postgres) CreateSession(ctx context.Context, s Session, key string, hash []byte) error {
 	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO public_ai.sessions
-			(session_id, grant_hash, created_at, expires_at, locale, market_code, page_context, last_seen_at, origin)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$3,$8)`,
-			s.SessionID, s.GrantHash, s.CreatedAt, s.ExpiresAt, s.Locale, s.MarketCode, s.PageContext, s.Origin); err != nil {
+			(session_id, grant_hash, created_at, expires_at, locale, market_code, page_context, last_seen_at, origin, release_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$3,$8,$9)`,
+			s.SessionID, s.GrantHash, s.CreatedAt, s.ExpiresAt, s.Locale, s.MarketCode, s.PageContext, s.Origin, s.ReleaseID); err != nil {
 			return err
 		}
 		if key == "" {
@@ -111,12 +111,12 @@ func (p *Postgres) CreateSession(ctx context.Context, s Session, key string, has
 }
 
 const sessionCols = `s.session_id, s.grant_hash, s.created_at, s.expires_at, s.locale, s.market_code, s.page_context, s.deleted_at, s.pending_context,
-	COALESCE(s.last_seen_at, s.created_at), s.tokens_used, s.origin`
+	COALESCE(s.last_seen_at, s.created_at), s.tokens_used, s.origin, s.release_id`
 
 func scanSession(row pgx.Row) (Session, error) {
 	var s Session
 	err := row.Scan(&s.SessionID, &s.GrantHash, &s.CreatedAt, &s.ExpiresAt, &s.Locale, &s.MarketCode, &s.PageContext, &s.DeletedAt, &s.PendingContext,
-		&s.LastSeenAt, &s.TokensUsed, &s.Origin)
+		&s.LastSeenAt, &s.TokensUsed, &s.Origin, &s.ReleaseID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
@@ -130,7 +130,7 @@ func (p *Postgres) SessionByIdempotencyKey(ctx context.Context, key string) (Ses
 		FROM public_ai.session_idempotency i JOIN public_ai.sessions s USING (session_id)
 		WHERE i.idempotency_key = $1`, key).
 		Scan(&s.SessionID, &s.GrantHash, &s.CreatedAt, &s.ExpiresAt, &s.Locale, &s.MarketCode, &s.PageContext, &s.DeletedAt, &s.PendingContext,
-			&s.LastSeenAt, &s.TokensUsed, &s.Origin, &hash)
+			&s.LastSeenAt, &s.TokensUsed, &s.Origin, &s.ReleaseID, &hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, nil, ErrNotFound
 	}
@@ -417,15 +417,39 @@ func (p *Postgres) RecordConflict(ctx context.Context, c Conflict) error {
 	return err
 }
 
+func (p *Postgres) ResolveConflict(ctx context.Context, id, state, evidenceRef string, audit AuditEntry) error {
+	if (state != ConflictResolved && state != ConflictDismissed) || strings.TrimSpace(evidenceRef) == "" {
+		return ErrConflictState
+	}
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE public_ai.conflicts SET resolution_state = $2, resolution_evidence_ref = $3
+			WHERE conflict_id = $1 AND resolution_state = 'OPEN'`, id, state, evidenceRef)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM public_ai.conflicts WHERE conflict_id = $1`, id).Scan(&n); err == nil && n == 0 {
+				return ErrNotFound
+			}
+			return ErrConflictState
+		}
+		audit.Action, audit.Target = "conflict."+strings.ToLower(state), id
+		return appendAudit(ctx, tx, audit)
+	})
+}
+
 func (p *Postgres) Conflicts(ctx context.Context) ([]Conflict, error) {
-	rows, err := p.pool.Query(ctx, `SELECT conflict_id, subject_key, claim_ids, detection_type, severity, resolution_state, detected_at, blocked_claim, assigned_owner
+	rows, err := p.pool.Query(ctx, `SELECT conflict_id, subject_key, claim_ids, detection_type, severity, resolution_state, detected_at, blocked_claim, assigned_owner,
+		COALESCE(resolution_evidence_ref, '')
 		FROM public_ai.conflicts ORDER BY detected_at, conflict_id`)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Conflict, error) {
 		var c Conflict
-		err := row.Scan(&c.ConflictID, &c.SubjectKey, &c.ClaimIDs, &c.DetectionType, &c.Severity, &c.ResolutionState, &c.DetectedAt, &c.BlockedClaim, &c.AssignedOwner)
+		err := row.Scan(&c.ConflictID, &c.SubjectKey, &c.ClaimIDs, &c.DetectionType, &c.Severity, &c.ResolutionState, &c.DetectedAt, &c.BlockedClaim, &c.AssignedOwner,
+			&c.ResolutionEvidenceRef)
 		return c, err
 	})
 }
@@ -452,31 +476,50 @@ func (p *Postgres) SetFlag(ctx context.Context, f Flag, events []OutboxEvent) er
 }
 
 func (p *Postgres) AppendAudit(ctx context.Context, e AuditEntry) error {
-	return appendAudit(ctx, p.pool, e)
+	// In a transaction, so the chain's advisory lock holds until commit.
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error { return appendAudit(ctx, tx, e) })
 }
 
 type execer interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
+
+// auditChainLock serialises audit appends so each row chains to the last.
+const auditChainLock = 7_001_021
 
 func appendAudit(ctx context.Context, db execer, e AuditEntry) error {
 	if e.Actor == "" || e.Approval == "" {
 		return ErrAuditIncomplete
 	}
-	_, err := db.Exec(ctx, `INSERT INTO public_ai.control_audit (action, target, actor, approval, reason, before_hash, after_hash, environment, at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, e.Action, e.Target, e.Actor, e.Approval, e.Reason, e.BeforeHash, e.AfterHash, e.Environment, e.At)
+	if _, err := db.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, auditChainLock); err != nil {
+		return err
+	}
+	err := db.QueryRow(ctx, `SELECT row_hash FROM public_ai.control_audit ORDER BY audit_id DESC LIMIT 1`).Scan(&e.PrevHash)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	e.At = e.At.UTC().Truncate(time.Microsecond) // what Postgres stores, so the hash verifies on read
+	e.RowHash = AuditRowHash(e.PrevHash, e)
+	_, err = db.Exec(ctx, `INSERT INTO public_ai.control_audit (action, target, actor, approval, reason, before_hash, after_hash, environment, at,
+		request_id, actor_role, prev_hash, row_hash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, e.Action, e.Target, e.Actor, e.Approval, e.Reason, e.BeforeHash, e.AfterHash, e.Environment, e.At,
+		e.RequestID, e.ActorRole, e.PrevHash, e.RowHash)
 	return err
 }
 
 func (p *Postgres) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) {
-	rows, err := p.pool.Query(ctx, `SELECT audit_id, action, target, actor, approval, reason, before_hash, after_hash, environment, at
+	rows, err := p.pool.Query(ctx, `SELECT audit_id, action, target, actor, approval, reason, before_hash, after_hash, environment, at,
+		request_id, actor_role, prev_hash, row_hash
 		FROM public_ai.control_audit ORDER BY audit_id DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (AuditEntry, error) {
 		var e AuditEntry
-		err := row.Scan(&e.AuditID, &e.Action, &e.Target, &e.Actor, &e.Approval, &e.Reason, &e.BeforeHash, &e.AfterHash, &e.Environment, &e.At)
+		err := row.Scan(&e.AuditID, &e.Action, &e.Target, &e.Actor, &e.Approval, &e.Reason, &e.BeforeHash, &e.AfterHash, &e.Environment, &e.At,
+			&e.RequestID, &e.ActorRole, &e.PrevHash, &e.RowHash)
+		e.At = e.At.UTC()
 		return e, err
 	})
 }

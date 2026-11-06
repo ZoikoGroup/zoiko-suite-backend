@@ -30,6 +30,9 @@ type Service struct {
 	// (PUBLIC_AI_IDEMPOTENCY_TTL).
 	idem time.Duration
 	now  func() time.Time
+	// ReleaseID, when set, names the active KB release; it is stamped on
+	// each new session (Doc 04 §16).
+	ReleaseID func() string
 }
 
 // WithIdleTTL ends a session that has had no completed turn for d, before
@@ -115,6 +118,9 @@ func (s *Service) Create(ctx context.Context, key string, requestHash []byte, lo
 		MarketCode:  market,
 		PageContext: page,
 		Origin:      origin,
+	}
+	if s.ReleaseID != nil {
+		sess.ReleaseID = s.ReleaseID()
 	}
 	if err := s.store.CreateSession(ctx, sess, key, requestHash); err != nil {
 		return Issued{}, err

@@ -10,6 +10,11 @@ effective_from: 2026-01-01
 expires_at: 2027-12-31
 locale: en-US
 intent_ids: I17,I02,I04
+market_codes: ALL
+classification: PUBLIC_APPROVED
+pii_state: CLEAR
+license: OWNED_PUBLIC
+signing_ref: kbctl-dev
 ---
 
 ## Tax
@@ -22,7 +27,7 @@ Tax rules are kept as effective-dated rule libraries, and the applicable treatme
 
 ## Filing preparation
 
-Filing preparation assembles a filing before submission and checks that its supporting evidence is complete. Each filing is tracked from due-date planning through submission and confirmation.
+Tax returns and other filings are prepared before submission: filing preparation assembles the filing and checks that its supporting evidence is complete. Each filing and its deadline is tracked from due-date planning through submission and confirmation.
 
 ## Jurisdictions
 

@@ -113,6 +113,30 @@ groups:
           runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-05-dead-lettered-events"
           summary: "Assistant: outbox events moved to a .dlq topic; review and replay with kbctl dlq-replay"
 
+      # Privacy (Doc 05 CT-045, Doc 08 §13): an event carried free text or
+      # personal data and was refused. Must stay at zero: a code change is
+      # leaking visitor input into telemetry.
+      - alert: PublicAIEventDLPBlocked
+        expr: increase(public_ai_events_dlp_blocked_total[15m]) > 0
+        labels:
+          severity: page
+        annotations:
+          runbook: "RB-08"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-08-security-signals-and-abuse"
+          summary: "Assistant: an event with free text or personal data was refused (privacy leak attempt)"
+
+      # Doc 08 §13: a revoked source reached the commit check. The answer was
+      # withheld, but revocation propagation is lagging somewhere.
+      - alert: PublicAIRevocationRejectedAtCommit
+        expr: increase(public_ai_commit_revocation_rejections_total[15m]) > 0
+        labels:
+          severity: page
+          freeze_promotion: "true"
+        annotations:
+          runbook: "RB-04"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-04-rollback-and-safe-static-doc-08-19"
+          summary: "Assistant: a revoked source reached the commit check; revocation is not propagating"
+
       # Abuse and cost (Doc 06 §13): sustained 429s or token burn.
       - alert: PublicAIRateLimitingSurge
         expr: sum(rate(public_ai_rate_limited_total[5m])) > 5
@@ -154,6 +178,20 @@ groups:
         expr: sum(rate(public_ai_turns_total{status="ABSTAIN"}[1h])) / clamp_min(sum(rate(public_ai_turns_total[1h])), 1e-9)
       - record: public_ai:turn_abstain_ratio:rate7d
         expr: sum(rate(public_ai_turns_total{status="ABSTAIN"}[7d])) / clamp_min(sum(rate(public_ai_turns_total[7d])), 1e-9)
+
+      # Doc 08 §12: "useful grounded resolution" is its own SLI, separate
+      # from availability. Grounded = an ANSWERED turn (always cited);
+      # useful = ANSWERED or an official-route HANDOFF, minus answers the
+      # visitor marked not useful. Doc 08 §25: cost per 1,000 useful
+      # resolutions, in model tokens (multiply by the contracted token price).
+      - record: public_ai:grounded_answer_ratio:rate1h
+        expr: sum(rate(public_ai_turns_total{status="ANSWERED"}[1h])) / clamp_min(sum(rate(public_ai_turns_total[1h])), 1e-9)
+      - record: public_ai:useful_resolutions:increase1d
+        expr: clamp_min(sum(increase(public_ai_turns_total{status=~"ANSWERED|HANDOFF"}[1d])) - (sum(increase(public_ai_feedback_total{rating="not_useful"}[1d])) or vector(0)), 0)
+      - record: public_ai:useful_resolution_ratio:rate1d
+        expr: public_ai:useful_resolutions:increase1d / clamp_min(sum(increase(public_ai_turns_total[1d])), 1e-9)
+      - record: public_ai:tokens_per_1k_useful_resolutions:1d
+        expr: sum(increase(public_ai_model_tokens_total[1d])) / clamp_min(public_ai:useful_resolutions:increase1d / 1000, 1e-9)
 
       # Spend: Doc 04 §25 bill-shock control, three thresholds; at 1.0
       # the guard has already throttled generation (SPEND_CEILING).

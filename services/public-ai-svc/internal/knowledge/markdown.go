@@ -10,9 +10,12 @@ import (
 // ParseMarkdownSource reads a public-KB article: YAML-style front matter
 // between "---" lines, then the body in markdown ("##" headings). Required
 // keys: source_id, title, domain, module_id, audience, status, owner,
-// effective_from, expires_at, locale. Optional: intent_ids, capability_ids,
-// market_codes (comma lists), url_key, canonical_url, approvers,
-// approval_ts, subject_type, version.
+// effective_from, expires_at, locale, and the scope and approval fields
+// market_codes, classification, pii_state, license and signing_ref: Doc 03
+// §06 "ALL is explicit; a null never means approved", so none of them is
+// defaulted. Optional: intent_ids, capability_ids, plan_codes (comma lists),
+// url_key, canonical_url, approvers, approval_ts, review_due_at,
+// subject_type, version, supersedes.
 //
 // The article goes through the same ingest checks as any source; front
 // matter cannot widen audience or skip approval. Without canonical_url the
@@ -39,7 +42,8 @@ func ParseMarkdownSource(raw string) (SourceFile, error) {
 		fm[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), `"'`)
 	}
 	body := strings.TrimSpace(strings.TrimPrefix(raw[4+end+4:], "\n"))
-	for _, k := range []string{"source_id", "title", "domain", "module_id", "audience", "status", "owner", "effective_from", "expires_at", "locale"} {
+	for _, k := range []string{"source_id", "title", "domain", "module_id", "audience", "status", "owner", "effective_from", "expires_at", "locale",
+		"market_codes", "classification", "pii_state", "license", "signing_ref"} {
 		if fm[k] == "" {
 			return SourceFile{}, fmt.Errorf("front matter %s is required", k)
 		}
@@ -60,18 +64,26 @@ func ParseMarkdownSource(raw string) (SourceFile, error) {
 		}
 		approvedAt = &t
 	}
+	var reviewDue *time.Time
+	if v := fm["review_due_at"]; v != "" {
+		t, err := parseDate(v)
+		if err != nil {
+			return SourceFile{}, fmt.Errorf("review_due_at: %w", err)
+		}
+		reviewDue = &t
+	}
 	urlKey := orDefault(fm["url_key"], fm["source_id"])
 	origin := orDefault(fm["canonical_url"], "https://"+PlaceholderHost+"/"+urlKey)
 	version := orDefault(fm["version"], "v1")
 	src := Source{
 		SourceID: fm["source_id"], SourceVersionID: fm["source_id"] + "-" + version, SourceType: "MARKDOWN",
 		OriginURI: origin, URLKey: urlKey, Title: fm["title"], ProductID: ProductID, Audience: fm["audience"],
-		Classification: Classification, PIIState: PIIClear, AuthorityTier: "P3",
+		Classification: fm["classification"], PIIState: fm["pii_state"], AuthorityTier: "P3",
 		SubjectType: orDefault(fm["subject_type"], "CAPABILITY"), OwnerID: fm["owner"], ApproverIDs: list(fm["approvers"]),
-		MarketCodes: orList(list(fm["market_codes"]), []string{MarketAll}), Locale: fm["locale"], PlanCodes: []string{},
+		MarketCodes: list(fm["market_codes"]), Locale: fm["locale"], PlanCodes: list(fm["plan_codes"]),
 		CapabilityIDs: list(fm["capability_ids"]), IntentIDs: list(fm["intent_ids"]), ApprovalState: fm["status"],
-		ApprovalTS: approvedAt, EffectiveFrom: &from, ExpiresAt: &until, SigningRef: "kbctl-dev", License: "OWNED_PUBLIC",
-		Domain: fm["domain"], ModuleID: fm["module_id"],
+		ApprovalTS: approvedAt, EffectiveFrom: &from, ExpiresAt: &until, ReviewDueAt: reviewDue, SigningRef: fm["signing_ref"], License: fm["license"],
+		Domain: fm["domain"], ModuleID: fm["module_id"], Supersedes: fm["supersedes"],
 	}
 	return SourceFile{Source: src, Body: body}, nil
 }

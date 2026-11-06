@@ -29,9 +29,13 @@ Retention periods come from the signed retention policy. Until the DPO signs it 
 | Logs | Request id, route, status, latency, trace id, intent, reason, release, evidence ids | Bodies, query strings, headers, grants, visitor text | Log platform retention (PENDING SRE/DPO) |
 | Traces (OTLP, when enabled) | Allowlisted attributes only: route, status, outcome, intent, releases, retrieval counts, token usage | Messages, prompts, source text, events, error messages | Collector retention (PENDING) |
 | Metrics (`/metrics`) | Counters and histograms with enum labels | Session, request ids, text | Prometheus retention (PENDING) |
-| Widget (browser) | The visible conversation, session id and grant in page memory only (no `localStorage`, `sessionStorage` or cookies) | Cookies, the console session | Gone on "Clear chat", page reload or tab close; sensitive inputs are replaced in the bubble |
+| Widget (browser), page memory | The visible conversation, session id and grant | Cookies, the console session | Gone on "Clear chat", page reload or tab close; sensitive inputs are replaced in the bubble |
+| Widget, `sessionStorage` `zoiko-assistant-conversations` | Chat history for this tab (default): up to 10 conversations, questions masked (`maskForHistory`: contact details and secrets), answers as shown | Session grant, cookies, unmasked contact details | Gone when the tab closes; per-chat delete and "Clear chat" |
+| Widget, `localStorage` `zoiko-assistant-history-v1` | Only after the visitor opts in to "Remember my chats on this device" (off by default, Doc 06 §11): up to 50 masked conversations | The same as above | 24 hours (`DEVICE_TTL_MS`); opting out deletes it; per-chat delete |
+| Widget, `localStorage` `zoiko-assistant-remember`, `zoiko-assistant-theme` | The opt-in flag ("1") and the light/dark choice | Any personal data | Until the visitor opts out / clears site data |
 
 ## Open items
 
 - Retention values for logs, traces, metrics, broker topics and the control audit (DEC-06, SRE).
 - Session idle expiry (Doc 06 §17) in addition to the fixed maximum.
+- Whether the opt-in device history and the theme preference need a consent-banner entry under PECR/ePrivacy (DPO; the history is strictly opt-in, the theme is a functional preference).

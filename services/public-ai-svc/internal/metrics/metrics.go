@@ -21,6 +21,22 @@ import (
 // Registry holds only this service's metrics (no global default registry).
 var Registry = prometheus.NewRegistry()
 
+// indexHealth is the Doc 03 §22 knowledge-index health: chunk and source
+// counts, the age of the oldest approval, revocations in force and open
+// conflict cases (by measure).
+var indexHealth = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "public_ai_index_health", Help: "Knowledge index health by measure (Doc 03 §22).",
+}, []string{"measure"})
+
+// IndexHealth records the active release's index health.
+func IndexHealth(chunks, sources, revocations, openConflicts int, oldestApprovalDays float64) {
+	indexHealth.WithLabelValues("chunks").Set(float64(chunks))
+	indexHealth.WithLabelValues("sources").Set(float64(sources))
+	indexHealth.WithLabelValues("revocations").Set(float64(revocations))
+	indexHealth.WithLabelValues("open_conflicts").Set(float64(openConflicts))
+	indexHealth.WithLabelValues("oldest_approval_days").Set(oldestApprovalDays)
+}
+
 var (
 	httpRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "public_ai_http_requests_total",
@@ -136,6 +152,7 @@ func init() {
 	Registry.MustRegister(httpRequests, httpDuration, turns, turnDuration, modelRequests, modelTokens,
 		rateLimited, eventsPublished, eventsDeadLettered, releaseReady, buildInfo,
 		ctaOffered, handoffClicked, feedback, securitySignals, spendRatio, stageDuration, turnsCancelled, turnOutcomes, outboxOldest, commitRevocations,
+		indexHealth, eventsDLPBlocked,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 }
 
@@ -165,6 +182,15 @@ func OutboxOldest(age time.Duration) { outboxOldest.Set(age.Seconds()) }
 
 // CommitRevocation counts an answer withheld by the revocation check at commit.
 func CommitRevocation() { commitRevocations.Inc() }
+
+// eventsDLPBlocked counts events refused because a field carried free text
+// or personal data (Doc 05 CT-045): it must stay at zero.
+var eventsDLPBlocked = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "public_ai_events_dlp_blocked_total", Help: "Events refused by the outbox DLP check (Doc 05 CT-045).",
+}, []string{"type"})
+
+// EventDLPBlocked records one refused event.
+func EventDLPBlocked(eventType string) { eventsDLPBlocked.WithLabelValues(eventType).Inc() }
 
 // TurnCancelled counts a turn the visitor cancelled.
 func TurnCancelled() { turnsCancelled.Inc() }

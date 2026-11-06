@@ -7,6 +7,8 @@ package release
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/metrics"
 	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
@@ -231,6 +234,10 @@ func (r *Runtime) refresh(ctx context.Context) error {
 			return fmt.Errorf("release %s: %w", newClaims, err)
 		}
 		next.Claims = claims.NewResolver(m)
+		if rel, err := r.store.GetRelease(ctx, newClaims); err == nil {
+			sum := sha256.Sum256(rel.Signature)
+			next.Claims = next.Claims.WithSignatureRef("ed25519:" + hex.EncodeToString(sum[:8]))
+		}
 		next.claimsChanged = true
 	}
 	if next.claimsChanged || newKB != kbID {
@@ -275,7 +282,40 @@ func (r *Runtime) refresh(ctx context.Context) error {
 		r.scanPending = false
 		r.mu.Unlock()
 	}
+	r.recordIndexHealth(ctx, &next)
 	return nil
+}
+
+// recordIndexHealth publishes the Doc 03 §22 index-health gauges.
+func (r *Runtime) recordIndexHealth(ctx context.Context, s *Snapshot) {
+	if s.kbManifest == nil {
+		return
+	}
+	now, oldest := time.Now().UTC(), 0.0
+	for _, src := range s.kbManifest.Sources {
+		t := src.ApprovalTS
+		if t == nil {
+			t = src.EffectiveFrom
+		}
+		if t != nil {
+			if d := now.Sub(*t).Hours() / 24; d > oldest {
+				oldest = d
+			}
+		}
+	}
+	revs := 0
+	if s.rev != nil {
+		revs = len(s.rev.sources) + len(s.rev.claims)
+	}
+	open := 0
+	if cs, err := r.store.Conflicts(ctx); err == nil {
+		for _, c := range cs {
+			if c.ResolutionState == "OPEN" {
+				open++
+			}
+		}
+	}
+	metrics.IndexHealth(len(s.kbManifest.Chunks), len(s.kbManifest.Sources), revs, open, oldest)
 }
 
 // ErrInvalidClaims means a signed claim release fails registry validation
@@ -463,7 +503,7 @@ func (r *Runtime) PublicConfig() contract.ConfigResponse {
 	cfg := contract.ConfigResponse{
 		AssistantDisplayName: "ZoikoSuite Assistant", // neutral until brand clearance (DEC-04)
 		Capabilities:         contract.Capabilities{},
-		SupportedLocales:     []string{"en-US"},
+		SupportedLocales:     append([]string(nil), contract.SupportedLocales...),
 		MarketChoices:        []string{},
 		PublicRoutes:         []contract.PublicRoute{},
 		CitationLinks:        []contract.CitationLink{},
@@ -524,4 +564,11 @@ func (r *Runtime) VectorError() error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.vecErr
+}
+
+// KBReleaseID is the active knowledge release id ("" before the first load).
+func (r *Runtime) KBReleaseID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.kbID
 }

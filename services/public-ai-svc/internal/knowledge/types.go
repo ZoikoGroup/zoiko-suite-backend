@@ -86,6 +86,12 @@ type Chunk struct {
 	ValidUntil      time.Time `json:"valid_until"`
 	ReleaseID       string    `json:"retrieval_release_id"`
 	Draft           bool      `json:"draft,omitempty"`
+	// Doc 03 §07 chunk record: subject and capability scope, and the review
+	// deadline of high-impact content, enforced at query time (§12/§26).
+	SubjectType   string     `json:"subject_type,omitempty"`
+	CapabilityIDs []string   `json:"capability_ids,omitempty"`
+	HighImpact    bool       `json:"high_impact,omitempty"`
+	ReviewDueAt   *time.Time `json:"review_due_at,omitempty"`
 }
 
 // Route is an official destination (Doc 05 §15). URL is never shown to the
@@ -191,18 +197,22 @@ func HeadingPrefix(heading string) string { return "\u00a7" + heading + "\u00a7 
 
 // Manifest is a signed knowledge release.
 type Manifest struct {
-	ReleaseID          string    `json:"release_id"`
-	Kind               string    `json:"kind"`
-	IndexSchemaVersion string    `json:"index_schema_version"`
-	CreatedAt          time.Time `json:"created_at"`
-	ApprovedBy         []string  `json:"approved_by"`
-	EvalRunID          string    `json:"eval_run_id"`
-	ChunkPolicy        string    `json:"chunk_policy"`
-	RedactionPolicy    string    `json:"redaction_policy"`
-	AllowedHosts       []string  `json:"allowed_hosts"`
-	Sources            []Source  `json:"sources"`
-	Chunks             []Chunk   `json:"chunks"`
-	Routes             []Route   `json:"routes"`
+	ReleaseID          string `json:"release_id"`
+	Kind               string `json:"kind"`
+	IndexSchemaVersion string `json:"index_schema_version"`
+	// EmbeddingModel and Tokenizer name how the index was built (Doc 03
+	// §11): "none" while retrieval is lexical only (D03-08).
+	EmbeddingModel  string    `json:"embedding_model,omitempty"`
+	Tokenizer       string    `json:"tokenizer,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	ApprovedBy      []string  `json:"approved_by"`
+	EvalRunID       string    `json:"eval_run_id"`
+	ChunkPolicy     string    `json:"chunk_policy"`
+	RedactionPolicy string    `json:"redaction_policy"`
+	AllowedHosts    []string  `json:"allowed_hosts"`
+	Sources         []Source  `json:"sources"`
+	Chunks          []Chunk   `json:"chunks"`
+	Routes          []Route   `json:"routes"`
 	// Synonyms is the signed alias lexicon (Doc 03 §13), e.g. "ar" →
 	// "accounts receivable". Keys are lower-case visitor words.
 	Synonyms map[string][]string `json:"synonyms,omitempty"`
@@ -218,3 +228,6 @@ type Manifest struct {
 	Audience  string    `json:"audience,omitempty"`
 	SignedAt  time.Time `json:"signed_at,omitempty"`
 }
+
+// TokenizerVersion names the lexical tokenizer the index is built with.
+const TokenizerVersion = "lexical-v1"
