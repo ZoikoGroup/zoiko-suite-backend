@@ -68,6 +68,10 @@ func main() {
 		err = conflicts(ctx, os.Args[2:])
 	case "policy-sign":
 		err = policySign()
+	case "review-kb":
+		err = reviewKB(os.Args[2:])
+	case "quality":
+		err = quality(ctx, os.Args[2:])
 	case "signoff":
 		err = signoff(ctx, os.Args[2:])
 	case "verify-manifest":
@@ -84,7 +88,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest|audit|conflicts|policy-sign|signoff|verify-manifest|dlq-replay [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest|audit|conflicts|policy-sign|signoff|verify-manifest|review-kb|quality|dlq-replay [flags]")
 	os.Exit(2)
 }
 
@@ -612,5 +616,60 @@ func verifyManifest(ctx context.Context, args []string) error {
 		return fmt.Errorf("%d sign-offs missing", len(missing))
 	}
 	fmt.Println("manifest verified and recorded:", f.ReleaseID)
+	return nil
+}
+
+// reviewKB reports every source's Doc 09 §16 editorial state (DRAFT →
+// VALIDATION_FAILED or PENDING_REVIEW → APPROVED) without publishing.
+func reviewKB(args []string) error {
+	fs := flag.NewFlagSet("review-kb", flag.ExitOnError)
+	dir := fs.String("dir", "data/public-kb", "release directory")
+	_ = fs.Parse(args)
+	m, reports, err := knowledge.IngestDirWith(*dir, "review", time.Now().UTC(), knowledge.IngestOptions{AllowDraft: true, AllowSynthetic: true})
+	if err != nil {
+		return err
+	}
+	draft := map[string]bool{}
+	for _, src := range m.Sources {
+		draft[src.SourceID] = src.ApprovalState == knowledge.ApprovalDraft
+	}
+	counts := map[string]int{}
+	for _, r := range reports {
+		st := knowledge.EditorialState(r, draft[r.SourceID])
+		counts[st]++
+		fmt.Printf("%-18s %-28s %-20s %s\n", st, r.SourceID, r.State, r.Reason)
+	}
+	fmt.Printf("review: %d approved, %d pending review, %d validation failed\n",
+		counts[knowledge.EditorialApproved], counts[knowledge.EditorialPendingReview], counts[knowledge.EditorialValidationFailed])
+	return nil
+}
+
+// quality lists answers visitors marked not useful (Doc 09 §19), blinded:
+// turn, intent and the public reply only, never the session or the question.
+func quality(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("quality", flag.ExitOnError)
+	limit := fs.Int("n", 50, "number of cases")
+	_ = fs.Parse(args)
+	st, err := openStore(ctx)
+	if err != nil {
+		return err
+	}
+	q, ok := st.(store.QualityQueue)
+	if !ok {
+		return fmt.Errorf("this store has no quality queue")
+	}
+	cases, err := q.QualityCases(ctx, *limit)
+	if err != nil {
+		return err
+	}
+	for _, c := range cases {
+		var env struct {
+			Text   string `json:"text"`
+			Reason string `json:"reason"`
+		}
+		_ = json.Unmarshal(c.Response, &env)
+		fmt.Printf("%s %s %-4s %-10s reason=%-12s reply=%.120q\n", c.CreatedAt.UTC().Format(time.RFC3339), c.TurnID, c.IntentID, c.Status, c.FeedbackReason, env.Text)
+	}
+	fmt.Printf("quality queue: %d not-useful answers\n", len(cases))
 	return nil
 }

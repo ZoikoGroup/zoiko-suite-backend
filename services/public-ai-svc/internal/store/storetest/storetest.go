@@ -23,6 +23,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("FeedbackPurge", func(t *testing.T) { testFeedbackPurge(t, newStore(t)) })
 	t.Run("ControlAudit", func(t *testing.T) { testControlAudit(t, newStore(t)) })
 	t.Run("RateCounters", func(t *testing.T) { testRateCounters(t, newStore(t)) })
+	t.Run("QualityQueue", func(t *testing.T) { testQualityQueue(t, newStore(t)) })
 	t.Run("ConflictCases", func(t *testing.T) { testConflictCases(t, newStore(t)) })
 	t.Run("CompleteTurnNeedsLiveSession", func(t *testing.T) { testCompleteTurnNeedsLiveSession(t, newStore(t)) })
 	t.Run("RetentionPurge", func(t *testing.T) { testRetentionPurge(t, newStore(t)) })
@@ -500,5 +501,35 @@ func testRateCounters(t *testing.T, s store.Store) {
 	}
 	if n, _ := rc.IncrRate(ctx, "ip:a", w); n != 1 {
 		t.Fatalf("purged window kept its count: %d", n)
+	}
+}
+
+// Doc 09 §19: answers marked not useful form the quality queue, with the
+// public reply and no session reference.
+func testQualityQueue(t *testing.T, s store.Store) {
+	q, ok := s.(store.QualityQueue)
+	if !ok {
+		t.Fatal("store has no quality queue")
+	}
+	sess := mkSession(t, s, "pub_s_qqqqqqqqqqqq")
+	for i, rating := range []string{"not_useful", "useful"} {
+		id := []string{"pub_t_q1", "pub_t_q2"}[i]
+		b, err := s.BeginTurn(ctx, turn(sess.SessionID, id, "cq"+id, "h"+id), time.Now().Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := b.Turn
+		done.Status, done.IntentID, done.Response = "ANSWERED", "I05", []byte(`{"text":"Plans vary by market."}`)
+		if err := s.CompleteTurn(ctx, done, nil, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetFeedback(ctx, sess.SessionID, id, rating, "incomplete", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases, err := q.QualityCases(ctx, 10)
+	if err != nil || len(cases) != 1 || cases[0].TurnID != "pub_t_q1" || cases[0].FeedbackReason != "incomplete" ||
+		cases[0].IntentID != "I05" || string(cases[0].Response) != `{"text":"Plans vary by market."}` {
+		t.Fatalf("quality cases %+v %v", cases, err)
 	}
 }
