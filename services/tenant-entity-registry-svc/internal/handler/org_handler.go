@@ -605,8 +605,10 @@ func mapORGError(err error) (int, string, bool) {
 		return http.StatusForbidden, "host/tenant mismatch: request refused before data access", true
 	case errors.Is(err, registry.ErrUnknownCommand):
 		return http.StatusNotFound, err.Error(), true
-	case errors.Is(err, registry.ErrRateMissing):
+	case errors.Is(err, registry.ErrRateMissing), errors.Is(err, registry.ErrConversionMissing):
 		return http.StatusNotFound, err.Error(), true
+	case errors.Is(err, registry.ErrDimensionMismatch):
+		return http.StatusUnprocessableEntity, err.Error(), true
 	}
 	return 0, "", false
 }

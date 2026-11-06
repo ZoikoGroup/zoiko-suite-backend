@@ -144,6 +144,13 @@ func codeEventNames() []string {
 		events.EventDimensionHierarchyProposed,
 		events.EventDimensionHierarchyChanged,
 		events.EventDimensionSourceMapped,
+		// REF-09 units of measure (unit_events.go).
+		events.EventQuantityDimensionCreated,
+		events.EventUnitCreated,
+		events.EventConversionProposed,
+		events.EventConversionActivated,
+		events.EventConversionSuperseded,
+		events.EventUnitRetired,
 	}
 }
 

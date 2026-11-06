@@ -143,6 +143,13 @@ channels:
           - $ref: "#/components/messages/DimensionHierarchyProposed"
           - $ref: "#/components/messages/DimensionHierarchyChanged"
           - $ref: "#/components/messages/DimensionSourceMapped"
+          # ── REF-09 units of measure ───────────────────────────────────────
+          - $ref: "#/components/messages/QuantityDimensionCreated"
+          - $ref: "#/components/messages/UnitCreated"
+          - $ref: "#/components/messages/UnitConversionProposed"
+          - $ref: "#/components/messages/UnitConversionActivated"
+          - $ref: "#/components/messages/UnitConversionSuperseded"
+          - $ref: "#/components/messages/UnitRetired"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -758,6 +765,60 @@ components:
       title: An operational source object was mapped to a dimension value
       description: Carries the source domain and object, the mapping version, and the previous value when it replaced a mapping.
       x-spec-event: SourceDimensionMapped
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    QuantityDimensionCreated:
+      name: unit.dimension.created
+      title: A quantity dimension was defined with its base unit
+      description: Carries the dimension code and the base unit code.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitCreated:
+      name: unit.created
+      title: A unit of measure was created
+      description: A base unit is ACTIVE at once; any other unit is a DRAFT until a conversion takes effect.
+      x-spec-event: UnitCreated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitConversionProposed:
+      name: unit.conversion.proposed
+      title: A non-standard conversion awaits independent approval
+      description: Nothing is in force yet. Carries the exact factor, its source class and reference, and the proposer.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitConversionActivated:
+      name: unit.conversion.activated
+      title: A conversion version took effect
+      description: Carries the version number, the exact factor as a fraction and its validity start. A previous version, when replaced, is named.
+      x-spec-event: ConversionRuleActivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitConversionSuperseded:
+      name: unit.conversion.superseded
+      title: A conversion version was replaced from a later date
+      description: Carries the superseded version with its end date. Results it produced stay reproducible from that version.
+      x-spec-event: ConversionRuleSuperseded
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitRetired:
+      name: unit.retired
+      title: A unit was retired and rejects new use
+      description: Carries the retirement date and reason. History is kept.
+      x-spec-event: UnitRetired
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"

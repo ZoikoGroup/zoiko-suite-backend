@@ -43,6 +43,9 @@ const (
 	CodeMergeProhibited = "MERGE_PROHIBITED"
 	// REF-03: no approved rate, and no fallback to another one.
 	CodeRateMissing = "FX_RATE_MISSING"
+	// REF-09: units of different dimensions, or no approved conversion in force.
+	CodeDimensionMismatch = "DIMENSION_MISMATCH"
+	CodeConversionMissing = "CONVERSION_MISSING"
 	CodeInternal        = "INTERNAL_ERROR"
 )
 
@@ -60,6 +63,8 @@ var errorCodes = []struct {
 	{registry.ErrCreateRequestMismatch, CodeIdempotencyMismatch},
 	{registry.ErrMergeProhibited, CodeMergeProhibited},
 	{registry.ErrRateMissing, CodeRateMissing},
+	{registry.ErrDimensionMismatch, CodeDimensionMismatch},
+	{registry.ErrConversionMissing, CodeConversionMissing},
 	{registry.ErrRegistryConflict, CodeDuplicateCandidate},
 	{registry.ErrApprovalPending, CodeDuplicateCandidate},
 	{registry.ErrJurisdictionRestricted, CodeJurisdictionRestricted},

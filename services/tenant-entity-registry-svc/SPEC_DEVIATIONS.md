@@ -385,3 +385,30 @@ Where the spec leaves a choice, the code chooses the safer reading:
 - **Not built.** Roll-up rules beyond the hierarchy itself (the spec's "roll-up rules" server-resolved context), and the
   "impacted reporting nodes" lineage on a hierarchy change: the change event carries the old and new parent and label, and a
   consumer computes the impact from the hierarchy as of either date.
+
+### Units of measure (REF-09, ORG-8 wave 4)
+
+- **One base unit per dimension; conversions are exact fractions.** A quantity dimension (length, mass, count) is created with
+  its base unit, ACTIVE at once. Every other unit converts to that base by a factor held as two whole numbers (NUMERIC, reduced,
+  positive), parsed from a decimal or a fraction with `math/big`. No float touches a quantity. A conversion between two units
+  is quantity x from / to, exact, and only the final figure is rounded (half away from zero, to the target unit's decimals).
+  The unrounded result is returned beside it as a fraction.
+- **Dimensionality is checked before arithmetic.** A unit has a factor to its own dimension's base and to nothing else, so
+  a cross-dimension conversion cannot be stored; asking for one is 422 DIMENSION_MISMATCH naming both dimensions. A unit with
+  no approved conversion in force on the date is 404 CONVERSION_MISSING, and a unit retired on the date is REFERENCE_RETIRED:
+  never a guess and never a fallback to another date.
+- **The applied version is named.** `ConvertQuantity` returns, for each unit, the conversion version number, exact factor,
+  source and validity start it applied. The domain holding the quantity retains that pin with the business fact; this
+  registry owns no quantities (the spec's "applied conversion version retained" is the caller's to store).
+- **Conversions are versioned, effective-dated and prospective.** A replacement (`conversions:supersede`) starts today or
+  later and after the active one began, so a quantity already converted is never rewritten; the old version ends where the new
+  one begins and stays readable (`GET .../conversions/{n}`, `GET /v1/units/{code}?as_of=&history=true`).
+- **Non-standard conversions are independently approved.** STANDARD (a defined constant such as ISO 80000) takes effect at
+  once. ORGANISATION and MANUAL_OVERRIDE wait PENDING until someone other than the proposer approves
+  (`conversions/{n}:approve`; 403 SOD_DENIED, and a table CHECK holds it). A manual override states why. Which source class a
+  given conversion is belongs to the proposer: no policy source says which are standard. The approve command is not in the
+  spec's list; it is how "manual override is not self-approved" is realised.
+- **Retirement.** `RetireUnit` takes effect today (no future-dated retirement: a status that is not true yet would be
+  misleading). History is kept; a past date still converts. A base unit retires only once every other unit of its dimension has.
+- **Not built.** Nonlinear conversions (offsets such as temperature, or context-dependent ones such as density), which the spec
+  says need specialised rules; the factor here is a pure proportion. No unit catalogue is pre-loaded: units are tenant master data.

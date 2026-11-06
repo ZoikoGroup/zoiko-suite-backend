@@ -3821,6 +3821,249 @@ paths:
           content: { application/json: { schema: { $ref: "#/components/schemas/DimensionResolution" } } }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
+  # ── REF-09 Units of measure ─────────────────────────────────────────────────
+  /v1/quantity-dimensions:
+    post:
+      operationId: createQuantityDimension
+      summary: "REF-09 create a quantity dimension (length, mass, volume, count) with its base unit"
+      description: |
+        A dimension has exactly one base unit, ACTIVE from the start: its factor is 1 by definition. Every other unit of the
+        dimension converts to it, so a conversion across dimensions cannot be defined.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateQuantityDimensionRequest" } } }
+      responses:
+        "201":
+          description: Dimension and base unit created
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionWithBase" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The dimension or unit code already exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listQuantityDimensions
+      summary: "REF-09 the quantity dimensions of the tenant"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Dimensions with their base unit codes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/QuantityDimension" } }
+
+  /v1/quantity-dimensions/{dimensionCode}/units:
+    get:
+      operationId: listUnitsByDimension
+      summary: "REF-09 ListUnitsByDimension - the units of a dimension, the base first"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: dimensionCode, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The units
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Unit" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/units:
+    post:
+      operationId: createUnit
+      summary: "REF-09 CreateUnit - a non-base unit of an existing dimension, a draft until its conversion is in force"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateUnitRequest" } } }
+      responses:
+        "201":
+          description: Draft unit created
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The unit code already exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/units:convert:
+    get:
+      operationId: convertQuantity
+      summary: "REF-09 ConvertQuantity - exact conversion between two units of one dimension on a date"
+      description: |
+        Dimensionality is checked before any arithmetic: units of different dimensions are refused (422 DIMENSION_MISMATCH).
+        The arithmetic is exact; only the final figure is rounded, half away from zero, to the target unit's decimals, and the
+        unrounded fraction is returned beside it. The result names the conversion version applied to each unit, which the
+        calling domain retains with the business fact so the number can be reproduced. A unit with no approved conversion in
+        force on the date is 404 CONVERSION_MISSING, never a guess.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: quantity, in: query, required: true, schema: { type: string }, description: "An exact decimal, which may be negative." }
+        - { name: from, in: query, required: true, schema: { type: string } }
+        - { name: to, in: query, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: The converted quantity and the versions applied
+          content: { application/json: { schema: { $ref: "#/components/schemas/ConversionResult" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  /v1/units/{unitCode}:
+    get:
+      operationId: getUnit
+      summary: "REF-09 GetUnit - the unit as it was on a date, with the conversion then in force"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/AsOf"
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every conversion version." }
+      responses:
+        "200":
+          description: The unit
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/units/{unitCode}/conversions:
+    post:
+      operationId: proposeConversion
+      summary: "REF-09 the first conversion of a unit to its dimension's base unit"
+      description: |
+        The factor is how many base units one of this unit is, a decimal or a fraction, held exactly. A STANDARD conversion
+        takes effect at once. An ORGANISATION or MANUAL_OVERRIDE conversion is PENDING until someone other than its proposer
+        approves it.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ProposeConversionRequest" } } }
+      responses:
+        "201":
+          description: Conversion recorded, PENDING or ACTIVE
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, a conversion already active or pending, or the unit is retired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/units/{unitCode}/conversions:supersede:
+    post:
+      operationId: supersedeConversion
+      summary: "REF-09 SupersedeConversion - replace the active conversion from a later date"
+      description: |
+        Prospective only: valid_from is today or later and after the active conversion began, so a quantity already converted
+        is never rewritten. The replaced version stays readable and reproduces earlier results.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ProposeConversionRequest" } } }
+      responses:
+        "201":
+          description: Replacement recorded, PENDING or ACTIVE
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, nothing to supersede, or a change already pending", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/units/{unitCode}/conversions/{versionNo}:
+    get:
+      operationId: getConversionVersion
+      summary: "REF-09 GetConversionVersion - one version of a unit's conversion, as applied by a past result"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - { name: versionNo, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The version
+          content: { application/json: { schema: { $ref: "#/components/schemas/ConversionVersion" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/units/{unitCode}/conversions/{versionNo}:approve:
+    post:
+      operationId: approveConversion
+      summary: "REF-09 ApproveConversion - take a pending conversion into effect"
+      description: |
+        Refused (403 SOD_DENIED) when the approver proposed it. A replacement ends the active conversion where it begins.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - { name: versionNo, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ApproveConversionRequest" } } }
+      responses:
+        "200":
+          description: Conversion in force
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, not pending, or the hierarchy of versions moved on", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/units/{unitCode}:retire:
+    post:
+      operationId: retireUnit
+      summary: "REF-09 RetireUnit - reject new use of a unit from today"
+      description: |
+        Nothing is deleted: conversions made before remain reproducible. A base unit retires only when every other unit of its
+        dimension is already retired.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RetireUnitRequest" } } }
+      responses:
+        "200":
+          description: Unit retired
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, already retired, or other units still convert through it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
 
 components:
   securitySchemes:
@@ -4927,6 +5170,178 @@ components:
         value: { $ref: "#/components/schemas/DimensionValue" }
         hierarchy: { $ref: "#/components/schemas/DimensionHierarchyVersion" }
         transition: { $ref: "#/components/schemas/DimensionTransition" }
+
+    UnitFields:
+      type: object
+      required: [unit_code, name, symbol]
+      properties:
+        unit_code: { type: string, pattern: "^[A-Z][A-Z0-9_]{0,19}$" }
+        name: { type: string, maxLength: 200 }
+        symbol: { type: string, maxLength: 20 }
+        decimals: { type: integer, minimum: 0, maximum: 18, description: "Quantities in this unit are rounded to this many decimals. Default 6." }
+        source_standard: { type: string, maxLength: 200 }
+
+    CreateQuantityDimensionRequest:
+      type: object
+      required: [dimension_code, name, base_unit]
+      properties:
+        dimension_code: { type: string, pattern: "^[A-Z][A-Z0-9_]{1,29}$" }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        base_unit: { $ref: "#/components/schemas/UnitFields" }
+        correlation_id: { type: string }
+
+    QuantityDimension:
+      type: object
+      required: [dimension_id, tenant_id, dimension_code, name, created_by, created_at]
+      properties:
+        dimension_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        dimension_code: { type: string }
+        name: { type: string }
+        description: { type: string }
+        base_unit_code: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    DimensionWithBase:
+      type: object
+      required: [dimension, base_unit]
+      properties:
+        dimension: { $ref: "#/components/schemas/QuantityDimension" }
+        base_unit: { $ref: "#/components/schemas/Unit" }
+
+    CreateUnitRequest:
+      type: object
+      required: [dimension_code, unit_code, name, symbol]
+      properties:
+        dimension_code: { type: string }
+        unit_code: { type: string, pattern: "^[A-Z][A-Z0-9_]{0,19}$" }
+        name: { type: string, maxLength: 200 }
+        symbol: { type: string, maxLength: 20 }
+        decimals: { type: integer, minimum: 0, maximum: 18 }
+        source_standard: { type: string, maxLength: 200 }
+        correlation_id: { type: string }
+
+    Unit:
+      type: object
+      required: [unit_id, tenant_id, dimension_code, unit_code, name, symbol, is_base, status, decimals, record_version, created_by, created_at]
+      properties:
+        unit_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        dimension_code: { type: string }
+        unit_code: { type: string }
+        name: { type: string }
+        symbol: { type: string }
+        is_base: { type: boolean }
+        status: { type: string, enum: [DRAFT, ACTIVE, RETIRED] }
+        decimals: { type: integer }
+        source_standard: { type: string }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        retired_on: { type: string, format: date }
+        retire_reason: { type: string }
+        retired_by: { type: string }
+
+    ProposeConversionRequest:
+      type: object
+      required: [expected_version, factor, source_class, source_ref, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        factor: { type: string, description: "How many base units one of this unit is: a positive decimal such as 1.609344, or a fraction such as 1609344/1000000. Held exactly." }
+        source_class: { type: string, enum: [STANDARD, ORGANISATION, MANUAL_OVERRIDE] }
+        source_ref: { type: string, maxLength: 300 }
+        valid_from: { type: string, format: date }
+        reason: { type: string, description: "Required for MANUAL_OVERRIDE." }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ApproveConversionRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    RetireUnitRequest:
+      type: object
+      required: [expected_version, reason, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ConversionVersion:
+      type: object
+      required: [version_no, factor, factor_decimal, source_class, source_ref, status, valid_from, evidence_ref, proposed_by, proposed_at]
+      properties:
+        version_no: { type: integer }
+        factor: { type: string, description: "The exact reduced fraction, numerator/denominator (a whole number when the denominator is 1)." }
+        factor_decimal: { type: string, description: "The factor to 18 decimals, for reading; use factor for arithmetic." }
+        source_class: { type: string, enum: [STANDARD, ORGANISATION, MANUAL_OVERRIDE] }
+        source_ref: { type: string }
+        status: { type: string, enum: [PENDING, ACTIVE, SUPERSEDED] }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        supersedes_version: { type: integer }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        proposed_by: { type: string }
+        proposed_at: { type: string, format: date-time }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+
+    UnitOutcome:
+      type: object
+      required: [unit]
+      properties:
+        unit: { $ref: "#/components/schemas/Unit" }
+        conversion: { $ref: "#/components/schemas/ConversionVersion" }
+        previous_conversion: { $ref: "#/components/schemas/ConversionVersion" }
+
+    UnitView:
+      type: object
+      required: [unit, as_of, usable]
+      properties:
+        unit: { $ref: "#/components/schemas/Unit" }
+        as_of: { type: string, format: date }
+        conversion: { oneOf: [{ $ref: "#/components/schemas/ConversionVersion" }, { type: "null" }] }
+        usable: { type: boolean, description: "Whether a conversion involving the unit is possible on the date." }
+        reason: { type: string }
+        pending_conversion: { $ref: "#/components/schemas/ConversionVersion" }
+        conversion_versions: { type: array, items: { $ref: "#/components/schemas/ConversionVersion" } }
+
+    ConversionPin:
+      type: object
+      required: [unit_code, is_base, factor, factor_decimal]
+      properties:
+        unit_code: { type: string }
+        is_base: { type: boolean }
+        version_no: { type: integer, description: "Absent for a base unit, whose factor is 1 by definition." }
+        factor: { type: string }
+        factor_decimal: { type: string }
+        source_class: { type: string }
+        source_ref: { type: string }
+        valid_from: { type: string, format: date }
+
+    ConversionResult:
+      type: object
+      required: [dimension, as_of, input_quantity, from_unit, to_unit, value, exact_fraction, decimals, rounding, from, to]
+      properties:
+        dimension: { type: string }
+        as_of: { type: string, format: date }
+        input_quantity: { type: string }
+        from_unit: { type: string }
+        to_unit: { type: string }
+        value: { type: string, description: "Rounded to the target unit's decimals." }
+        exact_fraction: { type: string, description: "The unrounded result, a reduced numerator/denominator." }
+        decimals: { type: integer }
+        rounding: { type: string }
+        from: { $ref: "#/components/schemas/ConversionPin" }
+        to: { $ref: "#/components/schemas/ConversionPin" }
 
     DimensionEligibility:
       type: object

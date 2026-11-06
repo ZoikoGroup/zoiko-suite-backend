@@ -112,6 +112,13 @@ var registeredActionMigrations = []struct {
 		"DIMENSION_APPROVE_HIERARCHY": "HIGH",
 		"DIMENSION_MAP_SOURCE":        "STANDARD",
 	}},
+	{"000053_register_unit_actions", "tenant-entity-registry-svc", map[string]string{
+		"UNIT_DIMENSION_CREATE":   "STANDARD",
+		"UNIT_CREATE":             "STANDARD",
+		"UNIT_PROPOSE_CONVERSION": "STANDARD",
+		"UNIT_APPROVE_CONVERSION": "HIGH",
+		"UNIT_RETIRE":             "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {
