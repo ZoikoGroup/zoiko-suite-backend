@@ -155,6 +155,12 @@ func codeEventNames() []string {
 		events.EventReferenceSetCreated,
 		events.EventReferenceReleaseStaged,
 		events.EventReferenceReleasePublished,
+		// ORG-9 master imports (master_import_events.go).
+		events.EventMasterImportUploaded,
+		events.EventMasterImportValidated,
+		events.EventMasterImportApproved,
+		events.EventMasterImportCompleted,
+		events.EventMasterImportCancelled,
 	}
 }
 

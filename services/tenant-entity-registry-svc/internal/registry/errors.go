@@ -55,3 +55,6 @@ var ErrDimensionMismatch error = &kindError{"the units belong to different quant
 // ErrConversionMissing — a unit has no approved conversion in force on the date asked for (never approved, not yet
 // effective, or retired), so a quantity cannot be converted. Nothing is guessed. 404, CONVERSION_MISSING.
 var ErrConversionMissing error = &kindError{"no approved conversion is in force for that unit on that date", ErrNotFound}
+
+// ErrIdempotencyKeyMismatch — an Idempotency-Key was reused for a different request. 409, IDEMPOTENCY_MISMATCH.
+var ErrIdempotencyKeyMismatch error = &kindError{"idempotency mismatch: this Idempotency-Key was already used for a different request", ErrConflict}

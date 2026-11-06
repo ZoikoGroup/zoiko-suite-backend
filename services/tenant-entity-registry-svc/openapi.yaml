@@ -4202,6 +4202,143 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  # ── ORG-9 Master imports (API-5 async operations) ───────────────────────────
+  /v1/master-imports:
+    post:
+      operationId: createMasterImport
+      summary: "ORG-9 upload a file of party rows; always asynchronous, answers 202 with an operation"
+      description: |
+        The file moves through upload, validate, preview, approve, import and reconcile. This call records the rows exactly as
+        received (with their SHA-256, checked against `manifest_sha256` when the sender gives one) and starts validation as an
+        operation: poll `Location`. Every row is checked and every problem of every row is kept, so a sender gets all the errors
+        at once. A retry carrying the same `Idempotency-Key` from the same principal is the same operation, never a second import;
+        the same key with a different file is refused (409 IDEMPOTENCY_MISMATCH).
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateMasterImportRequest" } } }
+      responses:
+        "202":
+          description: Accepted; validation is running
+          headers:
+            Location: { schema: { type: string }, description: "/v1/operations/{id}" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The Idempotency-Key was used for a different request", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/master-imports/{importID}:
+    get:
+      operationId: getMasterImport
+      summary: "ORG-9 an import: status, row counts and, once finished, its reconciliation"
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: importID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The import
+          content: { application/json: { schema: { $ref: "#/components/schemas/MasterImport" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/master-imports/{importID}/rows:
+    get:
+      operationId: listImportRows
+      summary: "ORG-9 each row's verdict, errors and outcome, by row number"
+      description: |
+        The row as received is never returned, because it can carry identifiers. A row that matched an existing party or needs
+        review is a CONFLICT left for stewardship, with the party and case it names: an import never overwrites.
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: importID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, VALID, INVALID, IMPORTED, CONFLICT, FAILED] } }
+        - { name: after_row, in: query, schema: { type: integer, minimum: 0 }, description: "Return rows after this row number." }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 }, description: "Default 50." }
+      responses:
+        "200":
+          description: The rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/ImportRow" } }
+                  next_after_row: { type: integer, description: "Present when more rows may follow." }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/master-imports/{importID}:approve:
+    post:
+      operationId: approveMasterImport
+      summary: "ORG-9 approve a previewed import, starting it; always asynchronous, answers 202 with an operation"
+      description: |
+        Refused when the file has any invalid row (409), and refused (403 SOD_DENIED) when the approver uploaded it. Importing
+        creates the parties of the valid rows through the ordinary party creation path, as the principal who uploaded the file;
+        a row that matches an existing party is recorded as a conflict, never overwritten. The operation cannot be cancelled once
+        it has started creating parties. Approving twice returns the same operation.
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: importID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ApproveMasterImportRequest" } } }
+      responses:
+        "202":
+          description: Accepted; the import is running
+          headers:
+            Location: { schema: { type: string }, description: "/v1/operations/{id}" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, a file with invalid rows, or not ready for approval", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/operations/{operationID}:
+    get:
+      operationId: getOperation
+      summary: "API-5 poll an operation of the tenant"
+      description: "States: queued, running, waiting_external, succeeded, failed, cancel_requested, cancelled. A finished operation names its resource in `resource_ref`; a failed one carries a problem."
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: operationID, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The operation
+          content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/operations/{operationID}:cancel:
+    post:
+      operationId: cancelOperation
+      summary: "API-5 ask an operation to stop, before its point of no return"
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: operationID, in: path, required: true, schema: { type: string } }
+      responses:
+        "202":
+          description: Cancellation requested; the operation ends cancelled
+          content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The operation is finished or past its point of no return", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
 
 components:
   securitySchemes:
@@ -5607,6 +5744,132 @@ components:
         supersedes: { type: array, items: { type: string } }
         pinned_release: { type: string }
         history: { type: array, items: { $ref: "#/components/schemas/ReferenceHistoryItem" } }
+
+    CreateMasterImportRequest:
+      type: object
+      required: [kind, source_name, source_version, evidence_ref, valid_from, rows]
+      properties:
+        kind: { type: string, enum: [PARTY] }
+        source_name: { type: string, maxLength: 200 }
+        source_version: { type: string, maxLength: 100 }
+        manifest_sha256: { type: string, pattern: "^[0-9a-f]{64}$", description: "SHA-256 of the compacted rows; refused if it does not match what was received." }
+        source_class: { type: string, description: "SYSTEM_IMPORT when absent." }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date, description: "When the facts in the file began to hold, unless a row says otherwise." }
+        rows:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          items: { $ref: "#/components/schemas/ImportPartyRow" }
+        correlation_id: { type: string }
+
+    ImportPartyRow:
+      type: object
+      required: [row_ref, party_kind, names]
+      description: "Any other field makes the row invalid; nothing is silently dropped."
+      properties:
+        row_ref: { type: string, description: "The sender's own key for the record, unique within the file." }
+        party_kind: { type: string, enum: [LEGAL_ENTITY, ORGANIZATION_NON_LEGAL, NATURAL_PERSON, PUBLIC_AUTHORITY] }
+        names: { type: array, items: { type: object, additionalProperties: true } }
+        country: { type: string }
+        identifiers: { type: array, items: { type: object, additionalProperties: true } }
+        legal_entity_id: { type: string, format: uuid }
+        valid_from: { type: string, format: date }
+
+    ApproveMasterImportRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    Reconciliation:
+      type: object
+      required: [source_rows, staged_rows, invalid, imported, conflicts, failed, unresolved, matched]
+      description: "Every row received is accounted for exactly once: imported, a conflict, failed or invalid, with none unresolved."
+      properties:
+        source_rows: { type: integer }
+        staged_rows: { type: integer }
+        invalid: { type: integer }
+        imported: { type: integer }
+        conflicts: { type: integer }
+        failed: { type: integer }
+        unresolved: { type: integer }
+        matched: { type: boolean }
+
+    MasterImport:
+      type: object
+      required: [import_id, tenant_id, kind, status, source_name, source_version, content_sha256, source_class, evidence_ref, valid_from, row_count, valid_rows, invalid_rows, imported_rows, conflict_rows, failed_rows, uploaded_by, uploaded_at, record_version]
+      properties:
+        import_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        kind: { type: string }
+        status: { type: string, enum: [UPLOADED, VALIDATING, PREVIEW_READY, BLOCKED, APPROVED, IMPORTING, COMPLETED, FAILED, CANCELLED] }
+        source_name: { type: string }
+        source_version: { type: string }
+        content_sha256: { type: string }
+        source_class: { type: string }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date }
+        row_count: { type: integer }
+        valid_rows: { type: integer }
+        invalid_rows: { type: integer }
+        imported_rows: { type: integer }
+        conflict_rows: { type: integer }
+        failed_rows: { type: integer }
+        uploaded_by: { type: string }
+        uploaded_at: { type: string, format: date-time }
+        validated_at: { type: string, format: date-time }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+        approval_evidence: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        validate_operation_id: { type: string }
+        import_operation_id: { type: string }
+        reconciliation: { $ref: "#/components/schemas/Reconciliation" }
+        record_version: { type: integer }
+
+    RowIssue:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, enum: [MALFORMED_ROW, ROW_REF_INVALID, DUPLICATE_ROW_REF, DUPLICATE_IDENTIFIER, ROW_INVALID, CREATE_FAILED] }
+        message: { type: string }
+
+    ImportRow:
+      type: object
+      required: [row_no, row_ref, status, updated_at]
+      properties:
+        row_no: { type: integer }
+        row_ref: { type: string }
+        status: { type: string, enum: [PENDING, VALID, INVALID, IMPORTED, CONFLICT, FAILED] }
+        errors: { type: array, items: { $ref: "#/components/schemas/RowIssue" } }
+        outcome: { type: string, description: "What party creation answered: CREATED, MATCHED_EXISTING or REVIEW_REQUIRED." }
+        party_id: { type: string, format: uuid }
+        case_id: { type: string, format: uuid }
+        updated_at: { type: string, format: date-time }
+
+    Operation:
+      type: object
+      required: [id, type, state, cancelable, created_at, updated_at]
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [master_import.validate, master_import.import] }
+        state: { type: string, enum: [queued, running, waiting_external, succeeded, failed, cancel_requested, cancelled] }
+        progress:
+          type: object
+          properties:
+            completed_units: { type: integer }
+            total_units: { type: integer }
+        resource_ref: { type: string, description: "The resource the operation produced or worked on, for example /v1/master-imports/{id}." }
+        problem: { type: object, additionalProperties: true }
+        cancelable: { type: boolean, description: "False once past the point of no return." }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
 
     DimensionEligibility:
       type: object

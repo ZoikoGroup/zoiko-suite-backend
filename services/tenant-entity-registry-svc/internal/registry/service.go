@@ -84,6 +84,9 @@ type Service struct {
 
 	// expectedVersionOptional — dev-only, see ConfigureConcurrency.
 	expectedVersionOptional bool
+
+	// importAsync runs the work of a master import in the background; see SetImportExecutor.
+	importAsync func(func())
 	// currencies validates currency codes against currency-registry-svc, read-only (REF-03). Nil fails closed.
 	currencies currency.Validator
 

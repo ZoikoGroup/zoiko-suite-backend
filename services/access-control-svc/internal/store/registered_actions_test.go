@@ -124,6 +124,11 @@ var registeredActionMigrations = []struct {
 		"REFERENCE_STAGE_RELEASE":   "STANDARD",
 		"REFERENCE_PUBLISH_RELEASE": "HIGH",
 	}},
+	{"000055_register_master_import_actions", "tenant-entity-registry-svc", map[string]string{
+		"MASTER_IMPORT_UPLOAD":  "STANDARD",
+		"MASTER_IMPORT_APPROVE": "HIGH",
+		"MASTER_IMPORT_CANCEL":  "STANDARD",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

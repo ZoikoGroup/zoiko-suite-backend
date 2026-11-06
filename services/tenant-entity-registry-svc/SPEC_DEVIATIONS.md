@@ -440,3 +440,20 @@ Where the spec leaves a choice, the code chooses the safer reading:
   ISO 3166/4217 and IANA releases are data a steward stages and a releaser publishes, with the retrieval evidence the spec asks for.
 - **Not built.** Calendar profiles and time-zone resolution (MDM-04 s16.2), which belong to the deadline evaluation in WFC; the
   `checksum` is stored as provenance but not verified against a content digest, since no canonical form of a source file is defined.
+
+### Master imports (ORG-9)
+
+- **Rows arrive as JSON, not a file upload.** `POST /v1/master-imports` takes a `rows` array; there is no multipart or file-store path. The content SHA-256 is
+  computed over the rows received. Raw rows are not returned by any read: only the per-row outcome and its errors.
+- **Always asynchronous.** Upload answers 202 with `Location: /v1/operations/{id}`; approval is also an operation. The same `Idempotency-Key` returns the same
+  operation, and the same key with a different request is a conflict.
+- **Party is the only kind.** Other master-data kinds are refused.
+- **Approval is maker-checker.** The uploader cannot approve (service and table CHECK), and any INVALID row blocks approval.
+- **Import goes through the ordinary party create path** as the uploader, so matching and review apply. A row that matches an existing party or opens a review
+  is recorded as CONFLICT and never overwrites. The request id `imp:{import}:{row}` makes a rerun idempotent.
+- **Reconciliation counts the rows themselves**, not the counters kept during the run. An import is COMPLETED only if every row is accounted for. Per-row
+  errors are kept.
+- **Cancel.** Allowed until the import starts. `StartImport` is the point of no return: it marks the operation not cancelable, and a later cancel is 409.
+  A cancel requested before start cancels an APPROVED import.
+- **No startup resume sweeper.** An import interrupted by a process restart is not resumed automatically; it needs an operator to re-run it (the row request
+  ids make that safe).

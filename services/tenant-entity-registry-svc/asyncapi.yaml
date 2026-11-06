@@ -154,6 +154,12 @@ channels:
           - $ref: "#/components/messages/ReferenceSetCreated"
           - $ref: "#/components/messages/ReferenceReleaseStaged"
           - $ref: "#/components/messages/ReferenceReleasePublished"
+          # ── ORG-9 master imports ──────────────────────────────────────────
+          - $ref: "#/components/messages/MasterImportUploaded"
+          - $ref: "#/components/messages/MasterImportValidated"
+          - $ref: "#/components/messages/MasterImportApproved"
+          - $ref: "#/components/messages/MasterImportCompleted"
+          - $ref: "#/components/messages/MasterImportCancelled"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -853,6 +859,53 @@ components:
         may adopt the release automatically, must migrate, or must preserve the old version for historical processing. The
         changed codes are read from the registry at the release.
       x-spec-event: reference_release_published
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportUploaded:
+      name: master_import.uploaded
+      title: A master import file was uploaded and awaits validation
+      description: Carries the import id, source name and version, the content hash, the row count and the uploader. Never a row.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportValidated:
+      name: master_import.validated
+      title: A master import was validated and is previewable or blocked
+      description: "`status` is PREVIEW_READY, or BLOCKED when any row is invalid; the counts say how many rows are valid and invalid."
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportApproved:
+      name: master_import.approved
+      title: A master import was approved, by someone other than its uploader, and is starting
+      description: Carries the approver and the evidence reference.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportCompleted:
+      name: master_import.completed
+      title: A master import ended, reconciled or failed
+      description: |
+        `status` is COMPLETED when every row received is accounted for exactly once, FAILED when not or when the work could not
+        be carried out. Carries the counts and the reconciliation. Outcomes per row are read from the registry.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportCancelled:
+      name: master_import.cancelled
+      title: A master import was cancelled before it started importing
+      description: Nothing was created.
+      x-spec-event: null
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"

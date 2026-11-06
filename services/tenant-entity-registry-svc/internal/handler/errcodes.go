@@ -61,6 +61,7 @@ var errorCodes = []struct {
 	{registry.ErrApprovalFingerprintMismatch, CodeVersionConflict},
 	{registry.ErrOnboardingKeyMismatch, CodeIdempotencyMismatch},
 	{registry.ErrCreateRequestMismatch, CodeIdempotencyMismatch},
+	{registry.ErrIdempotencyKeyMismatch, CodeIdempotencyMismatch},
 	{registry.ErrMergeProhibited, CodeMergeProhibited},
 	{registry.ErrRateMissing, CodeRateMissing},
 	{registry.ErrDimensionMismatch, CodeDimensionMismatch},
