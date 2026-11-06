@@ -4064,6 +4064,144 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: "Stale expected_version, already retired, or other units still convert through it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
+  # ── MDM-04 Reference releases ───────────────────────────────────────────────
+  /v1/reference-sets:
+    post:
+      operationId: createReferenceSet
+      summary: "MDM-04 define a governed reference set, a domain-neutral code list"
+      description: |
+        A set changes only by releases. `allow_custom` says whether releases may add user-assigned codes; an official code list
+        takes none.
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateReferenceSetRequest" } } }
+      responses:
+        "201":
+          description: Set defined
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReferenceSet" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The set already exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listReferenceSets
+      summary: "MDM-04 the reference sets of the tenant, with the release in force today"
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The sets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/ReferenceSet" } }
+
+  /v1/reference-sets/{setCode}/releases:
+    post:
+      operationId: stageReferenceRelease
+      summary: "MDM-04 stage a release: its changes to codes, source, effective date and compatibility"
+      description: |
+        The changes are checked against the set as published: ADD of an existing code, a change to a code that is not active, a
+        replacement that is not live once the release is applied, and a custom code in a set that takes none are all refused
+        naming the code. The effective date must follow every release already published. The release governs nothing until
+        someone other than its stager publishes it.
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/StageReferenceReleaseRequest" } } }
+      responses:
+        "201":
+          description: Release staged
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReferenceRelease" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The version exists, or the effective date does not follow the published releases", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listReferenceReleases
+      summary: "MDM-04 the releases of a set, staged and published, by effective date"
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setCode, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The releases
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/ReferenceRelease" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/reference-sets/{setCode}/releases/{version}:publish:
+    post:
+      operationId: publishReferenceRelease
+      summary: "MDM-04 publish a staged release, putting it in force from its effective date"
+      description: |
+        Refused (403 SOD_DENIED) when the publisher staged it. The changes are checked again against what has been published
+        since staging. A published release is final; a later release supersedes it.
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setCode, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/PublishReferenceReleaseRequest" } } }
+      responses:
+        "200":
+          description: Release published
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReferenceRelease" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Already published, or the set changed since the release was staged", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/reference/{setCode}/{code}:
+    get:
+      operationId: resolveReference
+      summary: "MDM-04 Resolve reference - a code as it stood on a date, with its release, validity and supersession"
+      description: |
+        Answers from published releases only. `status` is ACTIVE, RETIRED or SUPERSEDED: a retired or superseded code is still
+        returned, with `valid_to` and `superseded_by`, so a consumer reading old data can interpret it. A code not yet added on
+        the date, or never added, is 404. `release` pins the answer to one exact published release and those before it, whatever
+        the date, for processing that must interpret codes under the release it was built on. The date is ignored when a release
+        is pinned. `history=true` adds every published change to the code.
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setCode, in: path, required: true, schema: { type: string } }
+        - { name: code, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/AsOf"
+        - { name: release, in: query, schema: { type: string }, description: "An exact published release version." }
+        - { name: history, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: The code and the release that governed it
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReferenceResolution" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
 
 components:
   securitySchemes:
@@ -5342,6 +5480,133 @@ components:
         rounding: { type: string }
         from: { $ref: "#/components/schemas/ConversionPin" }
         to: { $ref: "#/components/schemas/ConversionPin" }
+
+    CreateReferenceSetRequest:
+      type: object
+      required: [set_code, name, source_authority]
+      properties:
+        set_code: { type: string, pattern: "^[A-Z][A-Z0-9_]{1,39}$", description: "For example ISO_3166_COUNTRY." }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        source_authority: { type: string, maxLength: 300 }
+        allow_custom: { type: boolean }
+        correlation_id: { type: string }
+
+    ReferenceSet:
+      type: object
+      required: [set_id, tenant_id, set_code, name, source_authority, allow_custom, created_by, created_at]
+      properties:
+        set_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        set_code: { type: string }
+        name: { type: string }
+        description: { type: string }
+        source_authority: { type: string }
+        allow_custom: { type: boolean }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        current_release: { type: string, description: "The release in force today, when one is." }
+
+    ReferenceEntryInput:
+      type: object
+      required: [code, change_type]
+      properties:
+        code: { type: string }
+        change_type: { type: string, enum: [ADD, MODIFY_METADATA, SUPERSEDE, RETIRE, CORRECT] }
+        label: { type: string, maxLength: 300, description: "Required except for RETIRE and SUPERSEDE." }
+        origin: { type: string, enum: [OFFICIAL, CUSTOM], description: "OFFICIAL when absent; a code's origin never changes." }
+        metadata: { type: object, additionalProperties: true }
+        replaced_by_code: { type: string, description: "For SUPERSEDE, and only then." }
+        reason: { type: string, description: "Required for SUPERSEDE, RETIRE and CORRECT." }
+
+    StageReferenceReleaseRequest:
+      type: object
+      required: [release_version, source_published_at, effective_from, compatibility, evidence_ref, entries]
+      properties:
+        release_version: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$" }
+        source_published_at: { type: string, format: date-time, description: "When the source published it, apart from the date from which it governs." }
+        effective_from: { type: string, format: date }
+        source_authority: { type: string, description: "Defaults to the set's authority." }
+        compatibility: { type: string, enum: [AUTO_ADOPT, REQUIRES_MIGRATION, PRESERVE_OLD] }
+        checksum: { type: string, pattern: "^[0-9a-f]{64}$" }
+        evidence_ref: { type: string }
+        entries: { type: array, minItems: 1, maxItems: 5000, items: { $ref: "#/components/schemas/ReferenceEntryInput" } }
+        correlation_id: { type: string }
+
+    PublishReferenceReleaseRequest:
+      type: object
+      required: [evidence_ref]
+      properties:
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ReferenceRelease:
+      type: object
+      required: [release_id, set_code, release_version, status, source_published_at, effective_from, source_authority, compatibility, evidence_ref, staged_by, staged_at, entry_count]
+      properties:
+        release_id: { type: string, format: uuid }
+        set_code: { type: string }
+        release_version: { type: string }
+        status: { type: string, enum: [STAGED, PUBLISHED] }
+        source_published_at: { type: string, format: date-time }
+        effective_from: { type: string, format: date }
+        source_authority: { type: string }
+        compatibility: { type: string, enum: [AUTO_ADOPT, REQUIRES_MIGRATION, PRESERVE_OLD] }
+        checksum: { type: string }
+        evidence_ref: { type: string }
+        staged_by: { type: string }
+        staged_at: { type: string, format: date-time }
+        released_by: { type: string }
+        released_at: { type: string, format: date-time }
+        release_evidence: { type: string }
+        publish_seq: { type: integer }
+        entry_count: { type: integer }
+        changes: { type: object, additionalProperties: { type: integer } }
+
+    ReferenceReleaseRef:
+      type: object
+      required: [release_version, effective_from, source_published_at, source_authority, compatibility, evidence_ref, publish_seq]
+      properties:
+        release_version: { type: string }
+        effective_from: { type: string, format: date }
+        source_published_at: { type: string, format: date-time }
+        source_authority: { type: string }
+        compatibility: { type: string }
+        checksum: { type: string }
+        evidence_ref: { type: string }
+        publish_seq: { type: integer }
+
+    ReferenceHistoryItem:
+      type: object
+      required: [release, change_type, origin]
+      properties:
+        release: { $ref: "#/components/schemas/ReferenceReleaseRef" }
+        change_type: { type: string }
+        label: { type: string }
+        origin: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        replaced_by_code: { type: string }
+        reason: { type: string }
+
+    ReferenceResolution:
+      type: object
+      required: [set_code, code, as_of, status, label, origin, metadata, release, valid_from, change_type]
+      properties:
+        set_code: { type: string }
+        code: { type: string }
+        as_of: { type: string, format: date }
+        status: { type: string, enum: [ACTIVE, RETIRED, SUPERSEDED] }
+        label: { type: string }
+        origin: { type: string, enum: [OFFICIAL, CUSTOM] }
+        metadata: { type: object, additionalProperties: true }
+        release: { $ref: "#/components/schemas/ReferenceReleaseRef" }
+        valid_from: { type: string, format: date, description: "The effective date of the release that added the code." }
+        valid_to: { type: string, format: date, description: "The effective date of the release that retired or superseded it." }
+        change_type: { type: string, description: "What the governing release did to the code." }
+        superseded_by: { type: string }
+        supersedes: { type: array, items: { type: string } }
+        pinned_release: { type: string }
+        history: { type: array, items: { $ref: "#/components/schemas/ReferenceHistoryItem" } }
 
     DimensionEligibility:
       type: object

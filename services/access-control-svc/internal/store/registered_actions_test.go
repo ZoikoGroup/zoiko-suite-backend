@@ -119,6 +119,11 @@ var registeredActionMigrations = []struct {
 		"UNIT_APPROVE_CONVERSION": "HIGH",
 		"UNIT_RETIRE":             "HIGH",
 	}},
+	{"000054_register_reference_actions", "tenant-entity-registry-svc", map[string]string{
+		"REFERENCE_CREATE_SET":      "STANDARD",
+		"REFERENCE_STAGE_RELEASE":   "STANDARD",
+		"REFERENCE_PUBLISH_RELEASE": "HIGH",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

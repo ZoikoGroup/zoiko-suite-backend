@@ -412,3 +412,31 @@ Where the spec leaves a choice, the code chooses the safer reading:
   misleading). History is kept; a past date still converts. A base unit retires only once every other unit of its dimension has.
 - **Not built.** Nonlinear conversions (offsets such as temperature, or context-dependent ones such as density), which the spec
   says need specialised rules; the factor here is a pure proportion. No unit catalogue is pre-loaded: units are tenant master data.
+
+### Reference releases (MDM-04, ORG-8 wave 5)
+
+- **What `GET /v1/reference/{set}/{code}?as_of=` answers.** A code as it stood on the date, from published releases only: its
+  status (ACTIVE, RETIRED or SUPERSEDED), label, origin (OFFICIAL or CUSTOM, kept distinct as the spec requires), metadata, the
+  release that governs it (version, effective date, publication time, authority, compatibility, checksum, evidence), when it
+  was added (`valid_from`) and when it stopped (`valid_to`), and the supersession from both sides (`superseded_by`,
+  `supersedes`). A retired or superseded code is still returned, so a consumer reading old data can interpret it. A code not yet
+  added on the date, or never added, is 404: nothing is guessed. `history=true` lists every published change.
+- **Pinning a release.** `release=` answers under one exact published release and those before it, whatever the date, for
+  processing that must interpret codes under the release it was built on ("exact reference set release controlling code
+  interpretation"). The date is ignored when a release is pinned, and a staged release cannot be pinned.
+- **A release is a set of changes, not a full snapshot.** Each entry is ADD, MODIFY_METADATA, SUPERSEDE, RETIRE or CORRECT, one per
+  code per release. Entries are checked against the set as published: a duplicate ADD, a change to a code that is not active,
+  a replacement that is not live once the release is applied, a custom code in a set that takes none, and a change of origin are
+  refused naming the code. A retired code is not reused. The checks run at staging and again at publication, so two releases
+  staged together cannot both be published if the first changes what the second assumed.
+- **Releases are published in effective-date order.** A release takes effect after every release already published (service
+  checks, and a trigger holds it), so published history is never rewritten; corrections are a later CORRECT release. A published
+  release is final (trigger). The spec's publication timestamp and business effective date are separate columns.
+- **Releasing is maker-checker.** The principal who staged a release cannot publish it (403 SOD_DENIED, and a table CHECK holds it).
+  The spec has no stage/publish commands; this is how the "release gate" is realised.
+- **Reference sets are per tenant.** Every other table of the service is tenant-scoped under row-level security, so a set (and its
+  releases) belongs to a tenant and is read under that tenant. A platform-wide ISO baseline shared by all tenants would need a
+  separate, cross-tenant read path that no existing spec section describes; it is not built. **No baseline is pre-loaded**: the
+  ISO 3166/4217 and IANA releases are data a steward stages and a releaser publishes, with the retrieval evidence the spec asks for.
+- **Not built.** Calendar profiles and time-zone resolution (MDM-04 s16.2), which belong to the deadline evaluation in WFC; the
+  `checksum` is stored as provenance but not verified against a content digest, since no canonical form of a source file is defined.

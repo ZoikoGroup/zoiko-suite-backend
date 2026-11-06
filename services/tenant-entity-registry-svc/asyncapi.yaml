@@ -150,6 +150,10 @@ channels:
           - $ref: "#/components/messages/UnitConversionActivated"
           - $ref: "#/components/messages/UnitConversionSuperseded"
           - $ref: "#/components/messages/UnitRetired"
+          # ── MDM-04 reference releases ─────────────────────────────────────
+          - $ref: "#/components/messages/ReferenceSetCreated"
+          - $ref: "#/components/messages/ReferenceReleaseStaged"
+          - $ref: "#/components/messages/ReferenceReleasePublished"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -819,6 +823,36 @@ components:
       title: A unit was retired and rejects new use
       description: Carries the retirement date and reason. History is kept.
       x-spec-event: UnitRetired
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ReferenceSetCreated:
+      name: reference.set.created
+      title: A governed reference set was defined
+      description: Carries the set code, its source authority and whether it takes user-assigned codes.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ReferenceReleaseStaged:
+      name: reference.release.staged
+      title: A reference release awaits independent publication
+      description: Nothing is in force yet. Carries the release version, effective date, compatibility and the count of changes by type.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ReferenceReleasePublished:
+      name: reference.release.published
+      title: A reference release was published and governs from its effective date
+      description: |
+        Carries `reference_set_id`, `release_version`, `effective_from` and `compatibility`, which tells a consumer whether it
+        may adopt the release automatically, must migrate, or must preserve the old version for historical processing. The
+        changed codes are read from the registry at the release.
+      x-spec-event: reference_release_published
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"

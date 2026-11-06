@@ -151,6 +151,10 @@ func codeEventNames() []string {
 		events.EventConversionActivated,
 		events.EventConversionSuperseded,
 		events.EventUnitRetired,
+		// MDM-04 reference releases (reference_events.go).
+		events.EventReferenceSetCreated,
+		events.EventReferenceReleaseStaged,
+		events.EventReferenceReleasePublished,
 	}
 }
 
