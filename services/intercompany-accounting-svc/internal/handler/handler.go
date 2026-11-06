@@ -1027,6 +1027,12 @@ func (h *Handler) ResolveMismatch(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	// SPEC_DEVIATIONS A8: the resolver must differ from whoever raised the
+	// dispute.
+	if entry.DisputedByPrincipalID != nil && *entry.DisputedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_resolution_forbidden", domain.ErrResolverIsDisputer.Error())
+		return
+	}
 
 	result, err := h.store.ResolveMismatch(r.Context(), id, idempotencyKey, principalID, req.ResolutionNote, req.Outcome, getCorrelationID(r))
 	if err != nil {

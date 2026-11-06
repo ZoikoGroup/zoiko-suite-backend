@@ -132,15 +132,24 @@ reconciliation-engine-svc holds for DATA-07.
   Matched/MismatchDetected), so no acknowledgement event is invented. All
   three new events are enqueued in the same guarded transaction as the
   state change; a failed enqueue rolls the change back.
-- **A8. No segregation of duties on resolution.** §14: "One entity cannot
-  certify both sides of material mismatch without compensating control."
-  Dispute and resolve use different actions, but both are authorized on the
-  **target** entity only, and nothing stops the principal who raised a dispute
-  from resolving it, or a target-entity user from resolving a mismatch with no
-  source-entity involvement. There is no materiality notion to scope it.
-  Needs a decision on what "certify both sides" means here (resolver ≠
-  disputer; or source and target each acknowledge; or a materiality threshold
-  above which both are required) before it is built.
+- **A8. No segregation of duties on resolution. — Resolver ≠ disputer closed
+  2026-11-06.** §14: "One entity cannot certify both sides of material
+  mismatch without compensating control." Dispute and resolve use different
+  actions, but both are authorized on the **target** entity only, and
+  nothing stopped the principal who raised a dispute from resolving it.
+  `ResolveMismatch` now refuses (403 `self_resolution_forbidden`) a
+  principal who is also the pair's own `DisputedByPrincipalID`, applied
+  unconditionally rather than building a materiality model the spec never
+  defines — the same interpretation financial-close-svc's B1 made for every
+  maker-checker gate in that register.
+  Still open: nothing requires source-entity involvement in a resolution a
+  target-entity user alone can make (the spec's "both sides" reading beyond
+  resolver-independence), and there is still no materiality threshold above
+  which that stronger reading would apply. Left open — a real design
+  decision on what "both sides" requires, not a mechanical fix.
+  - *Manual check:* `internal/handler/acc11_lifecycle_test.go` —
+    `TestResolveMismatch_SamePrincipalAsDisputer_Refused` (403, and the pair
+    does not move), an independent resolver still succeeds.
 - **A9. No `Closed` state, and `RESOLVED` records no outcome. — Closed
   (B8).** Migration 000006 adds `CLOSED`, the terminal state of a MATCHED
   pair (`POST …/entries/{id}/close`, with a required reason). It also
