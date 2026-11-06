@@ -3634,6 +3634,14 @@ func (h *Handler) ExecuteAllocation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAllocationRuleTransition))
 		return
 	}
+	// A7 (SPEC_DEVIATIONS): "run certifier separate from driver owner" —
+	// applied unconditionally, the same interpretation B1 already made for
+	// every other maker-checker gate in this service rather than building a
+	// materiality ("high-risk pools") model the spec never defines.
+	if rule.CreatedByPrincipalID == principalID {
+		writeSelfApproval(w)
+		return
+	}
 
 	existing, err := h.store.GetAllocationRunByRuleAndPeriod(r.Context(), req.RuleID, req.FiscalPeriod)
 	if err == nil {

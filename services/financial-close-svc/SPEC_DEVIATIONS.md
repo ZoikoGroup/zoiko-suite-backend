@@ -386,7 +386,7 @@ state-machine and kernel-seal tests updated to use independent principals),
 no prior transition, a tracked SOFT_CLOSE preparer, a tracked CLOSE_REVIEW
 preparer, each independently addressable by `toState`).
 
-### A7. ACC-09 posts on execution with no review, and its drivers are static percentages
+### A7. ACC-09 posts on execution with no review, and its drivers are static percentages — partially closed 2026-11-06
 
 §12:
 
@@ -403,12 +403,27 @@ preparer, each independently addressable by `toState`).
 > "Evidence / lineage | Persist source watermark, driver values, rule version,
 > rounding and posting refs."
 
-Rule maker-checker is now enforced (B1). `ExecuteAllocation`, however, moves
-Planned → Calculated → Posted inside one request, with no run review or
-certifier. Drivers are fixed percentages on the rule, not a driver
-population such as headcount or square metres, so "driver population
+Rule maker-checker is now enforced (B1). The run-certifier clause is now
+enforced too: `ExecuteAllocation` refuses a principal who is also the rule's
+`CreatedByPrincipalID` (403 `self_approval_forbidden`, reusing the same
+shared sentinel and literal state model — the spec's own Run state is
+Planned→Calculated→Posted/Failed with no separate Review state, so this is
+enforced as a certifier/driver-owner identity check at execution rather than
+by inventing a state the spec does not name). Applied unconditionally like
+every other maker-checker gate in this service (B1's own interpretation),
+not only for a "high-risk pool" the spec never defines how to identify.
+
+`ExecuteAllocation` still moves Planned → Calculated → Posted inside one
+request — there remains no standalone run-review step distinct from the
+certifier check above. Drivers are fixed percentages on the rule, not a
+driver population such as headcount or square metres, so "driver population
 incomplete" cannot arise and cannot be detected. The source amount is read
-from the trial balance with no watermark persisted on the run.
+from the trial balance with no watermark persisted on the run — GL's trial
+balance endpoint does not expose one to capture.
+
+Evidence: `internal/handler/handler_test.go`
+(`TestExecuteAllocation_SamePrincipalAsRuleCreator_Refused`, plus the
+existing execution tests updated to use an independent executor principal).
 
 ### A8. ACC-10 rates and classification are caller-asserted
 

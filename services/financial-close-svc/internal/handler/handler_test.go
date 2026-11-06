@@ -3712,6 +3712,33 @@ func TestApproveAllocationRule_UsesDistinctAuthorizationAction(t *testing.T) {
 	}
 }
 
+// A7 (SPEC_DEVIATIONS): the run certifier (whoever executes the allocation)
+// must differ from the driver owner (the rule's creator) — unconditionally,
+// not only for a "high-risk" pool the spec never defines how to identify.
+func TestExecuteAllocation_SamePrincipalAsRuleCreator_Refused(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{trialBalances: map[string]float64{"5000-ITSharedCost": 1000.00}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers()) // created by "preparer-1"
+
+	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("executor == rule creator: want 403, got %d %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "self_approval_forbidden") {
+		t.Fatalf("refusal must name self_approval_forbidden: %s", rr.Body.String())
+	}
+	if len(s.allocationRuns) != 0 {
+		t.Fatal("a refused execution must not create a run")
+	}
+
+	rr = doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("an independent executor must succeed: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestExecuteAllocation_SplitsSourceAmountAcrossDrivers(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{trialBalances: map[string]float64{"5000-ITSharedCost": 1000.00}}
@@ -3719,7 +3746,7 @@ func TestExecuteAllocation_SplitsSourceAmountAcrossDrivers(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3757,7 +3784,7 @@ func TestExecuteAllocation_RoundingResidualAbsorbedByLastDriver(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, drivers)
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3779,14 +3806,14 @@ func TestExecuteAllocation_Rerun_ReturnsSameRunWithoutReposting(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	first := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	first := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if first.Code != http.StatusCreated {
 		t.Fatalf("first execute failed: %d %s", first.Code, first.Body.String())
 	}
 	var firstRun domain.AllocationRun
 	_ = json.NewDecoder(first.Body).Decode(&firstRun)
 
-	rerun := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rerun := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rerun.Code != http.StatusOK {
 		t.Fatalf("expected 200 on rerun got %d: %s", rerun.Code, rerun.Body.String())
 	}
@@ -3807,7 +3834,7 @@ func TestExecuteAllocation_SourceBalanceNotFound_Returns422(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3820,7 +3847,7 @@ func TestExecuteAllocation_JournalPostingFails_RunMarkedFailedNotSilentlyLost(t 
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3844,11 +3871,11 @@ func TestExecuteAllocation_ExistingFailedRun_MustUseReprocess(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	if rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1"); rr.Code != http.StatusServiceUnavailable {
+	if rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1"); rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected first attempt to fail 503, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 (use reprocess) got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3861,7 +3888,7 @@ func TestReprocessAllocationRun_RetriesFailedRunWithSameAmounts(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	first := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	first := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if first.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected first attempt to fail: %d", first.Code)
 	}
