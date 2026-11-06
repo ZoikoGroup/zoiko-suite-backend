@@ -64,53 +64,83 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	dbPort := uint32(16601 + uint32(os.Getpid()%499))
-	dbName := "access_control_isolation_test"
-
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database(dbName).
-			Username("postgres").
-			Password("postgres").
-			// Isolated so this suite cannot collide with another service's
-			// embedded instance over the shared default extraction directory.
-			RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-access-control-%d", dbPort))),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("embedded postgres failed to start: %v\n", err)
-		os.Exit(1)
-	}
-	defer func() { _ = pg.Stop() }()
-
 	ctx := context.Background()
-	ownerDSN := fmt.Sprintf("postgres://postgres:postgres@localhost:%d/%s?sslmode=disable", dbPort, dbName)
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+	dbName := "access_control_isolation_test"
+	var dbPort uint32
+
+	if dsn == "" {
+		dbPort = uint32(16601 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				Version(embeddedpostgres.V16).
+				Port(dbPort).
+				Database(dbName).
+				Username("postgres").
+				Password("postgres").
+				// Isolated so this suite cannot collide with another service's
+				// embedded instance over the shared default extraction directory.
+				RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-access-control-%d", dbPort))),
+		)
+		if err := pg.Start(); err != nil {
+			fmt.Printf("embedded postgres failed to start: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() { _ = pg.Stop() }()
+
+		dsn = fmt.Sprintf("postgres://postgres:postgres@localhost:%d/%s?sslmode=disable", dbPort, dbName)
+	}
 
 	var err error
-	ownerPool, err = pgxpool.New(ctx, ownerDSN)
+	ownerPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("owner pool: %v\n", err)
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
 	if err := waitReady(ctx, ownerPool); err != nil {
 		fmt.Printf("postgres never became ready: %v\n", err)
-		os.Exit(1)
-	}
-	if err := applyMigrations(ctx, ownerPool); err != nil {
-		fmt.Printf("migrations: %v\n", err)
-		os.Exit(1)
-	}
-	if err := createAppRole(ctx, ownerPool, dbName); err != nil {
-		fmt.Printf("app role: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
-	appDSN := fmt.Sprintf("postgres://%s:%s@localhost:%d/%s?sslmode=disable", appRole, appPass, dbPort, dbName)
-	appPool, err = pgxpool.New(ctx, appDSN)
+	// When using an external DB (TEST_DATABASE_URL), we assume migrations and
+	// app role are already provisioned (e.g., by CI's postgres service container).
+	// When using embedded postgres, we must provision them ourselves.
+	if pg != nil {
+		if err := applyMigrations(ctx, ownerPool); err != nil {
+			fmt.Printf("migrations: %v\n", err)
+			ownerPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+		if err := createAppRole(ctx, ownerPool, dbName); err != nil {
+			fmt.Printf("app role: %v\n", err)
+			ownerPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+
+		appDSN := fmt.Sprintf("postgres://%s:%s@localhost:%d/%s?sslmode=disable", appRole, appPass, dbPort, dbName)
+		appPool, err = pgxpool.New(ctx, appDSN)
+	} else {
+		// Use the same DSN for the app pool when connecting to an external DB.
+		// The external DB should already have the app role provisioned.
+		appPool, err = pgxpool.New(ctx, dsn)
+	}
 	if err != nil {
 		fmt.Printf("app pool: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -120,7 +150,9 @@ func TestMain(m *testing.M) {
 
 	appPool.Close()
 	ownerPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 
