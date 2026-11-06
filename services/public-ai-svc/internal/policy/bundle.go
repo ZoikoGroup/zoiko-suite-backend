@@ -2,10 +2,13 @@ package policy
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
+
+	"zoiko.io/public-ai-svc/internal/signing"
 )
 
 // BundleDigest fingerprints the prompt/policy artifact (Doc 08 §06, Doc 06
@@ -63,3 +66,24 @@ func CheckDigest(approved, promptTemplateVersion string) error {
 	}
 	return nil
 }
+
+// CheckSignedDigest is CheckDigest plus the signers' approval (Doc 08 §06,
+// OPR-002): the approved digest must carry a valid Ed25519 signature from
+// the release signing key, so a digest typed into the environment by one
+// person is not enough. sig is base64; empty approved means dev/test.
+func CheckSignedDigest(approved, sigB64, pubKey, promptTemplateVersion string) error {
+	if err := CheckDigest(approved, promptTemplateVersion); err != nil || approved == "" {
+		return err
+	}
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil || len(sig) == 0 {
+		return fmt.Errorf("PUBLIC_AI_POLICY_SIGNATURE is missing or not base64")
+	}
+	if err := signing.Verify(pubKey, []byte(PolicySigningPayload(approved)), sig); err != nil {
+		return fmt.Errorf("policy digest signature does not verify with the release signing key: %w", err)
+	}
+	return nil
+}
+
+// PolicySigningPayload is what the signers sign for a policy digest.
+func PolicySigningPayload(digest string) string { return "zoikosuite-public-ai-policy:" + digest }

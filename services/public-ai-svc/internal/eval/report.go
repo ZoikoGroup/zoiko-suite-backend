@@ -142,12 +142,25 @@ func RunWith(ctx context.Context, a orchestrator.Answerer, d Dataset, opts Optio
 			rep.Flaky++
 		}
 		rep.Partitions[c.Partition] = ps
+		if c.Segment != "" {
+			if rep.Segments == nil {
+				rep.Segments = map[string]PartitionSummary{}
+			}
+			ss := rep.Segments[c.Segment]
+			ss.N++
+			if cr.Pass {
+				ss.Passed++
+			}
+			rep.Segments[c.Segment] = ss
+		}
 		rep.Results = append(rep.Results, cr)
 	}
-	for k, ps := range rep.Partitions {
-		ps.Rate = ratio(ps.Passed, ps.N)
-		ps.CILow, ps.CIHigh = wilson(ps.Passed, ps.N)
-		rep.Partitions[k] = ps
+	for _, m := range []map[string]PartitionSummary{rep.Partitions, rep.Segments} {
+		for k, ps := range m {
+			ps.Rate = ratio(ps.Passed, ps.N)
+			ps.CILow, ps.CIHigh = wilson(ps.Passed, ps.N)
+			m[k] = ps
+		}
 	}
 	im.Micro = ratio(im.Correct, im.Labelled)
 	if len(im.Support) > 0 {

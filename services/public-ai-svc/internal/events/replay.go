@@ -31,6 +31,10 @@ var typeTopics = map[string]struct {
 	TypeReleasePromoted:   {TopicGovernance, []string{"release_id", "kind", "signer_refs", "digest", "effective_at", "release_epoch"}},
 	TypeSourceRevoked:     {TopicGovernance, []string{"source_version_id", "reason_code", "effective_at", "revocation_epoch"}},
 	TypeKillSwitchChanged: {TopicControl, []string{"flag", "actor_ref", "approval_ref", "environment", "control_epoch"}},
+	TypeAnalytics: {TopicTelemetry, []string{"name", "route_id", "locale", "release_version", "intent_id", "confidence_bucket",
+		"safety_disposition", "slot_name", "reason_code", "answer_class", "source_count", "status_class", "latency_bucket",
+		"link_id", "action_id", "handoff_category", "route_available", "helpfulness", "feedback_reason", "severity_bucket",
+		"conflict_ids", "owner_queue_id"}},
 }
 
 // DefaultReplayMaxAge is how old a dead-lettered event may be and still be

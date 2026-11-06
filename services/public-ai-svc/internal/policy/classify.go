@@ -51,21 +51,28 @@ var exceptionRules = map[string][]*regexp.Regexp{
 			"ignore instructions", "ignore policy", "ignore the policy", "ignore your policy", "ignore policies", "ignore public only",
 			"ignore restrictions", "ignore the restrictions", "ignore safety", "bypass the filter", "bypass your", "without restrictions"),
 		regexp.MustCompile(`(?i)</?\s*(system|assistant|tool)\s*>|\[\s*system\s*\]|###\s*(system|instruction)|BEGIN SYSTEM`),
+		// Doc 06 §08/§25, QA-T040: the same instructions in other languages
+		// (Spanish, French, German, Portuguese, Italian, Dutch).
+		regexp.MustCompile(`(?i)\b(?:ignora|ignore|ignorez|ignoriere|ignorieren|negeer|olvida|oublie|oubliez|vergiss|esque[cç]a|dimentica)\b.{0,30}\b(?:instrucciones|instructions|anweisungen|instru[cç][oõ]es|istruzioni|instructies|reglas|r[eè]gles|regeln|regras|regole|regels)\b` +
+			`|\b(?:prompt|mensaje|invite)\s+(?:del|de|du)\s+(?:sistema|syst[eè]me)\b|\bsystemprompt\b|\bsystem-prompt\b` +
+			`|\b(?:muestra|revela|montre|r[eé]v[eè]le|zeige|verrate|mostra|rivela)\b.{0,25}\b(?:instrucciones|instructions|anweisungen|prompt|istruzioni)\b`),
 	},
 	X05SecurityEscalate: {
 		pattern("vulnerability", "vulnerabilities", "found a bug in your security", "security flaw", "exploit", "data breach",
 			"was hacked", "been hacked", "been compromised", "was compromised", "security breach", "security incident", "been breached", "were breached", "under attack", "ransomware", "cyber attack", "cyberattack", "phishing", "report a security", "responsible disclosure", "bug bounty",
-			"security concern", "security issue to report", "report a vulnerability"),
+			"security concern", "security issue to report", "report a vulnerability",
+			// Doc 02 §26 paraphrases (G20).
+			"being breached", "breached", "hacked", "breach in progress"),
 	},
 	X01PrivateAction: {
 		livePlatformRe,
-		regexp.MustCompile(`(?i)\b(?:my|our)\s+(?:\w+\s+){0,2}(?:invoices?|balances?|ledgers?|payroll|payslips?|pay ?stubs?|transactions?|bank statements?|tax returns?|journals?|employees?|staff records?|salar(?:y|ies)|accounts? receivable|accounts? payable|cash position|expenses?|bills?|vendors?|customers?|records?|filings?)\b`),
+		regexp.MustCompile(`(?i)\b(?:my|our)\s+(?:\w+\s+){0,2}(?:invoices?|balances?|ledgers?|payroll|payslips?|pay ?stubs?|transactions?|bank statements?|tax returns?|journals?|employees?|staff records?|salar(?:y|ies)|payments?|accounts? receivable|accounts? payable|cash position|expenses?|bills?|vendors?|customers?|records?|filings?)\b`),
 		pattern("show me my", "look up my", "check my account", "what is my balance", "what's my balance", "access my data", "pull my data", "in my account", "my tenant",
 			"private records", "all tenants", "other tenants", "every tenant", "all customers' data", "other customers' data", "customer records",
 			"status of my", "status of our", "my support account", "my subscription status"),
 	},
 	X02ActionDenied: {
-		regexp.MustCompile(`(?i)\b(?:pay|approve|reject|submit|file|export|delete|transfer|send|wire|refund|cancel|run|post|reconcile|issue)\s+(?:(?:my|our|the|this|these|that|a|an|all)\s+)?(?:\w+\s+){0,2}(?:invoices?|bills?|payments?|payroll|tax(?:es)?|returns?|filings?|data|accounts?|subscriptions?|money|funds|refunds?|journals?|entr(?:y|ies)|employees?)\b`),
+		regexp.MustCompile(`(?i)\b(?:pay|approve|reject|submit|file|export|delete|transfer|send|wire|refund|cancel|run|post|reconcile|issue)\s+(?:(?:my|our|the|this|these|that|a|an|all)\s+)?(?:\w+\s+){0,2}(?:invoices?|bills?|payments?|payroll|tax(?:es)?|returns?|filings?|data|accounts?|subscriptions?|money|funds|refunds?|journals?|entr(?:y|ies)|employees?|salar(?:y|ies)|wages)\b`),
 		pattern("do it for me", "make the payment", "process the payment", "execute the transfer", "make a payment", "make a transfer",
 			"make a bank transfer", "bank transfer for me", "send money", "move money", "wire money", "transfer money", "transfer funds"),
 	},
@@ -73,15 +80,18 @@ var exceptionRules = map[string][]*regexp.Regexp{
 		pattern("tax advice", "legal advice", "accounting advice", "financial advice", "investment advice", "employment law advice",
 			"should i deduct", "can i deduct", "should i claim", "can i claim", "should i file", "how much tax should", "how much tax do i",
 			"how do i avoid tax", "reduce my tax", "is it legal", "am i compliant", "are we compliant", "should i invest", "can i fire",
-			"tax liability", "how much tax do i owe", "legal guarantee",
+			"tax liability", "how much tax do i owe", "legal guarantee", "deductible", "tax deductible",
 			// Doc 02 S05: pay or rate advice is advice, whatever else is asked.
 			"what should i pay", "how much should i pay", "how much should we pay", "what should we pay", "what rate should i",
 			// Spanish (G33): regulated-advice requests are refused whatever the language.
 			"asesor*", "despedir", "despido", "consejo legal", "consejo fiscal", "impuestos debo", "debo pagar", "cuánto debo", "cuanto debo",
 			"qué debo pagar", "que debo pagar", "debo declarar", "cuántos impuestos", "cuantos impuestos"),
+		// "What should my German VAT return say?" asks for the visitor's own filing (G12/G19 paraphrases).
+		regexp.MustCompile(`(?i)\bwhat\s+should\s+(?:my|our)\s+(?:\w+\s+){0,2}(?:tax|vat|gst|returns?|filings?|declarations?)\b`),
 	},
 	X08ClaimVerification: {
-		pattern("guarantee", "guaranteed", "promise me", "confirm in writing", "legally binding", "put it in writing", "are you sure it is free"),
+		pattern("guarantee", "guaranteed", "promise me", "confirm in writing", "legally binding", "put it in writing", "are you sure it is free",
+			"promise in writing", "promise that", "in writing that"),
 	},
 	// Doc 02 §19: absolute coverage, compatibility or free-forever claims are
 	// never confirmed; the reply qualifies and refers (SAFETY_UNSUPPORTED_COVERAGE).
@@ -105,7 +115,9 @@ var intentRules = map[string]*regexp.Regexp{
 		"what is the zoiko suite", "what is the zoikosuite", "what's the zoiko suite", "tell me about zoiko suite", "about zoiko suite", "explain zoiko suite",
 		"tell me about zoikosuite", "about zoikosuite", "explain zoikosuite", "describe zoikosuite", "introduce zoikosuite", "how does zoikosuite work",
 		"new to zoikosuite", "what kind of platform", "overview", "hello", "hi", "hey", "good morning", "who are you",
-		"explore platform", "explore the platform", "explore capabilities"),
+		"explore platform", "explore the platform", "explore capabilities",
+		// Doc 02 §26 paraphrases (G01).
+		"what zoikosuite is", "what zoiko suite is", "this platform about", "what is this platform", "what is this product"),
 	"I02": pattern("feature*", "capabilit*", "module*", "accounts payable", "accounts receivable", "general ledger", "treasury", "procurement", "cash management", "what can you do",
 		"invoice*", "bills", "vendor payment*", "supplier payment*", "payables", "receivables", "expense*"),
 	"I03": pattern("multi-entity", "multi entity", "multiple entities", "entities", "subsidiar*", "consolidat*", "intercompany", "group companies",
@@ -115,7 +127,7 @@ var intentRules = map[string]*regexp.Regexp{
 	"I06": pattern("trial", "free trial", "try it", "try for free", "test drive", "sandbox account"),
 	"I07": pattern("upgrade*", "downgrade*", "switch plan", "change plan", "change my plan", "move to the growth", "add users", "remove users"),
 	"I08": pattern("demo", "book a demo", "what can be covered", "what can a demo cover", "demo cover", "can someone show me", "could someone show me", "someone show me", "show me how it works", "walk me through", "schedule a demo", "see it in action", "walkthrough", "product tour"),
-	"I09": pattern("enterprise quote", "custom quote", "enterprise pricing", "enterprise", "large organization", "large organisation", "sso", "scim", "solutions architect", "custom contract", "volume discount", "procurement team"),
+	"I09": pattern("enterprise quote", "custom quote", "enterprise pricing", "enterprise", "quote for", "discounted enterprise", "large organization", "large organisation", "sso", "scim", "solutions architect", "custom contract", "volume discount", "procurement team"),
 	"I10": pattern("integrat*", "connector*", "connect to", "connect with", "api", "apis", "webhook*", "quickbooks", "salesforce", "sync with", "bank feeds"),
 	"I11": pattern("migrat*", "switch from", "move from", "moving from", "import our data", "import data", "data import", "onboarding data"),
 	"I12": pattern("soc 2", "soc2", "iso 27001", "iso27001", "certif*", "secur*", "encrypt*", "penetration test", "pentest", "trust center", "compliance report", "mfa", "single sign-on"),
@@ -132,7 +144,7 @@ var intentRules = map[string]*regexp.Regexp{
 	"I21": pattern("help", "documentation", "docs", "guide", "faq", "knowledge base", "tutorial"),
 	"I22": pattern("log in", "login", "sign in", "sign-in", "signin", "account access", "access my account", "can't log", "cannot log", "can't sign", "cannot sign", "password reset", "reset my password", "forgot my password", "forgot password", "my account", "locked out"),
 	"I23": pattern("support ticket", "help from support", "need support", "get support", "support team", "talk to support", "speak to support", "reach support", "existing customer", "my ticket", "a ticket", "submit a request", "live chat", "chat support", "phone support", "24 hours", "24/7", "around the clock", "live agent", "live specialist", "ticket status", "raise a ticket", "open a ticket", "contact support", "customer support", "not working", "bug", "error", "problem with", "issue with", "broken"),
-	"I24": pattern("speak to a human", "talk to a human", "talk to a person", "speak to someone", "real person", "human", "agent", "representative", "talk to sales", "contact sales", "call me", "someone from sales", "sales to contact", "sales team to contact", "have sales"),
+	"I24": pattern("speak to a human", "talk to a human", "talk to a person", "speak to someone", "talk to someone", "talk to somebody", "speak to a person", "real person", "human", "agent", "representative", "talk to sales", "contact sales", "call me", "someone from sales", "sales to contact", "sales team to contact", "have sales"),
 	"I25": regexp.MustCompile(pattern("coming soon", "roadmap", "release date", "when will", "is it available", "availability", "launch*", "planned").String() +
 		`|(?i)\b(?:get|have|use|available|enable[ds]?|live|ready)\b[^.?!]{0,40}\b(?:today|right now|yet|currently)\b`),
 	"I26": pattern("compare", "comparison", "vs", "versus", "better than", "alternative to", "competitor*", "netsuite", "sage intacct"),
@@ -150,15 +162,24 @@ type Slots struct {
 	BillingCadence string // monthly | annual
 	EntityBand     string // 1 | 2-5 | 6+
 	Integration    string
+	// Doc 02 §09 optional context slots (enums only; see slots.go).
+	Persona       string
+	Workstream    string
+	SupportTopic  string
+	Jurisdiction  string
+	HandoffIntent string
 }
 
 // Decision is the policy outcome for one message.
 type Decision struct {
-	Exception string // X0n, or "" when none applies
-	Primary   string // I01–I30
-	Secondary string
-	Slots     Slots
-	Redaction Redaction
+	// Confidence is a coarse bucket of how strongly the message matched its
+	// intent (Doc 02 §27 intent_classified): high, medium, low or none.
+	Confidence string
+	Exception  string // X0n, or "" when none applies
+	Primary    string // I01–I30
+	Secondary  string
+	Slots      Slots
+	Redaction  Redaction
 }
 
 var (
@@ -191,7 +212,24 @@ func IsLivePlatform(text string) bool { return livePlatformRe.MatchString(text) 
 
 // moduleTermRe names ZoikoSuite areas, modules and their aliases. A question
 // that names one is never "out of scope" (classifier fallback ladder).
-var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|payments?|legal|contracts?|commercial ops|commercial operations|purchase requests?|purchase orders?|procurement|requisitions?|tax(?:es)?|vat|gst|compliance|evidence|delegated authority|delegation of authority|board resolutions?|corporate actions?|intelligence|reporting|security|trust|integrations?|connectors?|banking|hris|e-?signatures?|siem|mtls|cap tables?|ar|ap|gl|general ledger|payables|receivables|payroll|workforce|hr|modules?)\b`)
+var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|payments?|legal|contracts?|commercial ops|commercial operations|purchase requests?|purchase orders?|procurement|requisitions?|tax(?:es)?|vat|gst|compliance|evidence|delegated authority|delegation of authority|board resolutions?|corporate actions?|intelligence|reporting|security|trust|integrations?|connectors?|banking|hris|e-?signatures?|siem|mtls|cap tables?|ar|ap|gl|general ledger|payables|receivables|payroll|workforce|hr|modules?` +
+	// Console areas of My Work and Identity, Scope & Foundation (KB articles
+	// kb-my-work, kb-identity-context, kb-identity-foundation).
+	`|my work|tasks?(?: and approvals)?|approvals?|exceptions?|assigned actions?|identity(?: context)?|authentication|federation|federated|sign-?on|sso|mfa|second factor|sessions?|support access|password resets?` +
+	`|tenants? and entities|legal entit(?:y|ies)|feature flags?|config(?:uration)?|secret vault|secrets?|gateway(?: authentication)?|notifications?|roles?(?: and access)?|access control|permission bundles?|foundation` +
+	// Governance Platform and Overview console areas.
+	`|jurisdictions?(?: and rules)?|rule packs?|governance log|polic(?:y|ies)|obligations?|authori[sz]ation|segregation of duties|workflows?(?: and approvals)?|executive dashboard|domain health|dashboard|filing requirements?|evidence requirements?|requirement catalog|no_requirements_defined|journals?|statement lines?|reconciliation)\b`)
+
+// areaDefinitionRe asks what a console area is or does.
+var areaDefinitionRe = regexp.MustCompile(`(?i)^\s*(?:what\s+(?:is|are|does)|what's|explain|describe|define|tell me about|use of|how does)\s+(?:the\s+)?(?:domain health|executive dashboard|dashboards?|governance log)\b`)
+
+// ownDataRe names the visitor's own data.
+var ownDataRe = regexp.MustCompile(`(?i)\b(?:my|our|mine|ours)\b`)
+
+// consoleJurisdictionRe is a question about the Jurisdictions & Rules area
+// (registering, rules, rule packs), not about which markets ZoikoSuite is
+// offered in (I04).
+var consoleJurisdictionRe = regexp.MustCompile(`(?i)\b(?:register(?:ing|ed)?|add(?:ing)?|creat(?:e|ing)|delet\w*|remov\w*|deactivat\w*|resolv\w*|nest\w*|rule packs?|rules|jurisdictions?\s*(?:&|and)\s*rules|legal drift|effective[- ]dated)\b`)
 
 // IsModuleQuestion reports whether a message names a known area, module or
 // alias.
@@ -230,7 +268,7 @@ func LooksLikeInjection(text string) bool {
 // "my", "our" or "for me": a question about the product, not a request to
 // act on the visitor's records (Doc 02 G12: "Tax filing in Germany" is I17).
 var (
-	capabilityRe = regexp.MustCompile(`(?i)^\s*(?:do you|does (?:it|zoikosuite|zoiko suite|the platform)|can (?:it|zoikosuite|zoiko suite|the platform)|is (?:it|zoikosuite) able to)\b`)
+	capabilityRe = regexp.MustCompile(`(?i)^\s*(?:do you|does (?:it|zoikosuite|zoiko suite|the platform)|can (?:it|zoikosuite|zoiko suite|the platform)|is (?:it|zoikosuite) able to|how (?:do (?:i|you|we)|does one|to|can (?:i|you))|what (?:is|does)|tell me about|use of)\b`)
 	personalRe   = regexp.MustCompile(`(?i)\b(?:my|our|mine|for me|for us)\b`)
 )
 
@@ -330,17 +368,26 @@ func Classify(msg string) Decision {
 			}
 		}
 	}
+	if d.Exception == X01PrivateAction && areaDefinitionRe.MatchString(text) && !ownDataRe.MatchString(text) {
+		// "What is Domain Health?" asks what a console area is, not for live
+		// figures; "show our domain health" stays refused.
+		d.Exception = ""
+	}
 	if d.Exception == "" && recordIDRe.MatchString(text) {
 		// Doc 02 S04/G32: a record number is a request for that record, even
 		// without "my" ("Can I see invoice 4519?").
 		d.Exception = X01PrivateAction
 	}
-	d.Primary, d.Secondary = classifyIntent(text)
+	d.Primary, d.Secondary, d.Confidence = classifyIntentScored(text)
 	d.Slots = extractSlots(text)
 	switch {
 	case d.Primary == "I26" && len(planRe.FindAllString(text, -1)) > 0 && !competitorRe.MatchString(text):
 		// "Compare Starter and Growth" compares ZoikoSuite plans (Doc 02 §08).
 		d.Primary, d.Secondary = "I05", ""
+	case d.Primary == "I04" && d.Slots.MarketCode == "" && consoleJurisdictionRe.MatchString(text):
+		// "How to register a jurisdiction" is about the Jurisdictions &
+		// Rules area, never a market-availability question (no country named).
+		d.Primary, d.Secondary = "I02", ""
 	case d.Primary == "I04" && plansRe.MatchString(text) && !AsksPrice(text):
 		// "Which plans are available in my market?" is plan availability (Doc 01 AT-01).
 		d.Primary = "I05"
@@ -353,10 +400,18 @@ func Classify(msg string) Decision {
 	if d.Primary == "I29" && d.Slots.BillingCadence != "" && d.Slots.MarketCode != "" {
 		d.Primary = "I05"
 	}
+	intent := d.Primary
+	if d.Exception != "" {
+		intent, d.Confidence = d.Exception, "high" // a rule matched outright
+	}
+	fillContextSlots(&d.Slots, text, intent)
 	return d
 }
 
-func classifyIntent(text string) (string, string) {
+// classifyIntentScored also returns the confidence bucket: a rule-based
+// exception or a multi-word phrase match is high, two single words medium,
+// one word low, no match none.
+func classifyIntentScored(text string) (string, string, string) {
 	scores := map[string]int{}
 	for id, re := range intentRules {
 		for _, m := range re.FindAllString(text, -1) {
@@ -381,9 +436,16 @@ func classifyIntent(text string) (string, string) {
 		}
 	}
 	if best == "" {
-		return "I29", ""
+		return "I29", "", "none"
 	}
-	return best, second
+	conf := "low"
+	switch {
+	case scores[best] >= 3:
+		conf = "high"
+	case scores[best] == 2:
+		conf = "medium"
+	}
+	return best, second, conf
 }
 
 var (

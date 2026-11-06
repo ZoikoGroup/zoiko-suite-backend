@@ -22,6 +22,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("FlagsUsageOutbox", func(t *testing.T) { testFlagsUsageOutbox(t, newStore(t)) })
 	t.Run("FeedbackPurge", func(t *testing.T) { testFeedbackPurge(t, newStore(t)) })
 	t.Run("ControlAudit", func(t *testing.T) { testControlAudit(t, newStore(t)) })
+	t.Run("RateCounters", func(t *testing.T) { testRateCounters(t, newStore(t)) })
+	t.Run("QualityQueue", func(t *testing.T) { testQualityQueue(t, newStore(t)) })
 	t.Run("ConflictCases", func(t *testing.T) { testConflictCases(t, newStore(t)) })
 	t.Run("CompleteTurnNeedsLiveSession", func(t *testing.T) { testCompleteTurnNeedsLiveSession(t, newStore(t)) })
 	t.Run("RetentionPurge", func(t *testing.T) { testRetentionPurge(t, newStore(t)) })
@@ -197,6 +199,30 @@ func testControlAudit(t *testing.T, s store.Store) {
 	if err := s.SetFlag(ctx, store.Flag{Name: "public_ai_enabled", Value: []byte("true"), UpdatedAt: now}, nil); err == nil {
 		t.Fatal("a flag change without actor and approval must be refused")
 	}
+	// Doc 06 §21: the rows are hash-chained, oldest first.
+	if err := s.AppendAudit(ctx, store.AuditEntry{Action: "release.rollback", Target: "kb", Actor: "sre-3", ActorRole: "R07", Approval: "CHG-3",
+		RequestID: "req_1", At: now.Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.ListAudit(ctx, 10)
+	chain := make([]store.AuditEntry, 0, len(got))
+	for i := len(got) - 1; i >= 0; i-- {
+		chain = append(chain, got[i])
+	}
+	if err := store.VerifyAuditChain(chain); err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+	if chain[2].PrevHash != chain[1].RowHash || chain[2].ActorRole != "R07" || chain[2].RequestID != "req_1" {
+		t.Fatalf("chained row: %+v", chain[2])
+	}
+	tampered := append([]store.AuditEntry(nil), chain...)
+	tampered[1].Actor = "someone-else"
+	if store.VerifyAuditChain(tampered) == nil {
+		t.Fatal("an edited row must break the chain")
+	}
+	if store.VerifyAuditChain([]store.AuditEntry{chain[0], chain[2]}) == nil {
+		t.Fatal("a removed row must break the chain")
+	}
 }
 
 // Doc 03 §16: conflict cases keep their owner and blocked state, once.
@@ -212,6 +238,30 @@ func testConflictCases(t *testing.T, s store.Store) {
 	got, err := s.Conflicts(ctx)
 	if err != nil || len(got) != 1 || !got[0].BlockedClaim || got[0].AssignedOwner != "commercial-ops" {
 		t.Fatalf("conflicts: %+v %v", got, err)
+	}
+	// Doc 03 §16: closing needs evidence and an audited actor; only OPEN closes.
+	audit := store.AuditEntry{Actor: "ops-1", Approval: "CHG-9", At: time.Now().UTC()}
+	if err := s.ResolveConflict(ctx, c.ConflictID, store.ConflictResolved, "", audit); err == nil {
+		t.Fatal("resolution without evidence must be refused")
+	}
+	if err := s.ResolveConflict(ctx, "missing", store.ConflictResolved, "PB-2026-11", audit); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown case: %v", err)
+	}
+	if err := s.ResolveConflict(ctx, c.ConflictID, store.ConflictResolved, "PB-2026-11", store.AuditEntry{At: time.Now().UTC()}); err == nil {
+		t.Fatal("resolution without actor and approval must be refused")
+	}
+	if err := s.ResolveConflict(ctx, c.ConflictID, store.ConflictResolved, "PB-2026-11", audit); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResolveConflict(ctx, c.ConflictID, store.ConflictDismissed, "x", audit); !errors.Is(err, store.ErrConflictState) {
+		t.Fatalf("a closed case must stay closed: %v", err)
+	}
+	got, _ = s.Conflicts(ctx)
+	if got[0].ResolutionState != store.ConflictResolved || got[0].ResolutionEvidenceRef != "PB-2026-11" {
+		t.Fatalf("resolved: %+v", got[0])
+	}
+	if a, _ := s.ListAudit(ctx, 1); len(a) != 1 || a[0].Action != "conflict.resolved" || a[0].Target != c.ConflictID {
+		t.Fatalf("resolution not audited: %+v", a)
 	}
 }
 
@@ -423,5 +473,63 @@ func testRetentionPurge(t *testing.T, s store.Store) {
 	}
 	if !got["old-delivered"] || got["new-delivered"] || !got["undelivered"] {
 		t.Fatalf("after purge, unpublished = %v", got)
+	}
+}
+
+// Doc 06 §13: the shared per-minute counter counts per key and window and
+// forgets old windows.
+func testRateCounters(t *testing.T, s store.Store) {
+	rc, ok := s.(store.RateCounter)
+	if !ok {
+		t.Fatal("store does not share rate counters")
+	}
+	ctx := context.Background()
+	w := time.Now().UTC().Truncate(time.Minute)
+	for i := 1; i <= 3; i++ {
+		if n, err := rc.IncrRate(ctx, "ip:a", w); err != nil || n != int64(i) {
+			t.Fatalf("hit %d: %d %v", i, n, err)
+		}
+	}
+	if n, _ := rc.IncrRate(ctx, "ip:b", w); n != 1 {
+		t.Fatalf("keys share a count: %d", n)
+	}
+	if n, _ := rc.IncrRate(ctx, "ip:a", w.Add(time.Minute)); n != 1 {
+		t.Fatalf("windows share a count: %d", n)
+	}
+	if err := rc.PurgeRateCounters(ctx, w.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := rc.IncrRate(ctx, "ip:a", w); n != 1 {
+		t.Fatalf("purged window kept its count: %d", n)
+	}
+}
+
+// Doc 09 §19: answers marked not useful form the quality queue, with the
+// public reply and no session reference.
+func testQualityQueue(t *testing.T, s store.Store) {
+	q, ok := s.(store.QualityQueue)
+	if !ok {
+		t.Fatal("store has no quality queue")
+	}
+	sess := mkSession(t, s, "pub_s_qqqqqqqqqqqq")
+	for i, rating := range []string{"not_useful", "useful"} {
+		id := []string{"pub_t_q1", "pub_t_q2"}[i]
+		b, err := s.BeginTurn(ctx, turn(sess.SessionID, id, "cq"+id, "h"+id), time.Now().Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := b.Turn
+		done.Status, done.IntentID, done.Response = "ANSWERED", "I05", []byte(`{"text":"Plans vary by market."}`)
+		if err := s.CompleteTurn(ctx, done, nil, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetFeedback(ctx, sess.SessionID, id, rating, "incomplete", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases, err := q.QualityCases(ctx, 10)
+	if err != nil || len(cases) != 1 || cases[0].TurnID != "pub_t_q1" || cases[0].FeedbackReason != "incomplete" ||
+		cases[0].IntentID != "I05" || string(cases[0].Response) != `{"text":"Plans vary by market."}` {
+		t.Fatalf("quality cases %+v %v", cases, err)
 	}
 }

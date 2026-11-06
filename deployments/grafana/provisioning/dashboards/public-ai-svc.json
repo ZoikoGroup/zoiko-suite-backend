@@ -14,7 +14,7 @@
     "from": "now-6h",
     "to": "now"
   },
-  "description": "Doc 08 \u00a715 (H17) operations dashboard for the public assistant. Every panel names its alert and runbook (RB-xx in services/public-ai-svc/RUNBOOK.md). The assistant runs in its own isolated stack (INV-01): choose the Prometheus datasource that scrapes public-ai-svc (public-ai-prometheus in docker-compose.public-ai.yml).",
+  "description": "Doc 08 §15 (H17) operations dashboard for the public assistant. Every panel names its alert and runbook (RB-xx in services/public-ai-svc/RUNBOOK.md). The assistant runs in its own isolated stack (INV-01): choose the Prometheus datasource that scrapes public-ai-svc (public-ai-prometheus in docker-compose.public-ai.yml).",
   "links": [
     {
       "title": "Runbook",
@@ -31,8 +31,8 @@
         "type": "datasource",
         "query": "prometheus",
         "current": {
-          "text": "Prometheus",
-          "value": "prometheus"
+          "text": "Public AI Prometheus",
+          "value": "public-ai-prometheus"
         },
         "refresh": 1
       }
@@ -241,7 +241,7 @@
       "type": "stat",
       "title": "Kill-switch turns 1h",
       "id": 6,
-      "description": "Turns answered with the typed KILL_SWITCH outcome in the last hour. Operator decision, not an error: excluded from the error budget (Doc 08 \u00a726).",
+      "description": "Turns answered with the typed KILL_SWITCH outcome in the last hour. Operator decision, not an error: excluded from the error budget (Doc 08 §26).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -272,7 +272,7 @@
       "type": "stat",
       "title": "Build",
       "id": 7,
-      "description": "App version and model profile of the running processes (release tuple, Doc 08 \u00a706). Absent for 10m fires PublicAIMetricsAbsent (runbook RB-09).",
+      "description": "App version and model profile of the running processes (release tuple, Doc 08 §06). Absent for 10m fires PublicAIMetricsAbsent (runbook RB-09).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -570,7 +570,7 @@
       "type": "timeseries",
       "title": "Pipeline stage p95",
       "id": 16,
-      "description": "Time per pipeline stage: retrieve, model, postgate (Doc 04 \u00a723). Model stage growth usually means provider degradation (runbook RB-01).",
+      "description": "Time per pipeline stage: retrieve, model, postgate (Doc 04 §23). Model stage growth usually means provider degradation (runbook RB-01).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -849,7 +849,7 @@
       "type": "timeseries",
       "title": "CTAs offered vs handoffs clicked",
       "id": 26,
-      "description": "Official-route CTAs offered in answers and routes opened by visitors (Doc 09 \u00a720). Clicks are never leads, cases or bookings.",
+      "description": "Official-route CTAs offered in answers and routes opened by visitors (Doc 09 §20). Clicks are never leads, cases or bookings.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1116,6 +1116,156 @@
       "fieldConfig": {
         "defaults": {
           "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Useful grounded resolution (Doc 08 §12)",
+      "id": 35,
+      "description": "Error ratio divided by the 0.1% budget over 5m, 1h, 6h and 3d windows. Lines above 14.4 (fast) or 6 (sustained) page and freeze promotion; above 1 over 3d tickets (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 76
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "public_ai:grounded_answer_ratio:rate1h",
+          "legendFormat": "grounded (1h)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "public_ai:useful_resolution_ratio:rate1d",
+          "legendFormat": "useful (1d)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Model tokens per 1,000 useful resolutions (Doc 08 §25)",
+      "id": 36,
+      "description": "Error ratio divided by the 0.1% budget over 5m, 1h, 6h and 3d windows. Lines above 14.4 (fast) or 6 (sustained) page and freeze promotion; above 1 over 3d tickets (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 76
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "public_ai:tokens_per_1k_useful_resolutions:1d",
+          "legendFormat": "tokens / 1k useful",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Knowledge index health (Doc 03 §22)",
+      "id": 37,
+      "description": "Error ratio divided by the 0.1% budget over 5m, 1h, 6h and 3d windows. Lines above 14.4 (fast) or 6 (sustained) page and freeze promotion; above 1 over 3d tickets (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 84
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "public_ai_index_health",
+          "legendFormat": "{{measure}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Privacy and revocation integrity",
+      "id": 38,
+      "description": "Error ratio divided by the 0.1% budget over 5m, 1h, 6h and 3d windows. Lines above 14.4 (fast) or 6 (sustained) page and freeze promotion; above 1 over 3d tickets (runbook RB-01).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 84
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(public_ai_events_dlp_blocked_total[15m])) or vector(0)",
+          "legendFormat": "events refused by DLP",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "increase(public_ai_commit_revocation_rejections_total[15m])",
+          "legendFormat": "revocations caught at commit",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
         },
         "overrides": []
       }

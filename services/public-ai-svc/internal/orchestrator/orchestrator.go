@@ -88,6 +88,14 @@ type Result struct {
 	// Draft is set when the answer comes from DRAFT_PENDING_REVIEW articles
 	// (served only in local/dev); the UI labels it "Draft content".
 	Draft bool
+	// QualifierID is the Doc 02 template whose fixed qualifier line was
+	// appended to a grounded answer (T02, T03, ...), for the decision record.
+	QualifierID string
+	// Confidence is the classifier's bucket (Doc 02 §27 intent_classified).
+	Confidence string
+	// ConflictID and ConflictOwner name a claim conflict this turn found
+	// (Doc 02 §27 source_conflict: ids and owner queue only).
+	ConflictID, ConflictOwner string
 	// Diag is per-turn diagnostics (no message text): logged in dev/test.
 	Diag   Diag
 	Tokens int64

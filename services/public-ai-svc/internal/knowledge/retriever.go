@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -158,6 +159,16 @@ func (h *Hybrid) Retrieve(ctx context.Context, q Query, rev Revocations) Result 
 		ch := h.lex.chunks[c.i]
 		score[ch.ChunkID] += 1 / float64(rrfK+rank+1)
 		byID[ch.ChunkID] = ch
+	}
+	if q.HowTo {
+		// Rank fusion keeps positions, not scores, so the lexical how-to
+		// preference is applied again here: a "how do I" question is answered
+		// from a section written as steps when one was recalled.
+		for id, ch := range byID {
+			if strings.Contains(ch.PlainText, signInStep) {
+				score[id] *= howToBoost
+			}
+		}
 	}
 	res := Result{Answerability: NotFound, ReleaseID: lex.ReleaseID, Mode: "hybrid",
 		CandidatesBeforeACL: lex.CandidatesBeforeACL, CandidatesAfterACL: lex.CandidatesAfterACL}

@@ -1,0 +1,24 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/SessionRequest.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "locale": {
+      "type": "string"
+    },
+    "market_code": {
+      "pattern": "^[A-Z]{2}$",
+      "type": "string"
+    },
+    "page_context": {
+      "$ref": "PageContext.v1.schema.json"
+    },
+    "schema_version": {
+      "const": "1.0"
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "type": "object"
+}

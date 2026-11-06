@@ -10,6 +10,11 @@ effective_from: 2026-01-01
 expires_at: 2027-12-31
 locale: en-US
 intent_ids: I10,I11
+market_codes: ALL
+classification: PUBLIC_APPROVED
+pii_state: CLEAR
+license: OWNED_PUBLIC
+signing_ref: kbctl-dev
 ---
 
 ## Integrations
@@ -18,7 +23,7 @@ Integrations connect ZoikoSuite to external systems through connectors, includin
 
 ## Banking, HRIS and tax authority
 
-Banking connectivity covers payment rails, bank statement intake and treasury connectivity. An HRIS connection supports keeping a retained HRIS platform during phased adoption. A tax authority interface supports filing submission and status confirmation.
+Banking connectivity covers payment rails, bank statement intake and treasury connectivity. An HRIS connection connects ZoikoSuite to your HR system and supports keeping a retained HRIS platform during phased adoption. A tax authority interface supports filing submission and status confirmation.
 
 ## eSignature and data feeds
 

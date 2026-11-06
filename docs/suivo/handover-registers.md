@@ -4,7 +4,7 @@ Doc 11 §08, §17, §18, §19 and §23 ask for one handover checklist, one RAID 
 
 Status values: **Evidence ready** (engineering proof exists; the named approver still has to accept it), **Partial**, **Open** (needs people, infrastructure or a decision).
 
-Last updated 2026-10-30.
+Last updated 2026-11-05.
 
 ## 1. Engineering handover checklist (Doc 11 §23)
 
@@ -26,11 +26,11 @@ Last updated 2026-10-30.
 | H14 | Golden corpus, holdouts, adjudication, P0 gates signed | Partial | `evalrun` verdicts and CI gate (`qa-t-traceability.md`); holdout and human grading need reviewers |
 | H15 | Load, resilience and provider-offline fallback approved | Partial | `TestA29`–`TestA31`, `TestProviderFailuresFallBackSafely`; load needs DEC-08 and staging |
 | H16 | Four-artifact manifest and independent rollback demonstrated | Partial | `release.BuildManifest` (image digest required, model profile must match the eval report, evidence recorded by sha256: `TestManifest*`), `TestKB011`, audited `kbctl promote -rollback`; compatibility ranges built (OPR-004: `compatible_policy_versions`, `release.TestIncompatibleReleaseRefusedAtLoad`); releases immutable in the database (migration 007); restore drill DR-06; staging demonstration open |
-| H17 | SLIs, dashboards, alerts, incident and abuse runbooks linked | Partial | `/metrics` (`TestMetricsEndpoint`), multi-window burn-rate alert rules unit-tested with promtool in CI, every alert annotated with its RB-xx runbook (RUNBOOK RB-01…10 and alert map), Grafana dashboard `public-ai-svc.json`, canary textfile metric; paging targets and SLO approval need SRE |
+| H17 | SLIs, dashboards, alerts, incident and abuse runbooks linked | Partial | `/metrics` (`TestMetricsEndpoint`), multi-window burn-rate alert rules unit-tested with promtool in CI, every alert annotated with its RB-xx runbook (RUNBOOK RB-01…10 and alert map), Grafana dashboard `public-ai-svc.json` (its default datasource is the main Prometheus, which does not scrape public-ai-svc: point it at the public-ai Prometheus at deploy time), canary textfile metric; paging targets (Alertmanager) and SLO approval need SRE |
 | H18 | Support destinations route-only, no false ticket acknowledgement | Evidence ready | `TestFalseConfirmationsRejected`, `TestDemoIsRouteOnly`; real URLs need DEC-10 |
 | H19 | R1 staff roles and cases only after RBAC audit | Open (R1) | No staff console in R0 |
 | H20 | R1 lead, CRM and booking only after vendor and privacy gates | Evidence ready (gate) | Doc 10 flags hard-off (`TestDoc10GatesAreHardOff`) |
-| H21 | No unresolved critical/P0 defects | Evidence ready | All automated P0 checks, the ten Doc 02 scripts and the 40-case golden set pass; govulncheck reports no reachable vulnerability |
+| H21 | No unresolved critical/P0 defects | Evidence ready | All automated P0 checks, the ten Doc 02 scripts, the 42-case golden set (`golden-dev-v4`, 0 regressions against the baseline) and all 127 visitor questions quoted in Docs 01–11 pass; govulncheck reports no reachable vulnerability |
 | H22 | Pilot GO/NO-GO, canary, reversal and after-action records | Open | Needs a pilot |
 | H23 | Source editors, responders, incident commander, owner roster accepted | Open | §5 below has no named people yet |
 | H24 | Operations and commercial teams sign maintenance cadence | Open | Needs the teams |
@@ -93,6 +93,11 @@ Changes that alter an API schema, claim rule, data flow, provider, destination o
 | 2026-10-30 | A country the visitor names is stored on the session (`market_code`) and reused | Data flow; Doc 02 §10 |
 | 2026-10-30 | New reasons `GLOSSARY`, `CONTEXT_NOTED`; `LIVE_PLATFORM_DATA`, `NO_APPROVED_INFO` added to the OpenAPI enum | API enum addition; OpenAPI |
 | 2026-10-30 | Rate-limit keys are salted hashes; `PUBLIC_AI_ALLOWED_HOSTS` required outside dev/test | Security boundary; Doc 06 §11, §15 |
+| 2026-11-05 | `page_context` accepts `trust` (Doc 02 §22 Trust page chips); other values still rejected | API enum addition; OpenAPI |
+| 2026-11-05 | An unsupported `locale` is served in the default locale (en-US) instead of abstaining | Data flow; Doc 05 §08–09 |
+| 2026-11-05 | A claim owner may not be one of its approvers (load fails) | P1 claim rule; Doc 03 §10 |
+| 2026-11-05 | OpenAPI/AsyncAPI aligned with the code (`suggestions`, `draft`, `VERIFIED`, UUID turn key, declared problems, `TOOL_INSTRUCTION`, required event fields) and guarded by `internal/specs` tests | API documentation; Doc 05 App. A/B |
+| 2026-11-05 | Opt-in device chat history (24 h) and tab history in the browser | Data flow; Doc 06 §11, `data-inventory.md` |
 | 2026-10-30 | Dependency upgrades (OpenTelemetry 1.45, x/net 0.60, x/text 0.42, gRPC 1.83.1), toolchain go1.27.3, runtime alpine 3.22 | Supply chain; Doc 06 §12 |
 
 ## 5. Owner roster (Doc 11 §08, H23)

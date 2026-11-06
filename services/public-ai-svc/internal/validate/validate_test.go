@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	ev     = []model.Evidence{{Ref: "e1", Title: "Plans", Text: "Plans support 3 entities and annual billing."}}
+	ev     = []model.Evidence{{Ref: "e1", Title: "Plans", Text: "Plans support 3 approval levels and annual billing."}}
 	claims = []model.ClaimCard{{Ref: "c1", Statement: "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 49.00 per user per month."}}
 )
 
@@ -21,15 +21,15 @@ func TestCheck(t *testing.T) {
 		d    model.Draft
 		want error
 	}{
-		{"grounded evidence", model.Draft{Text: "Plans support 3 entities.", EvidenceRefs: []string{"e1"}}, nil},
+		{"grounded evidence", model.Draft{Text: "Plans support 3 approval levels.", EvidenceRefs: []string{"e1"}}, nil},
 		{"verbatim claim", model.Draft{Text: claims[0].Statement, ClaimRefs: []string{"c1"}}, nil},
 		{"no grounding", model.Draft{Text: "Plans support entities."}, ErrUnknownReference},
 		{"unknown evidence", model.Draft{Text: "x", EvidenceRefs: []string{"e9"}}, ErrUnknownReference},
 		// CT-032: a malformed or forged anchor is never accepted as a citation.
-		{"anchor injection", model.Draft{Text: "Plans support 3 entities.", EvidenceRefs: []string{`e1"><a href="https://evil.example">`}}, ErrUnknownReference},
-		{"anchor path", model.Draft{Text: "Plans support 3 entities.", EvidenceRefs: []string{"e1/../e2"}}, ErrUnknownReference},
-		{"anchor case", model.Draft{Text: "Plans support 3 entities.", EvidenceRefs: []string{"E1"}}, ErrUnknownReference},
-		{"empty anchor", model.Draft{Text: "Plans support 3 entities.", EvidenceRefs: []string{""}}, ErrUnknownReference},
+		{"anchor injection", model.Draft{Text: "Plans support 3 approval levels.", EvidenceRefs: []string{`e1"><a href="https://evil.example">`}}, ErrUnknownReference},
+		{"anchor path", model.Draft{Text: "Plans support 3 approval levels.", EvidenceRefs: []string{"e1/../e2"}}, ErrUnknownReference},
+		{"anchor case", model.Draft{Text: "Plans support 3 approval levels.", EvidenceRefs: []string{"E1"}}, ErrUnknownReference},
+		{"empty anchor", model.Draft{Text: "Plans support 3 approval levels.", EvidenceRefs: []string{""}}, ErrUnknownReference},
 		{"invented number", model.Draft{Text: "It costs XTS 9.99.", EvidenceRefs: []string{"e1"}}, ErrUnsupportedFact},
 		{"invented percent", model.Draft{Text: "Save 50% today.", EvidenceRefs: []string{"e1"}}, ErrUnsupportedFact},
 		{"html", model.Draft{Text: "Hi <script>x</script>", EvidenceRefs: []string{"e1"}}, ErrMarkup},
@@ -51,7 +51,7 @@ func TestCheck(t *testing.T) {
 }
 
 func TestModelLinksAreRemoved(t *testing.T) {
-	out, err := Check(model.Draft{Text: "Plans support 3 entities. See https://evil.example/x or mail a@b.example.", EvidenceRefs: []string{"e1"}}, nil, ev)
+	out, err := Check(model.Draft{Text: "Plans support 3 approval levels. See https://evil.example/x or mail a@b.example.", EvidenceRefs: []string{"e1"}}, nil, ev)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,5 +89,38 @@ func TestGatewayDeadlineAndNoTools(t *testing.T) {
 	}
 	if !strings.Contains(p, model.SystemPrompt) || !strings.Contains(p, model.PromptVersion) {
 		t.Fatal("the Suivo system prompt must be sent verbatim with its pinned version")
+	}
+}
+
+// Doc 03 §19: a sentence the cited source does not support is refused, even
+// when another source the model was shown would support it.
+func TestClaimToSpan(t *testing.T) {
+	evs := []model.Evidence{
+		{Ref: "e1", Title: "Approvals", Text: "Approval workflows route each request to the delegated approver and record evidence for audit."},
+		{Ref: "e2", Title: "Payroll", Text: "Payroll runs calculate gross to net pay with statutory deductions for each employee."},
+	}
+	ok := model.Draft{Text: "Approval workflows route each request to the delegated approver and record audit evidence.", EvidenceRefs: []string{"e1"}}
+	if _, err := Check(ok, nil, evs); err != nil {
+		t.Fatalf("supported sentence refused: %v", err)
+	}
+	laundered := model.Draft{Text: "Payroll runs calculate gross to net pay with statutory deductions for every employee.", EvidenceRefs: []string{"e1"}}
+	if _, err := Check(laundered, nil, evs); !errors.Is(err, ErrUnsupportedSpan) {
+		t.Fatalf("a sentence supported only by an uncited source: %v", err)
+	}
+	short := model.Draft{Text: "Yes.", EvidenceRefs: []string{"e1"}}
+	if _, err := Check(short, nil, evs); err != nil {
+		t.Fatalf("short sentences are not scored: %v", err)
+	}
+}
+
+// A number at the end of one step and the next step's number are not a
+// phone number: line breaks in a numbered list survive validation.
+func TestStepNumbersAreNotPhones(t *testing.T) {
+	text := "To set the limit:\n4. Enter the Limit (such as 10000).\n5. Select Save the limit."
+	if phoneRe.ReplaceAllString(text, "") != text {
+		t.Fatalf("steps were stripped as a phone number: %q", phoneRe.ReplaceAllString(text, ""))
+	}
+	if phoneRe.ReplaceAllString("call +1 415 555 0100 today", "") == "call +1 415 555 0100 today" {
+		t.Fatal("a phone number on one line is no longer stripped")
 	}
 }

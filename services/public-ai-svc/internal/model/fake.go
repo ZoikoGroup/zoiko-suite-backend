@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // Fault makes the Fake provider misbehave, for tests of the controls around
@@ -28,25 +29,26 @@ const (
 // extractive answer from the given claims and evidence and never adds facts.
 type Fake struct {
 	Fault Fault
-	calls int
+	calls atomic.Int64 // safe under concurrent load tests
 }
 
 func (f *Fake) Name() string { return "fake-v0" }
 
 // Calls reports how many times Generate ran (tests prove refusals and
 // sensitive input never reach the model).
-func (f *Fake) Calls() int { return f.calls }
+func (f *Fake) Calls() int { return int(f.calls.Load()) }
 
 var (
 	sentenceRe = regexp.MustCompile(`[^.!?]+[.!?]`)
-	headingRe  = regexp.MustCompile(`^\x{00a7}([^\x{00a7}]*)\x{00a7}\s*(.*)$`)
+	// headingRe is a section heading marker (knowledge.HeadingPrefix).
+	headingRe = regexp.MustCompile(`\x{00a7}([^\x{00a7}]*)\x{00a7}\s*`)
 	// qualifierRe marks availability caveats that must stay with the answer
 	// they qualify (Doc 02 T02, G01: no claim of universal availability).
 	qualifierRe = regexp.MustCompile(`(?i)\b(?:depends? on|depending on|varies|vary by|subject to|not available everywhere)\b`)
 )
 
 func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
-	f.calls++
+	n := f.calls.Add(1)
 	switch f.Fault {
 	case FaultTimeout:
 		<-ctx.Done()
@@ -54,7 +56,7 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 	case FaultError:
 		return Draft{}, errPermanent
 	case FaultTransientOnce:
-		if f.calls == 1 {
+		if n == 1 {
 			return Draft{}, ErrTransient
 		}
 	}
@@ -66,6 +68,11 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 			parts = append(parts, c.Statement)
 			d.ClaimRefs = append(d.ClaimRefs, c.Ref)
 		}
+	} else if p := procedure(req.Evidence); p != "" {
+		// The best passage is a how-to written as numbered steps: answer with
+		// those steps as a list, its lead line and note, and nothing else.
+		parts = append(parts, p)
+		d.EvidenceRefs = append(d.EvidenceRefs, req.Evidence[0].Ref)
 	} else if len(req.Evidence) > 0 {
 		// Extractive answer (evidence arrives in rank order). Doc 01 §12 / Doc
 		// 02 §16: a direct answer of up to answerWords before "expand": the
@@ -75,17 +82,15 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 		q := queryWords(req.Message)
 		top := req.Evidence[0]
 		var sentences, headings []string
-		heading := top.Title
-		for _, s := range sentenceRe.FindAllString(top.Text, -1) {
-			s = strings.TrimSpace(s)
-			if m := headingRe.FindStringSubmatch(s); m != nil {
-				heading, s = m[1], strings.TrimSpace(m[2])
+		for _, sec := range sections(top.Text, top.Title) {
+			for _, s := range sentenceRe.FindAllString(sec.body, -1) {
+				s = strings.TrimSpace(s)
+				if strings.HasPrefix(s, "TEST-ONLY") || strings.HasPrefix(s, "Not ZoikoSuite fact") || s == "" {
+					continue
+				}
+				sentences = append(sentences, s)
+				headings = append(headings, sec.heading)
 			}
-			if strings.HasPrefix(s, "TEST-ONLY") || strings.HasPrefix(s, "Not ZoikoSuite fact") || s == "" {
-				continue
-			}
-			sentences = append(sentences, s)
-			headings = append(headings, heading)
 		}
 		type cand struct {
 			s     string
@@ -308,13 +313,12 @@ const shortPassage = 3
 // when it is short, else its opening sentence.
 func passageText(text string) string {
 	var out []string
-	for _, s := range sentenceRe.FindAllString(text, -1) {
-		s = strings.TrimSpace(s)
-		if m := headingRe.FindStringSubmatch(s); m != nil {
-			s = strings.TrimSpace(m[2])
-		}
-		if s != "" && !strings.HasPrefix(s, "TEST-ONLY") && !strings.HasPrefix(s, "Not ZoikoSuite fact") {
-			out = append(out, s)
+	for _, sec := range sections(text, "") {
+		for _, s := range sentenceRe.FindAllString(sec.body, -1) {
+			s = strings.TrimSpace(s)
+			if s != "" && !strings.HasPrefix(s, "TEST-ONLY") && !strings.HasPrefix(s, "Not ZoikoSuite fact") {
+				out = append(out, s)
+			}
 		}
 	}
 	if len(out) > shortPassage {
@@ -343,3 +347,70 @@ func words(s string) map[string]bool {
 
 var commonWords = map[string]bool{"the": true, "and": true, "for": true, "does": true, "what": true, "which": true, "with": true,
 	"how": true, "are": true, "you": true, "your": true, "can": true, "this": true, "that": true, "from": true, "zoikosuite": true}
+
+type section struct{ heading, body string }
+
+// sections splits chunk text at its heading markers before sentences are
+// split, so a heading that ends in "?" ("Where can someone act?") is never
+// cut in two and its marker never reaches an answer.
+func sections(text, title string) []section {
+	var out []section
+	heading, last := title, 0
+	for _, m := range headingRe.FindAllStringSubmatchIndex(text, -1) {
+		if body := text[last:m[0]]; strings.TrimSpace(body) != "" {
+			out = append(out, section{heading, body})
+		}
+		heading, last = text[m[2]:m[3]], m[1]
+	}
+	if body := text[last:]; strings.TrimSpace(body) != "" {
+		out = append(out, section{heading, body})
+	}
+	return out
+}
+
+// stepRe is one numbered step of a how-to passage ("2. Open Policies.").
+var stepRe = regexp.MustCompile(`^\d+\.\s+\S`)
+
+// procedure is the best passage's how-to, when it is written as numbered
+// steps: the line that introduces the steps, each step on its own line, and
+// the one note that follows them. "" when the passage has no steps.
+func procedure(evidence []Evidence) string {
+	if len(evidence) == 0 {
+		return ""
+	}
+	for _, sec := range sections(evidence[0].Text, "") {
+		lines := strings.Split(strings.TrimSpace(sec.body), "\n")
+		first, last := -1, -1
+		for i, l := range lines {
+			if stepRe.MatchString(strings.TrimSpace(l)) {
+				if first < 0 {
+					first = i
+				}
+				last = i
+			} else if first >= 0 {
+				break
+			}
+		}
+		if first < 0 || last == first {
+			continue
+		}
+		// The section's own lead: what it is for (a short line or two) and
+		// the line that introduces the steps.
+		var out []string
+		for _, l := range lines[:first] {
+			if l = strings.TrimSpace(l); l != "" && (strings.HasSuffix(l, ":") || wordCount(l) <= 60) {
+				out = append(out, l)
+			}
+		}
+		for _, l := range lines[first : last+1] {
+			out = append(out, strings.TrimSpace(l))
+		}
+		if last+1 < len(lines) {
+			if note := strings.TrimSpace(lines[last+1]); note != "" && wordCount(note) <= 45 {
+				out = append(out, note)
+			}
+		}
+		return strings.Join(out, "\n")
+	}
+	return ""
+}

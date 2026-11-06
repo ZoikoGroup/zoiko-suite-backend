@@ -10,6 +10,11 @@ effective_from: 2026-01-01
 expires_at: 2027-12-31
 locale: en-US
 intent_ids: I02
+market_codes: ALL
+classification: PUBLIC_APPROVED
+pii_state: CLEAR
+license: OWNED_PUBLIC
+signing_ref: kbctl-dev
 ---
 
 ## Commercial Ops
@@ -18,7 +23,7 @@ Commercial Ops covers procurement, vendor approvals and invoice workflows. It li
 
 ## Vendor and invoice workflows
 
-Vendors are approved before they are used, and supplier invoices follow approval workflows before they are paid. Vendor due diligence covers validation, onboarding checks, and sanctions and risk status, and keeps the evidence of those checks. An invoice's approval state is settled before it is released for payment.
+Vendors are approved before they are used, and supplier invoices follow approval workflows before they are paid. Vendor due diligence covers validation, onboarding checks, and screening for sanctions and risk status, and keeps the evidence of those checks. An invoice's approval state is settled before it is released for payment.
 
 ## Procurement and spend controls
 

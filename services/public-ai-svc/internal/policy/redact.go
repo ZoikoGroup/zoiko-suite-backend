@@ -26,6 +26,11 @@ const (
 	// or medication. Generic uses ("health checks", "system health", "HR
 	// health benefits") are not about a person and do not match.
 	KindHealth = "special_category_health"
+	// KindSpecial is the other special categories (religion, ethnicity,
+	// sexuality, political or union membership, criminal records).
+	KindSpecial = "special_category"
+	// KindSalary is a pay amount about a person.
+	KindSalary = "salary_value"
 )
 
 // healthConditions are conditions that, stated about oneself, are
@@ -71,6 +76,18 @@ var detectors = []detector{
 	{KindHealth, regexp.MustCompile(`(?i)\bi(?:\s+take|\s+am\s+taking|'m\s+taking)\s+(?:insulin|antidepressants|antiretrovirals|chemo(?:therapy)?|(?:` + healthQualifiers + `)\s+(?:medication|meds|medicine|pills))\b`), nil},
 	{KindHealth, regexp.MustCompile(`(?i)\bmy\s+(?:(?:` + healthQualifiers + `)\s+)?(?:medications?|meds|prescriptions?|illness|disability|chemo(?:therapy)?)\b|\bmy\s+(?:` + healthQualifiers + `)\s+(?:diagnosis|condition|treatment|status|therapy|records?)\b|\bmy\s+(?:` + healthConditions + `)\b`), nil},
 	{KindBank, regexp.MustCompile(`(?i)\b(?:account|acct|routing|sort code|aba)\b\s*(?:number|no\.?|#)?\s*[:#]?\s*\d[\d -]{5,20}\d\b`), nil},
+	// Other special-category data about the visitor (Doc 06 §15/§21): a
+	// first-person statement of religion, ethnicity, sexuality, political or
+	// union membership, or a criminal record. Product words ("religious
+	// holidays in payroll", "union dues") are not about the visitor.
+	{KindSpecial, regexp.MustCompile(`(?i)\b(?:i\s+am|i'm|i\s+was\s+born)\s+(?:a\s+|an\s+)?(?:muslim|christian|catholic|jewish|hindu|sikh|buddhist|atheist|mormon)\b` +
+		`|\bmy\s+(?:religion|faith|religious\s+beliefs?|ethnicity|ethnic\s+origin|race|sexual\s+orientation|sexuality|gender\s+identity|political\s+(?:views|party|affiliation)|union\s+membership|criminal\s+(?:record|conviction|history))\b` +
+		`|\b(?:i\s+am|i'm)\s+(?:gay|lesbian|bisexual|transgender|trans|queer|non-binary|a\s+union\s+member)\b` +
+		`|\bi\s+(?:have|had)\s+(?:a\s+)?(?:criminal\s+record|conviction|prison\s+record)\b|\bi\s+(?:was|have\s+been)\s+(?:convicted|arrested|in\s+prison|jailed)\b`), nil},
+	// A salary or pay amount about the visitor or a named employee (Doc 06
+	// §21: payroll values never enter the chat).
+	{KindSalary, regexp.MustCompile(`(?i)\b(?:my|our\s+employee'?s?|(?:his|her|their))\s+(?:annual\s+|monthly\s+|gross\s+|net\s+|base\s+)?(?:salary|wage|pay|income|compensation)\s+(?:is|was|of)\s+(?:[$£€]\s?)?\d[\d,.]*\s*(?:k|usd|gbp|eur|per\s+\w+)?` +
+		`|\bi\s+(?:earn|make|am\s+paid|get\s+paid)\s+(?:[$£€]\s?)?\d[\d,.]*\s*(?:k\b|usd|gbp|eur|(?:a|per)\s+(?:year|month|hour|week))?`), nil},
 }
 
 // Redaction is the result of scanning a message.

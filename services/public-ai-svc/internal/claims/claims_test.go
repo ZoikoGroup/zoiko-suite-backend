@@ -1,6 +1,7 @@
 package claims
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -167,5 +168,72 @@ func TestConflictsNeedSameScopeAndOverlappingWindows(t *testing.T) {
 	d := NewResolver(Manifest{Claims: []Claim{usd, xtt}}).Resolve(Request{Subject: Price, Market: "US", AsOf: day(6)}, nil)
 	if d.Decision != Verified {
 		t.Fatalf("different currencies must not contradict: %+v", d)
+	}
+}
+
+// Doc 03 §10: no self-approval. The owner counted as one of the two
+// approvers makes the release structurally invalid.
+func TestOwnerMayNotApproveOwnClaim(t *testing.T) {
+	c := completePriceClaim()
+	c.OwnerID = "commercial-ops"
+	c.ApprovalRefs = []string{"approval-finance", "approval-legal"}
+	if p := (Manifest{Claims: []Claim{c}}).StructuralProblems(); len(p) != 0 {
+		t.Fatalf("independent approvers rejected: %v", p)
+	}
+	c.ApprovalRefs = []string{"approval-finance", " Commercial-Ops "}
+	p := (Manifest{Claims: []Claim{c}}).StructuralProblems()
+	if len(p) != 1 || !strings.Contains(p[0], "may not approve their own claim") {
+		t.Fatalf("self-approval not refused: %v", p)
+	}
+}
+
+// Doc 03 §08: CONDITIONAL and TARGET claims are never verified facts, but
+// they are returned as qualified with their governed label; an ACTIVE claim
+// for the same request wins.
+func TestConditionalAndTargetClaimsAreQualified(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	target := completePriceClaim()
+	target.ClaimID, target.Status = "c-target", StatusTarget
+	r := NewResolver(Manifest{Claims: []Claim{target}})
+	q := Request{Subject: target.ClaimType, SubjectID: target.SubjectID, Market: "US", AsOf: now}
+	d := r.Resolve(q, nil)
+	if d.Decision != InsufficientEvidence || d.ReasonCode != ReasonStatusQualified || len(d.Qualified) != 1 || len(d.Verified) != 0 {
+		t.Fatalf("target: %+v", d)
+	}
+	if StatusLabelFor(d.Qualified[0]) != "Planned" {
+		t.Fatalf("label %q", StatusLabelFor(d.Qualified[0]))
+	}
+	cond := target
+	cond.Status = StatusConditional
+	if l := StatusLabelFor(cond); l != "Limited" {
+		t.Fatalf("conditional label %q", l)
+	}
+	active := completePriceClaim()
+	d = NewResolver(Manifest{Claims: []Claim{target, active}}).Resolve(q, nil)
+	if d.Decision != Verified || len(d.Qualified) != 0 {
+		t.Fatalf("an ACTIVE claim must win: %+v", d)
+	}
+	held := target
+	held.Status = StatusHold
+	if d := NewResolver(Manifest{Claims: []Claim{held}}).Resolve(q, nil); len(d.Qualified) != 0 {
+		t.Fatal("a HOLD claim is never shown")
+	}
+}
+
+// Doc 05 §17: currency narrows the request; a verified decision says when
+// it expires; a miss names the missing key; the release signature is carried.
+func TestDecisionFields(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	c := completePriceClaim()
+	due := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	c.ReviewDueAt = &due
+	r := NewResolver(Manifest{ReleaseID: "claims-1", Claims: []Claim{c}}).WithSignatureRef("ed25519:abcd").WithDisputes(nil)
+	d := r.Resolve(Request{Subject: Price, SubjectID: "PLAN", Market: "US", Currency: "xts", AsOf: now}, nil)
+	if d.Decision != Verified || d.ExpiresAt == nil || !d.ExpiresAt.Equal(due) || d.SignatureRef != "ed25519:abcd" || len(d.MissingClaimKeys) != 0 {
+		t.Fatalf("verified: %+v", d)
+	}
+	d = r.Resolve(Request{Subject: Price, SubjectID: "PLAN", Market: "US", Currency: "EUR", AsOf: now}, nil)
+	if d.Decision == Verified || len(d.MissingClaimKeys) != 1 || d.MissingClaimKeys[0] != "PRICE|PLAN|US||EUR" {
+		t.Fatalf("other currency: %+v", d)
 	}
 }

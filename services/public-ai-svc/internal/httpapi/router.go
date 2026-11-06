@@ -139,6 +139,10 @@ func (s *Server) Router() http.Handler {
 		if s.deps.Sessions != nil && s.deps.Store != nil && s.deps.Routes != nil {
 			api.Post("/handoffs", s.postHandoff)
 		}
+		if s.deps.Sessions != nil && s.deps.Store != nil {
+			// Doc 02 §27 browser-only analytics (chat_opened, source_opened).
+			api.Post("/analytics", s.postAnalytics)
+		}
 	})
 
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) { problem.Write(w, r, problem.NotFound, "") })

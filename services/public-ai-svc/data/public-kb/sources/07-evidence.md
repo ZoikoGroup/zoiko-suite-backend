@@ -10,6 +10,11 @@ effective_from: 2026-01-01
 expires_at: 2027-12-31
 locale: en-US
 intent_ids: I16,I02
+market_codes: ALL
+classification: PUBLIC_APPROVED
+pii_state: CLEAR
+license: OWNED_PUBLIC
+signing_ref: kbctl-dev
 ---
 
 ## Evidence
@@ -18,7 +23,7 @@ Evidence keeps filing evidence and preparation records together with the work th
 
 ## Audit-ready records
 
-Because evidence is captured as work is done, reviewers and auditors can see what was prepared, by whom and when. Audit events are stored as append-only records linked to the action that produced them, and they can be searched by actor, entity, action, workflow or time range.
+Because evidence is captured as work is done, reviewers and auditors can see what was prepared, by whom and when. Audit events and evidence are stored as append-only records, never edited or deleted, linked to the action that produced them, and they can be searched by actor, entity, action, workflow or time range.
 
 ## Requirements before completion
 

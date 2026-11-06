@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"zoiko.io/public-ai-svc/internal/claims"
+	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/knowledge"
 	"zoiko.io/public-ai-svc/internal/store"
 )
@@ -118,6 +119,20 @@ func VerifyRollback(ctx context.Context, st store.Store, kind, releaseID string)
 // PromotionGateAudited is PromotionGate plus, for a rollback, proof from the
 // control audit that the release was promoted before.
 func PromotionGateAudited(ctx context.Context, st store.Store, kind, releaseID string, manifest []byte, op Operator, ev *EvalEvidence, rollback bool) error {
+	// Doc 08 §13, OPR-021/029: no promotion while the freeze is on; rollback
+	// stays available because it is the recovery. Checked first: a frozen
+	// promotion is refused whatever else is wrong with it.
+	if !rollback {
+		fs, err := st.Flags(ctx)
+		if err != nil {
+			return fmt.Errorf("promotion freeze check: %w", err)
+		}
+		for _, f := range fs {
+			if f.Name == flags.PromotionFrozen && strings.TrimSpace(string(f.Value)) == "true" {
+				return ErrPromotionFrozen
+			}
+		}
+	}
 	if err := PromotionGate(kind, releaseID, manifest, op, ev, rollback); err != nil {
 		return err
 	}
@@ -126,3 +141,7 @@ func PromotionGateAudited(ctx context.Context, st store.Store, kind, releaseID s
 	}
 	return nil
 }
+
+// ErrPromotionFrozen: promotion_frozen is on (an error-budget burn or P0
+// incident is open). Roll back instead, or clear the freeze with approval.
+var ErrPromotionFrozen = errors.New("promotion is frozen (promotion_frozen=true): an error-budget burn or P0 incident is open; rollback is still allowed")

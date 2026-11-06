@@ -272,7 +272,7 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 	}()
 	res := s.deps.Answerer.Answer(answerCtx, orchestrator.Input{
 		RequestID: rid, SessionID: sess.SessionID, TurnID: turnID, Message: req.Message, Pending: pending,
-		Locale: firstNonEmpty(req.Locale, sess.Locale), MarketCode: firstNonEmpty(req.MarketCode, sess.MarketCode),
+		Locale: contract.ServedLocale(firstNonEmpty(req.Locale, sess.Locale)), MarketCode: firstNonEmpty(req.MarketCode, sess.MarketCode),
 		PageContext:   firstNonEmpty(req.PageContext, sess.PageContext),
 		Budget:        s.sessionBudget(sess),
 		SessionCapped: s.cfg.SessionTokenCap > 0 && sess.TokensUsed >= s.cfg.SessionTokenCap,
@@ -287,9 +287,10 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 		SecondaryIntentID: res.SecondaryIntentID, Reason: res.Reason, Suggestions: res.Suggestions, Draft: res.Draft,
 	}
 	diag = turnDiag{status: string(res.Status), intent: res.IntentID, reason: res.Reason, pipeline: res.Diag}
-	if env.AnswerClass == "" {
+	if env.AnswerClass == "" || env.Status == contract.RefusedAction {
 		env.AnswerClass = contract.DefaultClass(env.Status)
 	}
+	env.SafetyDisposition = contract.DispositionFor(env.Status)
 	structured := s.structuredOn()
 	if structured {
 		s.structure(&env, firstNonEmpty(res.MarketCode, firstNonEmpty(req.MarketCode, sess.MarketCode)))
@@ -300,6 +301,7 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 		env.Status, env.IntentID, env.Text = contract.Unavailable, "UNKNOWN", unavailableText
 		env.Citations, env.Actions, env.Flags = []contract.Citation{}, []contract.Action{}, nil
 		env.AnswerClass, env.StatusLabel, env.MarketCode, env.Clarification = contract.HandoffUnknown, "", "", nil
+		env.SafetyDisposition = contract.DispositionRetry
 		env.SecondaryIntentID, env.Reason, env.Suggestions, env.Draft = "", contract.ReasonValidationFailed, nil, false
 		env.Outcome, env.FollowUps, env.CTA = "", nil, nil
 		if structured {
@@ -318,7 +320,7 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 
 	done := begun.Turn
 	done.Status, done.IntentID, done.Response = string(env.Status), env.IntentID, body
-	evs := s.turnEvents(env, res, now)
+	evs := s.turnEvents(env, res, now, firstNonEmpty(res.MarketCode, firstNonEmpty(req.MarketCode, sess.MarketCode)))
 	if err := s.deps.Store.CompleteTurn(runCtx, done, usageBuckets(now), res.Tokens, evs); err != nil {
 		_ = s.deps.Store.AbortTurn(context.WithoutCancel(ctx), sess.SessionID, turnID)
 		if errors.Is(err, store.ErrSessionGone) {
@@ -387,6 +389,7 @@ func (s *Server) postFeedback(w http.ResponseWriter, r *http.Request) {
 		problem.Write(w, r, problem.ServiceUnavailable, "")
 	default:
 		metrics.Feedback(req.Rating, req.Reason)
+		s.appendAnalytics(r, []events.Analytics{{Name: events.FeedbackSubmitted, Helpfulness: req.Rating, FeedbackReason: req.Reason}})
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -423,6 +426,7 @@ func (s *Server) postHandoff(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	metrics.HandoffClicked(req.RouteKey) // a click, never a case, lead or booking (Doc 09 §20)
+	s.appendAnalytics(r, []events.Analytics{{Name: events.CTAOpened, ActionID: req.RouteKey}})
 	writeJSON(w, http.StatusOK, contract.HandoffResponse{RouteKey: req.RouteKey, URL: url})
 }
 
@@ -457,7 +461,7 @@ func usageBuckets(now time.Time) []string {
 
 // turnEvents returns the redacted outbox events for a completed turn. They
 // carry identifiers, enums and coarse buckets only (Doc 05 §21).
-func (s *Server) turnEvents(env contract.Envelope, res orchestrator.Result, start time.Time) []store.OutboxEvent {
+func (s *Server) turnEvents(env contract.Envelope, res orchestrator.Result, start time.Time, market string) []store.OutboxEvent {
 	now := time.Now().UTC()
 	var out []store.OutboxEvent
 	if ev, err := events.TurnCompleted(env.RequestID, env.IntentID, string(env.Status), now.Sub(start), env.KnowledgeReleaseID, now); err == nil {
@@ -465,6 +469,12 @@ func (s *Server) turnEvents(env contract.Envelope, res orchestrator.Result, star
 	}
 	if res.SecuritySignal != "" {
 		if ev, err := events.SecuritySignal(res.SecuritySignal, env.RequestID, "MEDIUM", now); err == nil {
+			out = append(out, ev)
+		}
+	}
+	// Doc 02 §27 analytics, committed with the turn.
+	for _, a := range s.turnAnalytics(env, res, now.Sub(start), market) {
+		if ev, err := events.AnalyticsEvent(a, now); err == nil {
 			out = append(out, ev)
 		}
 	}
@@ -527,6 +537,7 @@ func (s *Server) replayBody(ctx context.Context, rid string, stored []byte) []by
 		Citations: []contract.Citation{}, Actions: nonNilA(env.Actions),
 		KnowledgeReleaseID: env.KnowledgeReleaseID, PolicyVersion: env.PolicyVersion,
 		AnswerClass: contract.DefaultClass(contract.Abstain), MarketCode: env.MarketCode, Reason: contract.ReasonSourceRevoked,
+		SafetyDisposition: contract.DispositionFor(contract.Abstain),
 	}
 	if env.Outcome != "" {
 		safe.Outcome = contract.OutcomeFor(contract.Abstain)

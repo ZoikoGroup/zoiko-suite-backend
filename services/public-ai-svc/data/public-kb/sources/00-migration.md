@@ -10,6 +10,11 @@ effective_from: 2026-01-01
 expires_at: 2027-12-31
 locale: en-US
 intent_ids: I11
+market_codes: ALL
+classification: PUBLIC_APPROVED
+pii_state: CLEAR
+license: OWNED_PUBLIC
+signing_ref: kbctl-dev
 ---
 
 ## Migration and onboarding

@@ -13,6 +13,7 @@ import (
 // same atomicity rules as Postgres by holding one mutex per call.
 type Memory struct {
 	mu          sync.Mutex
+	rates       map[rateWindow]int64
 	sessions    map[string]*memSession
 	byGrant     map[string]string
 	sessionIdem map[string]idemEntry
@@ -354,6 +355,25 @@ func (m *Memory) RecordConflict(_ context.Context, c Conflict) error {
 	return nil
 }
 
+func (m *Memory) ResolveConflict(_ context.Context, id, state, evidenceRef string, audit AuditEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.conflicts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if c.ResolutionState != ConflictOpen || (state != ConflictResolved && state != ConflictDismissed) || strings.TrimSpace(evidenceRef) == "" {
+		return ErrConflictState
+	}
+	audit.Action, audit.Target = "conflict."+strings.ToLower(state), id
+	if err := m.appendAudit(audit); err != nil {
+		return err
+	}
+	c.ResolutionState, c.ResolutionEvidenceRef = state, evidenceRef
+	m.conflicts[id] = c
+	return nil
+}
+
 func (m *Memory) Conflicts(context.Context) ([]Conflict, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -394,6 +414,10 @@ func (m *Memory) appendAudit(e AuditEntry) error {
 		return ErrAuditIncomplete
 	}
 	e.AuditID = int64(len(m.audit)) + 1
+	if n := len(m.audit); n > 0 {
+		e.PrevHash = m.audit[n-1].RowHash
+	}
+	e.RowHash = AuditRowHash(e.PrevHash, e)
 	m.audit = append(m.audit, e)
 	return nil
 }
@@ -401,7 +425,7 @@ func (m *Memory) appendAudit(e AuditEntry) error {
 func (m *Memory) ListAudit(_ context.Context, limit int) ([]AuditEntry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]AuditEntry, 0, limit)
+	out := make([]AuditEntry, 0, min(limit, len(m.audit)))
 	for i := len(m.audit) - 1; i >= 0 && len(out) < limit; i-- {
 		out = append(out, m.audit[i])
 	}

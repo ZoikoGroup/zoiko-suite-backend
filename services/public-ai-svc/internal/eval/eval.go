@@ -36,6 +36,9 @@ type Case struct {
 	Partition       string   `json:"partition"`
 	Priority        string   `json:"priority"`
 	RequirementRefs []string `json:"requirement_refs"`
+	// Segment is the visitor segment the wording represents (Doc 07
+	// QA-T076): novice or expert. Untagged cases are left out of the split.
+	Segment string `json:"segment,omitempty"`
 	// Setup pins what the case runs against (Doc 07 App. A).
 	Setup struct {
 		Locale             string `json:"locale"`
@@ -102,6 +105,8 @@ type Report struct {
 	DatasetSHA256   string `json:"dataset_sha256,omitempty"`
 	// Partitions, Intents, Waivers and Regressions: Doc 07 §09-§11, App. B.
 	Partitions  map[string]PartitionSummary `json:"partitions"`
+	// Segments compares novice and expert wording (QA-T076).
+	Segments map[string]PartitionSummary `json:"segments,omitempty"`
 	Intents     IntentMetrics               `json:"intents"`
 	Waivers     map[string]string           `json:"waivers,omitempty"`
 	Regressions []string                    `json:"regressions,omitempty"`

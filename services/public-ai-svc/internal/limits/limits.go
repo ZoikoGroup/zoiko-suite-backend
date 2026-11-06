@@ -6,6 +6,7 @@ package limits
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -158,6 +159,12 @@ type Guard struct {
 	daily      int64
 	monthly    int64
 	now        func() time.Time
+	// shared counts every allowed request in a one-minute window kept in
+	// the store, so the per-minute limits hold across replicas (Doc 06 §13).
+	// Nil without PUBLIC_AI_RATE_KEY_SALT: per-replica buckets only.
+	shared     store.RateCounter
+	sharedSalt []byte
+	perMin     map[string]int
 }
 
 // New builds a Guard from configuration.
@@ -168,11 +175,17 @@ func New(cfg config.Config, st store.Store, fl interface{ Values() flags.Values 
 			trusted = append(trusted, n)
 		}
 	}
-	return &Guard{
+	g := &Guard{
 		ip: newLimiter(cfg.RateLimitPerIPPerMinute), sess: newLimiter(cfg.RateLimitPerSessionPerMin), trusted: trusted,
 		sessCreate: newLimiter(sessionCreateLimit(cfg.RateLimitSessionCreatePerMin)), store: st, flags: fl, daily: cfg.DailyTokenCeiling, monthly: cfg.MonthlyTokenCeiling,
 		now: time.Now,
+		perMin: map[string]int{"ip": cfg.RateLimitPerIPPerMinute, "session": cfg.RateLimitPerSessionPerMin,
+			"session_create": sessionCreateLimit(cfg.RateLimitSessionCreatePerMin)},
 	}
+	if rc, ok := st.(store.RateCounter); ok && cfg.RateKeySalt != "" {
+		g.shared, g.sharedSalt = rc, []byte(cfg.RateKeySalt)
+	}
+	return g
 }
 
 // RunSweeper drops idle buckets from every limiter each interval until ctx
@@ -199,6 +212,11 @@ func (g *Guard) Sweep() {
 	now := g.now()
 	for _, l := range []*limiter{g.ip, g.sess, g.sessCreate} {
 		l.sweep(now)
+	}
+	if g.shared != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = g.shared.PurgeRateCounters(ctx, now.Add(-5*time.Minute))
 	}
 }
 
@@ -282,14 +300,15 @@ func tooMany(w http.ResponseWriter, r *http.Request, wait time.Duration) {
 func (g *Guard) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		now := g.now()
-		ipKey := clientKey(g.clientIP(r))
-		if ok, wait := g.ip.allow(ipKey, now); !ok {
+		ip := g.clientIP(r)
+		ipKey := clientKey(ip)
+		if ok, wait := g.ip.allow(ipKey, now); !ok || !g.sharedAllow(r, "ip", ipAddrKey(ip), now, &wait) {
 			metrics.RateLimited("ip")
 			tooMany(w, r, wait)
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/public-ai/v1/sessions" {
-			if ok, wait := g.sessCreate.allow(ipKey, now); !ok {
+			if ok, wait := g.sessCreate.allow(ipKey, now); !ok || !g.sharedAllow(r, "session_create", ipAddrKey(ip), now, &wait) {
 				metrics.RateLimited("session_create")
 				tooMany(w, r, wait)
 				return
@@ -297,7 +316,7 @@ func (g *Guard) Middleware(next http.Handler) http.Handler {
 		}
 		if grant := r.Header.Get("X-Public-Chat-Session"); grant != "" {
 			sum := sha256.Sum256([]byte(grant)) // never keep the grant itself
-			if ok, wait := g.sess.allow("s:"+string(sum[:12]), now); !ok {
+			if ok, wait := g.sess.allow("s:"+string(sum[:12]), now); !ok || !g.sharedAllow(r, "session", "s:"+grant, now, &wait) {
 				metrics.RateLimited("session")
 				tooMany(w, r, wait)
 				return
@@ -372,4 +391,40 @@ func (g *Guard) spendStage(ctx context.Context) (stage string, failed bool) {
 		return orchestrator.BudgetReduced, false
 	}
 	return "", false
+}
+
+// ipAddrKey is the coarsened address (IPv4, or IPv6 /64) before hashing.
+func ipAddrKey(ip net.IP) string {
+	if ip == nil {
+		return "ip:unknown"
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return "ip:" + v4.String()
+	}
+	return "ip:" + ip.Mask(net.CIDRMask(64, 128)).String()
+}
+
+// sharedAllow counts the request in the shared one-minute window for its
+// limit. Keys are HMAC-SHA256 with the shared salt, so they are the same on
+// every replica and reveal no address or grant. A store error fails open:
+// the replica's own bucket still applies, and the failure is counted.
+func (g *Guard) sharedAllow(r *http.Request, limit, raw string, now time.Time, wait *time.Duration) bool {
+	max := g.perMin[limit]
+	if g.shared == nil || max <= 0 {
+		return true
+	}
+	mac := hmac.New(sha256.New, g.sharedSalt)
+	mac.Write([]byte(limit + "\x00" + raw))
+	key := limit + ":" + hex.EncodeToString(mac.Sum(nil)[:16])
+	window := now.UTC().Truncate(time.Minute)
+	n, err := g.shared.IncrRate(r.Context(), key, window)
+	if err != nil {
+		metrics.RateLimited("shared_unavailable")
+		return true
+	}
+	if n > int64(max) {
+		*wait = window.Add(time.Minute).Sub(now)
+		return false
+	}
+	return true
 }

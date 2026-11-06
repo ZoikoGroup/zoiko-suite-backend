@@ -43,9 +43,39 @@ const (
 	StatusQualified    = "STATUS_QUALIFIED"
 	ProcessExplanation = "PROCESS_EXPLANATION"
 	HandoffUnknown     = "HANDOFF_UNKNOWN"
+	// SafeRefusal is a REFUSED_ACTION turn (Doc 02 §15).
+	SafeRefusal = "SAFE_REFUSAL"
 )
 
-var validClass = map[string]bool{VerifiedFact: true, StatusQualified: true, ProcessExplanation: true, HandoffUnknown: true}
+var validClass = map[string]bool{VerifiedFact: true, StatusQualified: true, ProcessExplanation: true, HandoffUnknown: true, SafeRefusal: true}
+
+// Safety dispositions (Doc 02 §15): what the UI may offer next. The widget
+// shows no CTA or tool button the disposition does not allow.
+const (
+	DispositionAllow    = "ALLOW"
+	DispositionClarify  = "CLARIFY"
+	DispositionDeny     = "DENY"
+	DispositionEscalate = "ESCALATE"
+	DispositionRetry    = "RETRY"
+)
+
+// DispositionFor maps a status to its safety disposition: an answer is
+// ALLOW, a question CLARIFY, a refusal DENY, a handoff or abstention (which
+// offers official routes) ESCALATE, an outage RETRY.
+func DispositionFor(s Status) string {
+	switch s {
+	case Answered:
+		return DispositionAllow
+	case Clarify:
+		return DispositionClarify
+	case RefusedAction:
+		return DispositionDeny
+	case Unavailable:
+		return DispositionRetry
+	default:
+		return DispositionEscalate
+	}
+}
 
 // StatusLabels is the governed status vocabulary. A label is shown only when
 // it comes from the signed claim registry; it is never inferred or upgraded.
@@ -147,13 +177,35 @@ func DefaultClass(s Status) string {
 		return ProcessExplanation
 	case Clarify:
 		return StatusQualified
+	case RefusedAction:
+		return SafeRefusal
 	default:
 		return HandoffUnknown
 	}
 }
 
-// PageContexts is the allowlisted page_context enum (Doc 05 §08).
-var PageContexts = map[string]bool{"home": true, "pricing": true, "core_modules": true, "demo": true, "support": true, "other": true}
+// PageContexts is the allowlisted page_context enum (Doc 05 §08), plus
+// "trust": Doc 02 §22 defines a Trust page starter set, and the widget sends
+// it on /trust. Any other value is still rejected (CT-009).
+var PageContexts = map[string]bool{"home": true, "pricing": true, "core_modules": true, "trust": true, "demo": true, "support": true, "other": true}
+
+// SupportedLocales are the locales the public knowledge is written in.
+// DefaultLocale is served when a visitor asks for any other (Doc 05 §08–09):
+// a non-English locale must not filter out every approved source.
+var SupportedLocales = []string{"en-US"}
+
+const DefaultLocale = "en-US"
+
+// ServedLocale returns loc when its language is supported, else DefaultLocale.
+func ServedLocale(loc string) string {
+	lang := strings.ToLower(strings.SplitN(loc, "-", 2)[0])
+	for _, s := range SupportedLocales {
+		if lang != "" && strings.EqualFold(strings.SplitN(s, "-", 2)[0], lang) {
+			return loc
+		}
+	}
+	return DefaultLocale
+}
 
 var (
 	marketRe = regexp.MustCompile(`^[A-Z]{2}$`)
@@ -213,6 +265,9 @@ type Citation struct {
 	Title    string `json:"title,omitempty"`
 	RouteKey string `json:"route_key,omitempty"`
 	URL      string `json:"url,omitempty"`
+	// ReviewedAt is the cited source's approval date (else its effective
+	// date), YYYY-MM-DD (Doc 01 FR-03, AT-01: show the source's review date).
+	ReviewedAt string `json:"reviewed_at,omitempty"`
 }
 
 type Action struct {
@@ -248,10 +303,12 @@ type Envelope struct {
 	Flags              *Flags     `json:"flags,omitempty"`
 	// AnswerClass, StatusLabel and MarketCode are the qualifier the UI shows
 	// next to the answer; Clarification is set only on CLARIFY.
-	AnswerClass   string         `json:"answer_class"`
-	StatusLabel   string         `json:"status_label,omitempty"`
-	MarketCode    string         `json:"market_code,omitempty"`
-	Clarification *Clarification `json:"clarification,omitempty"`
+	AnswerClass string `json:"answer_class"`
+	// SafetyDisposition is DispositionFor(Status) (Doc 02 §15).
+	SafetyDisposition string         `json:"safety_disposition"`
+	StatusLabel       string         `json:"status_label,omitempty"`
+	MarketCode        string         `json:"market_code,omitempty"`
+	Clarification     *Clarification `json:"clarification,omitempty"`
 	// SecondaryIntentID is the second intent of a two-part question (e.g.
 	// plans and trial); Reason says why the turn ended this way.
 	SecondaryIntentID string `json:"secondary_intent_id,omitempty"`
@@ -467,6 +524,10 @@ func (e *Envelope) Validate() error {
 		return errors.New("clarification only on CLARIFY")
 	case e.AnswerClass == HandoffUnknown && e.Status == Answered:
 		return errors.New("ANSWERED cannot be HANDOFF_UNKNOWN")
+	case (e.AnswerClass == SafeRefusal) != (e.Status == RefusedAction):
+		return errors.New("SAFE_REFUSAL is exactly the REFUSED_ACTION class")
+	case e.SafetyDisposition != DispositionFor(e.Status):
+		return errors.New("safety_disposition")
 	case e.Reason != "" && reasonStage[e.Reason] == "":
 		return errors.New("reason")
 	case e.SecondaryIntentID != "" && !intentRe.MatchString(e.SecondaryIntentID):
@@ -507,6 +568,49 @@ func (e *Envelope) Validate() error {
 	}
 	if e.Status == Answered && len(e.Citations) == 0 {
 		return errors.New("ANSWERED requires provenance")
+	}
+	return nil
+}
+
+// AnalyticsRequest is the body of POST /analytics: the two Doc 02 §27
+// events only the browser observes. Enums and ids only.
+type AnalyticsRequest struct {
+	SchemaVersion string `json:"schema_version"`
+	Event         string `json:"event"`
+	SessionID     string `json:"session_id,omitempty"`
+	PageContext   string `json:"page_context,omitempty"`
+	Locale        string `json:"locale,omitempty"`
+	LinkID        string `json:"link_id,omitempty"`
+	IntentID      string `json:"intent_id,omitempty"`
+}
+
+var linkIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// Validate allows chat_opened (page, locale) and source_opened (link, intent).
+func (a AnalyticsRequest) Validate() error {
+	if a.SchemaVersion != SchemaVersion {
+		return ErrUnsupportedSchema
+	}
+	switch a.Event {
+	case "chat_opened":
+		if a.LinkID != "" || a.IntentID != "" {
+			return &FieldError{"link_id", "not allowed on chat_opened"}
+		}
+	case "source_opened":
+		if !linkIDRe.MatchString(a.LinkID) {
+			return &FieldError{"link_id", "must be an approved link id"}
+		}
+		if a.IntentID != "" && !intentRe.MatchString(a.IntentID) {
+			return &FieldError{"intent_id", "unknown intent"}
+		}
+	default:
+		return &FieldError{"event", "must be chat_opened or source_opened"}
+	}
+	if a.PageContext != "" && !PageContexts[a.PageContext] {
+		return &FieldError{"page_context", "unknown page"}
+	}
+	if a.Locale != "" && !localeRe.MatchString(a.Locale) {
+		return &FieldError{"locale", "must be a BCP 47 tag"}
 	}
 	return nil
 }

@@ -13,4 +13,4 @@ scrape_configs:
   - job_name: public-ai-svc
     metrics_path: /metrics
     static_configs:
-      - targets: ["public-ai-svc:8080"]
+      - targets: ["public-ai-svc:9091"] # the admin listener (PUBLIC_AI_ADMIN_ADDR)

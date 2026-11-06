@@ -1,5 +1,8 @@
-version: '3.8'
-
+# Health checks: every service allows a 60s start_period. Failed checks
+# inside it do not count, and a service is marked healthy as soon as one
+# check passes, so this costs nothing on a fast start. It covers a cold start
+# of the whole stack, e.g. Postgres replaying WAL after an unclean Docker
+# shutdown, where 10s made `up` fail with "dependency failed to start".
 services:
 
   # ── Shared PostgreSQL ────────────────────────────────────────────────────────
@@ -116,7 +119,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 5s
+      # A cold start after an unclean shutdown replays WAL and fsyncs every
+      # database while the whole stack starts; 5s made dependants fail with
+      # "dependency postgres failed to start". Healthy is still reported as
+      # soon as pg_isready passes.
+      start_period: 90s
 
   # ── Shared Redis (identity-context-svc cache) ────────────────────────────────
   redis:
@@ -161,7 +168,9 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
-      start_period: 15s
+      # KRaft recovery on a cold start (with the rest of the stack starting)
+      # outlasted 15s + retries; failures inside the start period don't count.
+      start_period: 120s
 
   # ── S3-Class Object Storage (MinIO — §10.3 Document & Evidence Store) ────────
   # Port 9000: S3 API consumed by services. Port 9001: MinIO Console UI.
@@ -188,7 +197,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 10s
+      start_period: 60s
 
   # ── Search Layer (OpenSearch single-node — §10.4) ─────────────────────────────
   # DISABLE_SECURITY_PLUGIN=true is dev/local ONLY.
@@ -750,7 +759,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── API Gateway chunk 2: ForwardAuth — verifies every gated request's
@@ -842,7 +851,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 2. tenant-entity-registry-svc (Port: 8081) ────────────────────────────────
@@ -925,7 +934,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 3. jurisdiction-rules-svc (Port: 8082) ──────────────────────────────────
@@ -994,7 +1003,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
     # Gateway routing. PathPrefix /jurisdiction is stripped before
     # forwarding, so this container never sees anything other than its
@@ -1095,7 +1104,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 5. audit-event-store-svc (Port: 8084) ─────────────────────────────────────
@@ -1136,7 +1145,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 6. policy-svc (Port: 8085) ────────────────────────────────────────────────
@@ -1209,7 +1218,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 7. configuration-feature-flag-svc (Port: 8086) ───────────────────────────
@@ -1264,7 +1273,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 8. secret-vault-integration-svc (Port: 8087) ─────────────────────────────
@@ -1324,7 +1333,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 9. obligations-svc (Port: 8088) ──────────────────────────────────────────
@@ -1390,7 +1399,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 10. authorization-svc (Port: 8089) ──────────────────────────────────────
@@ -1589,7 +1598,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 11. workflow-svc (Port: 8090) ───────────────────────────────────────────
@@ -1662,7 +1671,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── 12. schema-registry-svc (Port: 8093) ─────────────────────────────────────
@@ -1703,7 +1712,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── One-shot: chown the document-vault storage volume ───────────────────────
@@ -1779,7 +1788,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── Phase 2: Evidence Manifest Service (Port: 8095) ──────────────────────────
@@ -1842,7 +1851,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── Search Indexer / ESR control plane (Port: 8096) ────────────────────────
@@ -1981,7 +1990,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── Phase 3: General Ledger Service (Port: 8098) ─────────────────────────────
@@ -2037,7 +2046,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── Phase 3: Accounts Payable Service (Port: 8099) ───────────────────────────
@@ -2090,7 +2099,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   purchase-request-svc:
@@ -2127,7 +2136,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # 8129, not 8112. benefits-svc also published "8112:8112", so the two could
@@ -2179,7 +2188,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Spend Controls Service — 03-microservices.md §12.12. Owns spend-control
@@ -2220,7 +2229,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Vendor Due Diligence Service — 03-microservices.md §12.10. Owns vendor
@@ -2267,7 +2276,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Notification Service — 03-microservices.md §9.7. Handles governed
@@ -2451,7 +2460,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Procurement Workflow Service — 03-microservices.md §12.7. Owns
@@ -2499,7 +2508,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Performance & Review Service — 03-microservices.md §11.10. Owns review
@@ -2551,7 +2560,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Delegated Authority Service — 03-microservices.md §9.3. Owns time-bound,
@@ -2603,7 +2612,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Currency Registry Service (REF-02). Global reference data: ISO 4217
@@ -2644,7 +2653,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Fiscal Calendar Service (REF-04). Calendar definitions and versions as data;
@@ -2685,7 +2694,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Accounting Period Service (REF-05). Authoritative period state and the
@@ -2727,7 +2736,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   financial-statements-svc:
@@ -2767,7 +2776,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Access Control Service — 03-microservices.md §9.4. Owns role/permission-
@@ -2826,7 +2835,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Decision Support Service — 03-microservices.md §15.5. Provides governed
@@ -2873,7 +2882,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # mTLS Management Service — 05-security.md §5.2/§10.7/§12.4/§18. Owns
@@ -2922,7 +2931,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Evidence Requirements Service — 03-microservices.md §8.6. The seventh and
@@ -2988,7 +2997,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   accounts-receivable-svc:
@@ -3045,7 +3054,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   treasury-svc:
@@ -3092,7 +3101,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   financial-close-svc:
@@ -3214,7 +3223,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Bank Reconciliation Service — UNMATCHED forks to MATCHED or EXCEPTION;
@@ -3260,7 +3269,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # Financial Control Service (ZS-CONTROL-001) — governed control definitions,
@@ -3312,7 +3321,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   intercompany-accounting-svc:
@@ -3357,7 +3366,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   consolidation-svc:
@@ -3401,7 +3410,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   asset-management-svc:
@@ -3455,7 +3464,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   inventory-management-svc:
@@ -3503,7 +3512,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   project-accounting-svc:
@@ -3548,7 +3557,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   invoice-approval-svc:
@@ -3589,7 +3598,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   employee-master-svc:
@@ -3624,7 +3633,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   employment-contracts-svc:
@@ -3662,7 +3671,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   payroll-run-svc:
@@ -3705,7 +3714,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   compensation-svc:
@@ -3743,7 +3752,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   benefits-svc:
@@ -3781,7 +3790,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   payroll-tax-svc:
@@ -3819,7 +3828,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   payroll-exceptions-svc:
@@ -3857,7 +3866,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   leave-absence-svc:
@@ -3895,7 +3904,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   org-structure-svc:
@@ -3933,7 +3942,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   offboarding-severance-svc:
@@ -3974,7 +3983,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   workforce-compliance-svc:
@@ -4015,7 +4024,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── Phase 5 · contract-lifecycle-svc (Port: 8119) ────────────────────────────
@@ -4050,7 +4059,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   clause-template-svc:
@@ -4081,7 +4090,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   obligation-tracking-svc:
@@ -4112,7 +4121,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   board-resolutions-svc:
@@ -4148,7 +4157,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   corporate-actions-svc:
@@ -4182,7 +4191,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   counterparty-management-svc:
@@ -4213,7 +4222,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── payee-banking-identity-svc (Port: 8166) ──────────────────────────────
@@ -4272,7 +4281,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   tax-rules-svc:
@@ -4303,7 +4312,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   tax-determination-svc:
@@ -4337,7 +4346,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   vat-gst-svc:
@@ -4372,7 +4381,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   corporate-tax-svc:
@@ -4410,7 +4419,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── commercial-account-svc (Port: 8144) ───────────────────────────────────────
@@ -4453,7 +4462,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── capability-registry-svc (Port: 8145) ──────────────────────────────────────
@@ -4500,7 +4509,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── ai-governance-svc (Port: 8146) ──────────────────────────────────────
@@ -4571,7 +4580,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── kill-switch-registry-svc (Port: 8147) ───────────────────────────────
@@ -4619,7 +4628,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── retention-registry-svc (Port: 8148) ─────────────────────────────────
@@ -4665,7 +4674,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── comments-collaboration-svc (Port: 8170) ─────────────────────────────
@@ -4702,7 +4711,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── privacy-purpose-registry-svc (Port: 8151) ───────────────────────────
@@ -4749,7 +4758,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── privacy-consent-svc (Port: 8152) ─────────────────────────────────────
@@ -4792,7 +4801,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── privacy-decision-svc (Port: 8153) ────────────────────────────────────
@@ -4847,7 +4856,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── privacy-rights-svc (Port: 8154) ──────────────────────────────────────
@@ -4894,7 +4903,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── privacy-transfer-svc (Port: 8155) ────────────────────────────────────
@@ -4943,7 +4952,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── supplier-financial-profile-svc (Port: 8156) ──────────────────────────
@@ -4990,7 +4999,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── goods-service-receipt-svc (Port: 8157) ───────────────────────────────
@@ -5049,7 +5058,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── payable-open-item-svc (Port: 8164) ───────────────────────────────────
@@ -5102,7 +5111,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── supplier-recovery-svc (Port: 8165) ───────────────────────────────────
@@ -5162,7 +5171,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── expense-claim-svc (Port: 8158) ───────────────────────────────────────
@@ -5228,7 +5237,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── payment-proposal-svc (Port: 8159) ────────────────────────────────────
@@ -5292,7 +5301,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── payment-authorization-svc (Port: 8160) ───────────────────────────────
@@ -5362,7 +5371,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── payment-run-svc (Port: 8161) ─────────────────────────────────────────
@@ -5438,7 +5447,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── payment-initiation-adapter-svc (Port: 8162) ──────────────────────────
@@ -5480,7 +5489,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── payment-status-svc (Port: 8163) ──────────────────────────────────────
@@ -5528,7 +5537,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── metric-registry-svc (Port: 8149) ────────────────────────────────────
@@ -5571,7 +5580,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
   # ── source-authority-svc (Port: 8150) ───────────────────────────────────
@@ -5614,7 +5623,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     restart: on-failure
 
 volumes:

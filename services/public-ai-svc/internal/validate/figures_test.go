@@ -11,7 +11,7 @@ import (
 // Doc 03 §17: a price or trial length needs a claim card that states it;
 // evidence text alone never grounds one.
 func TestFiguresAreWholeTokensAndP1NeedsAClaim(t *testing.T) {
-	evPrice := []model.Evidence{{Ref: "e1", Title: "Pricing", Text: "Growth costs $49 per user. A 14-day trial is offered. Plans support 3 entities and 1,000 records."}}
+	evPrice := []model.Evidence{{Ref: "e1", Title: "Pricing", Text: "Growth costs $49 per user. A 14-day trial is offered. Plans support 3 approval levels, 3 entities and 1,000 records."}}
 	price := []model.ClaimCard{{Ref: "c1", Statement: "The Growth plan is listed at XTS 49.00 per user per month."}}
 	trial := []model.ClaimCard{{Ref: "c2", Statement: "A 30-day self-serve trial is available."}}
 	cases := []struct {
@@ -20,8 +20,8 @@ func TestFiguresAreWholeTokensAndP1NeedsAClaim(t *testing.T) {
 		claims []model.ClaimCard
 		want   error
 	}{
-		{"substring of a grounded number", "Plans support 4 entities.", nil, ErrUnsupportedFact},
-		{"whole grounded number", "Plans support 3 entities.", nil, nil},
+		{"substring of a grounded number", "Plans support 4 approval levels.", nil, ErrUnsupportedFact},
+		{"whole grounded number", "Plans support 3 approval levels.", nil, nil},
 		{"thousands separator", "Plans support 1000 records.", nil, nil},
 		{"currency from evidence only", "Growth costs $49 per user.", nil, ErrUnsupportedFact},
 		{"currency code from evidence only", "Growth costs USD 49.", nil, ErrUnsupportedFact},
@@ -33,6 +33,10 @@ func TestFiguresAreWholeTokensAndP1NeedsAClaim(t *testing.T) {
 		{"price card does not ground another amount", "It is XTS 4 per user.", price, ErrUnsupportedFact},
 		{"trial stated by claim", "A 30-day trial is available.", trial, nil},
 		{"trial card does not ground another length", "A 14-day trial is available.", trial, ErrUnsupportedFact},
+		// Doc 03 §17: user/entity capacity only from a signed entitlement claim,
+		// never from article prose.
+		{"capacity from prose", "Plans support 3 approval levels and 3 entities.", nil, ErrUnsupportedFact},
+		{"capacity from a claim", "Growth includes 3 entities.", []model.ClaimCard{{Ref: "c-ent", Statement: "SYNTHETIC: Growth includes 3 entities."}}, nil},
 	}
 	for _, c := range cases {
 		d := model.Draft{Text: c.text, EvidenceRefs: []string{"e1"}}
