@@ -35,6 +35,7 @@ import (
 	"zoiko.io/notification-svc/internal/idempotency"
 	"zoiko.io/notification-svc/internal/identity"
 	"zoiko.io/notification-svc/internal/ledger"
+	"zoiko.io/notification-svc/internal/legalbasis"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
 	"zoiko.io/notification-svc/internal/ncd"
@@ -391,6 +392,11 @@ func main() {
 	ncdSvc.SetMetrics(telemetry.NewNCD("notification-svc", prometheus.DefaultRegisterer))
 	// S7-B2: with a document vault configured, the notice evidence package is declared as a record by this service.
 	// S7-C1: a party of the sender's own tenant can be addressed through its verified contact points.
+	// S7-C2: a regulated notice legal basis must be an active LEGAL_BASIS policy version in policy-svc.
+	if cfg.LegalBasisPolicyURL != "" {
+		ncdSvc.SetLegalBasisVerifier(legalbasis.NewClient(cfg.LegalBasisPolicyURL, cfg.LegalBasisPrincipal, 3*time.Second, log))
+		log.Info("notice legal basis is verified against policy-svc", zap.String("url", cfg.LegalBasisPolicyURL))
+	}
 	if cfg.PartyContactsURL != "" {
 		ncdSvc.SetPartyContacts(partycontacts.NewClient(cfg.PartyContactsURL, cfg.PartyContactsPrincipal, 3*time.Second, log))
 		log.Info("party recipients resolve through tenant-entity-registry-svc", zap.String("url", cfg.PartyContactsURL))

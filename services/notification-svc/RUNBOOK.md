@@ -322,3 +322,13 @@ first; the registry owns verification (maker-checker with evidence). A contact i
 the address in the evidence. A party of another tenant is not found (the call is made under the sender's own tenant); `recipient_tenant_id` of another tenant
 is still refused (NCD-020): no cross-tenant federation model exists (MDM-I-05, MDM-I-29). A party recipient cannot be combined with `free_text_endpoint`, the
 intent must allow EMAIL, and without `PARTY_CONTACTS_URL` the answer is `503 party_contacts_not_configured`.
+
+### S7-C2 notice legal basis checked against policy-svc
+
+Set `LEGAL_BASIS_POLICY_URL` (policy-svc; `LEGAL_BASIS_PRINCIPAL` default `notification-svc`, which needs policy-svc `POLICY_READ` in each tenant scope).
+`POST /v1/regulated-notices` then requires `legal_basis_ref` to be the id of an ACTIVE policy version, in force now, of a policy whose `policy_type` is
+`LEGAL_BASIS`, global or of the sending tenant. Free text, an unknown, superseded, draft, not-yet-effective or ended version, another tenant's version and a
+policy of another type are `400 legal_basis_unverified`; an unreachable policy-svc, or one that refuses this service, is `503 legal_basis_unavailable` and no notice
+is created. A steward creates the legal-basis policy and activates a version of it in policy-svc (policy types are data there, so no policy-svc change is needed);
+the notice keeps the version id, which names the exact immutable version it rests on. The rule is not interpreted and legal sufficiency is still NOT_DETERMINED_BY_NCD.
+Unset, the reference stays caller-supplied. `deadline_at` is still caller-supplied: workflow-svc has no deadline clocks.

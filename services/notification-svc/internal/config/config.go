@@ -98,6 +98,12 @@ type Config struct {
 	PartyContactsURL       string
 	PartyContactsPrincipal string
 
+	// LegalBasisPolicyURL is policy-svc. When set, a regulated notice legal_basis_ref must be the id of an ACTIVE LEGAL_BASIS
+	// policy version in force now (S7-C2); unset, it stays caller-supplied. LegalBasisPrincipal is the workload identity asked
+	// as, which needs policy-svc POLICY_READ in each tenant scope.
+	LegalBasisPolicyURL string
+	LegalBasisPrincipal string
+
 	// QuotaEnabled turns on the send quotas (ZS-SVC-Y-001 6.5): per tenant, recipient and intent,
 	// with protected capacity for security messages. NOTIFICATION_QUOTA_ENABLED, default false,
 	// because the right limits depend on the largest legitimate batch an environment sends (a
@@ -345,6 +351,9 @@ func Load() (*Config, error) {
 
 		PartyContactsURL:       env("PARTY_CONTACTS_URL", ""),
 		PartyContactsPrincipal: env("PARTY_CONTACTS_PRINCIPAL", "notification-svc"),
+
+		LegalBasisPolicyURL: env("LEGAL_BASIS_POLICY_URL", ""),
+		LegalBasisPrincipal: env("LEGAL_BASIS_PRINCIPAL", "notification-svc"),
 
 		QuotaEnabled: env("NOTIFICATION_QUOTA_ENABLED", "false") == "true",
 		QuotaLimits: quota.Limits{

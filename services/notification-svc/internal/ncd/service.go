@@ -68,7 +68,9 @@ type Service struct {
 	recordVault RecordVault
 	// partyContacts reads verified contact points of a party of the sender's tenant (S7-C1). Nil refuses party recipients.
 	partyContacts PartyContactSource
-	lastBacklog   time.Time
+	// legalBasis checks a notice legal basis against the policy authority (S7-C2). Nil leaves it caller-supplied.
+	legalBasis  LegalBasisVerifier
+	lastBacklog time.Time
 }
 
 // NewService wires the plane.
