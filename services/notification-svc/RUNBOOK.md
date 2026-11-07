@@ -298,3 +298,16 @@ ignored and the decision records `privacy_source: PRV`. PERMIT proceeds; BLOCK i
 INDETERMINATE, an outage and an intent with no binding go to review, never to permission; a RESTRICT is carried only when every
 constraint is `NO_<CHANNEL>`, otherwise it is refused because this service cannot enforce the duty. **Turn it on only after
 the intents in use carry a binding**, or they will all be held for review. Marketing permission is still caller-supplied.
+
+### S7-B3 provider and callback secrets from the vault
+
+Set `NOTIFICATION_SECRETS_VAULT_URL`, `NOTIFICATION_SECRETS_TENANT_ID` (the scope the policies are registered under) and
+`NOTIFICATION_SECRETS_PRINCIPAL` (default `notification-svc`, which every policy must list in `allowed_workload_ids`), then name the vault paths:
+`NOTIFICATION_SMTP_PASSWORD_SECRET_PATH`, `NOTIFICATION_SMTP_SECONDARY_PASSWORD_SECRET_PATH` (class PROVIDER_CREDENTIAL) and
+`NOTIFICATION_WEBHOOK_SECRETS_SECRET_PATH` (class CALLBACK_SECRET; the value is the same JSON as `NOTIFICATION_WEBHOOK_SECRETS`). The secrets are
+leased through `POST /v1/secrets/use` before anything uses them; the service **does not start** if one cannot be obtained. They are re-read every
+`NOTIFICATION_SECRETS_REFRESH_INTERVAL` (default 10m, 0 = once), so a rotation reaches the running SMTP providers and webhook verifier; an outage or a
+malformed rotated value keeps the value in use and is logged. Each read is audited by the vault (USED), so the interval sets the audit volume.
+In production an environment-held `SMTP_PASSWORD`, `SMTP_SECONDARY_PASSWORD` or `NOTIFICATION_WEBHOOK_SECRETS` without a vault path is refused unless
+`NOTIFICATION_ALLOW_ENV_SECRETS=true`. Still in the environment, by decision: `ACTION_TOKEN_SECRET` and `NOTIFICATION_UNSUBSCRIBE_SECRET` (HMAC keys; they
+belong with the vault sign operation) and `NOTIFICATION_DKIM_PRIVATE_KEY` (the vault cannot return it).

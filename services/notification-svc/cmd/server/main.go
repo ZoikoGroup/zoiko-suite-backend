@@ -47,6 +47,7 @@ import (
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
 	"zoiko.io/notification-svc/internal/unsubscribe"
+	"zoiko.io/notification-svc/internal/vaultsecrets"
 	"zoiko.io/notification-svc/internal/webhook"
 )
 
@@ -204,6 +205,61 @@ func main() {
 		log.Warn("DKIM not configured — this service sends unsigned mail; the mail provider must sign it (§11.1)")
 	}
 
+	// S7-B3: provider and callback secrets are leased from the vault when paths are configured (never logged). They are
+	// fetched before anything uses them, so a service that cannot obtain its provider credential does not start; the
+	// refresher below then carries rotations to the running providers and verifier.
+	var (
+		smtpPrimary, smtpSecondary *deliver.SMTPProvider
+		webhookVerifierRef         *webhook.Verifier
+		secretRefresher            *vaultsecrets.Refresher
+	)
+	if cfg.Secrets.Enabled() {
+		vc, verr := vaultsecrets.NewClient(cfg.Secrets.VaultURL, cfg.Secrets.Principal, cfg.Secrets.TenantID, nil)
+		if verr != nil {
+			log.Fatal("secret vault client configuration is invalid", zap.Error(verr))
+		}
+		var vs []vaultsecrets.Secret
+		if p := cfg.Secrets.SMTPPasswordPath; p != "" {
+			vs = append(vs, vaultsecrets.Secret{Name: "smtp_password", Path: p, Apply: func(v []byte) error {
+				cfg.Email.Password = string(v)
+				if smtpPrimary != nil {
+					return smtpPrimary.SetPassword(string(v))
+				}
+				return nil
+			}})
+		}
+		if p := cfg.Secrets.SMTPSecondaryPasswordPath; p != "" {
+			vs = append(vs, vaultsecrets.Secret{Name: "smtp_secondary_password", Path: p, Apply: func(v []byte) error {
+				cfg.SecondaryEmail.Password = string(v)
+				if smtpSecondary != nil {
+					return smtpSecondary.SetPassword(string(v))
+				}
+				return nil
+			}})
+		}
+		if p := cfg.Secrets.WebhookSecretsPath; p != "" {
+			vs = append(vs, vaultsecrets.Secret{Name: "webhook_secrets", Path: p, Apply: func(v []byte) error {
+				parsed, perr := config.ParseWebhookSecrets(string(v))
+				if perr != nil {
+					return perr
+				}
+				cfg.WebhookSecrets = parsed
+				if webhookVerifierRef != nil {
+					webhookVerifierRef.SetSecrets(parsed)
+				}
+				return nil
+			}})
+		}
+		secretRefresher = vaultsecrets.NewRefresher(vc, vs, log)
+		loadCtx, cancelLoad := context.WithTimeout(context.Background(), 30*time.Second)
+		lerr := secretRefresher.Load(loadCtx)
+		cancelLoad()
+		if lerr != nil {
+			log.Fatal("could not lease the service secrets from the vault", zap.Error(lerr))
+		}
+		log.Info("service secrets leased from the vault", zap.Int("secrets", len(vs)), zap.Duration("refresh_interval", cfg.Secrets.RefreshInterval))
+	}
+
 	var emailProvider deliver.Provider
 	switch cfg.Email.Provider {
 	case "":
@@ -225,6 +281,7 @@ func main() {
 			log.Fatal("email provider configuration is invalid", zap.Error(err))
 		}
 		emailProvider = p
+		smtpPrimary = p
 		log.Info("smtp email provider configured",
 			zap.String("host", cfg.Email.Host),
 			zap.Int("port", cfg.Email.Port),
@@ -286,6 +343,7 @@ func main() {
 			log.Fatal("secondary email provider configuration is invalid", zap.Error(err))
 		}
 		secondaryEmailProvider = sp
+		smtpSecondary = sp
 		log.Info("secondary smtp failover provider configured",
 			zap.String("host", cfg.SecondaryEmail.Host),
 			zap.Int("port", cfg.SecondaryEmail.Port))
@@ -478,6 +536,7 @@ func main() {
 	// (ZS-SVC-Y-001 INV-27, NP-26). With none configured every callback is refused:
 	// the route is envelope-exempt, so there is no other gate in front of it.
 	webhookVerifier := webhook.NewVerifier(cfg.WebhookSecrets, cfg.WebhookTolerance)
+	webhookVerifierRef = webhookVerifier
 	if len(webhookVerifier.Providers()) == 0 {
 		log.Warn("NOTIFICATION_WEBHOOK_SECRETS is empty: every provider callback will be refused; " +
 			"delivery receipts, bounces and complaints will not be recorded until a secret is configured")
@@ -546,6 +605,9 @@ func main() {
 	// forever with nothing to move them. The worker drains that backlog and
 	// then finds nothing, which is the correct behaviour for "disabled".
 	workerCtx, stopWorker := context.WithCancel(context.Background())
+	if secretRefresher != nil {
+		go secretRefresher.Run(workerCtx, cfg.Secrets.RefreshInterval)
+	}
 	defer stopWorker()
 
 	retryWorker := retry.NewWorker(

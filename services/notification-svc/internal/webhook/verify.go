@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -56,6 +57,7 @@ var (
 // Verifier checks callback signatures. A nil Verifier verifies nothing and is
 // refused by the handler; construct one with NewVerifier.
 type Verifier struct {
+	mu        sync.RWMutex
 	secrets   map[string][][]byte
 	tolerance time.Duration
 	now       func() time.Time
@@ -69,16 +71,26 @@ func NewVerifier(secrets map[string][]string, tolerance time.Duration) *Verifier
 	if tolerance <= 0 {
 		tolerance = DefaultTolerance
 	}
-	v := &Verifier{secrets: make(map[string][][]byte, len(secrets)), tolerance: tolerance, now: time.Now}
+	v := &Verifier{tolerance: tolerance, now: time.Now}
+	v.SetSecrets(secrets)
+	return v
+}
+
+// SetSecrets replaces the per-provider secrets, so a rotation reaches a running verifier (S7-B3). Secrets shorter than
+// MinSecretLength are dropped, as in NewVerifier.
+func (v *Verifier) SetSecrets(secrets map[string][]string) {
+	next := make(map[string][][]byte, len(secrets))
 	for provider, list := range secrets {
 		key := normalizeProvider(provider)
 		for _, s := range list {
 			if len(s) >= MinSecretLength {
-				v.secrets[key] = append(v.secrets[key], []byte(s))
+				next[key] = append(next[key], []byte(s))
 			}
 		}
 	}
-	return v
+	v.mu.Lock()
+	v.secrets = next
+	v.mu.Unlock()
 }
 
 // Providers reports the providers that have at least one usable secret.
@@ -86,6 +98,8 @@ func (v *Verifier) Providers() []string {
 	if v == nil {
 		return nil
 	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	out := make([]string, 0, len(v.secrets))
 	for p := range v.secrets {
 		out = append(out, p)
@@ -115,7 +129,9 @@ func mac(secret []byte, t string, body []byte) []byte {
 // HMAC of "<t>.<body>" under at least one of the provider's secrets. Comparison
 // is constant time.
 func (v *Verifier) Verify(provider, header string, body []byte) error {
+	v.mu.RLock()
 	secrets := v.secrets[normalizeProvider(provider)]
+	v.mu.RUnlock()
 	if len(secrets) == 0 {
 		return ErrNoSecret
 	}

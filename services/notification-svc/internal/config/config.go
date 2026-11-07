@@ -101,6 +101,9 @@ type Config struct {
 	QuotaLimits  quota.Limits
 
 	WebhookSecrets map[string][]string
+
+	// Secrets sources provider and callback secrets from the vault instead of the environment (S7-B3).
+	Secrets SecretsConfig
 	// WebhookTolerance is how far a callback timestamp may differ from the clock.
 	// Sourced from NOTIFICATION_WEBHOOK_TOLERANCE (default 5m).
 	WebhookTolerance time.Duration
@@ -377,6 +380,11 @@ func Load() (*Config, error) {
 	}
 	cfg.WebhookSecrets = secrets
 
+	cfg.Secrets = loadSecretsConfig()
+	if err := cfg.Secrets.validate(); err != nil {
+		return nil, err
+	}
+
 	// Load returned a nil error unconditionally, so every default above was
 	// also a production default: an empty DB password, and an authz URL that
 	// could point at a placeholder. Refuse to start rather than run a
@@ -425,6 +433,8 @@ func Load() (*Config, error) {
 					"it exists for a local mail catcher on a container network)")
 			}
 		}
+
+		missing = append(missing, cfg.secretsProductionProblems()...)
 
 		if len(missing) > 0 {
 			return nil, errors.New("invalid production config: " + strings.Join(missing, ", "))
