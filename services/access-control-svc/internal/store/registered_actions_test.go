@@ -129,6 +129,12 @@ var registeredActionMigrations = []struct {
 		"MASTER_IMPORT_APPROVE": "HIGH",
 		"MASTER_IMPORT_CANCEL":  "STANDARD",
 	}},
+	{"000056_register_party_contact_actions", "tenant-entity-registry-svc", map[string]string{
+		"PARTY_CONTACT_CREATE": "STANDARD",
+		"PARTY_CONTACT_VERIFY": "HIGH",
+		"PARTY_CONTACT_RETIRE": "STANDARD",
+		"PARTY_CONTACT_READ":   "STANDARD",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {

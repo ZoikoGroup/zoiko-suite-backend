@@ -39,6 +39,7 @@ import (
 	"zoiko.io/notification-svc/internal/mtls"
 	"zoiko.io/notification-svc/internal/ncd"
 	"zoiko.io/notification-svc/internal/outbox"
+	"zoiko.io/notification-svc/internal/partycontacts"
 	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/privacy"
 	"zoiko.io/notification-svc/internal/recordvault"
@@ -389,6 +390,11 @@ func main() {
 		ncd.RouterTransport{Email: deliverer, Inbox: ncdStore, Unsubscribe: ncdUnsub}, ncd.DefaultLimits(), log)
 	ncdSvc.SetMetrics(telemetry.NewNCD("notification-svc", prometheus.DefaultRegisterer))
 	// S7-B2: with a document vault configured, the notice evidence package is declared as a record by this service.
+	// S7-C1: a party of the sender's own tenant can be addressed through its verified contact points.
+	if cfg.PartyContactsURL != "" {
+		ncdSvc.SetPartyContacts(partycontacts.NewClient(cfg.PartyContactsURL, cfg.PartyContactsPrincipal, 3*time.Second, log))
+		log.Info("party recipients resolve through tenant-entity-registry-svc", zap.String("url", cfg.PartyContactsURL))
+	}
 	if cfg.DocumentVaultURL != "" {
 		ncdSvc.SetRecordVault(recordvault.NewClient(cfg.DocumentVaultURL, cfg.DocumentVaultTimeout, log))
 		log.Info("notice record declaration through document-vault-svc is on", zap.String("document_vault_url", cfg.DocumentVaultURL))

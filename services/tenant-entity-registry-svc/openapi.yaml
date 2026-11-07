@@ -2495,6 +2495,117 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  # ── MDM-01 Party contact points ─────────────────────────────────────────────
+  /v1/parties/{partyID}/contact-points:
+    post:
+      operationId: createContactPoint
+      summary: "MDM-01 CreateContactPoint - propose an email contact point for a party, starting PROPOSED"
+      description: |
+        The party must belong to the caller's tenant (404 otherwise) and be usable (not INACTIVE or merged). The address is
+        validated and normalised (trimmed, domain lower-cased, one address, no display name, at most 254 characters). A party
+        has at most one live contact point per channel and address (409). Needs PARTY_CONTACT_CREATE. The response never
+        echoes the address. Cross-tenant contact lookup is not offered.
+      tags: [ContactPoints]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - $ref: "#/components/parameters/CorrelationID"
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateContactPointRequest" } } }
+      responses:
+        "201":
+          description: Contact point recorded as PROPOSED
+          content: { application/json: { schema: { $ref: "#/components/schemas/ContactPointOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "A live contact point with that address exists, or the party is not usable", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listPartyContactPoints
+      summary: "MDM-01 ListPartyContactPoints - the contact points of a party in force at as_of, addresses included"
+      description: |
+        Needs PARTY_CONTACT_READ, because the rows carry the address. Without status every state is returned;
+        status=VERIFIED is what a notifier asks for. as_of (RFC3339 or a date, default now) limits the result to rows in force
+        at that instant: valid_from <= as_of and (no valid_to or as_of < valid_to). The address is never logged.
+      tags: [ContactPoints]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - { name: channel, in: query, schema: { type: string, enum: [EMAIL] } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/ContactStatus" } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Contact points in force at as_of
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contact_points]
+                properties:
+                  contact_points:
+                    type: array
+                    items: { $ref: "#/components/schemas/ContactPointItem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/party-contact-points/{contactPointID}:verify:
+    post:
+      operationId: verifyContactPoint
+      summary: "MDM-01 VerifyContactPoint - PROPOSED to VERIFIED on evidence, by someone other than the proposer"
+      description: |
+        evidence_ref is required. The principal who proposed the contact point cannot verify it: 403 SOD_DENIED, whatever
+        permissions they hold. Needs PARTY_CONTACT_VERIFY. No verification is automatic.
+      tags: [ContactPoints]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: contactPointID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VerifyContactPointRequest" } } }
+      responses:
+        "200":
+          description: Verified
+          content: { application/json: { schema: { $ref: "#/components/schemas/ContactPointOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the contact point is not PROPOSED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/party-contact-points/{contactPointID}:retire:
+    post:
+      operationId: retireContactPoint
+      summary: "MDM-01 RetireContactPoint - end a contact point, finally"
+      description: |
+        reason is required. valid_to is set to the time of retirement and the status becomes RETIRED, which is final. A
+        retired address can be proposed again as a new contact point. Needs PARTY_CONTACT_RETIRE.
+      tags: [ContactPoints]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: contactPointID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RetireContactPointRequest" } } }
+      responses:
+        "200":
+          description: Retired
+          content: { application/json: { schema: { $ref: "#/components/schemas/ContactPointOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the contact point is already RETIRED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
   # ── ORG-08 Establishments ───────────────────────────────────────────────────
   /v1/establishments:
     post:
@@ -4759,6 +4870,85 @@ components:
         version_before: { type: integer }
         version_after: { type: integer }
         occurred_at: { type: string, format: date-time }
+
+    ContactStatus:
+      type: string
+      enum: [PROPOSED, VERIFIED, RETIRED]
+
+    CreateContactPointRequest:
+      type: object
+      required: [channel, value, source_class]
+      properties:
+        channel: { type: string, enum: [EMAIL] }
+        value: { type: string, maxLength: 254, description: "One email address, no display name. Stored with the domain lower-cased." }
+        purpose: { type: string, enum: [GENERAL, BILLING, LEGAL_NOTICE], default: GENERAL }
+        source_class: { type: string, enum: [AUTHORITY_REGISTRY, AUTHORITY_DOCUMENT, TENANT_ASSERTED, SYSTEM_IMPORT, EXTERNAL_PROVIDER] }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date-time, description: "Defaults to now." }
+        correlation_id: { type: string }
+
+    VerifyContactPointRequest:
+      type: object
+      required: [evidence_ref]
+      properties:
+        expected_version: { type: integer, format: int64 }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    RetireContactPointRequest:
+      type: object
+      required: [reason]
+      properties:
+        expected_version: { type: integer, format: int64 }
+        reason: { type: string }
+        correlation_id: { type: string }
+
+    ContactPointRecord:
+      type: object
+      description: A contact point as a command returns it. The address is never included; value_digest is its sha256.
+      required: [contact_point_id, tenant_id, party_id, channel, value_digest, purpose, status, source_class, valid_from, record_version]
+      properties:
+        contact_point_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        channel: { type: string, enum: [EMAIL] }
+        value_digest: { type: string }
+        purpose: { type: string, enum: [GENERAL, BILLING, LEGAL_NOTICE] }
+        status: { $ref: "#/components/schemas/ContactStatus" }
+        source_class: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, nullable: true }
+        evidence_ref: { type: string }
+        created_by: { type: string }
+        verified_by: { type: string }
+        verified_at: { type: string, format: date-time, nullable: true }
+        retired_by: { type: string }
+        retired_at: { type: string, format: date-time, nullable: true }
+        record_version: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+
+    ContactPointOutcome:
+      type: object
+      required: [contact_point]
+      properties:
+        contact_point: { $ref: "#/components/schemas/ContactPointRecord" }
+
+    ContactPointItem:
+      type: object
+      required: [contact_point_id, party_id, channel, value, purpose, status, valid_from, valid_to, source_class, verified_at, evidence_ref, record_version]
+      properties:
+        contact_point_id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        channel: { type: string, enum: [EMAIL] }
+        value: { type: string }
+        purpose: { type: string, enum: [GENERAL, BILLING, LEGAL_NOTICE] }
+        status: { $ref: "#/components/schemas/ContactStatus" }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, nullable: true }
+        source_class: { type: string }
+        verified_at: { type: string, format: date-time, nullable: true }
+        evidence_ref: { type: string }
+        record_version: { type: integer, format: int64 }
 
     EstablishmentOutcome:
       type: object

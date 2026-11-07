@@ -114,6 +114,10 @@ channels:
           - $ref: "#/components/messages/EstablishmentActivated"
           - $ref: "#/components/messages/EstablishmentDeactivated"
           - $ref: "#/components/messages/EstablishmentClosed"
+          # ── MDM-01 party contact points ──────────────────────────────────
+          - $ref: "#/components/messages/ContactPointProposed"
+          - $ref: "#/components/messages/ContactPointVerified"
+          - $ref: "#/components/messages/ContactPointRetired"
           # ── ORG-09 registrations ─────────────────────────────────────────
           - $ref: "#/components/messages/RegistrationCreated"
           - $ref: "#/components/messages/RegistrationVerified"
@@ -518,6 +522,33 @@ components:
       title: An establishment was closed
       description: Final. `effective_date` is the end of the presence; history stays readable.
       x-spec-event: EstablishmentClosed
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ContactPointProposed:
+      name: party.contact_point.proposed
+      title: A party contact point was proposed
+      description: Carries identifiers, channel, purpose, status, validity and the sha256 digest of the address, never the address.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ContactPointVerified:
+      name: party.contact_point.verified
+      title: A party contact point was verified on evidence
+      description: Verified by a principal other than the proposer. Never carries the address; read it through the permissioned contact point read.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ContactPointRetired:
+      name: party.contact_point.retired
+      title: A party contact point was retired
+      description: Final. valid_to is the time of retirement. Never carries the address.
+      x-spec-event: null
       x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"

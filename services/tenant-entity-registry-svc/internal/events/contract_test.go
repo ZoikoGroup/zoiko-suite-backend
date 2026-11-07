@@ -113,6 +113,10 @@ func codeEventNames() []string {
 		events.EventEstablishmentActivated,
 		events.EventEstablishmentDeactivated,
 		events.EventEstablishmentClosed,
+		// MDM-01 party contact points (contact_point_events.go).
+		events.EventContactPointProposed,
+		events.EventContactPointVerified,
+		events.EventContactPointRetired,
 		// ORG-09 registrations (registration_events.go).
 		events.EventRegistrationCreated,
 		events.EventRegistrationVerified,

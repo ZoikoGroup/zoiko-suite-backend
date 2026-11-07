@@ -23,6 +23,7 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/classification"
 	"zoiko.io/tenant-entity-registry-svc/internal/currency"
+	"zoiko.io/tenant-entity-registry-svc/internal/fiscalcal"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
 	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
 	"zoiko.io/tenant-entity-registry-svc/internal/events"
@@ -89,6 +90,8 @@ type Service struct {
 	importAsync func(func())
 	// currencies validates currency codes against currency-registry-svc, read-only (REF-03). Nil fails closed.
 	currencies currency.Validator
+	// fiscal checks a legal entity's fiscal_calendar_id against fiscal-calendar-svc (ORG-03 s4.3, REF-04). Nil leaves the format check only.
+	fiscal fiscalcal.Validator
 
 	log *zap.Logger
 }
@@ -354,6 +357,9 @@ func (s *Service) CreateEntity(
 		return nil, err
 	}
 	if err := validateFiscalCalendarRef(req.FiscalCalendarID); err != nil {
+		return nil, err
+	}
+	if err := s.checkFiscalCalendar(ctx, req.TenantID, req.FiscalCalendarID); err != nil {
 		return nil, err
 	}
 	profileInputs, err := s.entityProfileInputs(req)

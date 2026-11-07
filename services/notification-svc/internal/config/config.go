@@ -92,6 +92,12 @@ type Config struct {
 	DocumentVaultURL     string
 	DocumentVaultTimeout time.Duration
 
+	// PartyContactsURL is tenant-entity-registry-svc. When set, a communication can be addressed to a party of the sender's own
+	// tenant (recipient `party:<id>`) using its verified contact points (S7-C1). PartyContactsPrincipal is the workload
+	// identity asked as; it needs the registry action PARTY_CONTACT_READ in each tenant scope.
+	PartyContactsURL       string
+	PartyContactsPrincipal string
+
 	// QuotaEnabled turns on the send quotas (ZS-SVC-Y-001 6.5): per tenant, recipient and intent,
 	// with protected capacity for security messages. NOTIFICATION_QUOTA_ENABLED, default false,
 	// because the right limits depend on the largest legitimate batch an environment sends (a
@@ -336,6 +342,9 @@ func Load() (*Config, error) {
 
 		DocumentVaultURL:     env("DOCUMENT_VAULT_URL", ""),
 		DocumentVaultTimeout: envDuration("DOCUMENT_VAULT_TIMEOUT", 10*time.Second),
+
+		PartyContactsURL:       env("PARTY_CONTACTS_URL", ""),
+		PartyContactsPrincipal: env("PARTY_CONTACTS_PRINCIPAL", "notification-svc"),
 
 		QuotaEnabled: env("NOTIFICATION_QUOTA_ENABLED", "false") == "true",
 		QuotaLimits: quota.Limits{

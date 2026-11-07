@@ -66,7 +66,9 @@ type Service struct {
 	privacyDecider PrivacyDecider
 	// recordVault declares notice evidence packages as records (S7-B2). Nil leaves record declaration to a caller-supplied reference.
 	recordVault RecordVault
-	lastBacklog time.Time
+	// partyContacts reads verified contact points of a party of the sender's tenant (S7-C1). Nil refuses party recipients.
+	partyContacts PartyContactSource
+	lastBacklog   time.Time
 }
 
 // NewService wires the plane.

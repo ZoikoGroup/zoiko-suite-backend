@@ -34,12 +34,13 @@ import (
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/config"
+	"zoiko.io/tenant-entity-registry-svc/internal/currency"
 	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
 	svcenvelope "zoiko.io/tenant-entity-registry-svc/internal/envelope"
+	"zoiko.io/tenant-entity-registry-svc/internal/fiscalcal"
 	"zoiko.io/tenant-entity-registry-svc/internal/handler"
 	"zoiko.io/tenant-entity-registry-svc/internal/health"
 	"zoiko.io/tenant-entity-registry-svc/internal/idempotency"
-	"zoiko.io/tenant-entity-registry-svc/internal/currency"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/tenant-entity-registry-svc/internal/middleware"
 	"zoiko.io/tenant-entity-registry-svc/internal/mtlslistener"
@@ -201,6 +202,13 @@ func main() {
 		currencyValidator = currency.NewStub(log)
 	}
 	svc.WithCurrencyValidator(currencyValidator)
+
+	// ORG-03 s4.3: a fiscal calendar reference must name a calendar of the tenant (fiscal-calendar-svc, read-only, fail-closed).
+	if cfg.FiscalCalendarURL != "" {
+		svc.WithFiscalCalendarValidator(fiscalcal.NewHTTP(cfg.FiscalCalendarURL, log))
+	} else {
+		log.Warn("FISCAL_CALENDAR_URL unset: fiscal calendar references are format-checked only")
+	}
 
 	// ORG-02 §4.2 server-resolved provisioning context: plan entitlement from
 	// commercial-account-svc and the restricted-jurisdiction list.

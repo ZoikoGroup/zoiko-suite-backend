@@ -483,3 +483,27 @@ Where the spec leaves a choice, the code chooses the safer reading:
   resumes, but nothing triggers it); the shared `asyncpgx` store is not used because it queries without the tenant GUC this service's
   FORCE RLS needs, so the service holds its own `apicontract.OperationStore`; no cursor pagination (API-4) on rows, `after_row` is a
   keyset by row number.
+
+### Fiscal calendar reference (ORG-03 s4.3, S2-C1)
+
+`fiscal_calendar_id` on entity creation is checked against fiscal-calendar-svc (`GET /v1/fiscal-calendars/{id}`), read under the entity's own tenant: another tenant's
+calendar is a 404, so it is refused. Unknown is `REFERENCE_INVALID`; an unreachable service refuses the create (fail-closed). `FISCAL_CALENDAR_URL` is required in
+staging and production; unset in development the check stays format-only. Calendar validity at a date (the period an entity posts in) is the fiscal-calendar-svc's
+`:resolve`, not checked at creation. Entities already created are not re-checked.
+
+### Party contact points (MDM-01 addresses and contact points, ZS-SVC-U-001)
+
+Governed contact points for parties (migration 000028, `party_contact_points`), so that notification-svc can address an external (non-principal) recipient of the same
+tenant. `POST /v1/parties/{id}/contact-points` proposes, `POST /v1/party-contact-points/{id}:verify` and `:retire` move it, and `GET /v1/parties/{id}/contact-points?channel=&status=&as_of=`
+reads it. Permissions: `PARTY_CONTACT_CREATE`, `_VERIFY` (HIGH), `_RETIRE`, `_READ`; registered in access-control-svc migration 000056.
+- **EMAIL only.** The channel column is a CHECK on `EMAIL`; phone and other channels are not modelled. The address is validated with `net/mail` (one address, no display name, at most 254 characters, a dotted domain) and
+  stored trimmed with the domain lower-cased; the local part is kept as written because it can be case-sensitive, so `A@x.io` and `a@x.io` are two contact points.
+- **The value is stored in clear.** Delivery needs it. It is protected by tenant row-level security (FORCE) and by the `PARTY_CONTACT_READ` permission, which the read requires and the commands do not grant. A command response
+  returns `value_digest` (sha256 of the normalised value), never the value. Events carry the digest and no value; the address is never logged.
+- **Maker-checker.** The principal who proposed a contact point cannot verify it: the store refuses with 403 `SOD_DENIED` and the table CHECK `pcp_independent_verification` refuses it too. Verification needs `evidence_ref`
+  (kept on the row, replacing the optional proposal evidence) and is never automatic: nothing here sends a message to confirm an address, and no inbound proof is checked.
+- **Lifecycle.** PROPOSED to VERIFIED or RETIRED, VERIFIED to RETIRED; RETIRED is final and ends validity (`valid_to`). Value, party, channel, purpose and start are immutable (trigger); rows are never deleted. One live
+  (not RETIRED) contact point per party, channel and address. Retire needs a reason. A party that is INACTIVE or merged takes no new or verified contact point, but a contact point on it can still be retired.
+- **as_of.** The read returns rows in force at the instant: `valid_from <= as_of` and (no `valid_to` or `as_of < valid_to`). Without `status` all states are returned; a notifier asks for `status=VERIFIED`.
+- **Not built.** Cross-tenant contact lookup (MDM-I-05, MDM-I-29); contact points for entities other than parties; a bounce or delivery-failure feedback path that retires an address; address-book style purposes beyond
+  GENERAL, BILLING and LEGAL_NOTICE; automatic verification of an authority-sourced address.

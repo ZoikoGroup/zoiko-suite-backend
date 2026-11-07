@@ -311,3 +311,14 @@ malformed rotated value keeps the value in use and is logged. Each read is audit
 In production an environment-held `SMTP_PASSWORD`, `SMTP_SECONDARY_PASSWORD` or `NOTIFICATION_WEBHOOK_SECRETS` without a vault path is refused unless
 `NOTIFICATION_ALLOW_ENV_SECRETS=true`. Still in the environment, by decision: `ACTION_TOKEN_SECRET` and `NOTIFICATION_UNSUBSCRIBE_SECRET` (HMAC keys; they
 belong with the vault sign operation) and `NOTIFICATION_DKIM_PRIVATE_KEY` (the vault cannot return it).
+
+### S7-C1 external contacts: a party of the sender's own tenant
+
+Set `PARTY_CONTACTS_URL` (tenant-entity-registry-svc) and, if it differs, `PARTY_CONTACTS_PRINCIPAL` (default `notification-svc`, which needs the registry
+action `PARTY_CONTACT_READ` in each tenant scope; without it the registry's 403 surfaces as `503 party_registry_unavailable`). A communication or recipient
+resolution then accepts `recipient_principal_id: "party:<party_id>"`. The address is the party's VERIFIED, in-force EMAIL contact point, newest verification
+first; the registry owns verification (maker-checker with evidence). A contact is used only for the purpose it was given for: a regulated notice takes
+`LEGAL_NOTICE`, marketing takes `GENERAL`, everything else `GENERAL` or `BILLING`. The plan records provenance `PARTY_MASTER` and the contact-point id, never
+the address in the evidence. A party of another tenant is not found (the call is made under the sender's own tenant); `recipient_tenant_id` of another tenant
+is still refused (NCD-020): no cross-tenant federation model exists (MDM-I-05, MDM-I-29). A party recipient cannot be combined with `free_text_endpoint`, the
+intent must allow EMAIL, and without `PARTY_CONTACTS_URL` the answer is `503 party_contacts_not_configured`.

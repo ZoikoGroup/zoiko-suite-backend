@@ -39,6 +39,18 @@ func (s *Service) resolveEndpoints(ctx context.Context, a Actor, intent Intent, 
 		return nil, evidence, Invalid("missing_fields", "recipient_principal_id is required")
 	}
 
+	if partyID, ok := PartyRecipient(in.RecipientPrincipalID); ok {
+		eps, ev, err := s.resolvePartyEndpoints(ctx, a, intent, in, partyID, evidence, now)
+		if err != nil {
+			return nil, ev, err
+		}
+		for i := range eps {
+			eps[i].EndpointHash = EndpointHash(eps[i].Channel, eps[i].Address)
+			eps[i].EndpointMasked = MaskEndpoint(eps[i].Channel, eps[i].Address)
+		}
+		return eps, ev, nil
+	}
+
 	protected := intent.Mandatory || intent.PurposeClass == PurposeRegulated || intent.PurposeClass == PurposeSecurityCritical
 	var eps []Endpoint
 
