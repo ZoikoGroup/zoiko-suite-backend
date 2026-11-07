@@ -503,7 +503,7 @@ func (h *Handler) GetContract(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, r, "get contract", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, c)
+	writeJSONWithETag(w, http.StatusOK, c, c.RecordVersion)
 }
 
 func (h *Handler) ListContracts(w http.ResponseWriter, r *http.Request) {
@@ -549,6 +549,11 @@ func (h *Handler) TransitionContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, current.RecordVersion) {
+		return
+	}
+
 	next := domain.ContractState(strings.ToUpper(strings.TrimSpace(req.State)))
 	if !current.State.CanTransitionTo(next) {
 		writeError(w, r, http.StatusConflict, "invalid_transition",
@@ -556,9 +561,13 @@ func (h *Handler) TransitionContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.TransitionContract(r.Context(), contractID, current.State, next); err != nil {
+	if err := h.store.TransitionContract(r.Context(), contractID, current.State, next, current.RecordVersion); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
 			writeError(w, r, http.StatusConflict, "conflict", err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeError(w, r, http.StatusPreconditionFailed, "version_conflict", err.Error())
 			return
 		}
 		h.internal(w, r, "transition contract", err)
@@ -573,10 +582,10 @@ func (h *Handler) TransitionContract(w http.ResponseWriter, r *http.Request) {
 
 	updated, err := h.store.GetContract(r.Context(), contractID)
 	if err != nil {
-		h.internal(w, r, "reload contract", err)
+		h.internal(w, r, "get updated contract", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSONWithETag(w, http.StatusOK, updated, updated.RecordVersion)
 }
 
 // ── ESR-05: generations ──────────────────────────────────────────────────────
@@ -650,7 +659,7 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 	if err := h.engine.EnsureGeneration(r.Context(), physical, projection.FieldMappings(*contract)); err != nil {
 		h.metrics.EngineError("create")
 		_ = h.store.TransitionGeneration(r.Context(), generationID,
-			domain.GenerationPlanned, domain.GenerationFailed, "", err.Error())
+			domain.GenerationPlanned, domain.GenerationFailed, "", err.Error(), 0)
 		if h.events != nil {
 			_ = h.events.ReindexFailed(r.Context(), contract.ScopeName, generationID, "BUILD", err.Error(), "")
 		}
@@ -659,7 +668,7 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.TransitionGeneration(r.Context(), generationID,
-		domain.GenerationPlanned, domain.GenerationBuilding, "", ""); err != nil {
+		domain.GenerationPlanned, domain.GenerationBuilding, "", "", 0); err != nil {
 		h.internal(w, r, "mark generation building", err)
 		return
 	}
@@ -669,7 +678,7 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 	// reload, so live events are written into it from now on, and the backfill
 	// replays everything before now (INV-21: a parallel build, not an empty
 	// index waiting for new events). READY is refused until it COMPLETES.
-	if err := h.store.SetBackfillState(r.Context(), generationID, domain.BackfillPending, ""); err != nil {
+	if err := h.store.SetBackfillState(r.Context(), generationID, domain.BackfillPending, "", 0); err != nil {
 		h.internal(w, r, "mark backfill pending", err)
 		return
 	}
@@ -735,6 +744,11 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, current.RecordVersion) {
+		return
+	}
+
 	if !current.State.CanTransitionTo(next) {
 		writeError(w, r, http.StatusConflict, "invalid_transition",
 			fmt.Sprintf("a %s generation cannot move to %s", current.State, next))
@@ -765,7 +779,7 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		result, err := h.validateGeneration(r.Context(), current)
 		if err != nil {
 			_ = h.store.TransitionGeneration(r.Context(), generationID,
-				current.State, domain.GenerationFailed, "", err.Error())
+				current.State, domain.GenerationFailed, "", err.Error(), current.RecordVersion)
 			h.metrics.GenerationTransitions.WithLabelValues(current.ScopeName, string(domain.GenerationFailed)).Inc()
 			if h.events != nil {
 				_ = h.events.ReindexFailed(r.Context(), current.ScopeName, generationID,
@@ -804,7 +818,7 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		if previous != "" && previous != current.PhysicalIndex {
 			if old, err := h.findGenerationByIndex(r.Context(), current.ScopeName, previous); err == nil && old != nil {
 				_ = h.store.TransitionGeneration(r.Context(), old.GenerationID,
-					domain.GenerationActive, domain.GenerationRetired, "", "replaced by "+generationID)
+					domain.GenerationActive, domain.GenerationRetired, "", "replaced by "+generationID, old.RecordVersion)
 			}
 		}
 		if h.events != nil {
@@ -823,9 +837,13 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.TransitionGeneration(r.Context(), generationID, current.State, next, digest, note); err != nil {
+	if err := h.store.TransitionGeneration(r.Context(), generationID, current.State, next, digest, note, current.RecordVersion); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
 			writeError(w, r, http.StatusConflict, "conflict", err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeError(w, r, http.StatusPreconditionFailed, "version_conflict", err.Error())
 			return
 		}
 		h.internal(w, r, "transition generation", err)

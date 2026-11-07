@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/eventing/kafkaout"
@@ -25,6 +26,7 @@ import (
 	"zoiko.io/payment-status-svc/internal/handler"
 	"zoiko.io/payment-status-svc/internal/health"
 	"zoiko.io/payment-status-svc/internal/middleware"
+	"zoiko.io/payment-status-svc/internal/paymentinit"
 	"zoiko.io/payment-status-svc/internal/store"
 )
 
@@ -102,6 +104,28 @@ func main() {
 		relay.Run(relayCtx)
 		relayDone <- struct{}{}
 	}()
+
+	// BNK-06 event consumer (SPEC_DEVIATIONS A4): the only way this service
+	// ever reaches SUBMITTED or PENDING_UNKNOWN. Always on — unlike
+	// access-control-svc's optional HR-review consumer, there is no "off"
+	// state for this service's own state model being complete.
+	bnk06Reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     brokers,
+		GroupID:     cfg.BNK06EventGroupID,
+		GroupTopics: cfg.BNK06EventTopics,
+		StartOffset: kafka.FirstOffset,
+		// A nil ErrorLogger hides a consumer that cannot join its group
+		// behind one that looks idle.
+		ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+			logger.Warn(fmt.Sprintf("bnk06-events reader: "+msg, args...))
+		}),
+	})
+	defer func() { _ = bnk06Reader.Close() }()
+	bnk06Handler := paymentinit.NewHandler(pgStore, paymentinit.IsTransient, logger)
+	go paymentinit.Run(relayCtx, bnk06Reader, bnk06Handler, logger, func(outcome string) {
+		logger.Info("BNK-06 event processed", zap.String("outcome", outcome))
+	})
+	logger.Info("BNK-06 event consumer on", zap.Strings("topics", cfg.BNK06EventTopics), zap.String("group_id", cfg.BNK06EventGroupID))
 
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 

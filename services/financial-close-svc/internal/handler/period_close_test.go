@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"zoiko.io/financial-close-svc/internal/domain"
 )
 
@@ -96,6 +98,67 @@ func TestPeriodStateMachine_OutOfOrderTransitionsRefused(t *testing.T) {
 	}
 	if s.periods["fp-1"].CloseStatus != domain.PeriodOpen {
 		t.Fatal("a refused transition must not move the period")
+	}
+}
+
+// TestStartSoftClose_RetryUnderSameKeyReplays and
+// TestEnterCloseReview_RetryUnderSameKeyReplays prove SPEC_DEVIATIONS A11
+// for the two simple period transitions: a lost-response retry must return
+// the period as it now stands, not 409 invalid_period_transition against a
+// period this same key already moved.
+func TestStartSoftClose_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	newOpenPeriod(s, "fp-1")
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/close/periods/fp-1/soft-close", nil, "accountant-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first soft-close: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/close/periods/fp-1/soft-close", nil, "accountant-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried soft-close under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.FiscalPeriod
+	if err := json.Unmarshal(retry.Body.Bytes(), &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.CloseStatus != domain.PeriodSoftClose {
+		t.Fatalf("replay status = %q, want SOFT_CLOSE", replayed.CloseStatus)
+	}
+
+	// A genuinely new attempt (a different key) against the now-SOFT_CLOSE
+	// period must still be refused: soft-close only applies from OPEN.
+	again := doReqKeyed(r, http.MethodPost, "/v1/close/periods/fp-1/soft-close", nil, "accountant-1", testTenantID, uuid.NewString())
+	if again.Code != http.StatusConflict {
+		t.Fatalf("new soft-close attempt on an already-SOFT_CLOSE period: want 409, got %d %s", again.Code, again.Body.String())
+	}
+}
+
+func TestEnterCloseReview_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	newOpenPeriod(s, "fp-1")
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
+	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/soft-close", nil, "accountant-1"); rr.Code != http.StatusOK {
+		t.Fatalf("soft-close: %d %s", rr.Code, rr.Body.String())
+	}
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/close/periods/fp-1/close-review", nil, "accountant-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first close-review: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/close/periods/fp-1/close-review", nil, "accountant-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried close-review under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.FiscalPeriod
+	if err := json.Unmarshal(retry.Body.Bytes(), &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.CloseStatus != domain.PeriodCloseReview {
+		t.Fatalf("replay status = %q, want CLOSE_REVIEW", replayed.CloseStatus)
 	}
 }
 

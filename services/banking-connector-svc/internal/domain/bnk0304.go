@@ -218,3 +218,119 @@ type MappingException struct {
 	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`
 }
+
+// ListTransactionsQuery is BNK-04's ListTransactions filter (spec table 23).
+// It returns only NORMALIZED canonical transactions: a SUPERSEDED version has
+// been replaced by a correction and a QUARANTINED one is not current truth,
+// so neither may reach a reconciling caller as a live fact. Tenant scope is
+// not a field: row-level security on every joined table scopes the read to
+// the request's tenant (app.tenant_id).
+type ListTransactionsQuery struct {
+	LegalEntityID string // required; authorization is per legal entity
+	BankAccountID string // optional; the connection's treasury-svc BNK-01 account
+	Currency      string // optional
+	// From / ToExclusive bound transaction_date in UTC: From is the first
+	// instant included, ToExclusive the first instant after the window. nil
+	// leaves that end open.
+	From, ToExclusive *time.Time
+	// AfterTransactionID is the keyset cursor: rows with a transaction_id
+	// after it, in byte order.
+	AfterTransactionID string
+	Limit              int
+}
+
+// CanonicalTransactionListItem is one ListTransactions row. It is a separate
+// type from CanonicalTransaction on purpose: Amount is the exact
+// NUMERIC(18,4) value as a decimal string with four places, never a float64
+// (ZS-DATA-001 D06), and BankAccountID / ConnectionID say which account the
+// transaction belongs to without a second lookup.
+type CanonicalTransactionListItem struct {
+	TransactionID string `json:"transaction_id"`
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	ConnectionID  string `json:"connection_id"`
+	// BankAccountID is null for a connection created before BNK-02 recorded
+	// one (bank_connections.bank_account_id = ''); such a transaction is
+	// never returned when a bank_account_id filter is given.
+	BankAccountID   *string   `json:"bank_account_id"`
+	StatementLineID string    `json:"statement_line_id"`
+	MappingVersion  int       `json:"mapping_version"`
+	TransactionDate time.Time `json:"transaction_date"`
+	Amount          string    `json:"amount"`
+	Currency        string    `json:"currency"`
+	Category        string    `json:"category"`
+	Counterparty    string    `json:"counterparty"`
+	Status          string    `json:"status"`
+}
+
+// CanonicalTransactionPage is one keyset page of ListTransactions. A non-empty
+// NextCursor means more rows exist and the page must not be read as the whole
+// result; an empty one means this page ends the result.
+type CanonicalTransactionPage struct {
+	Transactions []CanonicalTransactionListItem `json:"transactions"`
+	NextCursor   string                         `json:"next_cursor,omitempty"`
+}
+
+// RawLineage is GetRawLineage's response (table 23's "Queries/retrieval",
+// table 25's "Raw transaction hash/ID, canonical version, mapping/version").
+// It traces one canonical transaction back through its immutable statement
+// line to the statement and connection it arrived on. There is no
+// per-transaction raw hash column in this schema (migration 004):
+// StatementContentHash is the whole statement file's hash
+// (bank_statements.content_hash), not a per-line one — RawReference is the
+// only per-line raw evidence this service actually stores, and this type
+// never pretends otherwise.
+type RawLineage struct {
+	TransactionID   string    `json:"transaction_id"`
+	TenantID        string    `json:"tenant_id"`
+	Status          string    `json:"status"`
+	MappingVersion  int       `json:"mapping_version"`
+	SupersededBy    string    `json:"superseded_by,omitempty"`
+	StatementLineID string    `json:"statement_line_id"`
+	LineSeq         int       `json:"line_seq"`
+	RawReference    string    `json:"raw_reference"`
+	BankCode        string    `json:"bank_code"`
+	PostedDate      time.Time `json:"posted_date"`
+	StatementID     string    `json:"statement_id"`
+	// StatementContentHash is the statement-level hash recorded at BNK-03
+	// ingestion, not a per-transaction one — see the type comment.
+	StatementContentHash string  `json:"statement_content_hash"`
+	StatementSourceID    string  `json:"statement_source_id"`
+	ConnectionID         string  `json:"connection_id"`
+	LegalEntityID        string  `json:"legal_entity_id"`
+	BankAccountID        *string `json:"bank_account_id,omitempty"`
+}
+
+// NormalizationVersion is GetNormalizationVersion's response. Caveat carries
+// A19 (SPEC_DEVIATIONS.md) into the response itself, not just a code
+// comment: mapping_version is honestly exposed as the per-line
+// re-normalization counter it actually is, so a caller cannot mistake it
+// for a mapping-dictionary, parser or schema version.
+type NormalizationVersion struct {
+	TransactionID  string `json:"transaction_id"`
+	TenantID       string `json:"tenant_id"`
+	LegalEntityID  string `json:"legal_entity_id"`
+	Status         string `json:"status"`
+	MappingVersion int    `json:"mapping_version"`
+	Caveat         string `json:"caveat"`
+}
+
+// MappingVersionCaveat is NormalizationVersion.Caveat's fixed text.
+const MappingVersionCaveat = "mapping_version is an integer incremented on each re-normalization of this statement line (1 at first normalization or exception approval, prior+1 at each re-normalize); it is not an identifier or version of the bank_transaction_mappings dictionary entry, parser or schema that produced this row, and cannot be used to reproduce which mapping rule was applied (SPEC_DEVIATIONS.md A19)."
+
+// ListMappingExceptionsQuery is ListNormalizationExceptions' filter. Status
+// narrows to one lifecycle value (OPEN/APPROVED/REJECTED); empty means any.
+// mapping_exceptions has no legal_entity_id column — it is a platform-scoped
+// control queue, the same posture ApproveMappingException and
+// CreateTransactionMapping already use — so there is no legal-entity filter.
+type ListMappingExceptionsQuery struct {
+	Status           string
+	AfterExceptionID string
+	Limit            int
+}
+
+// MappingExceptionPage is one keyset page of ListNormalizationExceptions.
+type MappingExceptionPage struct {
+	Exceptions []MappingException `json:"exceptions"`
+	NextCursor string             `json:"next_cursor,omitempty"`
+}

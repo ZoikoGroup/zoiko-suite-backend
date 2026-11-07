@@ -292,8 +292,13 @@ func (h *Handler) CreateDepreciationRun(w http.ResponseWriter, r *http.Request) 
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.LegalEntityID == "" || req.FiscalPeriod == "" || req.DepreciationExpenseAccountCode == "" || req.AccumulatedDepreciationAccountCode == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, fiscal_period, depreciation_expense_account_code and accumulated_depreciation_account_code are required")
+	if req.LegalEntityID == "" || req.FiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
+		return
+	}
+	if h.depreciationExpenseMappingKey == "" || h.accumulatedDepreciationMappingKey == "" {
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+			"depreciation requires configured ACC-02 expense and accumulated-depreciation mapping keys")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -310,8 +315,9 @@ func (h *Handler) CreateDepreciationRun(w http.ResponseWriter, r *http.Request) 
 
 	run := &domain.DepreciationRun{
 		RunID: uuid.NewString(), LegalEntityID: req.LegalEntityID, FiscalPeriod: req.FiscalPeriod,
-		DepreciationExpenseAccountCode: req.DepreciationExpenseAccountCode, AccumulatedDepreciationAccountCode: req.AccumulatedDepreciationAccountCode,
-		Status: domain.DepreciationRunStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+		DepreciationExpenseMappingKey:     h.depreciationExpenseMappingKey,
+		AccumulatedDepreciationMappingKey: h.accumulatedDepreciationMappingKey,
+		Status:                            domain.DepreciationRunStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	if err := h.store.CreateDepreciationRun(r.Context(), run); err != nil {
 		if errors.Is(err, domain.ErrRunAlreadyExistsForPeriod) {
@@ -494,6 +500,22 @@ func (h *Handler) EmitDepreciationAccountingEvent(w http.ResponseWriter, r *http
 		return
 	}
 
+	expenseMappingKey, accumulatedMappingKey := run.DepreciationExpenseMappingKey, run.AccumulatedDepreciationMappingKey
+	// Runs created before the ACC-02 migration have no mapping keys; they are
+	// still postable with the deployment's configured keys. A deployment with
+	// no configuration fails closed instead of using the legacy raw codes.
+	if expenseMappingKey == "" {
+		expenseMappingKey = h.depreciationExpenseMappingKey
+	}
+	if accumulatedMappingKey == "" {
+		accumulatedMappingKey = h.accumulatedDepreciationMappingKey
+	}
+	if expenseMappingKey == "" || accumulatedMappingKey == "" {
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+			"this run has no ACC-02 mapping keys and none are configured")
+		return
+	}
+
 	var lines []clients.LedgerLine
 	var total float64
 	for _, l := range run.Lines {
@@ -501,8 +523,8 @@ func (h *Handler) EmitDepreciationAccountingEvent(w http.ResponseWriter, r *http
 			continue
 		}
 		lines = append(lines,
-			clients.LedgerLine{AccountCode: run.DepreciationExpenseAccountCode, DebitAmount: l.PeriodAmount},
-			clients.LedgerLine{AccountCode: run.AccumulatedDepreciationAccountCode, CreditAmount: l.PeriodAmount},
+			clients.LedgerLine{MappingKey: expenseMappingKey, DebitAmount: l.PeriodAmount},
+			clients.LedgerLine{MappingKey: accumulatedMappingKey, CreditAmount: l.PeriodAmount},
 		)
 		total += l.PeriodAmount
 	}

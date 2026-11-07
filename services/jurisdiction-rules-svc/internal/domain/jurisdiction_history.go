@@ -102,6 +102,9 @@ type RetireJurisdictionParams struct {
 	// SupersededBy names the active jurisdiction that takes over; nil when the
 	// jurisdiction is simply withdrawn.
 	SupersededBy *string
+	// ExpectedRowVersion is the caller's If-Match version (API-3): when set,
+	// the retirement applies only to that version. nil is unconditional.
+	ExpectedRowVersion *int64
 }
 
 // NotEffectiveError says a jurisdiction exists but was not in force at the

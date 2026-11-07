@@ -67,7 +67,7 @@ func (s *PgStore) GetSubjectIdentity(ctx context.Context, tenantID, principalID 
 			return err
 		}
 		out.CurrentAssurance = cur
-		if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT survivor_id FROM principal_merges WHERE tenant_id = $1 AND duplicate_id = $2), '')`,
+		if err := tx.QueryRow(ctx, `SELECT COALESCE((`+mergedAwaySQL+`), '')`,
 			tenantID, principalID).Scan(&out.MergedInto); err != nil {
 			return err
 		}

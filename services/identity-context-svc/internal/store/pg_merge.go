@@ -90,6 +90,18 @@ func (s *PgStore) MergeIdentities(ctx context.Context, tenantID, survivorID, dup
 			out = prior
 			return nil
 		}
+		// A duplicate merged by the other route (POST /v1/subjects/{id}/merge,
+		// identity_merges): the same survivor is the same merge, replayed; a
+		// different one is a conflict.
+		if prior, err := subjectMerge(ctx, tx, tenantID, duplicateID); err != nil {
+			return err
+		} else if prior != nil {
+			if prior.SurvivorID != survivorID {
+				return fmt.Errorf("%w: %s was already merged into %s", ErrMergeConflict, duplicateID, prior.SurvivorID)
+			}
+			out = prior
+			return nil
+		}
 
 		statuses := map[string]string{}
 		rows, err := tx.Query(ctx, `SELECT principal_id, status FROM principals
@@ -120,7 +132,9 @@ func (s *PgStore) MergeIdentities(ctx context.Context, tenantID, survivorID, dup
 		}
 		var chained bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM principal_merges WHERE tenant_id = $1
-			AND (duplicate_id = $2 OR survivor_id = $3))`, tenantID, survivorID, duplicateID).Scan(&chained); err != nil {
+			AND (duplicate_id = $2 OR survivor_id = $3))
+			OR EXISTS (SELECT 1 FROM identity_merges WHERE tenant_id = $1
+			AND (retired_id = $2 OR survivor_id = $3))`, tenantID, survivorID, duplicateID).Scan(&chained); err != nil {
 			return err
 		}
 		if chained {
@@ -209,12 +223,29 @@ func (s *PgStore) MergeIdentities(ctx context.Context, tenantID, survivorID, dup
 	return out, created, nil
 }
 
-// MergedInto reports the survivor a duplicate id was merged into, or "" when it was not merged away.
+// subjectMerge reads a merge made by POST /v1/subjects/{id}/merge (identity_merges, pg_subjects.go) in the
+// shape of this route's record. That route records no link outcomes. nil when duplicateID was not merged there.
+func subjectMerge(ctx context.Context, tx pgx.Tx, tenantID, duplicateID string) (*IdentityMerge, error) {
+	var m IdentityMerge
+	err := tx.QueryRow(ctx, `SELECT merge_id, tenant_id, survivor_id, retired_id, reason, approved_by, approved_at
+		FROM identity_merges WHERE tenant_id = $1 AND retired_id = $2`, tenantID, duplicateID).
+		Scan(&m.MergeID, &m.TenantID, &m.SurvivorID, &m.DuplicateID, &m.Reason, &m.MergedBy, &m.MergedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	m.LinkOutcomes = []LinkOutcome{}
+	return &m, nil
+}
+
+// MergedInto reports the survivor a duplicate id was merged into, by either merge route, or "" when it was not
+// merged away.
 func (s *PgStore) MergedInto(ctx context.Context, tenantID, principalID string) (string, error) {
 	var id string
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `SELECT survivor_id FROM principal_merges WHERE tenant_id = $1 AND duplicate_id = $2`,
-			tenantID, principalID).Scan(&id)
+		err := tx.QueryRow(ctx, mergedAwaySQL, tenantID, principalID).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}

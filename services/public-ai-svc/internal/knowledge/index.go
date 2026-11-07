@@ -27,8 +27,14 @@ type Query struct {
 	Locale    string
 	Now       time.Time
 	MaxChunks int
+	// Plan is the plan code the visitor named ("" = none). A chunk scoped to
+	// other plans is never evidence for it (Doc 03 §14 step 4).
+	Plan string
 	// IntentID boosts chunks whose source is tagged for the classified intent.
 	IntentID string
+	// HowTo marks a question asking how to do something: sections written
+	// as console steps are preferred.
+	HowTo bool
 }
 
 // Hit is one eligible chunk with its score.
@@ -42,6 +48,13 @@ type Result struct {
 	Answerability string
 	Hits          []Hit
 	ReleaseID     string
+	// Diagnostics (counts and scores only, never text): chunks that scored
+	// above the floor before and after the mandatory access filters, and the
+	// best eligible score. Mode is "lexical" (no embeddings in R0, ADR-002).
+	CandidatesBeforeACL int
+	CandidatesAfterACL  int
+	TopScore            float64
+	Mode                string
 }
 
 // Index is an immutable, release-pinned lexical index (BM25).
@@ -63,7 +76,8 @@ var stopwords = map[string]bool{}
 func init() {
 	for _, w := range strings.Fields(`a an and are as at be but by can do does for from has have how i if in into is it its
 		me my of on or our so than that the their them then there these they this to us was we what when where which who
-		why will with you your about any also just more most not only other some such tell please zoikosuite`) {
+		why will with you your about any also just more most not only other some such tell please zoikosuite
+		support supports supported handle handles work works use uses used using get need want offer offers provide provides`) {
 		stopwords[w] = true
 	}
 }
@@ -100,7 +114,7 @@ func NewIndex(m Manifest) *Index {
 	}
 	total := 0
 	for _, c := range m.Chunks {
-		toks := Tokens(c.DisplayTitle + " " + c.PlainText)
+		toks := Tokens(c.DisplayTitle + " " + indexText(c.PlainText))
 		tf := map[string]int{}
 		for _, t := range toks {
 			tf[t]++
@@ -121,6 +135,9 @@ func NewIndex(m Manifest) *Index {
 
 // ReleaseID is the pinned release.
 func (x *Index) ReleaseID() string { return x.releaseID }
+
+// Stats reports how many sources and chunks the release holds.
+func (x *Index) Stats() (sources, chunks int) { return len(x.sources), len(x.chunks) }
 
 // Source returns the registry record for a source version.
 func (x *Index) Source(sourceVersionID string) (Source, bool) {
@@ -160,7 +177,8 @@ const (
 )
 
 // eligibilityOf applies the mandatory filters in order: classification →
-// audience → effective/revoked → market → locale (Doc 05 §18).
+// audience → effective/revoked → market → locale → plan (Doc 05 §18,
+// Doc 03 §14).
 func (x *Index) eligibilityOf(c Chunk, q Query, rev Revocations) eligibility {
 	if c.Classification != Classification || c.Audience != Audience || c.ReleaseID != x.releaseID {
 		return denied
@@ -171,10 +189,18 @@ func (x *Index) eligibilityOf(c Chunk, q Query, rev Revocations) eligibility {
 	if q.Now.Before(c.ValidFrom) || !q.Now.Before(c.ValidUntil) {
 		return expired
 	}
+	// Doc 03 §12/§26: high-impact content past its review deadline stops
+	// being served, even inside its validity window.
+	if c.HighImpact && c.ReviewDueAt != nil && !q.Now.Before(*c.ReviewDueAt) {
+		return expired
+	}
 	if !marketOK(c.MarketCodes, q.Market) {
 		return denied
 	}
 	if q.Locale != "" && c.Locale != "" && !strings.EqualFold(langOf(c.Locale), langOf(q.Locale)) {
+		return denied
+	}
+	if !planOK(c.PlanCodes, q.Plan) {
 		return denied
 	}
 	return eligible
@@ -183,6 +209,21 @@ func (x *Index) eligibilityOf(c Chunk, q Query, rev Revocations) eligibility {
 func marketOK(codes []string, market string) bool {
 	for _, m := range codes {
 		if m == MarketAll || (market != "" && m == market) {
+			return true
+		}
+	}
+	return false
+}
+
+// planOK: an unscoped chunk (or one scoped to ALL) serves every plan; a
+// plan-scoped chunk serves only its plans. With no plan named, nothing is
+// filtered, as before plan scope existed.
+func planOK(codes []string, plan string) bool {
+	if plan == "" || len(codes) == 0 {
+		return true
+	}
+	for _, p := range codes {
+		if p == MarketAll || strings.EqualFold(p, plan) {
 			return true
 		}
 	}
@@ -221,8 +262,9 @@ func (x *Index) score(i int, qtoks []string) (float64, int) {
 
 // Search runs filtered retrieval and decides answerability.
 func (x *Index) Search(q Query, rev Revocations) Result {
-	res := Result{Answerability: NotFound, ReleaseID: x.releaseID}
+	res := Result{Answerability: NotFound, ReleaseID: x.releaseID, Mode: "lexical"}
 	qtoks := uniq(Tokens(x.expand(q.Text)))
+	rawToks := uniq(Tokens(q.Text)) // as asked, before synonyms
 	if len(qtoks) == 0 || len(x.chunks) == 0 {
 		return res
 	}
@@ -233,15 +275,36 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 	bestIneligible := eligible
 	bestIneligibleScore := 0.0
 	for i, c := range x.chunks {
+		// Doc 05 §18, Doc 03 §14: filter before ranking. Chunks the visitor
+		// may not see are never scored; expired and revoked ones are scored
+		// only to explain a stale answer, never returned.
+		el := x.eligibilityOf(c, q, rev)
+		if el == denied {
+			continue
+		}
 		sc, matched := x.score(i, qtoks)
 		if q.IntentID != "" && hasIntent(c.IntentIDs, q.IntentID) {
 			sc *= intentBoost
 		}
+		if x.titleNamed(c, qtoks) {
+			sc *= titleBoost
+		}
+		if sectionNamed(c, rawToks) {
+			sc *= titleBoost
+		}
+		if q.HowTo && strings.Contains(c.PlainText, signInStep) {
+			sc *= howToBoost
+			if introNamed(c.PlainText, rawToks) {
+				sc *= titleBoost
+			}
+		}
 		if sc < minScore || matched < need {
 			continue
 		}
-		switch el := x.eligibilityOf(c, q, rev); el {
+		res.CandidatesBeforeACL++
+		switch el {
 		case eligible:
+			res.CandidatesAfterACL++
 			res.Hits = append(res.Hits, Hit{Chunk: c, Score: sc})
 		case expired, revoked:
 			if sc > bestIneligibleScore {
@@ -266,6 +329,7 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 	if len(res.Hits) > 0 {
 		bestEligible = res.Hits[0].Score
 	}
+	res.TopScore = bestEligible
 	switch {
 	case bestIneligible != eligible && bestIneligibleScore > bestEligible:
 		res.Hits = nil
@@ -283,6 +347,55 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 	}
 	return res
 }
+
+// titleBoost favours the article the visitor names ("the compliance module"
+// → Compliance), so a broader article that merely mentions it does not win.
+const titleBoost = 2.0
+
+// titleNamed reports whether every word of the chunk's article title is in
+// the query (ZoikoSuite itself is a stopword, so "ZoikoSuite areas" needs
+// "areas").
+func (x *Index) titleNamed(c Chunk, qtoks []string) bool {
+	s, ok := x.sources[c.SourceVersionID]
+	if !ok {
+		return false
+	}
+	t := Tokens(s.Title)
+	if len(t) == 0 {
+		return false
+	}
+	in := map[string]bool{}
+	for _, q := range qtoks {
+		in[q] = true
+	}
+	for _, w := range t {
+		if !in[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// sectionNamed reports whether the query names this section: every word of
+// its heading (at least two) is in the query, as in "How do I start an
+// approval workflow?" for "Start a workflow".
+func sectionNamed(c Chunk, qtoks []string) bool {
+	h := Tokens(c.DisplayTitle)
+	if len(h) < 2 {
+		return false
+	}
+	for _, w := range h {
+		if !anyLike(qtoks, w) {
+			return false
+		}
+	}
+	return true
+}
+
+// howToBoost favours a section written as console steps for a question
+// asking how to do something, above an overview that merely names the area
+// (titleBoost).
+const howToBoost = 3.0
 
 // intentBoost favours sources tagged for the visitor's intent, so "How is
 // data secured?" lands on the trust page rather than any page saying "data".
@@ -303,7 +416,14 @@ func (x *Index) expand(text string) string {
 		return text
 	}
 	out := text
-	for _, w := range tokenRe.FindAllString(strings.ToLower(text), -1) {
+	lower := strings.ToLower(text)
+	for k, alts := range x.synonyms {
+		// A phrase key ("my work") is a name made of stopwords.
+		if strings.Contains(k, " ") && strings.Contains(lower, k) {
+			out += " " + strings.Join(alts, " ")
+		}
+	}
+	for _, w := range tokenRe.FindAllString(lower, -1) {
 		for _, alt := range x.synonyms[w] {
 			out += " " + alt
 		}
@@ -315,14 +435,19 @@ func (x *Index) expand(text string) string {
 // document order. It is the fallback when a question's words are too generic
 // to rank (for example "What is ZoikoSuite?"); every mandatory filter applies.
 func (x *Index) ByIntent(q Query, rev Revocations) Result {
-	res := Result{Answerability: NotFound, ReleaseID: x.releaseID}
+	res := Result{Answerability: NotFound, ReleaseID: x.releaseID, Mode: "intent"}
 	if q.IntentID == "" {
 		return res
 	}
 	for _, c := range x.chunks {
-		if !hasIntent(c.IntentIDs, q.IntentID) || x.eligibilityOf(c, q, rev) != eligible {
+		if !hasIntent(c.IntentIDs, q.IntentID) {
 			continue
 		}
+		res.CandidatesBeforeACL++
+		if x.eligibilityOf(c, q, rev) != eligible {
+			continue
+		}
+		res.CandidatesAfterACL++
 		res.Hits = append(res.Hits, Hit{Chunk: c})
 		if len(res.Hits) == 2 {
 			break
@@ -344,4 +469,195 @@ func uniq(xs []string) []string {
 		}
 	}
 	return out
+}
+
+// Neighbor returns the next section (segment) of c's source version when it
+// passes every mandatory filter, so an answer drawn from one section can
+// include the rest of the same topic (Doc 03 §13: sections are the chunk
+// boundary, not the answer boundary).
+func (x *Index) Neighbor(c Chunk, q Query, rev Revocations) (Chunk, bool) {
+	for _, n := range x.chunks {
+		if n.SourceVersionID == c.SourceVersionID && n.SegmentNumber == c.SegmentNumber+1 {
+			return n, x.eligibilityOf(n, q, rev) == eligible
+		}
+	}
+	return Chunk{}, false
+}
+
+// NamesSection reports whether the question names a section heading of an
+// article in this release (all of the heading's words, at least two), for
+// example "Set the limit" or "Decision log". Questions about a console page
+// section are then answered from that article rather than treated as off-topic.
+func (x *Index) NamesSection(question string) bool {
+	q := map[string]bool{}
+	for _, t := range Tokens(question) {
+		q[t] = true
+	}
+	if len(q) == 0 {
+		return false
+	}
+	for _, c := range x.chunks {
+		h := Tokens(c.DisplayTitle)
+		if len(h) < 2 {
+			continue
+		}
+		all := true
+		for _, w := range h {
+			if !q[w] {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+// Covers reports whether one article section in this release plainly covers
+// the question, so a question about any part of the platform is answered
+// rather than treated as off-topic. It holds when the question names a
+// section heading (NamesSection), or when a single section contains the
+// question's topic words: all of them, or at least two thirds with one of
+// them in that section's heading. A one-word topic must appear in a section
+// heading ("How does search work?"). Words are compared by stem prefix, so
+// "controlled" meets "control" and "revoked" meets "revocation", and filler
+// verbs ("manage", "happen") are not topic words. A word found only in
+// passing in an article body never counts on its own, so "write a poem about
+// money" is not taken for a product question.
+func (x *Index) Covers(question string) bool {
+	if x.NamesSection(question) {
+		return true
+	}
+	var q []string
+	for _, t := range uniq(Tokens(question)) {
+		if !coverFiller[t] {
+			q = append(q, t)
+		}
+	}
+	if len(q) == 0 {
+		return false
+	}
+	need := (2*len(q) + 2) / 3
+	for i, c := range x.chunks {
+		h := Tokens(c.DisplayTitle)
+		matched, inHeading := 0, false
+		for _, t := range q {
+			if x.hasLike(i, t) {
+				matched++
+				inHeading = inHeading || anyLike(h, t)
+			}
+		}
+		if len(q) == 1 {
+			if inHeading {
+				return true
+			}
+			continue
+		}
+		if matched >= 2 && (matched == len(q) || (inHeading && matched >= need)) {
+			return true
+		}
+	}
+	return false
+}
+
+// coverFiller are stems that say nothing about which part of the platform a
+// question is about.
+var coverFiller = map[string]bool{}
+
+func init() {
+	for _, w := range strings.Fields(`manage happen several two give way mean kind thing someone something anyone
+		everything everyone able let make done really much many lot good best new`) {
+		coverFiller[stem(w)] = true
+	}
+}
+
+// likeWords reports whether two stems are the same word: equal, or sharing
+// their first five letters ("controll"/"control", "revok"/"revoc" share
+// "revo" only and are joined by the shorter rule below).
+func likeWords(a, b string) bool {
+	if a == b {
+		return true
+	}
+	n := 5
+	if len(a) < n || len(b) < n {
+		return false
+	}
+	if a[:n] == b[:n] {
+		return true
+	}
+	// revoke/revocation, invoke/invocation: k and c alternate after a
+	// shared four-letter root.
+	return a[:4] == b[:4] && (a[4] == 'k' && b[4] == 'c' || a[4] == 'c' && b[4] == 'k')
+}
+
+func anyLike(words []string, t string) bool {
+	for _, w := range words {
+		if likeWords(w, t) {
+			return true
+		}
+	}
+	return false
+}
+
+func (x *Index) hasLike(i int, t string) bool {
+	if x.tf[i][t] > 0 {
+		return true
+	}
+	if len(t) < 5 {
+		return false
+	}
+	for w := range x.tf[i] {
+		if likeWords(w, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// signInStep is the first step of every console how-to. It is shown in
+// answers but not indexed: repeated in every procedure, its words ("access",
+// "account") would otherwise pull unrelated questions to them.
+const signInStep = "1. Sign in to your ZoikoSuite account."
+
+// navStepRe is the second step of a console how-to: where to find the page.
+// Like the sign-in step it repeats across procedures and is not indexed.
+var navStepRe = regexp.MustCompile(`^2\. (?:In the left menu, open|Open \*\*)`)
+
+// indexText is chunk text without the sign-in and navigation step lines.
+func indexText(text string) string {
+	if !strings.Contains(text, signInStep) {
+		return text
+	}
+	var keep []string
+	for _, l := range strings.Split(text, "\n") {
+		if t := strings.TrimSpace(l); !strings.HasPrefix(t, signInStep) && !navStepRe.MatchString(t) {
+			keep = append(keep, l)
+		}
+	}
+	return strings.Join(keep, "\n")
+}
+
+// introNamed reports whether the question carries every word of the line
+// that introduces a section's steps ("To delegate your approval authority:"),
+// the way a visitor asks for that task.
+func introNamed(text string, qtoks []string) bool {
+	for _, l := range strings.Split(text, "\n") {
+		l = strings.TrimSpace(l)
+		if !strings.HasPrefix(l, "To ") || !strings.HasSuffix(l, ":") {
+			continue
+		}
+		words := Tokens(l)
+		if len(words) == 0 {
+			return false
+		}
+		for _, w := range words {
+			if !anyLike(qtoks, w) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }

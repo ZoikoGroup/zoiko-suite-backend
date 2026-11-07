@@ -2,7 +2,9 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -74,6 +76,13 @@ type Config struct {
 	// this service's identity there (platform COMMERCIAL_RESTRICTION_READ).
 	CommercialAccountURL string
 	ServicePrincipalID   string
+
+	// CursorSigningKey signs the next_cursor of every console list (API-4) so
+	// a cursor is bound to the tenant, route and filter that minted it.
+	// CURSOR_SIGNING_KEY_HEX, at least 32 bytes; required in staging and
+	// production. Local and development generate one per process, which only
+	// means a cursor does not survive a restart.
+	CursorSigningKey []byte
 
 	// IDPClientChannels maps a verified IdP client id (azp) to its §4 source
 	// channel: IDP_CLIENT_CHANNELS="zoiko-console=web,zoiko-mobile=mobile".
@@ -177,6 +186,11 @@ type Config struct {
 	// live session is invalidated first.
 	MaxSessionsPerPrincipal int
 
+	// SessionCapWorkload caps concurrent sessions of a service account or API
+	// client (SESSION_CAP_WORKLOAD, default 20; 0 = uncapped). Workloads never
+	// draw on MaxSessionsPerPrincipal.
+	SessionCapWorkload int
+
 	// RetentionSweepIntervalMinutes is how often the disposition sweep runs.
 	RetentionSweepIntervalMinutes int
 
@@ -201,10 +215,6 @@ type Config struct {
 	// reads for non-material queries — so this default labels, it does not
 	// refuse. Zero disables staleness.
 	IngressBindingTTLSeconds int
-
-	// IngressBindingRefreshSeconds is the least time between registry re-reads of one ingress binding that is missing,
-	// STALE or INVALIDATED (S1-B3). Zero turns refresh off and leaves bindings as seeded.
-	IngressBindingRefreshSeconds int
 }
 
 type DBConfig struct {
@@ -343,6 +353,7 @@ var DefaultConsumeTopics = []string{
 	"zoiko.delegated-authority.events", // authority.revoked / authority.expired / authority.delegated
 	"zoiko.access-control.events",      // role.updated
 	"zoiko.entity.events",              // entity.updated (tenant-entity-registry-svc)
+	"zoiko.authorization.events",       // iam.assignment.* (authorization-svc, IAM-09)
 }
 
 // Load reads configuration from environment variables with safe defaults.
@@ -430,13 +441,13 @@ func Load() (*Config, error) {
 
 		SessionEvidenceRetentionDays:  envInt("SESSION_EVIDENCE_RETENTION_DAYS", 0),
 		MaxSessionsPerPrincipal:       envInt("MAX_SESSIONS_PER_PRINCIPAL", 5),
+		SessionCapWorkload:            envInt("SESSION_CAP_WORKLOAD", 20),
 		RetentionSweepIntervalMinutes: envInt("RETENTION_SWEEP_INTERVAL_MINUTES", 360),
 		OutboxRetentionDays:           envInt("OUTBOX_RETENTION_DAYS", 7),
 		OutboxRelayBatchSize:          envInt("OUTBOX_RELAY_BATCH_SIZE", 100),
 		OutboxRelayPollMillis:         envInt("OUTBOX_RELAY_POLL_MILLIS", 1000),
 		SupportReviewIntervalMinutes:  envInt("SUPPORT_REVIEW_INTERVAL_MINUTES", 60),
 		IngressBindingTTLSeconds:      envInt("INGRESS_BINDING_TTL_SECONDS", 24*60*60),
-		IngressBindingRefreshSeconds:  envInt("INGRESS_BINDING_REFRESH_SECONDS", 30),
 	}
 
 	// Lockout must actually bound guessing. A zero or negative threshold would
@@ -581,6 +592,19 @@ func Load() (*Config, error) {
 	if err := loadAuthPlane(cfg); err != nil {
 		return nil, err
 	}
+	// IAM-2: outside local development a resolve must be able to read the
+	// tenant's commercial entitlement; without the URL every session would
+	// carry UPSTREAM_NOT_CONFIGURED and nobody would notice.
+	if cfg.Environment != "local" && strings.TrimSpace(cfg.CommercialAccountURL) == "" {
+		return nil, fmt.Errorf("COMMERCIAL_ACCOUNT_URL is required in %s: the entitlement context reference (IAM-2) is read from commercial-account-svc", cfg.Environment)
+	}
+
+	key, err := cursorSigningKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), cfg.Environment)
+	if err != nil {
+		return nil, err
+	}
+	cfg.CursorSigningKey = key
+
 	return cfg, nil
 }
 
@@ -700,4 +724,27 @@ func envPairs(key string) map[string]string {
 		}
 	}
 	return out
+}
+
+// cursorSigningKey decodes CURSOR_SIGNING_KEY_HEX. Staging and production must
+// set it, so every replica verifies the cursors the others mint.
+func cursorSigningKey(raw, environment string) ([]byte, error) {
+	if raw == "" {
+		if environment == "staging" || environment == "production" {
+			return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is required in %s: replicas must share the key that signs list cursors", environment)
+		}
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("generate cursor signing key: %w", err)
+		}
+		return key, nil
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be hex-encoded: %w", err)
+	}
+	if len(key) < 32 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be at least 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }

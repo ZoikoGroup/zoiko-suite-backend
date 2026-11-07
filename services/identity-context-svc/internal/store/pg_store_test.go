@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
@@ -422,4 +423,49 @@ func TestPgStore_TenantIsolation_UpdateStatus(t *testing.T) {
 	if logCount != 0 {
 		t.Fatalf("expected no decision log row from a cross-tenant no-op, got %d", logCount)
 	}
+}
+
+// IC-5a: FindPrincipalIDsByRole returns the holders of a role, projected from
+// iam.assignment.granted via UpsertRoleAssignment. role.updated uses it to find
+// whose sessions to revoke.
+func TestPgStore_FindPrincipalIDsByRole_Integration(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	insertPrincipal(t, ctx, pool, "p-1", "t-1", "idp|one", "ACTIVE")
+	insertPrincipal(t, ctx, pool, "p-2", "t-1", "idp|two", "ACTIVE")
+	insertPrincipal(t, ctx, pool, "p-3", "t-2", "idp|three", "ACTIVE")
+
+	now := time.Now().UTC()
+	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", domain.PrincipalRoleAssignment{
+		AssignmentID: "a-1", PrincipalID: "p-1", RoleID: "role-x", EffectiveFrom: now.Add(-time.Hour), AssignedBy: "acs",
+	}))
+	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", domain.PrincipalRoleAssignment{
+		AssignmentID: "a-2", PrincipalID: "p-2", RoleID: "role-x", EffectiveFrom: now.Add(-time.Hour), AssignedBy: "acs",
+	}))
+	// Tenant-2 principal holding the same role ID — must not appear under t-1.
+	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-2", domain.PrincipalRoleAssignment{
+		AssignmentID: "a-3", PrincipalID: "p-3", RoleID: "role-x", EffectiveFrom: now.Add(-time.Hour), AssignedBy: "acs",
+	}))
+
+	holders, err := s.FindPrincipalIDsByRole(ctx, "role-x", "t-1", now)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"p-1", "p-2"}, holders,
+		"only t-1's holders of role-x are returned")
+
+	// An assignment that hasn't started yet is not a holder.
+	require.NoError(t, s.UpsertRoleAssignment(ctx, "t-1", domain.PrincipalRoleAssignment{
+		AssignmentID: "a-future", PrincipalID: "p-1", RoleID: "role-y", EffectiveFrom: now.Add(time.Hour), AssignedBy: "acs",
+	}))
+	holders, err = s.FindPrincipalIDsByRole(ctx, "role-y", "t-1", now)
+	require.NoError(t, err)
+	require.Empty(t, holders, "a future assignment is not yet a holder")
+
+	// An ended assignment is not a holder.
+	require.NoError(t, s.EndRoleAssignment(ctx, "t-1", "a-1", now.Add(30*time.Minute)))
+	holders, err = s.FindPrincipalIDsByRole(ctx, "role-x", "t-1", now.Add(time.Hour))
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"p-2"}, holders,
+		"the ended assignment's principal is no longer a holder")
 }

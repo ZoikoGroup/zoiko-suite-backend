@@ -345,10 +345,15 @@ func (s *PgStore) FinishSend(ctx context.Context, attemptID string, o providers.
 	return a, nil
 }
 
+// source_reference is included for the same reason as attemptEventData's
+// (pg_store.go): it is the one field a cross-service consumer — see
+// payment-status-svc's BNK-06 event consumer (SPEC_DEVIATIONS A4) — can
+// correlate this attempt against its own (tenant_id, source_reference) keyed
+// row.
 func submittedData(a *domain.PaymentInitiationAttempt, o providers.SendOutcome) map[string]any {
 	return map[string]any{
 		"attempt_id": a.AttemptID, "status": a.Status, "provider_ref": o.ProviderRef, "provider_status": o.Provider,
-		"idempotency_key": a.IdempotencyKey, "currency": a.Currency,
+		"idempotency_key": a.IdempotencyKey, "currency": a.Currency, "source_reference": a.SourceReference,
 	}
 }
 

@@ -16,10 +16,12 @@ const (
 	candTenant = "tenant-1"
 	candEntity = "le-1"
 	candCash   = "1000-Cash"
+
+	candBankAccount = "ba-1"
 )
 
 func cashLine(id, amount, date string) BankStatementLine {
-	return BankStatementLine{StatementLineID: id, LegalEntityID: candEntity, BankAccountID: "ba-1", StatementDate: date,
+	return BankStatementLine{StatementLineID: id, LegalEntityID: candEntity, BankAccountID: candBankAccount, StatementDate: date,
 		Amount: amount, CurrencyCode: "USD", BankReference: "REF-" + id, GLCashAccountCode: candCash}
 }
 
@@ -44,9 +46,12 @@ func cashEntry(journal, date, amount string) LedgerEntry {
 	return e
 }
 
+// searchWith is a search whose journal side holds entries and whose canonical
+// side read bank account ba-1 and found nothing.
 func searchWith(entries ...LedgerEntry) *CandidateSearch {
 	return &CandidateSearch{Tolerance: DateTolerance{Days: 3, Version: 5}, HorizonDays: 31,
-		EntriesByAccount: map[string][]LedgerEntry{candCash: entries}}
+		EntriesByAccount:          map[string][]LedgerEntry{candCash: entries},
+		TransactionsByBankAccount: map[string][]CanonicalTransaction{candBankAccount: nil}}
 }
 
 func analyzeCandidates(t *testing.T, search *CandidateSearch, lines ...BankStatementLine) []ReconciliationSuggestion {
@@ -99,7 +104,7 @@ func TestCandidate_NoCandidate_IsAnExplicitResult(t *testing.T) {
 	if got.CandidateSearchOutcome != CandidateNone || got.CounterpartJournalID != "" || got.DateToleranceVersion != 5 {
 		t.Fatalf("expected NO_CANDIDATE recorded with its tolerance version, got %+v", got)
 	}
-	if got.Recommendation == RecommendationAutoMatch || !strings.Contains(got.ResolutionNotes, "found no FINALIZED journal") {
+	if got.Recommendation == RecommendationAutoMatch || !strings.Contains(got.ResolutionNotes, "found no FINALIZED general-ledger-svc journal") {
 		t.Fatalf("expected the missing-reference suggestion with the search result stated, got %+v", got)
 	}
 }

@@ -374,10 +374,16 @@ func TestAttachSupportRoute_GrantsAndReturnsEvidence(t *testing.T) {
 	assert.NotEmpty(t, resp.SupportContextID)
 	assert.Equal(t, domain.SupportPendingApproval, resp.ApprovalStatus, "an attach is a request, not a grant")
 
-	// The named approver's own call makes it live.
-	w = do(h.router, http.MethodPost, "/v1/context/support/"+resp.SupportContextID+"/approve", "tenant-a", "support-lead-9", nil)
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	decodeBody(t, w, &resp)
+	// The named approver's own call makes it live. If-Match: v1 for initial version.
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/support/"+resp.SupportContextID+"/approve", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "support-lead-9")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v1"`)
+	w2 := httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
+	decodeBody(t, w2, &resp)
 	assert.Equal(t, domain.SupportApproved, resp.ApprovalStatus)
 	assert.NotEmpty(t, resp.EvidenceID)
 	assert.True(t, resp.ExpiresAt.After(time.Now()), "a grant must not be issued already expired")
@@ -471,9 +477,16 @@ func TestRevokeSupportRoute_RequiresItsOwnAction(t *testing.T) {
 	var created domain.AttachSupportContextResponse
 	decodeBody(t, w, &created)
 
-	w = do(h.router, http.MethodDelete, "/v1/context/support/"+created.SupportContextID,
-		"tenant-a", "security-1", domain.RevokeSupportContextRequest{Reason: "incident closed"})
-	require.Equal(t, http.StatusNoContent, w.Code)
+	// Revoke with If-Match: v1 (initial version)
+	req := httptest.NewRequest(http.MethodDelete, "/v1/context/support/"+created.SupportContextID, bytes.NewBuffer([]byte(`{"reason":"incident closed"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "security-1")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v1"`)
+	w2 := httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+	require.Equal(t, http.StatusNoContent, w2.Code)
 
 	// Revoking is de-escalation. Requiring the same grant to END a support
 	// session as to START one means the person who notices a problem may be
@@ -496,10 +509,12 @@ func TestRevokeSupportRoute_AcceptsAnEmptyBody(t *testing.T) {
 	decodeBody(t, w, &created)
 
 	// A revocation with no stated reason still beats one that did not happen
-	// because the caller forgot a payload.
+	// because the caller forgot a payload. If-Match: v1 for initial version.
 	req := httptest.NewRequest(http.MethodDelete, "/v1/context/support/"+created.SupportContextID, nil)
 	req.Header.Set("X-Tenant-Id", "tenant-a")
 	req.Header.Set("X-Principal-Id", "security-1")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v1"`)
 	w2 := httptest.NewRecorder()
 	h.router.ServeHTTP(w2, req)
 
@@ -557,6 +572,277 @@ func TestResolveRecordsTheIngressItArrivedOn(t *testing.T) {
 			"the ingress on the record must be what the server observed, not what the body claimed")
 		assert.Equal(t, domain.EnvironmentProduction, sc.Environment)
 		assert.NotEmpty(t, sc.EvidenceID)
+	}
+}
+
+// ── API-3 ETag/If-Match tests for Support Context ────────────────────────────
+
+// TestETag_GetSupportContextReturnsETag verifies that GET /v1/context/support/{id}
+// returns an ETag header with the record_version.
+func TestETag_GetSupportContextReturnsETag(t *testing.T) {
+	h := newGov01Harness(t, &permittingAuthz{})
+
+	// Create a support context
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
+	var created domain.AttachSupportContextResponse
+	decodeBody(t, w, &created)
+
+	// Approve it to make it live with If-Match: v1
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/support/"+created.SupportContextID+"/approve", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "support-lead-9")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v1"`)
+	w2 := httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+	require.Equal(t, http.StatusOK, w2.Code)
+	decodeBody(t, w2, &created)
+	supportContextID := created.SupportContextID
+
+	// Now GET it and check ETag
+	w = do(h.router, http.MethodGet, "/v1/context/support/"+supportContextID, "tenant-a", "security-1", nil)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	etag := w.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("ETag header is missing")
+	}
+	// After approve, RecordVersion should be 2 (1 initial + 1 on approve)
+	if etag != `"v2"` {
+		t.Fatalf("ETag = %q, want %q", etag, `"v2"`)
+	}
+}
+
+// TestIfMatch_ApproveSupportContext_MissingReturns428 verifies that
+// POST /v1/context/support/{id}/approve requires an If-Match header and returns
+// 428 Precondition Required when missing.
+func TestIfMatch_ApproveSupportContext_MissingReturns428(t *testing.T) {
+	h := newGov01Harness(t, &permittingAuthz{})
+
+	// Create a support context
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
+	var created domain.AttachSupportContextResponse
+	decodeBody(t, w, &created)
+	supportContextID := created.SupportContextID
+
+	// Try to approve without If-Match
+	w = do(h.router, http.MethodPost, "/v1/context/support/"+supportContextID+"/approve", "tenant-a", "support-lead-9", nil)
+	if w.Code != http.StatusPreconditionRequired {
+		t.Fatalf("expected 428, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	if resp.Code != "precondition_required" {
+		t.Fatalf("code = %q, want %q", resp.Code, "precondition_required")
+	}
+}
+
+// TestIfMatch_ApproveSupportContext_StaleReturns412 verifies that
+// POST /v1/context/support/{id}/approve with a stale ETag returns 412 Precondition Failed.
+func TestIfMatch_ApproveSupportContext_StaleReturns412(t *testing.T) {
+	h := newGov01Harness(t, &permittingAuthz{})
+
+	// Create a support context
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
+	var created domain.AttachSupportContextResponse
+	decodeBody(t, w, &created)
+	supportContextID := created.SupportContextID
+
+	// Try to approve with stale If-Match
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/support/"+supportContextID+"/approve", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "support-lead-9")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v999"`) // Stale version
+	w2 := httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+
+	if w2.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp struct {
+		Code           string `json:"code"`
+		CurrentVersion int64  `json:"current_version"`
+	}
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &resp))
+	if resp.Code != "stale_version" {
+		t.Fatalf("code = %q, want %q", resp.Code, "stale_version")
+	}
+	if resp.CurrentVersion != 1 {
+		t.Fatalf("current_version = %d, want 1", resp.CurrentVersion)
+	}
+	// Response should include the current ETag
+	etag := w2.Header().Get("ETag")
+	if etag != `"v1"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v1"`)
+	}
+}
+
+// TestIfMatch_ApproveSupportContext_CorrectReturns200 verifies that
+// POST /v1/context/support/{id}/approve with a correct ETag succeeds with 200.
+func TestIfMatch_ApproveSupportContext_CorrectReturns200(t *testing.T) {
+	h := newGov01Harness(t, &permittingAuthz{})
+
+	// Create a support context
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
+	var created domain.AttachSupportContextResponse
+	decodeBody(t, w, &created)
+	supportContextID := created.SupportContextID
+
+	// Approve with correct If-Match
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/support/"+supportContextID+"/approve", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "support-lead-9")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v1"`) // Correct version (initial version is 1)
+	w2 := httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+	// Response should include updated ETag (version 2 after approve)
+	etag := w2.Header().Get("ETag")
+	if etag != `"v2"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v2"`)
+	}
+}
+
+// TestIfMatch_RevokeSupportContext_MissingReturns428 verifies that
+// DELETE /v1/context/support/{id} requires an If-Match header and returns
+// 428 Precondition Required when missing.
+func TestIfMatch_RevokeSupportContext_MissingReturns428(t *testing.T) {
+	h := newGov01Harness(t, &permittingAuthz{})
+
+	// Create and approve a support context
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
+	var created domain.AttachSupportContextResponse
+	decodeBody(t, w, &created)
+	// Approve with If-Match: v1
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/support/"+created.SupportContextID+"/approve", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "support-lead-9")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v1"`)
+	w2 := httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+	require.Equal(t, http.StatusOK, w2.Code)
+	decodeBody(t, w2, &created)
+	supportContextID := created.SupportContextID
+
+	// Try to revoke without If-Match
+	req = httptest.NewRequest(http.MethodDelete, "/v1/context/support/"+supportContextID, nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "security-1")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	// No If-Match header
+	w2 = httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+
+	if w2.Code != http.StatusPreconditionRequired {
+		t.Fatalf("expected 428, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &resp))
+	if resp.Code != "precondition_required" {
+		t.Fatalf("code = %q, want %q", resp.Code, "precondition_required")
+	}
+}
+
+// TestIfMatch_RevokeSupportContext_StaleReturns412 verifies that
+// DELETE /v1/context/support/{id} with a stale ETag returns 412 Precondition Failed.
+func TestIfMatch_RevokeSupportContext_StaleReturns412(t *testing.T) {
+	h := newGov01Harness(t, &permittingAuthz{})
+
+	// Create and approve a support context
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
+	var created domain.AttachSupportContextResponse
+	decodeBody(t, w, &created)
+	// Approve with If-Match: v1
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/support/"+created.SupportContextID+"/approve", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "support-lead-9")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v1"`)
+	w2 := httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+	require.Equal(t, http.StatusOK, w2.Code)
+	decodeBody(t, w2, &created)
+	supportContextID := created.SupportContextID
+
+	// Try to revoke with stale If-Match
+	req = httptest.NewRequest(http.MethodDelete, "/v1/context/support/"+supportContextID, nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "security-1")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v999"`) // Stale version
+	w2 = httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+
+	if w2.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp struct {
+		Code           string `json:"code"`
+		CurrentVersion int64  `json:"current_version"`
+	}
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &resp))
+	if resp.Code != "stale_version" {
+		t.Fatalf("code = %q, want %q", resp.Code, "stale_version")
+	}
+	if resp.CurrentVersion != 2 {
+		t.Fatalf("current_version = %d, want 2", resp.CurrentVersion)
+	}
+	// Response should include the current ETag
+	etag := w2.Header().Get("ETag")
+	if etag != `"v2"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v2"`)
+	}
+}
+
+// TestIfMatch_RevokeSupportContext_CorrectReturns204 verifies that
+// DELETE /v1/context/support/{id} with a correct ETag succeeds with 204.
+func TestIfMatch_RevokeSupportContext_CorrectReturns204(t *testing.T) {
+	h := newGov01Harness(t, &permittingAuthz{})
+
+	// Create and approve a support context
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
+	var created domain.AttachSupportContextResponse
+	decodeBody(t, w, &created)
+	// Approve with If-Match: v1
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/support/"+created.SupportContextID+"/approve", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "support-lead-9")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v1"`)
+	w2 := httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+	require.Equal(t, http.StatusOK, w2.Code)
+	decodeBody(t, w2, &created)
+	supportContextID := created.SupportContextID
+
+	// Revoke with correct If-Match
+	req = httptest.NewRequest(http.MethodDelete, "/v1/context/support/"+supportContextID, nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "security-1")
+	req.Header.Set("X-Correlation-ID", "test-correlation")
+	req.Header.Set("If-Match", `"v2"`) // Correct version (after approve, version is 2)
+	w2 = httptest.NewRecorder()
+	h.router.ServeHTTP(w2, req)
+
+	if w2.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", w2.Code, w2.Body.String())
 	}
 }
 

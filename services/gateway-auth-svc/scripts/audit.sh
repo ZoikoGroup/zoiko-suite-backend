@@ -96,8 +96,12 @@ echo "-- 4. Minting a real identity envelope ------------------------------"
 # Not a stub. This service's whole job is verifying a signed envelope, so an
 # audit that only ever exercised refusal paths would never prove the one path
 # that matters works at all.
+# The console's confidential client: identity-context-svc runs with
+# IDP_CLIENT_AUTH=required on the stack.
+CID=${IDENTITY_CONSOLE_CLIENT_ID:-zoiko-console}
+CSEC=${IDENTITY_CONSOLE_CLIENT_SECRET:-local-dev-console-client-secret}
 ACCESS=$(curl -s -m 25 -X POST "$IDENTITY/v1/authenticate" -H "Content-Type: application/json" \
-  -d "{\"tenant_id\":\"$TEN\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | json access_token)
+  -d "{\"tenant_id\":\"$TEN\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"client_id\":\"$CID\",\"client_secret\":\"$CSEC\"}" | json access_token)
 if [ -n "$ACCESS" ]; then ok "identity-context-svc issued an access token"; else bad "authenticate failed"; fi
 
 RESOLVE=$(curl -s -m 25 -X POST "$IDENTITY/v1/context/resolve" -H "Content-Type: application/json" \

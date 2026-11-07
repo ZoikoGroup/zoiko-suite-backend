@@ -1,0 +1,127 @@
+{
+  "status": "UNRECONCILED",
+  "decided_by": "Signed Services/Categories Reconciliation v2.1 (not yet available)",
+  "documented_taxonomy": {
+    "summary": "Doc 03 §5 names four module domains with ten canonical modules, and six homepage thematic domains; Doc 02 T03 groups published capabilities into Core Modules, Governance Platform and Platform Foundation. Stable IDs and the mapping of dashboard areas still come from the signed v2.1 registry.",
+    "source": "Doc 03 §5 (Taxonomy alignment), Doc 02 T03",
+    "module_domains": {
+      "Finance": [
+        "Accounting & General Ledger",
+        "Accounts Payable",
+        "Accounts Receivable",
+        "Treasury & Cash Position"
+      ],
+      "Workforce": [
+        "Payroll",
+        "Human Resources"
+      ],
+      "Tax, Legal & Compliance": [
+        "Tax Management",
+        "Legal & Contracts",
+        "Compliance & Obligations"
+      ],
+      "Commercial": [
+        "Procurement & Commercial Operations"
+      ]
+    },
+    "homepage_domains": [
+      "Finance & Tax",
+      "Workforce & Payroll",
+      "Legal & Commercial",
+      "Compliance & Obligations",
+      "Evidence & Audit",
+      "Intelligence & Reporting"
+    ],
+    "capability_tiers": [
+      "Core Modules",
+      "Governance Platform",
+      "Platform Foundation"
+    ],
+    "ids": null
+  },
+  "dashboard_domains": [
+    {
+      "label": "Finance & Payments",
+      "public_kb_source": "kb-finance-payments",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Legal & Contracts",
+      "public_kb_source": "kb-legal-contracts",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Commercial Ops",
+      "public_kb_source": "kb-commercial-ops",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Purchase Requests",
+      "public_kb_source": "kb-purchase-requests",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Tax",
+      "public_kb_source": "kb-tax",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Compliance",
+      "public_kb_source": "kb-compliance",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Evidence",
+      "public_kb_source": "kb-evidence",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Delegated Authority",
+      "public_kb_source": "kb-delegated-authority",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Intelligence & Reporting",
+      "public_kb_source": "kb-intelligence-reporting",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Security & Trust",
+      "public_kb_source": "kb-security-trust",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    },
+    {
+      "label": "Integrations",
+      "public_kb_source": "kb-integrations",
+      "documented_module_id": null,
+      "documented_domain_id": null,
+      "status": "UNMAPPED_PENDING_V2_1"
+    }
+  ],
+  "conflicts": [
+    "11 admin-dashboard domains vs 4 documented module domains vs 6 documented homepage domains.",
+    "Ten canonical module names are not present in any source document.",
+    "Purchase Requests appears as its own dashboard domain but reads as part of Commercial Ops.",
+    "Integrations is a dashboard domain; the documents treat integrations as connector claims, not a domain."
+  ]
+}

@@ -31,6 +31,10 @@ type LifecycleProjector interface {
 	// ProjectEntityStatus records an entity's standing, which /v1/authorize
 	// evaluates as a negative control (SUSPENDED / DISSOLVED deny).
 	ProjectEntityStatus(ctx context.Context, params domain.ProjectEntityStatusParams) error
+
+	// RepointMergedSubject reissues a merged duplicate's live assignments to
+	// its survivor and ends the duplicate's (identity.subject.merged).
+	RepointMergedSubject(ctx context.Context, params domain.RepointMergedSubjectParams) (int, error)
 }
 
 // LifecycleConsumer consumes the three §8.3 event concepts that were recorded
@@ -154,8 +158,16 @@ const LifecycleSourceService = "identity-context-svc"
 var (
 	// principalStatusEvents is the projecting group.
 	principalStatusEvents = map[string]bool{
+		// The legacy name, kept so events still on the topic from before the
+		// rename are projected when replayed.
 		"principal.status.changed": true,
-		EventEmploymentChanged:     true,
+		// identity-context-svc's ZS-IAM-001 names, same payload (principal_id,
+		// tenant_id, new_status): SUSPENDED / DISABLED as .disabled, ACTIVE as
+		// .enabled. It stopped emitting principal.status.changed on 15 Oct
+		// 2026, and until these were listed no suspension reached layer 0.
+		"identity.subject.disabled": true,
+		"identity.subject.enabled":  true,
+		EventEmploymentChanged:      true,
 	}
 
 	// grantGraphEvents is the invalidating group: every event that changes
@@ -194,6 +206,11 @@ var (
 	}
 )
 
+// EventSubjectMerged is identity-context-svc's ORG-1 merge: a duplicate subject
+// retired into its survivor. The duplicate's own identity.subject.disabled
+// arrives alongside it and is projected as a status like any other.
+const EventSubjectMerged = "identity.subject.merged"
+
 // LifecycleConsumedEventTypes is the union, for tests and for anybody asking
 // what this consumer subscribes to without reading two maps.
 func LifecycleConsumedEventTypes() map[string]bool {
@@ -204,7 +221,49 @@ func LifecycleConsumedEventTypes() map[string]bool {
 	for k := range grantGraphEvents {
 		out[k] = true
 	}
+	out[EventSubjectMerged] = true
 	return out
+}
+
+// subjectMergedPayload is identity-context-svc's identity.subject.merged.
+type subjectMergedPayload struct {
+	SurvivorID  string `json:"survivor_id"`
+	DuplicateID string `json:"duplicate_id"`
+	TenantID    string `json:"tenant_id"`
+	Actor       string `json:"actor"`
+}
+
+// handleSubjectMerged moves the duplicate's live authority to the survivor.
+// A payload missing a subject or the tenant is refused (logged, committed):
+// re-pointing authority on a guess is worse than leaving it for an operator.
+// A failed write is returned so Run retries it.
+func (c *LifecycleConsumer) handleSubjectMerged(ctx context.Context, env inbound) error {
+	var p subjectMergedPayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		c.log.Error("identity.subject.merged: undecodable payload — skipped", zap.String("event_id", env.EventID), zap.Error(err))
+		return nil
+	}
+	tenantID := p.TenantID
+	if tenantID == "" {
+		tenantID = env.TenantID
+	}
+	if p.SurvivorID == "" || p.DuplicateID == "" || tenantID == "" || p.SurvivorID == p.DuplicateID {
+		c.log.Error("identity.subject.merged: survivor, duplicate and tenant are required — skipped",
+			zap.String("event_id", env.EventID))
+		return nil
+	}
+	moved, err := c.store.RepointMergedSubject(ctx, domain.RepointMergedSubjectParams{
+		TenantID: tenantID, SurvivorID: p.SurvivorID, DuplicateID: p.DuplicateID,
+		Actor: p.Actor, CorrelationID: env.CorrelationID,
+	})
+	if err != nil {
+		return err
+	}
+	c.store.InvalidateGrantSourcesForTenant(tenantID)
+	c.log.Info("identity.subject.merged — assignments re-pointed",
+		zap.String("tenant_id", tenantID), zap.String("survivor_id", p.SurvivorID),
+		zap.String("duplicate_id", p.DuplicateID), zap.Int("reissued", moved))
+	return nil
 }
 
 // principalStatusPayload is identity-context-svc's principal.status.changed
@@ -343,7 +402,8 @@ func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) error {
 
 	isStatus := principalStatusEvents[env.EventType]
 	isGrantGraph := grantGraphEvents[env.EventType]
-	if !isStatus && !isGrantGraph {
+	isMerge := env.EventType == EventSubjectMerged
+	if !isStatus && !isGrantGraph && !isMerge {
 		// Three topics are subscribed and each carries events this service has
 		// no interest in. Silently skipped, not logged: at this volume a line
 		// per uninteresting event is how the log stops being readable.
@@ -357,6 +417,13 @@ func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) error {
 		return nil // Already processed, commit and move on
 	}
 
+	if isMerge {
+		if err := c.handleSubjectMerged(ctx, env); err != nil {
+			c.release(env.EventID)
+			return err
+		}
+		return nil
+	}
 	if isStatus {
 		err := c.handlePrincipalStatus(ctx, env)
 		if err != nil {

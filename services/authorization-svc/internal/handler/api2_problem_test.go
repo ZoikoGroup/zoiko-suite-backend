@@ -27,6 +27,7 @@ func TestAPI2_ErrorResponsesAreProblemDetails(t *testing.T) {
 	}
 	retireBundle := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/admin/permission-bundles/b-elsewhere/retire", nil)
+		req.Header.Set("If-Match", `"v1"`)
 		req.Header.Set("X-Principal-Id", "admin-1")
 		req.Header.Set("X-Tenant-Id", goodTenant)
 		w := httptest.NewRecorder()

@@ -127,6 +127,85 @@ func TestScopeMissing_NoCall(t *testing.T) {
 	}
 }
 
+// ── LookupClaimedJournalIDs (A2b part 3) ──────────────────────────────────────
+
+func TestLookupClaimedJournalIDs_EmptyInput_NoCall(t *testing.T) {
+	called := false
+	c := serve(t, http.StatusOK, `[]`, func(*http.Request) { called = true })
+	claimed, err := c.LookupClaimedJournalIDs(context.Background(), scope, nil)
+	if err != nil {
+		t.Fatalf("LookupClaimedJournalIDs: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("expected an empty result, got %v", claimed)
+	}
+	if called {
+		t.Fatal("a request was sent for an empty journal id list")
+	}
+}
+
+// A scalar match, a scalar proposal, and a many-to-one (A2b part 2)
+// allocation each report the journals they claim — including an id the
+// caller never asked about, which is simply extra true information, never a
+// bug.
+func TestLookupClaimedJournalIDs_ExtractsScalarAndArrayIDs(t *testing.T) {
+	j1, j2, j3, j4, extra := "j1", "j2", "j3", "j4", "j5"
+	body := `[
+		{"statement_line_id":"l1","matched_journal_id":"` + j1 + `"},
+		{"statement_line_id":"l2","proposed_journal_id":"` + j2 + `"},
+		{"statement_line_id":"l3","matched_journal_ids":["` + j3 + `","` + extra + `"]},
+		{"statement_line_id":"l4","proposed_journal_ids":["` + j4 + `"]}
+	]`
+	c := serve(t, http.StatusOK, body, nil)
+	claimed, err := c.LookupClaimedJournalIDs(context.Background(), scope, []string{j1, j2, j3, j4})
+	if err != nil {
+		t.Fatalf("LookupClaimedJournalIDs: %v", err)
+	}
+	for _, id := range []string{j1, j2, j3, j4, extra} {
+		if !claimed[id] {
+			t.Errorf("expected %s to be claimed", id)
+		}
+	}
+	if claimed["never-seen"] {
+		t.Error("an id never returned must not read as claimed")
+	}
+}
+
+// More ids than bank-reconciliation-svc's per-request limit must be batched,
+// not refused or silently truncated.
+func TestLookupClaimedJournalIDs_BatchesOverLimit(t *testing.T) {
+	n := journalLookupBatchSize + 5
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("j-%d", i)
+	}
+	var requests []string
+	c := serve(t, http.StatusOK, `[]`, func(r *http.Request) {
+		requests = append(requests, r.URL.Query().Get("journal_ids"))
+	})
+	if _, err := c.LookupClaimedJournalIDs(context.Background(), scope, ids); err != nil {
+		t.Fatalf("LookupClaimedJournalIDs: %v", err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 batched requests, got %d", len(requests))
+	}
+	if got := len(strings.Split(requests[0], ",")); got != journalLookupBatchSize {
+		t.Errorf("first batch carried %d ids, want %d", got, journalLookupBatchSize)
+	}
+	if got := len(strings.Split(requests[1], ",")); got != 5 {
+		t.Errorf("second batch carried %d ids, want 5", got)
+	}
+}
+
+// A failure on any batch fails the whole lookup — this service fails
+// CLOSED, never partially checked.
+func TestLookupClaimedJournalIDs_BatchFailureFailsWhole(t *testing.T) {
+	c := serve(t, http.StatusServiceUnavailable, ``, nil)
+	if _, err := c.LookupClaimedJournalIDs(context.Background(), scope, []string{"j1"}); !errors.Is(err, ErrServiceUnavailable) {
+		t.Fatalf("expected ErrServiceUnavailable, got %v", err)
+	}
+}
+
 func TestGetRun_StatusMapping(t *testing.T) {
 	cases := []struct {
 		status int

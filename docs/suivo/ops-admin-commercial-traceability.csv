@@ -1,0 +1,211 @@
+id,doc,priority,title,status,evidence,note
+OPS-001,08,,Codebase and infrastructure discovery signed off,Partial,docs/suivo/g0-architecture-delta.md;docs/suivo/adr,Discovery written up; sign-off and real hosting/gateway inventory need DEC-01
+OPS-002,08,,"Service owners, on-call and backups named",Blocked,docs/suivo/handover-registers.md,People: owner roster rows are all PENDING (H23)
+OPS-003,08,,Egress denial to public/private targets proven,Partial,internal/isolation.TestT12_NoRouteToPrivateSystems;internal/isolation.TestForbiddenDepsRejectsOtherServices,Code has no private routes; network egress proof needs deployed NetworkPolicy (infrastructure)
+OPS-004,08,,"DNS, TLS, WAF and certificate paths validated",Blocked,,Infrastructure: no production DNS/TLS/WAF exists yet
+OPS-005,08,,Stage and production secrets proven separate,Blocked,services/public-ai-svc/RUNBOOK.md RB-11,Infrastructure: needs a secret manager per environment
+OPS-006,08,,Source and builder signatures enforced,Blocked,,Infrastructure: needs a registry and signing key for image/provenance signing
+OPS-007,08,,SBOM and critical vulnerability gates pass,Built,".github/workflows/ci.yml public-ai-supply-chain (govulncheck, CycloneDX SBOM, Trivy image scan)",CI fails on reachable vulns and fixable HIGH/CRITICAL; receipt from a release build still to attach
+OPS-008,08,,Signed four-artifact release manifest available,Partial,internal/release.TestManifestRequiresImageDigest;internal/release.TestManifestRecordAndSignoffs;cmd/kbctl manifest,Tooling built; no real manifest yet (needs registry image digest and a staging release)
+OPS-009,08,,Schema and model-profile compatibility checked,Built,internal/release.TestIncompatibleReleaseRefusedAtLoad;internal/release.TestManifestRefusesEvalForOtherModel;internal/specs.TestOpenAPIBackwardCompatible,Incompatible release refused at load; manifest refuses an eval run for another model
+OPS-010,08,,All P0 QA and security suites executed and passed,Partial,.github/workflows/ci.yml;cmd/traceability.TestAllMappedP0TestsPass;.github/workflows/public-ai-nightly.yml,Automated P0 suites run in CI; manual screen-reader pass and pen test not done
+OPS-011,08,,P1 claim effective-date fixtures pass,Built,internal/acceptance.TestKB023_SupersededAtMidnightUTC;internal/acceptance.TestKB009_ExpiredTrialClaim,Fixtures are synthetic claims (DEC-03)
+OPS-012,08,,Source revocation enforced at response commit,Built,internal/release.TestRevokedSinceAtCommit;internal/orchestrator.TestRevocationMidFlightAbstains;deployments/prometheus-rules-public-ai.yml PublicAIRevocationRejectedAtCommit,
+OPS-013,08,,Canary route and rollback knob tested,Blocked,cmd/canary.TestCanaryJourneyPasses;cmd/drill DR-03,Synthetic canary and rollback built; traffic-split canary route needs infrastructure
+OPS-014,08,,Kill switch tested by an independent operator,Partial,internal/flags.TestReEnableNeedsDifferentActor;cmd/drill DR-01,Dual-control drill automated; a run by a named independent operator is pending
+OPS-015,08,,Safe-static page and CTA work when the model fails,Partial,cmd/drill DR-05;internal/orchestrator.TestProviderFailuresFallBackSafely,Static fallback built; real support/demo URLs empty until DEC-10
+OPS-016,08,,One-active-turn race test across replicas passes,Built,internal/httpapi.TestCT011_TurnConflict;internal/acceptance.TestA26_ConcurrentTurnsSameSession;internal/store.TestPostgresConformance,"Turn lock lives in Postgres, shared by replicas; not yet run on a multi-replica staging"
+OPS-017,08,,"Retry, idempotency and DLQ replay contract passes",Built,internal/httpapi.TestCT009_TurnReplayNoSecondCall;internal/events.TestRelayDeliversOnceAndDivertsToDLQ;internal/events.TestDLQReplayRechecks,
+OPS-018,08,,"Readiness, startup and liveness probes tested",Partial,internal/httpapi.TestReadinessReflectsDependencies;internal/httpapi.TestStartupWaitsForFirstLoad;cmd/server.TestReadinessExcludesKillSwitch,Endpoints tested; Kubernetes probe manifests do not exist (infrastructure)
+OPS-019,08,,Outside-in synthetic journeys healthy,Partial,cmd/canary.TestCanaryJourneyPasses;deployments/prometheus-rules-public-ai.yml PublicAICanaryFailing,Canary built; needs a scheduled run against a deployed environment
+OPS-020,08,,Real on-call receives test alerts,Blocked,deployments/prometheus-rules-public-ai.test.yml,People and infrastructure: no Alertmanager routing or on-call rota
+OPS-021,08,,SLO definition and denominator approved,Blocked,deployments/prometheus-rules-public-ai.yml,Decision: 99.9% objective is PROPOSED (DEC-08)
+OPS-022,08,,Burn-rate alert replay tested,Built,deployments/prometheus-rules-public-ai.test.yml PublicAIErrorBudgetFastBurn;deployments/prometheus-rules-public-ai.test.yml PublicAIErrorBudgetSlowBurn,promtool rule tests run in CI
+OPS-023,08,,No sensitive GenAI attributes in traces,Built,internal/telemetry.TestFilterDropsContent;internal/telemetry.TestTurnSpansCarryNoMessageText,
+OPS-024,08,,"Log, backup and processor retention approved",Blocked,docs/suivo/data-inventory.md,Decision: retention period needs DPO (DEC-06)
+OPS-025,08,,"DPIA, transfer and cookie decisions signed",Blocked,,Approval: DPO decisions DEC-05/DEC-06 open
+OPS-026,08,,Manual WCAG defects cleared,Blocked,frontend:tests/e2e/assistant.spec.ts K11 axe,People: manual screen-reader pass not done
+OPS-027,08,,"Vendor limits, budget breaker and quotas tested",Partial,internal/limits.TestSpendCeilingStopsAnswering;internal/limits.TestSpendStages;cmd/loadtest.TestModelFaultsUnderLoad,Breaker and quotas tested; vendor limits and budget need DEC-05/DEC-08
+OPS-028,08,,Restore drill with RTO/RPO evidence,Blocked,cmd/drill DR-06,Infrastructure and decision: no backups or ratified RTO/RPO; DR-06 covers restore from signed files only
+OPS-029,08,,"Brand/IP, privacy notice and content approved",Blocked,,"Approval: DEC-04 name/brand, privacy notice text, real KB content"
+OPS-030,08,,"CTO, QA, Security and SRE release signatures",Blocked,internal/release.TestManifestRecordAndSignoffs;cmd/kbctl signoff,Signature tooling built; approvers not named
+OPR-001,08,,Unsigned application image is rejected,Blocked,internal/release.TestManifestRequiresImageDigest,Infrastructure: image signing needs a registry and key; manifest only requires a digest
+OPR-002,08,,Unsigned prompt/policy bundle is rejected,Built,internal/policy.TestSignedPolicyDigest;internal/config/config.go PUBLIC_AI_POLICY_SIGNATURE;cmd/kbctl policy-sign,
+OPR-003,08,,Unsigned knowledge release is rejected,Built,internal/release.TestSignatureEnforced;internal/release.TestClaimsReleaseGatedAtLoad,
+OPR-004,08,,Incompatible release tuple is refused,Built,internal/release.TestIncompatibleReleaseRefusedAtLoad,
+OPR-005,08,,Revoked claim stays denied across rollback,Built,internal/release.TestRevocationSurvivesRollback;internal/acceptance.TestKB011_RollbackKeepsRevocation;cmd/drill DR-03,
+OPR-006,08,,Canary cannot auto-ramp without human approval,Blocked,internal/acceptance.TestKB016_SignerNotIndependent,Infrastructure: no traffic-split canary; promotion itself needs two approvers and a third promoter
+OPR-007,08,,Canary p95 regression halts the ramp,Blocked,deployments/prometheus-rules-public-ai.yml PublicAIAnswerLatencyP95High,Infrastructure: no canary ramp to halt; p95 alert exists
+OPR-008,08,,Kill switch holds even with a cached page,Built,internal/orchestrator.TestKillSwitchMidFlightWithholdsAnswer;internal/orchestrator.TestKillSwitchAndFlags,"Flag is checked server-side on every turn, so a cached page cannot generate text"
+OPR-009,08,,Private finance hostname blocked at egress,Blocked,internal/isolation.TestT12_NoRouteToPrivateSystems,Infrastructure: pod/mesh egress proof needs a deployment; code has no such route
+OPR-010,08,,Public service token cannot call authenticated APIs,Partial,internal/isolation.TestForbiddenDepsRejectsOtherServices;internal/acceptance.TestA35_NoEgressToPrivateServices,Service holds no such credentials; network deny needs deployment
+OPR-011,08,,"Startup, readiness and liveness differ",Built,cmd/server.TestReadinessExcludesKillSwitch;internal/httpapi.TestStartupWaitsForFirstLoad;internal/httpapi.TestReadinessReflectsDependencies,
+OPR-012,08,,Graceful termination finishes in-flight turn,Built,cmd/server.TestShutdownOutlastsTurnLease;cmd/server.TestShutdownFitsStopGrace;internal/config.TestModelTimeoutFitsStopGrace,
+OPR-013,08,,Exactly one active turn across replicas,Built,internal/httpapi.TestCT011_TurnConflict;internal/acceptance.TestA26_ConcurrentTurnsSameSession;internal/store.TestPostgresConformance,Lock is in Postgres; not yet run with several replicas
+OPR-014,08,,Resource exhaustion gives bounded fallback,Built,internal/limits.TestGlobalInFlightCap;internal/limits.TestSpendCeilingStopsAnswering;internal/limits.TestBucketMapHardCap,
+OPR-015,08,,Model egress allowlist blocks arbitrary hosts,Partial,internal/model.TestGroqRedirectIsNotFollowed;internal/validate.TestGatewayDeadlineAndNoTools,No tools and no redirects; a network-level egress allowlist needs infrastructure
+OPR-016,08,,Event replay keeps idempotency,Partial,internal/events.TestDLQReplayRechecks;internal/events.TestReplayRejectsOlderControlEpoch,Producer side built; there is no event consumer in R0 to prove no duplicate action
+OPR-017,08,,"Request trace carries release tuple, no raw prompt",Built,internal/telemetry.TestTurnSpansCarryNoMessageText;internal/orchestrator/pipeline.go suivo.release.*,"Spans carry KB, claims, policy, model and app release ids"
+OPR-018,08,,GenAI content attributes disabled,Partial,internal/telemetry.TestFilterDropsContent,In-service filter tested; no vendor collector deployed to check
+OPR-019,08,,High-cardinality metric labels rejected,Partial,internal/metrics.TestAlertRulesUseExportedMetrics,Labels are fixed enums by design; no test that rejects a session-id label
+OPR-020,08,,Rapid burn-rate alert pages a human,Partial,deployments/prometheus-rules-public-ai.test.yml PublicAIErrorBudgetFastBurn,Both windows unit-tested; paging needs Alertmanager and an on-call rota
+OPR-021,08,,Sustained burn alert triggers promotion freeze,Partial,internal/release.TestPromotionFreeze;deployments/prometheus-rules-public-ai.test.yml PublicAIErrorBudgetSlowBurn,Alert carries freeze_promotion label; on-call sets the freeze flag by hand
+OPR-022,08,,No-data behaviour and dedup tested,Built,deployments/prometheus-rules-public-ai.test.yml PublicAIMetricsAbsent;deployments/prometheus-rules-public-ai.test.yml PublicAIScrapeDown,Dedup itself is an Alertmanager concern (not deployed)
+OPR-023,08,,Claim revocation metric tied to release and market,Partial,deployments/prometheus-rules-public-ai.yml PublicAIRevocationRejectedAtCommit,Counter has no release or market labels
+OPR-024,08,,"Synthetic outage reports safe, accessible fallback",Built,cmd/canary.TestCanaryFailsClosed;frontend:tests/e2e/assistant.spec.ts T10 outage,
+OPR-025,08,,Provider 503 gives a safe response,Built,internal/acceptance.TestA29_ProviderTimeout;internal/orchestrator.TestProviderFailuresFallBackSafely;cmd/drill DR-04,
+OPR-026,08,,Claim registry unreachable forces abstain,Built,internal/acceptance.TestA30_PriceRegistryUnavailable,
+OPR-027,08,,Source revoked mid-turn is denied at commit,Built,internal/orchestrator.TestRevocationMidFlightAbstains;internal/release.TestRevokedSinceAtCommit,
+OPR-028,08,,Model vendor change blocked unless approved,Built,internal/config.TestProductionGates;internal/config.TestUnknownProviderRejectedBeforeApprovalGates;internal/acceptance.TestA40_UnapprovedRegionFailsClosed,Single configured provider; no automatic failover
+OPR-029,08,,P0 incident freezes promotion,Built,internal/release.TestPromotionFreeze;services/public-ai-svc/RUNBOOK.md Promotion freeze,Freeze is a flag the on-call sets; rollback still allowed
+OPR-030,08,,Privacy leak detection escalates to DPO,Partial,deployments/prometheus-rules-public-ai.yml PublicAIEventDLPBlocked;internal/events.TestEventDLP;services/public-ai-svc/RUNBOOK.md RB-03,Detection and runbook built; DPO contact and scoped forensic access not assigned
+OPR-031,08,,Known-good rollback keeps claim revocations,Built,internal/acceptance.TestA36_RollbackKeepsRevocations;internal/store.TestPostgresRevocationsAppendOnly;cmd/drill DR-03,
+OPR-032,08,,Static mode keeps an accessible support CTA,Partial,cmd/drill DR-05;frontend:components/assistant/AssistantWidget.test.tsx chat_enabled false,Mechanism built; support route URL empty until DEC-10
+OPR-033,08,,Restore immutable releases with matching signatures,Built,cmd/drill DR-06;internal/store.TestPostgresReleasesImmutable,Restores from signed release files; no backup archive yet
+OPR-034,08,,Index rebuild leaves out revoked content,Built,cmd/drill DR-06;internal/knowledge.TestHybridKeepsRevokedOutcome;internal/acceptance.TestKB030_WithdrawnSourceInvalidatesReferences,
+OPR-035,08,,Ephemeral sessions invalidated safely,Built,internal/acceptance.TestA27_ExpiredSessionNoLeak;internal/session.TestIdleExpiry;internal/httpapi.TestLateReplyAfterExpiryNotDelivered,
+OPR-036,08,,Safe-static works without model or KB,Partial,cmd/drill DR-05;internal/acceptance.TestA31_RetrievalIndexOffline,Service fallback built; an independent website static route does not exist
+OPR-037,08,,Restore drill meets ratified RTO,Blocked,cmd/drill DR-06,"Decision and infrastructure: RTO not ratified, no backups"
+OPR-038,08,,Backup/restore access limited with break-glass trace,Blocked,,Infrastructure: no backup system or break-glass process
+OPR-039,08,,Secret rotation does not prolong an outage,Partial,internal/release.TestSigningKeyRotation;services/public-ai-svc/RUNBOOK.md RB-11,Signing-key rotation tested; DB/provider key rotation is runbook-only
+OPR-040,08,,Post-restore acceptance suite complete and signed,Blocked,cmd/canary.TestCanaryJourneyPasses,People: QA and SRE sign-off; suite exists as canary
+OPR-041,08,,Human QA gate blocks unsafe high-scoring model,Built,internal/eval.TestGraderCatchesFabrication;internal/eval.TestIntentMetricsAndFalsePermit,Any P0 failure gives BLOCK_RELEASE; no aggregate override
+OPR-042,08,,Accessibility regression stops promotion,Partial,frontend:tests/e2e/assistant.spec.ts K11 axe;frontend:tests/e2e/assistant.spec.ts K11 keyboard only,Automated gate in CI; manual evidence not captured
+OPR-043,08,,Anomalous token spend trips the breaker,Built,internal/limits.TestSpendCeilingStopsAnswering;internal/httpapi.TestSessionTokenCapStages;deployments/prometheus-rules-public-ai.yml PublicAITokenBurnHigh,
+OPR-044,08,,Retry storm has bounded requests and cost,Built,internal/acceptance.TestA25_DuplicateTurnOneModelCall;internal/model.TestGroqTransientErrorsRetryOnceThroughGateway;cmd/loadtest.TestLoadProfiles,
+OPR-045,08,,Wrong effective-date market claim is blocked,Built,internal/acceptance.TestKB023_SupersededAtMidnightUTC;internal/acceptance.TestKB009_ExpiredTrialClaim,
+OPR-046,08,,Abstain-rate shift raises an alert,Built,deployments/prometheus-rules-public-ai.yml PublicAIAbstainRateShift,Rule exists; not covered by promtool tests
+OPR-047,08,,Vendor/region change needs privacy sign-off,Built,internal/config.TestProductionGates;internal/acceptance.TestA40_UnapprovedRegionFailsClosed,Start refused without approval ref and approved region
+OPR-048,08,,Release manifest makes an immutable audit record,Built,internal/release.TestManifestRecordAndSignoffs;cmd/kbctl verify-manifest,
+ADM-T001,09,,Agents see only their team's cases,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T002,09,,Editor cannot approve or promote own content,Partial,internal/acceptance.TestKB016_SignerNotIndependent;internal/claims/claims.go owner self-approval check;internal/claims.TestOwnerMayNotApproveOwnClaim,Self-approval refused and tested; actor names are free text until staff SSO (DEC-11)
+ADM-T003,09,,Revoked staff grant blocks access at once,Blocked,,No staff console in R0 (DEC-11)
+ADM-T004,09,,Direct API access refused when UI route is hidden,Built,internal/acceptance.TestA34_NoAdminRoute;internal/httpapi.TestAdminListenerSeparatesInternalEndpoints,No admin API on the public listener
+ADM-T005,09,,Privilege elevation needs approver and short-lived grant,Blocked,,No staff console in R0 (DEC-11)
+ADM-T006,09,,Audit export needs purpose and approval,Partial,cmd/kbctl audit -export -purpose;services/public-ai-svc/RUNBOOK.md RB-12,kbctl enforces purpose and approval; no automated test; no role scope
+ADM-T007,09,,Link click alone creates no case or receipt,Built,internal/e2e.TestHandoffClickEmitsEvent;internal/validate.TestFalseConfirmationsRejected,
+ADM-T008,09,,Confirmed secure form creates exactly one case,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T009,09,,Abandoned form gives zero cases and no callback promise,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T010,09,,Receiving-system outage gives no false confirmation,Partial,internal/validate.TestFalseConfirmationsRejected,Guardrail built; no receiving system yet (DEC-12)
+ADM-T011,09,,No raw text or passwords in default handoff payload,Built,internal/e2e.TestHandoffClickEmitsEvent;internal/events.TestEnvelopeShapeAndRedaction,
+ADM-T012,09,,"Cases hidden from wrong queue, region or role",Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T013,09,,Invalid case state transition returns 409/422,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T014,09,,Concurrent assignment honours If-Match,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T015,09,,SLA timer starts on accepted case with approved calendar,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T016,09,,SLA pause/resume keeps evidence and recomputes,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T017,09,,Reopened case keeps ID and timeline,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T018,09,,Agent reply never goes to an unverified channel,Blocked,,No case system in R0; route-only handoff (DEC-12)
+ADM-T019,09,,Released draft is immutable; edits make a new revision,Built,internal/store.TestPostgresReleasesImmutable;internal/acceptance.TestSupersedesEndsTheOldVersion,
+ADM-T020,09,,PII or private class fails the public publishing gate,Built,internal/acceptance.TestKB002_PrivateDocumentMislabelledPublic;internal/acceptance.TestKB013_PrivatePayrollSlip,
+ADM-T021,09,,"Missing evidence, hash or owner blocks release",Built,internal/acceptance.TestKB028_OwnerAndReviewDeadline;internal/acceptance.TestPlanRegistryAndRevocationReason;internal/knowledge.TestIngestCheckApproversAndScope,
+ADM-T022,09,,Approver cannot approve own source revision,Built,internal/acceptance.TestKB016_SignerNotIndependent,Identities are free-text names until staff SSO (DEC-11)
+ADM-T023,09,,Contradicting source cannot overwrite active truth,Built,internal/acceptance.TestKB005_TwoActiveClaimsDisagree;internal/acceptance.TestKB003_PublicPageContradictsSignedPrice,
+ADM-T024,09,,Revoked source stops retrieval before index purge,Built,internal/acceptance.TestKB010_RevokedAfterCachePopulated;internal/orchestrator.TestRevokedSourceIsNotUsed,
+ADM-T025,09,,P1 claim needs independent sign-off and signed manifest,Built,internal/release.TestClaimsValidationRequiresTwoApprovals;internal/release.TestSignatureEnforced,
+ADM-T026,09,,Expired market/plan claim never released or used,Built,internal/acceptance.TestKB009_ExpiredTrialClaim;internal/acceptance.TestA12_ExpiredSourceExcluded,
+ADM-T027,09,,Capability IDs checked against the ten-module registry,Partial,internal/acceptance.TestKB019_PlanLabelMapsToStableID;internal/acceptance.TestA06_CategoryNotInRegistry,Check built; the ten-module taxonomy is not approved (DEC-02)
+ADM-T028,09,,Failed QA blocks KB or claim promotion,Built,internal/acceptance.TestKB027_EvaluationGatesPromotion,
+ADM-T029,09,,Rollback keeps the emergency revocation epoch,Built,internal/acceptance.TestKB011_RollbackKeepsRevocation;internal/events.TestReplayRejectsOlderControlEpoch,
+ADM-T030,09,,Production promotion records a compatible release tuple,Built,internal/release.TestManifestRecordsEvidenceDigests;internal/release.TestIncompatibleReleaseRefusedAtLoad,
+ADM-T031,09,,No staff path to private finance/HR/payroll data,Built,internal/isolation.TestT12_NoRouteToPrivateSystems;internal/isolation.TestSECT049_NoOtherZoikoModules,No console exists; service has no route to private systems
+ADM-T032,09,,"Case PII kept out of analytics, traces and prompts",Partial,internal/acceptance.TestA39_TelemetryCarriesNoCustomerText;internal/policy.TestRedactSensitiveInput,Visitor text redacted; no support cases exist in R0
+ADM-T033,09,,Attachments scanned or uploads disabled,Built,internal/httpapi.TestTurnRejectsExtraFieldsAndBadValues;internal/httpapi.TestCT005_WrongContentType,Uploads are not accepted by the public API
+ADM-T034,09,,Rights-request identity check only in secure channel,Built,internal/acceptance.TestDataRightsRequestsRouteOnly,Chat routes only; privacy route URL pending DEC-10
+ADM-T035,09,,Privacy export/deletion honours retention and legal hold,Blocked,,Decision: DPO retention and legal-hold rules (DEC-06)
+ADM-T036,09,,Injection in a source draft cannot change approval,Built,internal/acceptance.TestKB012_HiddenInstructionQuarantined;cmd/drill DR-07,
+ADM-T037,09,,All 12 console screens keyboard-operable,Blocked,,No staff console in R0 (DEC-11)
+ADM-T038,09,,Console usable at 400% zoom and 320 px,Blocked,,No staff console in R0 (DEC-11)
+ADM-T039,09,,Console status and errors announced (WCAG 4.1.3),Blocked,,No staff console in R0 (DEC-11)
+ADM-T040,09,,SLA urgency not shown by colour alone,Blocked,,No staff console in R0 (DEC-11)
+ADM-T041,09,,Destructive confirmations return focus and allow cancel,Blocked,,No staff console in R0 (DEC-11)
+ADM-T042,09,,Empty/loading/error screens leak no restricted data,Blocked,,No staff console in R0 (DEC-11)
+ADM-T043,09,,Source quarantine reaches read plane quickly,Built,internal/acceptance.TestKB010_RevokedAfterCachePopulated;cmd/drill DR-02,kbctl revoke applies within one refresh (about 5 s)
+ADM-T044,09,,Kill switch not changeable from public origin; audited,Built,internal/acceptance.TestA34_NoAdminRoute;internal/flags.TestFlagChangesAreAudited;internal/store.TestPostgresControlAuditAppendOnly,"Audit is hash-chained, not signed"
+ADM-T045,09,,Out-of-order control event cannot re-enable old release,Built,internal/events.TestReplayRejectsOlderControlEpoch;internal/events.TestEventsCarryEpochsAndKind,
+ADM-T046,09,,Re-enable after suspension needs a second person,Built,internal/flags.TestReEnableNeedsDifferentActor;cmd/drill DR-01,Actor is a free-text name until staff SSO (DEC-11)
+ADM-T047,09,,DLQ replay dedupes and revives nothing revoked,Built,internal/events.TestDLQReplayRechecks,
+ADM-T048,09,,Console warns of stale data on API outage,Blocked,,No staff console in R0 (DEC-11)
+ADM-T049,09,,"Offer, click, receipt and response measured apart",Partial,internal/metrics.TestConversionCounters,Offer and click counted; no case receipt or response in R0
+ADM-T050,09,,Analytics hold no raw messages or unconsented IDs,Built,internal/acceptance.TestAnalyticsEventContract;internal/acceptance.TestA39_TelemetryCarriesNoCustomerText,
+ADM-T051,09,,Answer rate counts abstentions separately,Built,deployments/prometheus-rules-public-ai.yml public_ai:turn_abstain_ratio:rate;deployments/prometheus-rules-public-ai.yml public_ai:grounded_answer_ratio:rate,
+ADM-T052,09,,Sampling and redaction QA is role-scoped,Blocked,,No staff console in R0 (DEC-11)
+ADM-T053,09,,P1 claim failure is a P0 incident whatever the score,Built,internal/eval.TestGraderCatchesFabrication;services/public-ai-svc/RUNBOOK.md RB-02,
+ADM-T054,09,,Aggregates tied to release tuple and window,Partial,internal/eval.TestReportProvenance;internal/httpapi.TestMetricsEndpoint,Eval reports and build_info carry releases; delayed events are not flagged
+ADM-T055,09,,"State changes log actor, approval, before/after, hash, UTC",Built,services/public-ai-svc/deployments/migrations/000004_control_audit.up.sql;internal/release.TestOperatorActionsAreAudited,
+ADM-T056,09,,Audit rows cannot be deleted or rewritten,Built,internal/store.TestPostgresControlAuditAppendOnly;services/public-ai-svc/deployments/migrations/000008_control_audit_chain.up.sql,
+ADM-T057,09,,Quarterly staff access review with signed attestations,Blocked,,People: no staff roles or reviewers (DEC-11)
+ADM-T058,09,,Missing approval leaves publication pending,Built,internal/release.TestClaimsValidationRequiresTwoApprovals;internal/release.TestManifestRecordAndSignoffs,
+ADM-T059,09,,Retention owner and matrix exist before launch,Blocked,docs/suivo/data-inventory.md,Decision: retention values PENDING (DEC-06)
+ADM-T060,09,,Release gate includes all owners or a documented hold,Partial,internal/release.TestManifestRecordAndSignoffs;cmd/kbctl verify-manifest,Sign-off roles have no Support role; approvers not named
+COM-T001,10,P0,Demo route offered only when active for the market,Partial,internal/orchestrator.TestDemoIsRouteOnly;internal/orchestrator.TestCommercialRoutesFlag;internal/release.TestRoutesRejectUnsafeURLs,Routes signed and flag-gated; no per-market demo route data (DEC-10)
+COM-T002,10,P1,"Disabled market gives a safe alternative, no claim",Built,internal/acceptance.TestKB025_PricingInUnsupportedMarket;internal/acceptance.TestG06_TrialUnsupportedMarket,
+COM-T003,10,P0,CTA click creates no lead or booking,Built,internal/e2e.TestHandoffClickEmitsEvent;internal/flags.TestDoc10GatesAreHardOff,
+COM-T004,10,P0,Unapproved external redirect blocked,Built,internal/release.TestRoutesRejectUnsafeURLs;internal/acceptance.TestA23_ModelReturnsExternalURL,
+COM-T005,10,P1,At most one primary commercial CTA per reply,Built,internal/acceptance.TestCTAHasOnePrimary,
+COM-T006,10,P1,Legacy /demo and /book-demo mapping audited,Blocked,,Real website routes unknown (DEC-10)
+COM-T007,10,P0,Specific quote needs current signed price/market/term,Built,internal/acceptance.TestA07_SignedStarterPriceUS;internal/claims.TestPriceClaimCompleteness;internal/acceptance.TestG05_ChangeUSDAnnualToUKMonthly,Claim data is synthetic (DEC-03)
+COM-T008,10,P1,Expired plan fact blocks quote despite cached answer,Built,internal/acceptance.TestG35_OutOfDatePricingPageCached;internal/acceptance.TestKB009_ExpiredTrialClaim,
+COM-T009,10,P0,Trial text never claims payment or account creation,Built,internal/validate/validate.go prohibited phrases;internal/orchestrator.TestTrialRouteOnlyWhereVerified,Validator bans 'opened your account' and 'automatically enrolled'; no test for those phrases
+COM-T010,10,P1,Trial link only when commercially enabled,Built,internal/acceptance.TestA09_TrialDisabledNoTrialCTA;internal/release.TestTrialRouteGatedByClaim,
+COM-T011,10,P0,Enterprise plan shows no unapproved price or signup,Built,internal/acceptance.TestG07_EnterpriseQuote,
+COM-T012,10,P1,Pricing release rolls back apart from runtime,Built,internal/release.TestRollbackNeedsPriorPromotion;internal/release.TestPromoteAuditedCompensatesFailedMove,kbctl promote -kind claims
+COM-T013,10,P1,Receipt only after durable commit and outbox write,Blocked,,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13
+COM-T014,10,P1,"Bad email, enum or size returns typed 422",Blocked,,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13
+COM-T015,10,P0,Missing optional phone does not block demo intake,Blocked,,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13
+COM-T016,10,P1,Client-sent owner or consent fields ignored,Blocked,,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13
+COM-T017,10,P1,Form shows notice version and purpose before submit,Blocked,,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13
+COM-T018,10,P1,Account numbers in free text rejected or quarantined,Blocked,internal/policy.TestRedactSensitiveInput,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13; chat already redacts
+COM-T019,10,P1,Exact idempotent replay returns prior receipt,Blocked,,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13
+COM-T020,10,P0,Conflicting idempotency key returns 409,Blocked,,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13
+COM-T021,10,P0,Duplicate CRM mapping creates no second contact,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T022,10,P0,Same organisation never merges unrelated people,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T023,10,P1,Existing-customer match never disclosed in chat,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T024,10,P1,Dedupe review and merge role-scoped and audited,Blocked,,R1: no staff lead queue; needs staff IAM DEC-11 and CRM DEC-13
+COM-T025,10,P1,"Worker uses narrow service principal, not browser token",Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T026,10,P1,CRM 429/5xx gives backoff and durable retry,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T027,10,P1,CRM outage keeps true receipt and pending status,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T028,10,P0,Dead letter replays without duplicate,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T029,10,P1,Vendor external ID reconciled to submission,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T030,10,P1,CRM field map rejects undeclared PII fields,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T031,10,P0,Slot selection alone never yields CONFIRMED,Blocked,internal/acceptance.TestG31_ImmediateBookedDemo,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14; chat never claims a booking
+COM-T032,10,P0,Booking confirmed only with provider ID and status,Blocked,,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14
+COM-T033,10,P1,"UTC, IANA timezone and DST handled correctly",Blocked,,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14
+COM-T034,10,P0,Duplicate webhook does not double-count bookings,Blocked,,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14
+COM-T035,10,P1,Cancellation removes reminder and updates lifecycle,Blocked,,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14
+COM-T036,10,P1,Late reschedule webhook reconciles by revision,Blocked,,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14
+COM-T037,10,P0,Unchecked marketing option stays off downstream,Blocked,,R1: consent model needs DPO (DEC-06) and CRM (DEC-13)
+COM-T038,10,P1,Demo reply possible without marketing opt-in,Blocked,,R1: consent model needs DPO (DEC-06)
+COM-T039,10,P0,Opt-out suppresses outbound before next send,Blocked,,R1: no outbound sender; needs DEC-13
+COM-T040,10,P1,UK sole-trader uncertainty uses strict channel rule,Blocked,,Decision: DPO/Legal marketing rule (DEC-06)
+COM-T041,10,P0,No tracking pixel without required permission,Built,internal/flags.TestDoc10GatesAreHardOff,third_party_tracking_enabled is refused if set true
+COM-T042,10,P1,DSAR/erasure goes through secure identity-checked flow,Partial,internal/acceptance.TestDataRightsRequestsRouteOnly,Chat routes only; secure DSAR workflow and URL need DPO (DEC-06/10)
+COM-T043,10,P1,Lead queue shows only staff-permitted records,Blocked,,R1: no staff lead queue; needs staff IAM DEC-11 and CRM DEC-13
+COM-T044,10,P1,Roles prevent cross-region bulk PII export,Blocked,,R1: no staff lead queue; needs staff IAM DEC-11 and CRM DEC-13
+COM-T045,10,P1,"Sales stage changes record actor, time and reason",Blocked,,R1: no staff lead queue; needs staff IAM DEC-11 and CRM DEC-13
+COM-T046,10,P1,Owner change keeps audit and consent evidence,Blocked,,R1: no staff lead queue; needs staff IAM DEC-11 and CRM DEC-13
+COM-T047,10,P1,Support/login enquiries stay out of sales queue,Blocked,,R1: no staff lead queue; needs staff IAM DEC-11 and CRM DEC-13
+COM-T048,10,P0,Queue IDs cannot enumerate helpdesk cases,Blocked,,R1: no staff lead queue; needs staff IAM DEC-11 and CRM DEC-13
+COM-T049,10,P0,Prompt injection cannot call CRM or scheduler,Built,internal/validate.TestGatewayDeadlineAndNoTools;internal/acceptance.TestA19_UserPromptInjection;internal/acceptance.TestA20_InjectionFromRetrievedPage,Model has no tools; no CRM or scheduler client exists
+COM-T050,10,P0,Bot/fraud limits do not block accessibility use,Partial,internal/limits.TestPerIPLimit;internal/limits.TestVisitorsBehindProxyHaveSeparateBuckets,Rate limits built; bot-defence vendor undecided; no assistive-tech load test
+COM-T051,10,P1,"Webhook signature, replay ID and timestamp enforced",Blocked,,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14
+COM-T052,10,P1,Open redirects and phishing URLs rejected,Built,internal/release.TestRoutesRejectUnsafeURLs;internal/acceptance.TestKB018_UnapprovedOrigin;internal/validate.TestModelLinksAreRemoved,
+COM-T053,10,P0,No secrets or full transcript in model or analytics,Built,internal/acceptance.TestContactDetailsNotKept;internal/policy.TestContactDetailsMaskedNotRefused;internal/acceptance.TestA39_TelemetryCarriesNoCustomerText,
+COM-T054,10,P1,Browser CSRF/origin and form abuse tests pass,Built,internal/httpapi.TestCT003_OriginDenied;internal/httpapi.TestMissingOriginDenied;frontend:components/assistant/boundary.test.tsx SEC-T012,No forms in R0; origin checks cover the chat API
+COM-T055,10,P1,"Click, lead, booking and trial counted separately",Partial,internal/metrics.TestConversionCounters,Offers and clicks counted; lead/booking/trial events do not exist (R1)
+COM-T056,10,P0,"Funnel excludes test traffic, replays and duplicates",Not built,,No test-traffic marker or analytics dedupe found
+COM-T057,10,P1,"No raw email, IP or phone in analytics events",Built,internal/acceptance.TestAnalyticsEventContract;internal/limits.TestBucketKeysAreNotAddresses,
+COM-T058,10,P0,Attribution kept only within approved privacy scope,Blocked,,Decision: attribution/consent scope needs DPO (DEC-06)
+COM-T059,10,P1,CRM sync latency from ACCEPTED to ACK,Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T060,10,P1,Quarter-end cohort window and denominator documented,Blocked,,Decision: commercial owner defines funnel cohorts
+COM-T061,10,P1,Provider timeout shows truthful pending and recovery link,Blocked,,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14
+COM-T062,10,P1,Claim registry outage suppresses pricing commitments,Built,internal/acceptance.TestA30_PriceRegistryUnavailable,
+COM-T063,10,P1,Preference propagation incident halts marketing worker,Blocked,,R1: no marketing worker; needs DEC-13
+COM-T064,10,P0,Rejected intake never shows 'received',Blocked,internal/validate.TestFalseConfirmationsRejected,R1: lead intake hard-off (secure_lead_intake_enabled); needs DEC-13; chat cannot claim receipt
+COM-T065,10,P0,Outbox recovery replays without duplicate,Partial,internal/events.TestRelayDeliversOnceAndDivertsToDLQ;internal/events.TestDLQReplayRechecks,Chat-event outbox built; no commercial outbox or disaster recovery run
+COM-T066,10,P1,"Kill switch stops new CRM writes, keeps verified leads",Blocked,,R1: CRM sync hard-off (crm_sync_enabled); needs CRM vendor DEC-13
+COM-T067,10,P1,Form/CTA keyboard-only with visible focus,Partial,frontend:tests/e2e/assistant.spec.ts K11 keyboard only,Widget and CTAs keyboard-tested; no form exists
+COM-T068,10,P1,Field errors attached and announced,Blocked,,R1: no intake form (DEC-13)
+COM-T069,10,P1,No loss of function at 320 CSS px,Partial,frontend:tests/e2e/assistant.spec.ts K10 header fits at 320 px,Widget tested at 320 px; no form exists
+COM-T070,10,P1,Date and timezone pickers properly labelled,Blocked,,R1: booking sync hard-off (booking_sync_enabled); needs scheduler DEC-14
+COM-T071,10,P1,Each flag has reversible rollout and fixed fallback,Built,internal/orchestrator.TestKillSwitchAndFlags;internal/orchestrator.TestCommercialRoutesFlag;internal/flags.TestDoc10GatesAreHardOff,
+COM-T072,10,P1,Go-live pack has every owner sign-off and no P0 failure,Blocked,cmd/kbctl verify-manifest,People: owner sign-offs not given

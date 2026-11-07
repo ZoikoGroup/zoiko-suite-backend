@@ -8,13 +8,20 @@ import (
 	"mime"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"github.com/go-chi/chi/v5"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"zoiko.io/public-ai-svc/internal/problem"
+	"zoiko.io/public-ai-svc/internal/telemetry"
 )
 
 // RequestID always issues a fresh server-side request id (Doc 05 §06: the
@@ -57,6 +64,9 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		// Doc 06 §11: browsers reach the API only through the console's
+		// same-origin proxy, so no other site may embed or read a response.
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -186,6 +196,7 @@ func AccessLog(log *zap.Logger) func(http.Handler) http.Handler {
 			if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
 				route = rc.RoutePattern()
 			}
+			metrics.ObserveHTTP(route, r.Method, rec.status, time.Since(start))
 			log.Info("http_request",
 				zap.String("request_id", w.Header().Get("X-Request-ID")),
 				zap.String("trace_id", TraceID(r.Header.Get("traceparent"))),
@@ -196,4 +207,31 @@ func AccessLog(log *zap.Logger) func(http.Handler) http.Handler {
 			)
 		})
 	}
+}
+
+// Trace opens the server span for a request, continuing a valid W3C
+// traceparent. It records the method, route pattern, status and request id
+// only: no query string, headers, body or session grant (Doc 08 §14).
+func Trace(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := telemetry.Tracer().Start(ctx, r.Method, trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r.WithContext(ctx))
+		route := "unmatched"
+		if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
+			route = rc.RoutePattern()
+		}
+		span.SetName(r.Method + " " + route)
+		span.SetAttributes(
+			attribute.String("http.request.method", r.Method),
+			attribute.String("http.route", route),
+			attribute.Int("http.response.status_code", rec.status),
+			attribute.String("request_id", w.Header().Get("X-Request-ID")),
+		)
+		if rec.status >= 500 {
+			telemetry.Fail(span, strconv.Itoa(rec.status))
+		}
+	})
 }

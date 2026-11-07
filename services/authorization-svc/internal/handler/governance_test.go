@@ -230,7 +230,7 @@ func TestReasonCode_EnforceRefusesWithout(t *testing.T) {
 func TestReasonCode_WarnAdmitsAndMarks(t *testing.T) {
 	s := newGovStore()
 	s.denyAdmin = false
-	w := govPost(govRouter(s, handler.CommandContractWarn), "admin-1", "/v1/admin/roles/r-1/retire", `{}`)
+	w := govPost(govRouter(s, handler.CommandContractWarn), "admin-1", "/v1/admin/roles/r-1/retire", `{"expected_version":1}`)
 	if w.Code != http.StatusOK || w.Header().Get(handler.HeaderCommandContract) != "violated" {
 		t.Fatalf("warn, no reason_code: want 200 marked violated, got %d %q", w.Code, w.Header().Get(handler.HeaderCommandContract))
 	}
@@ -240,7 +240,7 @@ func TestReasonCode_RecordedWithTheChange(t *testing.T) {
 	s := newGovStore()
 	s.denyAdmin = false
 	w := govPost(govRouter(s, handler.CommandContractEnforce), "admin-1", "/v1/admin/roles/r-1/retire",
-		`{"reason_code":"ROLE_DECOMMISSIONED","purpose":"finance restructure"}`)
+		`{"expected_version":1,"reason_code":"ROLE_DECOMMISSIONED","purpose":"finance restructure"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
 	}

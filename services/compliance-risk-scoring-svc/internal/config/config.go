@@ -22,7 +22,7 @@ type Config struct {
 }
 
 func Load() *Config {
-	port := getEnv("PORT", "8136")
+	port := getEnv("PORT", "8177")
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/compliance_risk_scoring?sslmode=disable")
 	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
 	kafkaTopic := getEnv("KAFKA_TOPIC", "zoiko.compliance-risk-scoring.events")

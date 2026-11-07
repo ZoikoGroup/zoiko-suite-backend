@@ -21,7 +21,29 @@ const (
 	KindOTP      = "one_time_code"
 	KindBank     = "bank_account"
 	KindPrivate  = "private_identifier" // invoice, customer, employee, payroll, tenant ids (G32, CT-036)
+	// KindHealth is special-category health data about the visitor (Doc 06
+	// §15, Doc 07 §14): a first-person statement of a diagnosis, condition
+	// or medication. Generic uses ("health checks", "system health", "HR
+	// health benefits") are not about a person and do not match.
+	KindHealth = "special_category_health"
+	// KindSpecial is the other special categories (religion, ethnicity,
+	// sexuality, political or union membership, criminal records).
+	KindSpecial = "special_category"
+	// KindSalary is a pay amount about a person.
+	KindSalary = "salary_value"
 )
+
+// healthConditions are conditions that, stated about oneself, are
+// special-category data. Ambiguous everyday words ("anxiety", "a stroke of")
+// are left out on purpose.
+const healthConditions = `(?:type\s*[12]\s+)?diabetes|cancer|leukaemia|leukemia|a\s+tumou?r|hiv|aids|hepatitis(?:\s+[abc])?|tuberculosis|asthma|epilepsy|` +
+	`(?:clinical\s+|major\s+)?depression|an?\s+anxiety\s+disorder|bipolar(?:\s+disorder)?|schizophrenia|ptsd|ocd|adhd|autism|dementia|` +
+	`alzheimer'?s|parkinson'?s|multiple\s+sclerosis|crohn'?s(?:\s+disease)?|arthritis|heart\s+disease|a\s+heart\s+condition|` +
+	`an?\s+(?:chronic|mental|terminal|serious)\s+(?:illness|health\s+condition|condition|disease)|an?\s+eating\s+disorder|an?\s+disability|covid(?:-19)?|long\s+covid|a\s+stroke\s+(?:last|this|in|two|three|recently)`
+
+// healthQualifiers name a condition or the health context of a noun
+// ("my HIV medication", "my mental health diagnosis").
+const healthQualifiers = `hiv|cancer|diabetes|insulin|heart|blood\s+pressure|mental\s+health|psychiatric|medical|health|antidepressant|epilepsy|asthma|chemo(?:therapy)?|thyroid`
 
 type detector struct {
 	kind  string
@@ -45,13 +67,36 @@ var detectors = []detector{
 	{KindNationID, regexp.MustCompile(`(?i)\b[A-CEGHJ-PR-TW-Z]{2} ?\d{2} ?\d{2} ?\d{2} ?[A-D]\b`), nil},            // UK NINO
 	{KindNationID, regexp.MustCompile(`(?i)\b(?:ein|fein|tin|utr|ssn|nino|pan)\b\D{0,10}\d[\d -]{6,12}\d\b`), nil}, // labelled tax IDs
 	{KindPrivate, regexp.MustCompile(`(?i)\b(?:invoice|inv|customer|client|account|employee|emp|payroll|tenant|order|ticket)\s*(?:id|no\.?|number|#|ref(?:erence)?)\s*(?:is\s*)?[:#]?\s*[A-Z0-9][A-Z0-9-]{3,}`), hasDigit},
+	// Special-category health data (Doc 06 §15): first person + diagnosis,
+	// condition or medication. Every pattern needs "I"/"my", so product
+	// phrases ("health checks", "system health") never match.
+	{KindHealth, regexp.MustCompile(`(?i)\bi(?:'ve|\s+have|\s+was|\s+am|'m|\s+got|\s+just\s+got|\s+recently\s+got)?\s+(?:been\s+)?diagnosed\s+(?:with|as)\b[^.?!\n]{0,40}`), nil},
+	{KindHealth, regexp.MustCompile(`(?i)\b(?:i\s+(?:have|had|still\s+have|suffer\s+from|am\s+suffering\s+from|am\s+living\s+with|live\s+with|was\s+treated\s+for|am\s+being\s+treated\s+for)|i've\s+(?:got|had)|i'm\s+(?:suffering\s+from|living\s+with|being\s+treated\s+for))\s+(?:` + healthConditions + `)\b`), nil},
+	{KindHealth, regexp.MustCompile(`(?i)\b(?:i\s+am|i'm)\s+(?:pregnant|diabetic|epileptic|hiv[- ]positive|autistic|bipolar|on\s+(?:insulin|antidepressants|chemo(?:therapy)?|medication|meds|dialysis))\b`), nil},
+	{KindHealth, regexp.MustCompile(`(?i)\bi(?:\s+take|\s+am\s+taking|'m\s+taking)\s+(?:insulin|antidepressants|antiretrovirals|chemo(?:therapy)?|(?:` + healthQualifiers + `)\s+(?:medication|meds|medicine|pills))\b`), nil},
+	{KindHealth, regexp.MustCompile(`(?i)\bmy\s+(?:(?:` + healthQualifiers + `)\s+)?(?:medications?|meds|prescriptions?|illness|disability|chemo(?:therapy)?)\b|\bmy\s+(?:` + healthQualifiers + `)\s+(?:diagnosis|condition|treatment|status|therapy|records?)\b|\bmy\s+(?:` + healthConditions + `)\b`), nil},
 	{KindBank, regexp.MustCompile(`(?i)\b(?:account|acct|routing|sort code|aba)\b\s*(?:number|no\.?|#)?\s*[:#]?\s*\d[\d -]{5,20}\d\b`), nil},
+	// Other special-category data about the visitor (Doc 06 §15/§21): a
+	// first-person statement of religion, ethnicity, sexuality, political or
+	// union membership, or a criminal record. Product words ("religious
+	// holidays in payroll", "union dues") are not about the visitor.
+	{KindSpecial, regexp.MustCompile(`(?i)\b(?:i\s+am|i'm|i\s+was\s+born)\s+(?:a\s+|an\s+)?(?:muslim|christian|catholic|jewish|hindu|sikh|buddhist|atheist|mormon)\b` +
+		`|\bmy\s+(?:religion|faith|religious\s+beliefs?|ethnicity|ethnic\s+origin|race|sexual\s+orientation|sexuality|gender\s+identity|political\s+(?:views|party|affiliation)|union\s+membership|criminal\s+(?:record|conviction|history))\b` +
+		`|\b(?:i\s+am|i'm)\s+(?:gay|lesbian|bisexual|transgender|trans|queer|non-binary|a\s+union\s+member)\b` +
+		`|\bi\s+(?:have|had)\s+(?:a\s+)?(?:criminal\s+record|conviction|prison\s+record)\b|\bi\s+(?:was|have\s+been)\s+(?:convicted|arrested|in\s+prison|jailed)\b`), nil},
+	// A salary or pay amount about the visitor or a named employee (Doc 06
+	// §21: payroll values never enter the chat).
+	{KindSalary, regexp.MustCompile(`(?i)\b(?:my|our\s+employee'?s?|(?:his|her|their))\s+(?:annual\s+|monthly\s+|gross\s+|net\s+|base\s+)?(?:salary|wage|pay|income|compensation)\s+(?:is|was|of)\s+(?:[$£€]\s?)?\d[\d,.]*\s*(?:k|usd|gbp|eur|per\s+\w+)?` +
+		`|\bi\s+(?:earn|make|am\s+paid|get\s+paid)\s+(?:[$£€]\s?)?\d[\d,.]*\s*(?:k\b|usd|gbp|eur|(?:a|per)\s+(?:year|month|hour|week))?`), nil},
 }
 
 // Redaction is the result of scanning a message.
 type Redaction struct {
 	Text  string   // message with every detected value replaced
 	Kinds []string // distinct kinds found, sorted
+	// Contacts: emails or phone numbers were masked (Doc 10 §21). They are
+	// not secrets, so the question is still answered, without them.
+	Contacts bool
 }
 
 // Found reports whether any sensitive value was detected.
@@ -61,7 +106,9 @@ func (r Redaction) Found() bool { return len(r.Kinds) > 0 }
 // message that may be passed on (to a model, never to logs).
 func Redact(msg string) Redaction {
 	kinds := map[string]bool{}
-	out := msg
+	// Every detector reads the folded text, so fullwidth digits, zero-width
+	// characters or look-alike letters cannot hide a value (SEC-T016).
+	out := SafetyFold(msg)
 	for _, d := range detectors {
 		out = d.re.ReplaceAllStringFunc(out, func(m string) string {
 			if d.check != nil && !d.check(m) {
@@ -71,7 +118,8 @@ func Redact(msg string) Redaction {
 			return "[REDACTED:" + d.kind + "]"
 		})
 	}
-	r := Redaction{Text: out}
+	out, contacts := maskContacts(out)
+	r := Redaction{Text: out, Contacts: contacts}
 	for k := range kinds {
 		r.Kinds = append(r.Kinds, k)
 	}

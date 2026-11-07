@@ -248,7 +248,10 @@ func main() {
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log).WithPeriodChecker(platformClients).WithLedgerClient(platformClients).WithGRNIReclassMappingKey(cfg.GRNIReclassMappingKey)
+	h := handler.New(pgStore, publisher, authzClient, log).WithPeriodChecker(platformClients).WithLedgerClient(platformClients).
+		WithGRNIReclassMappingKey(cfg.GRNIReclassMappingKey).
+		WithValuationMappingKeys(cfg.InventoryMappingKey, cfg.COGSMappingKey, cfg.WriteDownExpenseMappingKey).
+		WithLandedCostOffsetMappingKey(cfg.LandedCostOffsetMappingKey)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

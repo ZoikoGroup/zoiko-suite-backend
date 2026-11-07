@@ -617,11 +617,12 @@ func (s *stubStore) RevokePrivilegedSession(_ context.Context, sessionID, tenant
 	}
 	now := time.Now().UTC()
 	return &domain.PrivilegedSession{
-		SessionID: sessionID,
-		TenantID:  tenantID,
-		Status:    domain.PrivilegedSessionStatusRevoked,
-		RevokedAt: &now,
-		RevokedBy: &revokedBy,
+		SessionID:     sessionID,
+		TenantID:      tenantID,
+		Status:        domain.PrivilegedSessionStatusRevoked,
+		RevokedAt:     &now,
+		RevokedBy:     &revokedBy,
+		RecordVersion: 2, // Simulate version increment
 	}, nil
 }
 
@@ -653,6 +654,11 @@ func (s *stubStore) FindBreakGlassSessionByID(_ context.Context, sessionID, tena
 	}
 	if s.breakGlassSession != nil {
 		return s.breakGlassSession, nil
+	}
+	if s.revokeBreakGlassSession != nil {
+		bg := *s.revokeBreakGlassSession
+		bg.RecordVersion = 1
+		return &bg, nil
 	}
 	return nil, domain.ErrBreakGlassSessionNotFound
 }
@@ -712,6 +718,11 @@ func (s *stubStore) FindSupportSessionByID(_ context.Context, sessionID, tenantI
 	}
 	if s.supportSession != nil {
 		return s.supportSession, nil
+	}
+	if s.revokeSupportSession != nil {
+		ss := *s.revokeSupportSession
+		ss.RecordVersion = 1
+		return &ss, nil
 	}
 	return nil, domain.ErrSupportSessionNotFound
 }
@@ -1220,6 +1231,7 @@ func TestRetireRole_SetsActiveFalse(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
@@ -1244,6 +1256,7 @@ func TestReactivateRole_SetsActiveTrue(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/reactivate", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
@@ -1267,6 +1280,7 @@ func TestRetireRole_UnknownRoleIs404(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/does-not-exist/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
@@ -1285,6 +1299,7 @@ func TestRetireRole_StoreDownIs503(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()

@@ -19,15 +19,22 @@ components:
       in: header
       required: true
       schema: {type: string, minLength: 8, maxLength: 128}
+    TurnIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Must equal client_turn_id.
+      schema: {type: string, format: uuid}
   schemas:
     PageContext:
       type: string
-      enum: [home, pricing, core_modules, demo, support, other]
+      enum: [home, pricing, core_modules, trust, demo, support, other]
     Capabilities:
       type: object
       additionalProperties: false
       properties:
         streaming: {type: boolean}
+        chat_enabled: {type: boolean, description: "false while the kill switch is on: the widget shows the official routes instead of a composer (Doc 08 §10)."}
         lead_capture: {type: boolean}
         file_upload: {type: boolean}
         authenticated: {type: boolean}
@@ -71,6 +78,44 @@ components:
         source_version_id: {type: string}
         claim_ids: {type: array, items: {type: string}}
         url_key: {type: string}
+        title: {type: string, description: "Structured responses only (ADR-008): approved source or official page title."}
+        route_key: {type: string, description: "Structured responses only: set when the citation is an official route."}
+        url: {type: string, format: uri, description: "Structured responses only: omitted until a real, allowlisted page exists."}
+        reviewed_at: {type: string, format: date, description: "Date the cited source was last approved (else its effective date), so the visitor can judge currency (Doc 01 FR-03, AT-01)."}
+    FollowUp:
+      type: object
+      additionalProperties: false
+      required: [id, label, intent_id, message]
+      description: An approved question from the Doc 02 menu and follow-up map (ADR-008). Never chosen by the model.
+      properties:
+        id: {type: string}
+        label: {type: string}
+        intent_id: {type: string, pattern: "^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10))$"}
+        message: {type: string, description: Fixed message the widget sends; it classifies to intent_id.}
+    CTALink:
+      type: object
+      additionalProperties: false
+      required: [route_key, label]
+      properties:
+        route_key: {type: string}
+        label: {type: string, description: Doc 02 §06 default CTA for the intent, or the official page title.}
+        url: {type: string, format: uri, description: Omitted until the signed route registry has a real page.}
+    MenuResponse:
+      type: object
+      additionalProperties: false
+      required: [schema_version, categories]
+      properties:
+        schema_version: {const: "1.0"}
+        categories:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, label, items]
+            properties:
+              id: {type: string}
+              label: {type: string, description: Doc 02 §22 public page family.}
+              items: {type: array, maxItems: 4, items: {$ref: "#/components/schemas/FollowUp"}}
     Action:
       type: object
       additionalProperties: false
@@ -82,7 +127,7 @@ components:
       title: zs-public-answer-v1
       type: object
       additionalProperties: false
-      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version]
+      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version, answer_class, safety_disposition]
       properties:
         schema_version: {const: "1.0"}
         turn_id: {type: string}
@@ -99,6 +144,75 @@ components:
           type: object
           properties:
             requires_human: {type: boolean}
+        answer_class:
+          type: string
+          enum: [VERIFIED_FACT, STATUS_QUALIFIED, PROCESS_EXPLANATION, HANDOFF_UNKNOWN, SAFE_REFUSAL]
+          description: ANSWERED is never HANDOFF_UNKNOWN; REFUSED_ACTION is always SAFE_REFUSAL; abstentions, handoffs and outages are HANDOFF_UNKNOWN.
+        safety_disposition:
+          type: string
+          enum: [ALLOW, CLARIFY, DENY, ESCALATE, RETRY]
+          description: "Doc 02 §15: ANSWERED=ALLOW, CLARIFY=CLARIFY, REFUSED_ACTION=DENY, ABSTAIN/HANDOFF=ESCALATE, UNAVAILABLE=RETRY. The UI shows no CTA or tool button the disposition does not allow."
+        status_label:
+          type: string
+          description: Governed status from the signed claim registry only; never inferred or upgraded.
+          enum: [Available, Limited, Partner-Supported, Planned, Not Available, Unverified, Current Architecture, Implemented, In Validation, Readiness, MARKET_DEPENDENT, VERIFIED]
+        market_code:
+          type: string
+          pattern: "^[A-Z]{2}$"
+          description: The market a STATUS_QUALIFIED answer is scoped to.
+        secondary_intent_id:
+          type: string
+          pattern: "^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10))$"
+          description: Second intent of a two-part question (e.g. I05 plans with I06 trial).
+        reason:
+          type: string
+          description: >-
+            Why the turn ended this way, so the UI can word it. UNAVAILABLE carries only
+            KILL_SWITCH, INTENT_DISABLED, GENERATION_DISABLED, MODEL_UNAVAILABLE, MODEL_TIMEOUT
+            or KNOWLEDGE_UNAVAILABLE; "no evidence" and "market not covered" are ABSTAIN.
+          enum: [ANSWERED, GREETING, MARKET_REQUIRED, PLAN_REQUIRED, CLARIFY_EXHAUSTED, NO_EVIDENCE,
+            CLAIM_CONFLICT, EXPIRED_SOURCE, SOURCE_REVOKED, MARKET_NOT_COVERED, OUT_OF_SCOPE, ROUTE_ONLY,
+            SENSITIVE_INPUT, PRIVATE_DATA, ACTION_DENIED, REGULATED_ADVICE, SECURITY_REPORT, PROMPT_INJECTION,
+            CROSS_PRODUCT, UNSUPPORTED_GUARANTEE, VALIDATION_FAILED, TOOL_INSTRUCTION, PRICING_DISABLED,
+            KILL_SWITCH, INTENT_DISABLED, GENERATION_DISABLED, MODEL_UNAVAILABLE, MODEL_TIMEOUT,
+            KNOWLEDGE_UNAVAILABLE, SPEND_CEILING, LIVE_PLATFORM_DATA, NO_APPROVED_INFO, GLOSSARY, CONTEXT_NOTED]
+        clarification:
+          type: object
+          description: Present only on CLARIFY. Options are market codes, OTHER and GENERAL_OVERVIEW.
+          additionalProperties: false
+          required: [slot, question, options]
+          properties:
+            slot: {type: string}
+            question: {type: string}
+            options: {type: array, items: {type: string}}
+        suggestions:
+          type: array
+          description: Pre-approved follow-up questions shown as chips when the assistant cannot answer (never links or CTAs).
+          items:
+            type: object
+            required: [label, message]
+            properties:
+              label: {type: string}
+              message: {type: string}
+        draft:
+          type: boolean
+          description: Answered from DRAFT_PENDING_REVIEW articles (local/dev only; refused in production).
+        outcome:
+          type: string
+          description: Structured responses only (ADR-008). Typed form of status.
+          enum: [GROUNDED, CLARIFY, ABSTAIN, SAFE_FALLBACK, REFUSED, HANDOFF_OFFER]
+        followups:
+          type: array
+          maxItems: 4
+          description: Structured responses only. Approved follow-ups after ANSWERED or HANDOFF.
+          items: {$ref: "#/components/schemas/FollowUp"}
+        cta:
+          type: object
+          additionalProperties: false
+          description: Structured responses only. At most one primary and one secondary official route.
+          properties:
+            primary: {$ref: "#/components/schemas/CTALink"}
+            secondary: {$ref: "#/components/schemas/CTALink"}
     ConfigResponse:
       type: object
       required: [config_revision, assistant_display_name, capabilities, supported_locales, market_choices, public_routes, citation_links, privacy_notice_key]
@@ -128,6 +242,21 @@ components:
               url: {type: string, format: uri}
               title: {type: string}
         privacy_notice_key: {type: string}
+        microcopy:
+          type: object
+          description: Pre-approved UI wording keyed ui.* (plain text).
+          additionalProperties: {type: string}
+        chips:
+          type: object
+          description: Starter questions keyed by page_context.
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              required: [label, message]
+              properties:
+                label: {type: string}
+                message: {type: string}
     Problem:
       type: object
       required: [type, title, status, instance, code, request_id, retryable]
@@ -176,11 +305,13 @@ paths:
       responses:
         "201": {description: Created, content: {application/json: {schema: {$ref: "#/components/schemas/SessionResponse"}}}}
         "400": {$ref: "#/components/responses/Problem"}
+        "401": {$ref: "#/components/responses/Problem"}
         "403": {$ref: "#/components/responses/Problem"}
         "413": {$ref: "#/components/responses/Problem"}
         "415": {$ref: "#/components/responses/Problem"}
         "422": {$ref: "#/components/responses/Problem"}
         "429": {$ref: "#/components/responses/Problem"}
+        "503": {$ref: "#/components/responses/Problem"}
   /sessions/{session_id}:
     delete:
       summary: End the caller's session (repeat delete of own session is 204)
@@ -190,12 +321,14 @@ paths:
       responses:
         "204": {description: Ended}
         "401": {$ref: "#/components/responses/Problem"}
+        "403": {$ref: "#/components/responses/Problem"}
         "404": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
   /turns:
     post:
       summary: Submit one visitor turn
       security: [{publicChatSession: []}]
-      parameters: [{$ref: "#/components/parameters/IdempotencyKey"}]
+      parameters: [{$ref: "#/components/parameters/TurnIdempotencyKey"}]
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: "#/components/schemas/TurnRequest"}}}
@@ -231,9 +364,14 @@ paths:
                 reason: {type: string, enum: [incorrect, incomplete, not_relevant, unclear, other]}
       responses:
         "204": {description: Recorded}
+        "400": {$ref: "#/components/responses/Problem"}
         "401": {$ref: "#/components/responses/Problem"}
+        "403": {$ref: "#/components/responses/Problem"}
         "404": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "415": {$ref: "#/components/responses/Problem"}
         "422": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
   /handoffs:
     post:
       summary: Visitor opened an official route. Emits chat.handoff.clicked.v1; never creates a case, ticket, lead or booking. Extension (ADR-005).
@@ -261,8 +399,44 @@ paths:
                 properties:
                   route_key: {type: string}
                   url: {type: string, format: uri}
+        "400": {$ref: "#/components/responses/Problem"}
         "401": {$ref: "#/components/responses/Problem"}
+        "403": {$ref: "#/components/responses/Problem"}
         "404": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "415": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
+  /analytics:
+    post:
+      summary: >-
+        Doc 02 §27 events only the browser observes (chat_opened, source_opened). Enums and ids only.
+        A session grant is optional (chat_opened happens before a session exists); when sent it must match session_id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema_version, event]
+              properties:
+                schema_version: {const: "1.0"}
+                event: {type: string, enum: [chat_opened, source_opened]}
+                session_id: {type: string}
+                page_context: {$ref: "#/components/schemas/PageContext"}
+                locale: {type: string}
+                link_id: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,63}$"}
+                intent_id: {type: string}
+      responses:
+        "204": {description: Recorded}
+        "400": {$ref: "#/components/responses/Problem"}
+        "401": {$ref: "#/components/responses/Problem"}
+        "403": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "415": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
   /turns/{turn_id}/events:
     get:
       summary: Progress stream. Disabled in R0 (stream_enabled=false) and always 404.
@@ -276,6 +450,16 @@ paths:
       responses:
         "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/ConfigResponse"}}}}
         "304": {description: Not modified}
+        "403": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
+  /menu:
+    get:
+      summary: Guided topic menu (ADR-008). 404 while structured_response_enabled is off.
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/MenuResponse"}}}}
+        "403": {$ref: "#/components/responses/Problem"}
+        "404": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
   /health/public:
     get:
       summary: Coarse public health (no provider or region names)

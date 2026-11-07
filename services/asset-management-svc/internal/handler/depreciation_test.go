@@ -101,7 +101,6 @@ func TestCreateDepreciationRun_DuplicateForPeriod_Returns422(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	req := domain.CreateDepreciationRunRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
 	}
 	first := doReq(r, http.MethodPost, "/v1/depreciation-runs/", req, "preparer-1")
 	if first.Code != http.StatusCreated {
@@ -136,7 +135,6 @@ func TestFreezeDepreciationPopulation_ExcludesNonActiveAssets(t *testing.T) {
 
 	runReq := domain.CreateDepreciationRunRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
 	}
 	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
 	var run domain.DepreciationRun
@@ -164,7 +162,6 @@ func TestDepreciationRun_FullLifecycle_EmitsRealJournal(t *testing.T) {
 
 	runReq := domain.CreateDepreciationRunRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
 	}
 	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
 	var run domain.DepreciationRun
@@ -225,7 +222,6 @@ func TestDepreciationRun_PublishesRemainingLifecycleEvents(t *testing.T) {
 
 	runReq := domain.CreateDepreciationRunRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
 	}
 	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
 	var run domain.DepreciationRun
@@ -271,7 +267,6 @@ func TestApproveDepreciationRun_SameCreator_Returns403(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	req := domain.CreateDepreciationRunRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
 	}
 	createRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", req, "preparer-1")
 	var run domain.DepreciationRun
@@ -295,7 +290,6 @@ func TestSupersedeDepreciationRun_ReversesJournalAndReleasesPeriod(t *testing.T)
 
 	runReq := domain.CreateDepreciationRunRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
 	}
 	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
 	var run domain.DepreciationRun
@@ -369,7 +363,6 @@ func TestGetDepreciationCompleteness_FullyCovered(t *testing.T) {
 
 	runReq := domain.CreateDepreciationRunRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
 	}
 	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
 	var run domain.DepreciationRun
@@ -418,7 +411,6 @@ func TestGetAccumulatedDepreciation_AfterRun_ReturnsLatestLine(t *testing.T) {
 
 	runReq := domain.CreateDepreciationRunRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
 	}
 	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
 	var run domain.DepreciationRun

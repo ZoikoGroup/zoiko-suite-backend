@@ -18,9 +18,29 @@ import (
 
 // BuildKB ingests a fixture/import directory and signs the resulting manifest.
 func BuildKB(dir, releaseID string, now time.Time, privKey string) ([]byte, []byte, []knowledge.Report, error) {
-	m, reports, err := knowledge.IngestDir(dir, releaseID, now)
+	return BuildKBWith(dir, releaseID, now, privKey, knowledge.IngestOptions{})
+}
+
+// ErrDraftInRelease means a release built without the dev-only draft option
+// contains DRAFT_PENDING_REVIEW content; such a build never ships.
+var ErrDraftInRelease = errors.New("release contains DRAFT_PENDING_REVIEW content; drafts are allowed only in local/dev (KB_ALLOW_DRAFT)")
+
+// ErrSyntheticInRelease means a release built or loaded without the dev-only
+// synthetic option contains test data; such a release never ships.
+var ErrSyntheticInRelease = errors.New("release contains synthetic data; synthetic data is allowed only in local/dev")
+
+// BuildKBWith is BuildKB with ingest options. Without AllowDraft any draft
+// in the result fails the build.
+func BuildKBWith(dir, releaseID string, now time.Time, privKey string, opts knowledge.IngestOptions) ([]byte, []byte, []knowledge.Report, error) {
+	m, reports, err := knowledge.IngestDirWith(dir, releaseID, now, opts)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if !opts.AllowDraft && m.HasDraft() {
+		return nil, nil, reports, ErrDraftInRelease
+	}
+	if !opts.AllowSynthetic && m.HasSynthetic() {
+		return nil, nil, reports, ErrSyntheticInRelease
 	}
 	if len(m.Sources) == 0 {
 		return nil, nil, reports, errors.New("no source passed ingestion; refusing to build an empty release")
@@ -28,6 +48,7 @@ func BuildKB(dir, releaseID string, now time.Time, privKey string) ([]byte, []by
 	if err := m.Validate(); err != nil {
 		return nil, nil, reports, err
 	}
+	m.SignedAt = now.UTC() // Doc 03 §11: signed_at
 	body, err := json.Marshal(m)
 	if err != nil {
 		return nil, nil, nil, err
@@ -36,8 +57,20 @@ func BuildKB(dir, releaseID string, now time.Time, privKey string) ([]byte, []by
 	return body, sig, reports, err
 }
 
+// ClaimsOptions adjust claim release construction. AllowSynthetic admits
+// synthetic test data and is for local/dev only.
+type ClaimsOptions struct {
+	AllowSynthetic bool
+}
+
 // BuildClaims validates a claim registry file and signs it.
 func BuildClaims(path, releaseID string, now time.Time, privKey string) ([]byte, []byte, error) {
+	return BuildClaimsWith(path, releaseID, now, privKey, ClaimsOptions{})
+}
+
+// BuildClaimsWith is BuildClaims with options. Without AllowSynthetic a
+// synthetic registry fails the build.
+func BuildClaimsWith(path, releaseID string, now time.Time, privKey string, opts ClaimsOptions) ([]byte, []byte, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, err
@@ -49,6 +82,9 @@ func BuildClaims(path, releaseID string, now time.Time, privKey string) ([]byte,
 		return nil, nil, fmt.Errorf("claims file: %w", err)
 	}
 	m.ReleaseID, m.Kind, m.CreatedAt = releaseID, claims.KindClaims, now.UTC()
+	if !opts.AllowSynthetic && m.HasSynthetic() {
+		return nil, nil, ErrSyntheticInRelease
+	}
 	if problems := m.Validate(); len(problems) > 0 {
 		return nil, nil, fmt.Errorf("claims rejected: %s", strings.Join(problems, "; "))
 	}

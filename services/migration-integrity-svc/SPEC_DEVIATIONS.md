@@ -7,12 +7,14 @@ general-ledger as its dependency.
 
 **What the service actually is.** A stateless record checker with an audit
 trail: `POST /v1/migrations/validate` takes a list of records (`ref` + string
-fields) and a list of required field names, runs three checks (required
-fields present, duplicate `ref`, numeric format of four hard-coded field
-names), stores the job, its check results and one audit entry per violation,
-and emits events. `POST /v1/migrations/{id}/audit/{entryId}/remediate` flips
-`is_remediated`; `DELETE /v1/migrations/{id}` archives. It never writes to a
-target system, which is consistent with MIG-INV-06.
+fields) and a list of required field names, runs five checks (required
+fields present, source identity presence, duplicate `ref`, numeric format of
+four hard-coded field names, and — added 2026-11-02 — currency-code validity
+of a fifth hard-coded field name), stores the job, its check results and one
+audit entry per violation, and emits events. `POST
+/v1/migrations/{id}/audit/{entryId}/remediate` flips `is_remediated`;
+`DELETE /v1/migrations/{id}` archives. It never writes to a target system,
+which is consistent with MIG-INV-06.
 
 **Where ZS-MIG-001 work lives today.** The opening-balance flow is in
 **financial-close-svc** (ACC-17), not here: `/v1/migration-batches` with
@@ -122,12 +124,32 @@ service. One scoring defect was fixed in this pass (B1).
   B3 states the rule used instead.
 - **A7. Fixed, unversioned checks.** Required fields come from each request;
   the numeric fields are hard-coded (`amount`, `salary`, `balance`,
-  `quantity`); there is no schema-version check (MIG-C03, MIG-N03), currency
-  check (MIG-C12, MIG-N12), date/timezone check (MIG-C13, MIG-N13) or
-  referential check (the `REFERENTIAL_INTEGRITY` and `RANGE_CHECK` types and
-  `ORPHANED_REFERENCE` / `OUT_OF_RANGE` violations are declared but never
-  produced). Rules are not versioned, so a stored result cannot say which
-  rule set produced it (MIG-INV-05).
+  `quantity`); there is no schema-version check (MIG-C03, MIG-N03),
+  date/timezone check (MIG-C13, MIG-N13), or range check (the `RANGE_CHECK`
+  type and `OUT_OF_RANGE` violation are still declared but never produced).
+  Rules are not versioned, so a stored result cannot say which rule set
+  produced it (MIG-INV-05).
+  - *Currency check — closed 2026-11-02 (MIG-C12, MIG-N12).* A fifth check,
+    "Currency Code Validity", validates a record's `currency_code` field (a
+    hard-coded field name, same convention as the numeric-fields check)
+    against a static ISO 4217 alphabetic code list
+    (`domain.validISO4217Codes`). An unrecognized code is quarantined, never
+    silently substituted (MIG-N12): `ORPHANED_REFERENCE`/MQ1/REFERENCE —
+    the `REFERENTIAL_INTEGRITY` check type and `ORPHANED_REFERENCE`
+    violation this item named as "declared but never produced" are now
+    produced by this check, not a new type. A blank or absent
+    `currency_code` is left to the required-fields check, not this one.
+    *Not closed:* the rest of MIG-C12 ("minor units/functional currency
+    valid") — this service holds no minor-unit table per code and no
+    functional-currency context, only the alphabetic code list itself — and
+    the schema-version, date/timezone and general referential/range checks
+    A7 also names, none of which this pass touches. *Tests:*
+    `internal/domain/types_test.go`
+    (`TestIntegrity_CurrencyCodeValidity`); the pre-existing
+    `TestIntegrity_EntriesCarrySeverityFamilyAndOwner` fixture extended with
+    an invalid-currency record so every check still fails in that fixture;
+    `internal/handler/handler_test.go`'s check-count assertion updated from
+    4 to 5.
 - **A8. Empty `ref` is accepted** (closed). A blank `ref` is now its own
   violation, `MISSING_SOURCE_IDENTITY`, reported by a dedicated "Source
   Identity Presence" check before duplicate detection runs (MIG-INV-02 every

@@ -255,3 +255,203 @@ Trigger: in the console, "What plans are available?" asked for a country, and th
   unknown route refused, event payload), traceparent, synonyms, store conformance for feedback/purge/
   append-events on memory and Postgres. All 14 packages pass; golden 37/37; drills 5/5.
 - Record: `docs/suivo/docs-01-05-compliance.md`.
+
+## Master implementation prompt gaps (2026-10-28)
+
+- Checked the Suivo master implementation prompt against what was built. Its reference stack (Node/Fastify/React web component) is REPLACEABLE, so the discovered Go service and Next.js console stay; the delta is in ADR-006.
+- Turn envelope: `answer_class` on every turn, plus optional `status_label` (governed registry vocabulary only), `market_code` and `clarification` {slot, question, options = markets + GENERAL_OVERVIEW}. Validated in `contract.Envelope.Validate` and documented in OpenAPI.
+- "Show general overview" answers the pending question from market-free narrative (fixed per-intent overview query); it no longer falls through to the product overview.
+- Prompts: L1-PROMPT-001, L2-RESPONSE-001 and the L3-EVIDENCE-001 wrapper are sent verbatim and pinned by hash (`model.PromptVersion`); L2-INTENT-001 is pinned for the provider classifier (R0 classifies deterministically).
+- Validator: banned absolutes and action claims added (24/7, round-the-clock, works with every/all, I've submitted/created/sent/scheduled).
+- Config: refuses to start outside dev/test without `PUBLIC_AI_RETENTION` from the signed policy. `GET /config` serves the `ui.*` microcopy registry and page-aware chips.
+- Tests: S01–S10 multi-turn scripts over the HTTP API (`internal/acceptance/scripts_test.go`), envelope and retention tests. Full suite green.
+- Docs: ADR-006, `conversation-assets.md` (T01–T30, S01–S10, banned absolutes, escalation matrix), `owasp-llm-map.md`.
+- Console widget: S00–S09 reducer (`state.ts`, 7 `node --test` cases), status badge (text + icon), market qualifier, clarification chips, pre-send sensitive-data warning (blocks Send), privacy notice, Clear chat, unavailable panel with static routes, copy and chips from `/config`.
+- Verified in the browser against the live dev backend: price question → country chips → United Kingdom → GB price with qualifier, source and one CTA; pasted password → warning, Send disabled; FixtureBooks → "Implemented" badge; Clear chat → S09 with retention notice.
+
+## Widget fix-and-complete prompt (2026-10-28)
+
+- Root cause of "I can't reach the assistant right now": no service was listening where the console calls it (127.0.0.1:18080). The backend worktree had been deleted, and the service's own default port (:8080) is held by local Docker (traefik). The API path itself was healthy (sessions 201, turns 200, replay, 422, 401, 403 all correct). Fix: dev mode now defaults to 127.0.0.1:18080.
+- Duplicate bubbles: the widget's retry appended a new visitor bubble with a new client_turn_id. Fixed: one bubble per question; retry resends the same client_turn_id.
+- Backend: MODEL_PROVIDER=mock (dev/test only, allowlisted model ids), synthetic seed in `data/seed` (every record `synthetic: true`; GB trials expired on purpose) served by default in dev, PUBLIC_AI_SEED_ON_START for Postgres, capability crosswalk validation, PLAN_AVAILABILITY claims, plans-and-trial questions answered from both claims, Other market option, market-named expired-trial abstention, `reason` and `secondary_intent_id` on every turn (UNAVAILABLE only for infrastructure), dev-only per-turn diagnostics log (stage + reason, never text), validator rejects the working name.
+- Tests: `internal/acceptance/seed_test.go` (T1-T9, T11 and seed checks), `internal/isolation/boundary_test.go` (T12). Full suite green; golden 37/37.
+- Widget: logo header (T0), retries without duplicates, S08 panel with official links and Try again, wording per failure type, privacy drawer with retention placeholder, empty-input hint, mobile focus trap. Vitest 10/10, node --test 7/7, Playwright 16/16 in Edge (light and dark).
+- Not done: vector half of hybrid retrieval (lexical + aliases only, ADR-002; no embedding model approved).
+
+## Branding, public mounting and a real public KB (2026-10-28)
+
+- C1 diagnosis (seed dataset, before changes): release, pointers, access filters and locale were healthy (candidates before ACL = after ACL for every test question). Failures came from content and classification: 10 sources packed into 10 chunks with no coverage of Delegated Authority, banking connectors, Evidence or Intelligence; module names and live-dashboard questions fell to I29; answers began with the "SYNTHETIC seed data." preamble.
+- Public KB: `data/public-kb` has 12 markdown articles (areas overview plus 11 dashboard areas), all DRAFT_PENDING_REVIEW, rewritten as public capability text with no counts, status or certification claims. Served only with KB_ALLOW_DRAFT (dev default, refused elsewhere), labelled "Draft content". Production builds with drafts fail; a runtime without the flag refuses a draft release. Ingest quarantines live-dashboard text (QUARANTINE_PRIVATE). Aliases cover AR, AP, GL, VAT, GST, SIEM, HRIS, eSignature, mTLS, delegation of authority, board resolutions, purchase order.
+- Classification: live platform, tenant or dashboard questions are X01 with their own reply and chips, no model call, no CTA; a named area or alias never becomes I29 (falls to I02); recognised questions with no approved content get "I don't have approved information on that yet" with area chips.
+- Retrieval reports candidates before and after access filters, top score and evidence ids; per-turn dev diagnostics log them with slots and claim verdict. Retrieval stays lexical (no embeddings, logged at start).
+- Placeholder URLs (*.invalid and similar) are never exposed by /config: no CTA without a real route; sources show approved titles only.
+- Connector questions without a status claim answer the capability and carry the governed "Unverified" label; signed-claim answers without a narrower status carry "VERIFIED".
+- Tests: K1-K9 in `internal/acceptance/publickb_test.go`. Full suite green; golden 37/37.
+- Frontend: widget moved to `components/assistant`, removed from /admin, mounted from the root layout on allowlisted public paths (/assistant now). Same-origin /public-ai/v1/* route with credentials omit and allowlisted headers. Z-tile branding per spec. Vitest 20/20, Playwright 19/19 (Edge, light and dark).
+- Open decisions recorded in `docs/open-decisions.md` (taxonomy v2.1, public URLs, KB approval, retention, embeddings).
+
+## Groq provider and the Suivo system prompt (2026-10-28)
+
+- Inspection: neither zoiko-suite-backend (all branches) nor zoiko-suite-frontend-platform contained Groq, `openai/gpt-oss-120b`, `GROQ_API_KEY` or the greeting "I'm Suivo, ZoikoSuite's official public-facing assistant". Groq exists only in other local products (zoiko-billing-platform's Python chatbot, zoiko-logia). In this service, greetings are a template ("Hi! I'm the ZoikoSuite assistant…") and the output validator rejects any reply containing "Suivo", so the reported greeting cannot have come from this code.
+- Added: Groq provider behind `model.Provider` (`internal/model/groq.go`), Suivo system prompt file embedded and hash-pinned, `BuildMessages` (system + user) with evidence metadata (source id, authority tier, approval, validity, markets), `MODEL_PROVIDER=groq` / `GROQ_API_KEY` / `GROQ_MODEL` config, ADR-007.
+- Tests: Groq request shape, retry, error hygiene, timeout (model package); Tests 1-8 through the full pipeline with a local fake Groq server (acceptance); a live test that runs only with GROQ_API_KEY (not run: no key on this machine); frontend Test 7 (Playwright). Full suite green; golden 37/37.
+
+## Four improvements: chunking, visitor-IP limits, CT map, tracing (2026-10-28)
+
+- Chunking (Doc 03 §13):
+  - one chunk per heading section, with the heading kept;
+  - limits are 700 tokens maximum, 60 tokens overlap and 40 tokens minimum, estimated at 0.75 words per token (no tokenizer is approved yet; the estimate is written into the manifest's `chunk_policy`);
+  - only a short preamble merges into the next section;
+  - the public KB went from 12 chunks to about 24.
+- Rate limiting by real visitor IP:
+  - the per-IP bucket now uses the visitor's address when the TCP peer is in `PUBLIC_AI_TRUSTED_PROXIES` (default loopback);
+  - `X-Forwarded-For` is read right to left, trusted hops are skipped, and entries left of the first untrusted address are ignored, so a visitor cannot choose their own bucket;
+  - an untrusted peer's header is ignored;
+  - the console's same-origin proxy forwards only the right-most `X-Forwarded-For` entry (`visitorIP`);
+  - before this change every browser visitor shared one bucket, because all traffic arrives through that proxy;
+  - deployment needs the console behind an edge that sets `X-Forwarded-For`, with the edge or console ranges listed in `PUBLIC_AI_TRUSTED_PROXIES`.
+- Contract tests: `docs/suivo/contract-test-map.md` maps CT-001 to CT-052 using Doc 05 numbering. Four older test names use different numbers; the map lists them.
+  - Added: CT-002 (missing or forged grant), CT-006 (unknown schema on a turn), CT-016 (invalid status enum), CT-046 (no public event-ingest route).
+  - Result: 41 covered, 7 partial, 3 not applicable in R0 (020, 037, 051) and 1 gap (042, DLQ replay tool).
+- OpenTelemetry (`internal/telemetry`, OTLP/HTTP, otel v1.38.0):
+  - off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set;
+  - spans: HTTP server (method, route, status, request id; continues a valid `traceparent`), `public_ai.turn` (outcome, reason, intent, KB release, prompt version, retrieval mode, count and public chunk ids, claim verdict, citation count) and the model call (`gen_ai.operation.name`, `gen_ai.request.model`, token usage, `error.type`);
+  - the exporter is wrapped in an allowlist: any other attribute, every span event and every status description is dropped, so `gen_ai.input.messages` and similar keys cannot be exported;
+  - tests check the filter, a full turn, and a real OTLP export to a local receiver (no visitor text on the wire);
+  - the T12 boundary test now allows the three standard `OTEL_*` names.
+
+## Running on Postgres and answer check (2026-10-28)
+
+- Database per IMPLEMENTATION_PROMPT §5.1 and ADR-002:
+  - setup: Postgres 16, database `public_ai`, its own `public_ai_app` role;
+  - local container `public-ai-postgres-dev` on 127.0.0.1:55433;
+  - the connection string is in the gitignored `services/public-ai-svc/.env.local`.
+- Verified on that database:
+  - migrations create all 10 `public_ai` tables;
+  - `PUBLIC_AI_SEED_ON_START` signs and publishes the public KB and claims releases, and the pointers swap;
+  - `TestPostgresConformance`, `TestPostgresMigrationsRoundTrip` and `TestPostgresRevocationsAppendOnly` pass;
+  - turns store a request hash and the reply envelope only, and no visitor text was found in the stored rows.
+- Answer check through the HTTP API on Postgres (mock model): 12 document questions (Doc 02 I01/I02, K1, K2, K4, K5, G04, G10, G16, G18, G21, G23).
+  - Fixed: "ZoikoOne" written as one word was not recognised as another product, so the bot answered with ZoikoSuite modules. The cross-product rule now matches one-word, two-word and hyphenated forms of the Zoiko products named in the documents (One, Logia, Tech, Mobile, Telecom, Contracting). G23 now gives the CROSS_PRODUCT reply.
+
+## Retriever interface and vector slot (2026-10-28)
+
+- `internal/knowledge/retriever.go` adds:
+  - `Retriever`, which the lexical index implements;
+  - `Embedder`, the pinned embedding model interface;
+  - `Hybrid`: BM25 plus vector recall with RRF fusion, filters before ranking, the stale/revoked verdict kept, and a keyword fallback when embedding fails.
+- `release.Snapshot.Retriever` is used by the pipeline. `release.Runtime.Embedder` is the slot; it is unset in R0, so retrieval stays keyword-only, and `VectorError()` reports a failed release embed.
+- Tests: `knowledge` (default retriever, vector recall, private chunk filtered, revoked kept, query fallback, bad vectors) and `release` (lexical default, hybrid with an embedder, lexical fallback without going not-ready). ADR-002 updated.
+
+## Gap review against the documents (2026-10-28)
+
+- Answer quality:
+  - "What is ZoikoSuite?" now gets the approved platform overview from Doc 02 T02 (new draft article `00-overview.md`, intent I01) instead of the module list.
+  - I01 now also catches "Explain ZoikoSuite to me", "What's ZoikoSuite?", "Zoiko Suite" written as two words, "describe…" and "new to…"; "Explain ZoikoSuite to me" was previously answered as out of scope.
+  - I22 now catches "sign-in" with a hyphen and "account access"; I23 now catches "existing customer" and ticket phrasings.
+  - New `policy.TestDoc02CatalogExamples` is generated from the Doc 02 catalog; all 30 intents classify correctly.
+- Contract tests:
+  - CT-014: the widget ignores a reply whose `turn_sequence` is older than one already shown;
+  - CT-032: tests for forged, path, case-changed and empty citation anchors;
+  - CT-039: test that unknown route keys and routes outside their window resolve to nothing;
+  - CT-048: test that a kill switch thrown during generation withholds the answer.
+  - Map is now 45 covered, 3 partial, 3 not applicable in R0, 1 gap.
+- Compliance and traceability rows that were out of date are updated: chunking, OpenTelemetry, the Groq and Postgres stack, the CT mapping, and the automated accessibility checks.
+
+## Support dead end and live-data reply (2026-10-28)
+
+- Reported from the console (screenshot): "Active Microservices Directory" was refused (correct: the public assistant has no route to live platform data, INV-01 and Doc 03 §27). Its own "Get support" button sent "I need help from support", which was classified as I21 (help docs). With no guide article it ended in "I couldn't verify that" / "Which ZoikoSuite area…?".
+- Fixes:
+  - I23 now catches "help from support", "need support", "get support", "support team", "talk/speak/reach support";
+  - a help or support intent (I21–I24) with no approved guide now gives the Doc 02 T16 support reply instead of the area question (G26);
+  - the I23 reply now uses the Doc 02 T16 copy;
+  - the live-data reply (X01) now tells the visitor to use the ZoikoSuite application they are signed in to, following Doc 02 T21.
+- Test: `TestK5_LiveMicroservicesRefused` now also follows the "Get support" button through to the I23 support reply.
+- Still open: no "Open support" button is shown, because the support route has only a placeholder URL (`*.invalid` routes are never exposed). It appears once Product supplies the real Support Center URL (`docs/open-decisions.md`).
+
+## Live platform data: refusal kept, chatbot off /admin (2026-10-28)
+
+- Product decision: keep refusing live platform data (Docs 01 FR-16, 03, 04, 06, 11). The authenticated copilot is deferred to R2 as OD-06 in `docs/open-decisions.md`. No new ADR.
+- The X01 reply goes back to the fixed text "I can't see live platform data or account information. I can explain what ZoikoSuite's services and modules do, using public information.", which reverses the T21 rewording from earlier today. The chips are Explore modules and Get support; there is no CTA and no model call.
+- Fixed: "domain status" was classified as I29 and sent to the model. The live-data rule now also matches domain, service, microservice, cluster and platform status, health, readiness and uptime, plus "domains monitored", "operational status", "needs attention" and "services ready".
+- New test `acceptance.TestLivePlatformQuestionsAlwaysRefused` covers "What are the Active Microservices", "how many services are ready", "show cluster readiness", "domain status" and two variants: each gets X01, the fixed text, no CTA or citations, no digit, and no model call.
+- Frontend:
+  - the widget is active only on `/assistant` (removed from `/admin`);
+  - ESLint `no-restricted-imports` and `import-boundary.test.tsx` fail if chatbot code imports dashboard, health, auth or session modules or references `getDomainHealth`; both were checked with a probe import;
+  - a Playwright test checks that `/admin` shows no launcher and sends no assistant calls when signed in.
+
+## Assistant shown on /admin again (2026-10-28)
+
+- Product owner decision: the launcher returns on `/admin` and its pages. It is still the anonymous public assistant: it sends no cookies or Authorization, still refuses live platform data (X01), and the import-boundary lint rule and test stay. The mount test, the Playwright test, the widget README and OD-06 are updated.
+
+## Answer review: modules, overview and Legal and Contracts (2026-10-28)
+
+The answers were checked against the documents using console screenshots.
+
+- "What modules does ZoikoSuite include?" listed the 11 dashboard areas, which is wrong per Doc 03 §5. It is now answered from a new draft article, `00-modules.md`, with:
+  - the four module domains and ten canonical modules named in Doc 03 §5;
+  - the Governance Platform and Platform Foundation tiers from Doc 02 T03;
+  - the availability qualifier.
+  - The dashboard-areas article is retitled "Areas in the ZoikoSuite console".
+  - OD-01, ADR-007 and the taxonomy crosswalk no longer claim that the documents give no module names; stable IDs are still pending v2.1.
+- "What is ZoikoSuite?" dropped the T02 qualifier "The precise capabilities available depend on market, plan and deployment status." The mock model now always keeps an availability qualifier from the passage it answers from (G01).
+- "What does Legal and Contracts do?" left out approval-bound execution. Retrieval now adds the next section of the top article as supporting evidence (`knowledge.Index.Neighbor`, with every mandatory filter applied), and the mock adds that section's opening sentence. Groq receives the same evidence.
+- Tests: K3 (modules per Doc 03 with the qualifier and no count), K10 (overview qualifier), K11 (Legal and Contracts complete), and Groq2 (cites `kb-core-modules`).
+
+## Answer quality pass (2026-10-28)
+
+A 47-question sweep covered every Doc 02 intent and every KB article. It found six kinds of weakness, each fixed at its cause:
+
+1. **The wrong article answered.**
+   - Generic verbs (support, handle, work, use, get, need, want, offer, provide) are now stopwords, so "Does it support HR?" no longer lands on Evidence ("the work they support").
+   - An article whose title the question names ranks higher (×2), so "the compliance module" finds Compliance, not the module list.
+   - Added the synonym "hr" → human resources.
+2. **No source for an intent.** Doc 02 product copy was added as draft articles: T04 multi-entity (I03), T09 migration (I11) and T15 governance and approvals (I15).
+3. **Boundary questions answered from unrelated text.** Doc 02 boundary replies now cover data residency (T11, I14), roadmap or unverified availability (T18, I25), accessibility (T30, I27) and responsible AI (I30, from the welcome disclosure). They are used only when no retrieved article is tagged for the intent. For example, "Where is data stored?" had been answered with the Integrations text.
+4. **Classifier misses.**
+   - "What can ZoikoSuite do?" is now I01.
+   - "who can approve", "on behalf of" and "act for" are now I15.
+   - The openers "how do I" and "how to" are no longer I21 phrases, so they can't outscore the topic ("How do I migrate…" is I11).
+   - The console-areas article is no longer tagged I25 (roadmap).
+5. **Caveats cut off.** A passage of three sentences or fewer is used whole, so endings such as "…a scoped review is needed before any timeline or compatibility commitment" are kept.
+6. **Second section missing.** A next section that search had already found lower down is moved up to second place, and short sections are added whole (Compliance, Delegated Authority, Security and Trust).
+
+- Test: `acceptance.TestAnswerQuality` has 20 questions, each with its expected source (or Doc 02 reply) and required phrases, and fails if an unrelated article is cited.
+- Still open: Intelligence and Reporting has only a placeholder article (owner review), and the content is draft or synthetic until approved.
+
+## Answer shaping and the model's answer-quality rules (2026-10-28)
+
+- Dev composer (mock model):
+  - a long list sentence such as "Lead: Label (items), …" is shaped to the question;
+  - a general question gets a bulleted list with bold labels, and the caveat on its own line;
+  - a question that names one group ("Does it handle payroll?", "HR", "treasury") gets only that group plus the caveat, with no extra sections;
+  - shaping only reorders the article's own words (adding "include").
+  - Tests: `acceptance.TestAnswerShaping` and `model.TestShape*`.
+- Model contract (Groq): `model.ServerContract` now asks the model to answer the exact question in the first sentence, use only the records on the question's topic, keep every availability, scope or status qualifier, and use a short "- " list for three or more parallel items. The contract is included in the prompt-version hash (`SERVER-CONTRACT-002`), and the Doc 02 prompts are unchanged.
+
+## Work moved to the main checkout; chatbot dev port is 8001 (2026-10-28)
+
+- At the product owner's request, all chatbot work now lives in `C:\zoiko-suite-backend` (branch `Madhu`) instead of the `zoiko-suite-backend-r0` worktree (`suivo/r0-build`).
+  - The worktree's 3 unmerged commits and its uncommitted changes were applied as one patch from the merge base `5ac641a2` (55 changed files, applied cleanly) plus 58 new files. All 113 files match the worktree exactly.
+  - Nothing was committed or pushed. The gitignored `.env.local` (local Postgres) was copied over.
+- Dev port: the chatbot backend now defaults to `127.0.0.1:8001`, as do the console proxy default, `.env.example`, the README, `scripts/run-dev-postgres.ps1` and `docker-compose.public-ai.yml`. Port 8000 stays with the main ZoikoSuite gateway (`GATEWAY_PORT`, `ZOIKO_GATEWAY_URL`). Playwright still starts its own backend on 18181.
+- Verified from the main checkout: backend 18/18 packages, golden 37/37, Postgres tests, Vitest 40/40, Playwright 52/52, and the console (3000) reaching the chatbot (8001).
+
+## Answers aligned to Doc 02's approved copy (2026-10-28)
+
+- Fixed replies now use Doc 02 §12 visitor-facing copy word for word:
+  - T01 welcome, T05 market-dependent pricing question, T07 enterprise (new, I09), T11, T16, T17 sign-in, T18;
+  - T19 cross-product ("This assistant" for the uncleared working name);
+  - T20 advice, T21 records and actions (X01 records and X02), T22 sensitive data, T23 security reporting;
+  - T24 unavailable (the widget shows the reference), T25 off-topic, T26 ask for a person, T30.
+  - Not changed: the X01 live-platform reply keeps the product owner's wording.
+- `policy.TestRepliesUseDoc02Copy` reads Doc 02 at test time and fails if any of these 16 replies drifts.
+- Knowledge articles gained Doc 02 product copy:
+  - T08 APIs and connectors (integrations);
+  - T12 jurisdictions are not universal (tax);
+  - T13 workforce and payroll (new `00-workforce.md`);
+  - T14 assurance and admissibility (evidence).
+- Claim-gated facts stay claim-gated. T10 ("SOC 2/ISO not held") and T06 ("30-day trial") are not fixed text; an unverified certification now gets T10's due-diligence guidance instead (`TplAbstainCertification`).
+- G12: "Do you / does it / can ZoikoSuite + verb" with no "my", "our" or "for me" is a capability question, not an action request (X02), so "Do you file taxes in Germany?" is I17 behind the regional coverage gate. "File my taxes" is still refused. The tax intent now also matches taxes, taxation, tax filing and tax returns.
+- G14: admissibility and assurance questions are I16. They are answered only from a passage that addresses admissibility, otherwise with T14; they are never refused as advice and never answered from unrelated text.
+- Tests: `TestDoc02CapabilityVersusAction`; TestAnswerQuality is updated (workforce T13, integrations T08); golden A08 now expects T01's "ZoikoSuite AI guide".

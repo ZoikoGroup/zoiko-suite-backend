@@ -84,8 +84,13 @@ func TestClarificationCarriesPlan(t *testing.T) {
 		t.Fatalf("turn 1: %+v", r1)
 	}
 	r2 := e.Pipeline.Answer(ctx, orchestrator.Input{Message: "In the United States, per month", Pending: r1.Pending, Locale: "en-US"})
-	if r2.Status != contract.Answered || !strings.Contains(r2.Text, "XTS 49.00") || strings.Contains(r2.Text, "XTS 19.00") || r2.Pending != nil {
+	if r2.Status != contract.Answered || !strings.Contains(r2.Text, "XTS 49.00") || strings.Contains(r2.Text, "XTS 19.00") {
 		t.Fatalf("turn 2: %+v", r2)
+	}
+	// After the answer only the question stays open, for "what about the UK?"
+	// (Doc 02 G05): the old plan and billing are not carried.
+	if p := r2.Pending; p == nil || !p.Answered || p.Intent != "I05" || p.PlanName != "" || p.BillingCadence != "" {
+		t.Fatalf("turn 2 pending: %+v", r2.Pending)
 	}
 	// A new topic drops the carry-over.
 	r3 := e.Pipeline.Answer(ctx, orchestrator.Input{Message: "Can I book a demo?", Pending: r1.Pending})
@@ -159,7 +164,7 @@ func TestPrivateDataAndActionsRefused(t *testing.T) {
 		"Pay my invoice from Acme now": "X02",
 	} {
 		r := ask(e, msg, "")
-		if r.Status != contract.RefusedAction || r.IntentID != x || len(r.Citations) != 0 || action(r) != "support" {
+		if r.Status != contract.RefusedAction || r.IntentID != x || len(r.Citations) != 0 || action(r) != "sign-in" {
 			t.Errorf("%q: %+v", msg, r)
 		}
 	}
@@ -334,5 +339,63 @@ func TestOutOfScope(t *testing.T) {
 	e := newEnv(t)
 	if r := ask(e, "What's the weather in Paris?", ""); r.Status != contract.Abstain || r.IntentID != "I29" {
 		t.Fatalf("got %+v", r)
+	}
+}
+
+// killDuringGenerate throws the kill switch while the model is generating.
+type killDuringGenerate struct {
+	inner model.Provider
+	flip  func()
+}
+
+func (k killDuringGenerate) Name() string { return k.inner.Name() }
+
+func (k killDuringGenerate) Generate(ctx context.Context, req model.Request) (model.Draft, error) {
+	k.flip()
+	return k.inner.Generate(ctx, req)
+}
+
+// CT-048: a kill switch thrown mid-flight withholds the active turn's final.
+func TestKillSwitchMidFlightWithholdsAnswer(t *testing.T) {
+	e := newEnv(t)
+	e.Pipeline.Model.Provider = killDuringGenerate{inner: e.Pipeline.Model.Provider, flip: func() { setFlag(t, e, flags.PublicAIEnabled, "false") }}
+	r := ask(e, "Which finance modules does ZoikoSuite include?", "")
+	if r.Status != contract.Unavailable || r.Reason != contract.ReasonKillSwitch || len(r.Citations) != 0 {
+		t.Fatalf("got %s %s %+v", r.Status, r.Reason, r.Citations)
+	}
+}
+
+// Doc 10 App. B: with commercial_routes_enabled off, a demo or pricing CTA
+// falls back to the support route; nothing else changes.
+func TestCommercialRoutesFlag(t *testing.T) {
+	e := newEnv(t)
+	if got := action(ask(e, "I'd like to book a demo", "")); got != "demo" {
+		t.Fatalf("flag on: %q", got)
+	}
+	setFlag(t, e, flags.CommercialRoutesEnabled, "false")
+	if got := action(ask(e, "I'd like to book a demo", "")); got != "support" {
+		t.Fatalf("flag off: %q, want support", got)
+	}
+}
+
+// Doc 06 §13: at the conversation's own token cap the reply says so and
+// points to a new conversation; it is not reported as an outage.
+func TestSessionCapIsNotAnOutage(t *testing.T) {
+	e := newEnv(t)
+	r := e.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_cap", Message: "What does the tax module do?", Locale: "en-US",
+		Budget: orchestrator.BudgetStatic, SessionCapped: true})
+	if r.Status == contract.Unavailable || !strings.Contains(r.Text, "new conversation") {
+		t.Fatalf("got %s %q", r.Status, r.Text)
+	}
+}
+
+// Doc 03 §2, KB-004: a regional tax, payroll or legal question for a market
+// with no signed MARKET_AVAILABILITY claim is not answered as covered, even
+// when a page is tagged with that market.
+func TestRegionalCoverageNeedsMarketClaim(t *testing.T) {
+	e := newEnv(t)
+	r := ask(e, "Do you handle VAT filing in Ireland?", "IE")
+	if r.Status == contract.Answered {
+		t.Fatalf("IE has no market claim, yet answered: %q", r.Text)
 	}
 }

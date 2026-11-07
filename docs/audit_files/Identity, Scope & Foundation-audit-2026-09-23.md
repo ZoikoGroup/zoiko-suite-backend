@@ -3023,3 +3023,114 @@ required.
   gateway-auth 64, search-indexer 258, notification 634, delegated-authority 109,
   access-control 136). Docker Desktop is not installed, so image builds and compose/live
   acceptance remain unrun; CI remains the release gate.
+
+# identity-context-svc completion pass, 3 November 2026: issues found
+
+**Why.** The auth-plane plan (`AUTH-PLANE-PLAN-2026-11-02.md`, IC-0 … IC-10) was verified on
+3 Nov and left four items open (IC-9 passkeys and live federation probe, IC-FE-1 compose half,
+the console's resets / federation / diagnostics tabs, the DoD documents). Closing them meant
+re-reading the code behind each, and that turned up the findings below. Two of them (N-1, N-3)
+were claimed done or never exercised; one (N-2) is a hole that the new feature would have opened.
+
+**Scope and scores.** identity-context-svc and access-control-svc. Every finding is outside the
+scored GOV-01 rows (as F-5 was): **no Group 1 score changes** (identity 42/44, access-control
+10/10). The AU-01 … AU-11 re-score is in `Auth-Service-audit-2026-10-14.md`, last section.
+
+**Test evidence.** `shashi-changes`, the code as committed below (the tests ran on the same tree before commit).
+
+| Check | Result |
+|---|---|
+| identity-context-svc, `go build` / `go vet` | clean |
+| identity-context-svc, full suite in golang:1.26-alpine against Postgres 16 (`REQUIRE_DB_TESTS=1`) | **813 pass / 0 fail / 0 skip** (host binaries are blocked by Windows Application Control) |
+| `deployments/scripts/e2e-identity-context-deps.py`, live, image rebuilt 3 Nov 16:34 | **61/61** (was 47) |
+| `scripts/audit.sh`, live, Prometheus up | 37/38; the failure is section 2 (host `go test`, Application Control) |
+| Federation probe with `FEDERATION_ENABLED=true`, then off again | see N-3 |
+| access-control 000027 | up/down/up on a scratch DB, then applied to `access_control` (31/31) |
+| Mutants on a scratch copy (clone refusal, ceremony bound to its principal, federation entity) | 3/3 killed |
+
+## Findings, ranked by risk
+
+### N-1 · identity-context-svc: passkeys (AU-11) were claimed present and did not exist (claims / auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Passkey / WebAuthn factor | IAM §3, §13 (preferred phishing-resistant factor); AU-11; progress.md IC-9 "Passkey/WebAuthn … already present" | Table `webauthn_credentials` (000014), five store methods with **no caller**, and the hosted-login hooks `/oauth2/login/passkey/begin|finish` behind `oidc.Options.Passkeys`, which `main.go` never set | ✅ fixed (was ❌) | **Code + live.** The hooks' comment pointed at an `internal/webauthn` package that was never written, and there was no registration route at all, so no principal could ever hold a passkey and the login step always answered `passkey_not_available`. The 3 Nov verification table did not list it because IC-9 had marked it DONE. Built `internal/webauthn` on go-webauthn v0.17.4: single-use ceremonies in Redis bound to principal, tenant and purpose; user verification required; clone detection by signature counter; decision rows and events in the transaction of the credential change. Routes: `/v1/mfa/passkeys/register/begin|finish`, `GET /v1/mfa/passkeys`, `/v1/mfa/passkeys/revoke`, `/v1/authenticate/step-up/passkey/begin|finish`; the administrator MFA reset retires passkeys too. Live: an assertion from another origin 401 `passkey_rejected`; the step-up envelope carries `assurance_level: PHISHING_RESISTANT` |
+| Hosted-login passkey step | IAM §17 step order | `LoginPasskeyFinish` did not check that a passkey had been offered for this pending login, and did not count failed tries | ✅ fixed | Same rule as begin; failures count towards `maxSecondFails` and the login failure budget (429 + `Retry-After`, `TestAU11_HostedLoginRefusesAWrongPasskeyAndThrottles`) |
+
+### N-2 · identity-context-svc: a stolen password could add a second factor beside a passkey (auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Adding a factor beside an existing one needs that factor | IAM §3 ("changing who can step up is itself sensitive"); the service's own enrolment rule | `MFAService.Enrol` checked only `HasActiveTOTP` | ✅ fixed | **Code.** Latent until passkeys existed: for a person whose only factor is a passkey, a password-only session could enrol the attacker's authenticator app and then step up with it. The gate now counts any active factor (`TestAU11_PasskeyBesideAnExistingFactorNeedsStepUp`); a passkey registration beside any factor has the same gate |
+
+### N-3 · identity-context-svc: every federation admin route answered 503 once federation was on (availability / auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Federation admin routes authorized at the request's scope | INT-10; AU-07 | `internal/federation/handler.go` `require()` called `CheckAllowed(ctx, principal, c.tenantID, action, c.tenantID)`, the tenant id in the legal-entity slot | ✅ fixed | **Live.** With `FEDERATION_ENABLED=true`, authorization-svc answered 403 `tenant_scope_mismatch` and the client failed closed, so `GET /v1/federation/connections`, `/links` and every command answered 503 `authz_unavailable`. This is the defect `internal/context` fixed earlier (see F-2's history: `cbdb4aa1`), left behind in the federation package because federation is off by default and had never been probed live. Fixed with the envelope's legal entity (header fallback), pinned by `TestAdminRoutesAuthorizeAtTheLegalEntityNotTheTenant`. After the fix: admin 200 `[]`, a principal with no grant 403, a forged id_token 401 `invalid credentials`, `/scim/v2/*` 404 with provisioning off |
+
+### N-4 · access-control-svc: the six FEDERATION_* actions were never registered (auth, plan §2 R5)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Every action a gate checks is registered and carried by a template | R5; S1-B2 | identity-context-svc checks `FEDERATION_READ`, `_CONFIGURE`, `_APPROVE`, `_SUSPEND`, `_LINK`, `_PROVISIONING_MANAGE`; `permission_definitions` had none | ✅ fixed | **Live.** Even with N-3 fixed, every federation gate could only answer DENIED. Migration `000027_register_federation_actions` registers them (APPROVE CRITICAL, READ STANDARD, the rest HIGH) and publishes version 3 of IDENTITY_SUPPORT_OPERATOR (+READ), IDENTITY_SUPPORT_APPROVER (+READ, +APPROVE) and IDENTITY_ADMINISTRATOR (+READ, CONFIGURE, SUSPEND, LINK, PROVISIONING_MANAGE). A guard fails the migration if any template both configures and approves. The demo bundle `IDENTITY_ADMIN_FULL` in `seed-demo-rbac.ps1` grants them locally |
+
+### N-5 · identity-context-svc: the console client was optional at login (auth, register R-1)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Login by a confidential client with a verified channel | IAM §18; R-1; IC-FE-1 | Compose `IDP_CLIENT_AUTH: "optional"`; the E2E scripts, `audit.sh`, `verify.ps1` and gateway-auth-svc's `audit.sh` sent no client | ✅ fixed | **Live.** Compose now `required`; every caller sends `zoiko-console` (overridable by `IDENTITY_CONSOLE_CLIENT_ID` / `_SECRET`). E2E: a login without the client is 401 `invalid_client`. `deployments/scripts/e2e-authorization-deps.py` (untracked since 2 Nov) was changed the same way; its login step passes, its full 33-check run was not repeated |
+
+### N-6 · identity-context-svc: the MFA failure counter never moved (observability)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| `identity_mfa_verifications_total{outcome}` | IAM-6 / IC-8; the step-up failure-ratio alert in `deployments/prometheus-rules.yml` | Incremented at the end of `verifyCode`, after every refusal path had already returned | ✅ fixed | **Code.** `outcome="failure"` stayed 0 for every wrong, replayed or locked code, so the failure-ratio alert could never fire. Each refusal path (and each passkey refusal) now counts |
+
+### N-7 · identity-context-svc: governed resets had no register, a wrong KPI and no decision reason (evidence / console)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Password resets register | IC-FE-3 (tab "Password resets") | No list route; only `GET /v1/password-resets/{id}` | ✅ fixed | `GET /v1/password-resets` (cursor-paged, `filter[status]`, `filter[principal_id]`, authorized at IDENTITY_PRINCIPAL_READ); a pending or unused request past expiry reads EXPIRED. Each row names its requester so the console keeps approve / reject from the maker (rendered live: the requester's own request shows no buttons). RLS checked as a NOBYPASSRLS role |
+| KPI "resets awaiting approval" | console summary | Counted every `PENDING_APPROVAL` row, expired ones included | ✅ fixed | `AND expires_at > NOW()` |
+| A reason on every change | plan Console rule | `POST /v1/password-resets/{id}/decide` took only `decision` | ✅ fixed | Optional `reason` (≤ 500) stored on the approval and in `identity.password_reset.decided`; the console always sends one |
+
+### N-8 · identity-context-svc: `scripts/audit.sh` could not be run twice (DoD artefact)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Repeatable audit | DoD gate 12 | Fixed Idempotency-Keys (`au6`, `np3`, …); NP4 revoke without If-Match; Prometheus on `localhost` | ✅ fixed | **Live.** The second run answered 409 `IDEMPOTENCY_MISMATCH` (keys are kept for days) and NP4 428 since API-3. Keys are now per run, NP4 reads the ETag and also checks that a revoke without If-Match is 428, Prometheus is `$PROM` (127.0.0.1) |
+
+### N-9 · zoiko-suite-frontend-platform: no page to enrol a second factor (console)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Enrol / remove a factor from the console | AU-11; the step-up dialog's "Set up two-step verification" link | The link went to `/admin/account/security`, which did not exist; `beginEnrolmentAction` / `confirmEnrolmentAction` had no page | ✅ fixed | New Sign-in security page in the v2.0 layout (factors and sign-ins tabs, add a passkey, set up an authenticator app, remove behind step-up); "Use a passkey instead" in the shared step-up dialog. Rendered live |
+| Problem codes in the account actions | identity-context-svc sends RFC 9457 `code` | `mfaProblem` matched `invalid_code`, `step_up_required`, … against the message text, which carries only `detail` | ✅ fixed | Matching reads the problem `code` too |
+| Identity console tabs | IC-FE-3: Password resets, Federation (honest "not enabled"), Diagnostics | Missing | ✅ fixed | Built and rendered live, including the "federation is not enabled" state |
+
+## Also noted (not scored)
+
+- **IC-7's "template grant store test" does not exist.** progress.md lists one for migration
+  000026; access-control-svc has no Go test naming those actions. The migrations' own DO-block
+  guards are the check (000026 and the new 000027).
+- **`mfa_enrolled` on `/v1/authenticate` reports TOTP only.** A person whose only factor is a
+  passkey reads as not enrolled. Left as is on purpose: the console uses the flag to choose the
+  TOTP code prompt. The step-up dialog now offers a passkey either way.
+- **RUNBOOK had no federation section** although IC-9 required one; §12 (turning it on and off)
+  and §11.6 (passkeys) were added.
+- **SPEC_DEVIATIONS gained two entries:** SAML federation (decision D-4) and passkey attestation
+  (`none`, no authenticator allow-list; a Security decision).
+
+## Still open after this pass (what each needs)
+
+| Item | Needs |
+|---|---|
+| S1-C1 / IC-6 live entitlement | commercial-account-svc running on the local stack (code, config and test are done) |
+| A passkey ceremony in a real browser | A person with a platform authenticator (the live proof used a P-256 software authenticator; headless Chrome has none) |
+| Passkey-first (usernameless) login | Not built: passkeys are a second factor only |
+| AU-08 live SCIM | `FEDERATION_PROVISIONING_ENABLED=true` and an operator grant for `IDENTITY_SERVICE_PRINCIPAL_ID` |
+| AU-05 live key rotation | A rotation exercised with two published keys (JWKS publishes one locally) |
+| SAML | Decision D-4 |
+
+**Commits** (`shashi-changes`, 3 Nov): backend `a374c56b` (access-control 000025), `8049bd5c` (000027), `13299a0c` (federation), `8e7cbc19` (passkeys, resets, MFA), `d8e1a895` (client auth, E2E, audit), `feec479b` (override); frontend `9dbf896` (identity tabs), `5ee180d` (Sign-in security). The docs commit that follows them records this list.

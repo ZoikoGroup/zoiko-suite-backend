@@ -15,7 +15,8 @@ transactional outbox, tenant RLS and the real ORG-07 party lookup exist. The
 authoritative four-object model, most server-resolved context, independent
 verification, read authorization/purpose limitation, the verified event,
 event-driven AP invalidation and at-rest tokenisation are not present. Command
-idempotency and the activation auto-supersede event are closed in this pass.
+idempotency, the activation auto-supersede event, and the uniqueness indexes'
+tenant scoping are closed in this pass.
 
 ## A. Not implemented / weaker than the spec
 
@@ -149,20 +150,34 @@ idempotency and the activation auto-supersede event are closed in this pass.
     attempts one, so this is a spec-semantics/defence-in-depth gap rather than a
     reachable bypass through supported commands.
 
-11. **A11 — The uniqueness indexes are not tenant-scoped.** §4.10's
-    "Idempotency / concurrency" row requires "Destination candidate fingerprint
-    detects duplicates; activation only one active version per party/scope
-    unless explicit multi-destination policy." The two database invariants are
+11. **A11 — The uniqueness indexes are not tenant-scoped. Closed (migration
+    000006).** §4.10's "Idempotency / concurrency" row requires "Destination
+    candidate fingerprint detects duplicates; activation only one active
+    version per party/scope unless explicit multi-destination policy." The two
+    database invariants were
     `uq_payee_destinations_fingerprint (party_ref, fingerprint) WHERE status <> 'SUPERSEDED'`
     and `uq_payee_destinations_active_scope (party_ref, scope) WHERE status = 'ACTIVE'`
-    — neither includes `tenant_id`. RLS confines reads
-    and writes, but a PostgreSQL unique index is global, so the database treats
+    — neither included `tenant_id`. RLS confined reads
+    and writes, but a PostgreSQL unique index is global, so the database treated
     equal `(party_ref, fingerprint)` or `(party_ref, scope)` values in two
     tenants as a conflict. `party_ref` is an ORG-07 UUID and is very likely
-    globally unique in practice, which is why this is not an everyday failure;
-    it is still not a structural tenant boundary. A migration should add
-    `tenant_id` to both indexes (with the same partial predicates) before this
-    service is relied on for cross-tenant isolation.
+    globally unique in practice, which is why this was not an everyday failure;
+    it was still not a structural tenant boundary. Closed by
+    `deployments/migrations/000006_tenant_scoped_uniqueness.{up,down}.sql`,
+    which rebuilds both indexes as
+    `(COALESCE(tenant_id::text, ''), party_ref, fingerprint)` and
+    `(COALESCE(tenant_id::text, ''), party_ref, scope)` with the same partial
+    predicates — the same idiom `payment-status-svc`'s migration 000009 already
+    uses for the identical nullable-`tenant_id` situation, so every legacy
+    NULL-tenant row still shares one bucket (preserving pre-migration global
+    dedup for them) while every tenant-tagged row now gets a real per-tenant
+    boundary. No store-layer change was needed: unique-violation handling in
+    `isUniqueViolation`/`isCommandIdempotencyViolation` dispatches on the
+    Postgres error code and, for the idempotency-table case, the constraint
+    name — neither index's name changed. Tests:
+    `internal/store/tenant_scoped_uniqueness_integration_test.go`
+    (`TestTenantScopedUniqueness_SameFingerprintAcrossTenantsDoesNotConflict`,
+    `TestTenantScopedUniqueness_SameActiveScopeAcrossTenantsDoesNotConflict`).
 
 12. **A12 — Full account identifiers are masked on output but not tokenized or
     encrypted at rest.** The mandatory control says "Full account identifiers
@@ -349,7 +364,9 @@ idempotency and the activation auto-supersede event are closed in this pass.
   `TEST_DATABASE_URL` pointed at a fresh disposable `postgres:16-alpine`
   container (`payee_it` database), not the shared development database — all
   unit and store integration tests pass, including the new
-  `idempotency_integration_test.go` suite and the updated outbox assertions.
+  `idempotency_integration_test.go` suite and the updated outbox assertions;
+  re-run after migration 000006 (tenant-scoped uniqueness) adds the new
+  `tenant_scoped_uniqueness_integration_test.go` suite — all pass.
 - `payment-authorization-svc`: `go test ./internal/handler -run
   'ORG10|Payee|Destination'` passes, covering the existing pull-based
   fail-closed AP-10 path that B4/A9/A10 describe.

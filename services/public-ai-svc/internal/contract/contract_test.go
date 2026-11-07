@@ -17,6 +17,8 @@ func TestTurnRequestValidation(t *testing.T) {
 		field string
 	}{
 		{"ok", func(*TurnRequest) {}, ""},
+		{"trust page (Doc 02 §22)", func(r *TurnRequest) { r.PageContext = "trust" }, ""},
+		{"unknown page", func(r *TurnRequest) { r.PageContext = "blog" }, "page_context"},
 		{"bad schema", func(r *TurnRequest) { r.SchemaVersion = "2.0" }, "schema"},
 		{"short session", func(r *TurnRequest) { r.SessionID = "x" }, "session_id"},
 		{"bad uuid", func(r *TurnRequest) { r.ClientTurnID = "nope" }, "client_turn_id"},
@@ -56,12 +58,33 @@ func TestNormalizeMessage(t *testing.T) {
 }
 
 func TestEnvelopeValidate(t *testing.T) {
-	e := Envelope{SchemaVersion: "1.0", TurnSequence: 1, Status: Abstain, IntentID: "I05", KnowledgeReleaseID: "kb-1", PolicyVersion: "p", Citations: []Citation{}, Actions: []Action{}}
+	e := Envelope{SchemaVersion: "1.0", TurnSequence: 1, Status: Abstain, IntentID: "I05", KnowledgeReleaseID: "kb-1", PolicyVersion: "p",
+		Citations: []Citation{}, Actions: []Action{}, AnswerClass: HandoffUnknown, SafetyDisposition: DispositionEscalate}
 	if err := e.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	bad := e
-	bad.Status = Answered // ANSWERED without provenance is rejected
+	bad.SafetyDisposition = DispositionAllow // an abstention is never ALLOW
+	if bad.Validate() == nil {
+		t.Fatal("a disposition that does not match the status must fail")
+	}
+	// Doc 02 §15: a refusal is SAFE_REFUSAL and DENY, and only a refusal is.
+	refused := e
+	refused.Status, refused.AnswerClass, refused.SafetyDisposition = RefusedAction, SafeRefusal, DispositionDeny
+	if err := refused.Validate(); err != nil {
+		t.Fatalf("refusal: %v", err)
+	}
+	refused.AnswerClass = HandoffUnknown
+	if refused.Validate() == nil {
+		t.Fatal("a refusal must be SAFE_REFUSAL")
+	}
+	bad = e
+	bad.AnswerClass = SafeRefusal
+	if bad.Validate() == nil {
+		t.Fatal("SAFE_REFUSAL outside REFUSED_ACTION must fail")
+	}
+	bad = e
+	bad.Status, bad.SafetyDisposition = Answered, DispositionAllow // ANSWERED without provenance is rejected
 	if bad.Validate() == nil {
 		t.Fatal("ANSWERED without citations must fail")
 	}
@@ -79,5 +102,40 @@ func TestEnvelopeValidate(t *testing.T) {
 	bad.Text = strings.Repeat("x", 5001)
 	if bad.Validate() == nil {
 		t.Fatal("text over 5000 must fail")
+	}
+	bad = e
+	bad.AnswerClass = ""
+	if bad.Validate() == nil {
+		t.Fatal("missing answer_class must fail")
+	}
+	bad = e
+	bad.StatusLabel = "Certified" // not in the governed vocabulary
+	if bad.Validate() == nil {
+		t.Fatal("ungoverned status label must fail")
+	}
+	bad = e
+	bad.Clarification = &Clarification{Slot: "market_code", Question: "q", Options: []string{"US"}}
+	if bad.Validate() == nil {
+		t.Fatal("clarification outside CLARIFY must fail")
+	}
+}
+
+// CT-016 (Doc 05 §27): a status outside the published enum is rejected, so
+// the gateway answers with a safe problem instead of rendering it.
+func TestDoc05CT016_InvalidStatusEnum(t *testing.T) {
+	for _, st := range []Status{"MAYBE", "answered", ""} {
+		e := Envelope{SchemaVersion: "1.0", TurnSequence: 1, Status: st, IntentID: "I05", KnowledgeReleaseID: "kb-1", PolicyVersion: "p",
+			Citations: []Citation{}, Actions: []Action{}, AnswerClass: HandoffUnknown}
+		if e.Validate() == nil {
+			t.Errorf("status %q must be rejected", st)
+		}
+	}
+}
+
+func TestServedLocaleFallsBackToDefault(t *testing.T) {
+	for in, want := range map[string]string{"en-US": "en-US", "en-GB": "en-GB", "en": "en", "es-ES": DefaultLocale, "de": DefaultLocale, "": DefaultLocale} {
+		if got := ServedLocale(in); got != want {
+			t.Errorf("ServedLocale(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

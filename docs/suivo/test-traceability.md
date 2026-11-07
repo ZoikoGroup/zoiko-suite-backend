@@ -8,9 +8,7 @@ apply to the approved holdout set, real content and the approved model, none of 
 | Requirement / test IDs | Covered by | Status |
 |---|---|---|
 | INV-01, SEC-P0-01, SEC-T049 (no private-system path) | `isolation.TestSECT049_NoOtherZoikoModules`, `TestForbiddenDepsRejectsOtherServices` | Covered (code dependency level; network egress policy needs infra) |
-| CT-001/002 sessions, replay | `httpapi.TestCT001_CreateSession`, `TestCT002_SessionReplay` | Covered |
-| CT-003/004/005 origin, size, content type | `httpapi.TestCT003…`, `TestCT004…`, `TestCT005…` | Covered |
-| CT-009/010/011 idempotency, conflict | `httpapi.TestCT009_TurnReplayNoSecondCall`, `TestIdempotencyMismatch`, `TestIdempotencyHeaderMismatch`, `TestCT011_TurnConflict`, `storetest` | Covered |
+| Doc 05 CT-001 to CT-052 | See `contract-test-map.md` (one row per CT, with Doc 05 numbering) | 45 covered, 3 partial, 3 N/A in R0, 1 gap |
 | Doc 05 §07 delete semantics | `httpapi.TestDeleteSession` | Covered |
 | Doc 05 §10 envelope schema | `contract.TestEnvelopeValidate`, `httpapi.TestInvalidOrchestratorOutputIsContained`, `e2e` | Covered |
 | Doc 03 §09 ingestion states | `release.TestIngestionStates`, `TestRoutesRejectUnsafeURLs` | Covered |
@@ -29,6 +27,6 @@ apply to the approved holdout set, real content and the approved model, none of 
 | Events (six only, redacted, outbox, DLQ) | `events.*`, `e2e` | Covered |
 | Golden set partitions A–D | `eval.TestGoldenSet` (37 cases, dev set v2) | Covered; partition E holdout and F drift sentinel **not covered** (need independent authors / production) |
 | Semantic rubric + human grading lanes (Doc 07 §08) | — | Not covered (harness is deterministic lane only) |
-| WCAG 2.2 AA (QA-T050–056) | Manual browser checks in the console widget: keyboard, Escape focus return, live region, 44 px buttons, 375 px layout | Partial: no screen-reader or zoom pass, no automated a11y tests |
+| WCAG 2.2 AA (QA-T050–056) | Playwright in Edge: axe (no serious or critical issues, light and dark), keyboard-only flow, Tab order, Escape focus return, 44 px targets, contrast, 320 px and 200 % zoom header, reduced motion | Partial: no manual screen-reader pass |
 | Load / p95 latency (QA-T057–063) | — | Not covered: needs staging + agreed reference load |
 | Doc 09 admin console, Doc 10 CRM/leads | — | Out of R0 scope |

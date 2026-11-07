@@ -20,7 +20,7 @@ services:
       - ../services/migration-integrity-svc/deployments/migrations:/migrations/migration-integrity:ro
       - postgres_p6_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d postgres"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -151,9 +151,9 @@ services:
       dockerfile: Dockerfile
     container_name: compliance-risk-scoring-svc-p6
     ports:
-      - "8136:8136"
+      - "8177:8177"
     environment:
-      PORT: "8136"
+      PORT: "8177"
       DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/compliance_risk_scoring?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.compliance-risk-scoring.events

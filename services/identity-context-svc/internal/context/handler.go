@@ -20,8 +20,8 @@ import (
 	"zoiko.io/identity-context-svc/internal/ratelimit"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
-	"zoiko.io/identity-envelope/apicontract"
 	idenv "zoiko.io/identity-envelope"
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // Action constants passed to authorization-svc as action_type.
@@ -35,7 +35,13 @@ const (
 	IdentitySessionRead       = "IDENTITY_SESSION_READ"
 	IdentitySessionInvalidate = "IDENTITY_SESSION_INVALIDATE"
 	IdentityPrincipalRead     = "IDENTITY_PRINCIPAL_READ"
+	IdentityAuthEventsRead    = "IDENTITY_AUTH_EVENTS_READ"
+	IdentitySubjectMerge      = "IDENTITY_SUBJECT_MERGE"
 	IdentityPrincipalStatus   = "IDENTITY_PRINCIPAL_STATUS_SET"
+	// Subject lifecycle (IC-1).
+	IdentityPrincipalCreate      = "IDENTITY_PRINCIPAL_CREATE"
+	IdentityPasswordResetRequest = "IDENTITY_PASSWORD_RESET_REQUEST"
+	IdentityPasswordResetApprove = "IDENTITY_PASSWORD_RESET_APPROVE"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -89,10 +95,20 @@ type Handler struct {
 	// status backs PUT /v1/principals/{id}/status. Nil answers 501.
 	status StatusChanger
 
-	// identity backs the ORG-01 reads. Nil answers 501.
+	// lifecycle backs the subject lifecycle commands (CreateSubject, Invite,
+	// Activate, ChangePassword, ForgotPassword, RequestReset, DecideReset,
+	// CompleteReset). Nil answers 501 for those routes.
+	lifecycle *lifecycle.Service
+
+	// console backs the IC-2 read models; cursors signs their next_cursor.
+	// Nil answers 501 for those routes.
+	console ConsoleReader
+	cursors *apicontract.CursorSigner
+
+	// identity backs the ORG-01 reads under /v1/identities. Nil answers 501.
 	identity IdentityReader
 
-	// merger backs MergeDuplicateIdentity. Nil answers 501.
+	// merger backs POST /v1/identities/{id}/merge. Nil answers 501.
 	merger IdentityMerger
 }
 
@@ -113,6 +129,12 @@ type StatusChanger interface {
 // WithStatusChanger wires the principal-status command.
 func (h *Handler) WithStatusChanger(s StatusChanger) *Handler {
 	h.status = s
+	return h
+}
+
+// WithLifecycle wires the subject lifecycle commands.
+func (h *Handler) WithLifecycle(s *lifecycle.Service) *Handler {
+	h.lifecycle = s
 	return h
 }
 
@@ -368,6 +390,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/mfa/factors", h.ListMFAFactors)
 		r.Post("/principals/{principalID}/mfa/reset", h.ResetPrincipalMFA)
 
+		// ── Passkeys (WebAuthn, AU-11) ───────────────────────────────────────
+		// Same caller rule as TOTP. See handler_passkeys.go.
+		r.Post("/mfa/passkeys/register/begin", h.BeginPasskeyRegistration)
+		r.Post("/mfa/passkeys/register/finish", h.FinishPasskeyRegistration)
+		r.Get("/mfa/passkeys", h.ListPasskeys)
+		r.Post("/mfa/passkeys/revoke", h.RevokePasskey)
+		r.Post("/authenticate/step-up/passkey/begin", h.BeginPasskeyStepUp)
+		r.Post("/authenticate/step-up/passkey/finish", h.FinishPasskeyStepUp)
+
 		// ── GOV-01 queries ───────────────────────────────────────────────────
 		// ResolveTenantContext
 		r.Post("/context/resolve", h.ResolveContext)
@@ -399,12 +430,45 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/principals/{principalID}/delegations", h.GetPrincipalDelegations)
 		r.Put("/principals/{principalID}/status", h.UpdatePrincipalStatus)
 
-		// ── ORG-01 reads (handler_identity.go) ───────────────────────────────
-		r.Get("/identities/{principalID}", h.GetSubjectIdentity)
-		r.Get("/identities/{principalID}/links", h.ListIdentityLinks)
-		r.Get("/identities/{principalID}/assurance-history", h.GetAssuranceHistory)
-		r.Get("/identities/{principalID}/authentication-events", h.ListAuthenticationEvents)
-		r.Post("/identities/{principalID}/merge", h.MergeDuplicateIdentity)
+		// ── Console read models (IC-2) ─────────────────────────────────────────
+		r.Get("/principals", h.ListPrincipals)
+		r.Get("/principals/{principalID}/assurance-history", h.GetAssuranceHistory)
+		r.Get("/context/sessions", h.ListSessions)
+		r.Get("/context/support", h.ListSupportContexts)
+		r.Get("/authentication-events", h.ListAuthenticationEvents)
+		r.Get("/identity/summary", h.GetIdentitySummary)
+
+		// ── Subject identity and merge (IC-3) ──────────────────────────────────
+		r.Get("/subjects/{principalID}", h.GetSubjectIdentity)
+		r.Get("/subjects/{principalID}/links", h.ListIdentityLinks)
+		r.Post("/subjects/{survivorID}/merge", h.MergeDuplicateIdentity)
+
+		// ── Subject lifecycle (IC-1) ─────────────────────────────────────────
+		// CreateSubject / Invite: an administrator creates a subject.
+		r.Post("/principals", h.CreateSubject)
+		r.Post("/principals/{principalID}/invite", h.InviteSubject)
+		// Pre-session credential flows (no verified caller): activation,
+		// self-service change, forgotten-password, complete-reset.
+		r.Post("/account/activate", h.ActivateAccount)
+		r.Post("/account/password", h.ChangePassword)
+		r.Post("/account/password/forgot", h.ForgotPassword)
+		r.Post("/account/password/reset", h.CompleteReset)
+		// Administrator-initiated reset, awaiting independent approval.
+		r.Post("/principals/{principalID}/password-resets", h.RequestReset)
+		r.Post("/password-resets/{resetID}/decide", h.DecideReset)
+		r.Get("/password-resets/{resetID}", h.GetReset)
+		// The Password resets register (console read model).
+		r.Get("/password-resets", h.ListPasswordResets)
+
+		// ── ORG-01 identity surface (handler_identity.go) ────────────────────
+		// The same spec operations as /subjects above, over the
+		// assurance-observation and filtered authentication-event read models.
+		// Both merge routes share one alias ledger check (store.mergedAway).
+		r.Get("/identities/{principalID}", h.GetIdentity)
+		r.Get("/identities/{principalID}/links", h.ListIdentityProviderLinks)
+		r.Get("/identities/{principalID}/assurance-history", h.GetIdentityAssuranceHistory)
+		r.Get("/identities/{principalID}/authentication-events", h.ListIdentityAuthenticationEvents)
+		r.Post("/identities/{principalID}/merge", h.MergeIdentity)
 	})
 }
 
@@ -680,7 +744,7 @@ func (h *Handler) GetPrincipal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, "principal not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSONWithETag(w, http.StatusOK, p, p.RecordVersion)
 }
 
 // ── GET /v1/principals/:principalID/roles ────────────────────────────────────
@@ -757,9 +821,24 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	principalID := chi.URLParam(r, "principalID")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	p, err := h.principals.FindByID(r.Context(), principalID, tenantID)
+	if err != nil || p == nil {
+		writeError(w, r, http.StatusNotFound, "principal not found")
+		return
+	}
+
+	// Authorization (including the no-self-exemption rule) is decided before
+	// the version precondition: a caller who may not touch the aggregate at
+	// all hears 403, never 428. The If-Match check only matters once the
+	// caller is cleared to act.
 	if !h.authorize(w, r, callerPrincipalID, tenantID, IdentityPrincipalStatus) {
 		return
 	}
+
+	if !h.requireIfMatch(w, r, p.RecordVersion) {
+		return
+	}
+
 	if h.status == nil {
 		// An unconfigured privileged command is unavailable, not silently a
 		// row update that tells nobody (see StatusChanger).
@@ -797,6 +876,17 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, msg string) {

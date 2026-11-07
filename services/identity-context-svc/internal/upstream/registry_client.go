@@ -155,6 +155,31 @@ type entityView struct {
 // Returns false when the tenant is not ACTIVE or is not visible to its own
 // scope; returns an error when the registry cannot be reached, which the
 // resolver turns into a 503 rather than a denial.
+// ListTenantHostBindings reads the tenant's host bindings (ORG-02), for the
+// ingress binding refresher. Accepts the registry's bare array or a
+// {"data": [...]} page.
+func (c *RegistryClient) ListTenantHostBindings(ctx context.Context, tenantID string) ([]domain.HostBinding, error) {
+	status, body, err := c.get(ctx, tenantID,
+		fmt.Sprintf("%s/v1/tenants/%s/host-bindings", c.cfg.TenantRegistryURL, url.PathEscape(tenantID)))
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("list host bindings for %s: registry answered %d", tenantID, status)
+	}
+	var arr []domain.HostBinding
+	if err := json.Unmarshal(body, &arr); err == nil {
+		return arr, nil
+	}
+	var page struct {
+		Data []domain.HostBinding `json:"data"`
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, fmt.Errorf("list host bindings for %s: %w", tenantID, err)
+	}
+	return page.Data, nil
+}
+
 func (c *RegistryClient) IsTenantActive(ctx context.Context, tenantID string) (bool, error) {
 	if tenantID == "" {
 		return false, nil

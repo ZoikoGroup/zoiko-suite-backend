@@ -113,7 +113,9 @@ func TestCertification_RecordsAcceptedExceptionsAndAssessedExposure(t *testing.T
 	w := newWave5(t)
 	mat, err := testStore.CreateMaterialityPolicy(ctx, w.tenant, "maker", domain.CreateMaterialityPolicyRequest{
 		LegalEntityID: w.entity, ReportingBasis: "US_GAAP", AmountThreshold: "1000", AggregateThreshold: "300",
-		Currency: "USD", EffectiveFrom: "2026-01-01", ApprovedBy: "cfo"})
+		Currency: "USD", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	mat, err = testStore.ApproveMaterialityPolicy(ctx, w.tenant, w.entity, mat.MaterialityID, "cfo")
 	require.NoError(t, err)
 
 	w.src.set(catalogue.SysGL, "control-account-postings", "wm", r("e1", "J-1", "200.10"), r("e2", "J-2", "150.00"))

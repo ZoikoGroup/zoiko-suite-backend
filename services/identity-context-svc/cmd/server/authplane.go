@@ -97,7 +97,11 @@ func mergeClientChannels(cfg *config.Config, reg *oidc.Registry) {
 // replaces the built-in probe list, so the probes and the policy's own
 // ExemptPaths are listed again here.
 func protocolExempt(exemptPaths []string) func(*http.Request) bool {
-	exact := map[string]bool{"/healthz": true, "/readyz": true, "/health": true}
+	exact := map[string]bool{"/healthz": true, "/readyz": true, "/health": true,
+		// AU-09's pre-session routes: the caller has no session yet (an
+		// activation or reset link, or a forgotten password). Each is
+		// throttled per client address and answers without enumerating.
+		"/v1/account/activate": true, "/v1/account/password/forgot": true, "/v1/account/password/reset": true}
 	for _, p := range exemptPaths {
 		exact[p] = true
 	}

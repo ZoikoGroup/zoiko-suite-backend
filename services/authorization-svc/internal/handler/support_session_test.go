@@ -158,6 +158,7 @@ func TestSupportSession_Revocation(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/support/sessions/sup-uuid-1/revoke", nil)
 	req.Header.Set("X-Tenant-Id", testSupportTenantID)
 	req.Header.Set("X-Principal-Id", testSupportAdminCaller)
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

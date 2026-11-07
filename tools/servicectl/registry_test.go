@@ -19,8 +19,8 @@ func TestRegistryLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry invalid: %v", err)
 	}
-	if got := len(reg.All()); got != 86 {
-		t.Errorf("expected 86 services, got %d", got)
+	if got := len(reg.All()); got != 87 {
+		t.Errorf("expected 87 services, got %d", got)
 	}
 	if got := len(reg.Pages()); got != 25 {
 		t.Errorf("expected 25 console routes, got %d", got)

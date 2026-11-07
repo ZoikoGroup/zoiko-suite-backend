@@ -1,0 +1,114 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/ConfigResponse.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "assistant_display_name": {
+      "type": "string"
+    },
+    "capabilities": {
+      "$ref": "Capabilities.v1.schema.json"
+    },
+    "chips": {
+      "additionalProperties": {
+        "items": {
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "label",
+            "message"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "description": "Starter questions keyed by page_context.",
+      "type": "object"
+    },
+    "citation_links": {
+      "description": "Resolves a citation url_key to the approved public page (server-side).",
+      "items": {
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "format": "uri",
+            "type": "string"
+          },
+          "url_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url_key",
+          "url",
+          "title"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "config_revision": {
+      "type": "string"
+    },
+    "market_choices": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "microcopy": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Pre-approved UI wording keyed ui.* (plain text).",
+      "type": "object"
+    },
+    "privacy_notice_key": {
+      "type": "string"
+    },
+    "public_routes": {
+      "description": "Official destinations from the signed route registry. Actions reference route_key only.",
+      "items": {
+        "properties": {
+          "route_key": {
+            "type": "string"
+          },
+          "url": {
+            "format": "uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "route_key",
+          "url"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "supported_locales": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "config_revision",
+    "assistant_display_name",
+    "capabilities",
+    "supported_locales",
+    "market_choices",
+    "public_routes",
+    "citation_links",
+    "privacy_notice_key"
+  ],
+  "type": "object"
+}

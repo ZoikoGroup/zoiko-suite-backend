@@ -493,6 +493,64 @@ Nothing in GOV-01's contract. Two things worth naming:
    identity-context-svc's resolve path and did not affect these results. It is
    somebody's gate.
 
+## Addendum 3 — 2026-11-03, auth-plane completion (IC-0 to IC-10, AU-11)
+
+**Scope:** the auth-plane plan (`docs/audit_files/AUTH-PLANE-PLAN-2026-11-02.md`) for this
+service: subject lifecycle routes, console read models, ORG-1 operations, session-cap eviction
+events, role projection from authorization-svc, ingress refresh, observability, federation
+acceptance, passkeys (AU-11), and the console. This re-certifies the service after that work;
+earlier sections stand for what they covered.
+
+### Verification performed
+
+```
+go build ./...  clean
+go vet  ./...   clean
+go test ./...   813 passing, 0 failing, 0 skipped
+                (golang:1.26-alpine container, REQUIRE_DB_TESTS=1, Postgres 16 scratch DB;
+                 host test binaries are blocked by Windows Application Control)
+```
+
+Live, against the rebuilt image (3 Nov 16:34) on the local compose stack:
+
+| Check | Result |
+|---|---|
+| `deployments/scripts/e2e-identity-context-deps.py` (one check per dependency edge) | 61/61 PASS |
+| `scripts/audit.sh` with Prometheus up | 37/38 — the failure is section 2, host `go test` blocked by Application Control |
+| Federation probe with `FEDERATION_ENABLED=true` | admin reads 200, no grant 403, forged id_token 401, SCIM 404 with provisioning off |
+| Revocation reaching authorization-svc | invalidated envelope refused after 5.1 s |
+
+### Defects found and fixed during this pass
+
+1. **Passkeys did not exist.** Storage and hosted-login hooks were there; the WebAuthn service,
+   its wiring and any registration route were not. Built on go-webauthn v0.17.4 with
+   single-use ceremonies in Redis, user verification required, clone detection by signature
+   counter, and the decision rows and events in the transaction of the credential change.
+2. **A stolen password could add a TOTP factor beside a passkey** (the enrolment gate checked
+   TOTP only). The gate now counts any factor.
+3. **Federation admin routes answered 503 whenever federation was on**: the tenant id was sent
+   as the legal entity, and the six FEDERATION_* actions were never registered (access-control
+   000027 registers them; no template holds both configure and approve).
+4. **The MFA failure counter never moved**, so the step-up failure-ratio alert could not fire.
+5. Login without a client was accepted (`IDP_CLIENT_AUTH=optional`); now `required` on the stack.
+6. No password-reset register, and the KPI counted expired pending resets; reset decisions
+   carried no reason.
+7. `audit.sh` could not be run twice (fixed Idempotency-Keys → 409) and its NP4 predated API-3.
+
+### Unresolved, and deliberately so
+
+- **IC-6 live entitlement** — commercial-account-svc does not run locally.
+- **SAML federation** — decision D-4; recorded in SPEC_DEVIATIONS.
+- **Passkey attestation / authenticator allow-list** — a Security decision; recorded in
+  SPEC_DEVIATIONS.
+- **A real-browser passkey ceremony** — proven with a software authenticator only.
+- **Live SCIM** — provisioning is off on the local stack; covered by the store and handler suites.
+
+### Certification
+
+Certified for the scope above, with the five unresolved items named. Commits on
+`shashi-changes`: backend `a374c56b` (access-control 000025), `8049bd5c` (000027), `13299a0c` (federation), `8e7cbc19` (passkeys, resets, MFA), `d8e1a895` (client auth, E2E, audit), `feec479b` (override); frontend `9dbf896` (identity tabs), `5ee180d` (Sign-in security).
+
 ---
 
 *Generated as part of the GOV-01 completion change. Supersedes no previous

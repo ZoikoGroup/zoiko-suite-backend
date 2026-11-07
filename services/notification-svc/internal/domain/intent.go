@@ -93,6 +93,8 @@ type CommunicationIntent struct {
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
 	CreatedAt            time.Time  `json:"created_at"`
 	RetiredAt            *time.Time `json:"retired_at,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000034).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // VariableSpec is one entry of the typed variable contract.
@@ -132,6 +134,8 @@ type IntentVersion struct {
 	EffectiveFrom          *time.Time `json:"effective_from,omitempty"`
 	PublishedAt            *time.Time `json:"published_at,omitempty"`
 	PublishedByPrincipalID *string    `json:"published_by_principal_id,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000034).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // Intent version lifecycle.

@@ -225,3 +225,28 @@ func TestRetire_RefusalsAreMapped(t *testing.T) {
 		t.Errorf("over-long reason: %d %q calls %d", rr.Code, problemCode(t, rr), len(st.retireCalls))
 	}
 }
+
+// If-Match (API-3) reaches the retirement as the expected version, and the
+// store's stale-version refusal is 412, not an outage.
+func TestRetire_IfMatchIsTheExpectedVersion(t *testing.T) {
+	st := newHistoryStub()
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/jurisdictions/j-1/deactivate", nil)
+	req.Header.Set("X-Principal-Id", testPrincipal)
+	req.Header.Set("If-Match", `"4"`)
+	rr := executeRequest(newTestRouter(st), req)
+	if rr.Code != http.StatusOK || len(st.retireCalls) != 1 {
+		t.Fatalf("%d, calls %+v: %s", rr.Code, st.retireCalls, rr.Body.String())
+	}
+	if v := st.retireCalls[0].ExpectedRowVersion; v == nil || *v != 4 {
+		t.Errorf("expected row version = %v, want 4", v)
+	}
+
+	st = newHistoryStub()
+	st.retireErr = domain.ErrVersionConflict
+	req = httptest.NewRequest(http.MethodPost, "/v1/admin/jurisdictions/j-1/deactivate", nil)
+	req.Header.Set("X-Principal-Id", testPrincipal)
+	req.Header.Set("If-Match", `"3"`)
+	if rr := executeRequest(newTestRouter(st), req); rr.Code != http.StatusPreconditionFailed {
+		t.Errorf("stale If-Match: %d, want 412: %s", rr.Code, rr.Body.String())
+	}
+}

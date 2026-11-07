@@ -468,6 +468,11 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
+		return
+	}
+
 	activated, _, transitioned, err := h.store.ActivateVersion(r.Context(), versionID, req.ActivatedByPrincipalID)
 	if err != nil {
 		switch {
@@ -479,10 +484,10 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, activateVersionResponse{
+	writeJSONWithETag(w, http.StatusOK, activateVersionResponse{
 		SecretPolicyVersion: activated,
 		Transitioned:        transitioned,
-	})
+	}, activated.RecordVersion)
 }
 
 // ── POST /v1/secret-policies/{id}/material ──────────────────────────────────
@@ -1028,7 +1033,7 @@ func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
 	if h.refuseForeignRow(w, r, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
 		return
 	}
-	writeJSON(w, http.StatusOK, lease)
+	writeJSONWithETag(w, http.StatusOK, lease, lease.RecordVersion)
 }
 
 // ── POST /v1/secrets/leases/{lease_id}/verify ────────────────────────────────
@@ -1261,6 +1266,11 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 			zap.String("caller_tenant_id", tenantScope),
 			zap.String("correlation_id", correlationID),
 		)
+		return
+	}
+
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
 		return
 	}
 
@@ -1887,7 +1897,7 @@ func (h *Handler) CreateSharedSecretException(w http.ResponseWriter, r *http.Req
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, e)
+	writeJSONWithETag(w, status, e, e.RecordVersion)
 }
 
 // ListSharedSecretExceptions answers the register, optionally filtered by
@@ -1916,7 +1926,12 @@ func (h *Handler) ListSharedSecretExceptions(w http.ResponseWriter, r *http.Requ
 	if results == nil {
 		results = []*domain.SharedSecretException{}
 	}
-	writeJSON(w, http.StatusOK, results)
+	// List endpoint: ETag based on count and first item's record_version
+	var etag int64
+	if len(results) > 0 {
+		etag = results[0].RecordVersion
+	}
+	writeJSONWithETag(w, http.StatusOK, results, etag)
 }
 
 // RevokeSharedSecretException closes an ACTIVE exception early (before its
@@ -1941,6 +1956,28 @@ func (h *Handler) RevokeSharedSecretException(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// First, read the exception to check If-Match
+	existing, err := h.store.FindSharedSecretExceptionByID(r.Context(), exceptionID, tenantScope)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrSharedSecretExceptionNotFound):
+			writeError(w, r, http.StatusNotFound, "shared_secret_exception_not_found", exceptionID)
+		default:
+			h.log.Error("RevokeSharedSecretException: lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		}
+		return
+	}
+	if existing == nil {
+		writeError(w, r, http.StatusNotFound, "shared_secret_exception_not_found", exceptionID)
+		return
+	}
+
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
+		return
+	}
+
 	e, changed, err := h.store.RevokeSharedSecretException(r.Context(), exceptionID, tenantScope, principalID)
 	if err != nil {
 		switch {
@@ -1953,10 +1990,10 @@ func (h *Handler) RevokeSharedSecretException(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if !changed {
-		writeJSON(w, http.StatusOK, map[string]string{"exception_id": exceptionID, "status": "already_revoked"})
+		writeJSONWithETag(w, http.StatusOK, map[string]string{"exception_id": exceptionID, "status": "already_revoked"}, existing.RecordVersion)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSONWithETag(w, http.StatusOK, e, e.RecordVersion)
 }
 
 // ── authorization ────────────────────────────────────────────────────────────
@@ -2101,5 +2138,16 @@ func distinctCount(ids []string) int {
 		}
 	}
 	return len(seen)
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }
 

@@ -30,7 +30,6 @@ func createDraftRun(t *testing.T, r chi.Router, projectID, fiscalPeriod string) 
 	t.Helper()
 	req := domain.CreateRecognitionRunRequest{
 		ProjectID: projectID, FiscalPeriod: fiscalPeriod, ContractValue: 1000, BilledToDate: 0,
-		RevenueAccountCode: "4000", WIPAccountCode: "1300",
 	}
 	rr := doReq(r, http.MethodPost, "/v1/recognition/runs/", req, "preparer-1")
 	if rr.Code != http.StatusCreated {
@@ -73,13 +72,28 @@ func TestCreateRecognitionRun_MissingContractValue_Returns422(t *testing.T) {
 	}
 }
 
+func TestCreateRecognitionRun_MissingMappingConfig_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithMappingKeys(s, &stubPublisher{}, &stubAuthZ{}, &stubPeriodChecker{}, &stubLedger{}, "", "")
+	id := createActiveProject(t, r, "le-1", "REC-NOKEY")
+
+	req := domain.CreateRecognitionRunRequest{ProjectID: id, FiscalPeriod: "2026-09", ContractValue: 1000}
+	rr := doReq(r, http.MethodPost, "/v1/recognition/runs/", req, "preparer-1")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 mapping_key_not_configured, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(s.runs) != 0 {
+		t.Fatalf("a deployment with no mapping keys must not create a run, got %d", len(s.runs))
+	}
+}
+
 func TestCreateRecognitionRun_DuplicatePeriod_Returns422(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createRunReadyProject(t, r, "le-1", "REC-3")
 	createDraftRun(t, r, id, "2026-09")
 
-	req := domain.CreateRecognitionRunRequest{ProjectID: id, FiscalPeriod: "2026-09", ContractValue: 500, RevenueAccountCode: "4000", WIPAccountCode: "1300"}
+	req := domain.CreateRecognitionRunRequest{ProjectID: id, FiscalPeriod: "2026-09", ContractValue: 500}
 	rr := doReq(r, http.MethodPost, "/v1/recognition/runs/", req, "preparer-1")
 	if rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 duplicate live run for period, got %d: %s", rr.Code, rr.Body.String())
@@ -92,7 +106,7 @@ func TestCalculateRecognitionRun_NoApprovedEstimate_Fails(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createActiveProject(t, r, "le-1", "REC-4")
-	req := domain.CreateRecognitionRunRequest{ProjectID: id, FiscalPeriod: "2026-09", ContractValue: 1000, RevenueAccountCode: "4000", WIPAccountCode: "1300"}
+	req := domain.CreateRecognitionRunRequest{ProjectID: id, FiscalPeriod: "2026-09", ContractValue: 1000}
 	rr := doReq(r, http.MethodPost, "/v1/recognition/runs/", req, "preparer-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create run failed: %d %s", rr.Code, rr.Body.String())

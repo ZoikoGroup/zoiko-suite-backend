@@ -21,10 +21,12 @@ import (
 
 // Action types passed to authorization-svc for each write endpoint.
 const (
-	ActionTaxReturnCreate = "TAX_RETURN_CREATE"
-	ActionTaxReturnUpdate = "TAX_RETURN_UPDATE"
-	ActionTaxReturnSubmit = "TAX_RETURN_SUBMIT"
-	ActionTaxReturnAssess = "TAX_RETURN_ASSESS"
+	ActionTaxReturnCreate   = "TAX_RETURN_CREATE"
+	ActionTaxReturnUpdate   = "TAX_RETURN_UPDATE"
+	ActionTaxReturnSubmit   = "TAX_RETURN_SUBMIT"
+	ActionTaxReturnAssess   = "TAX_RETURN_ASSESS"
+	ActionNexusRecordCreate = "NEXUS_RECORD_CREATE"
+	ActionNexusRecordRead   = "NEXUS_RECORD_READ"
 )
 
 // Handler wires together the HTTP layer with the store and event bus.
@@ -91,6 +93,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/submit", h.Submit)
 		r.Post("/{id}/assess", h.Assess)
 	})
+	r.Route("/v1/nexus-records", func(r chi.Router) {
+		r.Post("/", h.CreateNexusRecord)
+		r.Get("/", h.ListNexusRecords)
+		r.Get("/{id}", h.GetNexusRecordByID)
+	})
 }
 
 // principalIDOrUnauthorized extracts the caller's principal from the
@@ -142,7 +149,6 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ret := &domain.TaxReturn{
-		TenantID:              tenantID,
 		LegalEntityID:         req.LegalEntityID,
 		JurisdictionID:        req.JurisdictionID,
 		TaxRegistrationNumber: req.TaxRegistrationNumber,
@@ -157,14 +163,15 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		Currency:              req.Currency,
 		Notes:                 req.Notes,
 		EffectiveFrom:         req.EffectiveFrom,
-		CreatedBy:             principalID, // always the authenticated caller, never the body value
+		CreatedBy:             principalID,
 	}
 
 	if err := h.store.Create(r.Context(), ret); err != nil {
-		h.logger.Error("create corporate tax return failed", zap.Error(err))
+		h.logger.Error("failed to create corporate tax return", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create corporate tax return")
 		return
 	}
+
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
 		EventType: "corporate_tax_return.created", ReturnID: ret.ReturnID, TenantID: tenantID,
 		LegalEntityID: ret.LegalEntityID, Jurisdiction: ret.JurisdictionID, ActorID: principalID,
@@ -175,34 +182,28 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	// Read routes require a principal: an unauthenticated caller must not
-	// retrieve corporate tax records (previously unguarded).
-	if _, ok := principalIDOrUnauthorized(w, r); !ok {
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id is required")
 		return
 	}
+
 	ret, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrTaxReturnNotFound) {
 			writeError(w, http.StatusNotFound, "corporate tax return not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to get corporate tax return")
+		writeError(w, http.StatusInternalServerError, "failed to fetch corporate tax return")
 		return
 	}
 	writeJSON(w, http.StatusOK, ret)
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	// Read routes require a principal — previously unguarded.
-	if _, ok := principalIDOrUnauthorized(w, r); !ok {
-		return
-	}
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
-	status := r.URL.Query().Get("status")
-	fiscalYear, _ := strconv.Atoi(r.URL.Query().Get("fiscal_year"))
+	q := r.URL.Query()
+	fiscalYear, _ := strconv.Atoi(q.Get("fiscal_year"))
 
-	returns, err := h.store.List(r.Context(), legalEntityID, jurisdictionID, status, fiscalYear)
+	returns, err := h.store.List(r.Context(), q.Get("legal_entity_id"), q.Get("jurisdiction_id"), q.Get("status"), fiscalYear)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list corporate tax returns")
 		return
@@ -210,10 +211,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if returns == nil {
 		returns = []domain.TaxReturn{}
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"corporate_tax_returns": returns,
-		"total":                 len(returns),
-	})
+	writeJSON(w, http.StatusOK, returns)
 }
 
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
@@ -235,12 +233,12 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if existing.Status != domain.StatusDraft {
-		writeError(w, http.StatusConflict, "only DRAFT tax returns can be updated")
+	if !h.checkAuthorized(w, r, principalID, existing.LegalEntityID, ActionTaxReturnUpdate) {
 		return
 	}
 
-	if !h.checkAuthorized(w, r, principalID, existing.LegalEntityID, ActionTaxReturnUpdate) {
+	if existing.Status != domain.StatusDraft {
+		writeError(w, http.StatusConflict, "cannot update a non-draft return")
 		return
 	}
 
@@ -255,14 +253,13 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	existing.TaxRatePercent = req.TaxRatePercent
 	existing.TaxCredits = req.TaxCredits
 	existing.TaxAlreadyPaid = req.TaxAlreadyPaid
-	if req.Notes != "" {
-		existing.Notes = req.Notes
-	}
+	existing.Notes = req.Notes
 
 	if err := h.store.Update(r.Context(), existing); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update corporate tax return")
 		return
 	}
+
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
 		EventType: "corporate_tax_return.updated", ReturnID: id, TenantID: tenantID,
 		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
@@ -293,32 +290,25 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAuthorized(w, r, principalID, existing.LegalEntityID, ActionTaxReturnSubmit) {
 		return
 	}
+
 	if !h.checkEvidence(w, r, tenantID, existing.LegalEntityID, principalID) {
 		return
 	}
 
-	var req domain.SubmitTaxReturnRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.SubmittedBy == "" {
-		writeError(w, http.StatusBadRequest, "submitted_by is required")
+	ret, err := h.store.Submit(r.Context(), id, principalID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAlreadySubmitted) {
+			writeError(w, http.StatusConflict, "return has already been submitted")
+			return
+		}
+		if errors.Is(err, domain.ErrTaxReturnNotFound) {
+			writeError(w, http.StatusNotFound, "corporate tax return not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to submit corporate tax return")
 		return
 	}
 
-	ret, err := h.store.Submit(r.Context(), id, req.SubmittedBy)
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrTaxReturnNotFound):
-			writeError(w, http.StatusNotFound, "corporate tax return not found")
-		case errors.Is(err, domain.ErrAlreadySubmitted):
-			writeError(w, http.StatusConflict, "corporate tax return is already submitted")
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to submit corporate tax return")
-		}
-		return
-	}
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
 		EventType: "corporate_tax_return.submitted", ReturnID: id, TenantID: tenantID,
 		LegalEntityID: ret.LegalEntityID, Jurisdiction: ret.JurisdictionID, ActorID: principalID,
@@ -375,6 +365,79 @@ func (h *Handler) Assess(w http.ResponseWriter, r *http.Request) {
 		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: ret,
 	})
 	writeJSON(w, http.StatusOK, ret)
+}
+
+func (h *Handler) CreateNexusRecord(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := principalIDOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.CreateNexusRecordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.LegalEntityID == "" || req.JurisdictionID == "" || req.NexusType == "" || req.EffectiveFrom == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id, jurisdiction_id, nexus_type, and effective_from are required")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principalID, req.LegalEntityID, ActionNexusRecordCreate) {
+		return
+	}
+
+	record := &domain.NexusRecord{
+		LegalEntityID:   req.LegalEntityID,
+		JurisdictionID:  req.JurisdictionID,
+		NexusType:       req.NexusType,
+		ThresholdAmount: req.ThresholdAmount,
+		Currency:        req.Currency,
+		EffectiveFrom:   req.EffectiveFrom,
+		EffectiveTo:     req.EffectiveTo,
+		CreatedBy:       principalID,
+	}
+
+	if err := h.store.CreateNexusRecord(r.Context(), record); err != nil {
+		h.logger.Error("failed to create nexus record", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to create nexus record")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, record)
+}
+
+func (h *Handler) GetNexusRecordByID(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+
+	record, err := h.store.GetNexusRecordByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrNexusRecordNotFound) {
+			writeError(w, http.StatusNotFound, "nexus record not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get nexus record")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, record)
+}
+
+func (h *Handler) ListNexusRecords(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	records, err := h.store.ListNexusRecords(r.Context(), q.Get("legal_entity_id"), q.Get("jurisdiction_id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list nexus records")
+		return
+	}
+	if records == nil {
+		records = []domain.NexusRecord{}
+	}
+	writeJSON(w, http.StatusOK, records)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

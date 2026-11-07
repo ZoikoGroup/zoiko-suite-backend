@@ -12,7 +12,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go. Reviewer 27 Oct: confirmed |
 | API-1 | Shared apicontract package | DONE | acce5b86; review fixes a3a89b24, 2a53338b, e84c8fac, 1a6cf81d, 37413879 | Reopened 27 Oct: its pgx v5.10.0 bump broke `go build` in authorization, evidence-requirements, policy and workflow; fixed. Now 33 unit + 7 pgx pass |
 | API-2 | Problem details + request id + cache, all our services | DONE | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257, af6e674a, a7d75009, 6d016f11, 9163a41f, b0844868, c0d2c2b4, 52899385, 1d5f9fc3, b13635a5, 416bce59, 6a2fae97, 00f41d6c; 28 Oct review fixes (see "Review 28 Oct 2026") | All 20 services. 12 closed by the 27 Oct review fixes; 8 reopened 28 Oct (D-1..D-12) and fixed the same day |
-| API-3 | ETag / If-Match on aggregate mutations | TODO | | |
+| API-3 | ETag / If-Match on aggregate mutations | IN PROGRESS | | 11/20 services done with tests (tenant-entity-registry, identity-context, notification-svc, jurisdiction-rules-svc, policy-svc, obligations-svc, governance-decision-log-svc, access-control-svc, search-indexer-svc, delegated-authority-svc, workflow-svc); 1 implemented but tests need update (secret-vault-integration-svc); authorization-svc partial (session aggregates done); configuration-feature-flag partial; 6 done without implementation (no version fields: gateway-auth-svc, evidence-requirements-svc, schema-registry-svc, retention-registry-svc, mtls-management-svc, siem-integration-svc, carta-svc, key-management-svc) |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
 | API-6 | Deprecation / Sunset on renamed routes | TODO | | |
@@ -34,7 +34,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | IAM-9 | AU-22 role-profile drift | TODO | | |
 | IAM-10 | AU-25 canonical event names | TODO | | after G-08 |
 | IAM-11 | AU-26 /v1/iam aliases | TODO | | |
-| IAM-12 | Federation / SCIM / passkey acceptance | TODO | | |
+| IAM-12 | Federation / SCIM / passkey acceptance | DONE (identity-context-svc) | 8e7cbc19, 13299a0c, 8049bd5c (3 Nov) | Passkeys built and wired (internal/webauthn), TestAU11_* + live E2E 61/61; federation live probe with FEDERATION_ENABLED=true; FEDERATION_* registered (access-control 000027). Live SCIM not exercised (provisioning off locally). See services/identity-context-svc/progress.md |
 | IAM-13 | ORG-06 remaining operations | TODO | | |
 | WF-1 | WFC-01..03 open rows | TODO | | |
 | WF-2 | WFC-04 cases | TODO | | |
@@ -43,7 +43,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | ST-1 | State-machine definition registry | TODO | | |
 | ST-2 | Available actions + transition history | TODO | | |
 | ST-3 | No generic status writes | TODO | | |
-| ORG-1 | ORG-01 identity | TODO | | |
+| ORG-1 | ORG-01 identity | DONE (identity-context-svc) | 1fda0bb1, 0174312a | GetSubjectIdentity, ListIdentityLinks, MergeDuplicateIdentity, ListAuthenticationEvents, GetAssuranceHistory; authorization-svc re-points merged assignments; live E2E |
 | ORG-2 | ORG-03 name parity | TODO | | |
 | ORG-3 | ORG-04 ownership and control | TODO | | |
 | ORG-4 | ORG-05 org units + org graphs | TODO | | |
@@ -661,4 +661,40 @@ Tests:
 - `go test -count=1 ./internal/handler` → 0 fail (10 tests pass)
 Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for key-management-svc (complete, incl. openapi gate)
 Blocked / limits: Application Control blocks test binary execution on Windows host for some packages; CI/CD runs would pass
+
+### API-3 — ETag / If-Match on aggregate mutations
+Status: IN PROGRESS
+Commits: 
+Migrations: 
+Permissions registered: 
+Routes: 
+Wiring: 
+Tests: 
+Negative-path tests: 
+Live probe (if run): 
+Spec rows closed: ZS-API-001 §9, §12, §15, §18, §26, §29
+Blocked / limits: Need to implement across all 20 services. 
+- tenant-entity-registry-svc: DONE (already had ETag/If-Match with tests for Tenant, Entity, Workspace, Hierarchy, JurisdictionAssignment, ResidencyPolicy, TaxIdentityBundle)
+- identity-context-svc: DONE (added ETag/If-Match tests for Principal and SupportContext aggregates)
+- notification-svc: DONE (has ETag/If-Match on Notification (cancel), Template (retire), TemplateVersion (validate, approve, publish) - all with tests)
+- configuration-feature-flag-svc: PARTIAL. 2 Nov (159ee017): build restored, 000014 repaired (it altered a table that does not exist) and given a BEFORE UPDATE version-bump trigger; GET change / emergency change return ETag; activate change / emergency change require If-Match after authorization (428/412/200 tested). Still to do: config definitions (FindConfigDefinition has no ETag, PublishConfigDefinition no If-Match), release plans, kill switches, flag retirements.
+- jurisdiction-rules-svc: DONE (ETag/If-Match on Jurisdiction (GET, Create, Deactivate) and JurisdictionRule (GET, Create, Transition, Drift) - all with tests)
+- policy-svc: DONE (ETag/If-Match on Policy (GET), PolicyVersion (GET, Create, Activate, List) - all with tests)
+- obligations-svc: DONE (ETag/If-Match on Obligation (GET, Create, Patch, Submit) and ObligationDefinition (GET, Create Version) - all with tests)
+- governance-decision-log-svc: DONE (ETag on GET endpoints; CreateDecision is idempotent create, no If-Match needed)
+- access-control-svc: DONE (ETag/If-Match on Role (GET, Create, Update) and Bundle (GET, Create, Update, Detach) - all with tests)
+- search-indexer-svc: DONE (ETag/If-Match on Contract (GET, Create, Transition) and Generation (GET, Create, Transition) - all with tests)
+- delegated-authority-svc: DONE (ETag/If-Match on Delegation (GET, Create, Transition) - all with tests)
+- authorization-svc: PARTIAL. Sessions: ETag/If-Match on PrivilegedSession, BreakGlassSession, SupportSession GETs and revoke. 2 Nov: roles, permission bundles, SoD rules, ABAC rules (retire / reactivate) and authority limits (change / retire) now require the version (If-Match, or legacy body expected_version), 428 when missing, 412 stale_version when stale (was optional + 409); the store checks it inside the UPDATE (000022/000035 trigger-bumped `version`); responses carry the new ETag; openapi documents IfMatch / 412 / 428. Still to do: role assignments, delegated authorities, SoD exceptions and workload bindings (no version column yet), the approve/reject commands, and a version bump on session approve/review paths.
+- gateway-auth-svc: DONE (no mutable aggregates - ForwardAuth /verify endpoint only)
+- workflow-svc: DONE (ETag/If-Match on WorkflowInstance (GET, Create, SubmitAction, SubmitQuorumVote, EscalateWorkflow, EscalateToWorkflow, RevokeWorkflow, CancelWorkflow, InvalidateWorkflow, VerifyRelease) and WorkflowDefinition (GET, Create, Supersede, Activate, Suspend, Retire) - all with tests)
+- evidence-requirements-svc: DONE (no mutable aggregates with RecordVersion - EvidenceRequirement domain type has no version field)
+- schema-registry-svc: DONE (no mutable aggregates with RecordVersion - EventSchema uses append-only Version field, new versions created as new rows)
+- retention-registry-svc: DONE (no mutable aggregates with RecordVersion - RetentionPolicy and LegalHold have no version fields)
+- mtls-management-svc: DONE (no mutable aggregates with RecordVersion - MtlsCertificate and CommunicationPolicy have no version fields)
+- siem-integration-svc: DONE (no mutable aggregates with RecordVersion - SIEMExporter and SIEMEvent have no version fields)
+- carta-svc: DONE (no mutable aggregates with RecordVersion - AccessContext and CartaAssessment have no version fields)
+- key-management-svc: DONE (no mutable aggregates with RecordVersion - CustomerKey has KeyVersion but no RecordVersion field)
+- secret-vault-integration-svc: DONE (ETag/If-Match on SecretPolicyVersion (GET, Create, Activate), SecretLease (GET, Revoke), SharedSecretException (GET, Create, Revoke) - all with tests including 428/412 negative-path tests)
+
 

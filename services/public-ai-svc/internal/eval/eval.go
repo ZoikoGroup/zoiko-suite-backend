@@ -6,11 +6,12 @@ package eval
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
@@ -20,7 +21,13 @@ import (
 type Dataset struct {
 	DatasetVersion string `json:"dataset_version"`
 	Note           string `json:"note"`
-	Cases          []Case `json:"cases"`
+	// LaunchIntents are the intents in launch scope (Doc 07 §10): each one
+	// must have at least one labelled case, or intent accuracy across launch
+	// intents cannot be claimed.
+	LaunchIntents []string `json:"launch_intents,omitempty"`
+	Cases         []Case   `json:"cases"`
+	// SHA256 is the digest of the file as loaded (Doc 07 §19 evidence).
+	SHA256 string `json:"-"`
 }
 
 // Case is one fixture (Doc 07 App. A, deterministic lane).
@@ -29,9 +36,21 @@ type Case struct {
 	Partition       string   `json:"partition"`
 	Priority        string   `json:"priority"`
 	RequirementRefs []string `json:"requirement_refs"`
-	Input           struct {
-		Message string `json:"message"`
-		Market  string `json:"market"`
+	// Segment is the visitor segment the wording represents (Doc 07
+	// QA-T076): novice or expert. Untagged cases are left out of the split.
+	Segment string `json:"segment,omitempty"`
+	// Setup pins what the case runs against (Doc 07 App. A).
+	Setup struct {
+		Locale             string `json:"locale"`
+		PageContext        string `json:"page_context"`
+		KnowledgeReleaseID string `json:"knowledge_release_id"`
+	} `json:"setup"`
+	Input struct {
+		// Before are earlier turns of the same conversation, sent first
+		// (Doc 07 App. A multi-turn cases); only the last turn is graded.
+		Before  []string `json:"before,omitempty"`
+		Message string   `json:"message"`
+		Market  string   `json:"market"`
 	} `json:"input"`
 	Assert struct {
 		Outcome           string   `json:"application_outcome"`
@@ -56,19 +75,42 @@ type CaseResult struct {
 	Status    string   `json:"status"`
 	IntentID  string   `json:"intent_id"`
 	Failures  []string `json:"failures,omitempty"`
+	// Runs, Flaky: P0 cases run at least three times; any failing run fails
+	// the case and mixed results mark it flaky (Doc 07 §07).
+	Runs            int      `json:"runs"`
+	Flaky           bool     `json:"flaky,omitempty"`
+	ResultSHA256    string   `json:"result_sha256"`
+	RequirementRefs []string `json:"requirement_refs,omitempty"`
+	DurationMS      int64    `json:"duration_ms"`
 }
 
 // Report is the evidence artifact for a run.
 type Report struct {
-	DatasetVersion string       `json:"dataset_version"`
-	ExecutedAt     string       `json:"executed_at"`
-	ModelProfile   string       `json:"model_profile"`
-	ReleaseID      string       `json:"knowledge_release_id"`
-	Total          int          `json:"total"`
-	Passed         int          `json:"passed"`
-	P0Failed       int          `json:"p0_failed"`
-	Verdict        string       `json:"verdict"` // PASS | BLOCK_RELEASE
-	Results        []CaseResult `json:"results"`
+	DatasetVersion string `json:"dataset_version"`
+	ExecutedAt     string `json:"executed_at"`
+	ModelProfile   string `json:"model_profile"`
+	ReleaseID      string `json:"knowledge_release_id"`
+	Total          int    `json:"total"`
+	Passed         int    `json:"passed"`
+	P0Failed       int    `json:"p0_failed"`
+	Flaky          int    `json:"flaky"`
+	Verdict        string `json:"verdict"` // PASS | NO_GO | BLOCK_RELEASE
+	GitSHA         string `json:"git_sha,omitempty"`
+	// Provenance (Doc 07 §06/§19, REL-QA-02): what exactly was evaluated.
+	PromptVersion   string `json:"prompt_version"`
+	PolicyVersion   string `json:"policy_version,omitempty"`
+	PolicyDigest    string `json:"policy_digest"`
+	ClaimsReleaseID string `json:"claims_release_id,omitempty"`
+	ModelID         string `json:"model_id"`
+	DatasetSHA256   string `json:"dataset_sha256,omitempty"`
+	// Partitions, Intents, Waivers and Regressions: Doc 07 §09-§11, App. B.
+	Partitions  map[string]PartitionSummary `json:"partitions"`
+	// Segments compares novice and expert wording (QA-T076).
+	Segments map[string]PartitionSummary `json:"segments,omitempty"`
+	Intents     IntentMetrics               `json:"intents"`
+	Waivers     map[string]string           `json:"waivers,omitempty"`
+	Regressions []string                    `json:"regressions,omitempty"`
+	Results     []CaseResult                `json:"results"`
 }
 
 // Load reads a dataset file.
@@ -83,28 +125,15 @@ func Load(path string) (Dataset, error) {
 	if err := dec.Decode(&d); err != nil {
 		return Dataset{}, fmt.Errorf("%s: %w", path, err)
 	}
+	sum := sha256.Sum256(b)
+	d.SHA256 = hex.EncodeToString(sum[:])
 	return d, nil
 }
 
-// Run grades every case.
+// Run grades every case once (P0 cases three times) with the given model
+// profile; RunWith takes the full options.
 func Run(ctx context.Context, a orchestrator.Answerer, d Dataset, modelProfile string) Report {
-	rep := Report{DatasetVersion: d.DatasetVersion, ExecutedAt: time.Now().UTC().Format(time.RFC3339), ModelProfile: modelProfile, Verdict: "PASS"}
-	for _, c := range d.Cases {
-		r := a.Answer(ctx, orchestrator.Input{RequestID: "eval-" + c.ID, Message: c.Input.Message, MarketCode: c.Input.Market, Locale: "en-US"})
-		if rep.ReleaseID == "" {
-			rep.ReleaseID = r.KnowledgeReleaseID
-		}
-		cr := grade(c, r)
-		rep.Total++
-		if cr.Pass {
-			rep.Passed++
-		} else if c.Priority == "P0" {
-			rep.P0Failed++
-			rep.Verdict = "BLOCK_RELEASE"
-		}
-		rep.Results = append(rep.Results, cr)
-	}
-	return rep
+	return RunWith(ctx, a, d, Options{ModelProfile: modelProfile})
 }
 
 func grade(c Case, r orchestrator.Result) CaseResult {

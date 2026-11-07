@@ -1,0 +1,43 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/MenuResponse.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "categories": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "FollowUp.v1.schema.json"
+            },
+            "maxItems": 4,
+            "type": "array"
+          },
+          "label": {
+            "description": "Doc 02 §22 public page family.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "items"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "1.0"
+    }
+  },
+  "required": [
+    "schema_version",
+    "categories"
+  ],
+  "type": "object"
+}

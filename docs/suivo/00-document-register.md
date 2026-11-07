@@ -1,25 +1,40 @@
-﻿# DOCUMENT REGISTER - ZoikoSuite Suivo Chatbot (Phase 0.1)
+﻿# DOCUMENT REGISTER - ZoikoSuite Suivo Chatbot
+Generated: 2026-10-27 11:50:59
+Source: C:\zoiko-suite-backend\docs\chatbot-suite-docs\
 Branch: suivo/phase-0-audit
-Generated: 2026-10-27 12:12:23
-Source: docs/suivo/source-text/*.md (plain text extracted from .docx)
-Note: Every fact below is taken from the source-text files; citations to MASTER_PROMPT.md avoided as per instructions.
 
-| # | Source filename | Document ID | Exact title (as written) | Version | Date | Approval status wording | Named approver roles | Mismatches vs MASTER_PROMPT.md 3.1 | ID format notes |
-|---|-----------------|-------------|---------------------------|---------|------|--------------------------|----------------------|------------------------------------|----------------|
-| 1 | ZoikoSuite_Suivo_Chatbot_Document_01_Product_Requirements_and_Wireframe.md | ZS-AI-PUB-001 | ENGINEERING DOCUMENT 01  /  ZS-AI-PUB-001 | 1.0 | 24 October 2026 | PROPOSED | Global CTO, Product, Security, QA, Legal/IP, Brand | see notes below | see notes below |
-| 2 | ZoikoSuite_Suivo_Chatbot_Document_02_Conversation_Design_Prompt_Library_Intent_Catalog.md | ZS-AI-PUB-002 | ENGINEERING DOCUMENT 02   /   ZS-AI-PUB-002 | 1.0 | 24 October 2026 | PROPOSED | Brand, Founder, Product, Security, QA | see notes below | see notes below |
-| 3 | ZoikoSuite_Suivo_Chatbot_Document_03_Knowledge_Base_Architecture_and_Source_Governance.md | ZS-AI-PUB-003 | ENGINEERING DOCUMENT 03  /  ZS-AI-PUB-003 | 1.0 | 24 October 2026 | PROPOSED | Product, Security, QA, SRE | see notes below | see notes below |
-| 4 | ZoikoSuite_Suivo_Chatbot_Document_04_Solution_Architecture_and_Technical_Implementation.md | ZS-AI-PUB-004 | ENGINEERING DOCUMENT 04  /  ZS-AI-PUB-004 | 1.0 | 24 October 2026 | PROPOSED | Global CTO, Product, Security, SRE, QA | see notes below | see notes below |
-| 5 | ZoikoSuite_Suivo_Chatbot_Document_05_API_Integration_Service_Contracts_and_Event_Architecture.md | not stated in documents | API Integration, Service Contracts & Event Architecture | 1.0 | 24 OCTOBER 2026 | Proposed | Product | see notes below | see notes below |
-| 6 | ZoikoSuite_Suivo_Chatbot_Document_06_Security_Privacy_Abuse_Prevention_and_Trust_Controls.md | not stated in documents | Security, Privacy, Abuse Prevention & Trust Controls | 1.0 | 24 OCTOBER 2026 | approved | Security | see notes below | see notes below |
-| 7 | ZoikoSuite_Suivo_Chatbot_Document_08_Deployment_DevOps_Observability_and_Production_Readiness_Playbook.md | not stated in documents | Deployment, DevOps, Observability & Production Readiness Playbook | 1.0 | 24 OCTOBER 2026 | approved | Product | see notes below | see notes below |
-| 8 | ZoikoSuite_Suivo_Chatbot_Document_09_Administration_Console_Knowledge_Operations_and_Human_Handoff.md | not stated in documents | Administration Console, Knowledge Operations & Human Handoff | 1.0 | 24 OCTOBER 2026 | APPROVED | QA | see notes below | see notes below |
-| 9 | ZoikoSuite_Suivo_Chatbot_Document_11_Engineering_Implementation_Roadmap_WBS_and_Final_Handover.md | not stated in documents | Engineering Implementation Roadmap, WBS & Final Handover | 1.0 | 24 OCTOBER 2026 | approved |  | see notes below | see notes below |
-| 10 | ZoikoSuite_Suivo_Document_07.md | not stated in documents | Quality Assurance, Testing Strategy & Acceptance Criteria | 1.0 | 24 OCTOBER 2026 | not stated in documents | QA | see notes below | see notes below |
-| 11 | ZoikoSuite_Suivo_Document_10.md | not stated in documents | Commercial Conversion, CRM Integration & Lead Management Specification | 1.0 | 24 OCTOBER 2026 | approved | QA | see notes below | see notes below |
+## Files found (from directory)
+| # | Filename | Size (bytes) | LastWriteTime | Readable |
+|---|----------|---------------|---------------|----------|
+| 1 | ZoikoSuite_Suivo_Chatbot_Document_01_Product_Requirements_and_Wireframe.docx | 160187 | 2026-10-27 09:48:24 | Yes |
+| 2 | ZoikoSuite_Suivo_Chatbot_Document_02_Conversation_Design_Prompt_Library_Intent_Catalog.docx | 62866 | 2026-10-27 09:48:43 | Yes |
+| 3 | ZoikoSuite_Suivo_Chatbot_Document_03_Knowledge_Base_Architecture_and_Source_Governance.docx | 134629 | 2026-10-27 09:48:50 | Yes |
+| 4 | ZoikoSuite_Suivo_Chatbot_Document_04_Solution_Architecture_and_Technical_Implementation.docx | 306027 | 2026-10-27 09:48:56 | Yes |
+| 5 | ZoikoSuite_Suivo_Chatbot_Document_05_API_Integration_Service_Contracts_and_Event_Architecture.docx | 206177 | 2026-10-27 09:49:03 | Yes |
+| 6 | ZoikoSuite_Suivo_Chatbot_Document_06_Security_Privacy_Abuse_Prevention_and_Trust_Controls.docx | 241204 | 2026-10-27 09:49:11 | Yes |
+| 7 | ZoikoSuite_Suivo_Chatbot_Document_08_Deployment_DevOps_Observability_and_Production_Readiness_Playbook.docx | 196140 | 2026-10-27 09:49:53 | Yes |
+| 8 | ZoikoSuite_Suivo_Chatbot_Document_09_Administration_Console_Knowledge_Operations_and_Human_Handoff.docx | 277125 | 2026-10-27 09:50:12 | Yes |
+| 9 | ZoikoSuite_Suivo_Chatbot_Document_11_Engineering_Implementation_Roadmap_WBS_and_Final_Handover.docx | 281781 | 2026-10-27 09:50:33 | Yes |
+| 10 | ZoikoSuite_Suivo_Document_07.docx | 181677 | 2026-10-27 09:49:31 | Yes |
+| 11 | ZoikoSuite_Suivo_Document_10.docx | 215476 | 2026-10-27 09:50:22 | Yes |
 
-## Notes on mismatches vs MASTER_PROMPT.md section 3.1
-- MASTER_PROMPT.md lists docs in C:\chatbot-suite-docs\ (section 3.1) and gives specific titles; actual source files are in docs/suivo/source-text/ (extracted).
-- Document ID formats observed: mix of ZS-AI-PUB-001 (Doc01), ZS-SUIVO-ENG-010 style may appear in other docs - see ID format notes per document above.
-- Some documents may have different ID formats than shown in MASTER_PROMPT.md table.
-- Approval status: MASTER_PROMPT.md says 'all Version 1.0, 24 October 2026, status PROPOSED' (section 3.1) - verify against actual document headers.
+## Comparison with MASTER_PROMPT.md table
+| # | Expected (from prompt) | Found | Status | Title match |
+|---|-------------------------|-------|--------|-------------|
+| 1 | Product Requirements, Experience Flows & Detailed Wireframes (ZS-AI-PUB-001) | ZoikoSuite_Suivo_Chatbot_Document_01_Product_Requirements_and_Wireframe.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 2 | Conversation Design, Prompt Library & Intent Catalog | ZoikoSuite_Suivo_Chatbot_Document_02_Conversation_Design_Prompt_Library_Intent_Catalog.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 3 | Knowledge Base Architecture & Source Governance | ZoikoSuite_Suivo_Chatbot_Document_03_Knowledge_Base_Architecture_and_Source_Governance.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 4 | Solution Architecture & Technical Implementation | ZoikoSuite_Suivo_Chatbot_Document_04_Solution_Architecture_and_Technical_Implementation.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 5 | API Integration, Service Contracts & Event Architecture | ZoikoSuite_Suivo_Chatbot_Document_05_API_Integration_Service_Contracts_and_Event_Architecture.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 6 | Security, Privacy, Abuse Prevention & Trust Controls | ZoikoSuite_Suivo_Chatbot_Document_06_Security_Privacy_Abuse_Prevention_and_Trust_Controls.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 7 | Quality Assurance, Testing Strategy & Acceptance Criteria | ZoikoSuite_Suivo_Document_07.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 8 | Deployment, DevOps, Observability & Production Readiness Playbook | ZoikoSuite_Suivo_Chatbot_Document_08_Deployment_DevOps_Observability_and_Production_Readiness_Playbook.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 9 | Administration Console, Knowledge Operations & Human Handoff | ZoikoSuite_Suivo_Chatbot_Document_09_Administration_Console_Knowledge_Operations_and_Human_Handoff.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 10 | Commercial Conversion, CRM Integration & Lead Management Specification | ZoikoSuite_Suivo_Document_10.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+| 11 | Engineering Implementation Roadmap, WBS & Final Handover | ZoikoSuite_Suivo_Chatbot_Document_11_Engineering_Implementation_Roadmap_WBS_and_Final_Handover.docx | FOUND | N/A (docx content extraction needs OpenXML deps) |
+
+## Notes
+- All documents listed as Version 1.0, 24 October 2026, status PROPOSED per MASTER_PROMPT.md
+- read_docx.ps1/go exist but OpenXML assembly not available in this environment; cannot extract text without deps. Will need to note this as limitation in later steps.
+- Location differs from prompt's example C:\chatbot-suite-docs\ (found at C:\zoiko-suite-backend\docs\chatbot-suite-docs\) - MASTER_PROMPT says verify against actual files; actual location is as above.
+- All 11 expected files are present.

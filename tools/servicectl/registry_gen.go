@@ -21,7 +21,7 @@
 
 package main
 
-// generatedServices is the authoritative service table: 86 services.
+// generatedServices is the authoritative service table: 87 services.
 var generatedServices = []Service{
 	{
 		Name:   "access-control-svc",
@@ -667,6 +667,18 @@ var generatedServices = []Service{
 			"GOVERNANCE_DECISION_LOG_SERVICE_URL": "http://127.0.0.1:8083",
 			"KAFKA_EVENTS_TOPIC":                  "zoiko.policy.events",
 			"KAFKA_GROUP_ID":                      "policy-svc",
+		},
+	},
+	{
+		Name: "public-ai-svc",
+		Port: 8001,
+		Env: map[string]string{
+			"PUBLIC_AI_ALLOWED_ORIGINS": "http://localhost:3000",
+			"PUBLIC_AI_DATABASE_URL":    "",
+			"PUBLIC_AI_ENABLED":         "true",
+			"PUBLIC_AI_ENVIRONMENT":     "dev",
+			"PUBLIC_AI_HTTP_ADDR":       "127.0.0.1:8001",
+			"PUBLIC_AI_MODEL_PROVIDER":  "mock",
 		},
 	},
 	{

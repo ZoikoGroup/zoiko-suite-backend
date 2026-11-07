@@ -2,8 +2,11 @@ package limits
 
 import (
 	"context"
+	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +14,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
+	"zoiko.io/public-ai-svc/internal/problem"
 	"zoiko.io/public-ai-svc/internal/store"
 )
 
@@ -49,6 +53,16 @@ func TestPerIPLimit(t *testing.T) {
 	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("got %d retry=%q", w.Code, w.Header().Get("Retry-After"))
 	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content-type = %q", ct)
+	}
+	var p problem.Problem
+	if err := json.Unmarshal(w.Body.Bytes(), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Code != "publicai.rate_limited" || !p.Retryable || p.Status != http.StatusTooManyRequests {
+		t.Fatalf("problem = %+v", p)
+	}
 	if w := hit(h, "203.0.113.8", ""); w.Code != 200 {
 		t.Fatal("another client must not be affected")
 	}
@@ -66,8 +80,56 @@ func TestPerSessionLimitAcrossIPs(t *testing.T) {
 }
 
 func TestIPv6Coarsened(t *testing.T) {
-	if clientKey("[2001:db8:1:2:aaaa::1]:5") != clientKey("[2001:db8:1:2:bbbb::9]:5") {
+	if clientKey(net.ParseIP("2001:db8:1:2:aaaa::1")) != clientKey(net.ParseIP("2001:db8:1:2:bbbb::9")) {
 		t.Fatal("IPv6 addresses in one /64 must share a bucket")
+	}
+}
+
+// Visitors behind the console proxy get their own buckets; a forged
+// X-Forwarded-For cannot pick a bucket.
+func TestClientIPThroughTrustedProxy(t *testing.T) {
+	cfg := config.Config{TrustedProxies: []string{"127.0.0.1/32", "::1/128", "10.0.0.0/8"}}
+	g := New(cfg, store.NewMemory(), fixedFlags{flags.Defaults()})
+	cases := []struct{ peer, xff, want string }{
+		{"127.0.0.1", "203.0.113.7", "203.0.113.7"},           // console proxy
+		{"[::1]", "203.0.113.7", "203.0.113.7"},               // IPv6 loopback proxy
+		{"127.0.0.1", "6.6.6.6, 203.0.113.7", "203.0.113.7"},  // forged left entry ignored
+		{"127.0.0.1", "203.0.113.7, 10.1.2.3", "203.0.113.7"}, // trusted edge hop skipped
+		{"127.0.0.1", "", "127.0.0.1"},                        // no header: the peer
+		{"127.0.0.1", "not-an-ip", "127.0.0.1"},               // malformed: the peer
+		{"198.51.100.4", "203.0.113.7", "198.51.100.4"},       // untrusted peer: header ignored
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodPost, "/public-ai/v1/turns", nil)
+		r.RemoteAddr = c.peer + ":1234"
+		if c.xff != "" {
+			r.Header.Set("X-Forwarded-For", c.xff)
+		}
+		if got := g.clientIP(r).String(); got != c.want {
+			t.Errorf("peer %s xff %q: got %s, want %s", c.peer, c.xff, got, c.want)
+		}
+	}
+}
+
+func TestVisitorsBehindProxyHaveSeparateBuckets(t *testing.T) {
+	cfg := config.Config{RateLimitPerIPPerMinute: 12, RateLimitPerSessionPerMin: 1000, TrustedProxies: []string{"127.0.0.1/32"}}
+	h := New(cfg, store.NewMemory(), fixedFlags{flags.Defaults()}).Middleware(ok)
+	via := func(visitor string) int {
+		r := httptest.NewRequest(http.MethodPost, "/public-ai/v1/turns", nil)
+		r.RemoteAddr = "127.0.0.1:5000"
+		r.Header.Set("X-Forwarded-For", visitor)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	for i := 0; i < 3; i++ {
+		via("203.0.113.7")
+	}
+	if via("203.0.113.7") != http.StatusTooManyRequests {
+		t.Fatal("the busy visitor must be limited")
+	}
+	if via("203.0.113.8") != 200 {
+		t.Fatal("another visitor behind the same proxy must not be limited")
 	}
 }
 
@@ -120,4 +182,82 @@ func TestSpendCeilingStopsAnswering(t *testing.T) {
 	if inner.n != 1 {
 		t.Fatalf("model path called %d times", inner.n)
 	}
+}
+
+// Doc 06 §13: staged throttling on the spend ceilings.
+func TestSpendStages(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	cfg := config.Config{DailyTokenCeiling: 1000, MonthlyTokenCeiling: 100000}
+	g := New(cfg, st, nil)
+	day, month := UsageBuckets(g.now().UTC())
+	for _, c := range []struct {
+		used int64
+		want string
+	}{{0, ""}, {800, orchestrator.BudgetReduced}, {1000, orchestrator.BudgetStatic}} {
+		st.SetUsageForTest(day, c.used)
+		st.SetUsageForTest(month, c.used)
+		if got, failed := g.spendStage(ctx); failed || got != c.want {
+			t.Fatalf("used %d: stage %q failed %v, want %q", c.used, got, failed, c.want)
+		}
+	}
+}
+
+func TestBucketKeysAreNotAddresses(t *testing.T) {
+	for _, ip := range []string{"203.0.113.7", "2001:db8:1:2::1"} {
+		k := clientKey(net.ParseIP(ip))
+		if strings.Contains(k, "203.0.113") || strings.Contains(k, "2001:db8") {
+			t.Fatalf("bucket key %q contains the address", k)
+		}
+	}
+	if clientKey(net.ParseIP("203.0.113.7")) == clientKey(net.ParseIP("203.0.113.8")) {
+		t.Fatal("different visitors share a bucket")
+	}
+}
+
+// Doc 06 §13: two replicas sharing one store and salt enforce one per-minute
+// limit between them; without the shared salt each replica counts alone.
+func TestSharedLimitAcrossReplicas(t *testing.T) {
+	st := store.NewMemory()
+	cfg := config.Config{RateLimitPerIPPerMinute: 4, RateLimitPerSessionPerMin: 100, DailyTokenCeiling: 100, MonthlyTokenCeiling: 1000,
+		RateKeySalt: strings.Repeat("k", 32)}
+	a := New(cfg, st, fixedFlags{flags.Defaults()}).Middleware(okHandler())
+	b := New(cfg, st, fixedFlags{flags.Defaults()}).Middleware(okHandler())
+	allowed := 0
+	for i := 0; i < 8; i++ {
+		h := a
+		if i%2 == 1 {
+			h = b
+		}
+		if w := hit(h, "203.0.113.9", ""); w.Code == http.StatusOK {
+			allowed++
+		} else if w.Header().Get("Retry-After") == "" {
+			t.Fatal("429 without Retry-After")
+		}
+	}
+	if allowed != 4 {
+		t.Fatalf("two replicas allowed %d requests in one minute, want 4", allowed)
+	}
+	// Per-replica only (no salt): each replica has its own budget.
+	cfg.RateKeySalt = ""
+	st2 := store.NewMemory()
+	c := New(cfg, st2, fixedFlags{flags.Defaults()}).Middleware(okHandler())
+	d := New(cfg, st2, fixedFlags{flags.Defaults()}).Middleware(okHandler())
+	allowed = 0
+	for i := 0; i < 8; i++ {
+		h := c
+		if i%2 == 1 {
+			h = d
+		}
+		if hit(h, "203.0.113.9", "").Code == http.StatusOK {
+			allowed++
+		}
+	}
+	if allowed <= 4 {
+		t.Fatalf("without a shared salt each replica keeps its own budget, so together they allow more than one limit: %d", allowed)
+	}
+}
+
+func okHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 }

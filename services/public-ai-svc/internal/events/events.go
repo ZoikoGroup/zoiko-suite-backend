@@ -8,8 +8,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"regexp"
+	"strings"
 	"time"
 
+	"zoiko.io/public-ai-svc/internal/metrics"
+	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/store"
 )
 
@@ -30,7 +35,24 @@ const (
 	TypeSecuritySignal    = "chat.security.signal.v1"
 )
 
-const source = "urn:zoikosuite:publicai:orchestrator"
+// Sources per producer (Doc 05 §20): a consumer can tell who emitted an
+// event, and replay accepts only an event from the producer of its type.
+const (
+	sourceOrchestrator = "urn:zoikosuite:publicai:orchestrator"
+	sourceRelease      = "urn:zoikosuite:publicai:release"
+	sourceControl      = "urn:zoikosuite:publicai:control"
+)
+
+// sourceOf is the producer that emits an event type.
+func sourceOf(typ string) string {
+	switch typ {
+	case TypeReleasePromoted, TypeSourceRevoked:
+		return sourceRelease
+	case TypeKillSwitchChanged:
+		return sourceControl
+	}
+	return sourceOrchestrator
+}
 
 // Envelope is CloudEvents 1.0 structured JSON.
 type Envelope struct {
@@ -43,14 +65,35 @@ type Envelope struct {
 	Data            any    `json:"data"`
 }
 
+// newID is a random UUIDv4 (RFC 9562), the CloudEvents id consumers dedupe on.
 func newID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// Backoff is the wait before relay attempt n (1-based): doubling from base,
+// capped at two minutes.
+func Backoff(base time.Duration, attempt int) time.Duration {
+	d := base
+	for i := 1; i < attempt && d < 2*time.Minute; i++ {
+		d *= 2
+	}
+	if d > 2*time.Minute {
+		d = 2 * time.Minute
+	}
+	return d
 }
 
 func build(topic, typ string, data any, at time.Time) (store.OutboxEvent, error) {
-	env := Envelope{SpecVersion: "1.0", ID: newID(), Source: source, Type: typ,
+	if err := dlpCheck(data); err != nil {
+		metrics.EventDLPBlocked(typ)
+		return store.OutboxEvent{}, err
+	}
+	env := Envelope{SpecVersion: "1.0", ID: newID(), Source: sourceOf(typ), Type: typ,
 		Time: at.UTC().Format(time.RFC3339Nano), DataContentType: "application/json", Data: data}
 	b, err := json.Marshal(env)
 	if err != nil {
@@ -100,23 +143,40 @@ func HandoffClicked(routeKey, market string, consent bool, at time.Time) (store.
 
 type releasePromoted struct {
 	ReleaseID   string   `json:"release_id"`
+	Kind        string   `json:"kind"`
 	SignerRefs  []string `json:"signer_refs"`
 	Digest      string   `json:"digest"`
 	EffectiveAt string   `json:"effective_at"`
+	// ReleaseEpoch orders promotions of one kind (Doc 05 §22): consumers
+	// ignore an announcement older than the last one they applied.
+	ReleaseEpoch int64 `json:"release_epoch"`
 }
 
+// ReleasePromotedFor announces that the pointer for kind ("kb" or "claims")
+// moved to releaseID.
+func ReleasePromotedFor(kind, releaseID, digest string, signers []string, at time.Time) (store.OutboxEvent, error) {
+	return build(TopicGovernance, TypeReleasePromoted, releasePromoted{releaseID, kind, signers, digest, at.UTC().Format(time.RFC3339), at.UTC().UnixNano()}, at)
+}
+
+// ReleasePromoted is ReleasePromotedFor with the kind inferred from the id
+// prefix. Deprecated: callers that know the kind use ReleasePromotedFor.
 func ReleasePromoted(releaseID, digest string, signers []string, at time.Time) (store.OutboxEvent, error) {
-	return build(TopicGovernance, TypeReleasePromoted, releasePromoted{releaseID, signers, digest, at.UTC().Format(time.RFC3339)}, at)
+	return ReleasePromotedFor(kindOf(releaseID), releaseID, digest, signers, at)
 }
 
 type sourceRevoked struct {
 	SourceVersionID string `json:"source_version_id"`
 	ReasonCode      string `json:"reason_code"`
 	EffectiveAt     string `json:"effective_at"`
+	// RevocationEpoch is the revocation ledger watermark of this entry,
+	// filled in by the store in the same transaction (Doc 05 §18/§22).
+	RevocationEpoch int64 `json:"revocation_epoch"`
 }
 
+// SourceRevoked announces a revocation. Pass the event to the store call
+// that appends the ledger entry: it stamps revocation_epoch.
 func SourceRevoked(sourceVersionID, reason string, at time.Time) (store.OutboxEvent, error) {
-	return build(TopicGovernance, TypeSourceRevoked, sourceRevoked{sourceVersionID, reason, at.UTC().Format(time.RFC3339)}, at)
+	return build(TopicGovernance, TypeSourceRevoked, sourceRevoked{sourceVersionID, reason, at.UTC().Format(time.RFC3339), 0}, at)
 }
 
 type killSwitchChanged struct {
@@ -124,10 +184,13 @@ type killSwitchChanged struct {
 	ActorRef    string `json:"actor_ref"`
 	ApprovalRef string `json:"approval_ref"`
 	Environment string `json:"environment"`
+	// ControlEpoch orders control changes: replay never re-announces an
+	// event older than the flag's current change (Doc 05 §22).
+	ControlEpoch int64 `json:"control_epoch"`
 }
 
 func KillSwitchChanged(flag, actor, approval, environment string, at time.Time) (store.OutboxEvent, error) {
-	return build(TopicControl, TypeKillSwitchChanged, killSwitchChanged{flag, actor, approval, environment}, at)
+	return build(TopicControl, TypeKillSwitchChanged, killSwitchChanged{flag, actor, approval, environment, at.UTC().UnixNano()}, at)
 }
 
 type securitySignal struct {
@@ -139,4 +202,58 @@ type securitySignal struct {
 // SecuritySignal carries a reason class only, never the prompt body.
 func SecuritySignal(reasonClass, requestID, severity string, at time.Time) (store.OutboxEvent, error) {
 	return build(TopicTelemetry, TypeSecuritySignal, securitySignal{reasonClass, requestID, severity}, at)
+}
+
+// ErrEventDLP: an event field carried free text or personal data. Events are
+// ids, enums and buckets only (Doc 05 §21, CT-045); such an event is never
+// written to the outbox, and the refusal is counted and alerted on.
+var ErrEventDLP = errors.New("events: a field carries free text or personal data")
+
+var (
+	identRe  = regexp.MustCompile(`^[A-Za-z0-9_:.<>+\-]{1,160}$`)
+	digitsRe = regexp.MustCompile(`^\+?[0-9][0-9 ()-]{6,}$`)
+)
+
+// dlpCheck scans every string in an event payload: anything long, spaced
+// like prose, or matching a sensitive-data or contact pattern is refused.
+func dlpCheck(data any) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	var bad bool
+	var walk func(any)
+	walk = func(x any) {
+		switch t := x.(type) {
+		case map[string]any:
+			for _, y := range t {
+				walk(y)
+			}
+		case []any:
+			for _, y := range t {
+				walk(y)
+			}
+		case string:
+			switch {
+			case len(t) > 160 || strings.Count(t, " ") >= 6:
+				bad = true // prose, not an id or enum
+			case digitsRe.MatchString(t):
+				bad = true // a bare long number (phone, account, card)
+			case identRe.MatchString(t):
+				// ids, enums, buckets and timestamps: random ids would only
+				// trip the contact patterns by chance
+			case policy.Redact(t).Found() || policy.HasContact(t):
+				bad = true
+			}
+		}
+	}
+	walk(v)
+	if bad {
+		return ErrEventDLP
+	}
+	return nil
 }

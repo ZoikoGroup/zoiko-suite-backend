@@ -99,10 +99,77 @@ type Publisher struct {
 	producer       MessageWriter
 	residency      string
 	classification string
+	brokers        []string
+	dialer         *kafka.Dialer
+	probeTimeout   time.Duration
 }
 
 func NewPublisher(log *zap.Logger, topic string, producer MessageWriter) *Publisher {
-	return &Publisher{log: log, topic: topic, producer: producer, residency: Unspecified, classification: Unspecified}
+	return &Publisher{
+		log: log, topic: topic, producer: producer, residency: Unspecified, classification: Unspecified,
+		dialer: &kafka.Dialer{Timeout: 10 * time.Second}, probeTimeout: 5 * time.Second,
+	}
+}
+
+// WithBrokers records the broker addresses Probe dials directly (bypassing
+// the batching kafka.Writer, which only reports a write failure well after
+// the fact). Required for Probe to distinguish a down broker from a
+// malformed event; without it, Probe always reports an error, which is the
+// safe default (see Probe).
+func (p *Publisher) WithBrokers(brokers []string) *Publisher {
+	p.brokers = brokers
+	return p
+}
+
+// Probe reports whether the topic is currently servable, by dialing a
+// broker and reading the topic's partition metadata directly — the same
+// check kafkaout.Writer.Probe performs, kept local here rather than taking a
+// dependency on the eventing module, since this service's envelope
+// deliberately does not adopt that module's CloudEvents shape (see the
+// envelope type's doc comment).
+//
+// An empty broker list (WithBrokers was never called) always fails closed:
+// outbox.Relay treats a Probe error as "the broker is down" and releases the
+// batch uncharged, so a misconfigured Publisher can only make the relay
+// retry forever, never dead-letter a well-formed event it was never able to
+// genuinely test.
+func (p *Publisher) Probe(ctx context.Context) error {
+	if len(p.brokers) == 0 {
+		return fmt.Errorf("probe: no brokers configured")
+	}
+	ctx, cancel := context.WithTimeout(ctx, p.probeTimeout)
+	defer cancel()
+	var lastErr error
+	for _, broker := range p.brokers {
+		if lastErr = p.probeBroker(ctx, broker); lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
+func (p *Publisher) probeBroker(ctx context.Context, broker string) error {
+	conn, err := p.dialer.DialContext(ctx, "tcp", broker)
+	if err != nil {
+		return fmt.Errorf("probe: dial %s: %w", broker, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	partitions, err := conn.ReadPartitions(p.topic)
+	if err != nil {
+		return fmt.Errorf("probe: topic %s metadata from %s: %w", p.topic, broker, err)
+	}
+	if len(partitions) == 0 {
+		return fmt.Errorf("probe: topic %s has no partitions", p.topic)
+	}
+	for _, part := range partitions {
+		if part.Error != nil {
+			return fmt.Errorf("probe: topic %s partition %d: %w", p.topic, part.ID, part.Error)
+		}
+	}
+	return nil
 }
 
 // WithProfile sets the deployment's residency region and data classification. Blank values keep
