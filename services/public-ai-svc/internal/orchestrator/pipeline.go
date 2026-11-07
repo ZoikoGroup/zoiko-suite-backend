@@ -1151,7 +1151,7 @@ func claimRequest(intent string, dec policy.Decision, msg string, reg *claims.Re
 		case frameworkRe.MatchString(msg):
 			// A11: a named framework we hold no claim for must not borrow another one.
 			q.Subject, q.SubjectID = claims.Certification, strings.ToUpper(nonAlnum.ReplaceAllString(frameworkRe.FindString(msg), ""))
-		case strings.Contains(strings.ToLower(msg), "certif"):
+		case certificationWordRe.MatchString(msg):
 			q.Subject = claims.Certification
 		default:
 			return q, false // general security questions come from approved trust pages
@@ -1265,3 +1265,8 @@ func reviewedAt(s knowledge.Source) string {
 // howToRe asks how to do something in the product: such a question is
 // answered from a section written as steps when one matches.
 var howToRe = regexp.MustCompile(`(?i)^\s*(?:how\s+(?:do|can|should|would)\s+(?:i|we|you|one)\b|how\s+to\b|what\s+are\s+the\s+steps\b|steps?\s+(?:to|for)\b|walk\s+me\s+through\b|guide\s+me\b|use\s+of\b)`)
+
+// certificationWordRe asks about a certification ("are you certified",
+// "which certifications"), not a TLS or X.509 certificate ("how do I issue an
+// mTLS certificate"), which is answered from the console articles.
+var certificationWordRe = regexp.MustCompile(`(?i)\bcertif(?:y|ied|ication|ications)\b`)
