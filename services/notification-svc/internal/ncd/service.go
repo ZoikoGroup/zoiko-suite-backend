@@ -61,7 +61,15 @@ type Service struct {
 	now       func() time.Time
 	kick      chan struct{}
 	// metrics records §13.1 signals; never nil (noMetrics until SetMetrics).
-	metrics     Metrics
+	metrics Metrics
+	// privacyDecider asks privacy-decision-svc for the privacy permission (S7-B1). Nil reads the caller-supplied value.
+	privacyDecider PrivacyDecider
+	// recordVault declares notice evidence packages as records (S7-B2). Nil leaves record declaration to a caller-supplied reference.
+	recordVault RecordVault
+	// partyContacts reads verified contact points of a party of the sender's tenant (S7-C1). Nil refuses party recipients.
+	partyContacts PartyContactSource
+	// legalBasis checks a notice legal basis against the policy authority (S7-C2). Nil leaves it caller-supplied.
+	legalBasis  LegalBasisVerifier
 	lastBacklog time.Time
 }
 

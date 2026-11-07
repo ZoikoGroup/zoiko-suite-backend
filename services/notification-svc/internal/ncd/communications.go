@@ -272,7 +272,7 @@ func (s *Service) Prepare(ctx context.Context, a Actor, id string) (*PrepareResu
 			return emit(tx, a, EvtPrepared, c.LegalEntityID, c.CommunicationID, map[string]any{
 				"communication_id": c.CommunicationID, "intent_id": c.IntentID, "intent_version": c.IntentVersion,
 				"rendered_content_hash": combinedContentHash(renders, c.Attachments), "recipient_plan_id": plan.PlanID,
-				"decision_refs": map[string]any{"channel_decision_id": dec.DecisionID, "privacy": c.PrivacyPermission.DecisionID,
+				"decision_refs": map[string]any{"channel_decision_id": dec.DecisionID, "privacy": privacyDecisionID(dec),
 					"marketing": c.MarketingPermission.DecisionID, "pdc": c.PDCDecisionRef},
 			})
 		}

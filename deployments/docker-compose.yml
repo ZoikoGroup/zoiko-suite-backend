@@ -894,6 +894,8 @@ services:
       KAFKA_GROUP_ID: "tenant-entity-registry-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.entity.events"
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
+      # ORG-03 s4.3: a legal entity fiscal_calendar_id is checked against fiscal-calendar-svc (read-only, fail-closed).
+      FISCAL_CALENDAR_URL: "http://fiscal-calendar-svc:8173"
       # Was "http://tenant-svc:8081" — this service's own address, commented
       # "mock stub authz points back". main.go treated any URL other than the
       # literal "http://authorization-svc" as production wiring, so that value
@@ -1265,6 +1267,10 @@ services:
       # as legal_entity_id — authorization-svc rejects an empty one.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # S3-B3: a secret:// reference is accepted only if the vault governs its path (read-only, fail-closed). The principal needs
+      # the vault's SECRET_POLICY_LIST action in each tenant scope, granted at onboarding like the other service principals.
+      SECRET_VAULT_URL: "http://secret-vault-integration-svc:8087"
+      SECRET_VAULT_PRINCIPAL_ID: "svc-configuration"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "configuration-feature-flag-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.configuration.events"

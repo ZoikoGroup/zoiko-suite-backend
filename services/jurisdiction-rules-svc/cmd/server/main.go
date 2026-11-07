@@ -233,7 +233,7 @@ func main() {
 	} else {
 		log.Warn("pack signing disabled: PACK_SIGNING_KEY_REF/PACK_SIGNING_KEY_FILE are not set; the sign command will answer 503")
 	}
-	h.WithEntityApplicability(pgStore)
+	h.WithEntityApplicability(pgStore).WithEntityFacts(pgStore)
 
 	// J-02: activation confirms its X-Approval-Reference with workflow-svc.
 	switch {
@@ -284,7 +284,7 @@ func main() {
 			WatchPartitionChanges:  true,
 			PartitionWatchInterval: 30 * time.Second,
 		})
-		go consumer.NewEntityConsumer(log, pgStore).WithMetrics(metrics).Run(consumerCtx, entityReader)
+		go consumer.NewEntityConsumer(log, pgStore).WithFacts(pgStore).WithMetrics(metrics).Run(consumerCtx, entityReader)
 		log.Info("entity consumer wired", zap.String("topic", cfg.Kafka.EntityTopic), zap.String("group_id", cfg.Kafka.GroupID))
 	}
 

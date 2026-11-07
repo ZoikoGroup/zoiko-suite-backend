@@ -55,7 +55,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | REF-1 | REF-01 jurisdiction registry commands | TODO | | |
 | REF-2 | REF-07 accounting policy | TODO | | |
 | REF-3 | REF-10 calendars + payment terms | TODO | | |
-| JUR-1 | jurisdiction-decisions:resolve | TODO | | after ORG-5..7 |
+| JUR-1 | jurisdiction-decisions:resolve | DONE | | entity facts (ORG-6, ORG-7) added; place of supply not built |
 | G1-1 | Group 1 register items now unblocked | TODO | | |
 | EML-1 | 128 templates + 32 variants | TODO | | |
 | EML-2 | Register parity test | TODO | | |

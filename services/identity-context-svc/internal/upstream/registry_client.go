@@ -484,3 +484,37 @@ type correlationKey struct{}
 func WithCorrelationID(ctx context.Context, cid string) context.Context {
 	return context.WithValue(ctx, correlationKey{}, cid)
 }
+
+// ResolveHost asks the registry which tenant a hostname is bound to (ORG-02 ResolveTenantByHost):
+//
+//	GET {tenantRegistryURL}/v1/resolve-tenant?hostname=…
+//
+// The lookup is unauthenticated and not tenant-scoped by design: it is how a caller learns its tenant. found=false is
+// the registry's own 404 ("not bound to any tenant", never a fallback), an answer; anything else unreadable is an
+// error, so a caller never mistakes an outage for an unbound host.
+func (c *RegistryClient) ResolveHost(ctx context.Context, host string) (tenantID, lifecycleState string, found bool, err error) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return "", "", false, nil
+	}
+	status, body, err := c.get(ctx, "", fmt.Sprintf("%s/v1/resolve-tenant?hostname=%s",
+		strings.TrimRight(c.cfg.TenantRegistryURL, "/"), url.QueryEscape(host)))
+	if err != nil {
+		return "", "", false, fmt.Errorf("%w: %v", ErrUpstreamRead, err)
+	}
+	switch status {
+	case http.StatusOK:
+		var r struct {
+			TenantID       string `json:"tenant_id"`
+			LifecycleState string `json:"lifecycle_state"`
+		}
+		if err := json.Unmarshal(body, &r); err != nil || r.TenantID == "" {
+			return "", "", false, fmt.Errorf("%w: resolve-tenant answer unreadable", ErrUpstreamRead)
+		}
+		return r.TenantID, r.LifecycleState, true, nil
+	case http.StatusNotFound:
+		return "", "", false, nil
+	default:
+		return "", "", false, fmt.Errorf("%w: resolve-tenant returned %d", ErrUpstreamRead, status)
+	}
+}

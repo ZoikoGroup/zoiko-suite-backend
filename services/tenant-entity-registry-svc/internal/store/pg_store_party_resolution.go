@@ -250,8 +250,8 @@ func (s *PgStore) DecideResolutionCase(ctx context.Context, caseID string, req d
 		case domain.DecisionKeepHolder:
 			// The identifier stays where it is.
 
-		case domain.DecisionKeepVerified, domain.DecisionAcceptProposed:
-			p, err := s.decideFactConflict(ctx, tx, tid, c, req.Decision, actor, req.CorrelationID, now)
+		case domain.DecisionKeepVerified, domain.DecisionAcceptProposed, domain.DecisionAcceptObservation:
+			p, err := s.decideDisputed(ctx, tx, tid, c, req.Decision, actor, req.CorrelationID, now)
 			if err != nil {
 				return err
 			}

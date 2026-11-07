@@ -50,6 +50,11 @@ type Config struct {
 	// environments table to enumerate them from — so the sweep must be told
 	// which ones carry time-boxed objects.
 	SweepEnvironments []string
+
+	// SecretVaultURL is secret-vault-integration-svc. A secret:// reference is accepted only if the vault governs its path
+	// (S3-B3), asked as SecretVaultPrincipalID. Unset in local the check is shape-only; staging and production refuse to start without it.
+	SecretVaultURL         string
+	SecretVaultPrincipalID string
 }
 
 // KafkaConfig holds event backbone connection parameters.
@@ -88,6 +93,9 @@ func (d DBConfig) DSN() string {
 // about authorization being unavailable, while every read keeps working. The
 // cause is a missing environment variable and the symptom is what a dependency
 // outage looks like.
+// ErrSecretVaultMissing: staging and production check secret references against the vault; without it a dangling reference would be accepted.
+var ErrSecretVaultMissing = errors.New("SECRET_VAULT_URL is required in staging and production: a secret:// reference is accepted only when the vault governs its path")
+
 var ErrPlatformScopeMissing = errors.New("AUTHZ_PLATFORM_SCOPE_ID is required: every write authorizes against it as the legal_entity_id, and authorization-svc refuses an empty one — leaving it unset fails every write with an error that reads as an authorization-svc outage")
 
 // Load reads configuration from environment variables.
@@ -117,6 +125,8 @@ func Load() (*Config, error) {
 		},
 		SweepInterval:     envDuration("SWEEP_INTERVAL", time.Minute),
 		SweepEnvironments: envList("SWEEP_ENVIRONMENTS", []string{"staging", "production"}),
+		SecretVaultURL:         env("SECRET_VAULT_URL", ""),
+		SecretVaultPrincipalID: env("SECRET_VAULT_PRINCIPAL_ID", "svc-configuration"),
 	}
 
 	// Local development is allowed to omit it — a single-service run with no
@@ -125,6 +135,10 @@ func Load() (*Config, error) {
 	// be a deployment must name the scope.
 	if cfg.AuthZPlatformScopeID == "" && !strings.EqualFold(cfg.Env, "local") {
 		return nil, ErrPlatformScopeMissing
+	}
+
+	if cfg.SecretVaultURL == "" && (strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging")) {
+		return nil, ErrSecretVaultMissing
 	}
 
 	return cfg, nil

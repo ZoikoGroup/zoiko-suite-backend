@@ -39,6 +39,9 @@ func (s *Service) CreateNotice(ctx context.Context, a Actor, in NoticeInput) (*R
 			return nil, Invalid("invalid_effective_date", "effective_date must be YYYY-MM-DD")
 		}
 	}
+	if err := s.verifyLegalBasis(ctx, a, in.LegalBasisRef); err != nil {
+		return nil, err
+	}
 	var out *RegulatedNotice
 	err := s.store.InTx(ctx, a.TenantID, func(tx Tx) error {
 		c, err := tx.GetCommunication(in.CommunicationID, true)
