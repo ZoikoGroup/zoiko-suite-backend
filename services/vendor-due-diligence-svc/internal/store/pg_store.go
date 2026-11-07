@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,11 +24,6 @@ func New(pool *pgxpool.Pool) *PgStore {
 }
 
 // checkColumns is the single source of truth for the SELECT list.
-//
-// Derived from one slice rather than hand-copied into each query so the list and
-// its scan targets cannot drift apart — the policy-svc bug where a SELECT named
-// 10 of 12 columns was exactly this shape. COALESCE lives in selectCheckSQL so
-// the nullable columns scan into plain strings.
 var checkColumns = []string{
 	"check_id",
 	"tenant_id",
@@ -48,8 +44,6 @@ func selectCheckSQL() string {
 	return "SELECT " + strings.Join(checkColumns, ", ") + " FROM vendor_dd_checks"
 }
 
-// scanCheck reads one row in checkColumns order. The one place that knows the
-// order, paired with the one place that knows the list.
 func scanCheck(row pgx.Row, c *domain.VendorDDCheck) error {
 	return row.Scan(
 		&c.CheckID, &c.TenantID, &c.LegalEntityID, &c.CounterpartyID, &c.VendorName,
@@ -58,16 +52,6 @@ func scanCheck(row pgx.Row, c *domain.VendorDDCheck) error {
 	)
 }
 
-// mapPgError turns the Postgres failures that are really caller mistakes into
-// domain errors, so they stop arriving at the client as "the store is
-// unavailable".
-//
-// 22P02 is the one that mattered here: check_id is a uuid column, so
-// GET /v1/vendor-checks/not-a-uuid died inside the driver before any row was
-// examined and answered 503. A mistyped id in a URL is not an outage, and
-// reporting it as one sends an operator to look at Docker instead of at the id.
-// The existing handler test did not catch it because the stub store is a map and
-// never sees the driver.
 func mapPgError(err error) error {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
@@ -102,12 +86,6 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-// tenantScope resolves the tenant every query is filtered by, refusing rather
-// than running unscoped.
-//
-// The returned error is ErrTenantMissing and not a generic one on purpose: the
-// handler distinguishes it from a broken database, because a caller who omitted
-// X-Tenant-Id was previously told the service's database was down.
 func tenantScope(ctx context.Context) (string, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -116,13 +94,6 @@ func tenantScope(ctx context.Context) (string, error) {
 	return tenantID, nil
 }
 
-// CreateCheck inserts a new check in STARTED status, idempotent on
-// (tenant_id, correlation_id): a retry finds the existing row instead of
-// starting a second check for the same request.
-//
-// On conflict the caller's struct is overwritten with the stored row, so the
-// response describes what is actually on record — including a prior attempt left
-// in STARTED, which the handler reports rather than presenting as a fresh answer.
 func (s *PgStore) CreateCheck(ctx context.Context, c *domain.VendorDDCheck) (created bool, err error) {
 	tenantID, err := tenantScope(ctx)
 	if err != nil {
@@ -146,9 +117,6 @@ func (s *PgStore) CreateCheck(ctx context.Context, c *domain.VendorDDCheck) (cre
 			return nil
 		}
 
-		// Conflict: a check for this (tenant_id, correlation_id) already
-		// exists — fetch its current state so the caller returns the
-		// existing check rather than a second, divergent one.
 		row := tx.QueryRow(ctx,
 			selectCheckSQL()+" WHERE tenant_id = $1 AND correlation_id = $2",
 			tenantID, c.CorrelationID)
@@ -176,8 +144,6 @@ func (s *PgStore) GetCheck(ctx context.Context, id string) (*domain.VendorDDChec
 		return nil, domain.ErrCheckNotFound
 	}
 	if err != nil {
-		// A non-UUID path param means no such check can exist, which is what the
-		// caller asked about — so it reads as absent, not as a fault.
 		if mapped := mapPgError(err); errors.Is(mapped, domain.ErrInvalidIdentifier) {
 			return nil, domain.ErrCheckNotFound
 		}
@@ -186,12 +152,6 @@ func (s *PgStore) GetCheck(ctx context.Context, id string) (*domain.VendorDDChec
 	return &c, nil
 }
 
-// ListFilter narrows the register. Both filters are applied by the service and
-// compose with AND.
-//
-// Limit and Offset are required rather than optional: the route previously had no
-// pagination at all, so every read returned the tenant's entire screening history
-// and the response grew without bound as checks accumulated.
 type ListFilter struct {
 	LegalEntityID  string
 	CounterpartyID string
@@ -219,9 +179,6 @@ func (s *PgStore) ListChecks(ctx context.Context, f ListFilter) ([]domain.Vendor
 			query += fmt.Sprintf(" AND counterparty_id = $%d", len(args))
 		}
 
-		// started_at is not unique — the stub screening is fast enough that two
-		// checks can share a timestamp — so check_id breaks the tie. Without it
-		// two pages can repeat a row and skip another.
 		args = append(args, f.Limit, f.Offset)
 		query += fmt.Sprintf(" ORDER BY started_at DESC, check_id DESC LIMIT $%d OFFSET $%d",
 			len(args)-1, len(args))
@@ -247,22 +204,6 @@ func (s *PgStore) ListChecks(ctx context.Context, f ListFilter) ([]domain.Vendor
 	return out, nil
 }
 
-// ConcludeCheck records the outcome AND the evidence supporting it, in one
-// transaction, guarded on the check still being STARTED.
-//
-// This replaces a separate AddEvidence + CompleteCheck pair, and the split was a
-// real defect rather than a tidiness problem. The evidence write's failure was
-// logged and swallowed, the completion then ran anyway, and the handler returned
-// the evidence record in its response — so a caller was handed a COMPLETED/CLEAR
-// check together with the evidence for it while the store held the check and no
-// evidence at all. A later GET returned the clean outcome with an empty evidence
-// list. For a service whose purpose is due-diligence evidence, a conclusion that
-// can outlive its evidence is the worst available failure: it is an unevidenced
-// compliance pass that reads exactly like an evidenced one.
-//
-// Both rows now land together or neither does. The STARTED guard is what stops a
-// second conclusion overwriting a terminal one — including overwriting FLAGGED
-// with CLEAR, which the unguarded UPDATE permitted.
 func (s *PgStore) ConcludeCheck(
 	ctx context.Context,
 	checkID, riskOutcome, screeningBasis, screeningSource string,
@@ -287,10 +228,6 @@ func (s *PgStore) ConcludeCheck(
 			return err
 		}
 		if res.RowsAffected() == 0 {
-			// Either no such check for this tenant, or it is no longer STARTED.
-			// Distinguished by a read, so a replay is not reported as a missing
-			// record — and it is inside this transaction, so the answer cannot be
-			// stale by the time it is returned.
 			var status string
 			err := tx.QueryRow(ctx,
 				"SELECT status FROM vendor_dd_checks WHERE check_id = $1 AND tenant_id = $2",
@@ -315,17 +252,6 @@ func (s *PgStore) ConcludeCheck(
 	}))
 }
 
-// MarkFailed records that a check could not be concluded, with the reason.
-//
-// Before this existed, FAILED was a status no code path could ever write and
-// vendor.dd.failed was an event declared in the spec (§12.10) that could never be
-// emitted. A check whose conclusion failed was simply left in STARTED — where it
-// stayed forever, indistinguishable in the register from anything else, with no
-// route to retry it and nothing downstream told that a screening had been
-// attempted and lost.
-//
-// Guarded on STARTED like ConcludeCheck: a check that already concluded must not
-// be retrospectively marked failed.
 func (s *PgStore) MarkFailed(ctx context.Context, checkID, reason string) error {
 	tenantID, err := tenantScope(ctx)
 	if err != nil {
@@ -383,7 +309,6 @@ func (s *PgStore) ListEvidence(ctx context.Context, checkID string) ([]domain.Ve
 	})
 	if err != nil {
 		if mapped := mapPgError(err); errors.Is(mapped, domain.ErrInvalidIdentifier) {
-			// No check with a non-UUID id exists, so it has no evidence.
 			return []domain.VendorDDEvidence{}, nil
 		}
 		return nil, err
@@ -391,10 +316,127 @@ func (s *PgStore) ListEvidence(ctx context.Context, checkID string) ([]domain.Ve
 	return out, nil
 }
 
-// nullIfEmpty keeps "no value" out of the database as NULL rather than "".
-// document_reference held "" for every row it had ever been written, making
-// "no supporting document" and "a document whose reference is blank" the same
-// value.
+func (s *PgStore) CreateVendorProfile(ctx context.Context, p *domain.VendorProfile) error {
+	tenantID, err := tenantScope(ctx)
+	if err != nil {
+		return err
+	}
+
+	if p.VendorProfileID == "" {
+		p.VendorProfileID = uuid.NewString()
+	}
+	p.TenantID = tenantID
+	now := time.Now().UTC()
+	p.CreatedAt = now
+	p.UpdatedAt = now
+	if p.VendorStatus == "" {
+		p.VendorStatus = "ONBOARDING"
+	}
+	if p.DueDiligenceStatus == "" {
+		p.DueDiligenceStatus = "PENDING"
+	}
+	if p.RiskRating == "" {
+		p.RiskRating = "UNRATED"
+	}
+
+	return mapPgError(s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO vendor_profiles (
+				vendor_profile_id, tenant_id, legal_entity_id, counterparty_id,
+				vendor_name, vendor_status, due_diligence_status, risk_rating,
+				approved_at, approved_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		`, p.VendorProfileID, p.TenantID, p.LegalEntityID, p.CounterpartyID,
+			p.VendorName, p.VendorStatus, p.DueDiligenceStatus, p.RiskRating,
+			p.ApprovedAt, p.ApprovedBy, p.CreatedAt, p.UpdatedAt,
+		)
+		return err
+	}))
+}
+
+func (s *PgStore) GetVendorProfileByID(ctx context.Context, id string) (*domain.VendorProfile, error) {
+	tenantID, err := tenantScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var p domain.VendorProfile
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT vendor_profile_id, tenant_id, legal_entity_id, counterparty_id,
+			       vendor_name, vendor_status, due_diligence_status, risk_rating,
+			       approved_at, approved_by, created_at, updated_at
+			FROM vendor_profiles
+			WHERE vendor_profile_id = $1 AND tenant_id = $2
+		`, id, tenantID).Scan(
+			&p.VendorProfileID, &p.TenantID, &p.LegalEntityID, &p.CounterpartyID,
+			&p.VendorName, &p.VendorStatus, &p.DueDiligenceStatus, &p.RiskRating,
+			&p.ApprovedAt, &p.ApprovedBy, &p.CreatedAt, &p.UpdatedAt,
+		)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrVendorProfileNotFound
+		}
+		return nil, mapPgError(err)
+	}
+	return &p, nil
+}
+
+func (s *PgStore) ListVendorProfiles(ctx context.Context, legalEntityID, counterpartyID string) ([]domain.VendorProfile, error) {
+	tenantID, err := tenantScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []domain.VendorProfile
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `
+			SELECT vendor_profile_id, tenant_id, legal_entity_id, counterparty_id,
+			       vendor_name, vendor_status, due_diligence_status, risk_rating,
+			       approved_at, approved_by, created_at, updated_at
+			FROM vendor_profiles
+			WHERE tenant_id = $1
+		`
+		args := []any{tenantID}
+		idx := 2
+		if legalEntityID != "" {
+			query += fmt.Sprintf(" AND legal_entity_id = $%d", idx)
+			args = append(args, legalEntityID)
+			idx++
+		}
+		if counterpartyID != "" {
+			query += fmt.Sprintf(" AND counterparty_id = $%d", idx)
+			args = append(args, counterpartyID)
+			idx++
+		}
+		query += " ORDER BY created_at DESC"
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var p domain.VendorProfile
+			if err := rows.Scan(
+				&p.VendorProfileID, &p.TenantID, &p.LegalEntityID, &p.CounterpartyID,
+				&p.VendorName, &p.VendorStatus, &p.DueDiligenceStatus, &p.RiskRating,
+				&p.ApprovedAt, &p.ApprovedBy, &p.CreatedAt, &p.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			out = append(out, p)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return out, nil
+}
+
 func nullIfEmpty(s string) *string {
 	if s == "" {
 		return nil

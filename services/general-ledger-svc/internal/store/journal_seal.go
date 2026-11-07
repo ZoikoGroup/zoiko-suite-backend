@@ -69,10 +69,10 @@ func sealJournal(ctx context.Context, tx pgx.Tx, tenantID, journalID string) (nu
 			SELECT encode(sha256(convert_to(
 				h.tenant_id::text || '|' || h.legal_entity_id::text || '|' || COALESCE(h.book_id, '') || '|' || h.posting_date::text || '|' ||
 				h.journal_type || '|' || h.currency_code || '|' || COALESCE(h.reversal_of_journal_id::text, '') || '|' ||
-				COALESCE(h.source_accounting_event_id::text, '') || E'\n' ||
+				COALESCE(h.source_accounting_event_id::text, '') || COALESCE('|' || h.evidence_bundle_id, '') || E'\n' ||
 				COALESCE((SELECT string_agg(l.line_number || ':' || l.account_code || ':' || l.debit_amount::text || ':' || l.credit_amount::text || ':' ||
 				                            COALESCE(l.transaction_amount::text, '') || ':' || COALESCE(l.transaction_currency, '') || ':' ||
-				                            COALESCE(l.posting_rule_line_ref, ''), E'\n' ORDER BY l.line_number)
+				                            COALESCE(l.posting_rule_line_ref, '') || COALESCE(':' || l.tax_detail_ref, '') || COALESCE('@' || l.source_line_ref, ''), E'\n' ORDER BY l.line_number)
 				          FROM journal_lines l WHERE l.journal_id = h.journal_id), ''),
 				'UTF8')), 'hex'))
 		WHERE h.journal_id = $1 AND h.tenant_id = $2 AND h.journal_hash IS NULL`, journalID, tenantID, number)

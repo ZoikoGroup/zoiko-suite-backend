@@ -240,8 +240,8 @@ func TestCreateApplicabilityDecision_RefusesForeignAttribution(t *testing.T) {
 			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 				t.Fatalf("unmarshal: %v", err)
 			}
-			if body["error"] != tc.wantErr {
-				t.Fatalf("expected error %q, got %q", tc.wantErr, body["error"])
+			if body["code"] != tc.wantErr {
+				t.Fatalf("expected code %q, got %q", tc.wantErr, body["code"])
 			}
 		})
 	}

@@ -25,7 +25,7 @@ type EvidenceStore interface {
 func (h *Handler) ListEvidence(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if h.evidence == nil {
-		writeError(w, http.StatusServiceUnavailable, "evidence_unavailable", "delivery evidence is not configured")
+		writeError(w, r, http.StatusServiceUnavailable, "evidence_unavailable", "delivery evidence is not configured")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -37,22 +37,22 @@ func (h *Handler) ListEvidence(w http.ResponseWriter, r *http.Request) {
 	}
 	notification, err := h.store.GetNotification(r.Context(), id)
 	if errors.Is(err, domain.ErrNotificationNotFound) {
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to fetch notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionView); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	facts, err := h.evidence.ListDeliveryEvidence(r.Context(), id)
 	if err != nil {
 		h.log.Error("failed to list delivery evidence", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

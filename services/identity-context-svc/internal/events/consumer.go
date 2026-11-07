@@ -370,7 +370,7 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 
 	switch ev.EventType {
 	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated",
-		"iam.assignment.revoked":
+		"iam.assignment.revoked", "iam.assignment.expired", "iam.assignment.suspended":
 		if c.stale(ev) {
 			return nil
 		}
@@ -386,10 +386,20 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 		return c.handleAuthorityDelegated(ctx, ev)
 	case "role.updated":
 		return c.handleRoleUpdated(ctx, ev)
-	case "iam.assignment.revoked":
+	// IAM-09: authorization-svc (zoiko.authorization.events) and
+	// access-control-svc both publish the assignment lifecycle. An expiry
+	// ends authority like a revocation; an approval adds it, like a grant.
+	case "iam.assignment.revoked", "iam.assignment.expired":
 		return c.handleAssignmentRevoked(ctx, ev)
-	case "iam.assignment.granted":
+	case "iam.assignment.granted", "iam.assignment.approved":
 		return c.handleAssignmentGranted(ctx, ev)
+	// A suspended assignment confers nothing until it is resumed (ORG-06), so
+	// the subject's sessions end as on a revocation; a resume only ADDS access,
+	// like a grant, and ends nothing.
+	case "iam.assignment.suspended":
+		return c.handleAssignmentSuspended(ctx, ev)
+	case "iam.assignment.resumed":
+		return c.handleAssignmentResumed(ctx, ev)
 	case "entity.updated":
 		return c.handleEntityUpdated(ctx, ev)
 	case "session.risk.changed", "risk.signal.updated":
@@ -539,8 +549,11 @@ func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) erro
 		TargetPrincipalID string `json:"target_principal_id"`
 		RoleID            string `json:"role_id"`
 		AssignmentID      string `json:"assignment_id"`
+		// authorization-svc names the id principal_role_assignment_id.
+		AuthzAssignmentID string `json:"principal_role_assignment_id"`
 	}
 	_ = json.Unmarshal(ev.Payload, &p)
+	p.AssignmentID = firstNonEmpty(p.AssignmentID, p.AuthzAssignmentID)
 	principalID := firstNonEmpty(p.PrincipalID, p.TargetPrincipalID)
 	if principalID == "" {
 		c.log.Error("iam.assignment.revoked names no principal — cannot revoke",
@@ -586,17 +599,19 @@ func (c *Consumer) handleAssignmentGranted(ctx context.Context, ev inbound) erro
 		return nil
 	}
 	var p struct {
-		AssignmentID  string    `json:"assignment_id"`
-		PrincipalID   string    `json:"principal_id"`
-		RoleID        string    `json:"role_id"`
-		LegalEntityID string    `json:"legal_entity_id"`
-		EffectiveFrom time.Time `json:"effective_from"`
+		AssignmentID      string    `json:"assignment_id"`
+		AuthzAssignmentID string    `json:"principal_role_assignment_id"`
+		PrincipalID       string    `json:"principal_id"`
+		RoleID            string    `json:"role_id"`
+		LegalEntityID     string    `json:"legal_entity_id"`
+		EffectiveFrom     time.Time `json:"effective_from"`
 		// EffectiveTo is the assignment's end date when it was granted with
 		// one. Projected, so a resolve after it stops framing the role even
 		// before the expiry's iam.assignment.revoked arrives.
 		EffectiveTo time.Time `json:"effective_to"`
 	}
 	_ = json.Unmarshal(ev.Payload, &p)
+	p.AssignmentID = firstNonEmpty(p.AssignmentID, p.AuthzAssignmentID)
 	if p.AssignmentID == "" || p.PrincipalID == "" || p.RoleID == "" {
 		c.log.Error("iam.assignment.granted is missing assignment_id, principal_id or role_id — not projected",
 			zap.String("event_id", ev.EventID))

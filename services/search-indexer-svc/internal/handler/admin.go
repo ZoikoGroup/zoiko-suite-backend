@@ -41,7 +41,7 @@ import (
 func (h *Handler) requirePlatform(w http.ResponseWriter, r *http.Request, action string) (envelope.Envelope, bool) {
 	env := envelope.MustFromContext(r.Context())
 	if env.ActorSubjectID == "" {
-		writeError(w, http.StatusUnauthorized, "principal_required",
+		writeError(w, r, http.StatusUnauthorized, "principal_required",
 			"a control-plane write requires a verified principal")
 		return env, false
 	}
@@ -51,13 +51,13 @@ func (h *Handler) requirePlatform(w http.ResponseWriter, r *http.Request, action
 		// tenant-scoped check that a tenant admin could pass — the exact
 		// confusion row 67 records, where a grant seeded against one id was
 		// invisible to a check made against another.
-		writeError(w, http.StatusInternalServerError, "platform_scope_not_configured",
+		writeError(w, r, http.StatusInternalServerError, "platform_scope_not_configured",
 			"AUTHZ_PLATFORM_SCOPE_ID is not set; control-plane writes cannot be authorized")
 		return env, false
 	}
 	if err := h.authz.CheckAllowed(r.Context(), env.ActorSubjectID, h.platformScopeID, action); err != nil {
 		h.metrics.AuthzDecision(action, outcomeOf(err))
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return env, false
 	}
 	h.metrics.AuthzDecision(action, "allowed")
@@ -72,18 +72,18 @@ func (h *Handler) requirePlatform(w http.ResponseWriter, r *http.Request, action
 func (h *Handler) requirePlatformRead(w http.ResponseWriter, r *http.Request, action string) (envelope.Envelope, bool) {
 	env := envelope.MustFromContext(r.Context())
 	if env.ActorSubjectID == "" {
-		writeError(w, http.StatusUnauthorized, "principal_required",
+		writeError(w, r, http.StatusUnauthorized, "principal_required",
 			"a control-plane read requires a verified principal")
 		return env, false
 	}
 	if h.platformScopeID == "" {
-		writeError(w, http.StatusInternalServerError, "platform_scope_not_configured",
+		writeError(w, r, http.StatusInternalServerError, "platform_scope_not_configured",
 			"AUTHZ_PLATFORM_SCOPE_ID is not set; control-plane reads cannot be authorized")
 		return env, false
 	}
 	if err := h.authz.CheckAllowed(r.Context(), env.ActorSubjectID, h.platformScopeID, action); err != nil {
 		h.metrics.AuthzDecision(action, outcomeOf(err))
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return env, false
 	}
 	h.metrics.AuthzDecision(action, "allowed")
@@ -116,7 +116,7 @@ func (h *Handler) CreateSource(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.SourceType == "" || req.OwnerService == "" || req.EventTopic == "" {
-		writeError(w, http.StatusBadRequest, "invalid_request",
+		writeError(w, r, http.StatusBadRequest, "invalid_request",
 			"owner_service, source_type and event_topic are required")
 		return
 	}
@@ -125,7 +125,7 @@ func (h *Handler) CreateSource(w http.ResponseWriter, r *http.Request) {
 		// would create a topic subscription that can never produce a
 		// projection, which reads as "indexing is broken" rather than as
 		// "nobody finished the registration".
-		writeError(w, http.StatusBadRequest, "event_types_required",
+		writeError(w, r, http.StatusBadRequest, "event_types_required",
 			"a source must declare the event types it is indexed from")
 		return
 	}
@@ -138,7 +138,7 @@ func (h *Handler) CreateSource(w http.ResponseWriter, r *http.Request) {
 		// INV-09. A source whose ceiling is the prohibited class could have
 		// no legal contract at all, so registering it would only create
 		// something for a later bug to misread as permission.
-		writeError(w, http.StatusBadRequest, "prohibited_ceiling",
+		writeError(w, r, http.StatusBadRequest, "prohibited_ceiling",
 			"SECRET_PROHIBITED is not a sensitivity ceiling: such content never enters a search index")
 		return
 	}
@@ -160,7 +160,7 @@ func (h *Handler) CreateSource(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.store.CreateSource(r.Context(), src); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
-			writeError(w, http.StatusConflict, "source_exists", err.Error())
+			writeError(w, r, http.StatusConflict, "source_exists", err.Error())
 			return
 		}
 		h.internal(w, r, "create source", err)
@@ -247,7 +247,7 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 	src, err := h.store.GetSourceByType(r.Context(), req.SourceType)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "source_not_registered",
+			writeError(w, r, http.StatusNotFound, "source_not_registered",
 				"source_type "+req.SourceType+" is not registered")
 			return
 		}
@@ -257,7 +257,7 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 
 	scope := orDefault(req.ScopeName, req.SourceType)
 	if req.AuthzAction == "" {
-		writeError(w, http.StatusBadRequest, "authz_action_required",
+		writeError(w, r, http.StatusBadRequest, "authz_action_required",
 			"a contract must name the action its results are re-authorized against; "+
 				"without one, R1/R2 retrieval has nothing to ask authorization-svc")
 		return
@@ -266,19 +266,19 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 	switch retrieval {
 	case domain.RetrievalR0, domain.RetrievalR1, domain.RetrievalR2, domain.RetrievalR3:
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_retrieval_class",
+		writeError(w, r, http.StatusBadRequest, "invalid_retrieval_class",
 			"retrieval_class must be one of R0, R1, R2, R3")
 		return
 	}
 
 	fields, err := h.validateFields(req.Fields, src, retrieval)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_field_contract", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_field_contract", err.Error())
 		return
 	}
 	spec, err := validateEmbedding(req.Embedding, fields)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_embedding_contract", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_embedding_contract", err.Error())
 		return
 	}
 
@@ -306,7 +306,7 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.store.CreateContract(r.Context(), contract); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
-			writeError(w, http.StatusConflict, "contract_exists", err.Error())
+			writeError(w, r, http.StatusConflict, "contract_exists", err.Error())
 			return
 		}
 		h.internal(w, r, "create contract", err)
@@ -497,13 +497,13 @@ func (h *Handler) GetContract(w http.ResponseWriter, r *http.Request) {
 	c, err := h.store.GetContract(r.Context(), contractID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "no such contract")
+			writeError(w, r, http.StatusNotFound, "not_found", "no such contract")
 			return
 		}
 		h.internal(w, r, "get contract", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, c)
+	writeJSONWithETag(w, http.StatusOK, c, c.RecordVersion)
 }
 
 func (h *Handler) ListContracts(w http.ResponseWriter, r *http.Request) {
@@ -542,23 +542,32 @@ func (h *Handler) TransitionContract(w http.ResponseWriter, r *http.Request) {
 	current, err := h.store.GetContract(r.Context(), contractID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "no such contract")
+			writeError(w, r, http.StatusNotFound, "not_found", "no such contract")
 			return
 		}
 		h.internal(w, r, "get contract", err)
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, current.RecordVersion) {
+		return
+	}
+
 	next := domain.ContractState(strings.ToUpper(strings.TrimSpace(req.State)))
 	if !current.State.CanTransitionTo(next) {
-		writeError(w, http.StatusConflict, "invalid_transition",
+		writeError(w, r, http.StatusConflict, "invalid_transition",
 			fmt.Sprintf("a %s contract cannot move to %s", current.State, next))
 		return
 	}
 
-	if err := h.store.TransitionContract(r.Context(), contractID, current.State, next); err != nil {
+	if err := h.store.TransitionContract(r.Context(), contractID, current.State, next, current.RecordVersion); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
-			writeError(w, http.StatusConflict, "conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "conflict", err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeError(w, r, http.StatusPreconditionFailed, "version_conflict", err.Error())
 			return
 		}
 		h.internal(w, r, "transition contract", err)
@@ -573,10 +582,10 @@ func (h *Handler) TransitionContract(w http.ResponseWriter, r *http.Request) {
 
 	updated, err := h.store.GetContract(r.Context(), contractID)
 	if err != nil {
-		h.internal(w, r, "reload contract", err)
+		h.internal(w, r, "get updated contract", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSONWithETag(w, http.StatusOK, updated, updated.RecordVersion)
 }
 
 // ── ESR-05: generations ──────────────────────────────────────────────────────
@@ -608,7 +617,7 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 			// §2.2: "only published contracts may build production
 			// generations." A DRAFT contract building an index would produce
 			// a generation whose field set nobody certified.
-			writeError(w, http.StatusConflict, "no_published_contract",
+			writeError(w, r, http.StatusConflict, "no_published_contract",
 				"scope "+req.Scope+" has no PUBLISHED contract to build from")
 			return
 		}
@@ -621,7 +630,7 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 		// receives would fail to embed and be dead-lettered. Refused here,
 		// where the cause is obvious, rather than discovered as an empty
 		// vector index at validation.
-		writeErrorCode(w, http.StatusConflict, "embedding_provider_not_configured",
+		writeErrorCode(w, r, http.StatusConflict, "embedding_provider_not_configured",
 			"scope "+contract.ScopeName+" pins embedding model "+contract.Embedding.PinnedModel()+
 				" but no embedding provider is configured (EMBEDDING_PROVIDER_URL; OD-10)",
 			domain.ReasonSemanticModelMismatch)
@@ -650,7 +659,7 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 	if err := h.engine.EnsureGeneration(r.Context(), physical, projection.FieldMappings(*contract)); err != nil {
 		h.metrics.EngineError("create")
 		_ = h.store.TransitionGeneration(r.Context(), generationID,
-			domain.GenerationPlanned, domain.GenerationFailed, "", err.Error())
+			domain.GenerationPlanned, domain.GenerationFailed, "", err.Error(), 0)
 		if h.events != nil {
 			_ = h.events.ReindexFailed(r.Context(), contract.ScopeName, generationID, "BUILD", err.Error(), "")
 		}
@@ -659,7 +668,7 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.TransitionGeneration(r.Context(), generationID,
-		domain.GenerationPlanned, domain.GenerationBuilding, "", ""); err != nil {
+		domain.GenerationPlanned, domain.GenerationBuilding, "", "", 0); err != nil {
 		h.internal(w, r, "mark generation building", err)
 		return
 	}
@@ -669,7 +678,7 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 	// reload, so live events are written into it from now on, and the backfill
 	// replays everything before now (INV-21: a parallel build, not an empty
 	// index waiting for new events). READY is refused until it COMPLETES.
-	if err := h.store.SetBackfillState(r.Context(), generationID, domain.BackfillPending, ""); err != nil {
+	if err := h.store.SetBackfillState(r.Context(), generationID, domain.BackfillPending, "", 0); err != nil {
 		h.internal(w, r, "mark backfill pending", err)
 		return
 	}
@@ -728,15 +737,20 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 	current, err := h.store.GetGeneration(r.Context(), generationID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "no such generation")
+			writeError(w, r, http.StatusNotFound, "not_found", "no such generation")
 			return
 		}
 		h.internal(w, r, "get generation", err)
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, current.RecordVersion) {
+		return
+	}
+
 	if !current.State.CanTransitionTo(next) {
-		writeError(w, http.StatusConflict, "invalid_transition",
+		writeError(w, r, http.StatusConflict, "invalid_transition",
 			fmt.Sprintf("a %s generation cannot move to %s", current.State, next))
 		return
 	}
@@ -753,25 +767,25 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		// "engine=0 ledger=4" passing validation is how activating a rebuild
 		// emptied a scope (found live, 30 Sep 2026).
 		if current.BackfillState != domain.BackfillComplete {
-			writeErrorCode(w, http.StatusConflict, "backfill_incomplete",
+			writeErrorCode(w, r, http.StatusConflict, "backfill_incomplete",
 				fmt.Sprintf("generation backfill is %q, not COMPLETE: %s", current.BackfillState, current.BackfillNote),
 				domain.ReasonReindexValidationFailed)
 			return
 		}
 		if code, msg := h.requireMigrationCertification(r.Context(), current); code != "" {
-			writeErrorCode(w, http.StatusConflict, code, msg, domain.ReasonReindexValidationFailed)
+			writeErrorCode(w, r, http.StatusConflict, code, msg, domain.ReasonReindexValidationFailed)
 			return
 		}
 		result, err := h.validateGeneration(r.Context(), current)
 		if err != nil {
 			_ = h.store.TransitionGeneration(r.Context(), generationID,
-				current.State, domain.GenerationFailed, "", err.Error())
+				current.State, domain.GenerationFailed, "", err.Error(), current.RecordVersion)
 			h.metrics.GenerationTransitions.WithLabelValues(current.ScopeName, string(domain.GenerationFailed)).Inc()
 			if h.events != nil {
 				_ = h.events.ReindexFailed(r.Context(), current.ScopeName, generationID,
 					"VALIDATION", err.Error(), env.CorrelationID)
 			}
-			writeErrorCode(w, http.StatusConflict, "validation_failed", err.Error(),
+			writeErrorCode(w, r, http.StatusConflict, "validation_failed", err.Error(),
 				domain.ReasonReindexValidationFailed)
 			return
 		}
@@ -782,7 +796,7 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		// may have changed in between (a rollback), and certification is
 		// against what is serving at the moment of the switch.
 		if code, msg := h.requireMigrationCertification(r.Context(), current); code != "" {
-			writeErrorCode(w, http.StatusConflict, code, msg, domain.ReasonReindexValidationFailed)
+			writeErrorCode(w, r, http.StatusConflict, code, msg, domain.ReasonReindexValidationFailed)
 			return
 		}
 		// The alias swap and the state write are two systems that must agree.
@@ -804,7 +818,7 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		if previous != "" && previous != current.PhysicalIndex {
 			if old, err := h.findGenerationByIndex(r.Context(), current.ScopeName, previous); err == nil && old != nil {
 				_ = h.store.TransitionGeneration(r.Context(), old.GenerationID,
-					domain.GenerationActive, domain.GenerationRetired, "", "replaced by "+generationID)
+					domain.GenerationActive, domain.GenerationRetired, "", "replaced by "+generationID, old.RecordVersion)
 			}
 		}
 		if h.events != nil {
@@ -817,15 +831,19 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 			// Retiring the serving generation would leave the alias pointing
 			// at a retired index, or at nothing. §8.1's exit from ACTIVE is
 			// "RETIRED after replacement" — replacement first.
-			writeError(w, http.StatusConflict, "active_generation",
+			writeError(w, r, http.StatusConflict, "active_generation",
 				"activate a replacement generation before retiring the serving one")
 			return
 		}
 	}
 
-	if err := h.store.TransitionGeneration(r.Context(), generationID, current.State, next, digest, note); err != nil {
+	if err := h.store.TransitionGeneration(r.Context(), generationID, current.State, next, digest, note, current.RecordVersion); err != nil {
 		if errors.Is(err, domain.ErrConflict) {
-			writeError(w, http.StatusConflict, "conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "conflict", err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeError(w, r, http.StatusPreconditionFailed, "version_conflict", err.Error())
 			return
 		}
 		h.internal(w, r, "transition generation", err)

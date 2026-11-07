@@ -111,6 +111,15 @@ const IngressUnknown = "UNKNOWN"
 // claim, which is a refusal, but it can never supply a tenant the token did
 // not claim. That is what keeps GOV-01 out of tenant master data while still
 // letting it satisfy negative path #2.
+// HostBinding is one tenant-entity-registry-svc host binding (ORG-02
+// ListTenantHostBindings), the source TenantIngressBinding is refreshed from.
+type HostBinding struct {
+	HostBindingID string `json:"host_binding_id"`
+	Hostname      string `json:"hostname"`
+	TenantID      string `json:"tenant_id"`
+	ActiveFlag    bool   `json:"active_flag"`
+}
+
 type TenantIngressBinding struct {
 	IngressIdentifier string      `json:"ingress_identifier"`
 	TenantID          string      `json:"tenant_id"`
@@ -252,6 +261,8 @@ type SupportContext struct {
 	ReviewedBy    *string    `json:"reviewed_by"`
 	EvidenceID    string     `json:"evidence_id"`
 	CorrelationID string     `json:"correlation_id"`
+	// RecordVersion is the optimistic-concurrency token (migration 000016).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // Live reports whether the grant is usable at t: granted, not revoked, not

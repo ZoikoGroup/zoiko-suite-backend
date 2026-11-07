@@ -1,0 +1,191 @@
+asyncapi: 3.0.0
+info:
+  title: public-ai-svc events (zoikosuite-public-ai)
+  version: "1.0"
+  description: >
+    The six R0 events (Doc 05 §21) and the Doc 02 §27 analytics events, CloudEvents 1.0 structured JSON, published at-least-once from a
+    transactional outbox (Doc 05 §20). Consumers must be idempotent on the CloudEvents id, tolerate
+    out-of-order delivery and re-check the revocation epoch on replay. Payloads carry identifiers, enums
+    and coarse buckets only, never visitor text, prompts, model output, grants or contact data. Events that
+    fail 10 times are diverted to "<topic>.dlq". The browser never publishes events. The payload
+    version is the ".vN" suffix of the CloudEvents type; a breaking change is a new type.
+    Producers connect over TLS with SASL/SCRAM. Each Kafka message carries headers ce_type, content-type and,
+    outside dev/test, ce_signature (base64 Ed25519 over the exact message value) and ce_signer (key id):
+    consumers verify the signature before acting. Events never carry free text or personal data; the
+    outbox refuses any that would (public_ai_events_dlp_blocked_total).
+defaultContentType: application/cloudevents+json
+channels:
+  telemetry:
+    address: publicai.telemetry.v1
+    messages:
+      turnCompleted: {$ref: "#/components/messages/turnCompleted"}
+      handoffClicked: {$ref: "#/components/messages/handoffClicked"}
+      securitySignal: {$ref: "#/components/messages/securitySignal"}
+      analytics: {$ref: "#/components/messages/analytics"}
+  control:
+    address: publicai.control.v1
+    messages:
+      killSwitchChanged: {$ref: "#/components/messages/killSwitchChanged"}
+  governance:
+    address: kb.governance.v1
+    messages:
+      releasePromoted: {$ref: "#/components/messages/releasePromoted"}
+      sourceRevoked: {$ref: "#/components/messages/sourceRevoked"}
+operations:
+  publishTelemetry:
+    action: send
+    channel: {$ref: "#/channels/telemetry"}
+  publishControl:
+    action: send
+    channel: {$ref: "#/channels/control"}
+  publishGovernance:
+    action: send
+    channel: {$ref: "#/channels/governance"}
+components:
+  schemas:
+    envelope:
+      type: object
+      required: [specversion, id, source, type, time, datacontenttype, data]
+      properties:
+        specversion: {const: "1.0"}
+        id: {type: string, format: uuid, description: Random UUIDv4; unique per event and the idempotency key for consumers}
+        source:
+          type: string
+          description: The producer (orchestrator for chat events, release for KB governance, control for kill switches).
+          enum: ["urn:zoikosuite:publicai:orchestrator", "urn:zoikosuite:publicai:release", "urn:zoikosuite:publicai:control"]
+        type: {type: string}
+        time: {type: string, format: date-time}
+        datacontenttype: {const: application/json}
+  messages:
+    turnCompleted:
+      name: chat.turn.completed.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [request_id, intent_id, status, latency_bucket, release_id]
+                properties:
+                  request_id: {type: string}
+                  intent_id: {type: string}
+                  status: {type: string, enum: [ANSWERED, CLARIFY, REFUSED_ACTION, ABSTAIN, HANDOFF, UNAVAILABLE]}
+                  latency_bucket: {type: string, enum: ["<2s", "2s-5s", "5s-15s", ">15s"]}
+                  release_id: {type: string}
+    handoffClicked:
+      name: chat.handoff.clicked.v1
+      summary: A visitor opened an official route. Never means a case, ticket, lead or booking exists.
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [route_key, consent_flag]
+                properties:
+                  route_key: {type: string}
+                  market_code_if_explicit: {type: string}
+                  consent_flag: {type: boolean}
+    securitySignal:
+      name: chat.security.signal.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [reason_class, request_id, severity]
+                properties:
+                  reason_class: {type: string, enum: [PROMPT_INJECTION, SENSITIVE_INPUT, SECURITY_REPORT, TOOL_INSTRUCTION]}
+                  request_id: {type: string}
+                  severity: {type: string, enum: [LOW, MEDIUM, HIGH]}
+    analytics:
+      name: chat.analytics.v1
+      summary: >-
+        Doc 02 §27 analytics events (one type, enum name). Only the fields the name permits are set;
+        raw questions, URLs, IPs, contact details, evidence snippets and model output are never carried.
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [name]
+                properties:
+                  name:
+                    type: string
+                    enum: [chat_opened, intent_classified, clarification_shown, answer_delivered, source_opened,
+                      cta_opened, handoff_offered, feedback_submitted, safety_intercepted, source_conflict]
+                  route_id: {type: string, description: "chat_opened: the page_context enum"}
+                  locale: {type: string}
+                  release_version: {type: string}
+                  intent_id: {type: string}
+                  confidence_bucket: {type: string, enum: [high, medium, low, none]}
+                  safety_disposition: {type: string, enum: [ALLOW, CLARIFY, DENY, ESCALATE, RETRY]}
+                  slot_name: {type: string}
+                  reason_code: {type: string}
+                  answer_class: {type: string}
+                  source_count: {type: integer, minimum: 0}
+                  status_class: {type: string}
+                  latency_bucket: {type: string, enum: ["<2s", "2s-5s", "5s-15s", ">15s"]}
+                  link_id: {type: string, description: "source_opened: the approved citation url_key"}
+                  action_id: {type: string, description: "cta_opened: the official route key"}
+                  handoff_category: {type: string}
+                  route_available: {type: boolean}
+                  helpfulness: {type: string, enum: [useful, not_useful]}
+                  feedback_reason: {type: string}
+                  severity_bucket: {type: string, enum: [low, medium, high]}
+                  conflict_ids: {type: array, items: {type: string}}
+                  owner_queue_id: {type: string}
+    killSwitchChanged:
+      name: publicai.kill_switch.changed.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [flag, actor_ref, approval_ref, environment, control_epoch]
+                properties:
+                  flag: {type: string}
+                  actor_ref: {type: string}
+                  approval_ref: {type: string}
+                  environment: {type: string}
+                  control_epoch: {type: integer, description: Change time in Unix nanoseconds; an older event is never replayed (Doc 05 §22).}
+    releasePromoted:
+      name: kb.release.promoted.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [release_id, kind, signer_refs, digest, effective_at, release_epoch]
+                properties:
+                  release_id: {type: string}
+                  kind: {type: string, enum: [kb, claims], description: "Which release pointer moved; replay rechecks that pointer (Doc 05 §22)."}
+                  signer_refs: {type: array, items: {type: string}}
+                  digest: {type: string}
+                  effective_at: {type: string, format: date-time}
+                  release_epoch: {type: integer, description: "Promotion time in Unix nanoseconds; consumers ignore an older promotion of the same kind (Doc 05 §22)."}
+    sourceRevoked:
+      name: kb.source.revoked.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                required: [source_version_id, reason_code, effective_at, revocation_epoch]
+                properties:
+                  source_version_id: {type: string}
+                  reason_code: {type: string}
+                  effective_at: {type: string, format: date-time}
+                  revocation_epoch: {type: integer, description: "Revocation ledger watermark of this entry, assigned in the same transaction (Doc 05 §18, §22)."}

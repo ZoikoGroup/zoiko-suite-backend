@@ -1,9 +1,19 @@
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
+# BUILT FROM THE REPOSITORY ROOT:
+#
+#   docker build -f services/carta-svc/Dockerfile .
+#
+# go.mod replaces zoiko.io/identity-envelope with ../identity-envelope, so the
+# build must see that sibling module; with the service folder as the context
+# the path does not exist. Dockerfile.dockerignore keeps the root context to
+# the modules listed here.
+FROM golang:1.25-alpine AS builder
 RUN apk add --no-cache git gcc musl-dev
-COPY go.mod go.sum ./
+# The same relative layout as the repository, so the replace path resolves.
+WORKDIR /src/services/carta-svc
+COPY services/carta-svc/go.mod services/carta-svc/go.sum ./
+COPY services/identity-envelope/ /src/services/identity-envelope/
 RUN go mod download
-COPY . .
+COPY services/carta-svc/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server ./cmd/server
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/healthcheck ./cmd/healthcheck
 

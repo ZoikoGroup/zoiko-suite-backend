@@ -1,0 +1,21 @@
+# Doc 05 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_05_API_Integration_Service_Contracts_and_Event_Architecture.md
+- Document ID (exact): ZS-SUIVO-ENG-005
+- Title (exact, from the title line, not the ID line): API Integration, Service Contracts & Event Architecture
+- Version (exact): VERSION 1.0
+- Date (exact): 24 OCTOBER 2026
+- Status / approval wording (quote the full sentence): APPROVAL STATUS PROPOSED / submitted for Founder, Global CTO, Product, Architecture, Security, Privacy, Data Governance and QA review. All routes, services and event topics are target contracts—not a claim of implemented endpoints. Implementation starts only after a repository inventory and explicit approvals.
+- Approver roles (exactly as written in the status or approval text): Founder, Global CTO, Product, Architecture, Security, Privacy, Data Governance and QA
+- Classification (if stated): not stated in lines 1—80
+- Other document IDs mentioned in lines 1—80 (list each ID + the line number):
+  - ZS-SUIVO-ENG-005 (line 18)
+  - Docs 01—04 (line 20)
+- Line numbers where each value above was found:
+  - Document ID (exact): line 18
+  - Title (exact): line 7
+  - Version (exact): line 9
+  - Date (exact): line 9
+  - Status / approval wording: line 13
+  - Approver roles: line 13
+  - Classification: not found in lines 1—80
+  - Other document IDs: line 18, line 20

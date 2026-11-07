@@ -95,7 +95,7 @@ func (h *pbcHandler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Title == "" || req.AssignedToPrincipalID == "" || req.CorrelationID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "title, assigned_to_principal_id, and correlation_id are required")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "title, assigned_to_principal_id, and correlation_id are required")
 		return
 	}
 	// The envelope is the authoritative legal-entity scope on material
@@ -105,22 +105,22 @@ func (h *pbcHandler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := req.LegalEntityID
 	if env.LegalEntityID != "" {
 		if legalEntityID != "" && legalEntityID != env.LegalEntityID {
-			writeError(w, http.StatusBadRequest, "legal_entity_mismatch",
+			writeError(w, r, http.StatusBadRequest, "legal_entity_mismatch",
 				"body legal_entity_id does not match envelope X-Legal-Entity-Id")
 			return
 		}
 		legalEntityID = env.LegalEntityID
 	}
 	if legalEntityID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "legal_entity_id")
 		return
 	}
 	if !isUUID(legalEntityID) {
-		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionCreateEvidenceRequest); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	request, created, err := h.store.CreateEvidenceRequest(r.Context(), uuid.NewString(), domain.CreateEvidenceRequestParams{
@@ -129,14 +129,14 @@ func (h *pbcHandler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID,
 	})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, request)
+	writeJSON(w, r, status, request)
 }
 
 func (h *pbcHandler) GetRequest(w http.ResponseWriter, r *http.Request) {
@@ -149,10 +149,10 @@ func (h *pbcHandler) GetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	req, err := h.store.GetEvidenceRequest(r.Context(), tenantID, chi.URLParam(r, "request_id"))
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, req)
+	writeJSON(w, r, http.StatusOK, req)
 }
 
 func (h *pbcHandler) ListOpenRequests(w http.ResponseWriter, r *http.Request) {
@@ -165,15 +165,15 @@ func (h *pbcHandler) ListOpenRequests(w http.ResponseWriter, r *http.Request) {
 	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	if legalEntityID != "" && !isUUID(legalEntityID) {
-		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
 		return
 	}
 	reqs, err := h.store.ListOpenEvidenceRequests(r.Context(), tenantID, legalEntityID)
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, reqs)
+	writeJSON(w, r, http.StatusOK, reqs)
 }
 
 // requireManageAuthz fetches the request (to learn its own legal entity)
@@ -182,11 +182,11 @@ func (h *pbcHandler) ListOpenRequests(w http.ResponseWriter, r *http.Request) {
 func (h *pbcHandler) requireManageAuthz(w http.ResponseWriter, r *http.Request, tenantID, principalID, requestID string) (*domain.EvidenceRequest, bool) {
 	req, err := h.store.GetEvidenceRequest(r.Context(), tenantID, requestID)
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return nil, false
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionManageEvidenceRequest); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return nil, false
 	}
 	return req, true
@@ -207,15 +207,15 @@ func (h *pbcHandler) SendRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
-		writeError(w, http.StatusBadRequest, "missing_correlation_id", "")
+		writeError(w, r, http.StatusBadRequest, "missing_correlation_id", "")
 		return
 	}
 	updated, err := h.store.SendEvidenceRequest(r.Context(), domain.SendEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, CorrelationID: correlationID})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 type reassignRequestRequest struct {
@@ -237,15 +237,15 @@ func (h *pbcHandler) ReassignRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	var req reassignRequestRequest
 	if !decodeJSON(w, r, &req) || req.NewAssigneePrincipalID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "new_assignee_principal_id")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "new_assignee_principal_id")
 		return
 	}
 	updated, err := h.store.ReassignEvidenceRequest(r.Context(), domain.ReassignEvidenceRequestParams{RequestID: requestID, TenantID: tenantID, NewAssigneePrincipalID: req.NewAssigneePrincipalID})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 type extendDueDateRequest struct {
@@ -267,15 +267,15 @@ func (h *pbcHandler) ExtendDueDate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req extendDueDateRequest
 	if !decodeJSON(w, r, &req) || req.NewDueAt.IsZero() {
-		writeError(w, http.StatusBadRequest, "missing_field", "new_due_at")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "new_due_at")
 		return
 	}
 	updated, err := h.store.ExtendDueDate(r.Context(), domain.ExtendDueDateParams{RequestID: requestID, TenantID: tenantID, NewDueAt: req.NewDueAt})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 func (h *pbcHandler) ViewRequest(w http.ResponseWriter, r *http.Request) {
@@ -288,10 +288,10 @@ func (h *pbcHandler) ViewRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	updated, err := h.store.ViewEvidenceRequest(r.Context(), domain.ViewEvidenceRequestParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 type submitResponseRequest struct {
@@ -319,21 +319,21 @@ func (h *pbcHandler) SubmitResponse(w http.ResponseWriter, r *http.Request) {
 	// one that does not cover the entity the request belongs to.
 	evReq, err := h.store.GetEvidenceRequest(r.Context(), tenantID, requestID)
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, evReq.LegalEntityID, actionSubmitEvidenceResponse); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	var req submitResponseRequest
 	if !decodeJSON(w, r, &req) || req.CorrelationID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "correlation_id")
 		return
 	}
 	if req.ArtifactDocumentID != nil {
 		if err := h.docs.VerifyDocument(r.Context(), tenantID, evReq.LegalEntityID, *req.ArtifactDocumentID, principalID); err != nil {
-			h.writeDocumentErr(w, err)
+			h.writeDocumentErr(w, r, err)
 			return
 		}
 	}
@@ -341,14 +341,14 @@ func (h *pbcHandler) SubmitResponse(w http.ResponseWriter, r *http.Request) {
 		RequestID: requestID, TenantID: tenantID, SubmittedByPrincipalID: principalID, ArtifactDocumentID: req.ArtifactDocumentID, CorrelationID: req.CorrelationID,
 	})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, response)
+	writeJSON(w, r, status, response)
 }
 
 type scanResultRequest struct {
@@ -377,11 +377,11 @@ func (h *pbcHandler) RecordScanResult(w http.ResponseWriter, r *http.Request) {
 	// decision log).
 	evReq, err := h.store.GetResponseRequest(r.Context(), tenantID, responseID)
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, evReq.LegalEntityID, actionManageEvidenceRequest); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	var req scanResultRequest
@@ -389,15 +389,15 @@ func (h *pbcHandler) RecordScanResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Result != domain.MalwareScanClean && req.Result != domain.MalwareScanQuarantined {
-		writeError(w, http.StatusBadRequest, "invalid_field", "result must be CLEAN or QUARANTINED")
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "result must be CLEAN or QUARANTINED")
 		return
 	}
 	updated, err := h.store.RecordScanResult(r.Context(), domain.ScanResultParams{ResponseID: responseID, TenantID: tenantID, Result: req.Result})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 func (h *pbcHandler) AcknowledgeReceipt(w http.ResponseWriter, r *http.Request) {
@@ -411,10 +411,10 @@ func (h *pbcHandler) AcknowledgeReceipt(w http.ResponseWriter, r *http.Request) 
 	}
 	receipt, err := h.store.AcknowledgeReceipt(r.Context(), domain.AcknowledgeReceiptParams{ResponseID: chi.URLParam(r, "response_id"), TenantID: tenantID, AcknowledgedByPrincipalID: principalID})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, receipt)
+	writeJSON(w, r, http.StatusCreated, receipt)
 }
 
 type addNoteRequest struct {
@@ -440,19 +440,19 @@ func (h *pbcHandler) AddNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Body == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "body")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "body")
 		return
 	}
 	if req.Visibility != domain.NoteVisibilityShared && req.Visibility != domain.NoteVisibilityAuditOnly {
-		writeError(w, http.StatusBadRequest, "invalid_field", "visibility must be SHARED or AUDIT_ONLY")
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "visibility must be SHARED or AUDIT_ONLY")
 		return
 	}
 	note, err := h.store.AddRequestNote(r.Context(), domain.AddRequestNoteParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID, AuthorPrincipalID: principalID, Body: req.Body, Visibility: req.Visibility})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, note)
+	writeJSON(w, r, http.StatusCreated, note)
 }
 
 type requestClarificationRequest struct {
@@ -478,10 +478,10 @@ func (h *pbcHandler) RequestClarification(w http.ResponseWriter, r *http.Request
 	}
 	updated, err := h.store.RequestClarification(r.Context(), domain.RequestClarificationParams{RequestID: requestID, TenantID: tenantID, Reason: req.Reason})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 // MarkSatisfied is the real enforcement point for AUD-NEG-016 — see
@@ -498,21 +498,21 @@ func (h *pbcHandler) MarkSatisfied(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, "request_id")
 	evReq, err := h.store.GetEvidenceRequest(r.Context(), tenantID, requestID)
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
 	// Scope the check to the request's legal entity, not the tenant id: the
 	// latter is also a UUID and silently authorized the wrong scope.
 	if err := h.authz.CheckAllowed(r.Context(), principalID, evReq.LegalEntityID, actionEvaluateEvidenceRequest); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	updated, err := h.store.MarkSatisfied(r.Context(), domain.MarkSatisfiedParams{RequestID: requestID, TenantID: tenantID, ActorPrincipalID: principalID})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 func (h *pbcHandler) CloseRequest(w http.ResponseWriter, r *http.Request) {
@@ -530,41 +530,41 @@ func (h *pbcHandler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	updated, err := h.store.CloseEvidenceRequest(r.Context(), domain.CloseEvidenceRequestParams{RequestID: requestID, TenantID: tenantID})
 	if err != nil {
-		h.writePBCErr(w, err)
+		h.writePBCErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
-func (h *pbcHandler) writeDocumentErr(w http.ResponseWriter, err error) {
+func (h *pbcHandler) writeDocumentErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrDocumentNotFound):
-		writeError(w, http.StatusUnprocessableEntity, "document_not_found", "")
+		writeError(w, r, http.StatusUnprocessableEntity, "document_not_found", "")
 	case errors.Is(err, domain.ErrDocumentMismatch):
-		writeError(w, http.StatusUnprocessableEntity, "document_mismatch", "")
+		writeError(w, r, http.StatusUnprocessableEntity, "document_mismatch", "")
 	default:
-		writeError(w, http.StatusServiceUnavailable, "document_service_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "document_service_unavailable", "")
 	}
 }
 
-func (h *pbcHandler) writePBCErr(w http.ResponseWriter, err error) {
+func (h *pbcHandler) writePBCErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrEvidenceRequestNotFound):
-		writeError(w, http.StatusNotFound, "evidence_request_not_found", "")
+		writeError(w, r, http.StatusNotFound, "evidence_request_not_found", "")
 	case errors.Is(err, domain.ErrEvidenceRequestInvalidState):
-		writeError(w, http.StatusUnprocessableEntity, "invalid_evidence_request_state", "")
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_evidence_request_state", "")
 	case errors.Is(err, domain.ErrResponseNotFound):
-		writeError(w, http.StatusNotFound, "evidence_response_not_found", "")
+		writeError(w, r, http.StatusNotFound, "evidence_response_not_found", "")
 	case errors.Is(err, domain.ErrSelfEvaluationNotAllowed):
-		writeError(w, http.StatusForbidden, "self_evaluation_not_allowed", "")
+		writeError(w, r, http.StatusForbidden, "self_evaluation_not_allowed", "")
 	case errors.Is(err, domain.ErrArtifactNotScanned):
-		writeError(w, http.StatusUnprocessableEntity, "artifact_not_scanned", "")
+		writeError(w, r, http.StatusUnprocessableEntity, "artifact_not_scanned", "")
 	case errors.Is(err, domain.ErrIdempotencyMismatch):
-		writeError(w, http.StatusConflict, "idempotency_mismatch", domain.ErrIdempotencyMismatch.Error())
+		writeError(w, r, http.StatusConflict, "idempotency_mismatch", domain.ErrIdempotencyMismatch.Error())
 	case errors.Is(err, domain.ErrInvalidIdentifier):
-		writeError(w, http.StatusBadRequest, "invalid_identifier", domain.ErrInvalidIdentifier.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_identifier", domain.ErrInvalidIdentifier.Error())
 	default:
 		h.log.Error("pbc store error")
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 	}
 }

@@ -1,0 +1,20 @@
+﻿# Doc 04 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_04_Solution_Architecture_and_Technical_Implementation.md
+- Document ID (exact): ZS-AI-PUB-004
+- Title (exact, from the title line, not the ID line): SOLUTION ARCHITECTURE & TECHNICAL IMPLEMENTATION
+- Version (exact): Version 1.0
+- Date (exact): 24 October 2026
+- Status / approval wording (quote the full sentence): Classification: INTERNAL / CONTROLLED  |  Status: PROPOSED FOR FOUNDER AND ARCHITECTURE APPROVAL
+- Approver roles (exactly as written in the status or approval text): FOUNDER AND ARCHITECTURE
+- Classification (if stated): INTERNAL / CONTROLLED
+- Other document IDs mentioned in lines 1–80 (list each ID + the line number):
+  - ZS-AI-PUB-004 (line 10)
+- Line numbers where each value above was found:
+- Document ID (exact): line 11
+- Title (exact): line 9
+- Version (exact): line 13
+- Date (exact): line 13
+- Status / approval wording: line 15
+- Approver roles: line 15
+- Classification: line 15
+- Other document IDs: line 11

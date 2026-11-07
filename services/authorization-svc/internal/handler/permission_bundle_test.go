@@ -169,6 +169,7 @@ func TestRetirePermissionBundle_RequiresPrincipal(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/permission-bundles/b-1/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -186,6 +187,7 @@ func TestRetirePermissionBundle_RequiresTenant(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/permission-bundles/b-1/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -213,6 +215,7 @@ func TestPermissionBundleLifecycle_RoutesPassTheRightFlag(t *testing.T) {
 		r := newTestRouter(store)
 
 		req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+		req.Header.Set("If-Match", `"v1"`)
 		req.Header.Set("X-Principal-Id", "admin-1")
 		req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 		w := httptest.NewRecorder()
@@ -240,6 +243,7 @@ func TestRetirePermissionBundle_NotFoundIs404(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/permission-bundles/b-elsewhere/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
@@ -250,8 +254,8 @@ func TestRetirePermissionBundle_NotFoundIs404(t *testing.T) {
 	}
 	var body map[string]string
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
-	if body["error"] != "permission_bundle_not_found" {
-		t.Errorf("error code %q, want permission_bundle_not_found", body["error"])
+	if body["code"] != "permission_bundle_not_found" {
+		t.Errorf("error code %q, want permission_bundle_not_found", body["code"])
 	}
 }
 
@@ -260,6 +264,7 @@ func TestRetirePermissionBundle_StoreFailureIs503(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/permission-bundles/b-1/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()

@@ -122,8 +122,8 @@ func TestAuthorize_PlatformScopeRefusedWhenUnconfigured(t *testing.T) {
 	if code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", code)
 	}
-	if got["error"] != "platform_scope_not_configured" {
-		t.Fatalf("error = %q, want platform_scope_not_configured", got["error"])
+	if got["code"] != "platform_scope_not_configured" {
+		t.Fatalf("error = %q, want platform_scope_not_configured", got["code"])
 	}
 }
 
@@ -375,8 +375,8 @@ func TestCreateABACRule_RejectsUnsupportedOperatorAndEffect(t *testing.T) {
 			}
 			var got map[string]string
 			_ = json.Unmarshal(w.Body.Bytes(), &got)
-			if got["error"] != tc.wantError {
-				t.Fatalf("error = %q, want %q", got["error"], tc.wantError)
+			if got["code"] != tc.wantError {
+				t.Fatalf("error = %q, want %q", got["code"], tc.wantError)
 			}
 			if store.gotCreateABACRule.RuleCode != "" {
 				t.Errorf("an invalid rule reached the store: %+v", store.gotCreateABACRule)
@@ -502,12 +502,13 @@ func TestRetireAndReactivateABACRule(t *testing.T) {
 
 	for _, path := range []string{"retire", "reactivate"} {
 		req := httptest.NewRequest(http.MethodPost, "/v1/admin/abac-rules/r-1/"+path, nil)
+		req.Header.Set("If-Match", `"v1"`)
 		req.Header.Set("X-Principal-Id", "admin-1")
 		req.Header.Set("X-Tenant-Id", testTenant)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("%s: expected 200, got %d: %s", path, w.Code, w.Body.String())
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("%s: expected 202, got %d: %s", path, w.Code, w.Body.String())
 		}
 	}
 
@@ -521,6 +522,7 @@ func TestRetireABACRule_NotFoundIs404(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/abac-rules/r-missing/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", testTenant)
 	w := httptest.NewRecorder()

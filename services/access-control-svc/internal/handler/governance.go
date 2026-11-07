@@ -173,7 +173,7 @@ func (g *Gov) refuse(w http.ResponseWriter, r *http.Request, op, tenantID, entit
 	}
 	g.count(op, outcome)
 	g.h.recordRefusal(r.Context(), tenantID, entityID, principalID, correlationID, strings.ToUpper(op), code, code, msg, payload)
-	writeError(w, status, code, msg)
+	writeError(w, r, status, code, msg)
 }
 
 // fail maps an error from a guard, authorization-svc or the store to the
@@ -265,7 +265,7 @@ func (g *Gov) begin(w http.ResponseWriter, r *http.Request, op, legalEntityID, c
 	principalID = r.Header.Get("X-Principal-Id")
 	if principalID == "" {
 		g.count(op, telemetry.WriteIdentityMissing)
-		writeError(w, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
+		writeError(w, r, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
 		return "", "", false
 	}
 	tenantID, ok = g.h.requireTenant(w, r, nil)
@@ -278,7 +278,7 @@ func (g *Gov) begin(w http.ResponseWriter, r *http.Request, op, legalEntityID, c
 			g.refuse(w, r, op, tenantID, legalEntityID, principalID, correlationID, http.StatusForbidden, "forbidden", err.Error(), payload)
 		} else {
 			g.count(op, telemetry.WriteAuthzUnavailable)
-			writeError(w, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
+			writeError(w, r, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
 		}
 		return "", "", false
 	}
@@ -292,7 +292,7 @@ func (g *Gov) identify(w http.ResponseWriter, r *http.Request, op string) (princ
 	principalID = r.Header.Get("X-Principal-Id")
 	if principalID == "" {
 		g.count(op, telemetry.WriteIdentityMissing)
-		writeError(w, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
+		writeError(w, r, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
 		return "", "", false
 	}
 	tenantID, ok = g.h.requireTenant(w, r, nil)
@@ -364,13 +364,13 @@ func (g *Gov) ListPermissionDefinitions(w http.ResponseWriter, r *http.Request) 
 	}
 	naming := r.URL.Query().Get("naming")
 	if naming != "" && naming != "TAXONOMY" && naming != "LEGACY" {
-		writeError(w, http.StatusBadRequest, "invalid_naming", "naming must be TAXONOMY or LEGACY")
+		writeError(w, r, http.StatusBadRequest, "invalid_naming", "naming must be TAXONOMY or LEGACY")
 		return
 	}
 	list, err := g.h.taxonomy.List(r.Context(), naming, r.URL.Query().Get("search"))
 	if err != nil {
 		g.h.log.Error("failed to list permission definitions", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "taxonomy_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "taxonomy_unavailable", err.Error())
 		return
 	}
 	if list == nil {
@@ -387,7 +387,7 @@ func (g *Gov) ListTemplates(w http.ResponseWriter, r *http.Request) {
 	}
 	list, err := g.store.ListTemplates(r.Context())
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if list == nil {
@@ -403,10 +403,10 @@ func (g *Gov) GetTemplate(w http.ResponseWriter, r *http.Request) {
 	t, err := g.store.GetTemplate(r.Context(), chi.URLParam(r, "template_code"))
 	if err != nil {
 		if errors.Is(err, domain.ErrTemplateNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			writeError(w, r, http.StatusNotFound, "not_found", err.Error())
 			return
 		}
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
@@ -419,15 +419,15 @@ func (g *Gov) ListTemplateVersions(w http.ResponseWriter, r *http.Request) {
 	code := chi.URLParam(r, "template_code")
 	if _, err := g.store.GetTemplate(r.Context(), code); err != nil {
 		if errors.Is(err, domain.ErrTemplateNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			writeError(w, r, http.StatusNotFound, "not_found", err.Error())
 			return
 		}
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	list, err := g.store.ListTemplateVersions(r.Context(), code)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -841,21 +841,21 @@ func (g *Gov) ListAssignments(w http.ResponseWriter, r *http.Request) {
 	case "", domain.AssignmentPendingApproval, domain.AssignmentProvisioned, domain.AssignmentRejected, domain.AssignmentCancelled,
 		domain.AssignmentRevoked, domain.AssignmentExpired:
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_status", "unknown status "+strconv.Quote(f.Status))
+		writeError(w, r, http.StatusBadRequest, "invalid_status", "unknown status "+strconv.Quote(f.Status))
 		return
 	}
 	var err error
 	if f.Limit, err = parseIntQuery(r, "limit"); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_limit", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_limit", err.Error())
 		return
 	}
 	if f.Offset, err = parseIntQuery(r, "offset"); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_offset", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_offset", err.Error())
 		return
 	}
 	list, err := g.store.ListAssignmentRequests(r.Context(), f)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if list == nil {
@@ -871,10 +871,10 @@ func (g *Gov) GetAssignment(w http.ResponseWriter, r *http.Request) {
 	a, err := g.store.GetAssignmentRequest(r.Context(), chi.URLParam(r, "request_id"))
 	if err != nil {
 		if errors.Is(err, domain.ErrAssignmentNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			writeError(w, r, http.StatusNotFound, "not_found", err.Error())
 			return
 		}
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, a)
@@ -1375,22 +1375,22 @@ func (g *Gov) ListCampaigns(w http.ResponseWriter, r *http.Request) {
 	}
 	status := r.URL.Query().Get("status")
 	if status != "" && status != domain.CampaignOpen && status != domain.CampaignCompleted {
-		writeError(w, http.StatusBadRequest, "invalid_status", "status must be OPEN or COMPLETED")
+		writeError(w, r, http.StatusBadRequest, "invalid_status", "status must be OPEN or COMPLETED")
 		return
 	}
 	limit, err := parseIntQuery(r, "limit")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_limit", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_limit", err.Error())
 		return
 	}
 	offset, err := parseIntQuery(r, "offset")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_offset", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_offset", err.Error())
 		return
 	}
 	list, err := g.store.ListCampaigns(r.Context(), status, limit, offset)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if list == nil {
@@ -1406,10 +1406,10 @@ func (g *Gov) GetCampaign(w http.ResponseWriter, r *http.Request) {
 	c, err := g.store.GetCampaign(r.Context(), chi.URLParam(r, "campaign_id"))
 	if err != nil {
 		if errors.Is(err, domain.ErrCampaignNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			writeError(w, r, http.StatusNotFound, "not_found", err.Error())
 			return
 		}
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if c.Items == nil {
@@ -1423,7 +1423,7 @@ func (g *Gov) GetCampaign(w http.ResponseWriter, r *http.Request) {
 func (g *Gov) ListMyReviewItems(w http.ResponseWriter, r *http.Request) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
+		writeError(w, r, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
 		return
 	}
 	if _, ok := g.h.requireTenant(w, r, nil); !ok {
@@ -1433,12 +1433,12 @@ func (g *Gov) ListMyReviewItems(w http.ResponseWriter, r *http.Request) {
 	switch status {
 	case "", domain.ReviewItemOpen, domain.ReviewItemDecided, domain.ReviewItemEscalated, domain.ReviewItemExpired:
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_status", "status must be OPEN, DECIDED, ESCALATED or EXPIRED")
+		writeError(w, r, http.StatusBadRequest, "invalid_status", "status must be OPEN, DECIDED, ESCALATED or EXPIRED")
 		return
 	}
 	list, err := g.store.ListReviewItems(r.Context(), principalID, status)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if list == nil {

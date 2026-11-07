@@ -404,8 +404,8 @@ func TestCreateObligation_MissingSourceReference(t *testing.T) {
 	}
 	var got map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
-	if got["field"] != "source_reference" {
-		t.Errorf("expected missing field source_reference, got %q", got["field"])
+	if got["code"] != "missing_field" {
+		t.Errorf("expected missing field source_reference, got %q", got["code"])
 	}
 }
 

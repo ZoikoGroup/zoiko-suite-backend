@@ -18,7 +18,6 @@ import (
 	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
-	"zoiko.io/gateway-auth-svc/internal/problem"
 	"zoiko.io/gateway-auth-svc/internal/siem"
 	"zoiko.io/gateway-auth-svc/internal/tenantctx"
 )
@@ -310,7 +309,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			"token for tenant "+claims.TenantID+" presented against hostname-resolved tenant "+resolvedTenantID+
 				" by principal "+claims.Principal.PrincipalID)
 		h.refuse(w, r, rc, refusal{
-			outcome: outcomeTenantHostnameMismatch, code: problem.CodeContextInvalid, status: http.StatusForbidden,
+			outcome: outcomeTenantHostnameMismatch, code: "context_invalid", status: http.StatusForbidden,
 			detail: "token tenant does not match the hostname-resolved tenant", severity: siem.SeverityCritical, dedicated: true,
 		})
 		return
@@ -337,7 +336,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	// everything, so an outage of the risk engine removed the control.
 	if assessment == nil && h.carta.Enabled() && materialWrite(originalMethod(r)) {
 		h.refuse(w, r, rc, refusal{
-			outcome: outcomeCartaUnavailable, code: problem.CodeAuthDenied, status: http.StatusServiceUnavailable,
+			outcome: outcomeCartaUnavailable, code: "auth_denied", status: http.StatusServiceUnavailable,
 			detail: "continuous risk assessment unavailable", retryable: true,
 		})
 		return
@@ -375,7 +374,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		// is never attributed to a refusal the risk engine did not make.
 		if assessment.Decision == carta.DecisionStepUpMFA {
 			h.refuse(w, r, rc, refusal{
-				outcome: outcomeStepUpRequired, code: problem.CodeAuthDenied, status: http.StatusUnauthorized,
+				outcome: outcomeStepUpRequired, code: "auth_denied", status: http.StatusUnauthorized,
 				detail: "step-up authentication required", severity: severityFor(assessment.Decision), dedicated: true,
 				headers: [][2]string{
 					{"X-Carta-Decision", string(carta.DecisionStepUpMFA)},
@@ -386,7 +385,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.refuse(w, r, rc, refusal{
-			outcome: outcomeCartaBlocked, code: problem.CodeAuthDenied, status: http.StatusForbidden,
+			outcome: outcomeCartaBlocked, code: "auth_denied", status: http.StatusForbidden,
 			detail: "access denied by continuous risk assessment", severity: severityFor(assessment.Decision), dedicated: true,
 			headers: [][2]string{{"X-Carta-Decision", string(assessment.Decision)}},
 		})
@@ -555,7 +554,7 @@ func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, rc *req
 		// Fail closed, and say why: no fallback to a global or default tenant,
 		// and no proceeding on a context nobody could confirm.
 		h.refuse(w, r, rc, refusal{
-			outcome: outcomeTenantContextUnresolved, code: problem.CodeContextInvalid,
+			outcome: outcomeTenantContextUnresolved, code: "context_invalid",
 			status: http.StatusServiceUnavailable, detail: "tenant context could not be resolved",
 			retryable: true, retryAfter: 5, severity: siem.SeverityHigh,
 			headers: [][2]string{{"X-Tenant-Context", "unresolved"}},
@@ -567,7 +566,7 @@ func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, rc *req
 	h.siem.Stream(r.Context(), claims.TenantID, "tenant_context.denied", siem.SeverityHigh,
 		"tenant context denied for principal "+claims.Principal.PrincipalID)
 	h.refuse(w, r, rc, refusal{
-		outcome: outcomeTenantContextDenied, code: problem.CodeContextInvalid, status: http.StatusForbidden,
+		outcome: outcomeTenantContextDenied, code: "context_invalid", status: http.StatusForbidden,
 		detail: "tenant context denied", severity: siem.SeverityHigh, dedicated: true,
 		headers: [][2]string{{"X-Tenant-Context", "denied"}},
 	})
@@ -673,7 +672,7 @@ func (h *Handler) sessionLive(ctx context.Context, w http.ResponseWriter, r *htt
 	default:
 		h.log.Error("identity session status unavailable — failing closed", zap.Error(err))
 		h.refuse(w, r, rc, refusal{
-			outcome: outcomeSessionStatusUnavailable, code: problem.CodeAuthDenied, status: http.StatusServiceUnavailable,
+			outcome: outcomeSessionStatusUnavailable, code: "auth_denied", status: http.StatusServiceUnavailable,
 			detail: "session status unavailable", retryable: true,
 		})
 	}

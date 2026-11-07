@@ -1,0 +1,669 @@
+// Package contract defines the public wire contract of /public-ai/v1
+// (Doc 05 §08–§10, §15; Doc 04 §10) and its validation rules.
+package contract
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
+)
+
+const (
+	SchemaVersion   = "1.0"
+	MaxMessageRunes = 2000
+	MaxTextRunes    = 5000
+	MaxCitations    = 5 // schema bound (Doc 05 §10); the orchestrator emits ≤3 (ADR-005)
+	MaxActions      = 3 // schema bound; the orchestrator emits ≤1 primary CTA (ADR-005)
+	ActionOpenRoute = "OPEN_OFFICIAL_ROUTE"
+)
+
+// Status is the turn outcome (Doc 05 §10). Business outcomes are HTTP 200.
+type Status string
+
+const (
+	Answered      Status = "ANSWERED"
+	Clarify       Status = "CLARIFY"
+	RefusedAction Status = "REFUSED_ACTION"
+	Abstain       Status = "ABSTAIN"
+	Handoff       Status = "HANDOFF"
+	Unavailable   Status = "UNAVAILABLE"
+)
+
+var validStatus = map[Status]bool{Answered: true, Clarify: true, RefusedAction: true, Abstain: true, Handoff: true, Unavailable: true}
+
+// Answer classes (Master prompt §4.1, Doc 02 §12): how much of the answer is
+// a governed fact. Every status maps to exactly one class.
+const (
+	VerifiedFact       = "VERIFIED_FACT"
+	StatusQualified    = "STATUS_QUALIFIED"
+	ProcessExplanation = "PROCESS_EXPLANATION"
+	HandoffUnknown     = "HANDOFF_UNKNOWN"
+	// SafeRefusal is a REFUSED_ACTION turn (Doc 02 §15).
+	SafeRefusal = "SAFE_REFUSAL"
+)
+
+var validClass = map[string]bool{VerifiedFact: true, StatusQualified: true, ProcessExplanation: true, HandoffUnknown: true, SafeRefusal: true}
+
+// Safety dispositions (Doc 02 §15): what the UI may offer next. The widget
+// shows no CTA or tool button the disposition does not allow.
+const (
+	DispositionAllow    = "ALLOW"
+	DispositionClarify  = "CLARIFY"
+	DispositionDeny     = "DENY"
+	DispositionEscalate = "ESCALATE"
+	DispositionRetry    = "RETRY"
+)
+
+// DispositionFor maps a status to its safety disposition: an answer is
+// ALLOW, a question CLARIFY, a refusal DENY, a handoff or abstention (which
+// offers official routes) ESCALATE, an outage RETRY.
+func DispositionFor(s Status) string {
+	switch s {
+	case Answered:
+		return DispositionAllow
+	case Clarify:
+		return DispositionClarify
+	case RefusedAction:
+		return DispositionDeny
+	case Unavailable:
+		return DispositionRetry
+	default:
+		return DispositionEscalate
+	}
+}
+
+// StatusLabels is the governed status vocabulary. A label is shown only when
+// it comes from the signed claim registry; it is never inferred or upgraded.
+var StatusLabels = map[string]bool{
+	"Available": true, "Limited": true, "Partner-Supported": true, "Planned": true, "Not Available": true,
+	"Unverified": true, "Current Architecture": true, "Implemented": true, "In Validation": true, "Readiness": true,
+	"MARKET_DEPENDENT": true,
+	// VERIFIED: backed by a signed claim with no narrower status.
+	"VERIFIED": true,
+}
+
+// OverviewOption is the clarification choice that skips the missing slot and
+// asks for the general, non-market answer instead. OtherOption is "a country
+// not listed": it is answered as not covered, never guessed.
+const (
+	OverviewOption = "GENERAL_OVERVIEW"
+	OtherOption    = "OTHER"
+)
+
+// Reasons say why a turn ended the way it did, so the UI can word it and
+// diagnostics can name the failing stage. UNAVAILABLE carries only the
+// infrastructure reasons (kill switch, model, knowledge); "no evidence" and
+// "market not covered" are business outcomes (ABSTAIN, HTTP 200).
+const (
+	ReasonAnswered             = "ANSWERED"
+	ReasonGreeting             = "GREETING"
+	ReasonMarketRequired       = "MARKET_REQUIRED"
+	ReasonPlanRequired         = "PLAN_REQUIRED"
+	ReasonClarifyExhausted     = "CLARIFY_EXHAUSTED"
+	ReasonNoEvidence           = "NO_EVIDENCE"
+	ReasonClaimConflict        = "CLAIM_CONFLICT"
+	ReasonExpiredSource        = "EXPIRED_SOURCE"
+	ReasonSourceRevoked        = "SOURCE_REVOKED"
+	ReasonMarketNotCovered     = "MARKET_NOT_COVERED"
+	ReasonOutOfScope           = "OUT_OF_SCOPE"
+	ReasonRouteOnly            = "ROUTE_ONLY"
+	ReasonSensitiveInput       = "SENSITIVE_INPUT"
+	ReasonPrivateData          = "PRIVATE_DATA"
+	ReasonActionDenied         = "ACTION_DENIED"
+	ReasonRegulatedAdvice      = "REGULATED_ADVICE"
+	ReasonSecurityReport       = "SECURITY_REPORT"
+	ReasonPromptInjection      = "PROMPT_INJECTION"
+	ReasonCrossProduct         = "CROSS_PRODUCT"
+	ReasonUnsupportedClaim     = "UNSUPPORTED_GUARANTEE"
+	ReasonValidationFailed     = "VALIDATION_FAILED"
+	ReasonToolInstruction      = "TOOL_INSTRUCTION"
+	ReasonPricingDisabled      = "PRICING_DISABLED"
+	ReasonKillSwitch           = "KILL_SWITCH"
+	ReasonSpendCeiling         = "SPEND_CEILING" // Doc 06 §13 stage 2: static content only
+	ReasonIntentDisabled       = "INTENT_DISABLED"
+	ReasonGenerationDisabled   = "GENERATION_DISABLED"
+	ReasonModelUnavailable     = "MODEL_UNAVAILABLE"
+	ReasonModelTimeout         = "MODEL_TIMEOUT"
+	ReasonKnowledgeUnavailable = "KNOWLEDGE_UNAVAILABLE"
+	ReasonLivePlatformData     = "LIVE_PLATFORM_DATA"
+	ReasonNoApprovedInfo       = "NO_APPROVED_INFO"
+	ReasonGlossary             = "GLOSSARY"      // Doc 02 §23: a general definition, no ZoikoSuite claim
+	ReasonContextNoted         = "CONTEXT_NOTED" // Doc 02 §10: the visitor's market is kept for the session
+)
+
+// Pipeline stages named in diagnostics (Master prompt STEP 1).
+const (
+	StageEdge     = "EDGE"
+	StagePolicy   = "POLICY"
+	StageClassify = "CLASSIFY"
+	StageClaims   = "CLAIMS"
+	StageRetrieve = "RETRIEVE"
+	StageCompose  = "COMPOSE"
+	StageValidate = "VALIDATE"
+	StageDone     = "DONE"
+)
+
+var reasonStage = map[string]string{
+	ReasonAnswered: StageDone, ReasonGreeting: StageDone, ReasonRouteOnly: StageDone,
+	ReasonMarketRequired: StageClaims, ReasonPlanRequired: StageClaims, ReasonClarifyExhausted: StageClaims,
+	ReasonNoEvidence: StageRetrieve, ReasonClaimConflict: StageClaims, ReasonExpiredSource: StageClaims,
+	ReasonSourceRevoked: StageClaims, ReasonMarketNotCovered: StageClaims, ReasonOutOfScope: StageClassify,
+	ReasonSensitiveInput: StagePolicy, ReasonPrivateData: StagePolicy, ReasonActionDenied: StagePolicy,
+	ReasonRegulatedAdvice: StagePolicy, ReasonSecurityReport: StagePolicy, ReasonPromptInjection: StagePolicy,
+	ReasonCrossProduct: StagePolicy, ReasonUnsupportedClaim: StagePolicy, ReasonValidationFailed: StageValidate,
+	ReasonToolInstruction: StageValidate, ReasonPricingDisabled: StageEdge, ReasonKillSwitch: StageEdge,
+	ReasonIntentDisabled: StageEdge, ReasonSpendCeiling: StageEdge, ReasonGenerationDisabled: StageCompose, ReasonModelUnavailable: StageCompose,
+	ReasonModelTimeout: StageCompose, ReasonKnowledgeUnavailable: StageRetrieve,
+	ReasonLivePlatformData: StagePolicy, ReasonNoApprovedInfo: StageRetrieve,
+	ReasonGlossary: StageDone, ReasonContextNoted: StageDone,
+}
+
+// infraReason are the only reasons an UNAVAILABLE turn may carry.
+var infraReason = map[string]bool{ReasonKillSwitch: true, ReasonIntentDisabled: true, ReasonGenerationDisabled: true, ReasonSpendCeiling: true,
+	ReasonModelUnavailable: true, ReasonModelTimeout: true, ReasonKnowledgeUnavailable: true}
+
+// StageFor names the pipeline stage a reason comes from ("" if unknown).
+func StageFor(reason string) string { return reasonStage[reason] }
+
+// DefaultClass is the class for a status when the orchestrator set none.
+func DefaultClass(s Status) string {
+	switch s {
+	case Answered:
+		return ProcessExplanation
+	case Clarify:
+		return StatusQualified
+	case RefusedAction:
+		return SafeRefusal
+	default:
+		return HandoffUnknown
+	}
+}
+
+// PageContexts is the allowlisted page_context enum (Doc 05 §08), plus
+// "trust": Doc 02 §22 defines a Trust page starter set, and the widget sends
+// it on /trust. Any other value is still rejected (CT-009).
+var PageContexts = map[string]bool{"home": true, "pricing": true, "core_modules": true, "trust": true, "demo": true, "support": true, "other": true}
+
+// SupportedLocales are the locales the public knowledge is written in.
+// DefaultLocale is served when a visitor asks for any other (Doc 05 §08–09):
+// a non-English locale must not filter out every approved source.
+var SupportedLocales = []string{"en-US"}
+
+const DefaultLocale = "en-US"
+
+// ServedLocale returns loc when its language is supported, else DefaultLocale.
+func ServedLocale(loc string) string {
+	lang := strings.ToLower(strings.SplitN(loc, "-", 2)[0])
+	for _, s := range SupportedLocales {
+		if lang != "" && strings.EqualFold(strings.SplitN(s, "-", 2)[0], lang) {
+			return loc
+		}
+	}
+	return DefaultLocale
+}
+
+var (
+	marketRe = regexp.MustCompile(`^[A-Z]{2}$`)
+	localeRe = regexp.MustCompile(`^[a-zA-Z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$`)
+	uuidRe   = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	intentRe = regexp.MustCompile(`^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10)|UNKNOWN)$`)
+)
+
+// SessionRequest is the body of POST /sessions.
+type SessionRequest struct {
+	SchemaVersion string `json:"schema_version"`
+	Locale        string `json:"locale,omitempty"`
+	MarketCode    string `json:"market_code,omitempty"`
+	PageContext   string `json:"page_context,omitempty"`
+}
+
+type Capabilities struct {
+	Streaming     bool  `json:"streaming"`
+	LeadCapture   bool  `json:"lead_capture"`
+	FileUpload    bool  `json:"file_upload"`
+	Authenticated *bool `json:"authenticated,omitempty"`
+	// ChatEnabled is false while the kill switch (public_ai_enabled) is off,
+	// so the widget can show the closed state up front (Doc 08 §26). Only
+	// set on GET /config.
+	ChatEnabled *bool `json:"chat_enabled,omitempty"`
+}
+
+// SessionResponse is the 201 body of POST /sessions.
+type SessionResponse struct {
+	SchemaVersion string       `json:"schema_version"`
+	SessionID     string       `json:"session_id"`
+	SessionGrant  string       `json:"session_grant"`
+	ExpiresAt     string       `json:"expires_at"`
+	PolicyVersion string       `json:"policy_version"`
+	Capabilities  Capabilities `json:"capabilities"`
+}
+
+// TurnRequest is the body of POST /turns.
+type TurnRequest struct {
+	SchemaVersion         string `json:"schema_version"`
+	SessionID             string `json:"session_id"`
+	ClientTurnID          string `json:"client_turn_id"`
+	Message               string `json:"message"`
+	Locale                string `json:"locale,omitempty"`
+	MarketCode            string `json:"market_code,omitempty"`
+	PageContext           string `json:"page_context,omitempty"`
+	RequestedResponseMode string `json:"requested_response_mode,omitempty"`
+}
+
+type Citation struct {
+	SourceVersionID string   `json:"source_version_id"`
+	ClaimIDs        []string `json:"claim_ids"`
+	URLKey          string   `json:"url_key"`
+	// Title, RouteKey and URL are resolved server-side from the signed KB
+	// and route registries when structured responses are on (ADR-008). URL
+	// is omitted until a real, allowlisted page exists.
+	Title    string `json:"title,omitempty"`
+	RouteKey string `json:"route_key,omitempty"`
+	URL      string `json:"url,omitempty"`
+	// ReviewedAt is the cited source's approval date (else its effective
+	// date), YYYY-MM-DD (Doc 01 FR-03, AT-01: show the source's review date).
+	ReviewedAt string `json:"reviewed_at,omitempty"`
+}
+
+type Action struct {
+	Type     string `json:"type"`
+	RouteKey string `json:"route_key"`
+}
+
+type Flags struct {
+	RequiresHuman bool `json:"requires_human,omitempty"`
+}
+
+// Clarification is the one question a CLARIFY turn asks: the slot it fills
+// and the allowed choices (market codes plus OverviewOption).
+type Clarification struct {
+	Slot     string   `json:"slot"`
+	Question string   `json:"question"`
+	Options  []string `json:"options"`
+}
+
+// Envelope is the turn response (zs-public-answer-v1).
+type Envelope struct {
+	SchemaVersion      string     `json:"schema_version"`
+	TurnID             string     `json:"turn_id"`
+	RequestID          string     `json:"request_id"`
+	TurnSequence       int        `json:"turn_sequence"`
+	Status             Status     `json:"status"`
+	IntentID           string     `json:"intent_id"`
+	Text               string     `json:"text"`
+	Citations          []Citation `json:"citations"`
+	Actions            []Action   `json:"actions"`
+	KnowledgeReleaseID string     `json:"knowledge_release_id"`
+	PolicyVersion      string     `json:"policy_version"`
+	Flags              *Flags     `json:"flags,omitempty"`
+	// AnswerClass, StatusLabel and MarketCode are the qualifier the UI shows
+	// next to the answer; Clarification is set only on CLARIFY.
+	AnswerClass string `json:"answer_class"`
+	// SafetyDisposition is DispositionFor(Status) (Doc 02 §15).
+	SafetyDisposition string         `json:"safety_disposition"`
+	StatusLabel       string         `json:"status_label,omitempty"`
+	MarketCode        string         `json:"market_code,omitempty"`
+	Clarification     *Clarification `json:"clarification,omitempty"`
+	// SecondaryIntentID is the second intent of a two-part question (e.g.
+	// plans and trial); Reason says why the turn ended this way.
+	SecondaryIntentID string `json:"secondary_intent_id,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+	// Suggestions are pre-approved follow-up questions shown as chips when
+	// the assistant cannot answer (never links, never CTAs).
+	Suggestions []Chip `json:"suggestions,omitempty"`
+	// Draft: answered from DRAFT_PENDING_REVIEW articles (local/dev only).
+	Draft bool `json:"draft,omitempty"`
+	// Structured response fields (ADR-008), sent only while the
+	// structured_response_enabled flag is on. Outcome types the status;
+	// FollowUps come from the approved Doc 02 follow-up map, never the
+	// model; CTA is at most one primary and one secondary official route.
+	Outcome   string     `json:"outcome,omitempty"`
+	FollowUps []FollowUp `json:"followups,omitempty"`
+	CTA       *CTA       `json:"cta,omitempty"`
+}
+
+// Typed outcomes (ADR-008). CLARIFY keeps its own outcome: it asks, it
+// neither answers nor abstains.
+const (
+	OutcomeGrounded     = "GROUNDED"
+	OutcomeClarify      = "CLARIFY"
+	OutcomeAbstain      = "ABSTAIN"
+	OutcomeSafeFallback = "SAFE_FALLBACK"
+	OutcomeRefused      = "REFUSED"
+	OutcomeHandoffOffer = "HANDOFF_OFFER"
+)
+
+// MaxFollowUps bounds followups[] (ADR-008).
+const MaxFollowUps = 4
+
+// OutcomeFor maps a status to its typed outcome.
+func OutcomeFor(s Status) string {
+	switch s {
+	case Answered:
+		return OutcomeGrounded
+	case Clarify:
+		return OutcomeClarify
+	case RefusedAction:
+		return OutcomeRefused
+	case Handoff:
+		return OutcomeHandoffOffer
+	case Unavailable:
+		return OutcomeSafeFallback
+	default:
+		return OutcomeAbstain
+	}
+}
+
+var validOutcome = map[string]bool{OutcomeGrounded: true, OutcomeClarify: true, OutcomeAbstain: true,
+	OutcomeSafeFallback: true, OutcomeRefused: true, OutcomeHandoffOffer: true}
+
+// FollowUp is one approved follow-up question: the fixed message it sends
+// and the intent that message classifies to.
+type FollowUp struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	IntentID string `json:"intent_id"`
+	Message  string `json:"message"`
+}
+
+// CTALink is one official route offered as a call to action. URL is set
+// only when the signed route registry has a real page for it.
+type CTALink struct {
+	RouteKey string `json:"route_key"`
+	Label    string `json:"label"`
+	URL      string `json:"url,omitempty"`
+}
+
+// CTA is at most one primary and one secondary call to action.
+type CTA struct {
+	Primary   *CTALink `json:"primary,omitempty"`
+	Secondary *CTALink `json:"secondary,omitempty"`
+}
+
+// MenuResponse is the body of GET /menu: the guided topic menu (ADR-008).
+type MenuResponse struct {
+	SchemaVersion string         `json:"schema_version"`
+	Categories    []MenuCategory `json:"categories"`
+}
+
+// MenuCategory is one Doc 02 §22 page family and its questions.
+type MenuCategory struct {
+	ID    string     `json:"id"`
+	Label string     `json:"label"`
+	Items []FollowUp `json:"items"`
+}
+
+// ConfigResponse is the body of GET /config (Doc 05 §15).
+type ConfigResponse struct {
+	ConfigRevision       string        `json:"config_revision"`
+	AssistantDisplayName string        `json:"assistant_display_name"`
+	Capabilities         Capabilities  `json:"capabilities"`
+	SupportedLocales     []string      `json:"supported_locales"`
+	MarketChoices        []string      `json:"market_choices"`
+	PublicRoutes         []PublicRoute `json:"public_routes"`
+	// CitationLinks resolves a citation url_key to the approved public page
+	// it came from (server-side resolution, Doc 06 §10). Extension of Doc 05
+	// §15 recorded in ADR-005.
+	CitationLinks    []CitationLink `json:"citation_links"`
+	PrivacyNoticeKey string         `json:"privacy_notice_key"`
+	// Microcopy (ui.* keys) and Chips (starter questions by page_context)
+	// let the widget render pre-approved wording only (Master prompt §6.4).
+	Microcopy map[string]string `json:"microcopy"`
+	Chips     map[string][]Chip `json:"chips"`
+}
+
+// Chip is one welcome-card starter: a label and the fixed message it sends.
+type Chip struct {
+	Label   string `json:"label"`
+	Message string `json:"message"`
+}
+
+// FieldError is a 422 validation failure (safe to show publicly).
+type FieldError struct{ Field, Reason string }
+
+func (e *FieldError) Error() string { return e.Field + ": " + e.Reason }
+
+// ErrUnsupportedSchema means schema_version is not "1.0".
+var ErrUnsupportedSchema = errors.New("unsupported schema_version")
+
+// NormalizeMessage applies Unicode NFC, removes control characters other
+// than newline and tab, and trims surrounding space (Doc 05 §09).
+func NormalizeMessage(s string) string {
+	s = norm.NFC.String(strings.ToValidUTF8(s, ""))
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return -1
+		}
+		return r
+	}, s)
+	return strings.TrimSpace(s)
+}
+
+func validateOptional(locale, market, page string) error {
+	if locale != "" && !localeRe.MatchString(locale) {
+		return &FieldError{"locale", "must be a BCP 47 tag"}
+	}
+	if market != "" && !marketRe.MatchString(market) {
+		return &FieldError{"market_code", "must be an ISO 3166-1 alpha-2 code"}
+	}
+	if page != "" && !PageContexts[page] {
+		return &FieldError{"page_context", "unsupported value"}
+	}
+	return nil
+}
+
+// Validate checks a session request.
+func (r *SessionRequest) Validate() error {
+	if r.SchemaVersion != SchemaVersion {
+		return ErrUnsupportedSchema
+	}
+	return validateOptional(r.Locale, r.MarketCode, r.PageContext)
+}
+
+// ValidUUID reports whether s is a canonical UUID.
+func ValidUUID(s string) bool { return uuidRe.MatchString(s) }
+
+// Validate checks and normalizes a turn request in place.
+func (r *TurnRequest) Validate() error {
+	if r.SchemaVersion != SchemaVersion {
+		return ErrUnsupportedSchema
+	}
+	if utf8.RuneCountInString(r.SessionID) < 12 {
+		return &FieldError{"session_id", "invalid"}
+	}
+	if !ValidUUID(r.ClientTurnID) {
+		return &FieldError{"client_turn_id", "must be a UUID"}
+	}
+	r.ClientTurnID = strings.ToLower(r.ClientTurnID)
+	r.Message = NormalizeMessage(r.Message)
+	if n := utf8.RuneCountInString(r.Message); n < 1 {
+		return &FieldError{"message", "must not be empty"}
+	} else if n > MaxMessageRunes {
+		return &FieldError{"message", fmt.Sprintf("too long: at most %d characters", MaxMessageRunes)}
+	}
+	if r.RequestedResponseMode != "" && r.RequestedResponseMode != "json" {
+		return &FieldError{"requested_response_mode", "only json is supported"}
+	}
+	return validateOptional(r.Locale, r.MarketCode, r.PageContext)
+}
+
+// Validate enforces the response schema before anything reaches a client.
+func (e *Envelope) Validate() error {
+	switch {
+	case e.SchemaVersion != SchemaVersion:
+		return errors.New("schema_version")
+	case !validStatus[e.Status]:
+		return errors.New("status")
+	case !intentRe.MatchString(e.IntentID):
+		return errors.New("intent_id")
+	case utf8.RuneCountInString(e.Text) > MaxTextRunes:
+		return errors.New("text too long")
+	case len(e.Citations) > MaxCitations:
+		return errors.New("too many citations")
+	case len(e.Actions) > MaxActions:
+		return errors.New("too many actions")
+	case e.KnowledgeReleaseID == "" || e.PolicyVersion == "":
+		return errors.New("release/policy required")
+	case e.TurnSequence < 1:
+		return errors.New("turn_sequence")
+	case !validClass[e.AnswerClass]:
+		return errors.New("answer_class")
+	case e.StatusLabel != "" && !StatusLabels[e.StatusLabel]:
+		return errors.New("status_label")
+	case e.MarketCode != "" && !marketRe.MatchString(e.MarketCode):
+		return errors.New("market_code")
+	case e.Clarification != nil && e.Status != Clarify:
+		return errors.New("clarification only on CLARIFY")
+	case e.AnswerClass == HandoffUnknown && e.Status == Answered:
+		return errors.New("ANSWERED cannot be HANDOFF_UNKNOWN")
+	case (e.AnswerClass == SafeRefusal) != (e.Status == RefusedAction):
+		return errors.New("SAFE_REFUSAL is exactly the REFUSED_ACTION class")
+	case e.SafetyDisposition != DispositionFor(e.Status):
+		return errors.New("safety_disposition")
+	case e.Reason != "" && reasonStage[e.Reason] == "":
+		return errors.New("reason")
+	case e.SecondaryIntentID != "" && !intentRe.MatchString(e.SecondaryIntentID):
+		return errors.New("secondary_intent_id")
+	case e.Status == Unavailable && e.Reason != "" && !infraReason[e.Reason]:
+		return errors.New("UNAVAILABLE is only for infrastructure failures")
+	}
+	for _, a := range e.Actions {
+		if a.Type != ActionOpenRoute || a.RouteKey == "" {
+			return errors.New("action")
+		}
+	}
+	for _, c := range e.Citations {
+		if c.SourceVersionID == "" || c.URLKey == "" {
+			return errors.New("citation")
+		}
+	}
+	if e.Outcome != "" && (!validOutcome[e.Outcome] || e.Outcome != OutcomeFor(e.Status)) {
+		return errors.New("outcome")
+	}
+	if len(e.FollowUps) > MaxFollowUps {
+		return errors.New("too many followups")
+	}
+	for _, f := range e.FollowUps {
+		if f.ID == "" || f.Label == "" || f.Message == "" || !intentRe.MatchString(f.IntentID) {
+			return errors.New("followup")
+		}
+	}
+	if e.CTA != nil {
+		for _, l := range []*CTALink{e.CTA.Primary, e.CTA.Secondary} {
+			if l != nil && (l.RouteKey == "" || l.Label == "") {
+				return errors.New("cta")
+			}
+		}
+		if e.CTA.Primary == nil && e.CTA.Secondary != nil {
+			return errors.New("cta secondary without primary")
+		}
+	}
+	if e.Status == Answered && len(e.Citations) == 0 {
+		return errors.New("ANSWERED requires provenance")
+	}
+	return nil
+}
+
+// AnalyticsRequest is the body of POST /analytics: the two Doc 02 §27
+// events only the browser observes. Enums and ids only.
+type AnalyticsRequest struct {
+	SchemaVersion string `json:"schema_version"`
+	Event         string `json:"event"`
+	SessionID     string `json:"session_id,omitempty"`
+	PageContext   string `json:"page_context,omitempty"`
+	Locale        string `json:"locale,omitempty"`
+	LinkID        string `json:"link_id,omitempty"`
+	IntentID      string `json:"intent_id,omitempty"`
+}
+
+var linkIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// Validate allows chat_opened (page, locale) and source_opened (link, intent).
+func (a AnalyticsRequest) Validate() error {
+	if a.SchemaVersion != SchemaVersion {
+		return ErrUnsupportedSchema
+	}
+	switch a.Event {
+	case "chat_opened":
+		if a.LinkID != "" || a.IntentID != "" {
+			return &FieldError{"link_id", "not allowed on chat_opened"}
+		}
+	case "source_opened":
+		if !linkIDRe.MatchString(a.LinkID) {
+			return &FieldError{"link_id", "must be an approved link id"}
+		}
+		if a.IntentID != "" && !intentRe.MatchString(a.IntentID) {
+			return &FieldError{"intent_id", "unknown intent"}
+		}
+	default:
+		return &FieldError{"event", "must be chat_opened or source_opened"}
+	}
+	if a.PageContext != "" && !PageContexts[a.PageContext] {
+		return &FieldError{"page_context", "unknown page"}
+	}
+	if a.Locale != "" && !localeRe.MatchString(a.Locale) {
+		return &FieldError{"locale", "must be a BCP 47 tag"}
+	}
+	return nil
+}
+
+// FeedbackRequest is the body of POST /turns/{turn_id}/feedback (Doc 01
+// FR-09 "useful / not useful"; extension recorded in ADR-005). Enums only.
+type FeedbackRequest struct {
+	SchemaVersion string `json:"schema_version"`
+	SessionID     string `json:"session_id"`
+	Rating        string `json:"rating"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+var feedbackReasons = map[string]bool{"": true, "incorrect": true, "incomplete": true, "not_relevant": true, "unclear": true, "other": true}
+
+// Validate checks a feedback request.
+func (f *FeedbackRequest) Validate() error {
+	if f.SchemaVersion != SchemaVersion {
+		return ErrUnsupportedSchema
+	}
+	if f.Rating != "useful" && f.Rating != "not_useful" {
+		return &FieldError{"rating", "must be useful or not_useful"}
+	}
+	if !feedbackReasons[f.Reason] || (f.Rating == "useful" && f.Reason != "") {
+		return &FieldError{"reason", "unsupported value"}
+	}
+	return nil
+}
+
+// HandoffRequest is the body of POST /handoffs: a visitor opened an official
+// route (Doc 05 §21 chat.handoff.clicked.v1). It never creates a case.
+type HandoffRequest struct {
+	SchemaVersion string `json:"schema_version"`
+	SessionID     string `json:"session_id"`
+	RouteKey      string `json:"route_key"`
+}
+
+// HandoffResponse returns the approved URL for the route.
+type HandoffResponse struct {
+	RouteKey string `json:"route_key"`
+	URL      string `json:"url"`
+}
+
+// PublicRoute is an official destination the widget may open. URLs come only
+// from the signed route registry, never from model output (Doc 05 §15).
+type PublicRoute struct {
+	RouteKey string `json:"route_key"`
+	URL      string `json:"url"`
+}
+
+// CitationLink maps a citation url_key to an approved, allowlisted HTTPS page.
+type CitationLink struct {
+	URLKey string `json:"url_key"`
+	URL    string `json:"url"`
+	Title  string `json:"title"`
+}

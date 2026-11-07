@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: Public AI assistant
+    orgId: 1
+    folder: "Public AI"
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      # The same dashboard file the main Grafana provisions.
+      path: /var/lib/grafana/dashboards

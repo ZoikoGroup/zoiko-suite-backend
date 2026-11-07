@@ -227,6 +227,11 @@ func TestControlPopulation_SignConventionAndFieldChoices(t *testing.T) {
 	if r := by["a-t3"]; r.Attributes["statement_status"] != "RECEIVED" {
 		t.Fatalf("parent statement status must be exposed: %+v", r)
 	}
+	// Direction is derived from the signed amount, so a control can exclude receipts by an explicit rule.
+	if by["a-t1"].Attributes["direction"] != "CREDIT" || by["a-t2"].Attributes["direction"] != "DEBIT" || by["a-t4"].Attributes["direction"] != "DEBIT" {
+		t.Fatalf("direction: t1=%q t2=%q t4=%q", by["a-t1"].Attributes["direction"], by["a-t2"].Attributes["direction"], by["a-t4"].Attributes["direction"])
+	}
+
 	// A line with no bank reference must not get an empty (matchable) reference.
 	if r := by["a-t4"]; r.Reference != "txn:a-t4" || r.Currency != "EUR" || r.Amount != "-50.0000" {
 		t.Fatalf("no-reference fallback: %+v", r)

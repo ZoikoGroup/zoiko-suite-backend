@@ -348,7 +348,7 @@ func TestStoreUpdateCannotCrossTenants(t *testing.T) {
 	idB := seedRole(t, tenantB, "UPD_B_"+uuid.NewString()[:8])
 
 	ctxA := svcmiddleware.WithTenant(context.Background(), tenantA)
-	_, err := testStore.UpdateRole(ctxA, idB, "Renamed By Other Tenant", "RETIRED", "admin-seed")
+	_, err := testStore.UpdateRole(ctxA, idB, "Renamed By Other Tenant", "RETIRED", "admin-seed", 0)
 	require.ErrorIs(t, err, domain.ErrRoleNotFound,
 		"tenant %s retired tenant %s's role", tenantA, tenantB)
 
@@ -441,7 +441,7 @@ func TestUpdateRoleEnqueuesRoleUpdatedWithRoleID(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantA)
 	id := seedRole(t, tenantA, "RETIRE_"+uuid.NewString()[:8])
 
-	_, err := testStore.UpdateRole(ctx, id, "", "RETIRED", "admin-seed")
+	_, err := testStore.UpdateRole(ctx, id, "", "RETIRED", "admin-seed", 0)
 	require.NoError(t, err)
 
 	var payload []byte
@@ -507,7 +507,7 @@ func TestMalformedIDsAreNotFoundNotOutages(t *testing.T) {
 	_, err = testStore.GetBundle(ctx, "not-a-uuid", "also-not-a-uuid")
 	require.ErrorIs(t, err, domain.ErrBundleNotFound)
 
-	_, err = testStore.UpdateRole(ctx, "not-a-uuid", "x", "RETIRED", "admin-seed")
+	_, err = testStore.UpdateRole(ctx, "not-a-uuid", "x", "RETIRED", "admin-seed", 0)
 	require.ErrorIs(t, err, domain.ErrRoleNotFound)
 
 	// Collection reads narrow to nothing rather than refusing.

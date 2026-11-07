@@ -1,0 +1,21 @@
+# Doc 10 register entry
+- Filename: ZoikoSuite_Suivo_Document_10.md
+- Document ID (exact): ZS-SUIVO-ENG-010
+- Title (exact, from the title line, not the ID line): Commercial Conversion, CRM Integration & Lead Management Specification
+- Version (exact): VERSION 1.0
+- Date (exact): 24 OCTOBER 2026
+- Status / approval wording (quote the full sentence): DOCUMENT STATUS — PROPOSED IMPLEMENTATION BASELINE FOR FOUNDER / GLOBAL CTO / PRODUCT / GLOBAL COMMERCIAL / SALES OPERATIONS / LEGAL-DPO / SECURITY / BACKEND / QA APPROVAL. This document is a target engineering specification. It is NOT proof that ZoikoSuite has a particular CRM, calendar vendor, lead workflow, billing system, live webhook, response-time SLA, country coverage or approved conversion tracking deployment.
+- Approver roles (exactly as written in the status or approval text): FOUNDER / GLOBAL CTO / PRODUCT / GLOBAL COMMERCIAL / SALES OPERATIONS / LEGAL-DPO / SECURITY / BACKEND / QA
+- Classification (if stated): Internal / controlled
+- Other document IDs mentioned in lines 1—80 (list each ID + the line number):
+  - ZS-SUIVO-ENG-010 (line 18)
+  - Documents 01—09 (line 19)
+- Line numbers where each value above was found:
+  - Document ID (exact): line 18
+  - Title (exact): line 7
+  - Version (exact): line 9
+  - Date (exact): line 9
+  - Status / approval wording: line 13
+  - Approver roles: line 13
+  - Classification: not found in lines 1—80
+  - Other document IDs: line 18, line 19

@@ -33,25 +33,25 @@ func (h *Handler) CreateAuditPlan(w http.ResponseWriter, r *http.Request) {
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	plan, created, err := h.store.CreateAuditPlan(r.Context(), domain.CreateAuditPlanParams{
 		EngagementID: engagement.EngagementID, TenantID: tenantID, CreatedByPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, plan)
+	writeJSON(w, r, status, plan)
 }
 
 func (h *Handler) GetAuditPlan(w http.ResponseWriter, r *http.Request) {
@@ -65,19 +65,19 @@ func (h *Handler) GetAuditPlan(w http.ResponseWriter, r *http.Request) {
 	}
 	plan, err := h.store.GetAuditPlanByEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, plan.EngagementID)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, plan)
+	writeJSON(w, r, http.StatusOK, plan)
 }
 
 type recordMaterialityRequest struct {
@@ -102,25 +102,25 @@ func (h *Handler) RecordMateriality(w http.ResponseWriter, r *http.Request) {
 	planID := chi.URLParam(r, "plan_id")
 	plan, err := h.store.GetAuditPlan(r.Context(), tenantID, planID)
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, plan.EngagementID)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	var req recordMaterialityRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if req.Rationale == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "rationale"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "rationale"})
 		return
 	}
 	materiality, err := h.store.RecordMateriality(r.Context(), domain.RecordMaterialityParams{
@@ -129,10 +129,10 @@ func (h *Handler) RecordMateriality(w http.ResponseWriter, r *http.Request) {
 		ClearlyTrivialThreshold: req.ClearlyTrivialThreshold, Rationale: req.Rationale,
 	})
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, materiality)
+	writeJSON(w, r, http.StatusCreated, materiality)
 }
 
 type identifyRiskRequest struct {
@@ -156,31 +156,31 @@ func (h *Handler) IdentifyRisk(w http.ResponseWriter, r *http.Request) {
 	planID := chi.URLParam(r, "plan_id")
 	plan, err := h.store.GetAuditPlan(r.Context(), tenantID, planID)
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, plan.EngagementID)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	var req identifyRiskRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if req.Description == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
 		return
 	}
 	switch req.RiskLevel {
 	case domain.RiskLevelLow, domain.RiskLevelModerate, domain.RiskLevelHigh:
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "risk_level"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "risk_level"})
 		return
 	}
 	risk, created, err := h.store.IdentifyRisk(r.Context(), domain.IdentifyRiskParams{
@@ -188,14 +188,14 @@ func (h *Handler) IdentifyRisk(w http.ResponseWriter, r *http.Request) {
 		RiskLevel: req.RiskLevel, CreatedByPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, risk)
+	writeJSON(w, r, status, risk)
 }
 
 func (h *Handler) ListRisks(w http.ResponseWriter, r *http.Request) {
@@ -210,24 +210,24 @@ func (h *Handler) ListRisks(w http.ResponseWriter, r *http.Request) {
 	planID := chi.URLParam(r, "plan_id")
 	plan, err := h.store.GetAuditPlan(r.Context(), tenantID, planID)
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, plan.EngagementID)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	risks, err := h.store.ListRisksByPlan(r.Context(), tenantID, planID)
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, risks)
+	writeJSON(w, r, http.StatusOK, risks)
 }
 
 func (h *Handler) getRiskForManage(w http.ResponseWriter, r *http.Request, riskID string) (*domain.RiskAssessment, bool) {
@@ -241,16 +241,16 @@ func (h *Handler) getRiskForManage(w http.ResponseWriter, r *http.Request, riskI
 	}
 	risk, err := h.store.GetRiskAssessment(r.Context(), tenantID, riskID)
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return nil, false
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, risk.EngagementID)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return nil, false
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return nil, false
 	}
 	return risk, true
@@ -268,18 +268,18 @@ func (h *Handler) LinkAssertion(w http.ResponseWriter, r *http.Request) {
 	tenantID, _ := h.requireTenant(w, r)
 	var req linkAssertionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if req.AssertionCode == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "assertion_code"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "assertion_code"})
 		return
 	}
 	if err := h.store.LinkAssertion(r.Context(), domain.LinkAssertionParams{RiskID: riskID, TenantID: tenantID, AssertionCode: req.AssertionCode}); err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "linked"})
+	writeJSON(w, r, http.StatusCreated, map[string]string{"status": "linked"})
 }
 
 type designAuditResponseRequest struct {
@@ -295,20 +295,20 @@ func (h *Handler) DesignAuditResponse(w http.ResponseWriter, r *http.Request) {
 	principalID, _ := h.requirePrincipal(w, r)
 	var req designAuditResponseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if req.Description == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
 		return
 	}
 	if err := h.store.DesignAuditResponse(r.Context(), domain.DesignAuditResponseParams{
 		RiskID: riskID, TenantID: tenantID, Description: req.Description, DesignedByPrincipalID: principalID,
 	}); err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "designed"})
+	writeJSON(w, r, http.StatusCreated, map[string]string{"status": "designed"})
 }
 
 // AssessRisk is the real, DB-enforced form of "every risk links to
@@ -327,10 +327,10 @@ func (h *Handler) AssessRisk(w http.ResponseWriter, r *http.Request) {
 	}
 	risk, _, err := h.store.AssessRisk(r.Context(), domain.AssessRiskParams{RiskID: riskID, TenantID: tenantID, ActorPrincipalID: principalID, CorrelationID: correlationID})
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, risk)
+	writeJSON(w, r, http.StatusOK, risk)
 }
 
 // MarkSignificantRisk is the only code path anywhere that can set
@@ -351,10 +351,10 @@ func (h *Handler) MarkSignificantRisk(w http.ResponseWriter, r *http.Request) {
 	}
 	risk, err := h.store.MarkSignificantRisk(r.Context(), domain.MarkSignificantRiskParams{RiskID: riskID, TenantID: tenantID, ActorPrincipalID: principalID, CorrelationID: correlationID})
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, risk)
+	writeJSON(w, r, http.StatusOK, risk)
 }
 
 // ApprovePlan refuses self-approval — the plan's own preparer cannot
@@ -376,43 +376,43 @@ func (h *Handler) ApprovePlan(w http.ResponseWriter, r *http.Request) {
 	planID := chi.URLParam(r, "plan_id")
 	plan, err := h.store.GetAuditPlan(r.Context(), tenantID, planID)
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, plan.EngagementID)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanApprove, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	approved, _, err := h.store.ApprovePlan(r.Context(), domain.ApprovePlanParams{PlanID: planID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID})
 	if err != nil {
-		h.writeAuditPlanErr(w, err)
+		h.writeAuditPlanErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, approved)
+	writeJSON(w, r, http.StatusOK, approved)
 }
 
-func (h *Handler) writeAuditPlanErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeAuditPlanErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrAuditPlanNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "audit_plan_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "audit_plan_not_found"})
 	case errors.Is(err, domain.ErrAuditRiskNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "risk_assessment_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "risk_assessment_not_found"})
 	case errors.Is(err, domain.ErrAuditPlanAlreadyExists):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "audit_plan_already_exists"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "audit_plan_already_exists"})
 	case errors.Is(err, domain.ErrAuditPlanInvalidState):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_plan_state"})
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_plan_state"})
 	case errors.Is(err, domain.ErrAuditRiskInvalidState):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_risk_state"})
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_risk_state"})
 	case errors.Is(err, domain.ErrAuditRiskRequiresAssertionAndResponse):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "risk_requires_assertion_and_response"})
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "risk_requires_assertion_and_response"})
 	case errors.Is(err, domain.ErrAuditPlanSelfApproval):
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed"})
+		writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed"})
 	default:
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	}
 }

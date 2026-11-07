@@ -8,7 +8,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
+
 	"zoiko.io/carta-svc/internal/authz"
 	"zoiko.io/carta-svc/internal/handler"
 	"zoiko.io/carta-svc/internal/store"
@@ -38,7 +41,13 @@ func main() {
 	h := handler.New(s, authzClient, logger)
 	router := handler.NewRouter(h)
 
-	srv := &http.Server{Addr: ":" + port, Handler: router, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}
+	// Wrap router with apicontract middleware
+	r := chi.NewRouter()
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
+	r.Mount("/", router)
+
+	srv := &http.Server{Addr: ":" + port, Handler: r, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("server error", zap.Error(err))

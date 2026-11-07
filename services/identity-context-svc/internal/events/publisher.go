@@ -100,10 +100,15 @@ const (
 	// consume those. Both are now emitted: the legacy name for existing
 	// consumers, the canonical one for every new consumer. The legacy names
 	// retire when the consumer register shows no subscriber.
-	EventSessionRevoked    = "identity.session.revoked"
-	EventSubjectCreated    = "identity.subject.created"
-	EventSubjectDisabled   = "identity.subject.disabled"
-	EventSubjectEnabled    = "identity.subject.enabled"
+	EventSessionRevoked  = "identity.session.revoked"
+	EventSubjectCreated  = "identity.subject.created"
+	EventSubjectDisabled = "identity.subject.disabled"
+	EventSubjectEnabled  = "identity.subject.enabled"
+	// EventSubjectMerged: a duplicate identity was merged into a survivor
+	// (ORG-1), by POST /v1/subjects/{id}/merge or POST /v1/identities/{id}/merge.
+	// Consumers re-point what they hold for the duplicate (role assignments,
+	// delegations) to the survivor; the duplicate id is never reused.
+	EventSubjectMerged     = "identity.subject.merged"
 	EventSCIMSyncCompleted = "identity.scim_sync.completed"
 
 	// ── Auth plane closure (15 Oct 2026) ─────────────────────────────────────
@@ -269,9 +274,13 @@ func (p *Publisher) PublishSessionInvalidated(
 		"invalidation_reason": reason,
 		"correlation_id":      correlationID,
 	}
-	// ZS-IAM-001 §23 canonical name. The legacy session.invalidated name
-	// retired once all consumers subscribed to identity.session.revoked.
-	return p.emit(ctx, EventSessionRevoked, "", "", principalID, correlationID, sessionContextID, payload)
+	// ZS-IAM-001 §23 canonical name plus the legacy name both fire, so
+	// consumers on either contract see every revocation including
+	// session-concurrency-cap evictions (IC-4).
+	if err := p.emit(ctx, EventSessionRevoked, "", "", principalID, correlationID, sessionContextID, payload); err != nil {
+		return err
+	}
+	return p.emit(ctx, EventSessionInvalidated, "", "", principalID, correlationID, sessionContextID, payload)
 }
 
 // Emit renders and enqueues any event (the auth-plane services use it for

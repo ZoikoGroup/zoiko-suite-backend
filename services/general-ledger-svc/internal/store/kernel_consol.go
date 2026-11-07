@@ -48,7 +48,7 @@ func scanGroup(row pgx.Row, g *kernel.ConsolGroup) error {
 }
 
 func loadMembers(ctx context.Context, t pgx.Tx, tenant, group string) ([]kernel.ConsolMember, error) {
-	rows, err := t.Query(ctx, `SELECT member_id::text, group_id::text, legal_entity_id::text, source_book_id::text, method, ownership_pct::text, effective_from::text, COALESCE(effective_to::text, ''), investment_account, COALESCE(investor_entity_id::text, ''), equity_accounts
+	rows, err := t.Query(ctx, `SELECT member_id::text, group_id::text, legal_entity_id::text, source_book_id::text, method, ownership_pct::text, effective_from::text, COALESCE(effective_to::text, ''), investment_account, COALESCE(investor_entity_id::text, ''), equity_accounts, COALESCE(equity_rate_date::text, '')
 		FROM consolidation_members WHERE tenant_id = $1::uuid AND group_id = $2::uuid ORDER BY legal_entity_id, effective_from`, tenant, group)
 	if err != nil {
 		return nil, err
@@ -58,7 +58,7 @@ func loadMembers(ctx context.Context, t pgx.Tx, tenant, group string) ([]kernel.
 	for rows.Next() {
 		var m kernel.ConsolMember
 		var eq []byte
-		if err := rows.Scan(&m.MemberID, &m.GroupID, &m.LegalEntityID, &m.SourceBookID, &m.Method, &m.OwnershipPct, &m.EffectiveFrom, &m.EffectiveTo, &m.InvestmentAccount, &m.InvestorEntityID, &eq); err != nil {
+		if err := rows.Scan(&m.MemberID, &m.GroupID, &m.LegalEntityID, &m.SourceBookID, &m.Method, &m.OwnershipPct, &m.EffectiveFrom, &m.EffectiveTo, &m.InvestmentAccount, &m.InvestorEntityID, &eq, &m.EquityRateDate); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(eq, &m.EquityAccounts)
@@ -126,9 +126,9 @@ func (r *KernelRepo) insertMember(ctx context.Context, tenant string, m *kernel.
 		if overlapping > 0 {
 			return kernel.ErrOverlap
 		}
-		if _, e := t.Exec(ctx, `INSERT INTO consolidation_members (member_id, tenant_id, group_id, legal_entity_id, source_book_id, method, ownership_pct, effective_from, created_by, investment_account, investor_entity_id, equity_accounts)
-			VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7::numeric, $8::date, $9, $10, NULLIF($11, '')::uuid, $12::jsonb)`,
-			m.MemberID, tenant, m.GroupID, m.LegalEntityID, m.SourceBookID, m.Method, m.OwnershipPct, m.EffectiveFrom, actor, m.InvestmentAccount, m.InvestorEntityID, equityJSON(m.EquityAccounts)); e != nil {
+		if _, e := t.Exec(ctx, `INSERT INTO consolidation_members (member_id, tenant_id, group_id, legal_entity_id, source_book_id, method, ownership_pct, effective_from, created_by, investment_account, investor_entity_id, equity_accounts, equity_rate_date)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7::numeric, $8::date, $9, $10, NULLIF($11, '')::uuid, $12::jsonb, NULLIF($13::text, '')::date)`,
+			m.MemberID, tenant, m.GroupID, m.LegalEntityID, m.SourceBookID, m.Method, m.OwnershipPct, m.EffectiveFrom, actor, m.InvestmentAccount, m.InvestorEntityID, equityJSON(m.EquityAccounts), m.EquityRateDate); e != nil {
 			return e
 		}
 		return r.enqueue(ctx, t, tenant, out)

@@ -55,6 +55,8 @@ func NewRouter(h *Handler, extra ...func(chi.Router)) http.Handler {
 	// every liveness/readiness probe.
 	r.Get("/healthz", health.Handler())
 
+	r.With(customMiddleware.TenantMiddleware).Get("/v1/control-populations/{population}", h.GetControlPopulation)
+
 	r.With(customMiddleware.TenantMiddleware).Route("/v1/data-ingestion", func(r chi.Router) {
 		r.Post("/runs", h.StartIngestion)
 		r.Get("/runs/{runID}", h.GetRun)

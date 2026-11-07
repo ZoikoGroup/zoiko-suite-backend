@@ -1,0 +1,348 @@
+openapi: 3.1.0
+info:
+  title: siem-integration-svc
+  version: 1.0.0
+  description: |
+    SIEM event ingestion and exporter management service.
+
+    ## Authentication & Authorization
+
+    Every mutating endpoint requires the standard ZS-ARCH-SVC-001 §4
+    identity envelope headers (`X-Tenant-Id`, `X-Principal-Id`,
+    `X-Correlation-Id`, `Idempotency-Key`). Missing or unverified headers
+    result in 401. Authorization is enforced via `authorization-svc` at
+    the legal entity or tenant scope (see per-route descriptions).
+
+    **Two routes are deliberately not principal-gated:**
+
+    * `POST /v1/siem/stream` — called by other services to report
+      security events (including authentication failures). By definition
+      there is no authenticated principal when an authentication failure
+      occurs.
+    * `GET /v1/siem/exporters` — called by service-to-service clients that
+      send only `X-Tenant-Id`.
+
+    Both routes remain tenant-scoped; adding a principal check would break
+    the five callers that depend on them.
+
+    ## Error responses (RFC 9457)
+
+    All error responses are `application/problem+json` with the stable
+    `code` field. The legacy `error` string is preserved in the body for
+    backward compatibility. Clients should branch on `code`, not on the
+    human-readable `detail`.
+
+servers:
+  - url: http://localhost:8141
+    description: Local development
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      operationId: Healthz
+      responses:
+        '200':
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: siem-integration-svc }
+
+  /v1/siem/exporters:
+    post:
+      summary: Create a SIEM exporter
+      description: |
+        Registers a new SIEM destination. The `auth_token` is stored as
+        provided and is **never redacted on read** (it is tagged `json:"-"`).
+        Authorized on `SIEM_EXPORTER_CREATE` at the `legal_entity_id`.
+      operationId: CreateExporter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExporterRequest'
+      responses:
+        '201':
+          description: Exporter created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SIEMExporter' }
+        '400':
+          description: Invalid request body or validation error
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to create exporter at that entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: Failed to create exporter
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    get:
+      summary: List SIEM exporters
+      description: |
+        With `X-Principal-Id` (a person): `legal_entity_id` is required, the
+        call is authorized on `SIEM_EXPORTER_READ` at that entity, and the
+        entity's exporters are returned. `auth_token` is never returned
+        (tagged `json:"-"`).
+
+        Without `X-Principal-Id` (the service-to-service fan-out lookup the
+        platform's SIEM clients make with only `X-Tenant-Id`): only the `id`
+        and `status` of each ACTIVE exporter in the tenant — no name,
+        platform, legal entity or endpoint.
+      operationId: ListExporters
+      parameters:
+        - name: legal_entity_id
+          in: query
+          description: Required when X-Principal-Id is present; it is the authorization scope.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Exporters (full rows for a person, id and status only for a service)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ExporterListResponse'
+                  - $ref: '#/components/schemas/ExporterRefListResponse'
+        '400':
+          description: A person did not name legal_entity_id
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read that entity's exporters
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: Authorization or the store unavailable (fails closed)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/siem/exporters/{id}:
+    get:
+      summary: Get a SIEM exporter by ID
+      operationId: GetExporter
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Exporter
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SIEMExporter' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read that exporter
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Exporter not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/siem/stream:
+    post:
+      summary: Stream a security event
+      description: |
+        Ingests a security event into the named exporter's pipeline.
+        Exempt from principal requirement — callers include
+        gateway-auth-svc reporting authentication failures, where no
+        principal exists by definition. Requires tenant header and
+        exporter_id that exists in that tenant.
+      operationId: StreamEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StreamEventRequest' }
+      responses:
+        '201':
+          description: Event accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SIEMEvent' }
+        '400':
+          description: Invalid request body or validation error
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Exporter not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/siem/events:
+    get:
+      summary: List security events
+      description: |
+        Returns events for the specified exporter. The `exporter_id`
+        query parameter is **required** — it identifies the authorization
+        scope. Requires principal and authorization on `SIEM_EVENT_READ`
+        at the exporter's legal entity.
+      operationId: ListEvents
+      parameters:
+        - name: exporter_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: List of events
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventListResponse' }
+        '400':
+          description: Missing exporter_id
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read events from that exporter
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Exporter not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
+
+    CreateExporterRequest:
+      type: object
+      required: [legal_entity_id, name, platform, endpoint_url]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        name: { type: string }
+        platform: { type: string, enum: [SPLUNK, ELASTICSEARCH, DATADOG, HUMIO, GENERIC] }
+        endpoint_url: { type: string, format: uri }
+        auth_token: { type: string }
+
+    SIEMExporter:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        name: { type: string }
+        platform: { type: string }
+        endpoint_url: { type: string, format: uri }
+        created_at: { type: string, format: date-time }
+
+    ExporterListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/SIEMExporter' }
+        count: { type: integer }
+
+    ExporterRefListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              status: { type: string, enum: [ACTIVE] }
+        count: { type: integer }
+
+    StreamEventRequest:
+      type: object
+      required: [exporter_id, source_svc, event_type, severity, message]
+      properties:
+        exporter_id: { type: string, format: uuid }
+        source_svc: { type: string }
+        event_type: { type: string }
+        severity: { type: string, enum: [LOW, MEDIUM, HIGH, CRITICAL] }
+        message: { type: string }
+        payload: { type: object, additionalProperties: true }
+
+    SIEMEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        exporter_id: { type: string, format: uuid }
+        source_svc: { type: string }
+        event_type: { type: string }
+        severity: { type: string }
+        message: { type: string }
+        payload: { type: object, additionalProperties: true }
+        received_at: { type: string, format: date-time }
+
+    EventListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/SIEMEvent' }
+        count: { type: integer }

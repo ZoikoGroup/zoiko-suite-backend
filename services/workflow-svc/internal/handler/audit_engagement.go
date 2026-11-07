@@ -81,27 +81,27 @@ func (h *Handler) CreateAuditEngagement(w http.ResponseWriter, r *http.Request) 
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
 		return
 	}
 	var req createAuditEngagementRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if missing := req.missing(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
 	}
 	if req.ReportingPeriodEnd.Before(req.ReportingPeriodStart) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_reporting_period"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_reporting_period"})
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantID) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantID) {
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, req.LegalEntityID, actionAuditEngagementCreate, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	engagement, created, err := h.store.CreateAuditEngagement(r.Context(), domain.CreateAuditEngagementParams{
@@ -112,7 +112,7 @@ func (h *Handler) CreateAuditEngagement(w http.ResponseWriter, r *http.Request) 
 		ScopeSummary: req.ScopeSummary, CreatedByPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	status := http.StatusOK
@@ -120,7 +120,7 @@ func (h *Handler) CreateAuditEngagement(w http.ResponseWriter, r *http.Request) 
 		status = http.StatusCreated
 		h.publishAuditEngagementEvent(r, "audit.engagement.created", *engagement, actor)
 	}
-	writeJSON(w, status, engagement)
+	writeJSON(w, r, status, engagement)
 }
 
 func (h *Handler) GetAuditEngagement(w http.ResponseWriter, r *http.Request) {
@@ -134,14 +134,14 @@ func (h *Handler) GetAuditEngagement(w http.ResponseWriter, r *http.Request) {
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementRead, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, engagement)
+	writeJSON(w, r, http.StatusOK, engagement)
 }
 
 type submitAuditAcceptanceRequest struct {
@@ -159,43 +159,43 @@ func (h *Handler) SubmitAuditEngagementAcceptance(w http.ResponseWriter, r *http
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
 		return
 	}
 	var req submitAuditAcceptanceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if req.DocumentID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "acceptance_evidence_required"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "acceptance_evidence_required"})
 		return
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementAccept, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	version, err := h.documents.VerifyDocument(r.Context(), tenantID, engagement.LegalEntityID, req.DocumentID, actor, correlationID)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	engagement, changed, err := h.store.SubmitAuditEngagementAcceptance(r.Context(), domain.SubmitAuditEngagementAcceptanceParams{
 		EngagementID: engagement.EngagementID, TenantID: tenantID, EvidenceDocumentID: req.DocumentID, EvidenceDocumentVersion: version, ActorPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if changed {
 		h.publishAuditEngagementEvent(r, "audit.engagement.acceptance_submitted", *engagement, actor)
 	}
-	writeJSON(w, http.StatusOK, engagement)
+	writeJSON(w, r, http.StatusOK, engagement)
 }
 
 type auditAcceptanceDecisionRequest struct {
@@ -207,7 +207,7 @@ type auditAcceptanceDecisionRequest struct {
 func (h *Handler) RecordAuditAcceptanceDecision(w http.ResponseWriter, r *http.Request) {
 	var req auditAcceptanceDecisionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	next := ""
@@ -217,7 +217,7 @@ func (h *Handler) RecordAuditAcceptanceDecision(w http.ResponseWriter, r *http.R
 	case "REJECT":
 		next = domain.AuditEngagementWithdrawn
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_acceptance_decision"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_acceptance_decision"})
 		return
 	}
 	h.transitionAuditEngagement(w, r, actionAuditEngagementDecide, []string{domain.AuditEngagementAcceptanceReview}, next, true)
@@ -257,16 +257,16 @@ func (h *Handler) AmendAuditEngagementScope(w http.ResponseWriter, r *http.Reque
 	}
 	var req amendScopeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementManage, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	amended, changed, err := h.store.AmendAuditEngagementScope(r.Context(), domain.AmendAuditEngagementScopeParams{
@@ -275,13 +275,13 @@ func (h *Handler) AmendAuditEngagementScope(w http.ResponseWriter, r *http.Reque
 		MethodologyID: req.MethodologyID, MethodologyVersion: req.MethodologyVersion,
 	})
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if changed {
 		h.publishAuditEngagementEvent(r, "audit.engagement.scope_amended", *amended, actor)
 	}
-	writeJSON(w, http.StatusOK, amended)
+	writeJSON(w, r, http.StatusOK, amended)
 }
 
 // GetCompletionGates is the real "why can't I proceed" answer for
@@ -298,11 +298,11 @@ func (h *Handler) GetCompletionGates(w http.ResponseWriter, r *http.Request) {
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementRead, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	stage := r.URL.Query().Get("stage")
@@ -311,10 +311,10 @@ func (h *Handler) GetCompletionGates(w http.ResponseWriter, r *http.Request) {
 	}
 	gates, err := h.store.GetAuditEngagementCompletionGates(r.Context(), tenantID, engagement.EngagementID, stage)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, gates)
+	writeJSON(w, r, http.StatusOK, gates)
 }
 
 // MarkFieldworkComplete only transitions once every FIELDWORK-stage gate
@@ -355,20 +355,20 @@ func (h *Handler) transitionWithGate(w http.ResponseWriter, r *http.Request, sta
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementManage, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	gates, err := h.store.GetAuditEngagementCompletionGates(r.Context(), tenantID, engagement.EngagementID, stage)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if !allGatesSatisfied(gates) {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "completion_gate_blocked", "gates": gates})
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]any{"error": "completion_gate_blocked", "gates": gates})
 		return
 	}
 	updated, changed, err := h.store.TransitionAuditEngagement(r.Context(), domain.TransitionAuditEngagementParams{
@@ -376,13 +376,13 @@ func (h *Handler) transitionWithGate(w http.ResponseWriter, r *http.Request, sta
 		ExpectedStatuses: expected, NextStatus: next,
 	})
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if changed {
 		h.publishAuditEngagementEvent(r, eventType, *updated, actor)
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 func (h *Handler) transitionAuditEngagement(w http.ResponseWriter, r *http.Request, action string, expected []string, next string, preventCreator bool) {
@@ -396,25 +396,25 @@ func (h *Handler) transitionAuditEngagement(w http.ResponseWriter, r *http.Reque
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
 		return
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if preventCreator && engagement.CreatedByPrincipalID == actor {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_acceptance_forbidden"})
+		writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "self_acceptance_forbidden"})
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, action, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	engagement, changed, err := h.store.TransitionAuditEngagement(r.Context(), domain.TransitionAuditEngagementParams{EngagementID: engagement.EngagementID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID, ExpectedStatuses: expected, NextStatus: next})
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if changed {
@@ -430,7 +430,7 @@ func (h *Handler) transitionAuditEngagement(w http.ResponseWriter, r *http.Reque
 			h.publishAuditEngagementEvent(r, eventType, *engagement, actor)
 		}
 	}
-	writeJSON(w, http.StatusOK, engagement)
+	writeJSON(w, r, http.StatusOK, engagement)
 }
 
 // Engagement state is already committed before Kafka publication. A transient
@@ -451,29 +451,29 @@ func allGatesSatisfied(gates []domain.CompletionGate) bool {
 	return true
 }
 
-func (h *Handler) writeAuditEngagementAuthzErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeAuditEngagementAuthzErr(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, domain.ErrAuthorizationDenied) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "forbidden"})
 		return
 	}
-	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_unavailable"})
+	writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_unavailable"})
 }
 
-func (h *Handler) writeAuditEngagementErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeAuditEngagementErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrAuditEngagementNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "audit_engagement_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "audit_engagement_not_found"})
 	case errors.Is(err, domain.ErrAuditEngagementDuplicateCode):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "duplicate_engagement_code"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "duplicate_engagement_code"})
 	case errors.Is(err, domain.ErrAuditEngagementInvalidState):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_engagement_state"})
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_engagement_state"})
 	case errors.Is(err, domain.ErrAuditAcceptanceEvidenceRequired):
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "acceptance_evidence_required"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "acceptance_evidence_required"})
 	case errors.Is(err, domain.ErrAuditAcceptanceEvidenceInvalid):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "acceptance_evidence_invalid"})
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "acceptance_evidence_invalid"})
 	case errors.Is(err, domain.ErrAuditAcceptanceEvidenceUnavailable):
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "acceptance_evidence_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "acceptance_evidence_unavailable"})
 	default:
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	}
 }

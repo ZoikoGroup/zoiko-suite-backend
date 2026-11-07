@@ -119,7 +119,7 @@ func resolveOutcome(t *testing.T, c *certFixture) (string, map[string]any) {
 	_, r := c.e.do("POST", "/v1/rule-resolutions:resolve", "tax-engine", c.resolveReq(time.Now()))
 	d, _ := r["decision"].(map[string]any)
 	if d == nil {
-		return "ERROR:" + mustString(r["error"]), r
+		return "ERROR:" + mustString(r["code"]), r
 	}
 	return d["outcome"].(string), d
 }
@@ -132,7 +132,7 @@ func TestRelease_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
 
 	// A version under REVIEW cannot be released; only CERTIFIED can.
 	r := c.lifecycle(t, c.version, "publish", nil, 409)
-	assert.Equal(t, "invalid_lifecycle_state", r["error"])
+	assert.Equal(t, "invalid_lifecycle_state", r["code"])
 	c.certifyVersion(t, c.version)
 
 	// Bare status updates cannot reach RELEASED, WITHDRAWN or EMERGENCY_BLOCKED: only the commands can.
@@ -186,6 +186,9 @@ func TestRelease_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing
 	mustStatus(t, 201, code, p)
 	m := f2.manifest("2026.08.1", f2.ruleID)
 	m["dependencies"] = []map[string]string{{"ref": a.packRef, "version": a.version}}
+	// Both packs carry the same rule for the same jurisdiction. Released together over the same period they would be ambiguous at runtime (JUR-NEG-24)
+	// and the release check refuses that, so this pack's window ends before the rule takes effect: the test is about dependency gates, not rule overlap.
+	m["effective_to"] = "2026-08-02"
 	code, v := a.e.do("POST", "/v1/admin/packs/"+f2.packRef+"/versions", "author", m)
 	mustStatus(t, 201, code, v)
 	code, r := a.e.do("POST", f2.path("2026.08.1", "/submit-review"), "author", nil)
@@ -201,7 +204,7 @@ func TestRelease_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing
 
 	// B cannot be released while A is not.
 	r = b.lifecycle(t, "2026.08.1", "publish", nil, 409)
-	assert.Equal(t, "operation_blocked", r["error"])
+	assert.Equal(t, "operation_blocked", r["code"])
 	assert.Contains(t, mustString(r["reasons"]), "dependency_not_released")
 	a.lifecycle(t, a.version, "publish", nil, 200)
 	b.lifecycle(t, "2026.08.1", "publish", nil, 200)
@@ -240,9 +243,9 @@ func TestDeployment_RingOrderSoakAndHealthGates(t *testing.T) {
 
 	// Unknown scope and unreleased versions are precise errors.
 	r := c.deploy(t, c.version, "nope", regionEU, 404)
-	assert.Equal(t, "ring_not_found", r["error"])
+	assert.Equal(t, "ring_not_found", r["code"])
 	r = c.deploy(t, c.version, ringCanary, "nowhere", 404)
-	assert.Equal(t, "region_not_found", r["error"])
+	assert.Equal(t, "region_not_found", r["code"])
 	c.lifecycle(t, c.version, "deploy", map[string]any{"ring": ringCanary}, 400)
 
 	// Ring order: early and general cannot be skipped to.
@@ -358,7 +361,18 @@ func TestRollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T)
 
 	r = c.lifecycle(t, "2026.09.1", "rollback", body(nil), 200)
 	assert.EqualValues(t, 1, r["decisions_made_with_rolled_back_version"], "JUR-NEG-19: decisions already made are counted, not rewritten")
-	assert.Contains(t, mustString(r["remediation_note"]), "remediation workflow")
+	assert.Contains(t, mustString(r["remediation_note"]), "remediation case", "the note points at the case that tracks the decisions")
+	caseID := mustString(r["remediation_case_id"])
+	require.NotEmpty(t, caseID, "rolling back with decisions in scope opens a remediation case in the same transaction")
+	assert.Equal(t, true, r["remediation_opened"])
+	assert.EqualValues(t, 1, r["remediation_decisions"])
+	code, rc := c.e.do("GET", "/v1/admin/remediation-cases/"+caseID, "auditor", nil)
+	mustStatus(t, 200, code, rc)
+	assert.Equal(t, "ROLLBACK", rc["trigger"])
+	assert.Equal(t, ringCanary, rc["ring_code"])
+	assert.Equal(t, regionEU, rc["region_code"])
+	assert.EqualValues(t, 1, rc["progress"].(map[string]any)["pending"])
+	assert.Equal(t, 1, c.e.pub.count(events.EventRemediationOpened))
 	assert.Contains(t, mustString(r["reconciliation"]), "not performed")
 	assert.Equal(t, "ROLLED_BACK", r["rolled_back"].(map[string]any)["status"])
 	assert.Equal(t, c.version, r["restored"].(map[string]any)["version"])
@@ -400,7 +414,7 @@ func TestHotfix_EnhancedReviewRingExceptionAndRetrospective(t *testing.T) {
 	}
 	declare(map[string]any{"severity": "P2"}, 400)
 	r := declare(map[string]any{"rollback_target_version": "9.9.9"}, 400)
-	assert.Equal(t, "invalid_reference", r["error"], "the rollback target must exist")
+	assert.Equal(t, "invalid_reference", r["code"], "the rollback target must exist")
 	declare(map[string]any{"incident_ref": ""}, 400)
 	hf := declare(nil, 201)
 	assert.Equal(t, "P0", hf["severity"])
@@ -515,7 +529,7 @@ func TestSourceChangeIntake_OpensReviewButNeverTouchesRules(t *testing.T) {
 	mustStatus(t, 409, code, r)
 	code, r = e.do("POST", "/v1/admin/source-change-notices/"+nid+"/close", "analyst-3", map[string]any{"outcome": "NO_CHANGE", "note": "n"})
 	mustStatus(t, 403, code, r)
-	assert.Equal(t, "not_assigned_reviewer", r["error"])
+	assert.Equal(t, "not_assigned_reviewer", r["code"])
 
 	// Conclusions are validated; an interpretation conclusion needs an APPROVED interpretation.
 	code, r = e.do("POST", "/v1/admin/source-change-notices/"+nid+"/close", "analyst-2", map[string]any{"outcome": "MAYBE", "note": "n"})

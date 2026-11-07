@@ -24,6 +24,11 @@ type AccountScope struct {
 	// is given a control type becomes restricted. A control account that a subledger service still posts to through the legacy
 	// posting command is opened by setting it false, which is evented and is the operator's decision, not a default.
 	DirectPostingRestricted *bool
+	// DimensionPolicy says, by dimension, whether the account's lines must carry it (REQUIRED), may (OPTIONAL) or must not (PROHIBITED).
+	DimensionPolicy map[string]string
+	// ReplacementAccount is the account a retired account maps forward to: a posting that resolves to the retired account lands on it, and
+	// says so in its evidence. Posted lines keep the account they were posted to.
+	ReplacementAccount string
 }
 
 // AccountApplicability is the optional part of the chart that says where an account may be used: the books it is valid in and
@@ -80,6 +85,35 @@ func (d TenantDirectory) ResolveAccount(ctx context.Context, ref AccountRef, boo
 		}
 		code = c
 	}
+	info, err := d.resolveCode(ctx, code, bookID, asOf)
+	if err != nil {
+		return nil, err
+	}
+	// a retired account that names its replacement maps forward: the posting lands on the replacement, and the evidence says so. A chain
+	// is followed to its end, and one that loops or runs on is refused rather than guessed at.
+	var path []string
+	for !info.Active && info.Replacement != "" {
+		if len(path) >= maxReplacementHops || containsStr(path, info.Replacement) || info.Replacement == code {
+			return nil, fmt.Errorf("account %q is retired and its replacement chain does not end", code)
+		}
+		path = append(path, info.Code)
+		next, err := d.resolveCode(ctx, info.Replacement, bookID, asOf)
+		if err != nil {
+			return nil, fmt.Errorf("account %q is retired and its replacement %q cannot be used: %w", info.Code, info.Replacement, err)
+		}
+		info = next
+	}
+	if len(path) > 0 {
+		info.ReplacedFrom = path
+	}
+	return info, nil
+}
+
+// maxReplacementHops bounds how far a retired account is followed to its replacement.
+const maxReplacementHops = 5
+
+// resolveCode reads one account: its status, where it may be used and how its lines are classified.
+func (d TenantDirectory) resolveCode(ctx context.Context, code, bookID string, asOf time.Time) (*AccountInfo, error) {
 	active, postable, found, err := d.Ref.AccountFacts(ctx, d.Tenant, code)
 	if err != nil {
 		return nil, err
@@ -104,6 +138,7 @@ func (d TenantDirectory) ResolveAccount(ctx context.Context, ref AccountRef, boo
 			return nil, err
 		}
 		info.BookIDs, info.ControlType, info.CounterpartyRequired = sc.BookIDs, sc.ControlType, sc.CounterpartyRequired
+		info.DimensionPolicy, info.Replacement = sc.DimensionPolicy, sc.ReplacementAccount
 		if sc.Currency != "" {
 			info.CurrencyRestricted = []string{sc.Currency}
 		}
@@ -125,4 +160,30 @@ func (d TenantDirectory) FXBasis(ctx context.Context, policyID, from, to string,
 		return nil, fmt.Errorf("no exchange-rate source is configured: supply fx_basis")
 	}
 	return d.FX.Basis(ctx, policyID, from, to, asOf)
+}
+
+// ValidateScope checks what an account's scope says before it is stored: a dimension policy names dimension codes and one of the three
+// modes, and a replacement is an account code other than the account itself.
+func ValidateScope(code string, sc AccountScope) error {
+	bad := func(f, why string) error { return exc(FamCOA, "SCOPE_INVALID", "%s: %s", f, why).with("field", f) }
+	if len(sc.DimensionPolicy) > 24 {
+		return bad("dimension_policy", "at most 24 dimensions")
+	}
+	for d, m := range sc.DimensionPolicy {
+		if !codeRE.MatchString(d) {
+			return bad("dimension_policy."+d, "a dimension code")
+		}
+		if m != DimRequired && m != DimOptional && m != DimProhibited {
+			return bad("dimension_policy."+d, "REQUIRED, OPTIONAL or PROHIBITED")
+		}
+	}
+	if sc.ReplacementAccount != "" {
+		if !codeRE.MatchString(sc.ReplacementAccount) {
+			return bad("replacement_account", "an account code")
+		}
+		if sc.ReplacementAccount == code {
+			return bad("replacement_account", "an account cannot replace itself")
+		}
+	}
+	return nil
 }

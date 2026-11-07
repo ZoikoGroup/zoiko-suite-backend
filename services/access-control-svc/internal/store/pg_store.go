@@ -82,7 +82,8 @@ func uniqueViolation(err error, constraint string) bool {
 const roleColumns = `
 	role_definition_id, tenant_id, role_code, role_name, role_scope_type,
 	status, created_by_principal_id, COALESCE(updated_by_principal_id, '') AS updated_by_principal_id, correlation_id, created_at, updated_at,
-	COALESCE(template_code, '') AS template_code, COALESCE(template_version, 0) AS template_version
+	COALESCE(template_code, '') AS template_code, COALESCE(template_version, 0) AS template_version,
+	record_version
 `
 
 func scanRole(row pgx.Row, r *domain.RoleDefinition) error {
@@ -91,6 +92,7 @@ func scanRole(row pgx.Row, r *domain.RoleDefinition) error {
 		&r.RoleDefinitionID, &r.TenantID, &r.RoleCode, &r.RoleName, &r.RoleScopeType,
 		&status, &r.CreatedByPrincipalID, &r.UpdatedByPrincipalID, &r.CorrelationID, &r.CreatedAt, &r.UpdatedAt,
 		&r.TemplateCode, &r.TemplateVersion,
+		&r.RecordVersion,
 	); err != nil {
 		return err
 	}
@@ -333,7 +335,7 @@ func (s *PgStore) ListRoles(ctx context.Context, filter domain.ListFilter) ([]do
 
 // UpdateRole applies a rename and/or a status change and enqueues role.updated
 // in the same transaction.
-func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, status, updatedByPrincipalID string) (*domain.RoleDefinition, error) {
+func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, status, updatedByPrincipalID string, expectedVersion int64) (*domain.RoleDefinition, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, domain.ErrIdentityMissing
@@ -351,6 +353,11 @@ func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, st
 				return domain.ErrRoleNotFound
 			}
 			return err
+		}
+
+		// Optimistic concurrency check (API-3).
+		if expectedVersion > 0 && current.RecordVersion != expectedVersion {
+			return domain.ErrVersionConflict
 		}
 
 		if roleName == "" {
@@ -395,7 +402,8 @@ func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, st
 const bundleColumns = `
 	bundle_id, tenant_id, role_definition_id, bundle_code, permitted_actions,
 	active_flag, COALESCE(updated_by_principal_id, '') AS updated_by_principal_id, correlation_id, created_at, updated_at,
-	COALESCE(template_code, '') AS template_code, COALESCE(template_version, 0) AS template_version
+	COALESCE(template_code, '') AS template_code, COALESCE(template_version, 0) AS template_version,
+	record_version
 `
 
 func scanBundle(row pgx.Row, b *domain.PermissionBundleDef) error {
@@ -403,6 +411,7 @@ func scanBundle(row pgx.Row, b *domain.PermissionBundleDef) error {
 		&b.BundleID, &b.TenantID, &b.RoleDefinitionID, &b.BundleCode, &b.PermittedActions,
 		&b.ActiveFlag, &b.UpdatedByPrincipalID, &b.CorrelationID, &b.CreatedAt, &b.UpdatedAt,
 		&b.TemplateCode, &b.TemplateVersion,
+		&b.RecordVersion,
 	)
 }
 
@@ -551,7 +560,7 @@ func (s *PgStore) GetBundle(ctx context.Context, roleDefinitionID, bundleID stri
 // Scoped by roleDefinitionID as well as bundleID, matching GetBundle: a write
 // addressed under the wrong role resolves to ErrBundleNotFound rather than
 // editing another role's bundle.
-func (s *PgStore) UpdateBundle(ctx context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string) (*domain.PermissionBundleDef, error) {
+func (s *PgStore) UpdateBundle(ctx context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string, expectedVersion int64) (*domain.PermissionBundleDef, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, domain.ErrIdentityMissing
@@ -568,6 +577,11 @@ func (s *PgStore) UpdateBundle(ctx context.Context, roleDefinitionID, bundleID s
 				return domain.ErrBundleNotFound
 			}
 			return err
+		}
+
+		// Optimistic concurrency check (API-3).
+		if expectedVersion > 0 && out.RecordVersion != expectedVersion {
+			return domain.ErrVersionConflict
 		}
 
 		sets := []string{}

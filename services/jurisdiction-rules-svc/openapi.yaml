@@ -157,7 +157,516 @@ paths:
         "404": { $ref: '#/components/responses/NotFound' }
         "503": { $ref: '#/components/responses/StoreUnavailable' }
 
+  /v1/jurisdictions/{jurisdiction_id}/as-of:
+    get:
+      tags: [Jurisdictions]
+      summary: GetJurisdictionAsOf, a jurisdiction as it was at an instant (REF-01)
+      description: |
+        Answers from the effective-dated version history, so a rename, a move or a
+        retirement since `as_of` does not change the answer. A jurisdiction retired
+        since is still readable as of any time it was in force, and says so
+        (`retired`, `retired_at`, `superseded_by_jurisdiction_id`).
+
+        A jurisdiction that exists but was not in force at `as_of` (before it began,
+        or after it was retired) answers `404 jurisdiction_not_effective` with the
+        dates, which is a different fact from `404 jurisdiction_not_found`: the code
+        was real. Never guesses from the current state.
+      operationId: getJurisdictionAsOf
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The jurisdiction as it was at as_of.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionAsOf' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdictions/{jurisdiction_id}/hierarchy:
+    get:
+      tags: [Jurisdictions]
+      summary: GetHierarchy, the tree below a jurisdiction at an instant (REF-01)
+      description: |
+        The jurisdictions below this one as they stood at `as_of`, nested, to at most
+        `depth` levels (default 5, maximum 10). Parentage is read from the versions in
+        force at `as_of`, so a jurisdiction that was moved appears under its parent of
+        that date, and one retired since still appears if it was then in force. Ordered
+        deterministically by code. The root must itself have been in force at `as_of`.
+      operationId: getJurisdictionHierarchy
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/AsOf'
+        - name: depth
+          in: query
+          required: false
+          description: Levels below the root to include. 0 is the root alone.
+          schema: { type: integer, minimum: 0, maximum: 10, default: 5 }
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The tree.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionHierarchy' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "422":
+          description: The tree is too large for one answer (more than 5000 jurisdictions); ask for a smaller depth or a deeper root.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdiction-resolutions:
+    get:
+      tags: [Jurisdictions]
+      summary: ResolveJurisdiction, a code to exactly one jurisdiction at an instant (REF-01)
+      description: |
+        Resolves `code` to ONE jurisdiction as it was at `as_of`, or says precisely why
+        it cannot. With no `system` the code is a jurisdiction's own `jurisdiction_code`;
+        with one (for example `ISO3166-1-ALPHA2`) it is that system's code. Case and
+        surrounding whitespace are ignored; nothing else is, and a near match is never
+        offered ("never guess from free text").
+
+        Four distinct refusals, so a caller whose legal treatment depends on the answer
+        can tell them apart:
+
+        - `404 unknown_jurisdiction_code`: nothing is known by that code.
+        - `404 code_not_mapped_at`: the code is mapped, but not at `as_of`.
+        - `410 jurisdiction_retired`: it resolves to a jurisdiction that had been
+          retired by `as_of`; the body carries `retired_at`, `retirement_reason` and
+          `superseded_by_jurisdiction_id`.
+        - `409 ambiguous_jurisdiction_code`: several jurisdictions in force answer to an
+          internal code (for example a country and a tax authority both coded `GB`); the
+          body lists `candidates`, and the caller narrows with `type`. The service does
+          not choose.
+      operationId: resolveJurisdiction
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string, maxLength: 64 }
+        - name: system
+          in: query
+          required: false
+          description: The code system. Omit for a jurisdiction's own code.
+          schema: { type: string, maxLength: 64 }
+        - name: type
+          in: query
+          required: false
+          description: Narrows an internal-code lookup to one jurisdiction_type.
+          schema: { type: string }
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The one jurisdiction the code meant at as_of.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodeResolution' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: More than one jurisdiction in force answers to the code.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "410":
+          description: The code resolves to a jurisdiction retired by as_of.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdiction-code-mappings:
+    get:
+      tags: [Jurisdictions]
+      summary: MapExternalJurisdictionCode, an external system's code to a jurisdiction (REF-01)
+      description: |
+        The same resolution as `GET /v1/jurisdiction-resolutions`, with the code system
+        required: map one system's code to the stable internal jurisdiction. The answer
+        names the mapping used (`alias`), including its source standard and version and
+        the rationale, so the mapping can be audited. The same four refusals apply.
+      operationId: mapExternalJurisdictionCode
+      parameters:
+        - name: system
+          in: query
+          required: true
+          description: The external code system, for example ISO3166-1-ALPHA3 or an ERP's own list.
+          schema: { type: string, maxLength: 64 }
+        - name: code
+          in: query
+          required: true
+          schema: { type: string, maxLength: 64 }
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The jurisdiction the code meant at as_of.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodeResolution' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "410":
+          description: The code resolves to a jurisdiction retired by as_of.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdictions/{jurisdiction_id}/aliases:
+    get:
+      tags: [Jurisdictions]
+      summary: The codes a jurisdiction is known by (REF-01)
+      description: |
+        Every mapping of an external code to this jurisdiction, oldest first, including
+        ended ones. With `as_of`, only those in force then. A retired jurisdiction's
+        mappings stay readable.
+      operationId: listJurisdictionAliases
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The mappings. Always an array, never null.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/JurisdictionAlias' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/admin/jurisdictions/{jurisdiction_id}/aliases:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: AmendJurisdictionAlias, record that a code means this jurisdiction (REF-01)
+      description: |
+        Maps `(alias_system, alias_code)` to this jurisdiction over
+        `[valid_from, valid_to)`, with the source standard, its version and the
+        rationale (all required: a mapping without its source cannot be audited). The
+        jurisdiction must be in force; a retired jurisdiction gets no new codes.
+
+        A code can mean only ONE jurisdiction at any instant, enforced by the database,
+        so a mapping that overlaps another meaning of the same code is
+        `409 alias_conflict`, also under concurrency. To move a code to another
+        jurisdiction, give `replaces_alias_id`: the old mapping of the same code is
+        ended at `valid_from` in the same transaction, and nothing is changed if the
+        new one cannot be recorded. ISO 3166 codes are checked against the standard's
+        format. Repeating an identical request answers `200` with the original and emits
+        nothing. Publishes `jurisdiction.updated` (`change_type` `ALIAS_ADDED`).
+      operationId: amendJurisdictionAlias
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AmendAliasRequest' }
+      responses:
+        "200":
+          description: An identical mapping already existed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionAlias' }
+        "201":
+          description: The mapping was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionAlias' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: The code already means a different jurisdiction (or the same one on different evidence) during part of that interval.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdictions/{jurisdiction_id}/aliases/{alias_id}/end:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: End a code mapping (REF-01)
+      description: |
+        Ends the mapping at `valid_to`, recording who ended it and why (`reason` is
+        required). The mapping is kept: what the code meant before `valid_to` stays
+        answerable. An end can only bring a mapping's end forward. Ending an already
+        ended mapping answers `200` with the original end and emits nothing. Publishes
+        `jurisdiction.updated` (`change_type` `ALIAS_ENDED`).
+      operationId: endJurisdictionAlias
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/JurisdictionID'
+        - name: alias_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EndAliasRequest' }
+      responses:
+        "200":
+          description: The mapping, ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionAlias' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
   # ── Rules (public read) ────────────────────────────────────────────────────
+
+  /v1/admin/jurisdiction-imports:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: ImportJurisdictionUpdate, propose an externally sourced update (REF-01)
+      description: |
+        Proposes an update from an external source (an ISO 3166 edition, a regulator's list) as a
+        batch of rows: `ADD` a jurisdiction, `UPDATE` one (name, authority type, or its parent) or
+        `RETIRE` one, optionally naming its successor. **Proposing changes nothing.** Every row is
+        checked against the registry as it is now and its errors are kept, row by row, so a whole
+        file's problems are reported at once. A batch with a bad row is stored and can be read, but
+        **cannot be approved**.
+
+        A row names a jurisdiction by `jurisdiction_id`, or by `code` and `type` together, never by
+        code alone, because one code can mean a country and a tax authority. A name that matches no
+        active jurisdiction, or more than one, is a row error: the registry does not choose. A row
+        may name, as its parent or successor, a jurisdiction that an earlier row of the same file adds.
+
+        `(source_standard, source_version)` is imported once. The same content again (compared by
+        the import hash of the normalised content, so padding and time zones do not matter) answers
+        `200` with the first batch; different content for the same version is `409
+        import_version_conflict`. A rejected batch frees its version.
+
+        Needs `JURISDICTION_IMPORT_PROPOSE`. The principal who proposes cannot approve.
+      operationId: importJurisdictionUpdate
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProposeImportRequest' }
+      responses:
+        "200":
+          description: This source version was already proposed with the same content.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "201":
+          description: Proposed. Read `invalid_count` and each row's `validation_errors` before asking for approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "409":
+          description: This source version was already proposed or imported with different content (`import_version_conflict`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+    get:
+      tags: [Admin, Jurisdictions]
+      summary: List jurisdiction import batches (REF-01)
+      description: Newest first, without rows. Read one batch for its rows. Needs `JURISDICTION_IMPORT_VIEW`.
+      operationId: listJurisdictionImports
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [PROPOSED, APPROVED, REJECTED] }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: The batches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [imports]
+                properties:
+                  imports:
+                    type: array
+                    items: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}:
+    get:
+      tags: [Admin, Jurisdictions]
+      summary: Get a jurisdiction import batch with its rows (REF-01)
+      description: |
+        The batch, every row as it was sent, each row's validation errors and, once approved, each
+        row's outcome and the jurisdiction it concerned. Needs `JURISDICTION_IMPORT_VIEW`.
+      operationId: getJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The batch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}/approve:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: Approve and apply a jurisdiction import (REF-01)
+      description: |
+        Approval by a principal **other than the proposer** (`403 segregation_of_duties`, also
+        enforced by a database constraint). A batch with a row that failed validation is
+        `422 import_has_invalid_rows`.
+
+        Approval applies every row, in order, **in one transaction: all rows or none.** If a row
+        cannot be applied (the registry moved on since the proposal, or two moves would together
+        make a cycle) nothing is applied, the batch stays `PROPOSED` and the answer is
+        `422 import_row_failed` naming the row. Hierarchy changes are serialised, so two imports
+        approved at once cannot leave a cycle. The registry history records each change against
+        the batch, its evidence and the row's effective date.
+
+        The response carries counts that add up to the number of rows. Publishes, in the same
+        transaction, `jurisdiction.created` for an add, `jurisdiction.deactivated` for a
+        retirement, `jurisdiction.hierarchy.changed` for a move (previous and new parent, and the
+        import) and `jurisdiction.updated` (`change_type` `ATTRIBUTES_CHANGED`, with the previous
+        and current values) for a changed name or authority type. A row that changed nothing
+        publishes nothing. Needs `JURISDICTION_IMPORT_APPROVE`.
+      operationId: approveJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecideImportRequest' }
+      responses:
+        "200":
+          description: Approved and applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: The batch was already decided (`import_already_decided`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "422":
+          description: A row failed validation (`import_has_invalid_rows`), or a row could not be applied and nothing was (`import_row_failed`, with `item_no` and `message`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdiction-imports/{batch_id}/reject:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: Reject a jurisdiction import (REF-01)
+      description: |
+        Rejects a proposed batch, with a `reason` (required). Nothing in the registry changes and
+        the source version can be proposed again. The proposer may reject (withdraw) their own
+        batch. Needs `JURISDICTION_IMPORT_APPROVE`.
+      operationId: rejectJurisdictionImport
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: batch_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecideImportRequest' }
+      responses:
+        "200":
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatch' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: The batch was already decided (`import_already_decided`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
   /v1/jurisdictions/{jurisdiction_id}/rules:
     get:
@@ -305,7 +814,7 @@ paths:
           description: "`missing_tenant` — no X-Tenant-Id."
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "503": { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/rules/{jurisdiction_rule_id}:
@@ -432,7 +941,7 @@ paths:
             `parent_jurisdiction_not_found` — the supplied parent does not exist.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "409":
           description: |
             `conflict` — the dedup key matches an existing jurisdiction with different
@@ -441,7 +950,7 @@ paths:
             its own ancestor, so create never returns it.)
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -455,6 +964,17 @@ paths:
         Publishes `jurisdiction.deactivated`.
       operationId: deactivateJurisdiction
       security: [{ principalHeader: [] }]
+      requestBody:
+        required: false
+        description: |
+          REF-01 RetireJurisdiction evidence, all optional: the reason, the source that
+          withdrew the jurisdiction and the active jurisdiction that takes over. The
+          retired jurisdiction stays readable as of any time it was in force
+          (`GET /v1/jurisdictions/{id}/as-of`) and is refused for anything new. A replay
+          of an already-retired jurisdiction changes nothing and keeps the original evidence.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetireJurisdictionRequest' }
       parameters:
         - $ref: '#/components/parameters/RequestID'
         - $ref: '#/components/parameters/TenantID'
@@ -469,6 +989,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Jurisdiction' }
+        "400": { $ref: '#/components/responses/BadRequest' }
         "401": { $ref: '#/components/responses/MissingPrincipal' }
         "403": { $ref: '#/components/responses/Forbidden' }
         "404": { $ref: '#/components/responses/NotFound' }
@@ -524,7 +1045,7 @@ paths:
             `jurisdiction_not_found` — the jurisdiction is unknown or has been deactivated.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "409":
           description: |
             `conflict` — dedup key matches an existing rule with a different payload,
@@ -534,7 +1055,7 @@ paths:
             the one the chain implies.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -591,7 +1112,7 @@ paths:
             rule's creator tried to activate it.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "404": { $ref: '#/components/responses/NotFound' }
         "409":
           description: |
@@ -600,12 +1121,12 @@ paths:
             with the same `rule_code`.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "412":
           description: "`precondition_failed` — If-Match named a row_version the rule no longer has."
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -653,7 +1174,7 @@ paths:
           description: "`precondition_failed` — If-Match named a row_version the rule no longer has."
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -788,7 +1309,7 @@ paths:
         "400": { $ref: '#/components/responses/BadRequest' }
         "401": { $ref: '#/components/responses/MissingPrincipal' }
         "403": { $ref: '#/components/responses/Forbidden' }
-        "409": { description: 'Same code, different name.' }
+        "409": { description: 'Same code, different name.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
   /v1/admin/sources:
     post:
       tags: [Admin, Registry]
@@ -808,8 +1329,8 @@ paths:
         "400": { $ref: '#/components/responses/BadRequest' }
         "401": { $ref: '#/components/responses/MissingPrincipal' }
         "403": { $ref: '#/components/responses/Forbidden' }
-        "404": { description: Unknown jurisdiction. }
-        "409": { description: Hash collision with different attributes. }
+        "404": { description: Unknown jurisdiction., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": { description: Hash collision with different attributes., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
   /v1/admin/sources/{source_id}/review:
     post:
       tags: [Admin, Registry]
@@ -818,7 +1339,7 @@ paths:
       operationId: reviewSource
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: source_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Reviewed (or the same reviewer replaying). }, "403": { $ref: '#/components/responses/Forbidden' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Already reviewed by someone else. } }
+      responses: { "200": { description: Reviewed (or the same reviewer replaying). }, "403": { $ref: '#/components/responses/Forbidden' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Already reviewed by someone else., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/sources/{source_id}/supersede:
     post:
       tags: [Admin, Registry]
@@ -827,7 +1348,7 @@ paths:
       operationId: supersedeSource
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: source_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Superseded. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Already superseded by another source. } }
+      responses: { "200": { description: Superseded. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Already superseded by another source., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/interpretations:
     post:
       tags: [Admin, Registry]
@@ -849,7 +1370,7 @@ paths:
       operationId: approveInterpretation
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: interpretation_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Approved (or the same approver replaying). }, "403": { $ref: '#/components/responses/Forbidden' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: 'Source not ready, or already approved by someone else.' } }
+      responses: { "200": { description: Approved (or the same approver replaying). }, "403": { $ref: '#/components/responses/Forbidden' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: 'Source not ready, or already approved by someone else.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/packs:
     post:
       tags: [Admin, Packs]
@@ -858,7 +1379,7 @@ paths:
       operationId: createPack
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Already existed. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Same ref, different attributes.' } }
+      responses: { "200": { description: Already existed. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Same ref, different attributes.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/packs/{pack_ref}/versions:
     post:
       tags: [Admin, Packs]
@@ -876,7 +1397,7 @@ paths:
       operationId: createPackVersion
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Identical version already drafted. }, "201": { description: Drafted. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Version collision or not newer. } }
+      responses: { "200": { description: Identical version already drafted. }, "201": { description: Drafted. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Version collision or not newer., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/submit-review:
     post:
       tags: [Admin, Packs]
@@ -892,7 +1413,7 @@ paths:
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
-      responses: { "200": { description: In REVIEW (or already was). }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Past DRAFT in another direction. } }
+      responses: { "200": { description: In REVIEW (or already was). }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Past DRAFT in another direction., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/rules/{jurisdiction_rule_id}/provenance:
     put:
       tags: [Admin, Registry]
@@ -906,7 +1427,7 @@ paths:
       operationId: setRuleProvenance
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/RuleID' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Provenance replaced. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: 'Rule not DRAFT, or interpretation not approved.' } }
+      responses: { "200": { description: Provenance replaced. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: 'Rule not DRAFT, or interpretation not approved.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   # ── ZS-JUR-001 Wave 1: compiler, signing, verification, trusted keys ───────
 
@@ -939,8 +1460,8 @@ paths:
         "200": { description: Identical artifact already compiled. }
         "201": { description: Compiled. }
         "404": { $ref: '#/components/responses/NotFound' }
-        "409": { description: 'Not under REVIEW, or inputs changed since the artifact was compiled.' }
-        "422": { description: Compile errors; the body carries the full report. }
+        "409": { description: 'Not under REVIEW, or inputs changed since the artifact was compiled.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: Compile errors; the body carries the full report., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/sign:
     post:
       tags: [Admin, Packs]
@@ -961,7 +1482,7 @@ paths:
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
-      responses: { "200": { description: Signed (or already signed). }, "404": { $ref: '#/components/responses/NotFound' }, "503": { description: Signing unavailable. } }
+      responses: { "200": { description: Signed (or already signed). }, "404": { $ref: '#/components/responses/NotFound' }, "503": { description: Signing unavailable., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/packs/{pack_ref}/versions/{version}/artifact:
     get:
       tags: [Packs]
@@ -991,7 +1512,7 @@ paths:
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
-      responses: { "200": { description: Verified. }, "409": { description: Not verified; reasons in body. } }
+      responses: { "200": { description: Verified. }, "409": { description: Not verified; reasons in body., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/pack-signing-keys:
     get: { tags: [Registry], summary: List trusted signing PUBLIC keys, operationId: listSigningKeys, responses: { "200": { description: Keys. } } }
   /v1/admin/pack-signing-keys:
@@ -1002,7 +1523,7 @@ paths:
       operationId: registerSigningKey
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Already registered. }, "201": { description: Registered. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: key_ref held by a different key. } }
+      responses: { "200": { description: Already registered. }, "201": { description: Registered. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: key_ref held by a different key., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/pack-signing-keys/{key_ref}/retire:
     post:
       tags: [Admin, Registry]
@@ -1011,7 +1532,7 @@ paths:
       operationId: retireSigningKey
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: key_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Retired (or already). }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Illegal status move. } }
+      responses: { "200": { description: Retired (or already). }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Illegal status move., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/pack-signing-keys/{key_ref}/revoke:
     post:
       tags: [Admin, Registry]
@@ -1043,7 +1564,7 @@ paths:
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
-      responses: { "200": { description: Identical to the latest revision. }, "201": { description: New revision. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not under REVIEW. } }
+      responses: { "200": { description: Identical to the latest revision. }, "201": { description: New revision. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not under REVIEW., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/packs/{pack_ref}/versions/{version}/test-bundle:
     get:
       tags: [Packs]
@@ -1052,7 +1573,7 @@ paths:
       parameters:
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
-      responses: { "200": { description: The bundle. }, "409": { description: No bundle submitted yet. } }
+      responses: { "200": { description: The bundle. }, "409": { description: No bundle submitted yet., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/test-runs:
     post:
       tags: [Admin, Packs]
@@ -1074,7 +1595,7 @@ paths:
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
-      responses: { "201": { description: Run recorded. }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Not under REVIEW or no bundle. } }
+      responses: { "201": { description: Run recorded. }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Not under REVIEW or no bundle., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/packs/{pack_ref}/versions/{version}/test-runs:
     get:
       tags: [Packs]
@@ -1104,7 +1625,7 @@ paths:
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
-      responses: { "201": { description: Review recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Not under REVIEW / not compiled. } }
+      responses: { "201": { description: Review recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Not under REVIEW / not compiled., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/packs/{pack_ref}/versions/{version}/reviews:
     get:
       tags: [Packs]
@@ -1137,7 +1658,7 @@ paths:
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
-      responses: { "200": { description: Already certified. }, "201": { description: Certified. }, "409": { description: 'certification_blocked, or not under REVIEW.' }, "503": { description: Signing unavailable. } }
+      responses: { "200": { description: Already certified. }, "201": { description: Certified. }, "409": { description: 'certification_blocked, or not under REVIEW.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: Signing unavailable., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/packs/{pack_ref}/versions/{version}/certification:
     get:
       tags: [Packs]
@@ -1192,10 +1713,10 @@ paths:
         "400": { $ref: '#/components/responses/BadRequest' }
         "401": { $ref: '#/components/responses/MissingPrincipal' }
         "403": { $ref: '#/components/responses/Forbidden' }
-        "404": { description: Pinned pack version not found. }
-        "409": { description: 'AMBIGUOUS, idempotency_conflict, or pinned_pack_not_eligible.' }
-        "422": { description: UNSUPPORTED_JURISDICTION. }
-        "503": { description: pack_unverified (fail closed) or authorization/store unavailable. }
+        "404": { description: Pinned pack version not found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": { description: 'AMBIGUOUS, idempotency_conflict, or pinned_pack_not_eligible.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: UNSUPPORTED_JURISDICTION., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { description: pack_unverified (fail closed) or authorization/store unavailable., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
   /v1/rule-decisions/{decision_id}:
     get:
       tags: [Resolver]
@@ -1236,7 +1757,7 @@ paths:
   /v1/deployment-regions:
     get: { tags: [Rollout], summary: List regions, operationId: listRegions, responses: { "200": { description: Regions. } } }
   /v1/admin/deployment-rings:
-    post: { tags: [Admin, Rollout], summary: Define a rollout ring (append-only), description: "Action DEPLOYMENT_RING_CREATE. Body: ring_code, ordinal (>=1, unique), min_soak_seconds (time a version must have been active in THIS ring before the next), description?. Same code with different values is 409.", operationId: createRing, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "409": { description: Conflicting definition. } } }
+    post: { tags: [Admin, Rollout], summary: Define a rollout ring (append-only), description: "Action DEPLOYMENT_RING_CREATE. Body: ring_code, ordinal (>=1, unique), min_soak_seconds (time a version must have been active in THIS ring before the next), description?. Same code with different values is 409.", operationId: createRing, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "409": { description: Conflicting definition., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/deployment-rings:
     get: { tags: [Rollout], summary: List rings in rollout order, operationId: listRings, responses: { "200": { description: Rings. } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/publish:
@@ -1246,26 +1767,106 @@ paths:
       description: |
         Action JURISDICTION_PACK_VERSION_PUBLISH. Re-verifies the artifact and certification (never trusting an
         earlier check), requires every registered-pack dependency to be RELEASED, and for a hotfix its rollback target
-        to be RELEASED. Optional body {evidence_ref}. RELEASED, WITHDRAWN and EMERGENCY_BLOCKED are reachable only
+        to be RELEASED, and (s10) that none of its rules or obligation rules collides with another released pack's over an overlapping period (cross_pack_conflict:
+        the resolver refuses any such overlap between packs). Optional body {evidence_ref}. RELEASED, WITHDRAWN and EMERGENCY_BLOCKED are reachable only
         through these commands (database-enforced). Publishing again is a no-op.
       operationId: publishPackVersion
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Released (changed=true) or already released. }, "409": { description: 'Not CERTIFIED, or operation_blocked.' } }
+      responses: { "200": { description: Released (changed=true) or already released. }, "409": { description: 'Not CERTIFIED, or operation_blocked.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/withdraw:
     post:
       tags: [Admin, Packs]
       summary: "Withdraw a version: no new use, history stays resolvable"
 
-      description: "Action JURISDICTION_PACK_VERSION_WITHDRAW. Body: reason AND evidence_ref are required. Refused while another RELEASED version depends on it. Rolls its ACTIVE deployments back with the reason."
+      description: "Action JURISDICTION_PACK_VERSION_WITHDRAW. Body: reason AND evidence_ref are required. Refused while another RELEASED version depends on it. Opens a remediation case for the decisions already made with it (remediation_case_id). Rolls its ACTIVE deployments back with the reason."
       operationId: withdrawPackVersion
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Withdrawn (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'In use by a released dependent, or wrong state.' } }
+      responses: { "200": { description: Withdrawn (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'In use by a released dependent, or wrong state.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/supersede:
+    post:
+      tags: [Admin, Packs]
+      summary: "Supersede a RELEASED version with a newer one (RELEASED to SUPERSEDED): history stays resolvable"
+      description: |
+        Action JURISDICTION_PACK_VERSION_SUPERSEDE (ZS-JUR-001 s23). Body: superseded_by (the newer version of the same pack) and reason are required; evidence_ref is optional.
+
+        A superseded version stays resolvable for pinned replay but is no longer eligible for NEW decisions, so it is refused (409 operation_blocked, every reason at once) unless
+        nothing it served is left without a servant: the newer version must be RELEASED, strictly later (numeric order), cover the older version's period, jurisdictions, rules and
+        obligations (not_carried_forward), and be ACTIVE in every ring and region where the older one is (newer_not_deployed). Recorded as a release event with the reason and the
+        replacing version; announced as jurisdiction-pack.superseded. Repeating it changes nothing.
+
+        HTTP: 200 superseded (changed=true) or already (changed=false); 400 superseded_by or reason missing; 404 no such version; 409 operation_blocked or invalid_lifecycle_state.
+      operationId: supersedePackVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Superseded (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: No such version. }, "409": { description: 'operation_blocked (reasons listed) or wrong state.' } }
+  /v1/admin/remediation-cases:
+    post:
+      tags: [Admin, Packs]
+      summary: Open a remediation case for decisions made with a pack version (withdrawals and rollbacks open one automatically)
+      description: |
+        Action REMEDIATION_CASE_OPEN (ZS-JUR-001 s23, s31, JUR-NEG-19). Body: pack_ref, version, reason (required); ring?, region?, evidence_ref?. Snapshots the decisions made with the
+        version (in that ring and region when given) into a case. Returns the case already open for the same version and scope instead of a second one. HTTP: 201 opened; 200 already open;
+        409 nothing_to_remediate (no decision was made with the version in that scope); 404 no such version; 400 missing field. Announced as jurisdiction-remediation.opened.
+      operationId: openRemediationCase
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: A case was already open. }, "201": { description: Opened. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: No such version. }, "409": { description: nothing_to_remediate. } }
+    get:
+      tags: [Admin, Packs]
+      summary: List remediation cases (newest first; ?status=OPEN|CLOSED)
+      description: Action REMEDIATION_CASE_VIEW. Paged (limit default 50, maximum 200).
+      operationId: listRemediationCases
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Cases. }, "400": { $ref: '#/components/responses/BadRequest' } }
+  /v1/admin/remediation-cases/{case_id}:
+    get:
+      tags: [Admin, Packs]
+      summary: Read a remediation case with its progress (total, dispositioned, pending, by disposition)
+      description: Action REMEDIATION_CASE_VIEW.
+      operationId: getRemediationCase
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: case_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: The case. }, "404": { description: No such case. } }
+  /v1/admin/remediation-cases/{case_id}/decisions:
+    get:
+      tags: [Admin, Packs]
+      summary: List the decisions of a case with their dispositions (?pending=true for those still to do)
+      description: Action REMEDIATION_CASE_VIEW. Paged (limit default 100, maximum 500). The decisions are the recorded evidence ledger rows; they are never changed.
+      operationId: listRemediationDecisions
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: case_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Decisions. }, "404": { description: No such case. } }
+  /v1/admin/remediation-cases/{case_id}/dispositions:
+    post:
+      tags: [Admin, Packs]
+      summary: Record what was done about decisions of an open case (1 to 100, all or nothing)
+      description: |
+        Action REMEDIATION_CASE_DISPOSE. Body: dispositions [{decision_id, disposition, evidence_ref, note?, new_decision_id?}]. disposition is RECONFIRMED (re-checked and stands), NOT_AFFECTED,
+        RECALCULATED or SUPERSEDED_BY_NEW_DECISION (the last two name new_decision_id, a decision made with a DIFFERENT pack version than the one under remediation). evidence_ref is required.
+        Repeating an identical disposition is a replay; a different one for the same decision is refused, because dispositions are final.
+        HTTP: 200 {recorded, replayed}; 400 invalid disposition; 404 no such case; 409 case closed or disposition_differs; 422 decision_not_in_case or remediation_refused.
+      operationId: recordRemediationDispositions
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: case_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: No such case. }, "409": { description: Closed or different disposition. }, "422": { description: Refused. } }
+  /v1/admin/remediation-cases/{case_id}/close:
+    post:
+      tags: [Admin, Packs]
+      summary: Close a remediation case once every decision has a disposition
+      description: |
+        Action REMEDIATION_CASE_CLOSE. Body: note (required). Refused while any decision has no disposition (409 operation_blocked) and for the person who opened the case (403): segregation of
+        duties, also enforced by the database. Closing a closed case changes nothing (changed=false). Announced as jurisdiction-remediation.closed.
+      operationId: closeRemediationCase
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: case_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Closed (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: The opener cannot close their own case. }, "404": { description: No such case. }, "409": { description: operation_blocked (decisions pending). } }
   /v1/admin/packs/{pack_ref}/versions/{version}/block:
-    post: { tags: [Admin, Packs], summary: Emergency stop (RELEASED to EMERGENCY_BLOCKED), description: "Action JURISDICTION_PACK_VERSION_BLOCK. Body: reason (required). The resolver stops using it within its cache TTL.", operationId: blockPackVersion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Blocked. }, "409": { description: Not RELEASED. } } }
+    post: { tags: [Admin, Packs], summary: Emergency stop (RELEASED to EMERGENCY_BLOCKED), description: "Action JURISDICTION_PACK_VERSION_BLOCK. Body: reason (required). The resolver stops using it within its cache TTL.", operationId: blockPackVersion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Blocked. }, "409": { description: Not RELEASED., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/unblock:
-    post: { tags: [Admin, Packs], summary: Return a blocked version to RELEASED after incident review, description: "Action JURISDICTION_PACK_VERSION_UNBLOCK. Body: reason (required). Re-verifies the version first.", operationId: unblockPackVersion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Released again. }, "409": { description: 'Not blocked, or unverified.' } } }
+    post: { tags: [Admin, Packs], summary: Return a blocked version to RELEASED after incident review, description: "Action JURISDICTION_PACK_VERSION_UNBLOCK. Body: reason (required). Re-verifies the version first.", operationId: unblockPackVersion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Released again. }, "409": { description: 'Not blocked, or unverified.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/deploy:
     post:
       tags: [Admin, Packs]
@@ -1281,7 +1882,7 @@ paths:
       operationId: deployPackVersion
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Already active there. }, "201": { description: Deployed. }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: operation_blocked or not RELEASED. } }
+      responses: { "200": { description: Already active there. }, "201": { description: Deployed. }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: operation_blocked or not RELEASED., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/rollback:
     post:
       tags: [Admin, Packs]
@@ -1290,12 +1891,12 @@ paths:
         Action JURISDICTION_PACK_VERSION_ROLLBACK. Body: ring, region, restore_version, reason (all required). The restore
         version must be the same pack, strictly older, RELEASED, re-verify, and have been deployed in that scope before.
         Rollback changes FUTURE resolution only (JUR-NEG-19): the response counts the decisions already made with the
-        rolled-back version in that scope, states that remediating them is a separate workflow (not built), and states that
+        rolled-back version in that scope, opens a remediation case for them in the same transaction (remediation_case_id; see /v1/admin/remediation-cases), and states that
         no reconciliation was performed.
       operationId: rollbackDeployment
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Rolled back and restored. }, "404": { description: No active deployment of that version there. }, "409": { description: operation_blocked. } }
+      responses: { "200": { description: Rolled back and restored. }, "404": { description: No active deployment of that version there., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "409": { description: operation_blocked., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/packs/{pack_ref}/versions/{version}/deployments:
     get: { tags: [Rollout], summary: Deployment history of a version, operationId: listDeployments, parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }], responses: { "200": { description: Deployments. } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/hotfix:
@@ -1310,7 +1911,7 @@ paths:
       operationId: declareHotfix
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Identical declaration already exists. }, "201": { description: Declared. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Different declaration exists, wrong state, or invalid rollback target.' } }
+      responses: { "200": { description: Identical declaration already exists. }, "201": { description: Declared. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Different declaration exists, wrong state, or invalid rollback target.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/packs/{pack_ref}/versions/{version}/hotfix:
     get: { tags: [Packs], summary: The hotfix record of a version, operationId: getHotfix, parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The hotfix. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/hotfix/retrospective:
@@ -1333,9 +1934,9 @@ paths:
   /v1/source-change-notices/{notice_id}:
     get: { tags: [SourceChange], summary: Get a notice, operationId: getNotice, parameters: [{ name: notice_id, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The notice. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/source-change-notices/{notice_id}/review:
-    post: { tags: [Admin, SourceChange], summary: Take the notice for independent review, description: "Action SOURCE_CHANGE_NOTICE_REVIEW. The reviewer must differ from the author (403 segregation_of_duties).", operationId: startNoticeReview, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Under review. }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Already reviewed by someone else. } } }
+    post: { tags: [Admin, SourceChange], summary: Take the notice for independent review, description: "Action SOURCE_CHANGE_NOTICE_REVIEW. The reviewer must differ from the author (403 segregation_of_duties).", operationId: startNoticeReview, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Under review. }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Already reviewed by someone else., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/admin/source-change-notices/{notice_id}/close:
-    post: { tags: [Admin, SourceChange], summary: Close with a conclusion, description: "Action SOURCE_CHANGE_NOTICE_CLOSE. Only the assigned reviewer may close. Body: outcome (NO_CHANGE|INTERPRETATION_RECORDED|RULE_CHANGE_PLANNED|CAPABILITY_BLOCKED), note, linked_interpretation_id (required, and must be APPROVED, for INTERPRETATION_RECORDED). Changes no rule or pack.", operationId: closeNotice, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Closed (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Different conclusion already recorded. } } }
+    post: { tags: [Admin, SourceChange], summary: Close with a conclusion, description: "Action SOURCE_CHANGE_NOTICE_CLOSE. Only the assigned reviewer may close. Body: outcome (NO_CHANGE|INTERPRETATION_RECORDED|RULE_CHANGE_PLANNED|CAPABILITY_BLOCKED), note, linked_interpretation_id (required, and must be APPROVED, for INTERPRETATION_RECORDED). Changes no rule or pack.", operationId: closeNotice, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Closed (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Different conclusion already recorded., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/ops/metrics:
     get:
       tags: [Ops]
@@ -1358,7 +1959,7 @@ paths:
   # runtime only inside signed, certified, released packs (manifest fields calendar_modules and obligation_modules).
 
   /v1/admin/calendars:
-    post: { tags: [Admin, Calendar], summary: Register an authority calendar, description: "Action REGULATORY_CALENDAR_CREATE. Body: calendar_code (lowercase), jurisdiction_id, authority, description?. Same code with different jurisdiction or authority is 409.", operationId: createCalendar, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Conflicting definition. } } }
+    post: { tags: [Admin, Calendar], summary: Register an authority calendar, description: "Action REGULATORY_CALENDAR_CREATE. Body: calendar_code (lowercase), jurisdiction_id, authority, description?. Same code with different jurisdiction or authority is 409.", operationId: createCalendar, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Conflicting definition., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/calendars:
     get: { tags: [Calendar], summary: List calendars, operationId: listCalendars, responses: { "200": { description: Calendars. } } }
   /v1/calendars/{calendar_code}:
@@ -1380,7 +1981,7 @@ paths:
   /v1/calendars/{calendar_code}/versions/{version}:
     get: { tags: [Calendar], summary: One calendar version, operationId: getCalendarVersion, parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }], responses: { "200": { description: The version. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/calendars/{calendar_code}/versions/{version}/sources:
-    put: { tags: [Admin, Calendar], summary: Replace the official sources of a DRAFT version, description: "Action REGULATORY_CALENDAR_VERSION_SET_SOURCES. Body: source_ids[]. 409 not_draft once published.", operationId: setCalendarVersionSources, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Sources set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not DRAFT. } } }
+    put: { tags: [Admin, Calendar], summary: Replace the official sources of a DRAFT version, description: "Action REGULATORY_CALENDAR_VERSION_SET_SOURCES. Body: source_ids[]. 409 not_draft once published.", operationId: setCalendarVersionSources, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Sources set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not DRAFT., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/admin/calendars/{calendar_code}/versions/{version}/publish:
     post:
       tags: [Admin, Calendar]
@@ -1388,11 +1989,302 @@ paths:
       description: |
         Action REGULATORY_CALENDAR_VERSION_PUBLISH. The publisher must differ from the author (403 segregation_of_duties,
         also a database check); the version must cite at least one reviewed, non-superseded source (409 source_not_ready).
-        Emits jurisdiction.calendar.changed. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
+        Emits jurisdiction.calendar.changed, business-calendar.updated and a holiday-occurrence.changed for each holiday it adds, removes or changes against the previous published version. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
       operationId: publishCalendarVersion
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready. } }
+      responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
+  /v1/admin/calendars/{calendar_code}/imports:
+    post:
+      tags: [Admin, Calendar]
+      summary: ImportHolidayCalendar, import an authority's holiday list as a draft version (REF-10)
+      description: |
+        Action REGULATORY_CALENDAR_VERSION_CREATE. Drafts the next version of the calendar from a holiday list, with the
+        evidence of where it came from: `source_authority`, `source_reference` and the authority's own `source_version`
+        (all required), and a content hash computed here. Body also as for a calendar version (`effective_from`,
+        `timezone`, `weekend_days`, `cutoff_time?`, `holidays`) and optional `source_ids` citing registered regulatory
+        sources, which publishing requires.
+
+        Each holiday may carry an `observed_rule` (`NONE`, `WEEKEND_TO_NEXT_WEEKDAY`, `WEEKEND_TO_PREVIOUS_WEEKDAY`,
+        `WEEKEND_TO_NEAREST_WEEKDAY`) saying how it is observed when it falls on a weekend. Its observed date is worked out
+        here from the rule and the calendar's own weekend, never taken from the caller, and business-day arithmetic uses it.
+
+        One source version is imported once per calendar: the same edition with the same content again answers `200` with
+        the first version; the same edition with different content is `409 calendar_import_conflict`. The draft is then
+        published by a different principal, as any calendar version is.
+      operationId: importHolidayCalendar
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportCalendarRequest' }
+      responses:
+        "201": { description: Drafted as the next version. }
+        "200": { description: This source version was already imported with the same content. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: This source version was already imported with different content (calendar_import_conflict)., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/calendars/{calendar_code}/is-business-day:
+    get:
+      tags: [Calendar]
+      summary: IsBusinessDay (REF-10)
+      description: |
+        Whether `date` is a business day of the calendar, and if not why (`WEEKEND`, or `HOLIDAY` with its name; a holiday
+        is non-business on the date it is observed). Deterministic, and it says which calendar version answered, with its
+        content digest and the evidence of its import.
+
+        Only published versions answer. Without `calendar_version` it is the highest version effective on or before the date
+        and published at `known_at` (default now), so a correction published later does not change what a past date was
+        answered with as it was known then. With `calendar_version` it is that version exactly, to reproduce an earlier answer.
+      operationId: isBusinessDay
+      parameters:
+        - { name: calendar_code, in: path, required: true, schema: { type: string } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The answer and the calendar version that gave it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BusinessDayCheck' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/calendars/{calendar_code}/add-business-days:
+    get:
+      tags: [Calendar]
+      summary: AddBusinessDays (REF-10)
+      description: |
+        Moves `days` business days from `date` (negative moves back, at most 1000). The start date is never counted, so one
+        business day from a Friday or from a Saturday is the Monday. The days passed over are returned with their reasons.
+
+        One calendar version, the one governing the start date, answers the whole calculation: a shift that crosses the
+        start of a later version does not change calendars halfway. `known_at` and `calendar_version` are as for
+        `is-business-day`.
+      operationId: addBusinessDays
+      parameters:
+        - { name: calendar_code, in: path, required: true, schema: { type: string } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: days, in: query, required: true, schema: { type: integer, minimum: -1000, maximum: 1000 } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The result date, what was skipped, and the calendar version that gave it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AddBusinessDaysResult' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: Register a payment term (REF-10)
+      description: |
+        Action PAYMENT_TERM_CREATE. Registers a term by its code (upper-case, such as `NET30` or `EOM45`), its name and,
+        optionally, the jurisdiction it is specific to. The rule lives on its versions. The same code with the same name and
+        jurisdiction answers `200`; the same code naming a different term is `409`.
+      operationId: createPaymentTerm
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePaymentTermRequest' }
+      responses:
+        "201": { description: Registered. }
+        "200": { description: An identical term already exists. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "409": { description: The code names a different term., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms/{term_code}/versions:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: Draft the next version of a payment term (REF-10)
+      description: |
+        Action PAYMENT_TERM_CREATE. Drafts a version: how the due date is worked out (`basis_date_rule`, `due_method`,
+        `due_days` or `due_day_of_month`), the `business_day_convention` and the `calendar_code` it is applied by, `grace_days`,
+        an optional early-payment discount, and a `rationale`. Every problem is reported at once (`400`, with `problems`). A term
+        beyond 90 days of credit must say it changes controlled credit policy (`controlled_credit`). The version number, the
+        formula in words and the content digest are assigned by the service. A version is immutable once drafted; a change is a
+        new version.
+      operationId: createPaymentTermVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: term_code, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentTermVersionInput' }
+      responses:
+        "201": { description: Drafted., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTermVersion' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms/{term_code}/versions/{version}/approve:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: ApprovePaymentTerm (REF-10)
+      description: |
+        Action PAYMENT_TERM_APPROVE. Approves a DRAFT, which puts it in force from its `effective_from`. **The author cannot
+        approve their own version** (`403 segregation_of_duties`, also a database check). Approving over another approved
+        version that governs any of its period is `409 supersession_required`: replacing a term in force is stated, with
+        `supersede`. A version applied by a calendar needs that calendar to have a published version (`409 calendar_not_ready`).
+        Repeating it answers `200`. Publishes `payment-term.activated`.
+      operationId: approvePaymentTerm
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: term_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      responses:
+        "200": { description: Approved (or already)., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTermVersion' } } } }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: Not a draft; supersession_required; or calendar_not_ready., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms/{term_code}/versions/{version}/supersede:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: SupersedePaymentTerm (REF-10)
+      description: |
+        Action PAYMENT_TERM_SUPERSEDE. Approves a DRAFT over the ACTIVE version named in `supersedes_version`, in one
+        transaction. The replaced version stops governing on the new version's `effective_from`, so every date before it keeps
+        the replaced version's rule and due dates already worked out are not changed. The version named must be this term's
+        active version, and the new one must start after it (`409 invalid_supersession`). The author cannot do it. Publishes
+        `payment-term.superseded` for the replaced version and `payment-term.activated` for the new one.
+      operationId: supersedePaymentTerm
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: term_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SupersedeTermRequest' }
+      responses:
+        "200": { description: Superseded (or already)., content: { application/json: { schema: { $ref: '#/components/schemas/SupersedeTermResult' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: Not a draft; not active; invalid_supersession; or calendar_not_ready., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/admin/payment-terms/{term_code}/versions/{version}/retire:
+    post:
+      tags: [Admin, PaymentTerm]
+      summary: RetirePaymentTerm (REF-10)
+      description: |
+        Action PAYMENT_TERM_RETIRE. A draft is withdrawn. An active version stops governing on `ends_on` (default today, which
+        must be after its `effective_from`), so the dates before it keep its rule. A `reason` is required. A superseded
+        version is already over (`409`). Repeating it answers `200`. Publishes `payment-term.retired`.
+      operationId: retirePaymentTerm
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: term_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetireTermRequest' }
+      responses:
+        "200": { description: Retired (or already)., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTermVersion' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: The version is superseded., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}:
+    get:
+      tags: [PaymentTerm]
+      summary: GetPaymentTerm (REF-10)
+      operationId: getPaymentTerm
+      parameters: [{ name: term_code, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: The term., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTerm' } } } }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}/versions:
+    get:
+      tags: [PaymentTerm]
+      summary: List the versions of a payment term, oldest first (REF-10)
+      operationId: listPaymentTermVersions
+      parameters: [{ name: term_code, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: The versions. }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}/versions/{version}:
+    get:
+      tags: [PaymentTerm]
+      summary: One version of a payment term (REF-10)
+      operationId: getPaymentTermVersion
+      parameters: [{ name: term_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { description: The version., content: { application/json: { schema: { $ref: '#/components/schemas/PaymentTermVersion' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}/due-date:
+    get:
+      tags: [PaymentTerm]
+      summary: CalculateDueDate (REF-10)
+      description: |
+        The due date for an invoice, and what it was worked out by: the **term version**, the **calendar version**, the **basis
+        date** and the **adjustment convention** (the answer's `term`, `calendar`, `basis_date` and `adjustment_convention`).
+
+        The term version is the approved one in force on `invoice_date` (which is therefore required) and already approved at
+        `known_at` (default now). A term that counts from the receipt or delivery date needs `receipt_date` or `delivery_date`
+        (`400 basis_date_required`). The calendar version is the published one governing the date the due date lands on, before
+        any adjustment.
+
+        **Historical due dates are never silently recalculated.** A version superseded or retired later, or a calendar amended
+        later, does not change an answer asked as it was known then (`known_at`), and either version can be pinned
+        (`term_version`, `calendar_version`) to reproduce an earlier answer exactly. Deterministic: the same inputs always give
+        the same answer.
+      operationId: calculateDueDate
+      parameters:
+        - { name: term_code, in: path, required: true, schema: { type: string } }
+        - { name: invoice_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: receipt_date, in: query, required: false, schema: { type: string, format: date } }
+        - { name: delivery_date, in: query, required: false, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: term_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200": { description: The due date and its provenance., content: { application/json: { schema: { $ref: '#/components/schemas/DueDateResult' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+  /v1/payment-terms/{term_code}/explain-due-date:
+    get:
+      tags: [PaymentTerm]
+      summary: ExplainDueDate (REF-10)
+      description: |
+        The due date as `due-date` gives it, with `steps`, how it was worked out, in order. The explanation is the executed calculation, never written separately. Same parameters.
+      operationId: explainDueDate
+      parameters:
+        - { name: term_code, in: path, required: true, schema: { type: string } }
+        - { name: invoice_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: receipt_date, in: query, required: false, schema: { type: string, format: date } }
+        - { name: delivery_date, in: query, required: false, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: term_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: calendar_version, in: query, required: false, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200": { description: "The due date, its provenance and the steps.", content: { application/json: { schema: { $ref: '#/components/schemas/DueDateResult' } } } }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
   /v1/admin/obligation-rules:
     post:
       tags: [Admin, Obligations]
@@ -1415,9 +2307,9 @@ paths:
   /v1/obligation-rules/{obligation_rule_id}:
     get: { tags: [Obligations], summary: Get an obligation rule, operationId: getObligationRule, parameters: [{ name: obligation_rule_id, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The rule. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/obligation-rules/{obligation_rule_id}/provenance:
-    put: { tags: [Admin, Obligations], summary: 'Set regime, interpretation and sources of a DRAFT rule', description: "Action OBLIGATION_RULE_SET_PROVENANCE. Body: regime_id, interpretation_id (must be APPROVED, in the rule's jurisdiction or an ancestor), source_ids[]. Full replacement.", operationId: setObligationProvenance, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Not DRAFT, or interpretation not approved.' } } }
+    put: { tags: [Admin, Obligations], summary: 'Set regime, interpretation and sources of a DRAFT rule', description: "Action OBLIGATION_RULE_SET_PROVENANCE. Body: regime_id, interpretation_id (must be APPROVED, in the rule's jurisdiction or an ancestor), source_ids[]. Full replacement.", operationId: setObligationProvenance, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Not DRAFT, or interpretation not approved.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/admin/obligation-rules/{obligation_rule_id}/publish:
-    post: { tags: [Admin, Obligations], summary: Publish (freeze) an obligation rule, description: "Action OBLIGATION_RULE_PUBLISH. Publisher must differ from the author (403). Needs regime, an APPROVED interpretation, reviewed non-superseded sources, and an existing calendar when one is named.", operationId: publishObligationRule, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready or interpretation_not_approved. } } }
+    post: { tags: [Admin, Obligations], summary: Publish (freeze) an obligation rule, description: "Action OBLIGATION_RULE_PUBLISH. Publisher must differ from the author (403). Needs regime, an APPROVED interpretation, reviewed non-superseded sources, and an existing calendar when one is named.", operationId: publishObligationRule, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready or interpretation_not_approved., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/obligation-calculations:calculate:
     post:
       tags: [Resolver]
@@ -1439,7 +2331,7 @@ paths:
       operationId: calculateObligation
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: 'Calculated, or no obligation rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'AMBIGUOUS, NO_CALENDAR or idempotency_conflict.' }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+      responses: { "200": { description: 'Calculated, or no obligation rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'AMBIGUOUS, NO_CALENDAR or idempotency_conflict.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "422": { description: Explicit refusal., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: pack_unverified., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   # ── ZS-JUR-001 Wave 4 (tax half): rule parameters and regulatory calculation ──
   # DECISION: ZS-JUR-001 governs. Rates, thresholds and rounding live in a rule's typed `parameters`, frozen with the rule and
@@ -1461,7 +2353,7 @@ paths:
       operationId: setRuleParameters
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/RuleID' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Set (or cleared). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Not DRAFT. } }
+      responses: { "200": { description: Set (or cleared). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Not DRAFT., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
   /v1/rules/{jurisdiction_rule_id}/parameters:
     get: { tags: [Rules], summary: A rule's typed calculation parameters (null when none), operationId: getRuleParameters, parameters: [{ $ref: '#/components/parameters/RuleID' }], responses: { "200": { description: The parameters. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/regulatory-calculations:execute:
@@ -1489,7 +2381,7 @@ paths:
       operationId: executeCalculation
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: 'Calculated, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+      responses: { "200": { description: 'Calculated, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "422": { description: Explicit refusal., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: pack_unverified., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/payroll-statutory-parameters:resolve:
     post:
@@ -1508,7 +2400,7 @@ paths:
       operationId: resolvePayrollParameters
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: 'Parameter set, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: UNSUPPORTED_JURISDICTION. }, "503": { description: pack_unverified. } }
+      responses: { "200": { description: 'Parameter set, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "422": { description: UNSUPPORTED_JURISDICTION., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: pack_unverified., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/retention-rules:resolve:
     post:
@@ -1528,7 +2420,7 @@ paths:
       operationId: resolveRetention
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: 'Retention determined, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+      responses: { "200": { description: 'Retention determined, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "422": { description: Explicit refusal., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: pack_unverified., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/accounting-mappings:resolve:
     post:
@@ -1545,7 +2437,129 @@ paths:
       operationId: resolveAccountingMapping
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: 'Mapping resolved, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+      responses: { "200": { description: 'Mapping resolved, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "422": { description: Explicit refusal., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: pack_unverified., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
+
+  /v1/jurisdiction-decisions:resolve:
+    post:
+      tags: [Resolver]
+      summary: Determine which jurisdiction applies to a legal entity (a claimed jurisdiction never widens the authorised set)
+      description: |
+        Action JURISDICTION_DECISION_RESOLVE (ZS-JUR-001 s9, s25). Headers: X-Tenant-Id (required: assignments are tenant data), Idempotency-Key?. Body: legal_entity_id,
+        purpose (TAX, FILING or ANY), effective_at (RFC 3339), claimed_jurisdiction? (a jurisdiction code).
+
+        The decision rests on the entity's authorised assignments, projected from tenant-entity-registry-svc, in force at effective_at and relevant to the purpose
+        (TAX: ENTITY_PRIMARY, PRIMARY, SECONDARY, TAX_ONLY; FILING: ENTITY_PRIMARY, PRIMARY, SECONDARY, FILING_ONLY). A claimed jurisdiction is an input fact: it can select
+        among jurisdictions the entity is authorised for and can never add one (JUR-NEG-05), and it is never used when nothing is authorised. Each candidate carries its rollout
+        support answer (SUPPORTED, NOT_YET_SUPPORTED, SUSPENDED, NO_RELEASED_PACK or NO_ROLLOUT) and the assignment records it rests on.
+
+        This does NOT decide place of supply, situs or any transaction-level question (no such rules exist yet). The route exists only where the entity projection is wired.
+        Recorded as evidence (decision_kind JURISDICTION); the platform-wide ledger holds a digest of tenant and entity, never their ids. Announced as jurisdiction-decision.resolved.
+
+        HTTP: 200 JURISDICTION_DETERMINED; 409 AMBIGUOUS_JURISDICTION (several authorised and nothing selects between them) or idempotency_conflict;
+        422 NO_APPLICABLE_JURISDICTION or CLAIM_NOT_AUTHORISED; 401 no X-Tenant-Id; 503 store unavailable.
+      operationId: resolveJurisdictionDecision
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Jurisdiction determined.' }, "400": { $ref: '#/components/responses/BadRequest' }, "401": { description: X-Tenant-Id missing. }, "409": { description: AMBIGUOUS_JURISDICTION or idempotency_conflict. }, "422": { description: NO_APPLICABLE_JURISDICTION or CLAIM_NOT_AUTHORISED. }, "503": { description: Store unavailable. } }
+
+  /v1/registration-obligations:resolve:
+    post:
+      tags: [Resolver]
+      summary: List the obligations that apply for an entity's registrations and derive each due date
+      description: |
+        Action REGISTRATION_OBLIGATION_RESOLVE (ZS-JUR-001 s15, s16). Header Idempotency-Key?. Body: jurisdiction, as_of (YYYY-MM-DD), registrations (1 to 25 of
+        {registration_code, registration_date, deregistration_date?}), facts? (the period facts obligations anchor on: period_end, event_date, anniversary_date with
+        anchor_year, extension_days with extension_evidence_ref), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        A registration is in force on as_of when it started on or before it and has not ended (the deregistration date is the first day it no longer applies). For each
+        registration in force, the registration TYPE rule (registration.obligations) names the obligation codes it brings, and each due date is derived by the same engine as
+        POST /v1/obligation-calculations:calculate with registration_date set from the registration. Per obligation the answer is DUE_DATE_CALCULATED with the full derivation,
+        or the reason there is none (NO_OBLIGATION_RULE, INVALID_FACTS, AMBIGUOUS, ...), with a reason when the cause is missing period facts. A registration that is not in force, or whose
+        type is unknown, brings nothing and says so. Nothing is assumed.
+
+        The caller sends type codes and dates, never a registration number; nothing is stored about the registration. Tracking each obligation (status, overdue, filing) belongs to
+        obligations-svc. Recorded as evidence (decision_kind APPLICABILITY).
+
+        HTTP: 200 APPLICABILITY_RESOLVED (per-item outcomes are inside); 400 invalid request; 409 idempotency_conflict; 503 pack_unverified.
+      operationId: resolveRegistrationObligations
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Applicability resolved.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: idempotency_conflict. }, "503": { description: pack_unverified. } }
+
+  /v1/registration-identifiers:validate:
+    post:
+      tags: [Resolver]
+      summary: Check a registration identifier's format against the registration type in force (never stores the identifier)
+      description: |
+        Action REGISTRATION_IDENTIFIER_VALIDATE (ZS-JUR-001 s16). Body: jurisdiction, registration_code, identifier, as_of (YYYY-MM-DD; the rule in force
+        that day applies), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        A FORMAT check only: whether the number is actually registered is for the authority to confirm. The identifier is normalised as the rule declares
+        (NONE, UPPER, UPPER_STRIP_SEPARATORS) and matched with a linear-time pattern. The response and the evidence ledger hold a sha256 digest of the
+        normalised identifier, never the identifier. Returns the registration kind, authority, evidence_required and threshold_monitor the type names.
+        Recorded as evidence (decision_kind REGISTRATION).
+
+        HTTP: 200 IDENTIFIER_VALID, IDENTIFIER_INVALID or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION or NO_PARAMETERS; 503 pack_unverified.
+      operationId: validateRegistrationIdentifier
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Identifier checked, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/licences:evaluate:
+    post:
+      tags: [Resolver]
+      summary: Derive a licence's validity window and status as of a date
+      description: |
+        Action LICENCE_EVALUATE (ZS-JUR-001 s16). Body: jurisdiction, licence_code, issue_date, expiry_date? (the last valid day as printed on the licence;
+        optional when the type has a fixed term), as_of (all YYYY-MM-DD), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        Returns valid_until, renewal_window_opens, grace_ends_on, days_to_expiry and a status: NOT_YET_VALID, ACTIVE, RENEWAL_WINDOW, IN_GRACE or EXPIRED. A derived
+        expiry is the day before the term anniversary; a stated expiry beyond the type's maximum term is refused (LICENCE_TERM_EXCEEDED), not trusted.
+        Recorded as evidence (decision_kind LICENCE).
+
+        HTTP: 200 LICENCE_EVALUATED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, INVALID_FACTS, LICENCE_TERM_EXCEEDED or NO_PARAMETERS; 503 pack_unverified.
+      operationId: evaluateLicence
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Licence evaluated, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/scheme-elections:evaluate:
+    post:
+      tags: [Resolver]
+      summary: Check scheme eligibility and the earliest cancellation date (records no election)
+      description: |
+        Action SCHEME_ELECTION_EVALUATE (ZS-JUR-001 s16). Body: jurisdiction, scheme_code, metric_value (a non-negative decimal string, such as "120000"), start_date,
+        cancel_date? (when a cancellation would be asked for), as_of (all YYYY-MM-DD), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        Eligibility is one exact comparison of the metric to the scheme's threshold (LT, LTE, GT or GTE). With a lock-in, an election is locked in until start_date plus
+        the lock-in; a cancellation takes effect at the later of cancel_date plus the notice period and the lock-in end (deferred_by_lock_in tells the caller which).
+        This service records no election: that is a tenant tax fact owned by the Tax domain. Recorded as evidence (decision_kind SCHEME).
+
+        HTTP: 200 SCHEME_ELIGIBLE, SCHEME_NOT_ELIGIBLE or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, INVALID_FACTS or NO_PARAMETERS; 503 pack_unverified.
+      operationId: evaluateSchemeElection
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Eligibility decided, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/threshold-monitors:evaluate:
+    post:
+      tags: [Resolver]
+      summary: Evaluate dated observations against a threshold monitor; returns the breach and effective dates
+      description: |
+        Action THRESHOLD_MONITOR_EVALUATE (ZS-JUR-001 s16). Body: jurisdiction, monitor_code, as_of (YYYY-MM-DD), observations ([{date, amount}], at most 5000; amounts are
+        non-negative decimal strings), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        The period is STATIC (a yearly start such as 1 April) or ROLLING (the last N months, (as_of minus N months, as_of]). Amounts are summed exactly (never floating point)
+        and compared with GT or GTE. Observations dated after as_of are ignored, so a re-run for an earlier date reproduces the earlier answer. A breach reports the first date
+        the threshold was met and when it takes effect (IMMEDIATE, NEXT_PERIOD_START, DAYS_AFTER or END_OF_MONTH_FOLLOWING). For a REGISTRATION_REQUIRED breach,
+        registration_effective_date is the value to pass to the obligation engine as its registration_date fact. A monitor never registers anyone.
+        Recorded as evidence (decision_kind THRESHOLD).
+
+        HTTP: 200 THRESHOLD_EVALUATED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, INVALID_FACTS or NO_PARAMETERS; 503 pack_unverified.
+      operationId: evaluateThresholdMonitor
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Threshold evaluated, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
 
   /v1/submission-profiles:resolve:
     post:
@@ -1565,7 +2579,7 @@ paths:
       operationId: resolveSubmissionProfile
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: 'Profile resolved, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+      responses: { "200": { description: 'Profile resolved, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "422": { description: Explicit refusal., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: pack_unverified., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/regulatory-submissions:
     post:
@@ -1584,7 +2598,7 @@ paths:
       operationId: registerSubmission
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: Idempotent repeat. }, "201": { description: Registered. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+      responses: { "200": { description: Idempotent repeat. }, "201": { description: Registered. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "422": { description: Explicit refusal., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: pack_unverified., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/regulatory-submissions/{submission_id}:
     get:
@@ -1594,7 +2608,7 @@ paths:
       operationId: getSubmission
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: submission_id, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses: { "200": { description: The submission and its events. }, "404": { description: submission_not_found. } }
+      responses: { "200": { description: The submission and its events. }, "404": { description: submission_not_found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/regulatory-submissions/{submission_id}/events:
     post:
@@ -1612,7 +2626,7 @@ paths:
       operationId: recordSubmissionEvent
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: submission_id, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses: { "200": { description: Report stored (see applied and disposition). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: submission_not_found. } }
+      responses: { "200": { description: Report stored (see applied and disposition). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: submission_not_found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/admin/rollouts:
     post:
@@ -1625,7 +2639,7 @@ paths:
       operationId: createRollout
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: One rollout per family_ref. } }
+      responses: { "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: One rollout per family_ref., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
     get:
       tags: [Rollout]
       summary: List rollouts (optional status filter)
@@ -1653,7 +2667,7 @@ paths:
       operationId: getRollout
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses: { "200": { description: Detail. }, "404": { description: rollout_not_found. } }
+      responses: { "200": { description: Detail. }, "404": { description: rollout_not_found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/admin/rollouts/{rollout_id}/owner:
     put:
@@ -1663,7 +2677,7 @@ paths:
       operationId: setRolloutOwner
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses: { "200": { description: Updated. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
+      responses: { "200": { description: Updated. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "404": { description: rollout_not_found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/admin/rollouts/{rollout_id}/packs:
     put:
@@ -1673,7 +2687,7 @@ paths:
       operationId: linkRolloutPacks
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses: { "200": { description: Linked pack refs. }, "404": { description: rollout_not_found or pack_not_found. } }
+      responses: { "200": { description: Linked pack refs. }, "404": { description: rollout_not_found or pack_not_found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/admin/rollouts/{rollout_id}/attestations:
     post:
@@ -1685,7 +2699,7 @@ paths:
       operationId: attestRollout
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses: { "201": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
+      responses: { "201": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "404": { description: rollout_not_found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/admin/rollouts/{rollout_id}/expert-approvals:
     post:
@@ -1695,7 +2709,7 @@ paths:
       operationId: expertApproveRollout
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses: { "201": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
+      responses: { "201": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "404": { description: rollout_not_found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/admin/rollouts/{rollout_id}/transition:
     post:
@@ -1708,7 +2722,7 @@ paths:
       operationId: transitionRollout
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
-      responses: { "200": { description: Moved. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: rollout_not_found. }, "409": { description: 'rollout_blocked, with blockers.' } }
+      responses: { "200": { description: Moved. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: rollout_not_found., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "409": { description: 'rollout_blocked, with blockers.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
 
   /v1/rollout-checklists:
     get:
@@ -1787,6 +2801,12 @@ components:
         rejected with `401 missing_principal` rather than attributed to the platform.
 
   parameters:
+    AsOf:
+      name: as_of
+      in: query
+      required: false
+      description: Business time, an RFC 3339 timestamp or a YYYY-MM-DD date (read as midnight UTC). Defaults to now. A malformed value answers 400.
+      schema: { type: string }
     JurisdictionID:
       name: jurisdiction_id
       in: path
@@ -1922,7 +2942,7 @@ components:
         An unknown JSON field is rejected rather than ignored.
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     MissingPrincipal:
       description: |
@@ -1931,13 +2951,13 @@ components:
         `X-Tenant-Id` or `X-Principal-Id` (a write-strict obligation).
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     Forbidden:
       description: '`unauthorized` — the Authorization Service denied the action.'
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     NotFound:
       description: |
@@ -1945,13 +2965,13 @@ components:
         which cannot name an existing row.
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     BodyTooLarge:
       description: '`request_body_too_large` — the body exceeds 256 KiB.'
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     StoreUnavailable:
       description: |
@@ -1959,7 +2979,7 @@ components:
         validating a `jurisdiction_id` must reject the write fail-closed.
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     AuthzOrStoreUnavailable:
       description: |
@@ -1968,21 +2988,13 @@ components:
         Both fail closed: nothing was written.
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
   schemas:
 
-    Error:
+    Problem:
       type: object
       required: [type, title, status, code]
-      description: |
-        RFC 9457 Problem Details (API standard §12) plus the Zoiko extensions:
-        `code` is the stable machine-readable code clients branch on, and `error`
-        is a deprecated alias of `code` retained for one migration cycle.
-        `type` names the stable error class (Governance Control Plane §16) where
-        one applies. Additional extension fields — `field`, `jurisdiction_id`,
-        `reasons`, `report`, `failures`, `service` — appear inline as relevant.
-        Emitted as `application/problem+json`.
       properties:
         type:
           type: string
@@ -2005,9 +3017,6 @@ components:
         code:
           type: string
           description: Stable machine-readable code for client logic (e.g., "missing_field").
-        error:
-          type: string
-          description: Deprecated alias of `code`; clients should branch on `code`.
         request_id:
           type: string
           description: Request identifier for support/evidence (API standard §12).
@@ -2034,13 +3043,402 @@ components:
               detail:
                 type: string
                 description: Human-readable explanation of the violation.
-        field:
-          type: string
-          description: The offending field, when code is "missing_field".
-        jurisdiction_id:
+        current_version:
+          type: integer
+          format: int64
+
+    JurisdictionAsOf:
+      type: object
+      required: [jurisdiction_id, jurisdiction_code, jurisdiction_name, jurisdiction_type, authority_type, as_of, version_no, valid_from, retired]
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        jurisdiction_code: { type: string }
+        jurisdiction_name: { type: string }
+        jurisdiction_type: { type: string }
+        parent_jurisdiction_id: { type: string, format: uuid, nullable: true }
+        authority_type: { type: string }
+        as_of: { type: string, format: date-time }
+        version_no: { type: integer, minimum: 1 }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, nullable: true }
+        retired:
+          type: boolean
+          description: True when the jurisdiction has SINCE been retired. It was in force at as_of.
+        retired_at: { type: string, format: date-time }
+        retirement_reason: { type: string }
+        superseded_by_jurisdiction_id: { type: string, format: uuid }
+
+    HierarchyNode:
+      type: object
+      required: [jurisdiction_id, jurisdiction_code, jurisdiction_name, jurisdiction_type, authority_type, depth, children]
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        jurisdiction_code: { type: string }
+        jurisdiction_name: { type: string }
+        jurisdiction_type: { type: string }
+        authority_type: { type: string }
+        depth: { type: integer, minimum: 0 }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/HierarchyNode' }
+
+    JurisdictionHierarchy:
+      type: object
+      required: [as_of, root, count]
+      properties:
+        as_of: { type: string, format: date-time }
+        root: { $ref: '#/components/schemas/HierarchyNode' }
+        count: { type: integer, minimum: 1, description: "Jurisdictions in the tree, root included." }
+
+    RetireJurisdictionRequest:
+      type: object
+      description: The optional retirement evidence (REF-01 RetireJurisdiction). Every field is optional.
+      properties:
+        reason: { type: string, maxLength: 2000 }
+        evidence_ref: { type: string, maxLength: 2000, description: "The source that says the jurisdiction was withdrawn, for example an ISO 3166 newsletter." }
+        superseded_by_jurisdiction_id:
           type: string
           format: uuid
-          description: The jurisdiction ID, when relevant.
+          description: The active jurisdiction that takes over. Must be a different, active jurisdiction.
+
+
+    ImportCalendarRequest:
+      type: object
+      required: [source_authority, source_reference, source_version, effective_from, timezone, weekend_days, holidays]
+      properties:
+        source_authority: { type: string, maxLength: 512, description: "The holiday authority, for example UK Government." }
+        source_reference: { type: string, maxLength: 512, description: "Where the list came from." }
+        source_version: { type: string, maxLength: 64, description: "The authority's own identifier for this edition. One edition is imported once per calendar." }
+        effective_from: { type: string, format: date }
+        timezone: { type: string, description: IANA time zone. }
+        weekend_days: { type: array, items: { type: integer, minimum: 0, maximum: 6 }, description: "0=Sunday .. 6=Saturday. Required: it differs between authorities." }
+        cutoff_time: { type: string, nullable: true, description: "HH:MM authority-local." }
+        holidays:
+          type: array
+          minItems: 1
+          maxItems: 400
+          items:
+            type: object
+            required: [date, name]
+            properties:
+              date: { type: string, format: date }
+              name: { type: string }
+              observed_rule: { type: string, enum: [NONE, WEEKEND_TO_NEXT_WEEKDAY, WEEKEND_TO_PREVIOUS_WEEKDAY, WEEKEND_TO_NEAREST_WEEKDAY], description: "How the holiday is observed when it falls on a weekend." }
+        source_ids: { type: array, items: { type: string, format: uuid }, description: "Registered regulatory sources cited, which publishing requires." }
+
+    CalendarProvenance:
+      type: object
+      description: Which calendar version answered, so the answer can be reproduced.
+      required: [calendar_code, calendar_version, calendar_version_id, content_digest, timezone, effective_from, pinned]
+      properties:
+        calendar_code: { type: string }
+        calendar_version: { type: integer }
+        calendar_version_id: { type: string, format: uuid }
+        content_digest: { type: string, description: "Digest of what the version says; two versions with the same digest give the same answers." }
+        timezone: { type: string }
+        effective_from: { type: string, format: date }
+        source_authority: { type: string }
+        source_version: { type: string }
+        import_hash: { type: string }
+        pinned: { type: boolean, description: "True when the caller named the version rather than asking for the one in force." }
+
+    BusinessDayCheck:
+      type: object
+      required: [date, is_business_day, calendar]
+      properties:
+        date: { type: string, format: date }
+        is_business_day: { type: boolean }
+        reason: { type: string, enum: [WEEKEND, HOLIDAY] }
+        holiday_name: { type: string }
+        calendar: { $ref: '#/components/schemas/CalendarProvenance' }
+
+    AddBusinessDaysResult:
+      type: object
+      required: [start_date, days, result_date, skipped, calendar]
+      properties:
+        start_date: { type: string, format: date }
+        days: { type: integer }
+        result_date: { type: string, format: date }
+        skipped:
+          type: array
+          items:
+            type: object
+            required: [date, reason]
+            properties:
+              date: { type: string, format: date }
+              reason: { type: string, enum: [WEEKEND, HOLIDAY] }
+              name: { type: string }
+        calendar: { $ref: '#/components/schemas/CalendarProvenance' }
+
+    CreatePaymentTermRequest:
+      type: object
+      required: [term_code, term_name]
+      properties:
+        term_code: { type: string, pattern: '^[A-Z][A-Z0-9_]{1,31}$', example: NET30 }
+        term_name: { type: string, maxLength: 512 }
+        jurisdiction_id: { type: string, format: uuid, nullable: true, description: "Omit for a term not specific to one jurisdiction." }
+
+    PaymentTerm:
+      type: object
+      properties:
+        term_id: { type: string, format: uuid }
+        term_code: { type: string }
+        term_name: { type: string }
+        jurisdiction_id: { type: string, format: uuid, nullable: true }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+
+    PaymentTermVersionInput:
+      type: object
+      required: [basis_date_rule, due_method, business_day_convention, rationale, effective_from]
+      properties:
+        basis_date_rule: { type: string, enum: [INVOICE_DATE, RECEIPT_DATE, DELIVERY_DATE] }
+        due_method: { type: string, enum: [NET_DAYS, END_OF_MONTH_PLUS, DAY_OF_NEXT_MONTH], description: "NET_DAYS: basis + due_days. END_OF_MONTH_PLUS: end of the basis month + due_days. DAY_OF_NEXT_MONTH: due_day_of_month of the month after, clamped to its length." }
+        due_days: { type: integer, minimum: 0, maximum: 365, default: 0, description: "Beyond 90 needs controlled_credit. Must be 0 for DAY_OF_NEXT_MONTH." }
+        due_day_of_month: { type: integer, minimum: 1, maximum: 31, description: "DAY_OF_NEXT_MONTH only." }
+        business_day_convention: { type: string, enum: [NONE, FOLLOWING, PRECEDING, MODIFIED_FOLLOWING, MODIFIED_PRECEDING] }
+        calendar_code: { type: string, description: "Required with a convention, and only then." }
+        grace_days: { type: integer, minimum: 0, maximum: 90, default: 0 }
+        discount_percent: { type: string, description: "A decimal above 0 and at most 100, such as 2.5. With discount_days." }
+        discount_days: { type: integer, minimum: 1, maximum: 365, description: "Days from the basis date the discount can be taken. Fewer than due_days for NET_DAYS." }
+        controlled_credit: { type: boolean, default: false, description: "The term changes controlled credit policy: required beyond 90 days." }
+        rationale: { type: string }
+        source_ref: { type: string }
+        effective_from: { type: string, format: date }
+
+    PaymentTermVersion:
+      allOf:
+        - $ref: '#/components/schemas/PaymentTermVersionInput'
+        - type: object
+          properties:
+            term_version_id: { type: string, format: uuid }
+            term_code: { type: string }
+            version: { type: integer }
+            status: { type: string, enum: [DRAFT, ACTIVE, SUPERSEDED, RETIRED] }
+            formula_text: { type: string, description: "The rule in words, derived from the rule." }
+            content_digest: { type: string, description: "Digest of what the term does; two versions with the same digest give the same due dates." }
+            ends_on: { type: string, format: date, description: "Set once, when the version stops governing." }
+            created_at: { type: string, format: date-time }
+            created_by: { type: string }
+            approved_at: { type: string, format: date-time }
+            approved_by: { type: string }
+            superseded_at: { type: string, format: date-time }
+            superseded_by_version_id: { type: string, format: uuid }
+            retired_at: { type: string, format: date-time }
+            retired_by: { type: string }
+            retire_reason: { type: string }
+
+    SupersedeTermRequest:
+      type: object
+      required: [supersedes_version]
+      properties:
+        supersedes_version: { type: integer, minimum: 1, description: "The active version this one replaces." }
+
+    SupersedeTermResult:
+      type: object
+      properties:
+        version: { $ref: '#/components/schemas/PaymentTermVersion' }
+        superseded: { $ref: '#/components/schemas/PaymentTermVersion' }
+
+    RetireTermRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string }
+        ends_on: { type: string, format: date, nullable: true, description: "For an active version: the day it stops governing (default today)." }
+
+    DueDateResult:
+      type: object
+      required: [basis_date_rule, basis_date, unadjusted_due_date, due_date, adjustment_convention, adjusted, skipped, term]
+      properties:
+        basis_date_rule: { type: string }
+        basis_date: { type: string, format: date }
+        unadjusted_due_date: { type: string, format: date, description: "Before any business-day convention." }
+        due_date: { type: string, format: date }
+        adjustment_convention: { type: string, enum: [NONE, FOLLOWING, PRECEDING, MODIFIED_FOLLOWING, MODIFIED_PRECEDING] }
+        adjusted: { type: boolean, description: "Whether the convention moved the date." }
+        skipped:
+          type: array
+          items: { type: object, properties: { date: { type: string, format: date }, reason: { type: string, enum: [WEEKEND, HOLIDAY] }, name: { type: string } } }
+        grace_until: { type: string, format: date }
+        discount:
+          type: object
+          properties:
+            percent: { type: string }
+            until: { type: string, format: date, description: "The last day the discount can be taken, adjusted by the convention and never later than the due date." }
+        term:
+          type: object
+          required: [term_code, term_version, term_version_id, content_digest, formula_text, effective_from, pinned]
+          properties:
+            term_code: { type: string }
+            term_version: { type: integer }
+            term_version_id: { type: string, format: uuid }
+            content_digest: { type: string }
+            formula_text: { type: string }
+            effective_from: { type: string, format: date }
+            ends_on: { type: string, format: date }
+            pinned: { type: boolean }
+        calendar: { $ref: '#/components/schemas/CalendarProvenance' }
+        steps:
+          type: array
+          items: { type: string }
+          description: "Only from explain-due-date."
+    JurisdictionAlias:
+      type: object
+      required: [alias_id, jurisdiction_id, alias_system, alias_code, source_standard, source_version, mapping_rationale, valid_from, created_by, created_at]
+      properties:
+        alias_id: { type: string, format: uuid }
+        jurisdiction_id: { type: string, format: uuid }
+        alias_system: { type: string }
+        alias_code: { type: string }
+        source_standard: { type: string }
+        source_version: { type: string }
+        mapping_rationale: { type: string }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, nullable: true }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        ended_by: { type: string }
+        ended_at: { type: string, format: date-time }
+        end_reason: { type: string }
+
+    CodeResolution:
+      type: object
+      required: [jurisdiction_id, jurisdiction_code, jurisdiction_name, jurisdiction_type, authority_type, as_of, version_no, matched_via]
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        jurisdiction_code: { type: string }
+        jurisdiction_name: { type: string }
+        jurisdiction_type: { type: string }
+        authority_type: { type: string }
+        parent_jurisdiction_id: { type: string, format: uuid, nullable: true }
+        as_of: { type: string, format: date-time }
+        version_no: { type: integer, minimum: 1 }
+        matched_via:
+          type: string
+          description: INTERNAL for a jurisdiction_code match, or the alias system that matched.
+        alias:
+          description: The mapping used, with its source and rationale. Absent for an internal-code match.
+          $ref: '#/components/schemas/JurisdictionAlias'
+
+    AmendAliasRequest:
+      type: object
+      required: [alias_system, alias_code, source_standard, source_version, mapping_rationale, valid_from]
+      properties:
+        alias_system:
+          type: string
+          description: "Upper-case letters, digits and . _ : - (2 to 64). ISO3166-1-ALPHA2, ISO3166-1-ALPHA3, ISO3166-1-NUMERIC, ISO3166-2 and UN-M49 are validated against the standard's format. INTERNAL is reserved."
+        alias_code: { type: string, maxLength: 64 }
+        source_standard: { type: string, maxLength: 128 }
+        source_version: { type: string, maxLength: 64 }
+        mapping_rationale: { type: string }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time }
+        replaces_alias_id:
+          type: string
+          format: uuid
+          description: Ends that mapping of the same code at valid_from, in the same transaction.
+
+    EndAliasRequest:
+      type: object
+      required: [valid_to, reason]
+      properties:
+        valid_to: { type: string, format: date-time }
+        reason: { type: string }
+
+    JurisdictionRef:
+      type: object
+      description: "A jurisdiction named by jurisdiction_id, or by code and type together. A code alone never names one."
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        code: { type: string, maxLength: 32 }
+        type: { type: string, maxLength: 64 }
+
+    ImportItemInput:
+      type: object
+      required: [action, target]
+      properties:
+        action: { type: string, enum: [ADD, UPDATE, RETIRE] }
+        target:
+          description: "What the row is about. For an ADD, the new jurisdiction's code and type; its id is assigned by the registry."
+          $ref: '#/components/schemas/JurisdictionRef'
+        jurisdiction_name: { type: string, maxLength: 500 }
+        authority_type: { type: string, maxLength: 64 }
+        parent:
+          description: "Where the jurisdiction sits. On an UPDATE, absent means unchanged. May name a jurisdiction an earlier row adds."
+          $ref: '#/components/schemas/JurisdictionRef'
+        effective_from:
+          type: string
+          format: date-time
+          description: "Required for an ADD. Optional for an UPDATE (default: when it is applied) and must follow the version in force. Not accepted for a RETIRE, which takes effect when approved."
+        successor:
+          description: "RETIRE only: the jurisdiction that takes over."
+          $ref: '#/components/schemas/JurisdictionRef'
+        note: { type: string, maxLength: 2000 }
+
+    ImportItem:
+      description: "A stored row: what was sent, what validation said and, once approved, what it did."
+      allOf:
+        - $ref: '#/components/schemas/ImportItemInput'
+        - type: object
+          required: [item_no, validation_errors]
+          properties:
+            item_no: { type: integer, minimum: 1 }
+            validation_errors:
+              type: array
+              items: { type: string }
+              description: "Empty when the row passed validation."
+            outcome: { type: string, enum: [ADDED, UPDATED, RETIRED, UNCHANGED] }
+            jurisdiction_id: { type: string, format: uuid }
+
+    ImportBatch:
+      type: object
+      required: [batch_id, source_standard, source_version, import_hash, evidence_ref, summary, status, item_count, invalid_count, proposed_by, proposed_at]
+      properties:
+        batch_id: { type: string, format: uuid }
+        source_standard: { type: string }
+        source_version: { type: string }
+        import_hash:
+          type: string
+          description: "SHA-256 of the normalised content: the same content hashes the same however it was formatted."
+        evidence_ref: { type: string }
+        summary: { type: string }
+        status: { type: string, enum: [PROPOSED, APPROVED, REJECTED] }
+        item_count: { type: integer }
+        invalid_count: { type: integer, description: "Rows that failed validation. A batch with any cannot be approved." }
+        proposed_by: { type: string }
+        proposed_at: { type: string, format: date-time }
+        decided_by: { type: string }
+        decided_at: { type: string, format: date-time }
+        decision_reason: { type: string }
+        added_count: { type: integer }
+        updated_count: { type: integer }
+        retired_count: { type: integer }
+        unchanged_count: { type: integer, description: "With the other three counts, adds up to item_count once approved." }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ImportItem' }
+
+    ProposeImportRequest:
+      type: object
+      required: [source_standard, source_version, evidence_ref, summary, items]
+      properties:
+        source_standard: { type: string, maxLength: 128 }
+        source_version: { type: string, maxLength: 64 }
+        evidence_ref: { type: string, description: "Where the source came from." }
+        summary: { type: string }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 2000
+          items: { $ref: '#/components/schemas/ImportItemInput' }
+
+    DecideImportRequest:
+      type: object
+      properties:
+        reason: { type: string, description: "Required to reject, optional to approve." }
 
     Jurisdiction:
       type: object
@@ -2095,6 +3493,9 @@ components:
         row_version:
           type: integer
           description: Increases on every change; the ETag and the If-Match value, and the events' aggregate_version.
+        retirement_reason: { type: string, description: Why it was retired. Present only on a retired jurisdiction that was given one. }
+        retirement_evidence_ref: { type: string, description: The source that withdrew it. }
+        superseded_by_jurisdiction_id: { type: string, format: uuid, description: The active jurisdiction that took over. }
 
     JurisdictionRule:
       type: object

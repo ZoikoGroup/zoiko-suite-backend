@@ -25,6 +25,8 @@ import (
 
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/apicontract"
+
 	"zoiko.io/identity-context-svc/internal/store"
 )
 
@@ -69,6 +71,12 @@ var exemptPaths = map[string]bool{
 	// replay it to whoever repeats the key.
 	"/v1/authenticate/step-up": true,
 	"/v1/mfa/totp/enroll":      true,
+	// The passkey step-up finish mints a login token like the TOTP step-up.
+	// The begin routes answer a fresh single-use challenge: a replayed answer
+	// would hand back a ceremony already taken, never a working one.
+	"/v1/authenticate/step-up/passkey/begin":  true,
+	"/v1/authenticate/step-up/passkey/finish": true,
+	"/v1/mfa/passkeys/register/begin":         true,
 }
 
 // Middleware answers a repeated command from its first response.
@@ -92,7 +100,7 @@ func Middleware(s Store, log *zap.Logger) func(http.Handler) http.Handler {
 			// needs it afterwards.
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
-				writeErr(w, http.StatusBadRequest, "invalid_request", "could not read request body")
+				writeErr(w, r, http.StatusBadRequest, "invalid_request", "could not read request body")
 				return
 			}
 			_ = r.Body.Close()
@@ -111,14 +119,14 @@ func Middleware(s Store, log *zap.Logger) func(http.Handler) http.Handler {
 			switch {
 			case errors.Is(err, store.ErrIdempotencyFingerprintMismatch):
 				// The stable code §4 named and this service could not produce.
-				writeErr(w, http.StatusConflict, "IDEMPOTENCY_MISMATCH",
+				writeErr(w, r, http.StatusConflict, "IDEMPOTENCY_MISMATCH",
 					"this Idempotency-Key was already used for a different request")
 				return
 			case err != nil:
 				// Fail closed. Executing a command we cannot deduplicate is
 				// exactly the behaviour being fixed.
 				log.Error("idempotency claim failed", zap.Error(err), zap.String("endpoint", endpoint))
-				writeErr(w, http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE",
+				writeErr(w, r, http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE",
 					"could not establish replay protection for this command")
 				return
 			}
@@ -128,7 +136,7 @@ func Middleware(s Store, log *zap.Logger) func(http.Handler) http.Handler {
 					// Claimed by a concurrent request that has not finished.
 					// 409 rather than replaying an empty record: the first
 					// attempt may still succeed, and the caller should retry.
-					writeErr(w, http.StatusConflict, "IDEMPOTENCY_IN_FLIGHT",
+					writeErr(w, r, http.StatusConflict, "IDEMPOTENCY_IN_FLIGHT",
 						"an identical command is currently in flight")
 					return
 				}
@@ -249,16 +257,21 @@ func replay(w http.ResponseWriter, rec *store.IdempotencyRecord) {
 		w.WriteHeader(rec.ResponseStatus)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	// A recorded refusal was written as a problem document; replay it as one.
+	ct := "application/json"
+	if rec.ResponseStatus >= 400 {
+		ct = apicontract.ContentTypeProblem
+	}
+	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(rec.ResponseStatus)
 	_, _ = w.Write(rec.ResponseBody)
 }
 
-func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"error_code": code,
-		"error":      msg,
-	})
+// writeErr answers as RFC 9457 problem+json, like every other error from
+// this service (ZS-API-001 §12). A 503 and an in-flight duplicate are worth
+// retrying; a mismatched key or an unreadable body is not.
+func writeErr(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	p := apicontract.ProblemFor(status, code, msg)
+	p.Retryable = status == http.StatusServiceUnavailable || code == "IDEMPOTENCY_IN_FLIGHT"
+	apicontract.WriteProblem(w, r, p)
 }

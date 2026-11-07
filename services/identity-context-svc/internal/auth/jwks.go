@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"zoiko.io/identity-context-svc/internal/keys"
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // NewJWKSHandler publishes every key in the ring (the active one and any
@@ -14,7 +15,7 @@ func NewJWKSHandler(ring *keys.Keyring) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		set, err := ring.JWKS()
 		if err != nil {
-			http.Error(w, "key set unavailable", http.StatusInternalServerError)
+			apicontract.WriteError(w, r, http.StatusInternalServerError, "key_set_unavailable", "key set unavailable")
 			return
 		}
 		w.Header().Set("Content-Type", "application/jwk-set+json")

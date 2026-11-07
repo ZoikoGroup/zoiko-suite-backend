@@ -25,13 +25,14 @@ import (
 
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/authorization-svc/internal/cache"
 	"zoiko.io/authorization-svc/internal/config"
@@ -45,6 +46,7 @@ import (
 	"zoiko.io/authorization-svc/internal/mtls"
 	"zoiko.io/authorization-svc/internal/outbox"
 	"zoiko.io/authorization-svc/internal/registry"
+	"zoiko.io/authorization-svc/internal/assignmentexpiry"
 	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
 	"zoiko.io/authorization-svc/internal/store"
@@ -181,13 +183,14 @@ func main() {
 	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Recoverer)
 	r.Use(otelchi.Middleware("authorization-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
-	r.Use(middleware.Logger)
+	r.Use(chimiddleware.Logger)
 
 	// Which SERVICE may ask for a decision (register A-02). Both listeners
 	// share this router; on the plaintext one r.TLS is nil, so in require
@@ -255,6 +258,8 @@ func main() {
 	// handler.EnvelopePolicy, not svcenvelope.ServicePolicy: the generated
 	// policy classifies POST /v1/authorize as a material write, which refused
 	// almost every caller of the evaluation endpoint. See handler.MaterialWrite.
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(handler.EnvelopePolicy(), svcenvelope.DefaultReporter()))
 	// Idempotency-Key honoured on material writes (migration 000021): a retry
 	// is answered from the first response instead of creating a second grant
@@ -295,6 +300,8 @@ func main() {
 	h.SetSessionLimits(handler.SessionLimits{
 		JIT: cfg.MaxJITSeconds, BreakGlass: cfg.MaxBreakGlassSeconds, Support: cfg.MaxSupportSeconds,
 	})
+	// AU-02: break-glass waits for this many independent, stepped-up approvers.
+	h.SetBreakGlassApprovals(cfg.BreakGlassApprovals)
 	if cfg.SessionStepUp == "off" {
 		log.Warn("AUTHZ_SESSION_STEP_UP=off — privileged and break-glass sessions are issued without a second factor (ENV=local only)")
 	}
@@ -587,6 +594,17 @@ func main() {
 		go sweeper.Run(retentionCtx)
 	}
 
+	// ── role-assignment expiry (ORG-06 AssignmentExpired) ──────────────────
+	//
+	// Announces, once each, assignments whose window has closed, as
+	// iam.assignment.expired. Enforcement does not wait for this: an assignment
+	// stops granting at its effective_to. This tells consumers that hold their
+	// own projection. Safe on every replica: the database claims rows with
+	// SKIP LOCKED.
+	expiryCtx, stopExpiry := context.WithCancel(context.Background())
+	defer stopExpiry()
+	go assignmentexpiry.New(pgStore, log).Run(expiryCtx)
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -647,7 +665,7 @@ func kafkaErrorLogger(log *zap.Logger, topics string) kafka.LoggerFunc {
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+			r.Header.Set("X-Correlation-ID", chimiddleware.GetReqID(r.Context()))
 		}
 		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)

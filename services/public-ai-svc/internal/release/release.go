@@ -1,0 +1,574 @@
+// Package release keeps the active, verified knowledge and claim releases
+// and the revocation ledger in memory. A turn takes one Snapshot at start
+// (the release tuple is pinned) and re-checks revocations at commit
+// (Doc 08 §06).
+package release
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"zoiko.io/public-ai-svc/internal/claims"
+	"zoiko.io/public-ai-svc/internal/contract"
+	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/metrics"
+	"zoiko.io/public-ai-svc/internal/policy"
+	"zoiko.io/public-ai-svc/internal/signing"
+	"zoiko.io/public-ai-svc/internal/store"
+)
+
+// Snapshot is an immutable view used for one turn.
+type Snapshot struct {
+	KB *knowledge.Index
+	// Retriever searches KB: the lexical index itself, or Hybrid when an
+	// embedder is configured (ADR-002).
+	Retriever knowledge.Retriever
+	Claims    *claims.Resolver
+	Routes    []knowledge.Route
+	Watermark int64
+	rev       *revocationSet
+
+	kbManifest    *knowledge.Manifest
+	claimsChanged bool
+}
+
+// SourceRevoked implements knowledge.Revocations.
+func (s *Snapshot) SourceRevoked(sourceID, sourceVersionID string) bool {
+	return s.rev.sources[sourceID] || s.rev.sources[sourceVersionID]
+}
+
+// EvidenceRevoked reports whether a claim's evidence was withdrawn, by its
+// version or by its whole source (KB-030): a claim citing it is never stated.
+func (s *Snapshot) EvidenceRevoked(sourceVersionID string) bool {
+	if s.rev.sources[sourceVersionID] {
+		return true
+	}
+	if s.kbManifest != nil {
+		for _, src := range s.kbManifest.Sources {
+			if src.SourceVersionID == sourceVersionID && s.rev.sources[src.SourceID] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ClaimRevoked implements claims.RevocationSet.
+func (s *Snapshot) ClaimRevoked(claimID string) bool { return s.rev.claims[claimID] }
+
+// Route returns the effective route for key and market, or false.
+func (s *Snapshot) Route(key, market string, now time.Time) (knowledge.Route, bool) {
+	for _, r := range s.Routes {
+		if r.RouteKey != key || now.Before(r.EffectiveFrom) || !now.Before(r.EffectiveUntil) {
+			continue
+		}
+		if !routeMarketOK(r.MarketCodes, market) {
+			continue
+		}
+		if r.RequiresClaim != "" && (s.Claims == nil || !s.Claims.HasVerified(r.RequiresClaim, market, now, s)) {
+			continue
+		}
+		return r, true
+	}
+	return knowledge.Route{}, false
+}
+
+func routeMarketOK(codes []string, market string) bool {
+	for _, c := range codes {
+		if c == knowledge.MarketAll || (market != "" && c == market) {
+			return true
+		}
+	}
+	return false
+}
+
+type revocationSet struct {
+	sources map[string]bool
+	claims  map[string]bool
+}
+
+// Runtime loads and refreshes releases.
+type Runtime struct {
+	store  store.Store
+	pubKey string
+	// AllowDraft lets a local/dev runtime serve a release that contains
+	// DRAFT_PENDING_REVIEW content. Anywhere else such a release is refused
+	// and the service stays not-ready (fail closed).
+	AllowDraft bool
+	// AllowSynthetic lets a local/dev runtime serve a release containing
+	// synthetic test data (synthetic sources, synthetic routes, or synthetic
+	// claims). Anywhere else such a release is refused and the service stays
+	// not-ready (fail closed).
+	AllowSynthetic bool
+	// Embedder, when set, adds vector recall (knowledge.Hybrid) to each KB
+	// release. Nil (the R0 default: no approved model) keeps retrieval
+	// lexical. If embedding a release fails, that release is served
+	// lexically and VectorError reports why.
+	Embedder knowledge.Embedder
+	vecErr   error
+	// PolicyVersion is the running prompt/policy version. A release whose
+	// compatible_policy_versions does not include it is refused at load
+	// (Doc 08 OPR-004). RequireCompatibility also refuses a release that
+	// declares no range: set outside dev/test, where nothing is assumed.
+	PolicyVersion        string
+	RequireCompatibility bool
+
+	mu          sync.RWMutex
+	snap        *Snapshot
+	kbID        string
+	claimsID    string
+	lastRefresh time.Time
+	lastErr     error
+	// scanPending: a release changed and its conflict cases are not yet
+	// all recorded; the next refresh retries.
+	scanPending bool
+}
+
+// New creates a Runtime. pubKey is the base64 Ed25519 verification key.
+func New(s store.Store, pubKey string) *Runtime {
+	return &Runtime{store: s, pubKey: pubKey, snap: &Snapshot{rev: &revocationSet{sources: map[string]bool{}, claims: map[string]bool{}}}}
+}
+
+// ErrNotLoaded means no verified release is active.
+var ErrNotLoaded = errors.New("no verified knowledge/claim release is active")
+
+// Refresh reloads releases whose pointer moved and applies new revocations.
+// Any verification failure fails closed: the runtime reports not ready
+// until a valid release is promoted.
+func (r *Runtime) Refresh(ctx context.Context) error {
+	err := r.refresh(ctx)
+	r.mu.Lock()
+	r.lastErr = err
+	if err == nil {
+		r.lastRefresh = time.Now()
+	}
+	r.mu.Unlock()
+	return err
+}
+
+func (r *Runtime) refresh(ctx context.Context) error {
+	r.mu.RLock()
+	cur := *r.snap
+	kbID, claimsID := r.kbID, r.claimsID
+	r.mu.RUnlock()
+
+	next := cur
+	newKB, err := r.store.GetPointer(ctx, knowledge.KindKB)
+	if err != nil {
+		return fmt.Errorf("kb pointer: %w", err)
+	}
+	if newKB != kbID || cur.KB == nil {
+		var m knowledge.Manifest
+		if err := r.load(ctx, newKB, knowledge.KindKB, &m); err != nil {
+			r.invalidate()
+			return err
+		}
+		if err := m.Validate(); err != nil {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, err)
+		}
+		if m.HasDraft() && !r.AllowDraft {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, ErrDraftInRelease)
+		}
+		if m.HasSynthetic() && !r.AllowSynthetic {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease)
+		}
+		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, err)
+		}
+		// additionally, gate synthetic routes
+		for _, rt := range m.Routes {
+			if rt.Synthetic && !r.AllowSynthetic {
+				r.invalidate()
+				return fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease)
+			}
+		}
+		next.KB, next.Routes, next.kbManifest = knowledge.NewIndex(m), m.Routes, &m
+		next.Retriever = next.KB
+		var vecErr error
+		if r.Embedder != nil {
+			if h, err := knowledge.NewHybrid(ctx, next.KB, r.Embedder); err != nil {
+				vecErr = err
+			} else {
+				next.Retriever = h
+			}
+		}
+		r.mu.Lock()
+		r.vecErr = vecErr
+		r.mu.Unlock()
+	}
+	newClaims, err := r.store.GetPointer(ctx, claims.KindClaims)
+	if err != nil {
+		return fmt.Errorf("claims pointer: %w", err)
+	}
+	if newClaims != claimsID || cur.Claims == nil {
+		var m claims.Manifest
+		if err := r.load(ctx, newClaims, claims.KindClaims, &m); err != nil {
+			r.invalidate()
+			return err
+		}
+		// Doc 03 §6/§12, CT-043: a claim release is held to the same load
+		// gates as a KB release, not only to the checks it passed at build.
+		if problems := m.StructuralProblems(); len(problems) > 0 {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w: %s", newClaims, ErrInvalidClaims, strings.Join(problems, "; "))
+		}
+		if m.HasSynthetic() && !r.AllowSynthetic {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newClaims, ErrSyntheticInRelease)
+		}
+		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newClaims, err)
+		}
+		next.Claims = claims.NewResolver(m)
+		if rel, err := r.store.GetRelease(ctx, newClaims); err == nil {
+			sum := sha256.Sum256(rel.Signature)
+			next.Claims = next.Claims.WithSignatureRef("ed25519:" + hex.EncodeToString(sum[:8]))
+		}
+		next.claimsChanged = true
+	}
+	if next.claimsChanged || newKB != kbID {
+		next.Claims = next.Claims.WithDisputes(PriceDisputes(next.kbManifest, next.Claims.Manifest()))
+		next.claimsChanged = false
+	}
+	revs, err := r.store.Revocations(ctx, cur.Watermark)
+	if err != nil {
+		return fmt.Errorf("revocations: %w", err)
+	}
+	if len(revs) > 0 {
+		// Copy-on-write so snapshots held by in-flight turns never change.
+		rs := &revocationSet{sources: copySet(cur.rev.sources), claims: copySet(cur.rev.claims)}
+		for _, v := range revs {
+			if v.TargetKind == "claim" {
+				rs.claims[v.TargetID] = true
+			} else {
+				rs.sources[v.TargetID] = true
+			}
+			if v.Watermark > next.Watermark {
+				next.Watermark = v.Watermark
+			}
+		}
+		next.rev = rs
+	}
+	r.mu.Lock()
+	r.snap, r.kbID, r.claimsID = &next, newKB, newClaims
+	if newKB != kbID || newClaims != claimsID {
+		r.scanPending = true
+	}
+	scan := r.scanPending
+	r.mu.Unlock()
+	if scan && next.Claims != nil {
+		// Doc 03 §16, KB-005: every conflict in the new releases becomes an
+		// owned case at load, before any visitor asks about it.
+		for _, c := range ScanConflicts(next.kbManifest, next.Claims.Manifest(), time.Now().UTC()) {
+			if err := r.store.RecordConflict(ctx, c); err != nil {
+				return fmt.Errorf("record conflict %s: %w", c.ConflictID, err)
+			}
+		}
+		r.mu.Lock()
+		r.scanPending = false
+		r.mu.Unlock()
+	}
+	r.recordIndexHealth(ctx, &next)
+	return nil
+}
+
+// recordIndexHealth publishes the Doc 03 §22 index-health gauges.
+func (r *Runtime) recordIndexHealth(ctx context.Context, s *Snapshot) {
+	if s.kbManifest == nil {
+		return
+	}
+	now, oldest := time.Now().UTC(), 0.0
+	for _, src := range s.kbManifest.Sources {
+		t := src.ApprovalTS
+		if t == nil {
+			t = src.EffectiveFrom
+		}
+		if t != nil {
+			if d := now.Sub(*t).Hours() / 24; d > oldest {
+				oldest = d
+			}
+		}
+	}
+	revs := 0
+	if s.rev != nil {
+		revs = len(s.rev.sources) + len(s.rev.claims)
+	}
+	open := 0
+	if cs, err := r.store.Conflicts(ctx); err == nil {
+		for _, c := range cs {
+			if c.ResolutionState == "OPEN" {
+				open++
+			}
+		}
+	}
+	metrics.IndexHealth(len(s.kbManifest.Chunks), len(s.kbManifest.Sources), revs, open, oldest)
+}
+
+// ErrInvalidClaims means a signed claim release fails registry validation
+// at load; the runtime stays not-ready.
+var ErrInvalidClaims = errors.New("claim release fails validation")
+
+// ErrIncompatibleRelease means a release was not evaluated with the running
+// policy version (Doc 08 OPR-004); the runtime stays not-ready.
+var ErrIncompatibleRelease = errors.New("release is not compatible with the running policy version")
+
+func (r *Runtime) compatible(versions []string) error {
+	if len(versions) == 0 {
+		if r.RequireCompatibility {
+			return fmt.Errorf("%w: no compatible_policy_versions declared", ErrIncompatibleRelease)
+		}
+		return nil
+	}
+	if r.PolicyVersion == "" {
+		return nil
+	}
+	for _, v := range versions {
+		if v == r.PolicyVersion {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s not in %v", ErrIncompatibleRelease, r.PolicyVersion, versions)
+}
+
+func (r *Runtime) invalidate() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := *r.snap
+	s.KB, s.Claims = nil, nil
+	r.snap, r.kbID, r.claimsID = &s, "", ""
+}
+
+func (r *Runtime) load(ctx context.Context, id, kind string, into any) error {
+	rel, err := r.store.GetRelease(ctx, id)
+	if err != nil {
+		return fmt.Errorf("release %s: %w", id, err)
+	}
+	if rel.Kind != kind {
+		return fmt.Errorf("release %s has kind %s, want %s", id, rel.Kind, kind)
+	}
+	if err := signing.Verify(r.pubKey, rel.Manifest, rel.Signature); err != nil {
+		return fmt.Errorf("release %s: %w", id, err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(rel.Manifest))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(into); err != nil {
+		return fmt.Errorf("release %s manifest: %w", id, err)
+	}
+	var head struct {
+		ReleaseID string `json:"release_id"`
+		Kind      string `json:"kind"`
+	}
+	_ = json.Unmarshal(rel.Manifest, &head)
+	if head.ReleaseID != id || head.Kind != kind {
+		return fmt.Errorf("release %s manifest header mismatch", id)
+	}
+	return nil
+}
+
+func copySet(m map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(m)+1)
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// Snapshot returns the current immutable view, or ErrNotLoaded.
+func (r *Runtime) Snapshot() (*Snapshot, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.snap.KB == nil || r.snap.Claims == nil {
+		return nil, ErrNotLoaded
+	}
+	return r.snap, nil
+}
+
+// Ready is true when verified releases are loaded and revocations were
+// refreshed recently enough to be enforceable (Doc 08 §10).
+func (r *Runtime) Ready(maxAge time.Duration) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.snap.KB != nil && r.snap.Claims != nil && r.lastErr == nil && time.Since(r.lastRefresh) <= maxAge
+}
+
+// RevokedSince reports whether any of the given source/claim ids was revoked
+// after watermark. It reads the ledger directly so it cannot be stale.
+func (r *Runtime) RevokedSince(ctx context.Context, watermark int64, sourceIDs, claimIDs []string) (bool, error) {
+	revs, err := r.store.Revocations(ctx, watermark)
+	if err != nil {
+		return true, err // fail closed
+	}
+	want := map[string]bool{}
+	for _, id := range append(append([]string{}, sourceIDs...), claimIDs...) {
+		want[id] = true
+	}
+	for _, v := range revs {
+		if want[v.TargetID] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// CitationsRevoked reports whether any cited source version or claim was
+// revoked, by id or (for a version) through its whole source, in the active
+// snapshot or in the ledger since it was refreshed. A stored answer is
+// re-checked with it before replay (Doc 03 §19, Doc 05 §12). Any doubt
+// (no release loaded, ledger unreadable) reports revoked: fail closed.
+func (r *Runtime) CitationsRevoked(ctx context.Context, sourceVersionIDs, claimIDs []string) (bool, error) {
+	snap, err := r.Snapshot()
+	if err != nil {
+		return true, err
+	}
+	for _, v := range sourceVersionIDs {
+		if snap.EvidenceRevoked(v) {
+			return true, nil
+		}
+	}
+	for _, c := range claimIDs {
+		if snap.ClaimRevoked(c) {
+			return true, nil
+		}
+	}
+	revs, err := r.store.Revocations(ctx, snap.Watermark)
+	if err != nil {
+		return true, err
+	}
+	if len(revs) == 0 {
+		return false, nil
+	}
+	newer := &Snapshot{kbManifest: snap.kbManifest, rev: &revocationSet{sources: map[string]bool{}, claims: map[string]bool{}}}
+	for _, v := range revs {
+		if v.TargetKind == "claim" {
+			newer.rev.claims[v.TargetID] = true
+		} else {
+			newer.rev.sources[v.TargetID] = true
+		}
+	}
+	for _, v := range sourceVersionIDs {
+		if newer.EvidenceRevoked(v) {
+			return true, nil
+		}
+	}
+	for _, c := range claimIDs {
+		if newer.ClaimRevoked(c) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Run refreshes every interval until ctx ends.
+func (r *Runtime) Run(ctx context.Context, interval time.Duration, onErr func(error)) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := r.Refresh(ctx); err != nil && onErr != nil {
+				onErr(err)
+			}
+		}
+	}
+}
+
+// ResolveRoute returns the approved URL for an official route key in market.
+func (r *Runtime) ResolveRoute(key, market string) (string, bool) {
+	snap, err := r.Snapshot()
+	if err != nil {
+		return "", false
+	}
+	rt, ok := snap.Route(key, market, time.Now())
+	return rt.URL, ok
+}
+
+// PublicConfig implements httpapi.ConfigSource from the active releases.
+func (r *Runtime) PublicConfig() contract.ConfigResponse {
+	cfg := contract.ConfigResponse{
+		AssistantDisplayName: "ZoikoSuite Assistant", // neutral until brand clearance (DEC-04)
+		Capabilities:         contract.Capabilities{},
+		SupportedLocales:     append([]string(nil), contract.SupportedLocales...),
+		MarketChoices:        []string{},
+		PublicRoutes:         []contract.PublicRoute{},
+		CitationLinks:        []contract.CitationLink{},
+		PrivacyNoticeKey:     "privacy-notice-pending-dpo",
+		Microcopy:            policy.Microcopy,
+		Chips:                map[string][]contract.Chip{},
+	}
+	for page, chips := range policy.Chips {
+		for _, c := range chips {
+			cfg.Chips[page] = append(cfg.Chips[page], contract.Chip{Label: c.Label, Message: c.Message})
+		}
+	}
+	f := false
+	cfg.Capabilities.Authenticated = &f
+	snap, err := r.Snapshot()
+	if err != nil {
+		return cfg
+	}
+	cfg.ConfigRevision = snap.KB.ReleaseID() + "/" + snap.Claims.ReleaseID()
+	cfg.MarketChoices = snap.Claims.Markets()
+	now := time.Now()
+	seen := map[string]bool{}
+	for _, rt := range snap.Routes {
+		if seen[rt.RouteKey] || now.Before(rt.EffectiveFrom) || !now.Before(rt.EffectiveUntil) {
+			continue
+		}
+		if rt.RequiresClaim != "" && !anyMarketVerified(snap, rt.RequiresClaim, now) {
+			continue
+		}
+		seen[rt.RouteKey] = true
+		if knowledge.IsPlaceholderURL(rt.URL) {
+			continue // no real public page yet: the CTA is hidden, never a placeholder link
+		}
+		cfg.PublicRoutes = append(cfg.PublicRoutes, contract.PublicRoute{RouteKey: rt.RouteKey, URL: rt.URL})
+	}
+	sort.Slice(cfg.PublicRoutes, func(i, j int) bool { return cfg.PublicRoutes[i].RouteKey < cfg.PublicRoutes[j].RouteKey })
+	cfg.CitationLinks = snap.KB.CitationLinks()
+	for i, l := range cfg.CitationLinks {
+		if knowledge.IsPlaceholderURL(l.URL) {
+			cfg.CitationLinks[i].URL = "" // the approved title is shown, unlinked
+		}
+	}
+	return cfg
+}
+
+func anyMarketVerified(s *Snapshot, subject string, now time.Time) bool {
+	for _, m := range s.Claims.Markets() {
+		if s.Claims.HasVerified(subject, m, now, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// VectorError is why the active KB release is served without vector recall
+// although an Embedder is configured (nil when hybrid is active or off).
+func (r *Runtime) VectorError() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.vecErr
+}
+
+// KBReleaseID is the active knowledge release id ("" before the first load).
+func (r *Runtime) KBReleaseID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.kbID
+}

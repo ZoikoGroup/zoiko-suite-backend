@@ -51,15 +51,15 @@ func (h *Handler) CreateForm(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createFormRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if req.LegalEntityID == "" || req.Name == "" || req.BusinessPurpose == "" || req.TargetDomain == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_fields"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_fields"})
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, req.LegalEntityID, actionFormManage, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -68,14 +68,14 @@ func (h *Handler) CreateForm(w http.ResponseWriter, r *http.Request) {
 		TargetDomain: req.TargetDomain, Schema: req.Schema, OwnerPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, form)
+	writeJSON(w, r, status, form)
 }
 
 // GetForm — BIZ-04's own GetForm query.
@@ -90,14 +90,14 @@ func (h *Handler) GetForm(w http.ResponseWriter, r *http.Request) {
 	}
 	form, err := h.store.GetForm(r.Context(), tenantID, chi.URLParam(r, "form_id"))
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, form)
+	writeJSON(w, r, http.StatusOK, form)
 }
 
 // PublishForm — BIZ-04's own PublishForm command. Fetched (read-only)
@@ -120,11 +120,11 @@ func (h *Handler) PublishForm(w http.ResponseWriter, r *http.Request) {
 	formID := chi.URLParam(r, "form_id")
 	existing, err := h.store.GetForm(r.Context(), tenantID, formID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, existing.LegalEntityID, actionFormApprove, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -132,13 +132,13 @@ func (h *Handler) PublishForm(w http.ResponseWriter, r *http.Request) {
 		FormID: formID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.publisher.PublishFormPublished(r.Context(), *published, actor, correlationID); err != nil {
 		h.log.Error("failed to publish form.published event", zap.Error(err))
 	}
-	writeJSON(w, http.StatusOK, published)
+	writeJSON(w, r, http.StatusOK, published)
 }
 
 // RetireForm — BIZ-04's own RetireForm command (filling a real gap in
@@ -160,11 +160,11 @@ func (h *Handler) RetireForm(w http.ResponseWriter, r *http.Request) {
 	formID := chi.URLParam(r, "form_id")
 	existing, err := h.store.GetForm(r.Context(), tenantID, formID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, existing.LegalEntityID, actionFormApprove, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -172,10 +172,10 @@ func (h *Handler) RetireForm(w http.ResponseWriter, r *http.Request) {
 		FormID: formID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, retired)
+	writeJSON(w, r, http.StatusOK, retired)
 }
 
 type saveDraftRequest struct {
@@ -202,7 +202,7 @@ func (h *Handler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 	}
 	var req saveDraftRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 
@@ -212,25 +212,25 @@ func (h *Handler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 	if formID != "" {
 		form, err := h.store.GetForm(r.Context(), tenantID, formID)
 		if err != nil {
-			h.writeFormErr(w, err)
+			h.writeFormErr(w, r, err)
 			return
 		}
 		legalEntityID = form.LegalEntityID
 	} else {
 		existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
 		if err != nil {
-			h.writeFormErr(w, err)
+			h.writeFormErr(w, r, err)
 			return
 		}
 		form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
 		if err != nil {
-			h.writeFormErr(w, err)
+			h.writeFormErr(w, r, err)
 			return
 		}
 		legalEntityID = form.LegalEntityID
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, legalEntityID, actionFormSubmit, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -239,14 +239,14 @@ func (h *Handler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 		CorrelationID: correlationID, SubmittedValues: req.SubmittedValues, ConsentAttestation: req.ConsentAttestation,
 	})
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	status := http.StatusOK
 	if submissionID == "" {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, submission)
+	writeJSON(w, r, status, submission)
 }
 
 // SubmitForm — BIZ-04's own SubmitForm command.
@@ -266,16 +266,16 @@ func (h *Handler) SubmitForm(w http.ResponseWriter, r *http.Request) {
 	submissionID := chi.URLParam(r, "submission_id")
 	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -283,13 +283,13 @@ func (h *Handler) SubmitForm(w http.ResponseWriter, r *http.Request) {
 		SubmissionID: submissionID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.publisher.PublishFormEvent(r.Context(), "form.submission.received", *submitted, actor, correlationID); err != nil {
 		h.log.Error("failed to publish form.submission.received event", zap.Error(err))
 	}
-	writeJSON(w, http.StatusOK, submitted)
+	writeJSON(w, r, http.StatusOK, submitted)
 }
 
 // ValidateSubmission — BIZ-04's own ValidateSubmission command.
@@ -309,16 +309,16 @@ func (h *Handler) ValidateSubmission(w http.ResponseWriter, r *http.Request) {
 	submissionID := chi.URLParam(r, "submission_id")
 	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -326,7 +326,7 @@ func (h *Handler) ValidateSubmission(w http.ResponseWriter, r *http.Request) {
 		SubmissionID: submissionID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	eventType := "form.submission.validated"
@@ -336,7 +336,7 @@ func (h *Handler) ValidateSubmission(w http.ResponseWriter, r *http.Request) {
 	if err := h.publisher.PublishFormEvent(r.Context(), eventType, *validated, actor, correlationID); err != nil {
 		h.log.Error("failed to publish form validation event", zap.Error(err))
 	}
-	writeJSON(w, http.StatusOK, validated)
+	writeJSON(w, r, http.StatusOK, validated)
 }
 
 // GetSubmission — BIZ-04's own GetSubmission query.
@@ -352,19 +352,19 @@ func (h *Handler) GetSubmission(w http.ResponseWriter, r *http.Request) {
 	submissionID := chi.URLParam(r, "submission_id")
 	submission, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	form, err := h.store.GetForm(r.Context(), tenantID, submission.FormID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, submission)
+	writeJSON(w, r, http.StatusOK, submission)
 }
 
 type supersedeSubmissionRequest struct {
@@ -389,22 +389,22 @@ func (h *Handler) SupersedeSubmission(w http.ResponseWriter, r *http.Request) {
 	}
 	var req supersedeSubmissionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	submissionID := chi.URLParam(r, "submission_id")
 	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -413,10 +413,10 @@ func (h *Handler) SupersedeSubmission(w http.ResponseWriter, r *http.Request) {
 		ActorPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, superseded)
+	writeJSON(w, r, http.StatusOK, superseded)
 }
 
 type routeToDomainRequest struct {
@@ -442,26 +442,26 @@ func (h *Handler) RouteToDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	var req routeToDomainRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if req.Outcome != "SUCCEEDED" && req.Outcome != "FAILED" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_outcome"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_outcome"})
 		return
 	}
 	submissionID := chi.URLParam(r, "submission_id")
 	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -470,13 +470,13 @@ func (h *Handler) RouteToDomain(w http.ResponseWriter, r *http.Request) {
 		CommandReference: req.CommandReference, ResultReference: req.ResultReference, Outcome: req.Outcome, FailureReason: req.FailureReason,
 	})
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.publisher.PublishFormEvent(r.Context(), "form.submission.routed", *existing, actor, correlationID); err != nil {
 		h.log.Error("failed to publish form.submission.routed event", zap.Error(err))
 	}
-	writeJSON(w, http.StatusCreated, route)
+	writeJSON(w, r, http.StatusCreated, route)
 }
 
 // GetSubmissionVersion — BIZ-04's own GetSubmissionVersion query.
@@ -492,25 +492,25 @@ func (h *Handler) GetSubmissionVersion(w http.ResponseWriter, r *http.Request) {
 	submissionID := chi.URLParam(r, "submission_id")
 	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
 	version, err := h.store.GetSubmissionVersion(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, version)
+	writeJSON(w, r, http.StatusOK, version)
 }
 
 // GetValidationResult — BIZ-04's own GetValidationResult query.
@@ -526,25 +526,25 @@ func (h *Handler) GetValidationResult(w http.ResponseWriter, r *http.Request) {
 	submissionID := chi.URLParam(r, "submission_id")
 	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
 	result, err := h.store.GetValidationResult(r.Context(), tenantID, submissionID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, r, http.StatusOK, result)
 }
 
 // ListPendingSubmissions — BIZ-04's own ListPendingSubmissions query,
@@ -561,11 +561,11 @@ func (h *Handler) ListPendingSubmissions(w http.ResponseWriter, r *http.Request)
 	formID := chi.URLParam(r, "form_id")
 	form, err := h.store.GetForm(r.Context(), tenantID, formID)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
-		h.writeFormAuthzErr(w, err)
+		h.writeFormAuthzErr(w, r, err)
 		return
 	}
 
@@ -583,54 +583,54 @@ func (h *Handler) ListPendingSubmissions(w http.ResponseWriter, r *http.Request)
 
 	pending, err := h.store.ListPendingSubmissions(r.Context(), tenantID, formID, limit, offset)
 	if err != nil {
-		h.writeFormErr(w, err)
+		h.writeFormErr(w, r, err)
 		return
 	}
 	if pending == nil {
 		pending = []*domain.FormSubmission{}
 	}
-	writeJSON(w, http.StatusOK, pending)
+	writeJSON(w, r, http.StatusOK, pending)
 }
 
-func (h *Handler) writeFormErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeFormErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrFormNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "form_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "form_not_found"})
 	case errors.Is(err, domain.ErrFormSubmissionNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "form_submission_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "form_submission_not_found"})
 	case errors.Is(err, domain.ErrFormRetired):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "form_retired"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "form_retired"})
 	case errors.Is(err, domain.ErrFormNotDraft):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "form_not_draft"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "form_not_draft"})
 	case errors.Is(err, domain.ErrFormNotPublished):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "form_not_published"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "form_not_published"})
 	case errors.Is(err, domain.ErrFormAlreadyRetired):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "form_already_retired"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "form_already_retired"})
 	case errors.Is(err, domain.ErrFormSelfPublish):
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_publish_not_allowed"})
+		writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "self_publish_not_allowed"})
 	case errors.Is(err, domain.ErrFormSubmissionNotDraft):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "submission_not_draft"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "submission_not_draft"})
 	case errors.Is(err, domain.ErrFormSubmissionNotSubmitted):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "submission_not_submitted"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "submission_not_submitted"})
 	case errors.Is(err, domain.ErrFormSubmissionNotAccepted):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "submission_not_accepted"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "submission_not_accepted"})
 	case errors.Is(err, domain.ErrFormSubmissionNotAcceptedOrRejected):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "submission_not_accepted_or_rejected"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "submission_not_accepted_or_rejected"})
 	case errors.Is(err, domain.ErrFormSubmissionAlreadySuperseded):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "submission_already_superseded"})
+		writeJSON(w, r, http.StatusConflict, map[string]string{"error": "submission_already_superseded"})
 	case errors.Is(err, domain.ErrFormSubmissionsBelongToDifferentForms):
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "submissions_belong_to_different_forms"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "submissions_belong_to_different_forms"})
 	case errors.Is(err, domain.ErrFormSubmissionNotYetValidated):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_yet_validated"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "not_yet_validated"})
 	default:
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	}
 }
 
-func (h *Handler) writeFormAuthzErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeFormAuthzErr(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, domain.ErrAuthorizationDenied) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "forbidden"})
 		return
 	}
-	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_unavailable"})
+	writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_unavailable"})
 }

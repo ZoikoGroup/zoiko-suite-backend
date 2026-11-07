@@ -77,7 +77,7 @@ func (g *Gov) ListSubjectLinks(w http.ResponseWriter, r *http.Request) {
 	}
 	list, err := g.links.ListSubjectLinks(r.Context())
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, list)

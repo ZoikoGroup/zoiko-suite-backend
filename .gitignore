@@ -56,3 +56,7 @@ docs/original_doc/*.docx
 # race, not a test failure.
 .gotmp/
 scratch/
+
+# Suivo public-ai stack: local secrets and signed release files
+deployments/.env.public-ai
+deployments/public-ai-releases/

@@ -1,0 +1,200 @@
+# Platform question bank: one visitor question per line, asked of the assistant
+# by acceptance.TestPlatformQuestionBank.
+# area <TAB> acceptable sources (| separated; kb- prefix of the source_id) <TAB> question
+Overview	kb-overview|kb-core-modules|kb-areas	What is ZoikoSuite?
+Overview	kb-overview|kb-core-modules|kb-areas	What does ZoikoSuite do?
+Overview	kb-overview|kb-core-modules|kb-areas	What modules does ZoikoSuite have?
+Overview	kb-overview|kb-core-modules|kb-areas	How is the platform organized?
+Overview	kb-areas|kb-core-modules|kb-overview	What areas are in the console?
+Overview	kb-overview|kb-governance|kb-core-modules	How does governance run through the platform?
+Tax	kb-tax	What does the Tax module do?
+Tax	kb-tax	How does ZoikoSuite handle tax?
+Tax	kb-tax	How is tax determined?
+Tax	kb-tax	Can ZoikoSuite prepare tax filings?
+Tax	kb-tax|kb-obligations	How are tax returns prepared?
+Tax	kb-tax	Does it support VAT?
+Tax	kb-tax	How does tax work across jurisdictions?
+Tax	kb-tax	What is tax determination?
+Tax	kb-tax|kb-integrations	Does ZoikoSuite connect to tax authorities?
+Tax	kb-tax	Tell me about the tax features
+Tax	kb-tax	How does indirect tax work in ZoikoSuite?
+Tax	kb-tax|kb-obligations	How are tax filing deadlines tracked?
+Governance	kb-governance|kb-governance-log-policies|kb-authorization-workflows	What is governance in ZoikoSuite?
+Governance	kb-governance|kb-authorization-workflows	How do approvals work?
+Governance	kb-governance	How does a governed action proceed?
+Governance	kb-governance|kb-delegated-authority|kb-delegations-console	Can someone approve on behalf of someone else?
+Governance	kb-governance|kb-governance-log-policies	How are decisions recorded?
+Governance	kb-governance-log-policies	What is the Governance Log?
+Governance	kb-governance-log-policies	Can decisions in the governance log be edited?
+Governance	kb-governance-log-policies	How do I filter the decision log?
+Governance	kb-governance-log-policies|kb-delegated-authority	How do I change an approval limit?
+Governance	kb-governance-log-policies	What is an approval threshold?
+Governance	kb-governance-log-policies	Which rule decides when two rules apply?
+Governance	kb-authorization-workflows|kb-security-trust|kb-governance	What is segregation of duties?
+Governance	kb-authorization-workflows|kb-governance|kb-purchase-requests	Can I approve my own request?
+Governance	kb-authorization-workflows	What happens when an approval deadline passes?
+Finance	kb-finance-payments	What does Finance and Payments do?
+Finance	kb-finance-payments|kb-finance-journals	How does the general ledger work?
+Finance	kb-finance-payments|kb-finance-journals	How does bank reconciliation work?
+Finance	kb-finance-journals	How do I post a journal entry?
+Finance	kb-finance-journals|kb-finance-payments	Can a posted journal be edited?
+Finance	kb-finance-journals	How do I reverse a journal?
+Finance	kb-finance-payments	How does period close work?
+Finance	kb-finance-payments|kb-finance-journals	How are customer invoices handled?
+Finance	kb-finance-payments	Does ZoikoSuite manage cash and liquidity?
+Finance	kb-finance-journals	What does double entry mean in ZoikoSuite?
+Finance	kb-finance-payments|kb-commercial-ops	How are supplier invoices paid?
+Legal	kb-legal-contracts|kb-contracts-console	What does the Legal module do?
+Legal	kb-legal-contracts|kb-contracts-console	How does contract management work?
+Legal	kb-legal-contracts|kb-contracts-console	What is the contract lifecycle?
+Legal	kb-contracts-console|kb-legal-contracts	How do I draft a contract?
+Legal	kb-contracts-console|kb-legal-contracts	Are old contract versions kept?
+Legal	kb-legal-contracts	Does ZoikoSuite handle board resolutions?
+Legal	kb-legal-contracts|kb-obligations	How are obligations from contracts tracked?
+Commercial	kb-commercial-ops|kb-procurement-console	What is Commercial Ops?
+Commercial	kb-commercial-ops|kb-procurement-console	How does vendor onboarding work?
+Commercial	kb-commercial-ops|kb-procurement-console	How does vendor due diligence work?
+Commercial	kb-procurement-console|kb-commercial-ops	How are spend limits checked?
+Commercial	kb-procurement-console|kb-commercial-ops	How do I issue a purchase order?
+Commercial	kb-procurement-console|kb-commercial-ops	Can a purchase order be amended?
+Commercial	kb-procurement-console|kb-commercial-ops	How does sanctions screening work?
+Purchase requests	kb-purchase-requests	What are Purchase Requests?
+Purchase requests	kb-purchase-requests	How does a purchase request get approved?
+Purchase requests	kb-purchase-requests	How do I raise a purchase request?
+Purchase requests	kb-purchase-requests	What happens after a purchase request is approved?
+Compliance	kb-compliance	What does the Compliance module do?
+Compliance	kb-compliance|kb-obligations	How are compliance obligations tracked?
+Compliance	kb-compliance	How are compliance exceptions handled?
+Compliance	kb-compliance	How does ZoikoSuite manage compliance risk?
+Compliance	kb-obligations|kb-compliance	What is the obligation register?
+Compliance	kb-obligations	What statuses can an obligation have?
+Compliance	kb-obligations	Does an obligation become overdue automatically?
+Evidence	kb-evidence|kb-evidence-requirements	What is the Evidence module?
+Evidence	kb-evidence|kb-evidence-requirements	How does ZoikoSuite keep audit evidence?
+Evidence	kb-evidence|kb-evidence-requirements	Are records audit-ready?
+Evidence	kb-evidence-requirements|kb-evidence	How do I require a document before an action?
+Evidence	kb-evidence-requirements|kb-evidence	What does MISSING mean in an evidence check?
+Evidence	kb-evidence|kb-evidence-requirements	Can evidence be deleted?
+Delegated authority	kb-delegated-authority|kb-delegations-console	What is delegated authority?
+Delegated authority	kb-delegated-authority|kb-delegations-console	How do I delegate my approval authority?
+Delegated authority	kb-delegated-authority|kb-delegations-console	Does a delegation expire?
+Delegated authority	kb-delegated-authority|kb-delegations-console	How is a delegation revoked?
+Delegated authority	kb-delegated-authority|kb-delegations-console	Can a delegation exceed the delegator's limits?
+Reporting	kb-intelligence-reporting	What reporting does ZoikoSuite have?
+Reporting	kb-intelligence-reporting	What does Intelligence and Reporting do?
+Reporting	kb-intelligence-reporting	Does ZoikoSuite give recommendations?
+Reporting	kb-intelligence-reporting|kb-console-overview|kb-platform-console	Is there a dashboard?
+Reporting	kb-console-overview	What is the Executive Dashboard?
+Security	kb-security-trust|kb-identity-foundation|kb-access-settings-console	How does ZoikoSuite keep data secure?
+Security	kb-security-trust|kb-identity-context|kb-access-settings-console	Does ZoikoSuite support single sign-on?
+Security	kb-identity-context|kb-access-settings-console|kb-security-trust	Does it support multi-factor authentication?
+Security	kb-identity-foundation|kb-access-settings-console|kb-security-trust	How are secrets stored?
+Security	kb-security-trust|kb-authorization-workflows|kb-identity-foundation	How is access controlled?
+Security	kb-identity-context	How does support access work?
+Integrations	kb-integrations	What integrations does ZoikoSuite have?
+Integrations	kb-integrations	Does ZoikoSuite integrate with banks?
+Integrations	kb-integrations	Can it connect to our HR system?
+Integrations	kb-integrations	Does ZoikoSuite support eSignature?
+Integrations	kb-integrations	How is data from integrations governed?
+Workforce	kb-workforce	Does ZoikoSuite run payroll?
+Workforce	kb-workforce	What HR features are there?
+Workforce	kb-workforce	How does workforce compliance work?
+Multi-entity	kb-multi-entity	Can ZoikoSuite handle several companies?
+Multi-entity	kb-multi-entity	How does intercompany work?
+Multi-entity	kb-multi-entity	Does ZoikoSuite support consolidation?
+Multi-entity	kb-tenants-entities|kb-multi-entity|kb-identity-foundation	How do I add a legal entity?
+Migration	kb-migration	How do we migrate to ZoikoSuite?
+Migration	kb-migration	How is migrated data validated?
+Migration	kb-migration	Can we adopt ZoikoSuite in phases?
+Jurisdictions	kb-jurisdictions-rules	What is Jurisdictions & Rules?
+Jurisdictions	kb-jurisdictions-rules	How do I register a jurisdiction?
+Jurisdictions	kb-jurisdictions-rules	What is a rule pack?
+Jurisdictions	kb-jurisdictions-rules	Can I delete a jurisdiction?
+Authorization	kb-authorization-workflows|kb-authorization-checks	How is a permission check decided?
+Authorization	kb-authorization-checks|kb-authorization-workflows	How do I check if someone has access?
+Authorization	kb-authorization-workflows|kb-access-settings-console|kb-identity-foundation	How do I grant a role?
+Authorization	kb-authorization-workflows	What is elevated access?
+Authorization	kb-authorization-checks	What is maker and checker?
+Workflows	kb-authorization-workflows|kb-governance	What are Workflows & Approvals?
+Workflows	kb-authorization-workflows	How do I start an approval workflow?
+Workflows	kb-authorization-workflows	Who can decide a workflow stage?
+Workflows	kb-authorization-workflows|kb-purchase-requests	Is a reason needed to reject?
+Workflows	kb-authorization-workflows	What is a workflow definition?
+My Work	kb-my-work	What is My Work?
+My Work	kb-my-work	Where do I see tasks waiting for me?
+My Work	kb-my-work	What are Assigned Actions?
+Identity	kb-identity-context|kb-identity-foundation	What is Identity Context?
+Identity	kb-identity-foundation|kb-access-settings-console	What are feature flags?
+Identity	kb-identity-foundation|kb-access-settings-console	What is the Secret Vault?
+Identity	kb-identity-foundation|kb-access-settings-console	What is Gateway Authentication?
+Privacy	kb-privacy-transfers	How does ZoikoSuite manage consent?
+Privacy	kb-privacy-transfers	How do cross-border data transfers work?
+Privacy	kb-privacy-transfers	What happens when someone withdraws consent?
+Privacy	kb-privacy-transfers	What is a transfer risk assessment?
+Search	kb-search-admin	How does search work in ZoikoSuite?
+Search	kb-search-admin	How do I remove a record from search?
+Source authority	kb-source-authority	What is Source Authority?
+Source authority	kb-source-authority	What happens when two systems disagree on a value?
+Tenants	kb-tenants-entities|kb-identity-foundation	What is a tenant?
+Tenants	kb-tenants-entities	What is a workspace?
+Tenants	kb-tenants-entities	Can two entities have the same registration number?
+Legal page	kb-contracts-console	how do I create a contract
+Legal page	kb-contracts-console	how do I draft a clause
+Legal page	kb-contracts-console	how do I propose a resolution
+Legal page	kb-contracts-console	how do I schedule a board meeting
+Legal page	kb-contracts-console	what is Clause Library & Template Governance
+Legal page	kb-contracts-console|kb-obligations	what is Legal Obligation Tracking
+Legal page	kb-contracts-console	what is Corporate Actions & Counterparty Risk
+Legal page	kb-contracts-console|kb-legal-contracts	what is a clause redline
+Commercial page	kb-procurement-console	how do I set a spend limit
+Commercial page	kb-procurement-console	what is Limits in force
+Commercial page	kb-procurement-console	how do I open a procurement case
+Commercial page	kb-procurement-console	what is the procurement and commercial execution flow
+Commercial page	kb-procurement-console	what is 3-way match
+Commercial page	kb-procurement-console|kb-commercial-ops	what is the invoice approval service
+Purchase Requests page	kb-purchase-requests	how do I cancel a purchase request
+Purchase Requests page	kb-purchase-requests	how do I look up a request
+Purchase Requests page	kb-purchase-requests	how do I submit a purchase request for approval
+Purchase Requests page	kb-purchase-requests	what is the Requisition register
+Tax page	kb-tax-console	how do I create a tax rule
+Tax page	kb-tax-console	how do I evaluate a tax determination
+Tax page	kb-tax-console	how do I assemble a filing
+Tax page	kb-tax-console	how do I export the tax report
+Tax page	kb-tax-console	how do I create a VAT return
+Tax page	kb-tax-console	how do I file a VAT return
+Tax page	kb-tax-console	how do I look up a VAT return
+Tax page	kb-tax-console	what is the VAT GST engine
+Tax page	kb-tax-console	what is the tax governance process flow
+Tax page	kb-tax-console	what is the jurisdiction overview
+Tax page	kb-tax-console	how is net VAT payable calculated
+Tax page	kb-tax-console	what is the Live VAT GST returns register
+Tax page	kb-tax-console	what is Corporate & Withholding Tax
+Tax page	kb-tax-console	what are withholding tax obligations
+Tax page	kb-tax-console	what is Filing Preparation & Authority Interfaces
+Tax page	kb-tax-console	how do I test a tax authority connection
+Compliance page	kb-compliance-console	how do I create a new statutory filing
+Compliance page	kb-compliance-console	how do I evaluate compliance
+Compliance page	kb-compliance-console	how do I upload an evidence manifest
+Compliance page	kb-compliance-console	what is the statutory compliance governance flow
+Compliance page	kb-compliance-console	what are anomaly detection signals
+Compliance page	kb-compliance-console	what is the Decision Support & Audit Readiness Checklist
+Intelligence page	kb-intelligence-console	what is the intelligence pipeline
+Intelligence page	kb-intelligence-console	what is real-time anomaly detection
+Intelligence page	kb-intelligence-console	what is predictive forecasting
+Intelligence page	kb-intelligence-console	what is reconciliation intelligence
+Intelligence page	kb-intelligence-console	what is decision support
+Intelligence page	kb-intelligence-console	what is migration integrity
+Security page	kb-security-console	how do I issue an mTLS certificate
+Security page	kb-security-console	how do I rotate the active key
+Security page	kb-security-console	what is CARTA zero trust
+Security page	kb-security-console	how do I evaluate a test subject
+Security page	kb-security-console	what is the SIEM threat feed
+Security page	kb-security-console	what is the cryptographic trust chain
+Security page	kb-security-console	what is the action risk registry
+Integration page	kb-integration-console	how do I add a connection
+Integration page	kb-integration-console	how do I sync all feeds
+Integration page	kb-integration-console	what is the Connectivity API Bridge
+Integration page	kb-integration-console	what is HRIS Directory Sync
+Integration page	kb-integration-console|kb-integrations	what are External Market Feeds
+Service Inputs page	kb-platform-console	what is the Service Input & Execution Console
+Service Inputs page	kb-platform-console	how do I execute all services

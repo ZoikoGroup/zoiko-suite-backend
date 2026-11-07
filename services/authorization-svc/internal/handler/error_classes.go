@@ -1,5 +1,11 @@
 package handler
 
+import (
+	"net/http"
+
+	apicontract "zoiko.io/identity-envelope/apicontract"
+)
+
 // Governance Control Plane §16 names the stable error classes a caller may
 // rely on. This service's error codes predate them and callers match on the
 // codes, so the class is ADDED beside the code ("error_class") rather than
@@ -46,6 +52,49 @@ var errorClasses = map[string]string{
 
 // ErrorClass returns the §16 class for an error code, or "".
 func ErrorClass(code string) string { return errorClasses[code] }
+
+// legacyErrorProblem turns an error body written through writeJSON
+// (`{"error": code, "message": …, …}`) into an RFC 9457 problem (ZS-API-001
+// §12): error becomes code, message (or detail, or the offending field)
+// becomes detail, and every other member (error_class, approval_status,
+// reason, …) stays as an extension member. writeJSON has no request, so the
+// request and correlation ids come from the response headers the
+// RequestID and correlation middleware already set.
+func legacyErrorProblem(w http.ResponseWriter, status int, v any) (apicontract.Problem, bool) {
+	if status < 400 {
+		return apicontract.Problem{}, false
+	}
+	var m map[string]any
+	switch t := v.(type) {
+	case map[string]any:
+		m = t
+	case map[string]string:
+		m = make(map[string]any, len(t))
+		for k, s := range t {
+			m[k] = s
+		}
+	}
+	code, _ := m["error"].(string)
+	if code == "" {
+		return apicontract.Problem{}, false
+	}
+	p := apicontract.Problem{Status: status, Code: code, Extra: map[string]any{}}
+	detailKey := ""
+	for _, k := range []string{"message", "detail", "field"} {
+		if s, _ := m[k].(string); s != "" {
+			p.Detail, detailKey = s, k
+			break
+		}
+	}
+	for k, val := range m {
+		if k != "error" && (k != detailKey || k == "field") {
+			p.Extra[k] = val
+		}
+	}
+	p.RequestID = w.Header().Get(apicontract.HeaderRequestID)
+	p.CorrelationID = w.Header().Get(apicontract.HeaderLegacyCorrelationID)
+	return p, true
+}
 
 // withErrorClass adds error_class to an error body that has an "error" code
 // with a §16 counterpart. Never mutates the caller's map.

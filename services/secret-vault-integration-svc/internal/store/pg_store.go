@@ -263,14 +263,15 @@ const secretPolicyVersionColumns = `
 	effective_to,
 	version_status,
 	created_at,
-	created_by_principal_id`
+	created_by_principal_id,
+	record_version`
 
 func scanSecretPolicyVersion(row pgx.Row) (*domain.SecretPolicyVersion, error) {
 	v := &domain.SecretPolicyVersion{}
 	err := row.Scan(
 		&v.SecretPolicyVersionID, &v.SecretPolicyID, &v.TenantID, &v.LegalEntityID,
 		&v.AllowedWorkloadIDs, &v.MaxLeaseDurationSeconds, &v.EffectiveFrom, &v.EffectiveTo,
-		&v.VersionStatus, &v.CreatedAt, &v.CreatedByPrincipalID,
+		&v.VersionStatus, &v.CreatedAt, &v.CreatedByPrincipalID, &v.RecordVersion,
 	)
 	return v, err
 }
@@ -439,7 +440,7 @@ type queryRower interface {
 func transitionVersionStatus(ctx context.Context, q queryRower, secretPolicyVersionID, newStatus string, allowedPriors []string) (*domain.SecretPolicyVersion, error) {
 	const query = `
 		UPDATE secret_policy_versions
-		SET version_status = $1
+		SET version_status = $1, record_version = record_version + 1
 		WHERE secret_policy_version_id = $2 AND version_status = ANY($3::text[])
 		RETURNING ` + secretPolicyVersionColumns + `;`
 
@@ -477,7 +478,7 @@ func (s *PgStore) ActivateVersion(ctx context.Context, secretPolicyVersionID, ac
 
 	const supersedeQuery = `
 		UPDATE secret_policy_versions
-		SET version_status = 'SUPERSEDED'
+		SET version_status = 'SUPERSEDED', record_version = record_version + 1
 		WHERE secret_policy_id = $1
 		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($2::uuid, '` + nilScopeUUID + `'::UUID)
 		  AND COALESCE(legal_entity_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
@@ -653,7 +654,8 @@ const secretLeaseColumns = `
 	expires_at,
 	revoked_at,
 	correlation_id,
-	created_at`
+	created_at,
+	record_version`
 
 // secretLeaseReadColumns is secretLeaseColumns with one difference: status
 // is computed at read time rather than trusted verbatim from the stored
@@ -677,14 +679,15 @@ const secretLeaseReadColumns = `
 	expires_at,
 	revoked_at,
 	correlation_id,
-	created_at`
+	created_at,
+	record_version`
 
 func scanSecretLease(row pgx.Row) (*domain.SecretLease, error) {
 	l := &domain.SecretLease{}
 	err := row.Scan(
 		&l.LeaseID, &l.RequestID, &l.SecretPolicyVersionID, &l.SecretClass, &l.SecretPath,
 		&l.RequestedByPrincipalID, &l.TenantID, &l.LegalEntityID, &l.Status,
-		&l.GrantedAt, &l.ExpiresAt, &l.RevokedAt, &l.CorrelationID, &l.CreatedAt,
+		&l.GrantedAt, &l.ExpiresAt, &l.RevokedAt, &l.CorrelationID, &l.CreatedAt, &l.RecordVersion,
 	)
 	return l, err
 }
@@ -854,7 +857,7 @@ func (s *PgStore) RevokeLease(ctx context.Context, leaseID, tenantID string) (*d
 
 	const query = `
 		UPDATE secret_leases
-		SET status = 'REVOKED', revoked_at = NOW()
+		SET status = 'REVOKED', revoked_at = NOW(), record_version = record_version + 1
 		WHERE lease_id = $1 AND status = 'GRANTED'
 		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid)
 		RETURNING ` + secretLeaseColumns + `;`
@@ -887,7 +890,7 @@ func (s *PgStore) RevokeLease(ctx context.Context, leaseID, tenantID string) (*d
 func (s *PgStore) RevokeLeasesBySecretPath(ctx context.Context, secretPath string) ([]*domain.SecretLease, error) {
 	const query = `
 		UPDATE secret_leases
-		SET status = 'REVOKED', revoked_at = NOW()
+		SET status = 'REVOKED', revoked_at = NOW(), record_version = record_version + 1
 		WHERE secret_path = $1 AND status = 'GRANTED'
 		RETURNING ` + secretLeaseColumns + `;`
 
@@ -1114,14 +1117,15 @@ const sharedSecretExceptionColumns = `
 	status,
 	created_at,
 	revoked_at,
-	revoked_by_principal_id`
+	revoked_by_principal_id,
+	record_version`
 
 func scanSharedSecretException(row pgx.Row) (*domain.SharedSecretException, error) {
 	e := &domain.SharedSecretException{}
 	err := row.Scan(
 		&e.ExceptionID, &e.SecretPath, &e.Reason, &e.EvidenceReference,
 		&e.ApprovedByPrincipalID, &e.TenantID, &e.ExpiresAt, &e.Status,
-		&e.CreatedAt, &e.RevokedAt, &e.RevokedBy,
+		&e.CreatedAt, &e.RevokedAt, &e.RevokedBy, &e.RecordVersion,
 	)
 	return e, err
 }
@@ -1269,7 +1273,7 @@ func (s *PgStore) ListSharedSecretExceptions(ctx context.Context, filter domain.
 func (s *PgStore) RevokeSharedSecretException(ctx context.Context, exceptionID, tenantID, actorID string) (*domain.SharedSecretException, bool, error) {
 	const query = `
 		UPDATE shared_secret_exceptions
-		SET status = 'REVOKED', revoked_at = NOW(), revoked_by_principal_id = $3
+		SET status = 'REVOKED', revoked_at = NOW(), revoked_by_principal_id = $3, record_version = record_version + 1
 		WHERE exception_id = $1
 		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid)
 		  AND status IN ('ACTIVE', 'REVOKED')

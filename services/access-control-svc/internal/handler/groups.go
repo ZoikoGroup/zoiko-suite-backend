@@ -137,7 +137,7 @@ func (g *Gov) ListGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	list, err := g.groups.ListGroups(r.Context())
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -150,7 +150,7 @@ func (g *Gov) GetGroup(w http.ResponseWriter, r *http.Request) {
 	grp, err := g.groups.GetGroup(r.Context(), chi.URLParam(r, "group_id"))
 	if err != nil {
 		status, code := classify(err)
-		writeError(w, status, code, err.Error())
+		writeError(w, r, status, code, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, grp)
@@ -162,7 +162,7 @@ func (g *Gov) ListGroupAssignments(w http.ResponseWriter, r *http.Request) {
 	}
 	list, err := g.groups.ListGroupAssignments(r.Context(), chi.URLParam(r, "group_id"), false)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -176,12 +176,12 @@ func (g *Gov) GetGroupAssignment(w http.ResponseWriter, r *http.Request) {
 	ga, err := g.groups.GetGroupAssignment(r.Context(), chi.URLParam(r, "group_assignment_id"))
 	if err != nil {
 		status, code := classify(err)
-		writeError(w, status, code, err.Error())
+		writeError(w, r, status, code, err.Error())
 		return
 	}
 	reqs, err := g.groups.ListGroupAssignmentRequests(r.Context(), ga.GroupAssignmentID, "")
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	for _, a := range reqs {

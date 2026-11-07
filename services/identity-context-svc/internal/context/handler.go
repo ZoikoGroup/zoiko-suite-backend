@@ -21,6 +21,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
 	idenv "zoiko.io/identity-envelope"
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // Action constants passed to authorization-svc as action_type.
@@ -34,7 +35,13 @@ const (
 	IdentitySessionRead       = "IDENTITY_SESSION_READ"
 	IdentitySessionInvalidate = "IDENTITY_SESSION_INVALIDATE"
 	IdentityPrincipalRead     = "IDENTITY_PRINCIPAL_READ"
+	IdentityAuthEventsRead    = "IDENTITY_AUTH_EVENTS_READ"
+	IdentitySubjectMerge      = "IDENTITY_SUBJECT_MERGE"
 	IdentityPrincipalStatus   = "IDENTITY_PRINCIPAL_STATUS_SET"
+	// Subject lifecycle (IC-1).
+	IdentityPrincipalCreate      = "IDENTITY_PRINCIPAL_CREATE"
+	IdentityPasswordResetRequest = "IDENTITY_PASSWORD_RESET_REQUEST"
+	IdentityPasswordResetApprove = "IDENTITY_PASSWORD_RESET_APPROVE"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -87,6 +94,22 @@ type Handler struct {
 
 	// status backs PUT /v1/principals/{id}/status. Nil answers 501.
 	status StatusChanger
+
+	// lifecycle backs the subject lifecycle commands (CreateSubject, Invite,
+	// Activate, ChangePassword, ForgotPassword, RequestReset, DecideReset,
+	// CompleteReset). Nil answers 501 for those routes.
+	lifecycle *lifecycle.Service
+
+	// console backs the IC-2 read models; cursors signs their next_cursor.
+	// Nil answers 501 for those routes.
+	console ConsoleReader
+	cursors *apicontract.CursorSigner
+
+	// identity backs the ORG-01 reads under /v1/identities. Nil answers 501.
+	identity IdentityReader
+
+	// merger backs POST /v1/identities/{id}/merge. Nil answers 501.
+	merger IdentityMerger
 }
 
 // StatusChanger changes a principal's status as one governed command: the
@@ -106,6 +129,12 @@ type StatusChanger interface {
 // WithStatusChanger wires the principal-status command.
 func (h *Handler) WithStatusChanger(s StatusChanger) *Handler {
 	h.status = s
+	return h
+}
+
+// WithLifecycle wires the subject lifecycle commands.
+func (h *Handler) WithLifecycle(s *lifecycle.Service) *Handler {
+	h.lifecycle = s
 	return h
 }
 
@@ -148,7 +177,7 @@ func (h *Handler) throttle(w http.ResponseWriter, r *http.Request, endpoint, ten
 		h.log.Warn("credential endpoint throttled", zap.String("endpoint", endpoint), zap.String("reason", d.Reason),
 			zap.String("client_ip_hash", ratelimit.HashIP(ip)))
 		w.Header().Set("Retry-After", d.RetryAfterSeconds())
-		writeCoded(w, http.StatusTooManyRequests, "too_many_attempts", "too many attempts; retry later")
+		writeCoded(w, r, http.StatusTooManyRequests, "too_many_attempts", "too many attempts; retry later")
 		return ip, false
 	}
 	return ip, true
@@ -241,7 +270,7 @@ func (h *Handler) WithContextCache(c *ContextCacheService) *Handler {
 func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tenantID := r.Header.Get("X-Tenant-Id")
 	if tenantID == "" {
-		writeError(w, http.StatusUnauthorized,
+		writeError(w, r, http.StatusUnauthorized,
 			"X-Tenant-Id is required — the gateway sets it from a verified identity envelope")
 		return "", false
 	}
@@ -259,7 +288,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		writeError(w, http.StatusUnauthorized,
+		writeError(w, r, http.StatusUnauthorized,
 			"X-Principal-Id is required — the gateway sets it from a verified identity envelope")
 		return "", false
 	}
@@ -282,7 +311,7 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 func (h *Handler) requireCorrelation(w http.ResponseWriter, r *http.Request) (string, bool) {
 	correlationID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
 	if correlationID == "" {
-		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved,
+		writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeContextUnresolved,
 			"X-Correlation-ID is required on GOV-01 queries — a governance read must be traceable to the story that caused it")
 		return "", false
 	}
@@ -324,11 +353,11 @@ func (h *Handler) authorizeUnlessSelf(w http.ResponseWriter, r *http.Request, ca
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, action string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityOf(r), action, tenantID); err != nil {
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
-			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+			writeError(w, r, http.StatusForbidden, "not authorized to perform this action")
 			return false
 		}
 		h.log.Error("authorization check failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		writeError(w, r, http.StatusServiceUnavailable, "authorization service unavailable")
 		return false
 	}
 	return true
@@ -361,6 +390,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/mfa/factors", h.ListMFAFactors)
 		r.Post("/principals/{principalID}/mfa/reset", h.ResetPrincipalMFA)
 
+		// ── Passkeys (WebAuthn, AU-11) ───────────────────────────────────────
+		// Same caller rule as TOTP. See handler_passkeys.go.
+		r.Post("/mfa/passkeys/register/begin", h.BeginPasskeyRegistration)
+		r.Post("/mfa/passkeys/register/finish", h.FinishPasskeyRegistration)
+		r.Get("/mfa/passkeys", h.ListPasskeys)
+		r.Post("/mfa/passkeys/revoke", h.RevokePasskey)
+		r.Post("/authenticate/step-up/passkey/begin", h.BeginPasskeyStepUp)
+		r.Post("/authenticate/step-up/passkey/finish", h.FinishPasskeyStepUp)
+
 		// ── GOV-01 queries ───────────────────────────────────────────────────
 		// ResolveTenantContext
 		r.Post("/context/resolve", h.ResolveContext)
@@ -391,6 +429,46 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/principals/{principalID}/roles", h.GetPrincipalRoles)
 		r.Get("/principals/{principalID}/delegations", h.GetPrincipalDelegations)
 		r.Put("/principals/{principalID}/status", h.UpdatePrincipalStatus)
+
+		// ── Console read models (IC-2) ─────────────────────────────────────────
+		r.Get("/principals", h.ListPrincipals)
+		r.Get("/principals/{principalID}/assurance-history", h.GetAssuranceHistory)
+		r.Get("/context/sessions", h.ListSessions)
+		r.Get("/context/support", h.ListSupportContexts)
+		r.Get("/authentication-events", h.ListAuthenticationEvents)
+		r.Get("/identity/summary", h.GetIdentitySummary)
+
+		// ── Subject identity and merge (IC-3) ──────────────────────────────────
+		r.Get("/subjects/{principalID}", h.GetSubjectIdentity)
+		r.Get("/subjects/{principalID}/links", h.ListIdentityLinks)
+		r.Post("/subjects/{survivorID}/merge", h.MergeDuplicateIdentity)
+
+		// ── Subject lifecycle (IC-1) ─────────────────────────────────────────
+		// CreateSubject / Invite: an administrator creates a subject.
+		r.Post("/principals", h.CreateSubject)
+		r.Post("/principals/{principalID}/invite", h.InviteSubject)
+		// Pre-session credential flows (no verified caller): activation,
+		// self-service change, forgotten-password, complete-reset.
+		r.Post("/account/activate", h.ActivateAccount)
+		r.Post("/account/password", h.ChangePassword)
+		r.Post("/account/password/forgot", h.ForgotPassword)
+		r.Post("/account/password/reset", h.CompleteReset)
+		// Administrator-initiated reset, awaiting independent approval.
+		r.Post("/principals/{principalID}/password-resets", h.RequestReset)
+		r.Post("/password-resets/{resetID}/decide", h.DecideReset)
+		r.Get("/password-resets/{resetID}", h.GetReset)
+		// The Password resets register (console read model).
+		r.Get("/password-resets", h.ListPasswordResets)
+
+		// ── ORG-01 identity surface (handler_identity.go) ────────────────────
+		// The same spec operations as /subjects above, over the
+		// assurance-observation and filtered authentication-event read models.
+		// Both merge routes share one alias ledger check (store.mergedAway).
+		r.Get("/identities/{principalID}", h.GetIdentity)
+		r.Get("/identities/{principalID}/links", h.ListIdentityProviderLinks)
+		r.Get("/identities/{principalID}/assurance-history", h.GetIdentityAssuranceHistory)
+		r.Get("/identities/{principalID}/authentication-events", h.ListIdentityAuthenticationEvents)
+		r.Post("/identities/{principalID}/merge", h.MergeIdentity)
 	})
 }
 
@@ -399,7 +477,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 	var req domain.ResolveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
+		writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
 		return
 	}
 
@@ -432,7 +510,7 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 		pf, err := h.dpop.Verify(proof, idenv.RequestMethod(r), idenv.RequestHTU(r), req.BearerToken)
 		if err != nil {
 			w.Header().Set("WWW-Authenticate", `DPoP error="invalid_dpop_proof"`)
-			writeCoded(w, http.StatusUnauthorized, "invalid_dpop_proof", err.Error())
+			writeCoded(w, r, http.StatusUnauthorized, "invalid_dpop_proof", err.Error())
 			return
 		}
 		req.DPoPJKT = pf.JKT
@@ -460,14 +538,14 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, domain.ErrIngressTenantMismatch):
 			// 401, not 403. The caller is not forbidden from an action — the
 			// context in which they claimed to act could not be established.
-			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeContextUnresolved,
+			writeCoded(w, r, http.StatusUnauthorized, domain.ErrCodeContextUnresolved,
 				"context could not be resolved for this request")
 		case errors.Is(err, domain.ErrResidencyDenied):
-			writeCoded(w, http.StatusForbidden, domain.ErrCodeResidencyDenied, err.Error())
+			writeCoded(w, r, http.StatusForbidden, domain.ErrCodeResidencyDenied, err.Error())
 		case errors.Is(err, ErrSAMLUnsupported):
-			writeCoded(w, http.StatusBadRequest, domain.ErrCodeUnsupported, err.Error())
+			writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeUnsupported, err.Error())
 		case errors.Is(err, ErrTrustPostureBlocked):
-			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeTrustPostureBlocked, err.Error())
+			writeCoded(w, r, http.StatusUnauthorized, domain.ErrCodeTrustPostureBlocked, err.Error())
 		// A refused support elevation. 401 rather than 403 for the same reason
 		// the ingress mismatch above is 401: the caller is not forbidden an
 		// action, the context it claimed to act in could not be established.
@@ -475,23 +553,23 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 		// These two codes were declared for exactly this and, until now, were
 		// reachable only from the support read/revoke routes.
 		case errors.Is(err, domain.ErrSupportContextExpired):
-			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeBreakGlassExpired, err.Error())
+			writeCoded(w, r, http.StatusUnauthorized, domain.ErrCodeBreakGlassExpired, err.Error())
 		case errors.Is(err, domain.ErrSupportContextNotFound):
-			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeBreakGlassRequired, err.Error())
+			writeCoded(w, r, http.StatusUnauthorized, domain.ErrCodeBreakGlassRequired, err.Error())
 		// Not the caller's fault: support is unwired in this deployment, so
 		// the assertion could not be checked either way. 503, not 401.
 		case errors.Is(err, domain.ErrSupportContextUnverifiable):
-			writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, err.Error())
+			writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, err.Error())
 		case errors.Is(err, ErrTokenInvalid),
 			errors.Is(err, ErrPrincipalInactive),
 			errors.Is(err, ErrTenantInactive),
 			errors.Is(err, ErrEntityUnauthorized),
 			errors.Is(err, ErrNoToken):
-			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeContextUnresolved, err.Error())
+			writeCoded(w, r, http.StatusUnauthorized, domain.ErrCodeContextUnresolved, err.Error())
 		case errors.Is(err, ErrUpstreamUnavailable):
-			writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, err.Error())
+			writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, err.Error())
 		default:
-			writeCoded(w, http.StatusInternalServerError, domain.ErrCodeContextUnresolved, "internal error")
+			writeCoded(w, r, http.StatusInternalServerError, domain.ErrCodeContextUnresolved, "internal error")
 		}
 		return
 	}
@@ -544,11 +622,11 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 
 	sc, err := h.sessions.GetSessionContext(r.Context(), sessionContextID, tenantID)
 	if err != nil || sc == nil {
-		writeError(w, http.StatusNotFound, "session not found or expired")
+		writeError(w, r, http.StatusNotFound, "session not found or expired")
 		return
 	}
 	if sc.TenantID != tenantID {
-		writeError(w, http.StatusNotFound, "session not found or expired")
+		writeError(w, r, http.StatusNotFound, "session not found or expired")
 		return
 	}
 	// Even within the tenant, handing one principal's envelope to another is
@@ -559,7 +637,7 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 
 	jwt, err := h.sessions.Get(r.Context(), sessionContextID, tenantID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "session not found or expired")
+		writeError(w, r, http.StatusNotFound, "session not found or expired")
 		return
 	}
 	writeJSON(w, http.StatusOK, domain.GetSessionResponse{EnvelopeJWT: jwt})
@@ -592,11 +670,11 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 
 	sc, err := h.sessions.GetSessionContext(r.Context(), sessionContextID, tenantID)
 	if err != nil || sc == nil {
-		writeError(w, http.StatusNotFound, "session not found or expired")
+		writeError(w, r, http.StatusNotFound, "session not found or expired")
 		return
 	}
 	if sc.TenantID != tenantID {
-		writeError(w, http.StatusNotFound, "session not found or expired")
+		writeError(w, r, http.StatusNotFound, "session not found or expired")
 		return
 	}
 	if !h.authorizeUnlessSelf(w, r, callerPrincipalID, sc.PrincipalID, tenantID, IdentitySessionInvalidate) {
@@ -605,7 +683,7 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 
 	var req domain.InvalidateSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -620,7 +698,7 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 	// The reason is not decoration: it is what the evidence record says about
 	// why a session ended, and it is what a reviewer groups by.
 	if !domain.ValidInvalidationReason(req.Reason) {
-		writeError(w, http.StatusBadRequest,
+		writeError(w, r, http.StatusBadRequest,
 			`reason is required and must be one of LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED`)
 		return
 	}
@@ -631,7 +709,7 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 		r.Context(), sessionContextID, tenantID, req.Reason, callerPrincipalID, correlationID,
 	); err != nil {
 		h.log.Error("invalidate session failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to invalidate session")
+		writeError(w, r, http.StatusInternalServerError, "failed to invalidate session")
 		return
 	}
 	// A logout ends the login session the envelope came from, so a refresh
@@ -663,10 +741,10 @@ func (h *Handler) GetPrincipal(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := h.principals.FindByID(r.Context(), principalID, tenantID)
 	if err != nil || p == nil {
-		writeError(w, http.StatusNotFound, "principal not found")
+		writeError(w, r, http.StatusNotFound, "principal not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSONWithETag(w, http.StatusOK, p, p.RecordVersion)
 }
 
 // ── GET /v1/principals/:principalID/roles ────────────────────────────────────
@@ -686,7 +764,7 @@ func (h *Handler) GetPrincipalRoles(w http.ResponseWriter, r *http.Request) {
 	}
 	assignments, err := h.principals.FindActiveRoleAssignments(r.Context(), principalID, tenantID, nil)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to retrieve role assignments")
+		writeError(w, r, http.StatusInternalServerError, "failed to retrieve role assignments")
 		return
 	}
 	writeJSON(w, http.StatusOK, assignments)
@@ -709,7 +787,7 @@ func (h *Handler) GetPrincipalDelegations(w http.ResponseWriter, r *http.Request
 	}
 	delegations, err := h.principals.FindActiveDelegations(r.Context(), principalID, tenantID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to retrieve delegations")
+		writeError(w, r, http.StatusInternalServerError, "failed to retrieve delegations")
 		return
 	}
 	writeJSON(w, http.StatusOK, delegations)
@@ -743,19 +821,34 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	principalID := chi.URLParam(r, "principalID")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	p, err := h.principals.FindByID(r.Context(), principalID, tenantID)
+	if err != nil || p == nil {
+		writeError(w, r, http.StatusNotFound, "principal not found")
+		return
+	}
+
+	// Authorization (including the no-self-exemption rule) is decided before
+	// the version precondition: a caller who may not touch the aggregate at
+	// all hears 403, never 428. The If-Match check only matters once the
+	// caller is cleared to act.
 	if !h.authorize(w, r, callerPrincipalID, tenantID, IdentityPrincipalStatus) {
 		return
 	}
+
+	if !h.requireIfMatch(w, r, p.RecordVersion) {
+		return
+	}
+
 	if h.status == nil {
 		// An unconfigured privileged command is unavailable, not silently a
 		// row update that tells nobody (see StatusChanger).
-		writeError(w, http.StatusNotImplemented, "principal status changes are not configured")
+		writeError(w, r, http.StatusNotImplemented, "principal status changes are not configured")
 		return
 	}
 
 	var req domain.UpdateStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -764,12 +857,12 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	); err != nil {
 		switch {
 		case errors.Is(err, lifecycle.ErrInvalid):
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeError(w, r, http.StatusBadRequest, err.Error())
 		case errors.Is(err, lifecycle.ErrForbidden):
-			writeCoded(w, http.StatusForbidden, "self_status_change", err.Error())
+			writeCoded(w, r, http.StatusForbidden, "self_status_change", err.Error())
 		default:
 			h.log.Error("principal status change failed", zap.Error(err))
-			writeError(w, http.StatusInternalServerError, "failed to update status")
+			writeError(w, r, http.StatusInternalServerError, "failed to update status")
 		}
 		return
 	}
@@ -779,60 +872,34 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-// errorResponse is the refusal body.
-//
-// ErrorCode carries one of the spec's stable error classes (section 16). The
-// message is for a human reading a log; the CODE is what a client branches on,
-// and it is the half that must not change with a refactor. Before this, every
-// refusal from this service was an untyped message string, so a caller could
-// only distinguish "wrong password" from "residency denied" by matching prose.
-type errorResponse struct {
-	Error         string `json:"error"`
-	ErrorCode     string `json:"error_code,omitempty"`
-	CorrelationID string `json:"correlation_id,omitempty"`
-	EvidenceID    string `json:"evidence_id,omitempty"`
-}
-
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeCoded(w, status, "", msg)
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
 }
 
-// writeCoded is writeError with one of the spec's stable error classes.
-//
-// The body is an RFC 9457 problem document (ZS-API-001 §12, AU-24): type,
-// title, status, detail and the lower_snake_case code clients branch on.
-// error and error_code keep their old meaning (the message, and the spec's
-// upper-case class) until every consumer reads code.
-func writeCoded(w http.ResponseWriter, status int, code, msg string) {
-	slug := strings.ToLower(code)
-	if slug == "" {
-		slug = strings.ToLower(strings.ReplaceAll(http.StatusText(status), " ", "_"))
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
+}
+
+func writeError(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	writeCoded(w, r, status, "", msg)
+}
+
+// writeCoded writes an RFC 9457 problem document using the shared apicontract package.
+func writeCoded(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	if code == "" {
+		code = strings.ToLower(strings.ReplaceAll(http.StatusText(status), " ", "_"))
 	}
-	body := map[string]any{
-		"type":      "https://api.zoikosuite.com/problems/" + strings.ReplaceAll(slug, "_", "-"),
-		"title":     http.StatusText(status),
-		"status":    status,
-		"detail":    msg,
-		"code":      slug,
-		"retryable": status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests,
-		"error":     msg,
-	}
-	if code != "" {
-		body["error_code"] = code
-	}
-	if rid := w.Header().Get("Zoiko-Request-Id"); rid != "" {
-		body["request_id"] = rid
-		body["instance"] = "urn:zoikosuite:problem:" + rid
-	}
-	w.Header().Set("Content-Type", "application/problem+json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	p := apicontract.ProblemFor(status, code, msg)
+	apicontract.WriteProblem(w, r, p)
 }
 
 // Ensure the interfaces defined in interfaces.go are satisfied at compile time.
@@ -868,21 +935,21 @@ var _ RiskSignalCache = (*session.RiskSignalCache)(nil)
 func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
 	switch h.authEndpoint {
 	case "disabled":
-		writeCoded(w, http.StatusNotFound, "endpoint_disabled",
+		writeCoded(w, r, http.StatusNotFound, "endpoint_disabled",
 			"password login is disabled; use the OAuth authorization code flow at /oauth2/authorize")
 		return
 	case "internal":
 		// IAM §18 prohibits the resource-owner password grant for clients.
 		// This route stays for platform tooling over mTLS only (AU-06).
 		if h.peerName == nil || h.peerName(r) == "" {
-			writeCoded(w, http.StatusForbidden, "password_grant_prohibited",
+			writeCoded(w, r, http.StatusForbidden, "password_grant_prohibited",
 				"clients sign in with the OAuth authorization code flow (/oauth2/authorize); this route is for mTLS platform tooling")
 			return
 		}
 	}
 	var req domain.AuthenticateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.CorrelationID == "" {
@@ -900,27 +967,27 @@ func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrRequestInvalid):
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeError(w, r, http.StatusBadRequest, err.Error())
 		case errors.Is(err, ErrInvalidClient):
 			// The OAuth client did not authenticate (R-1). Distinct from a wrong
 			// password: it says nothing about the account, and was decided
 			// before the account was touched.
-			writeCoded(w, http.StatusUnauthorized, "invalid_client", "invalid client credentials")
+			writeCoded(w, r, http.StatusUnauthorized, "invalid_client", "invalid client credentials")
 		case errors.Is(err, ErrInvalidCredentials):
 			// One message for every rejection reason. See ErrInvalidCredentials
 			// — the reason is in access_decision_log and the event stream, not
 			// on the wire, so this response cannot be used to enumerate
 			// accounts or probe lockout state.
-			writeError(w, http.StatusUnauthorized, "invalid credentials")
+			writeError(w, r, http.StatusUnauthorized, "invalid credentials")
 		case errors.Is(err, ErrAuthUnavailable):
 			// 503, not 401: the attempt could not be decided. Collapsing the
 			// two would report an outage as a wrong password.
 			h.log.Error("authentication unavailable", zap.Error(err),
 				zap.String("correlation_id", req.CorrelationID))
-			writeError(w, http.StatusServiceUnavailable, "authentication unavailable")
+			writeError(w, r, http.StatusServiceUnavailable, "authentication unavailable")
 		default:
 			h.log.Error("unexpected authentication error", zap.Error(err))
-			writeError(w, http.StatusInternalServerError, "internal error")
+			writeError(w, r, http.StatusInternalServerError, "internal error")
 		}
 		return
 	}

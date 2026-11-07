@@ -38,7 +38,7 @@ func newWave2(t *testing.T) *wave2 {
 	t.Helper()
 	w := &wave2{t: t, tenant: uuid.NewString(), entity: uuid.NewString(), src: newFakeSources(), defs: map[string]string{}}
 	endpoints := map[string]string{}
-	for _, sys := range []string{catalogue.SysAR, catalogue.SysAP, catalogue.SysGL, catalogue.SysBanking} {
+	for _, sys := range []string{catalogue.SysAR, catalogue.SysAP, catalogue.SysGL, catalogue.SysBanking, catalogue.SysPaymentRun, catalogue.SysTreasury, catalogue.SysPaymentInitiation} {
 		s := w.src.server(sys)
 		t.Cleanup(s.Close)
 		endpoints[sys] = s.URL
@@ -205,10 +205,184 @@ func TestWave2_BankToCash_ExclusionsAreEvidenced_AndOutstandingItemsAreAged(t *t
 	assert.Empty(t, snaps[1].Exclusions)
 }
 
+// ── FIN-CTRL-004: payment provider settlement ────────────────────────────────
+
+func TestWave2_ProviderSettlement_PaymentsPairWithBankDebitsAndEveryOtherItemIsDisclosed(t *testing.T) {
+	w := newWave2(t)
+	pay := func(id, ref, amt, date, status string) domain.PopulationRecord {
+		return attrs(recAt(id, ref, amt, date), "status", status)
+	}
+	bank := func(id, ref, amt, date, direction string) domain.PopulationRecord {
+		return attrs(recAt(id, ref, amt, date), "status", "NORMALIZED", "direction", direction)
+	}
+	tied := func() {
+		w.src.set(catalogue.SysPaymentInitiation, "payment-attempts", "pa-wm",
+			pay("a1", "PAY-1", "-100.00", "2026-09-01", "SUBMITTED"),
+			pay("a2", "PAY-2", "-40.00", "2026-09-02", "SUBMITTED"),
+			pay("a3", "PAY-3", "-9.00", "2026-09-03", "CANCELLED"))
+		// the bank books each debit one day after the execution date, as banks do
+		w.src.set(catalogue.SysBanking, "bank-transactions", "bk-wm",
+			bank("b1", "PAY-1", "-100.00", "2026-09-02", "DEBIT"),
+			bank("b2", "PAY-2", "-40.00", "2026-09-03", "DEBIT"),
+			bank("b3", "CUST-RCPT", "500.00", "2026-09-04", "CREDIT"),
+			attrs(recAt("b1old", "PAY-1", "-100.00", "2026-09-02"), "status", "SUPERSEDED", "direction", "DEBIT"))
+	}
+
+	// Without an approved date tolerance the settlement lag is a mismatch: the date tolerance is a controlled
+	// decision (§34) made per entity, never baked into the definition.
+	tied()
+	run, final := w.run("FIN-CTRL-004", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	list, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	for _, x := range list {
+		assert.Equal(t, domain.ReasonDateOutOfTol, x.ReasonCode, "tolerance is 0 days until a policy is approved")
+	}
+
+	// The entity approves a 3-day settlement lag for this control; later runs pin it.
+	_, err = testStore.CreateTolerancePolicy(ctx, w.tenant, "maker", domain.CreateTolerancePolicyRequest{
+		LegalEntityID: w.entity, Metric: "FIN-CTRL-004", AbsoluteTolerance: "0", Currency: "USD", DateToleranceDays: 3,
+		Rationale: "bank booking lag", EffectiveFrom: "2026-01-01", ApprovedBy: "treasurer"})
+	require.NoError(t, err)
+
+	tied()
+	run, final = w.run("FIN-CTRL-004", nil)
+	assert.Equal(t, domain.ResultPass, final.ResultState, "every instructed payment is settled at the bank")
+	snaps, err := testStore.ListPopulationSnapshots(ctx, w.tenant, run.RunID)
+	require.NoError(t, err)
+	require.Len(t, snaps[0].Exclusions, 1)
+	assert.Equal(t, "TREASURER", snaps[0].Exclusions[0].Authority)
+	assert.Equal(t, 1, snaps[0].Exclusions[0].Count, "the cancelled attempt")
+	assert.Len(t, snaps[1].Exclusions, 2, "the receipt and the superseded row")
+
+	// A payment the bank never debited (old enough not to be in transit), a wrong amount, and a bank debit nobody
+	// instructed are each their own exception: nothing is netted away.
+	w.src.set(catalogue.SysPaymentInitiation, "payment-attempts", "pa-wm2",
+		pay("a1", "PAY-1", "-100.00", "2026-09-01", "SUBMITTED"),
+		pay("a2", "PAY-2", "-40.00", "2026-09-02", "SUBMITTED"),
+		pay("a4", "PAY-4", "-75.00", "2026-09-03", "SUBMITTED"))
+	w.src.set(catalogue.SysBanking, "bank-transactions", "bk-wm2",
+		bank("b1", "PAY-1", "-100.00", "2026-09-02", "DEBIT"),
+		bank("b2", "PAY-2", "-39.00", "2026-09-03", "DEBIT"),
+		bank("b9", "BANK-FEE", "-3.00", "2026-09-04", "DEBIT"))
+	run, final = w.run("FIN-CTRL-004", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	list, err = testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	reasons := map[string][]string{}
+	for _, x := range list {
+		reasons[x.ReasonCode] = append(reasons[x.ReasonCode], x.RecordIDs...)
+		assert.Equal(t, "TREASURY_OWNER", x.OwnerRole)
+	}
+	assert.Len(t, list, 3, "PAY-2 amount difference, PAY-4 unsettled, BANK-FEE unexplained: %v", reasons)
+	assert.Contains(t, reasons[domain.ReasonAmountMismatch], "a2", "-40.00 instructed against -39.00 at the bank")
+	assert.Equal(t, []string{"a4"}, reasons[domain.ReasonMissingDownstream], "instructed 27 days before the period end, never debited")
+	assert.Equal(t, []string{"b9"}, reasons[domain.ReasonMissingSource], "a bank debit nobody instructed")
+}
 func recAt(id, ref, amt, date string) domain.PopulationRecord {
 	x := r(id, ref, amt)
 	x.Date = date
 	return x
+}
+
+// ── FIN-CTRL-029: unapplied cash aging ───────────────────────────────────────
+
+func TestWave2_UnappliedCashAging_EveryAgedReceiptIsAFindingAndTheCutOffIsPerRun(t *testing.T) {
+	w := newWave2(t)
+	w.src.noPeriod[catalogue.SysAR+"/aged-unapplied-receipts"] = true // the real endpoint rejects period_id
+	sc := func(js string) func(*domain.CreateRunRequest) {
+		return func(r *domain.CreateRunRequest) { r.Scope = json.RawMessage(js) }
+	}
+
+	w.src.set(catalogue.SysAR, "aged-unapplied-receipts", "wm")
+	_, final := w.run("FIN-CTRL-029", sc(`{"unapplied_before":"2026-09-01"}`))
+	assert.Equal(t, domain.ResultPass, final.ResultState, "no aged unapplied cash: pass")
+
+	w.src.set(catalogue.SysAR, "aged-unapplied-receipts", "wm2",
+		r("rc1", "SET-1", "100.00"), r("rc2", "SET-2", "150.00"))
+	run, final := w.run("FIN-CTRL-029", sc(`{"unapplied_before":"2026-09-01"}`))
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, ex, 2)
+	for _, e := range ex {
+		assert.Equal(t, "CLASSIFICATION", e.Category)
+		assert.Equal(t, "UNAPPLIED_CASH_AGED", e.ReasonCode)
+	}
+	assert.Equal(t, "2026-09-01", w.src.lastQuery(catalogue.SysAR).Get("unapplied_before"))
+	assert.Empty(t, w.src.lastQuery(catalogue.SysAR).Get("period_id"))
+
+	// a run without the cut-off cannot silently widen the population: it fails closed, never passes
+	_, final = w.run("FIN-CTRL-029", nil)
+	assert.NotEqual(t, domain.ResultPass, final.ResultState)
+	assert.Equal(t, domain.ResultIndeterminate, final.ResultState)
+}
+
+// ── FIN-CTRL-026: FX rate source completeness ────────────────────────────────
+
+func TestWave2_FXRateCompleteness_MissingBusinessDayAndDeadPair(t *testing.T) {
+	w := newWave2(t) // the run period is 2026-09 and "today" is 2026-09-30
+	var recs []domain.PopulationRecord
+	for d := 1; d <= 30; d++ {
+		day := time.Date(2026, 9, d, 0, 0, 0, 0, time.UTC)
+		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday || d == 16 { // Wed 16 Sep has no rate
+			continue
+		}
+		ds := day.Format("2006-01-02")
+		recs = append(recs, attrs(recAt(fmt.Sprintf("f%d", d), "EUR/USD", "1.08000000", ds), "pair", "EUR/USD", "rate_type", "SPOT", "source", "ECB"))
+	}
+	w.src.set(catalogue.SysGL, "fx-rate-observations", "wm", recs...)
+	run, final := w.run("FIN-CTRL-026", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	list, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, []string{"gap:EUR/USD:2026-09-16..2026-09-16"}, list[0].RecordIDs)
+	q := w.src.lastQuery(catalogue.SysGL)
+	assert.Equal(t, "2026-09", q.Get("period_id"), "the month under test is sent to the source")
+	assert.Equal(t, "SPOT", q.Get("rate_type"), "the rate type defaults to SPOT")
+
+	// A pair listed in fx_pairs_expected that delivered nothing cannot pass: the catalogue definition built with a
+	// pair list names it, so it is covered even when the whole feed is dead.
+	defs, err := catalogue.Wave2(catalogue.Wave2Options{ARControlAccounts: "1200", APControlAccounts: "2000", CashAccounts: "1000",
+		FXPairsExpected: []string{"EUR/USD", "GBP/USD"}, EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	for _, d := range defs {
+		if d.ControlCode != "FIN-CTRL-026" {
+			continue
+		}
+		l, err := domain.ParseRuleLogic(d.InitialLogic)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"EUR/USD", "GBP/USD"}, l.ExpectedGroups)
+		assert.Equal(t, "pair", l.GroupAttr)
+	}
+}
+
+// ── FIN-CTRL-030: supplier unapplied payment aging ───────────────────────────
+
+func TestWave2_SupplierUnappliedPaymentAging_EverySettledUnappliedPayableIsAFinding(t *testing.T) {
+	w := newWave2(t)
+	w.src.noPeriod[catalogue.SysPaymentRun+"/unapplied-supplier-payments"] = true // the real endpoint rejects period_id
+	sc := func(r *domain.CreateRunRequest) { r.Scope = json.RawMessage(`{"unapplied_before":"2026-09-01"}`) }
+
+	w.src.set(catalogue.SysPaymentRun, "unapplied-supplier-payments", "wm")
+	_, final := w.run("FIN-CTRL-030", sc)
+	assert.Equal(t, domain.ResultPass, final.ResultState, "no settled-but-unapplied supplier payments: pass")
+
+	w.src.set(catalogue.SysPaymentRun, "unapplied-supplier-payments", "wm2", r("i1:AP_INVOICE:INV-1", "INV-1", "90.00"))
+	run, final := w.run("FIN-CTRL-030", sc)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, ex, 1)
+	assert.Equal(t, "CLASSIFICATION", ex[0].Category)
+	assert.Equal(t, "SUPPLIER_PAYMENT_UNAPPLIED", ex[0].ReasonCode)
+	assert.Equal(t, "2026-09-01", w.src.lastQuery(catalogue.SysPaymentRun).Get("unapplied_before"))
+	assert.Empty(t, w.src.lastQuery(catalogue.SysPaymentRun).Get("period_id"))
+
+	_, final = w.run("FIN-CTRL-030", nil)
+	assert.Equal(t, domain.ResultIndeterminate, final.ResultState, "no cut-off: fails closed, never passes")
 }
 
 // ── FIN-CTRL-027 / 028 / 032 ─────────────────────────────────────────────────
@@ -297,7 +471,7 @@ func TestWave2_TenantIsolationAcrossSeededCatalogue(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrNotFound, "another tenant cannot run this tenant's control")
 	defs, err := testStore.ListDefinitions(ctx, w.tenant, 50)
 	require.NoError(t, err)
-	assert.Len(t, defs, 6)
+	assert.Len(t, defs, 10)
 }
 
 // A rule version's logic cannot change under an approved/pinned run: a newer, looser

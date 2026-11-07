@@ -73,7 +73,7 @@ func assignTo(s *sodRuleStore, entity string) (int, map[string]any) {
 func TestAssignmentSoD_ConflictWithHeldRefused(t *testing.T) {
 	s := newSoDAssignStore([]string{"payment.prepare"}, "payment.release")
 	code, got := assignTo(s, "22222222-2222-4222-8222-222222222222")
-	if code != http.StatusConflict || got["error"] != "sod_conflict" {
+	if code != http.StatusConflict || got["code"] != "sod_conflict" {
 		t.Fatalf("preparer given the release role: want 409 sod_conflict, got %d %v", code, got)
 	}
 	c := got["conflicts"].([]any)[0].(map[string]any)

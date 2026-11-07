@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 	authzpkg "zoiko.io/mtls-management-svc/internal/authz"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/domain"
@@ -43,11 +44,11 @@ const tenantKey ctxKey = "tenant_id"
 func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tenantID := r.Header.Get("X-Tenant-ID")
 	if tenantID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "missing_tenant_scope",
-			"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status:    http.StatusUnauthorized,
+			Code:      "missing_tenant_scope",
+			Detail:    "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+			Retryable: false,
 		})
 		return "", false
 	}
@@ -125,7 +126,7 @@ func New(s store.Store, c *ca.CA, ledger *ca.Ledger, siemClient *siem.Client, az
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		h.errJSON(w, http.StatusUnauthorized,
+		h.errJSON(w, r, http.StatusUnauthorized,
 			"X-Principal-Id is required — the gateway sets it from a verified identity envelope")
 		return "", false
 	}
@@ -168,15 +169,15 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, scopeID, actionType string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, scopeID, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			h.errJSON(w, http.StatusForbidden, "not authorized to perform this action")
+			h.errJSON(w, r, http.StatusForbidden, "not authorized to perform this action")
 			return false
 		}
 		if errors.Is(err, authzpkg.ErrAuthorizationRejected) {
-			h.errJSON(w, http.StatusBadRequest, "authorization-svc rejected the request's scope (legal_entity_id or tenant)")
+			h.errJSON(w, r, http.StatusBadRequest, "authorization-svc rejected the request's scope (legal_entity_id or tenant)")
 			return false
 		}
 		h.logger.Error("authorization check failed", zap.Error(err))
-		h.errJSON(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		h.errJSON(w, r, http.StatusServiceUnavailable, "authorization service unavailable")
 		return false
 	}
 	return true
@@ -191,6 +192,8 @@ func NewRouter(h *Handler) http.Handler {
 	// request reaches business logic without a resolved tenant, actor,
 	// correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy(), svcenvelope.DefaultReporter()))
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -250,7 +253,7 @@ func (h *Handler) GetCRL(w http.ResponseWriter, r *http.Request) {
 	der, err := h.ca.SignCRL(h.ledger.Entries(), time.Now().UTC())
 	if err != nil {
 		h.logger.Error("failed to sign CRL", zap.Error(err))
-		h.errJSON(w, http.StatusInternalServerError, "failed to sign CRL")
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to sign CRL")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -270,11 +273,11 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 	}
 	var req domain.ProvisionCertRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errJSON(w, 400, "invalid body")
+		h.errJSON(w, r, 400, "invalid body")
 		return
 	}
 	if err := req.Validate(); err != nil {
-		h.errJSON(w, 400, err.Error())
+		h.errJSON(w, r, 400, err.Error())
 		return
 	}
 
@@ -302,7 +305,7 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			h.logger.Warn("mtls: bootstrap token presented but not recognised — refused",
 				zap.String("claimed_service", req.ServiceName))
-			h.errJSONCode(w, http.StatusUnauthorized, "invalid_bootstrap_token",
+			h.errJSONCode(w, r, http.StatusUnauthorized, "invalid_bootstrap_token",
 				"the bootstrap token is not valid for any service")
 			return
 		}
@@ -313,7 +316,7 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 			h.logger.Warn("mtls: bootstrap token used for another identity — refused",
 				zap.String("token_service", service),
 				zap.String("service_name", req.ServiceName), zap.String("common_name", req.CommonName))
-			h.errJSONCode(w, http.StatusForbidden, "bootstrap_identity_mismatch",
+			h.errJSONCode(w, r, http.StatusForbidden, "bootstrap_identity_mismatch",
 				"a bootstrap token provisions only its own service: service_name and common_name must both be "+service)
 			return
 		}
@@ -326,7 +329,7 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 		issued, err := h.ca.IssueLeaf(service, []string{service}, uriSANs, time.Duration(req.RotationDays)*24*time.Hour)
 		if err != nil {
 			h.logger.Error("failed to issue leaf certificate", zap.String("common_name", service), zap.Error(err))
-			h.errJSON(w, 500, "failed to issue certificate")
+			h.errJSON(w, r, 500, "failed to issue certificate")
 			return
 		}
 		h.recordAndRespond(w, r, tenantID, "bootstrap:"+service, req, issued)
@@ -350,7 +353,7 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 	issued, err := h.ca.IssueLeaf(req.CommonName, []string{req.ServiceName}, uriSANs, time.Duration(req.RotationDays)*24*time.Hour)
 	if err != nil {
 		h.logger.Error("failed to issue leaf certificate", zap.String("common_name", req.CommonName), zap.Error(err))
-		h.errJSON(w, 500, "failed to issue certificate")
+		h.errJSON(w, r, 500, "failed to issue certificate")
 		return
 	}
 	h.recordAndRespond(w, r, tenantID, principalID, req, issued)
@@ -381,7 +384,7 @@ func (h *Handler) recordAndRespond(w http.ResponseWriter, r *http.Request, tenan
 		UpdatedAt:      now,
 	}
 	if err := h.store.CreateCert(r.Context(), tenantID, cert); err != nil {
-		h.errJSON(w, 500, "failed to provision certificate")
+		h.errJSON(w, r, 500, "failed to provision certificate")
 		return
 	}
 
@@ -390,7 +393,7 @@ func (h *Handler) recordAndRespond(w http.ResponseWriter, r *http.Request, tenan
 	h.siem.Stream(r.Context(), tenantID, "certificate.issued", siem.SeverityLow,
 		"Certificate issued for "+req.ServiceName+" ("+req.CommonName+") by "+issuedByPrincipalID)
 
-	h.okJSON(w, 201, domain.ProvisionCertResult{
+	h.okJSON(w, r, 201, domain.ProvisionCertResult{
 		Certificate:   *cert,
 		PrivateKeyPEM: string(issued.PrivateKeyPEM),
 		CACertPEM:     string(h.ca.CertificatePEM()),
@@ -408,7 +411,7 @@ func (h *Handler) GetCert(w http.ResponseWriter, r *http.Request) {
 	}
 	cert, err := h.store.GetCertByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		h.errJSON(w, 404, "certificate not found")
+		h.errJSON(w, r, 404, "certificate not found")
 		return
 	}
 	// Authorized against the certificate row own legal entity, never a
@@ -419,7 +422,7 @@ func (h *Handler) GetCert(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, cert.LegalEntityID, MtlsCertRead) {
 		return
 	}
-	h.okJSON(w, 200, cert)
+	h.okJSON(w, r, 200, cert)
 }
 
 // ListCerts now REQUIRES legal_entity_id rather than treating it as an
@@ -442,7 +445,7 @@ func (h *Handler) ListCerts(w http.ResponseWriter, r *http.Request) {
 	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	if legalEntityID == "" {
-		h.errJSON(w, http.StatusBadRequest,
+		h.errJSON(w, r, http.StatusBadRequest,
 			"legal_entity_id query parameter is required — it is the authorization scope for this listing")
 		return
 	}
@@ -451,13 +454,13 @@ func (h *Handler) ListCerts(w http.ResponseWriter, r *http.Request) {
 	}
 	certs, err := h.store.ListCerts(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("status"))
 	if err != nil {
-		h.errJSON(w, 500, "failed to list certificates")
+		h.errJSON(w, r, 500, "failed to list certificates")
 		return
 	}
 	if certs == nil {
 		certs = []domain.MtlsCertificate{}
 	}
-	h.okJSON(w, 200, map[string]interface{}{"data": certs, "count": len(certs)})
+	h.okJSON(w, r, 200, map[string]interface{}{"data": certs, "count": len(certs)})
 }
 
 func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
@@ -474,7 +477,7 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 
 	existing, err := h.store.GetCertByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, 404, "certificate not found")
+		h.errJSON(w, r, 404, "certificate not found")
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, MtlsCertRotate) {
@@ -493,7 +496,7 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 	issued, err := h.ca.IssueLeaf(existing.CommonName, []string{existing.ServiceName}, uriSANs, time.Duration(existing.RotationDays)*24*time.Hour)
 	if err != nil {
 		h.logger.Error("failed to issue rotated certificate", zap.String("id", id), zap.Error(err))
-		h.errJSON(w, 500, "failed to rotate certificate")
+		h.errJSON(w, r, 500, "failed to rotate certificate")
 		return
 	}
 
@@ -503,18 +506,18 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 		// Rotation used to set the status back to ACTIVE, so rotating a
 		// revoked certificate silently un-revoked it and handed out fresh
 		// key material for an identity that had been withdrawn.
-		h.errJSONCode(w, http.StatusConflict, "certificate_revoked",
+		h.errJSONCode(w, r, http.StatusConflict, "certificate_revoked",
 			"a revoked certificate cannot be rotated; provision a new one")
 		return
 	}
 	if err != nil {
-		h.errJSON(w, 404, "certificate not found")
+		h.errJSON(w, r, 404, "certificate not found")
 		return
 	}
 
 	h.siem.Stream(r.Context(), tenantID, "certificate.rotated", siem.SeverityLow, "Certificate rotated: "+id)
 
-	h.okJSON(w, 200, domain.ProvisionCertResult{
+	h.okJSON(w, r, 200, domain.ProvisionCertResult{
 		Certificate:   *updated,
 		PrivateKeyPEM: string(issued.PrivateKeyPEM),
 		CACertPEM:     string(h.ca.CertificatePEM()),
@@ -539,7 +542,7 @@ func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
 	// service-to-service authentication depends on this certificate.
 	existing, err := h.store.GetCertByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, 404, "certificate not found")
+		h.errJSON(w, r, 404, "certificate not found")
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, MtlsCertRevoke) {
@@ -554,22 +557,22 @@ func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
 	// record, so nothing can be added after that.
 	if err := h.revokeSerials(r, tenantID, existing, principalID); err != nil {
 		h.logger.Error("failed to persist revocation", zap.String("id", id), zap.Error(err))
-		h.errJSON(w, http.StatusInternalServerError, "failed to revoke certificate")
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to revoke certificate")
 		return
 	}
 	revoked, err := h.store.RevokeCert(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, 404, "certificate not found")
+		h.errJSON(w, r, 404, "certificate not found")
 		return
 	}
 	if err := h.revokeSerials(r, tenantID, revoked, principalID); err != nil {
 		h.logger.Error("failed to persist revocation", zap.String("id", id), zap.Error(err))
-		h.errJSON(w, http.StatusInternalServerError, "failed to revoke certificate")
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to revoke certificate")
 		return
 	}
 	h.siem.Stream(r.Context(), tenantID, "certificate.revoked", siem.SeverityMedium,
 		"Certificate revoked: "+id+" by "+principalID)
-	h.okJSON(w, 200, map[string]interface{}{
+	h.okJSON(w, r, 200, map[string]interface{}{
 		"message":         "certificate revoked",
 		"revoked_serials": revoked.AllSerialNumbers(),
 		"crl":             CRLPath,
@@ -598,7 +601,7 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	var req domain.CreatePolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PolicyName == "" {
-		h.errJSON(w, 400, "policy_name is required")
+		h.errJSON(w, r, 400, "policy_name is required")
 		return
 	}
 	// Scoped at the tenant, not a legal entity: a CommunicationPolicy has no
@@ -616,10 +619,10 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		RequiresMtls:  req.RequiresMtls,
 	}
 	if err := h.store.CreatePolicy(r.Context(), tenantID, pol); err != nil {
-		h.errJSON(w, 500, "failed to create policy")
+		h.errJSON(w, r, 500, "failed to create policy")
 		return
 	}
-	h.okJSON(w, 201, pol)
+	h.okJSON(w, r, 201, pol)
 }
 
 func (h *Handler) ListPolicies(w http.ResponseWriter, r *http.Request) {
@@ -636,13 +639,13 @@ func (h *Handler) ListPolicies(w http.ResponseWriter, r *http.Request) {
 	}
 	pols, err := h.store.ListPolicies(r.Context(), tenantID)
 	if err != nil {
-		h.errJSON(w, 500, "failed to list policies")
+		h.errJSON(w, r, 500, "failed to list policies")
 		return
 	}
 	if pols == nil {
 		pols = []domain.CommunicationPolicy{}
 	}
-	h.okJSON(w, 200, map[string]interface{}{"data": pols, "count": len(pols)})
+	h.okJSON(w, r, 200, map[string]interface{}{"data": pols, "count": len(pols)})
 }
 
 // SignCSR handles POST /v1/mtls/certificates/csr — signs a CSR and returns
@@ -664,19 +667,19 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 		LegalEntityID string `json:"legal_entity_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errJSON(w, 400, "invalid body")
+		h.errJSON(w, r, 400, "invalid body")
 		return
 	}
 	if req.CSR == "" {
-		h.errJSON(w, 400, "csr is required")
+		h.errJSON(w, r, 400, "csr is required")
 		return
 	}
 	if req.ServiceName == "" {
-		h.errJSON(w, 400, "service_name is required")
+		h.errJSON(w, r, 400, "service_name is required")
 		return
 	}
 	if req.LegalEntityID == "" {
-		h.errJSON(w, 400, "legal_entity_id is required")
+		h.errJSON(w, r, 400, "legal_entity_id is required")
 		return
 	}
 	// Same decision as ProvisionCert: at the legal entity the certificate is for.
@@ -694,22 +697,22 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 	csrPEM := []byte(req.CSR)
 	block, _ := pem.Decode(csrPEM)
 	if block == nil || block.Type != "CERTIFICATE REQUEST" {
-		h.errJSON(w, 400, "invalid csr")
+		h.errJSON(w, r, 400, "invalid csr")
 		return
 	}
 	csr, err := x509.ParseCertificateRequest(block.Bytes)
 	if err != nil {
-		h.errJSON(w, 400, "invalid csr: "+err.Error())
+		h.errJSON(w, r, 400, "invalid csr: "+err.Error())
 		return
 	}
 	if err := csr.CheckSignature(); err != nil {
-		h.errJSON(w, 400, "csr signature invalid")
+		h.errJSON(w, r, 400, "csr signature invalid")
 		return
 	}
 
 	// Verify the CSR's subject matches the requested service name
 	if csr.Subject.CommonName != req.ServiceName {
-		h.errJSONCode(w, 400, "csr_subject_mismatch", "CSR common name must match service_name")
+		h.errJSONCode(w, r, 400, "csr_subject_mismatch", "CSR common name must match service_name")
 		return
 	}
 
@@ -722,7 +725,7 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !found {
-		h.errJSONCode(w, 400, "csr_dns_mismatch", "CSR DNS names must include service_name")
+		h.errJSONCode(w, r, 400, "csr_dns_mismatch", "CSR DNS names must include service_name")
 		return
 	}
 
@@ -740,7 +743,7 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !foundURI {
-		h.errJSONCode(w, 400, "csr_uri_mismatch", "CSR URI SANs must include "+expectedURI)
+		h.errJSONCode(w, r, 400, "csr_uri_mismatch", "CSR URI SANs must include "+expectedURI)
 		return
 	}
 
@@ -748,7 +751,7 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 	issued, err := h.ca.SignCSR(csr, time.Duration(req.RotationDays)*24*time.Hour)
 	if err != nil {
 		h.logger.Error("failed to sign CSR", zap.String("service_name", req.ServiceName), zap.Error(err))
-		h.errJSON(w, 500, "failed to sign certificate")
+		h.errJSON(w, r, 500, "failed to sign certificate")
 		return
 	}
 
@@ -772,7 +775,7 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:      now,
 	}
 	if err := h.store.CreateCert(r.Context(), tenantID, cert); err != nil {
-		h.errJSON(w, 500, "failed to provision certificate")
+		h.errJSON(w, r, 500, "failed to provision certificate")
 		return
 	}
 
@@ -781,22 +784,36 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 		"Certificate issued for "+req.ServiceName+" via CSR by "+principalID)
 
 	// Return only the certificate (no private key)
-	h.okJSON(w, 201, domain.ProvisionCertResult{
+	h.okJSON(w, r, 201, domain.ProvisionCertResult{
 		Certificate: *cert,
 		CACertPEM:   string(h.ca.CertificatePEM()),
 	})
 }
 
-func (h *Handler) okJSON(w http.ResponseWriter, code int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
-}
-func (h *Handler) errJSON(w http.ResponseWriter, code int, msg string) {
-	h.okJSON(w, code, map[string]string{"error": msg})
+// errJSON answers a refusal that names no code of its own. The code is the
+// status's class (apicontract.CodeForStatus), never a blanket internal_error,
+// so a caller has a stable value to match on (ZS-API-001 §12).
+func (h *Handler) errJSON(w http.ResponseWriter, r *http.Request, code int, msg string) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    code,
+		Code:      apicontract.CodeForStatus(code),
+		Detail:    msg,
+		Retryable: code >= 500,
+	})
 }
 
 // errJSONCode is errJSON with a machine-readable code beside the message.
-func (h *Handler) errJSONCode(w http.ResponseWriter, code int, errCode, msg string) {
-	h.okJSON(w, code, map[string]string{"error": errCode, "message": msg})
+func (h *Handler) errJSONCode(w http.ResponseWriter, r *http.Request, code int, errCode, msg string) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    code,
+		Code:      errCode,
+		Detail:    msg,
+		Retryable: code >= 500,
+	})
+}
+
+func (h *Handler) okJSON(w http.ResponseWriter, r *http.Request, code int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
 }

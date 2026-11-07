@@ -13,6 +13,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
 )
 
 func attestAll(t *testing.T, s *payrollScenario, id, checklist, prefix string, n int, who string) {
@@ -184,6 +186,13 @@ func TestRollout_LaunchGateAndIndependence(t *testing.T) {
 	mustStatus(t, 201, code, r)
 	transition(t, s, id, "launcher-1", "LAUNCHED", "", 200)
 	assert.Equal(t, "SUPPORTED", supportOf(t, s, jur)["outcome"])
+
+	// s26 events: one per committed fact, none for a refused request. support-changed fires only when LAUNCHED is entered or left.
+	assert.Equal(t, 2, s.e.pub.count(events.EventRolloutCreated))
+	assert.Equal(t, 32, s.e.pub.count(events.EventRolloutAttested), "9+10 READY, 11 DONE, 2 for DOD_05; refused attestations emit nothing")
+	assert.Equal(t, 1, s.e.pub.count(events.EventRolloutExpertDecided))
+	assert.Equal(t, 5, s.e.pub.count(events.EventRolloutStatusChanged), "AUTHORING, READY, LAUNCHED, SUSPENDED, LAUNCHED; 409 refusals emit nothing")
+	assert.Equal(t, 3, s.e.pub.count(events.EventJurisdictionSupportChange), "launch, suspend, relaunch; not AUTHORING or READY")
 
 	// A withdrawn pack ends support even though the rollout stays LAUNCHED (JUR-NEG-28).
 	_, err := pool.Exec(ctx, `ALTER TABLE jurisdiction_pack_versions DISABLE TRIGGER USER`)

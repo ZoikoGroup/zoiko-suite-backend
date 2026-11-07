@@ -245,7 +245,7 @@ func TestErrorClasses(t *testing.T) {
 		w := cmdDo(s, http.MethodPost, c.caller, c.path, c.body)
 		var got map[string]any
 		_ = json.Unmarshal(w.Body.Bytes(), &got)
-		if w.Code != c.wantCode || got["error_class"] != c.wantClass || got["error"] == nil {
+		if w.Code != c.wantCode || got["error_class"] != c.wantClass || got["code"] == nil {
 			t.Errorf("%s as %q: want %d %s beside the code, got %d %v", c.path, c.caller, c.wantCode, c.wantClass, w.Code, got)
 		}
 	}

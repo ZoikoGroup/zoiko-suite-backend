@@ -113,6 +113,10 @@ func TestSessionControlsIT_BreakGlassExpiryAndSupportEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// AU-02 (000034): active only once an independent approver approves it.
+	if _, err := f.s.ApproveBreakGlassSession(f.ctx, bg.SessionID, f.tenant, "approver-1", nil); err != nil {
+		t.Fatal(err)
+	}
 	f.backdate(t, "break_glass_sessions", bg.SessionID)
 	if _, err := f.s.ExpireDue(context.Background()); err != nil {
 		t.Fatal(err)
@@ -121,7 +125,8 @@ func TestSessionControlsIT_BreakGlassExpiryAndSupportEvents(t *testing.T) {
 	if got.Status != domain.BreakGlassSessionStatusExpired || got.ReviewStatus != domain.SessionReviewPending {
 		t.Errorf("after the sweep: status %s, review %s; want EXPIRED / PENDING", got.Status, got.ReviewStatus)
 	}
-	if types := f.outboxTypes(t, bg.SessionID); len(types) != 2 || types[1] != "security.break_glass.ended" {
+	// requested, approval_recorded, started, ended.
+	if types := f.outboxTypes(t, bg.SessionID); len(types) != 4 || types[3] != "security.break_glass.ended" {
 		t.Errorf("break-glass events = %v", types)
 	}
 

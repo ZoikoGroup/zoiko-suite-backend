@@ -80,6 +80,14 @@ type PrincipalRoleAssignment struct {
 	ApprovalDecidedAt *time.Time `json:"approval_decided_at,omitempty"`
 	ApprovalExpiresAt *time.Time `json:"approval_expires_at,omitempty"`
 
+	// Suspension (000038, ORG-06 SuspendAssignment). A suspended assignment
+	// grants nothing until it is resumed; it stays on record either way.
+	SuspendedAt      *time.Time `json:"suspended_at,omitempty"`
+	SuspendedBy      *string    `json:"suspended_by,omitempty"`
+	SuspensionReason *string    `json:"suspension_reason,omitempty"`
+	// Version is bumped on every real change (000038, API-3).
+	Version int64 `json:"version"`
+
 	// Filled only when a list asks for usage (include_usage=true), for access
 	// reviews (Authorization Standard §24 "Dormancy", "Orphan detection").
 	// LastGrantedAt is the latest GRANTED decision whose basis names this
@@ -212,6 +220,8 @@ type ABACRule struct {
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	Version              int64     `json:"version"`
+
+	RulePublication
 }
 
 // The two ABAC effects.
@@ -263,6 +273,8 @@ type CreateABACRuleParams struct {
 	Operator             string
 	AttributeValue       *string
 	CreatedByPrincipalID string
+	// Reason is the maker's reason for the publication request (000036).
+	Reason string
 }
 
 // SoDRule expresses a Separation-of-Duties conflict: a principal holding a
@@ -289,6 +301,8 @@ type SoDRule struct {
 	ActiveFlag bool      `json:"active_flag"`
 	CreatedAt  time.Time `json:"created_at"`
 	Version    int64     `json:"version"`
+
+	RulePublication
 }
 
 // ConflictTypeOwnObjectForbidden is the conflict_type convention for a
@@ -354,6 +368,10 @@ type AccessDecisionLog struct {
 	OnBehalfOf       string     `json:"on_behalf_of,omitempty"`
 	DelegationID     string     `json:"delegation_id,omitempty"`
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	// SessionKind / SessionID (000034, AU-13): the JIT (PRIVILEGED),
+	// BREAK_GLASS or SUPPORT session the decision was made in.
+	SessionKind string `json:"session_kind,omitempty"`
+	SessionID   string `json:"session_id,omitempty"`
 }
 
 // ── principal status ─────────────────────────────────────────────────────────
@@ -407,6 +425,16 @@ const (
 
 // ProjectEntityStatusParams is the lifecycle consumer's write for
 // entity.status.changed: latest event wins, older ones are ignored.
+// RepointMergedSubjectParams is identity-context-svc's identity.subject.merged:
+// DuplicateID was retired into SurvivorID (ORG-1 MergeDuplicateIdentity).
+type RepointMergedSubjectParams struct {
+	TenantID      string
+	SurvivorID    string
+	DuplicateID   string
+	Actor         string
+	CorrelationID string
+}
+
 type ProjectEntityStatusParams struct {
 	LegalEntityID   string
 	TenantID        string
@@ -464,6 +492,8 @@ type PrivilegedSession struct {
 	// 000033: the step-up the requester and the approver each proved (A-03).
 	RequesterStepUp *StepUpEvidence `json:"requester_step_up,omitempty"`
 	ApproverStepUp  *StepUpEvidence `json:"approver_step_up,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000037).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // CreatePrivilegedSessionParams holds the parameters to issue a new JIT privileged session.
@@ -489,9 +519,13 @@ type CreatePrivilegedSessionParams struct {
 
 // BreakGlassSessionStatus represents the lifecycle state of an emergency break-glass session (ZS-IAM-001 §14 & §21).
 const (
-	BreakGlassSessionStatusActive  = "ACTIVE"
-	BreakGlassSessionStatusRevoked = "REVOKED"
-	BreakGlassSessionStatusExpired = "EXPIRED"
+	// PENDING_APPROVAL / REJECTED (000034, AU-02): a request waits for its
+	// independent approvers and grants nothing until the quorum is met.
+	BreakGlassSessionStatusPendingApproval = "PENDING_APPROVAL"
+	BreakGlassSessionStatusRejected        = "REJECTED"
+	BreakGlassSessionStatusActive          = "ACTIVE"
+	BreakGlassSessionStatusRevoked         = "REVOKED"
+	BreakGlassSessionStatusExpired         = "EXPIRED"
 )
 
 // BreakGlassSession records an emergency time-bound access grant tied to a declared incident (ZS-IAM-001 §14 & §21).
@@ -516,6 +550,24 @@ type BreakGlassSession struct {
 	ReviewNotes  *string    `json:"review_notes,omitempty"`
 	// 000033: the step-up the requester proved (A-03, §14).
 	RequesterStepUp *StepUpEvidence `json:"requester_step_up,omitempty"`
+	// 000034 (AU-02): the approval the session waits for, and who gave it.
+	ApprovalsRequired int                  `json:"approvals_required"`
+	Approvals         []BreakGlassApproval `json:"approvals"`
+	ApprovedBy        *string              `json:"approved_by,omitempty"`
+	ApprovedAt        *time.Time           `json:"approved_at,omitempty"`
+	RejectedBy        *string              `json:"rejected_by,omitempty"`
+	RejectedAt        *time.Time           `json:"rejected_at,omitempty"`
+	RequestExpiresAt  *time.Time           `json:"request_expires_at,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000037).
+	RecordVersion int64 `json:"record_version"`
+}
+
+// BreakGlassApproval is one independent approver's approval of a break-glass
+// request, with the step-up they proved (GOV-12 CheckerApprovalRecorded).
+type BreakGlassApproval struct {
+	ApproverID string          `json:"approver_id"`
+	ApprovedAt time.Time       `json:"approved_at"`
+	StepUp     *StepUpEvidence `json:"step_up,omitempty"`
 }
 
 type CreateBreakGlassSessionParams struct {
@@ -529,6 +581,9 @@ type CreateBreakGlassSessionParams struct {
 	// MaxDurationSeconds: see CreatePrivilegedSessionParams. Zero applies 2 h.
 	MaxDurationSeconds int
 	StepUp             *StepUpEvidence
+	// ApprovalsRequired is the quorum (AUTHZ_BREAK_GLASS_APPROVALS); below 1
+	// is read as 1 — break-glass is never self-activating.
+	ApprovalsRequired int
 }
 
 // SupportSessionStatus represents the lifecycle state of a tenant support session (ZS-IAM-001 §15 & §21).
@@ -556,6 +611,8 @@ type SupportSession struct {
 	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy             *string    `json:"revoked_by,omitempty"`
 	RequestedBy           *string    `json:"requested_by,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000037).
+	RecordVersion int64 `json:"record_version"`
 }
 
 type CreateSupportSessionParams struct {
@@ -704,6 +761,9 @@ type CreateSoDRuleParams struct {
 	ConflictType   string
 	JurisdictionID *string
 	TenantID       *string
+	// RequestedBy / Reason: the maker of the publication request (000036).
+	RequestedBy string
+	Reason      string
 }
 
 // EvaluateParams holds input for the core authorization evaluation.
@@ -747,6 +807,8 @@ type RecordAccessDecisionParams struct {
 	ExpiresAt        *time.Time
 	Basis            string
 	CorrelationID    string
+	SessionKind      string
+	SessionID        string
 
 	// TenantID is the caller's verified tenant scope, empty when the caller
 	// supplied none. Stored as SQL NULL when empty: /v1/authorize is called
@@ -818,6 +880,10 @@ type ListAccessDecisionsParams struct {
 	// decided_at, so a bounded window is also partition pruning.
 	DecidedFrom *time.Time
 	DecidedTo   *time.Time
+
+	// SessionID narrows to the decisions made in one JIT, break-glass or
+	// support session (AU-13): "the commands executed under it".
+	SessionID string
 
 	// Limit is capped by the store — see MaxAccessDecisionPageSize.
 	Limit int
@@ -1025,20 +1091,35 @@ var ErrWorkloadBindingNotFound = errorString("workload binding not found")
 // AuthorityLimit defines the foundational approval and signing limit for a principal
 // or role within an optional legal entity, book, or org-unit scope (ZS-IAM-001 §12, §21, §22).
 type AuthorityLimit struct {
-	AuthorityLimitID string     `json:"authority_limit_id"`
-	TenantID         string     `json:"tenant_id"`
-	PrincipalID      *string    `json:"principal_id,omitempty"`
-	RoleID           *string    `json:"role_id,omitempty"`
-	AuthorityType    string     `json:"authority_type"`
-	LegalEntityID    *string    `json:"legal_entity_id,omitempty"`
-	BookID           *string    `json:"book_id,omitempty"`
-	OrgUnitID        *string    `json:"org_unit_id,omitempty"`
-	Currency         string     `json:"currency"`
-	LowerLimit       string     `json:"lower_limit"`
-	UpperLimit       string     `json:"upper_limit"`
-	EffectiveFrom    time.Time  `json:"effective_from"`
-	EffectiveTo      *time.Time `json:"effective_to,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
+	AuthorityLimitID string  `json:"authority_limit_id"`
+	TenantID         string  `json:"tenant_id"`
+	PrincipalID      *string `json:"principal_id,omitempty"`
+	RoleID           *string `json:"role_id,omitempty"`
+	AuthorityType    string  `json:"authority_type"`
+	LegalEntityID    *string `json:"legal_entity_id,omitempty"`
+	BookID           *string `json:"book_id,omitempty"`
+	OrgUnitID        *string `json:"org_unit_id,omitempty"`
+	// LimitKind is MONETARY (an amount in Currency) or QUANTITY (a whole
+	// count, no currency) — 000040, decision S8-D1.
+	LimitKind     string     `json:"limit_kind"`
+	Currency      string     `json:"currency,omitempty"`
+	LowerLimit    string     `json:"lower_limit"`
+	UpperLimit    string     `json:"upper_limit"`
+	EffectiveFrom time.Time  `json:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+
+	// Governance (000035, AU-03). Only an ACTIVE limit limits anything.
+	Status        string     `json:"status"`
+	PendingAction *string    `json:"pending_action,omitempty"`
+	SupersedesID  *string    `json:"supersedes_id,omitempty"`
+	RequestedBy   *string    `json:"requested_by,omitempty"`
+	RequestedAt   *time.Time `json:"requested_at,omitempty"`
+	RequestReason *string    `json:"request_reason,omitempty"`
+	DecidedBy     *string    `json:"decided_by,omitempty"`
+	DecidedAt     *time.Time `json:"decided_at,omitempty"`
+	LastDecision  *string    `json:"last_decision,omitempty"`
+	Version       int64      `json:"version"`
 }
 
 type CreateAuthorityLimitParams struct {
@@ -1050,11 +1131,19 @@ type CreateAuthorityLimitParams struct {
 	LegalEntityID    *string
 	BookID           *string
 	OrgUnitID        *string
+	LimitKind        string // empty means MONETARY
 	Currency         string
 	LowerLimit       string
 	UpperLimit       string
 	EffectiveFrom    time.Time
 	EffectiveTo      *time.Time
+
+	// RequestedBy / RequestReason: the maker (000035). A limit created through
+	// the admin API is PENDING_APPROVAL; Status empty means that.
+	RequestedBy   string
+	RequestReason string
+	// SupersedesID names the ACTIVE limit a change replaces once approved.
+	SupersedesID string
 }
 
 // ── Canonical Authorization API Contract & Dynamic SoD (ZS-IAM-001 §7, §8, §10.2, §21) ──
@@ -1198,6 +1287,7 @@ type WorkloadBinding struct {
 	AllowedActions  []string  `json:"allowed_actions"`
 	ActiveFlag      bool      `json:"active_flag"`
 	CreatedAt       time.Time `json:"created_at"`
+	Version         int64     `json:"version"`
 }
 
 type errorString string

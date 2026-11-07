@@ -206,6 +206,11 @@ type Config struct {
 	MaxJITSeconds        int
 	MaxBreakGlassSeconds int
 	MaxSupportSeconds    int
+
+	// BreakGlassApprovals is how many independent, stepped-up approvers a
+	// break-glass request needs before it is active (AU-02; GOV-12; decision
+	// D-3, 14 Oct 2026: default one, quorum by risk class left to GOV §23).
+	BreakGlassApprovals int
 }
 
 // Validate refuses a configuration under which no PEP could ever be admitted,
@@ -276,6 +281,10 @@ func (c *Config) Validate() error {
 		if v != 0 && (v < 60 || v > 86400) {
 			return fmt.Errorf("%s must be between 60 and 86400 seconds, got %d", name, v)
 		}
+	}
+	// 0 is the default (one approver); break-glass is never self-activating.
+	if c.BreakGlassApprovals < 0 || c.BreakGlassApprovals > 5 {
+		return fmt.Errorf("AUTHZ_BREAK_GLASS_APPROVALS must be between 1 and 5, got %d", c.BreakGlassApprovals)
 	}
 	switch c.MTLSRevocationCheck {
 	case "", "require": // "" is Load's default, require
@@ -581,6 +590,8 @@ func Load() (*Config, error) {
 		MaxJITSeconds:        envInt("AUTHZ_MAX_JIT_SECONDS", 8*3600),
 		MaxBreakGlassSeconds: envInt("AUTHZ_MAX_BREAK_GLASS_SECONDS", 2*3600),
 		MaxSupportSeconds:    envInt("AUTHZ_MAX_SUPPORT_SECONDS", 4*3600),
+
+		BreakGlassApprovals: envInt("AUTHZ_BREAK_GLASS_APPROVALS", 1),
 	}, nil
 }
 

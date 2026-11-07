@@ -16,6 +16,12 @@ import (
 //
 // Run: go test -tags=integration -count=1 -timeout=400s ./internal/store/
 func TestMain(m *testing.M) {
+	if os.Getenv("TEST_DATABASE_URL") != "" {
+		// An explicitly supplied throwaway database (CI's service container)
+		// wins over the embedded one.
+		os.Exit(m.Run())
+	}
+
 	port := uint32(17501 + uint32(os.Getpid()%499))
 	// A private runtime dir: the default (~/.embedded-postgres-go/extracted) is
 	// shared by every service's harness and collides when two run at once.

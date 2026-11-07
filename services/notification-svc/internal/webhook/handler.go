@@ -7,6 +7,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
+
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // Handler handles incoming ESP webhook HTTP requests.
@@ -50,12 +52,12 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
 		h.log.Warn("failed to read webhook body", zap.Error(err))
-		http.Error(w, `{"error":"unable to read body"}`, http.StatusBadRequest)
+		apicontract.WriteError(w, r, http.StatusBadRequest, "unreadable_body", "unable to read body")
 		return
 	}
 	defer r.Body.Close()
 	if len(body) > maxBody {
-		http.Error(w, `{"error":"webhook payload too large"}`, http.StatusRequestEntityTooLarge)
+		apicontract.WriteError(w, r, http.StatusRequestEntityTooLarge, "payload_too_large", "webhook payload too large")
 		return
 	}
 
@@ -65,7 +67,7 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	// response does not say which part was wrong; the reason is logged.
 	if h.verifier == nil {
 		h.log.Error("webhook refused: no verifier configured; ingress is closed", zap.String("provider", provider))
-		http.Error(w, `{"status":"error","message":"webhook ingress is not configured"}`, http.StatusServiceUnavailable)
+		apicontract.WriteError(w, r, http.StatusServiceUnavailable, "webhook_ingress_unconfigured", "webhook ingress is not configured")
 		return
 	}
 	if err := h.verifier.Verify(provider, r.Header.Get(SignatureHeader), body); err != nil {
@@ -77,12 +79,12 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		if h.processor != nil && h.processor.metrics != nil {
 			h.processor.metrics.RecordWebhookEvent(provider, "signature_rejected")
 		}
-		http.Error(w, `{"status":"error","message":"invalid webhook signature"}`, http.StatusUnauthorized)
+		apicontract.WriteError(w, r, http.StatusUnauthorized, "invalid_signature", "invalid webhook signature")
 		return
 	}
 
 	if len(body) == 0 {
-		http.Error(w, `{"error":"empty webhook payload"}`, http.StatusBadRequest)
+		apicontract.WriteError(w, r, http.StatusBadRequest, "empty_payload", "empty webhook payload")
 		return
 	}
 
@@ -94,10 +96,10 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		// For transient database or internal failures, return 500 so ESP retries.
 		// For permanently invalid payloads, DLQ has already captured the item, return 400.
 		if strings.Contains(err.Error(), "invalid webhook") {
-			http.Error(w, `{"status":"error","message":"invalid webhook event recorded in dlq"}`, http.StatusBadRequest)
+			apicontract.WriteError(w, r, http.StatusBadRequest, "invalid_event", "invalid webhook event recorded in dlq")
 			return
 		}
-		http.Error(w, `{"status":"error","message":"transient processing error, please retry"}`, http.StatusInternalServerError)
+		apicontract.WriteError(w, r, http.StatusInternalServerError, "transient_processing_error", "transient processing error, please retry")
 		return
 	}
 

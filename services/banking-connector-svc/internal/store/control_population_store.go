@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -74,6 +75,28 @@ var controlStatementsScope = `
 	FROM bank_statements s
 	JOIN bank_connections c ON c.connection_id = s.connection_id
 	WHERE ` + fmt.Sprintf(controlScopeWhere, `(s.statement_date AT TIME ZONE 'UTC')::date`)
+
+// amountDirection names the direction of a SIGNED statement amount, read from its exact decimal text (never through a
+// float): DEBIT for money out (negative), CREDIT for money in (positive), ZERO for an amount of exactly zero. It lets a
+// control exclude receipts from a payments comparison by an explicit, evidenced rule instead of a hidden filter.
+func amountDirection(amount string) string {
+	neg := strings.HasPrefix(amount, "-")
+	zero := true
+	for _, c := range amount {
+		if c >= '1' && c <= '9' {
+			zero = false
+			break
+		}
+	}
+	switch {
+	case zero:
+		return "ZERO"
+	case neg:
+		return "DEBIT"
+	default:
+		return "CREDIT"
+	}
+}
 
 // ControlPopulation returns one keyset page of a population together with the
 // whole-set watermark and declared totals, all read in ONE REPEATABLE READ,
@@ -172,6 +195,7 @@ func (p *PgStore) ControlPopulation(ctx context.Context, q domain.ControlPopulat
 				"statement_id":     stmtID,
 				"status":           status,
 				"statement_status": stmtStatus,
+					"direction":        amountDirection(r.Amount),
 			}
 		} else {
 			r.Attributes = map[string]string{

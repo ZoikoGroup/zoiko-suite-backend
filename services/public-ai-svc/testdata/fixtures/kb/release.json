@@ -1,0 +1,126 @@
+{
+    "allowed_hosts":  [
+                          "example.invalid"
+                      ],
+    "capability_ids":  [
+                           "CAP-GL",
+                           "CAP-AP",
+                           "CAP-AR",
+                           "CAP-TREASURY",
+                           "CAP-PAYROLL",
+                           "CAP-HR",
+                           "CAP-TAX",
+                           "CAP-LEGAL",
+                           "CAP-COMPLIANCE"
+                       ],
+    "approved_by":  [
+                        "approver-a",
+                        "approver-b"
+                    ],
+    "eval_run_id":  "eval-dev-0",
+    "routes":  [
+                   {
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "approval_ref":  "TEST-ROUTE-APPROVAL",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "route_key":  "pricing",
+                       "url":  "https://example.invalid/pricing",
+                       "locale":  "en-US"
+                   },
+                   {
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "approval_ref":  "TEST-ROUTE-APPROVAL",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "route_key":  "demo",
+                       "url":  "https://example.invalid/book-demo",
+                       "locale":  "en-US"
+                   },
+                   {
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "approval_ref":  "TEST-ROUTE-APPROVAL",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "route_key":  "support",
+                       "url":  "https://example.invalid/support",
+                       "locale":  "en-US"
+                   },
+                   {
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "approval_ref":  "TEST-ROUTE-APPROVAL",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "route_key":  "core_modules",
+                       "url":  "https://example.invalid/core-modules",
+                       "locale":  "en-US"
+                   },
+                   {
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "approval_ref":  "TEST-ROUTE-APPROVAL",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "route_key":  "trust",
+                       "url":  "https://example.invalid/trust-center",
+                       "locale":  "en-US"
+                   },
+                   {
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "approval_ref":  "TEST-ROUTE-APPROVAL",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "route_key":  "platform-overview",
+                       "url":  "https://example.invalid/platform-overview",
+                       "locale":  "en-US"
+                   },
+                   {
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "effective_until":  "2099-12-31T00:00:00Z",
+                       "approval_ref":  "TEST-ROUTE-APPROVAL",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "route_key":  "sign-in",
+                       "url":  "https://example.invalid/sign-in",
+                       "locale":  "en-US"
+                   },
+                   {
+                       "requires_claim":  "TRIAL",
+                       "approval_ref":  "TEST-ROUTE-APPROVAL",
+                       "url":  "https://example.invalid/signup",
+                       "market_codes":  [
+                                            "ALL"
+                                        ],
+                       "route_key":  "signup_or_trial",
+                       "effective_from":  "2026-01-01T00:00:00Z",
+                       "locale":  "en-US",
+                       "effective_until":  "2099-12-31T00:00:00Z"
+                   }
+               ],
+    "synonyms":  {
+                     "ar":  [
+                                "accounts",
+                                "receivable"
+                            ],
+                     "ap":  [
+                                "accounts",
+                                "payable"
+                            ],
+                     "gl":  [
+                                "general",
+                                "ledger"
+                            ]
+                 }
+}

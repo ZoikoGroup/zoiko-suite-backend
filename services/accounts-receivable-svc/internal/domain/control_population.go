@@ -12,6 +12,10 @@ const MaxControlPopulationRecords = 200000
 // MaxControlPopulationRecords.
 var ErrPopulationTooLarge = errorString("control population exceeds the 200000 record cap")
 
+// ErrInvalidPopulationParam is returned by a provider when a population-specific parameter is malformed; the endpoint
+// answers 400, never a 503.
+var ErrInvalidPopulationParam = errorString("invalid population parameter")
+
 // ControlPopulationQuery selects one page of the open-invoices population.
 type ControlPopulationQuery struct {
 	TenantID      string
@@ -22,6 +26,9 @@ type ControlPopulationQuery struct {
 	// AfterRecordID is the keyset position (last record_id of the previous page);
 	// empty for the first page.
 	AfterRecordID string
+	// Params carries the population-specific query parameters declared at registration
+	// (RegisterPopulationWithParams); empty for populations that define none.
+	Params map[string]string
 }
 
 // ControlRecord is one record of a control population. Amount is a decimal string.

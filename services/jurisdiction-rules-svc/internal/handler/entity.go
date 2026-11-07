@@ -46,12 +46,12 @@ func (h *Handler) GetEntityJurisdictions(w http.ResponseWriter, r *http.Request)
 
 	tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-Id"))
 	if tenantID == "" {
-		writeError(w, http.StatusUnauthorized, "missing_tenant",
+		writeError(w, r, http.StatusUnauthorized, "missing_tenant",
 			"X-Tenant-Id is required: entity jurisdiction mappings are tenant data")
 		return
 	}
 
-	at, ok := h.parseEffectiveAt(w, r.URL.Query())
+	at, ok := h.parseEffectiveAt(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
@@ -61,7 +61,7 @@ func (h *Handler) GetEntityJurisdictions(w http.ResponseWriter, r *http.Request)
 
 	rows, err := h.entities.ListEntityJurisdictions(r.Context(), tenantID, legalEntityID, at)
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 	h.log.Debug("GetEntityJurisdictions",
@@ -83,3 +83,4 @@ func (h *Handler) WithApprovalVerifier(v approval.Verifier) *Handler {
 	h.approvals = v
 	return h
 }
+

@@ -273,6 +273,7 @@ func TestCreateDecision_201_StoreErrorDoesNotFailRequest(t *testing.T) {
 		Status   int    `json:"status"`
 		Detail   string `json:"detail"`
 		Instance string `json:"instance"`
+		Code     string `json:"code"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
@@ -280,8 +281,8 @@ func TestCreateDecision_201_StoreErrorDoesNotFailRequest(t *testing.T) {
 	if got.Title != "Service Unavailable" {
 		t.Errorf("expected title=Service Unavailable, got %q", got.Title)
 	}
-	if got.Type != "SERVICE_UNAVAILABLE" {
-		t.Errorf("expected type=SERVICE_UNAVAILABLE, got %q", got.Type)
+	if got.Code != "SERVICE_UNAVAILABLE" {
+		t.Errorf("expected code=SERVICE_UNAVAILABLE, got %q", got.Code)
 	}
 }
 
@@ -304,6 +305,7 @@ func TestCreateDecision_400_MissingField(t *testing.T) {
 		Status   int    `json:"status"`
 		Detail   string `json:"detail"`
 		Instance string `json:"instance"`
+		Code     string `json:"code"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
@@ -311,8 +313,8 @@ func TestCreateDecision_400_MissingField(t *testing.T) {
 	if got.Title != "Missing Required Field" {
 		t.Errorf("expected title=Missing Required Field, got %q", got.Title)
 	}
-	if got.Type != "INVALID_REQUEST" {
-		t.Errorf("expected type=INVALID_REQUEST, got %q", got.Type)
+	if got.Code != "INVALID_REQUEST" {
+		t.Errorf("expected code=INVALID_REQUEST, got %q", got.Code)
 	}
 }
 
@@ -348,6 +350,7 @@ func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 		Status   int    `json:"status"`
 		Detail   string `json:"detail"`
 		Instance string `json:"instance"`
+		Code     string `json:"code"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
@@ -355,8 +358,8 @@ func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 	if got.Title != "Service Unavailable" {
 		t.Errorf("expected title=Service Unavailable, got %q", got.Title)
 	}
-	if got.Type != "SERVICE_UNAVAILABLE" {
-		t.Errorf("expected type=SERVICE_UNAVAILABLE, got %q", got.Type)
+	if got.Code != "SERVICE_UNAVAILABLE" {
+		t.Errorf("expected code=SERVICE_UNAVAILABLE, got %q", got.Code)
 	}
 }
 

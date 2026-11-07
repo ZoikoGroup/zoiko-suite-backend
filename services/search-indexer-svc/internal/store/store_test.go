@@ -125,9 +125,9 @@ func seedContract(t *testing.T, s *PgStore, src domain.SearchSource, scope strin
 	require.NoError(t, s.CreateContract(ctx, c))
 
 	if state != domain.ContractDraft {
-		require.NoError(t, s.TransitionContract(ctx, c.ContractID, domain.ContractDraft, domain.ContractCertified))
+		require.NoError(t, s.TransitionContract(ctx, c.ContractID, domain.ContractDraft, domain.ContractCertified, 0))
 		if state == domain.ContractPublished {
-			require.NoError(t, s.TransitionContract(ctx, c.ContractID, domain.ContractCertified, domain.ContractPublished))
+			require.NoError(t, s.TransitionContract(ctx, c.ContractID, domain.ContractCertified, domain.ContractPublished, 0))
 		}
 	}
 	c.State = state
@@ -400,10 +400,10 @@ func TestIndexGenerations_OnlyOneActivePerScope(t *testing.T) {
 	}
 	promote := func(g domain.IndexGeneration) error {
 		require.NoError(t, s.CreateGeneration(ctx, g))
-		require.NoError(t, s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationPlanned, domain.GenerationBuilding, "", ""))
-		require.NoError(t, s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationBuilding, domain.GenerationValidating, "", ""))
-		require.NoError(t, s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationValidating, domain.GenerationReady, "d", "n"))
-		return s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationReady, domain.GenerationActive, "", "")
+		require.NoError(t, s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationPlanned, domain.GenerationBuilding, "", "", 0))
+		require.NoError(t, s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationBuilding, domain.GenerationValidating, "", "", 0))
+		require.NoError(t, s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationValidating, domain.GenerationReady, "d", "n", 0))
+		return s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationReady, domain.GenerationActive, "", "", 0)
 	}
 
 	require.NoError(t, promote(mk()))
@@ -431,11 +431,11 @@ func TestTransitionGeneration_IsCompareAndSet(t *testing.T) {
 		CreatedByPrincipalID: uuid.NewString(),
 	}
 	require.NoError(t, s.CreateGeneration(ctx, g))
-	require.NoError(t, s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationPlanned, domain.GenerationBuilding, "", ""))
+	require.NoError(t, s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationPlanned, domain.GenerationBuilding, "", "", 0))
 
 	// The same transition again: the row is no longer PLANNED, so it affects
 	// nothing and reports a conflict rather than silently succeeding.
-	err := s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationPlanned, domain.GenerationBuilding, "", "")
+	err := s.TransitionGeneration(ctx, g.GenerationID, domain.GenerationPlanned, domain.GenerationBuilding, "", "", 0)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, domain.ErrConflict))
 }
@@ -455,11 +455,11 @@ func TestIndexContracts_OnlyOnePublishedPerScope(t *testing.T) {
 	seedContract(t, s, src, scope, domain.ContractPublished)
 
 	second := seedContract(t, s, src, scope, domain.ContractDraft)
-	require.NoError(t, s.TransitionContract(ctx, second.ContractID, domain.ContractDraft, domain.ContractCertified))
+	require.NoError(t, s.TransitionContract(ctx, second.ContractID, domain.ContractDraft, domain.ContractCertified, 0))
 
 	// Publishing the second SUPERSEDES the first in the same transaction:
 	// still never two PUBLISHED, and no window with none.
-	require.NoError(t, s.TransitionContract(ctx, second.ContractID, domain.ContractCertified, domain.ContractPublished))
+	require.NoError(t, s.TransitionContract(ctx, second.ContractID, domain.ContractCertified, domain.ContractPublished, 0))
 	all, err := s.ListContracts(ctx, scope)
 	require.NoError(t, err)
 	published := 0
@@ -629,7 +629,7 @@ func TestTombstoneStates_AppliedAndVerifiedAreDistinct(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, s.MarkTombstoneState(ctx, tenant, "obligation", "ob-1", "evt-1",
-		domain.PropagationApplied, ""))
+		domain.PropagationApplied, "", 0))
 	rows, err := s.ListTombstones(ctx, tenant, "", 10)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
@@ -638,7 +638,7 @@ func TestTombstoneStates_AppliedAndVerifiedAreDistinct(t *testing.T) {
 	assert.Nil(t, rows[0].VerifiedAt, "APPLIED must not set verified_at")
 
 	require.NoError(t, s.MarkTombstoneState(ctx, tenant, "obligation", "ob-1", "evt-1",
-		domain.PropagationVerified, ""))
+		domain.PropagationVerified, "", 0))
 	rows, err = s.ListTombstones(ctx, tenant, "", 10)
 	require.NoError(t, err)
 	require.NotNil(t, rows[0].VerifiedAt)

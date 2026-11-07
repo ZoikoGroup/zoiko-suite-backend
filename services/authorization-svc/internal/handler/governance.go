@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/authorization-svc/internal/domain"
 )
@@ -116,6 +117,45 @@ func (h *Handler) readCommand(w http.ResponseWriter, r **http.Request) (int64, b
 	return body.ExpectedVersion, true
 }
 
+// readVersionedCommand is readCommand for a mutation of an existing,
+// versioned aggregate, where the expected version is mandatory (API-3; P-09).
+func (h *Handler) readVersionedCommand(w http.ResponseWriter, r **http.Request) (int64, bool) {
+	bodyVersion, ok := h.readCommand(w, r)
+	if !ok {
+		return 0, false
+	}
+	return expectedVersion(w, *r, bodyVersion)
+}
+
+// expectedVersion settles the version a mutation is conditional on. It comes
+// from If-Match (the ETag of the caller's last read) or, for callers written
+// before API-3, the body's expected_version. Neither → 428; a malformed
+// If-Match, or one that disagrees with the body → 400. "If-Match: *" opts out
+// of the check and returns 0, which the stores read as "unconditional".
+func expectedVersion(w http.ResponseWriter, r *http.Request, bodyVersion int64) (int64, bool) {
+	v, wildcard, present, err := apicontract.IfMatchVersion(r)
+	switch {
+	case err != nil:
+		apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusBadRequest, "invalid_if_match",
+			"If-Match must be a single ETag from the latest representation"))
+		return 0, false
+	case wildcard:
+		return 0, true
+	case present && bodyVersion > 0 && bodyVersion != v:
+		apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusBadRequest, "conflicting_expected_version",
+			"If-Match and expected_version name different versions; send one"))
+		return 0, false
+	case present:
+		return v, true
+	case bodyVersion > 0:
+		return bodyVersion, true
+	default:
+		apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusPreconditionRequired, "precondition_required",
+			"If-Match is required for a mutation of an existing aggregate"))
+		return 0, false
+	}
+}
+
 // applyReason enforces §16's "purpose / reason_code required for privileged,
 // destructive or emergency commands" per the contract mode, and records the
 // reason on the request context.
@@ -197,7 +237,7 @@ func (h *Handler) refuseToxicForHolders(w http.ResponseWriter, r *http.Request, 
 	}
 	holders, err := h.store.ListRoleAssignments(r.Context(), tenantID, "", roleID, false)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return true
 	}
 	now := time.Now()
@@ -211,7 +251,7 @@ func (h *Handler) refuseToxicForHolders(w http.ResponseWriter, r *http.Request, 
 		seen[a.PrincipalID] = true
 		held, err := h.heldActionsInTenant(r, a.PrincipalID, tenantID)
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 			return true
 		}
 		var heldList []string
@@ -220,7 +260,7 @@ func (h *Handler) refuseToxicForHolders(w http.ResponseWriter, r *http.Request, 
 		}
 		conflicts, err := h.sodConflictsFor(r.Context(), dedupeSorted(heldList), candidates, tenantID)
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 			return true
 		}
 		if len(conflicts) > 0 {
@@ -293,23 +333,32 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 	if !ok {
 		return
 	}
-	if _, ok := h.readCommand(w, &r); !ok {
+	bodyVersion, ok := h.readCommand(w, &r)
+	if !ok {
+		return
+	}
+	expected, ok := optionalExpectedVersion(w, r, bodyVersion)
+	if !ok {
 		return
 	}
 
 	finder, okF := h.store.(roleAssignmentFinder)
 	decider, okD := h.store.(assignmentDecider)
 	if !okF || !okD {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	pending, err := finder.FindRoleAssignmentByID(r.Context(), assignmentID, tenantScope)
 	if err != nil {
 		if errors.Is(err, domain.ErrRoleAssignmentNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
+			writeError(w, r, http.StatusNotFound, "role_assignment_not_found", "", nil)
 			return
 		}
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
+		return
+	}
+	if expected > 0 && expected != pending.Version {
+		writeVersionConflict(w, r)
 		return
 	}
 	if pending.ApprovalStatus != domain.ApprovalPending {
@@ -329,7 +378,7 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 	}
 	entitled, err := h.holdsPrivilegedApproval(r, principalID, tenantScope, entity)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	if !entitled {
@@ -358,19 +407,19 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_expired", "message": err.Error()})
 		return
 	case errors.Is(err, domain.ErrApprovalNotPending):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_not_pending"})
+		writeError(w, r, http.StatusConflict, "approval_not_pending", "", nil)
 		return
 	case errors.Is(err, domain.ErrRoleAssignmentNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
+		writeError(w, r, http.StatusNotFound, "role_assignment_not_found", "", nil)
 		return
 	case err != nil:
 		h.log.Error("decideRoleAssignment: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	h.log.Info("privileged assignment decided",
 		zap.String("assignment_id", assignmentID), zap.String("decision", decision),
 		zap.String("checker", principalID), zap.String("maker", pending.AssignedBy),
 		zap.String("correlation_id", correlationID))
-	writeJSON(w, http.StatusOK, decided)
+	writeJSONWithETag(w, http.StatusOK, decided, decided.Version)
 }

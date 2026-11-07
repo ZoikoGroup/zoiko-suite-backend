@@ -84,3 +84,49 @@ func TestOpenAPI_MatchesTheRouter(t *testing.T) {
 		t.Fatalf("openapi.yaml out of step with the router - undocumented: %v, unserved: %v", missing, extra)
 	}
 }
+
+// Every 4xx/5xx the contract publishes is RFC 9457 problem+json pointing at
+// the Problem schema (or a schema built on it), and nothing else is: a request
+// body or a success relabelled as a problem is as wrong as a legacy error
+// (ZS-API-001 §12).
+func TestOpenAPI_ProblemJSONOnlyOnErrors(t *testing.T) {
+	doc := loadAuthzSpec(t)
+	isProblem := func(ref *openapi3.SchemaRef) bool {
+		if ref == nil {
+			return false
+		}
+		if strings.HasSuffix(ref.Ref, "/Problem") {
+			return true
+		}
+		if ref.Value != nil {
+			for _, part := range ref.Value.AllOf {
+				if strings.HasSuffix(part.Ref, "/Problem") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for path, item := range doc.Paths.Map() {
+		for method, op := range item.Operations() {
+			if op.RequestBody != nil && op.RequestBody.Value != nil &&
+				op.RequestBody.Value.Content.Get("application/problem+json") != nil {
+				t.Errorf("%s %s: a request body is not a problem", method, path)
+			}
+			for code, resp := range op.Responses.Map() {
+				mt := resp.Value.Content.Get("application/problem+json")
+				switch {
+				case code[0] == '4' || code[0] == '5':
+					if path == "/healthz" || path == "/readyz" {
+						continue
+					}
+					if mt == nil || !isProblem(mt.Schema) {
+						t.Errorf("%s %s %s must be application/problem+json with the Problem schema", method, path, code)
+					}
+				case mt != nil:
+					t.Errorf("%s %s %s is a success, not a problem", method, path, code)
+				}
+			}
+		}
+	}
+}

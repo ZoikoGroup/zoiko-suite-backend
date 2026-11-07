@@ -758,9 +758,10 @@ var _ kernel.AccountApplicability = (*KernelRepo)(nil)
 // nothing, which is every account that existed before the controls did.
 func (r *KernelRepo) AccountApplicability(ctx context.Context, tenant, code string) (sc kernel.AccountScope, err error) {
 	err = r.tx(ctx, tenant, func(t pgx.Tx) error {
-		var ccy, ctl *string
-		e := t.QueryRow(ctx, `SELECT COALESCE(applicable_book_ids, '{}'::uuid[])::text[], currency_restriction, control_type, counterparty_required
-			FROM chart_of_accounts WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code).Scan(&sc.BookIDs, &ccy, &ctl, &sc.CounterpartyRequired)
+		var ccy, ctl, repl *string
+		var policy []byte
+		e := t.QueryRow(ctx, `SELECT COALESCE(applicable_book_ids, '{}'::uuid[])::text[], currency_restriction, control_type, counterparty_required, dimension_policy, replaced_by_account_code
+			FROM chart_of_accounts WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code).Scan(&sc.BookIDs, &ccy, &ctl, &sc.CounterpartyRequired, &policy, &repl)
 		if errors.Is(e, pgx.ErrNoRows) {
 			return nil
 		}
@@ -772,6 +773,12 @@ func (r *KernelRepo) AccountApplicability(ctx context.Context, tenant, code stri
 		}
 		if ctl != nil {
 			sc.ControlType = *ctl
+		}
+		if repl != nil {
+			sc.ReplacementAccount = *repl
+		}
+		if len(policy) > 0 {
+			_ = json.Unmarshal(policy, &sc.DimensionPolicy)
 		}
 		return nil
 	})
@@ -792,14 +799,25 @@ func (r *KernelRepo) SetAccountScope(ctx context.Context, tenant, code string, s
 				return &kernel.Exception{Family: kernel.FamCOA, Code: "BOOK_UNKNOWN", Detail: "book " + b + " does not exist", Facts: map[string]any{"book_id": b}}
 			}
 		}
-		var arg any
+		if e := kernel.ValidateScope(code, sc); e != nil {
+			return e
+		}
+		if e := checkReplacement(ctx, t, tenant, code, sc.ReplacementAccount); e != nil {
+			return e
+		}
+		var arg, policy any
 		if len(sc.BookIDs) > 0 {
 			arg = sc.BookIDs
 		}
+		if len(sc.DimensionPolicy) > 0 {
+			b, _ := json.Marshal(sc.DimensionPolicy)
+			policy = string(b)
+		}
 		tag, e := t.Exec(ctx, `UPDATE chart_of_accounts SET applicable_book_ids=$3::uuid[], currency_restriction=NULLIF($4,''), control_type=NULLIF($5,''),
 				counterparty_required=$6, is_control_account = (NULLIF($5,'') IS NOT NULL OR is_control_account),
-				direct_posting_restricted = COALESCE($7::boolean, (NULLIF($5,'') IS NOT NULL OR direct_posting_restricted))
-			WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code, arg, sc.Currency, sc.ControlType, sc.CounterpartyRequired, sc.DirectPostingRestricted)
+				direct_posting_restricted = COALESCE($7::boolean, (NULLIF($5,'') IS NOT NULL OR direct_posting_restricted)),
+				dimension_policy=$8::jsonb, replaced_by_account_code=NULLIF($9,'')
+			WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code, arg, sc.Currency, sc.ControlType, sc.CounterpartyRequired, sc.DirectPostingRestricted, policy, sc.ReplacementAccount)
 		if e != nil {
 			return e
 		}
@@ -808,6 +826,45 @@ func (r *KernelRepo) SetAccountScope(ctx context.Context, tenant, code string, s
 		}
 		return r.enqueue(ctx, t, tenant, kernel.OutEvent{Fact: "account.scope-changed", AggregateType: "account", AggregateID: code, Actor: actor.PrincipalID,
 			CorrelationID: actor.CorrelationID, Data: map[string]any{"account_code": code, "book_ids": sc.BookIDs, "currency_restriction": sc.Currency,
-				"control_type": sc.ControlType, "counterparty_required": sc.CounterpartyRequired}})
+				"control_type": sc.ControlType, "counterparty_required": sc.CounterpartyRequired, "dimension_policy": sc.DimensionPolicy, "replacement_account": sc.ReplacementAccount}})
 	})
+}
+
+// checkReplacement refuses a replacement that cannot take the account's postings: it must exist, be open and postable, and the chain it
+// starts must not lead back to the account being retired.
+func checkReplacement(ctx context.Context, t pgx.Tx, tenant, code, repl string) error {
+	if repl == "" {
+		return nil
+	}
+	bad := func(why string) error {
+		return &kernel.Exception{Family: kernel.FamCOA, Code: "REPLACEMENT_INVALID", Detail: "replacement account " + repl + ": " + why, Facts: map[string]any{"replacement_account": repl}}
+	}
+	var status string
+	var header bool
+	err := t.QueryRow(ctx, `SELECT a.status, EXISTS (SELECT 1 FROM chart_of_accounts c WHERE c.tenant_id=a.tenant_id AND c.parent_account_id=a.account_id)
+		FROM chart_of_accounts a WHERE a.tenant_id=$1::uuid AND a.account_code=$2`, tenant, repl).Scan(&status, &header)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return bad("it is not in the chart of accounts")
+	}
+	if err != nil {
+		return err
+	}
+	if status != "ACTIVE" || header {
+		return bad("it must be an open account that can be posted to")
+	}
+	cur := repl
+	for i := 0; i < 10 && cur != ""; i++ {
+		var next *string
+		if e := t.QueryRow(ctx, `SELECT replaced_by_account_code FROM chart_of_accounts WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, cur).Scan(&next); e != nil && !errors.Is(e, pgx.ErrNoRows) {
+			return e
+		}
+		if next == nil {
+			return nil
+		}
+		if *next == code {
+			return bad("it already maps forward to " + code)
+		}
+		cur = *next
+	}
+	return nil
 }

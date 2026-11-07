@@ -1,0 +1,188 @@
+{
+  "synthetic": true,
+  "allowed_hosts": [
+    "example.invalid"
+  ],
+  "capability_ids": [
+    "CAP-GL",
+    "CAP-AP",
+    "CAP-AR",
+    "CAP-PAYROLL",
+    "CAP-HR",
+    "CAP-TAX",
+    "CAP-LEGAL",
+    "CAP-COMPLIANCE",
+    "CAP-CONTRACTS",
+    "CAP-PROCUREMENT"
+  ],
+  "capability_crosswalk": [
+    {
+      "module_id": "MOD-GL",
+      "capability_id": "CAP-GL",
+      "domain": "Finance",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-AP",
+      "capability_id": "CAP-AP",
+      "domain": "Finance",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-AR",
+      "capability_id": "CAP-AR",
+      "domain": "Finance",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-PAYROLL",
+      "capability_id": "CAP-PAYROLL",
+      "domain": "Workforce",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-HR",
+      "capability_id": "CAP-HR",
+      "domain": "Workforce",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-TAX",
+      "capability_id": "CAP-TAX",
+      "domain": "Tax/Legal/Compliance",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-LEGAL",
+      "capability_id": "CAP-LEGAL",
+      "domain": "Tax/Legal/Compliance",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-COMPLIANCE",
+      "capability_id": "CAP-COMPLIANCE",
+      "domain": "Tax/Legal/Compliance",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-CONTRACTS",
+      "capability_id": "CAP-CONTRACTS",
+      "domain": "Commercial",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    },
+    {
+      "module_id": "MOD-PROCUREMENT",
+      "capability_id": "CAP-PROCUREMENT",
+      "domain": "Commercial",
+      "public_route_key": "core_modules",
+      "synthetic": true
+    }
+  ],
+  "approved_by": [
+    "approver-a",
+    "approver-b"
+  ],
+  "eval_run_id": "eval-seed-0",
+  "routes": [
+    {
+      "route_key": "pricing",
+      "url": "https://example.invalid/pricing",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "SYNTHETIC-ROUTE-APPROVAL",
+      "synthetic": true
+    },
+    {
+      "route_key": "demo",
+      "url": "https://example.invalid/demo",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "SYNTHETIC-ROUTE-APPROVAL",
+      "synthetic": true
+    },
+    {
+      "route_key": "signup_or_trial",
+      "url": "https://example.invalid/trial",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "SYNTHETIC-ROUTE-APPROVAL",
+      "synthetic": true,
+      "requires_claim": "TRIAL"
+    },
+    {
+      "route_key": "support",
+      "url": "https://example.invalid/support",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "SYNTHETIC-ROUTE-APPROVAL",
+      "synthetic": true
+    },
+    {
+      "route_key": "core_modules",
+      "url": "https://example.invalid/core-modules",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "SYNTHETIC-ROUTE-APPROVAL",
+      "synthetic": true
+    },
+    {
+      "route_key": "trust",
+      "url": "https://example.invalid/trust",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "SYNTHETIC-ROUTE-APPROVAL",
+      "synthetic": true
+    }
+  ],
+  "synonyms": {
+    "ar": [
+      "accounts",
+      "receivable"
+    ],
+    "ap": [
+      "accounts",
+      "payable"
+    ],
+    "gl": [
+      "general",
+      "ledger"
+    ],
+    "hr": [
+      "human",
+      "resources"
+    ]
+  }
+}

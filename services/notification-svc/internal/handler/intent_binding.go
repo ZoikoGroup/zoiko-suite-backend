@@ -35,37 +35,37 @@ type IntentStore interface {
 	EffectiveIntentVersion(ctx context.Context, intentID string, at, knownAt time.Time) (*domain.IntentVersion, error)
 }
 
-func (h *Handler) writeIntentError(w http.ResponseWriter, err error) {
+func (h *Handler) writeIntentError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrIntentNotFound):
-		writeError(w, http.StatusNotFound, "intent_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "intent_not_found", err.Error())
 	case errors.Is(err, domain.ErrIntentVersionNotFound):
-		writeError(w, http.StatusNotFound, "intent_version_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "intent_version_not_found", err.Error())
 	case errors.Is(err, domain.ErrIntentNotEffective):
-		writeError(w, http.StatusConflict, "intent_not_effective", err.Error())
+		writeError(w, r, http.StatusConflict, "intent_not_effective", err.Error())
 	case errors.Is(err, domain.ErrIntentKeyTaken):
-		writeError(w, http.StatusConflict, "intent_key_taken", err.Error())
+		writeError(w, r, http.StatusConflict, "intent_key_taken", err.Error())
 	case errors.Is(err, domain.ErrIntentRetired):
-		writeError(w, http.StatusConflict, "intent_retired", err.Error())
+		writeError(w, r, http.StatusConflict, "intent_retired", err.Error())
 	case errors.Is(err, domain.ErrIntentVersionNotDraft):
-		writeError(w, http.StatusConflict, "not_draft", err.Error())
+		writeError(w, r, http.StatusConflict, "not_draft", err.Error())
 	case errors.Is(err, domain.ErrIntentVersionNotReview):
-		writeError(w, http.StatusConflict, "not_review", err.Error())
+		writeError(w, r, http.StatusConflict, "not_review", err.Error())
 	case errors.Is(err, domain.ErrIntentVersionNotApproved):
-		writeError(w, http.StatusConflict, "not_approved", err.Error())
+		writeError(w, r, http.StatusConflict, "not_approved", err.Error())
 	case errors.Is(err, domain.ErrIntentVersionSelfApproval):
-		writeError(w, http.StatusForbidden, "self_approval_forbidden", err.Error())
+		writeError(w, r, http.StatusForbidden, "self_approval_forbidden", err.Error())
 	case errors.Is(err, domain.ErrIntentEffectiveFromInvalid):
-		writeError(w, http.StatusBadRequest, "invalid_effective_from", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_from", err.Error())
 	case errors.Is(err, domain.ErrIntentInvalid):
-		writeError(w, http.StatusBadRequest, "invalid_intent", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_intent", err.Error())
 	case errors.Is(err, domain.ErrSubjectInvalid):
-		writeError(w, http.StatusBadRequest, "invalid_subject", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_subject", err.Error())
 	case errors.Is(err, domain.ErrTemplateVariableInvalid):
-		writeError(w, http.StatusBadRequest, "template_variable_invalid", err.Error())
+		writeError(w, r, http.StatusBadRequest, "template_variable_invalid", err.Error())
 	default:
 		h.log.Error("intent store error")
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 	}
 }
 
@@ -95,33 +95,33 @@ func (h *Handler) enforceIntent(w http.ResponseWriter, r *http.Request, intentID
 	req *domain.SendNotificationRequest) (*domain.IntentVersion, bool) {
 
 	if h.intents == nil {
-		writeError(w, http.StatusServiceUnavailable, "intent_registry_unavailable",
+		writeError(w, r, http.StatusServiceUnavailable, "intent_registry_unavailable",
 			"this template is bound to a communication intent, and the registry is not configured")
 		return nil, false
 	}
 	now := time.Now().UTC()
 	iv, err := h.intents.EffectiveIntentVersion(r.Context(), intentID, now, now)
 	if err != nil {
-		h.writeIntentError(w, err)
+		h.writeIntentError(w, r, err)
 		return nil, false
 	}
 	if !iv.ChannelAllowed(req.Channel) {
-		writeError(w, http.StatusUnprocessableEntity, "no_compliant_channel",
+		writeError(w, r, http.StatusUnprocessableEntity, "no_compliant_channel",
 			"NCD-011 NO_COMPLIANT_CHANNEL: the communication intent does not allow the "+req.Channel+" channel")
 		return nil, false
 	}
 	if req.CommunicationClass != "" && req.CommunicationClass != iv.PurposeClass {
-		writeError(w, http.StatusBadRequest, "communication_class_conflict",
+		writeError(w, r, http.StatusBadRequest, "communication_class_conflict",
 			"the communication intent decides the purpose class ("+iv.PurposeClass+"); do not supply a different one")
 		return nil, false
 	}
 	if !domain.ValidDirectPathClass(iv.PurposeClass) {
-		writeError(w, http.StatusUnprocessableEntity, "intent_class_not_direct",
+		writeError(w, r, http.StatusUnprocessableEntity, "intent_class_not_direct",
 			"the intent's purpose class "+iv.PurposeClass+" is not available on the direct send path; marketing and lifecycle mail use the ledger pipeline")
 		return nil, false
 	}
 	if err := domain.CheckTemplateVariables(published.VariableSchema, iv.VariableContract); err != nil {
-		h.writeIntentError(w, err)
+		h.writeIntentError(w, r, err)
 		return nil, false
 	}
 	used := make(map[string]domain.VariableSpec, len(published.VariableSchema))
@@ -129,7 +129,7 @@ func (h *Handler) enforceIntent(w http.ResponseWriter, r *http.Request, intentID
 		used[name] = iv.VariableContract[name]
 	}
 	if err := domain.CheckVariables(used, req.Variables); err != nil {
-		h.writeIntentError(w, err)
+		h.writeIntentError(w, r, err)
 		return nil, false
 	}
 	req.CommunicationClass = iv.PurposeClass

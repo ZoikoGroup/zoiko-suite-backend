@@ -126,7 +126,7 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 	// be recognised by its Idempotency-Key and the hash of what it asked for.
 	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 	if err != nil {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+		writeJSON(w, r, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -135,19 +135,19 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
 	}
 	// The database refuses both of these (000006 CHECKs); refusing them here
 	// answers 400 instead of the 503 a constraint violation used to become.
 	// UNASSESSED is the absence of a decision and is never stored.
 	if !domain.ApplicabilityDecisionValues[req.Decision] {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "decision",
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "decision",
 			"detail": "decision must be APPLICABLE, NOT_APPLICABLE or UNCERTAIN"})
 		return
 	}
 	if req.EffectiveTo != nil && !req.EffectiveTo.After(req.EffectiveFrom) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "effective_to",
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "effective_to",
 			"detail": "effective_to must be after effective_from"})
 		return
 	}
@@ -159,14 +159,14 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 	// decision names decided_by_system instead and leaves decided_by empty,
 	// which stays legitimate.
 	if req.CreatedByPrincipalID != principalID {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":  "created_by_mismatch",
 			"detail": "created_by_principal_id must be the authenticated principal — attribution comes from X-Principal-Id, not the request body",
 		})
 		return
 	}
 	if req.DecidedByPrincipalID != "" && req.DecidedByPrincipalID != principalID {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":  "decided_by_mismatch",
 			"detail": "decided_by_principal_id must be the authenticated principal — a decision cannot be attributed to another principal by the request body; use decided_by_system for an automated decision",
 		})
@@ -174,7 +174,7 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 	}
 	// doc7 §E2 "exactly one" of a human or a system (000006 CHECK).
 	if req.DecidedByPrincipalID != "" && req.DecidedBySystem != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "decided_by_principal_id",
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "decided_by_principal_id",
 			"detail": "a decision is attributed to exactly one of decided_by_principal_id or decided_by_system"})
 		return
 	}
@@ -186,7 +186,7 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 	// into an existence oracle for other tenants' registers.
 	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
 	if err != nil {
-		h.writeStoreErr(w, "CreateApplicabilityDecision: parent lookup failed", err)
+		h.writeStoreErr(w, r, "CreateApplicabilityDecision: parent lookup failed", err)
 		return
 	}
 
@@ -194,7 +194,7 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 	// The envelope is required on writes (contract.go: LegalEntityID: RequiredOnWrite).
 	env, _ := envelope.FromContext(r.Context())
 	if env.LegalEntityID != "" && env.LegalEntityID != parent.LegalEntityID {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":            "legal_entity_mismatch",
 			"detail":           "X-Legal-Entity-Id header must match parent obligation's legal_entity_id",
 			"header_value":     env.LegalEntityID,
@@ -234,27 +234,27 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrObligationNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "obligation_not_found", "obligation_id": obligationID})
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "obligation_not_found", "obligation_id": obligationID})
 		case errors.Is(err, domain.ErrIdempotencyKeyConflict), errors.Is(err, domain.ErrConflict),
 			errors.Is(err, domain.ErrInvalidField), errors.Is(err, domain.ErrInvalidIdentifier):
-			h.writeStoreErr(w, "CreateApplicabilityDecision", err)
+			h.writeStoreErr(w, r, "CreateApplicabilityDecision", err)
 		default:
 			h.log.Error("CreateApplicabilityDecision: store unavailable",
 				zap.String("obligation_id", obligationID),
 				zap.String("correlation_id", correlationID),
 				zap.Error(err),
 			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		}
 		return
 	}
 	if replayed {
 		// Same Idempotency-Key, same body: the decision already recorded.
-		writeJSON(w, http.StatusOK, d)
+		writeJSON(w, r, http.StatusOK, d)
 		return
 	}
 	w.Header().Set("Location", "/v1/obligations/"+obligationID+"/applicability-decisions/"+d.ApplicabilityDecisionID)
-	writeJSON(w, http.StatusCreated, d)
+	writeJSON(w, r, http.StatusCreated, d)
 }
 
 // ── GET /v1/obligations/{obligation_id}/applicability-decisions ───────────
@@ -275,14 +275,14 @@ func (h *Handler) ListApplicabilityDecisions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if jurisdictionCode == "" || entityRef == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "jurisdiction_code and entity_ref query params are required"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "jurisdiction_code and entity_ref query params are required"})
 		return
 	}
 
 	// Authorize against the parent obligation's legal entity.
 	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
 	if err != nil {
-		h.writeStoreErr(w, "ListApplicabilityDecisions: parent lookup failed", err)
+		h.writeStoreErr(w, r, "ListApplicabilityDecisions: parent lookup failed", err)
 		return
 	}
 	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionApplicabilityRead) {
@@ -297,16 +297,16 @@ func (h *Handler) ListApplicabilityDecisions(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrObligationNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "obligation_not_found", "obligation_id": obligationID})
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "obligation_not_found", "obligation_id": obligationID})
 		default:
-			h.writeStoreErr(w, "ListApplicabilityDecisions: store unavailable", err)
+			h.writeStoreErr(w, r, "ListApplicabilityDecisions: store unavailable", err)
 		}
 		return
 	}
 	if results == nil {
 		results = []*domain.ApplicabilityDecision{}
 	}
-	writeJSON(w, http.StatusOK, results)
+	writeJSON(w, r, http.StatusOK, results)
 }
 
 // ── GET /v1/obligations/{obligation_id}/applicability ─────────────────────
@@ -328,14 +328,14 @@ func (h *Handler) GetCurrentApplicability(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if jurisdictionCode == "" || entityRef == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "jurisdiction_code and entity_ref query params are required"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "jurisdiction_code and entity_ref query params are required"})
 		return
 	}
 
 	// Authorize against the parent obligation's legal entity.
 	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
 	if err != nil {
-		h.writeStoreErr(w, "GetCurrentApplicability: parent lookup failed", err)
+		h.writeStoreErr(w, r, "GetCurrentApplicability: parent lookup failed", err)
 		return
 	}
 	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionApplicabilityRead) {
@@ -346,11 +346,13 @@ func (h *Handler) GetCurrentApplicability(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrObligationNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "obligation_not_found", "obligation_id": obligationID})
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "obligation_not_found", "obligation_id": obligationID})
 		default:
-			h.writeStoreErr(w, "GetCurrentApplicability: store unavailable", err)
+			h.writeStoreErr(w, r, "GetCurrentApplicability: store unavailable", err)
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, r, http.StatusOK, result)
 }
+
+

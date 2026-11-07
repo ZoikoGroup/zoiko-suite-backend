@@ -122,6 +122,45 @@ func TestWave3_PayrollControlsUseMeasuresThatMatchOnBothSides(t *testing.T) {
 	}
 }
 
+// FIN-CTRL-011 needs an entity-specific input the catalogue cannot guess, so it is created only when it is given.
+func TestWave3_DepreciationRunToGLIsCreatedOnlyWithTheAccumulatedDepreciationAccounts(t *testing.T) {
+	without, err := Wave3("2026-09-01")
+	require.NoError(t, err)
+	for _, d := range without {
+		assert.NotEqual(t, "FIN-CTRL-011", d.ControlCode, "no accounts named, no control")
+	}
+	blank, err := Wave3("2026-09-01", Wave3Options{AccumulatedDepreciationAccounts: "  "})
+	require.NoError(t, err)
+	assert.Len(t, blank, len(without), "blank accounts are the same as none")
+
+	with, err := Wave3("2026-09-01", Wave3Options{AccumulatedDepreciationAccounts: " 1590,1591 "})
+	require.NoError(t, err)
+	require.Len(t, with, len(without)+1)
+	var d domain.CreateControlDefinitionRequest
+	for _, x := range with {
+		if x.ControlCode == "FIN-CTRL-011" {
+			d = x
+		}
+	}
+	require.Equal(t, "FIN-CTRL-011", d.ControlCode)
+	a, err := source.ParseSpec(d.SourceSpec)
+	require.NoError(t, err)
+	b, err := source.ParseSpec(d.TargetSpec)
+	require.NoError(t, err)
+	assert.Equal(t, SysAssetManagement, a.System)
+	assert.Equal(t, "depreciation-run-postings", a.Population)
+	assert.False(t, a.NoPeriod, "the run's period is the register's fiscal-period cut-off")
+	assert.Equal(t, SysGL, b.System)
+	assert.Equal(t, "account-postings", b.Population)
+	assert.Equal(t, "1590,1591", b.Params["account_codes"], "trimmed")
+	assert.Equal(t, "CREDIT", b.Params["normal_balance"], "accumulated depreciation is credit-normal")
+	l, err := domain.ParseRuleLogic(d.InitialLogic)
+	require.NoError(t, err)
+	assert.True(t, l.TwoSided())
+	assert.True(t, l.AllowGroups)
+	assert.False(t, d.CloseGating)
+}
+
 // ── status registry ──────────────────────────────────────────────────────────
 
 var codeRe = regexp.MustCompile(`^(FIN|PAY)-CTRL-\d{3}$`)
@@ -168,14 +207,14 @@ func TestStatus_BlockedControlsAlwaysNameTheirBlocker(t *testing.T) {
 			assert.GreaterOrEqual(t, c.Wave, 4, "%s: a not-started control belongs to a later wave", c.Code)
 		}
 	}
-	assert.Equal(t, 23, blocked)
+	assert.Equal(t, 14, blocked)
 }
 
 // The status report must agree with what the catalogue can actually create.
 func TestStatus_ImplementedControlsAreExactlyTheOnesTheCatalogueBuilds(t *testing.T) {
 	w2, err := Wave2(opts)
 	require.NoError(t, err)
-	w3, err := Wave3("2026-09-01")
+	w3, err := Wave3("2026-09-01", Wave3Options{AccumulatedDepreciationAccounts: "1590"})
 	require.NoError(t, err)
 	w4, err := Wave4("2026-09-01", Wave4Options{ICReceivableAccounts: "1300", ICPayableAccounts: "2300"})
 	require.NoError(t, err)
@@ -209,11 +248,12 @@ func TestStatus_KeyBlockersAreSpecific(t *testing.T) {
 	assert.Contains(t, by["FIN-CTRL-007"].BlockedBy[0], "tax ledger")
 	assert.Equal(t, StatePartial, by["FIN-CTRL-005"].State, "unblocked by the WFP interface, and honest about what it covers")
 	assert.Contains(t, by["FIN-CTRL-006"].Note, "not that Banking settled")
-	assert.Contains(t, by["FIN-CTRL-011"].BlockedBy[0], "PostAccountingEvent")
+	assert.Equal(t, StatePartial, by["FIN-CTRL-011"].State, "unblocked: depreciation posts through the kernel; the note says what is still not covered")
+	assert.Contains(t, by["FIN-CTRL-011"].Note, "SUPERSEDED", "and it is honest about the reversal residue")
 	assert.Contains(t, by["FIN-CTRL-013"].Note, "valuation")
 	sum := Summary(Status())
-	assert.Equal(t, 23, sum[StateBlocked])
-	assert.Equal(t, 13, sum[StateImplemented], "7 catalogue controls (001,002,003,020,027,028,032) + 4 payroll extensions + 041, 042 computed in-service")
-	assert.Equal(t, 13, sum[StatePartial], "005, 006, 013, 014, 015, 017, 019, 021, 022, 023, 037, 038, 045")
+	assert.Equal(t, 14, sum[StateBlocked])
+	assert.Equal(t, 15, sum[StateImplemented], "9 catalogue controls (001,002,003,020,027,028,029,030,032) + 4 payroll extensions + 041, 042 computed in-service")
+	assert.Equal(t, 20, sum[StatePartial], "004, 005, 006, 011, 013, 014, 015, 017, 019, 021, 022, 023, 024, 026, 031, 033, 037, 038, 044, 045")
 	assert.Equal(t, 0, sum[StateNotStarted], "every catalogue control now has a stated position")
 }

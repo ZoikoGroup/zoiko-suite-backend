@@ -1,0 +1,12 @@
+# Used by BuildKit for builds with -f services/siem-integration-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/siem-integration-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/siem-integration-svc/.gotmp/
+services/siem-integration-svc/**/*.exe
+services/siem-integration-svc/**/*_test.go
+services/identity-envelope/**/*_test.go

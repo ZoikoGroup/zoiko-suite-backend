@@ -1,0 +1,160 @@
+package apicontract
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+const (
+	ProblemBase        = "https://api.zoikosuite.com/problems/"
+	ContentTypeProblem = "application/problem+json"
+
+	HeaderRequestID           = "Zoiko-Request-Id"
+	HeaderLegacyRequestID     = "X-Request-Id"
+	HeaderCorrelationID       = "Zoiko-Correlation-Id"
+	HeaderLegacyCorrelationID = "X-Correlation-ID"
+)
+
+type FieldError struct {
+	Pointer string `json:"pointer,omitempty"`
+	Code    string `json:"code"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+type Problem struct {
+	Type           string         `json:"type"`
+	Title          string         `json:"title"`
+	Status         int            `json:"status"`
+	Detail         string         `json:"detail,omitempty"`
+	Instance       string         `json:"instance,omitempty"`
+	Code           string         `json:"code"`
+	RequestID      string         `json:"request_id,omitempty"`
+	CorrelationID  string         `json:"correlation_id,omitempty"`
+	Retryable      bool           `json:"retryable"`
+	RetryAfter     int            `json:"-"`
+	Errors         []FieldError   `json:"errors,omitempty"`
+	CurrentVersion *int64         `json:"current_version,omitempty"`
+	DecisionID     string         `json:"decision_id,omitempty"`
+	Extra          map[string]any `json:"-"`
+}
+
+func (p Problem) Error() string {
+	if p.Detail == "" {
+		return p.Code
+	}
+	return p.Code + ": " + p.Detail
+}
+
+func ProblemFor(status int, code, detail string) Problem {
+	return Problem{Status: status, Code: code, Detail: detail}
+}
+
+func WriteProblem(w http.ResponseWriter, r *http.Request, p Problem) {
+	if p.Code == "" {
+		p.Code = "internal_error"
+	}
+	if p.Status == 0 {
+		p.Status = http.StatusInternalServerError
+	}
+	if p.Type == "" {
+		p.Type = ProblemBase + strings.ReplaceAll(p.Code, "_", "-")
+	}
+	if p.Title == "" {
+		p.Title = http.StatusText(p.Status)
+		if p.Title == "" {
+			p.Title = "Error"
+		}
+	}
+	// Transient conditions are always worth a retry (ZS-API-001 §12); the
+	// caller still has to respect idempotency and Retry-After.
+	switch p.Status {
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		p.Retryable = true
+	}
+	if r != nil {
+		if p.RequestID == "" {
+			p.RequestID = RequestIDFrom(r)
+		}
+		if p.CorrelationID == "" {
+			p.CorrelationID = firstNonEmpty(r.Header.Get(HeaderCorrelationID), r.Header.Get(HeaderLegacyCorrelationID))
+		}
+	}
+	if p.Instance == "" && p.RequestID != "" {
+		p.Instance = "urn:zoikosuite:problem:" + p.RequestID
+	}
+
+	body := map[string]any{}
+	raw, _ := json.Marshal(p)
+	_ = json.Unmarshal(raw, &body)
+	for k, v := range p.Extra {
+		if _, taken := body[k]; !taken {
+			body[k] = v
+		}
+	}
+
+	h := w.Header()
+	h.Set("Content-Type", ContentTypeProblem)
+	h.Set("Cache-Control", "private, no-store")
+	if p.RequestID != "" {
+		h.Set(HeaderRequestID, p.RequestID)
+		h.Set(HeaderLegacyRequestID, p.RequestID)
+	}
+	if p.Retryable && p.RetryAfter > 0 {
+		h.Set("Retry-After", strconv.Itoa(p.RetryAfter))
+	}
+	if p.DecisionID != "" {
+		h.Set("X-Gateway-Decision-Id", p.DecisionID)
+	}
+	w.WriteHeader(p.Status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func WriteError(w http.ResponseWriter, r *http.Request, status int, code, detail string) {
+	WriteProblem(w, r, ProblemFor(status, code, detail))
+}
+
+// CodeForStatus is the stable code for a refusal whose writer names none
+// (ZS-API-001 §12 requires one on every problem): the status's own class, so
+// a caller still matches on something other than the detail text.
+func CodeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request"
+	case http.StatusUnauthorized:
+		return "unauthenticated"
+	case http.StatusForbidden:
+		return "authorization_denied"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusConflict:
+		return "conflict"
+	case http.StatusPreconditionFailed:
+		return "stale_version"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusUnprocessableEntity:
+		return "unprocessable"
+	case http.StatusPreconditionRequired:
+		return "precondition_required"
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	case http.StatusBadGateway:
+		return "upstream_error"
+	case http.StatusServiceUnavailable:
+		return "service_unavailable"
+	case http.StatusGatewayTimeout:
+		return "upstream_timeout"
+	}
+	return "internal_error"
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return ""
+}

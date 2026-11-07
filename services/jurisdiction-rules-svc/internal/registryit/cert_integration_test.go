@@ -136,7 +136,7 @@ func TestCertification_FullLifecycle(t *testing.T) {
 	// Nothing done yet: every unmet gate is reported in one answer.
 	code, r := e.do("POST", c.path("/certify"), "certifier", nil)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "certification_blocked", r["error"])
+	assert.Equal(t, "certification_blocked", r["code"])
 	assert.Contains(t, reasonsOf(r), "no_test_bundle")
 	assert.Contains(t, reasonsOf(r), "insufficient_reviews")
 
@@ -217,7 +217,7 @@ func TestCertification_IndependenceIsEnforced(t *testing.T) {
 	for _, builder := range []string{"author", "compiler", "tester"} {
 		code, r := e.do("POST", c.path("/reviews"), builder, map[string]any{"role": "TAX", "decision": "APPROVE"})
 		mustStatus(t, 403, code, r)
-		assert.Equal(t, "segregation_of_duties", r["error"], builder)
+		assert.Equal(t, "segregation_of_duties", r["code"], builder)
 	}
 
 	// A reviewer cannot also certify.
@@ -345,7 +345,7 @@ func TestCertification_RequiresSignedVerifiedArtifactAndASigner(t *testing.T) {
 	f.review(t, e, "2026.08.1", f.ruleID)
 	code, r := e.do("POST", f.path("2026.08.1", "/certify"), "certifier", nil)
 	mustStatus(t, 503, code, r)
-	assert.Equal(t, "signing_not_configured", r["error"])
+	assert.Equal(t, "signing_not_configured", r["code"])
 
 	// Compiled but never signed, then reviewed and tested: still blocked.
 	keyRef := "unsigned-" + strings.ToLower(uuid.NewString()[:6])
@@ -372,7 +372,7 @@ func TestCertification_RequiresSignedVerifiedArtifactAndASigner(t *testing.T) {
 	mustStatus(t, 200, code, r)
 	code, r = e2.do("POST", f2.path("2026.08.1", "/certify"), "certifier", nil)
 	mustStatus(t, 503, code, r)
-	assert.Equal(t, "signing_key_not_active", r["error"], "a retired key cannot sign new certifications")
+	assert.Equal(t, "signing_key_not_active", r["code"], "a retired key cannot sign new certifications")
 
 	// Unknown version and not-compiled paths are precise errors.
 	code, _ = e2.do("POST", f2.path("9.9.9", "/certify"), "certifier", nil)
@@ -400,7 +400,7 @@ func TestCertification_TestBundleValidationAndAuth(t *testing.T) {
 	assert.Equal(t, 403, code)
 	code, r := e.do("POST", c.path("/test-runs"), "tester", nil)
 	assert.Equal(t, 409, code, "running before any bundle exists: %v", r)
-	assert.Equal(t, "no_test_bundle", r["error"])
+	assert.Equal(t, "no_test_bundle", r["code"])
 	code, _ = e.do("GET", c.path("/test-bundle")[len("/v1/admin"):], "", nil)
 	_ = code
 	code, _ = e.do("GET", "/v1/packs/"+c.packRef+"/versions/"+c.version+"/test-bundle", "", nil)

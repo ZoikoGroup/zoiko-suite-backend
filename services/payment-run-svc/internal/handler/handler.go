@@ -87,6 +87,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{runID}/available-actions", h.GetAvailableActions)
 		r.Get("/{runID}/history", h.GetRunHistory)
 	})
+	r.Get("/v1/control-populations/unapplied-supplier-payments", h.GetUnappliedSupplierPaymentsPopulation)
 	r.Route("/ap11/instructions", func(r chi.Router) {
 		r.Post("/{instructionID}/reconcile", h.ReconcilePaymentRunStatus)
 		r.Post("/{instructionID}/poll", h.PollInstructionStatus)

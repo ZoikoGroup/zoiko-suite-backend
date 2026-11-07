@@ -68,11 +68,11 @@ type RecurringTemplate struct {
 
 // ErrRecurring* are the refusals of the recurring-journal commands.
 var (
-	ErrTemplateNotFound     = errorString("recurring journal template not found")
-	ErrTemplateNotActive    = errorString("the recurring journal template is not active")
-	ErrTemplateOutOfOrder   = errorString("the recurring journal template has runs before that date still to generate")
-	ErrTemplateExists       = errorString("a recurring journal template with that name already exists for the entity")
-	ErrNotWithdrawable      = errorString("only a draft journal can be withdrawn")
+	ErrTemplateNotFound   = errorString("recurring journal template not found")
+	ErrTemplateNotActive  = errorString("the recurring journal template is not active")
+	ErrTemplateOutOfOrder = errorString("the recurring journal template has runs before that date still to generate")
+	ErrTemplateExists     = errorString("a recurring journal template with that name already exists for the entity")
+	ErrNotWithdrawable    = errorString("only a draft journal can be withdrawn")
 )
 
 // ErrReconciliationCaseNotOpen is returned when a reconciliation adjustment names a case that is settled or accepted.
@@ -83,4 +83,6 @@ var ErrReconciliationCaseNotOpen = errorString("the reconciliation case is not o
 type AccountControl struct {
 	ControlType          string
 	CounterpartyRequired bool
+	// DimensionPolicy is the account's dimension policy: REQUIRED, OPTIONAL or PROHIBITED by dimension.
+	DimensionPolicy map[string]string
 }

@@ -3,6 +3,7 @@ package handler_test
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,11 +25,11 @@ func TestSend_OverAQuotaIsRefusedWith429AndRetryAfter(t *testing.T) {
 		t.Errorf("Retry-After = %q, want 754", got)
 	}
 	e := decodeAPIError(t, rr.Body.Bytes())
-	if e.ErrorCode != "quota_exceeded" || e.Message == "" {
+	if e.Code != "quota_exceeded" || e.Detail == "" {
 		t.Errorf("unexpected body: %+v", e)
 	}
-	if want := "recipient"; !contains(e.Message, want) {
-		t.Errorf("the refusal should name the budget: %q", e.Message)
+	if want := "recipient"; !strings.Contains(e.Detail, want) {
+		t.Errorf("the refusal should name the budget: %q", e.Detail)
 	}
 	if del.seen != nil {
 		t.Error("a refused send must never reach the provider")

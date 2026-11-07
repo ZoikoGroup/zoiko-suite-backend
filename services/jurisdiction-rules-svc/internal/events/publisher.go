@@ -283,6 +283,11 @@ func (p *OutboxPublisher) marshalJurisdictionDeactivated(j domain.Jurisdiction) 
 		"effective_to":            j.EffectiveTo,
 		"updated_at":              j.UpdatedAt,
 		"updated_by_principal_id": j.UpdatedByPrincipalID,
+		// REF-01 RetireJurisdiction evidence (000027): a consumer holding its own
+		// copy of the registry learns why, on what source, and what replaces it.
+		"retirement_reason":             j.RetirementReason,
+		"retirement_evidence_ref":       j.RetirementEvidenceRef,
+		"superseded_by_jurisdiction_id": j.SupersededByJurisdictionID,
 	})
 	return data
 }

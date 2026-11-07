@@ -125,8 +125,9 @@ func TestForeignTenant_CannotReadExporterAuthToken(t *testing.T) {
 		t.Fatalf("ISOLATION FAILURE: tenant-b read tenant-a's SIEM auth_token: %s", w.Body.String())
 	}
 
-	// Unfiltered list.
-	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters", nil)
+	// List, naming the very legal entity tenant-a's exporter belongs to (a
+	// person must name one since 28 Oct 2026).
+	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters?legal_entity_id=le-1", nil)
 	listReq.Header.Set("X-Tenant-ID", "tenant-b")
 	listReq.Header.Set("X-Principal-Id", "principal-test-01")
 	listReq = withEnvelope(listReq) // rest of the canonical envelope; headers already set win

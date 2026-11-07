@@ -39,9 +39,9 @@ import (
 // A route added without validation regresses silently: the failure only appears
 // against a real database, as a 503, on somebody else's typo.
 
-func decodeError(t *testing.T, w *httptest.ResponseRecorder) map[string]string {
+func decodeError(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal %q: %v", w.Body.String(), err)
 	}
@@ -66,8 +66,8 @@ func TestAuthorize_MalformedEntityIsBadRequestNotOutage(t *testing.T) {
 		t.Fatalf("expected 400, got %d: %s — a 503 here reads to the caller as this service being down", w.Code, w.Body.String())
 	}
 	got := decodeError(t, w)
-	if got["error"] != "invalid_scope" {
-		t.Errorf("error = %q, want invalid_scope", got["error"])
+	if got["code"] != "invalid_scope" {
+		t.Errorf("error = %q, want invalid_scope", got["code"])
 	}
 	if got["field"] != "legal_entity_id" {
 		t.Errorf("field = %q, want legal_entity_id — the caller has to know which value was wrong", got["field"])
@@ -222,8 +222,8 @@ func TestValidationRoutes_MalformedEntityIsBadRequest(t *testing.T) {
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 			}
-			if got := decodeError(t, w); got["error"] != "invalid_scope" {
-				t.Errorf("error = %q, want invalid_scope", got["error"])
+			if got := decodeError(t, w); got["code"] != "invalid_scope" {
+				t.Errorf("error = %q, want invalid_scope", got["code"])
 			}
 		})
 	}
@@ -259,8 +259,8 @@ func TestAdminReads_MalformedTenantHeaderIsBadRequest(t *testing.T) {
 				t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 			}
 			got := decodeError(t, w)
-			if got["error"] != "invalid_scope" {
-				t.Errorf("error = %q, want invalid_scope", got["error"])
+			if got["code"] != "invalid_scope" {
+				t.Errorf("error = %q, want invalid_scope", got["code"])
 			}
 			if got["field"] != "X-Tenant-Id" {
 				t.Errorf("field = %q, want X-Tenant-Id", got["field"])
@@ -283,7 +283,7 @@ func TestMissingTenantIsStillUnauthorizedNotBadRequest(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for a missing tenant, got %d: %s", w.Code, w.Body.String())
 	}
-	if got := decodeError(t, w); got["error"] != "missing_tenant_scope" {
-		t.Errorf("error = %q, want missing_tenant_scope", got["error"])
+	if got := decodeError(t, w); got["code"] != "missing_tenant_scope" {
+		t.Errorf("error = %q, want missing_tenant_scope", got["code"])
 	}
 }

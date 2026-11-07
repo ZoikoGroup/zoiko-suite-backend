@@ -1,0 +1,19 @@
+﻿# Doc 02 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_02_Conversation_Design_Prompt_Library_Intent_Catalog.md
+- Document ID (exact): ZS-AI-PUB-002
+- Title (exact, from the title line, not the ID line): CONVERSATION DESIGN, PROMPT LIBRARY & INTENT CATALOG
+- Version (exact): Version 1.0
+- Date (exact): 24 October 2026
+- Status / approval wording (quote the full sentence): Document state: PROPOSED — submitted for founder/product approval. All named prompts, service interfaces, response schemas and release targets remain subject to engineering, legal, privacy and security validation.
+- Approver roles (exactly as written in the status or approval text): founder/product
+- Classification (if stated): not stated in lines 1–80
+- Other document IDs mentioned in lines 1–80 (list each ID + the line number):
+  - ZS-AI-PUB-002 (line 10)
+- Line numbers where each value above was found:
+- Document ID (exact): line 11
+- Title (exact): line 9
+- Version (exact): line 13
+- Date (exact): line 13
+- Status / approval wording: line 15
+- Approver roles: line 15
+- Other document IDs: line 11

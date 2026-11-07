@@ -32,6 +32,10 @@ type ReleaseResult struct {
 	FromStatus string `json:"from_status"`
 	ToStatus   string `json:"to_status"`
 	Changed    bool   `json:"changed"`
+	// RemediationCaseID is set when the command left decisions made with the version that need remediating (a withdrawal): the case that tracks them.
+	RemediationCaseID    *string `json:"remediation_case_id,omitempty"`
+	RemediationOpened    bool    `json:"remediation_opened,omitempty"`
+	RemediationDecisions int     `json:"remediation_decisions,omitempty"`
 }
 
 type Ring struct {
@@ -67,11 +71,15 @@ type Deployment struct {
 
 // RollbackResult reports what a rollback changed and what it could not undo.
 type RollbackResult struct {
-	RolledBack      *Deployment `json:"rolled_back"`
-	Restored        *Deployment `json:"restored"`
-	DecisionsMade   int         `json:"decisions_made_with_rolled_back_version"`
-	RemediationNote string      `json:"remediation_note"`
-	Reconciliation  string      `json:"reconciliation"`
+	RolledBack    *Deployment `json:"rolled_back"`
+	Restored      *Deployment `json:"restored"`
+	DecisionsMade int         `json:"decisions_made_with_rolled_back_version"`
+	// RemediationCaseID is the case tracking those decisions (opened by this rollback, or already open for the same version and scope).
+	RemediationCaseID    *string `json:"remediation_case_id,omitempty"`
+	RemediationOpened    bool    `json:"remediation_opened,omitempty"`
+	RemediationDecisions int     `json:"remediation_decisions,omitempty"`
+	RemediationNote      string  `json:"remediation_note"`
+	Reconciliation       string  `json:"reconciliation"`
 }
 
 type Hotfix struct {
@@ -297,6 +305,12 @@ func (s *PgStore) PublishPackVersion(ctx context.Context, ref, version, actor, e
 	} else if !errors.Is(herr, pgx.ErrNoRows) {
 		return nil, s.registryFail("PublishPackVersion hotfix", herr, nil)
 	}
+	// s10: a rule that collides with another released pack's rule, with nothing declared between them, is a release blocker.
+	crossReasons, cerr := s.crossPackReasons(ctx, ref, version)
+	if cerr != nil {
+		return nil, cerr
+	}
+	reasons = append(reasons, crossReasons...)
 	if len(reasons) > 0 {
 		return nil, &OpsBlocked{Reasons: reasons}
 	}
@@ -359,10 +373,20 @@ func (s *PgStore) WithdrawPackVersion(ctx context.Context, ref, version, reason,
 	if err := s.transition(ctx, tx, v, "WITHDRAW", "WITHDRAWN", actor, reason, evidenceRef); err != nil {
 		return nil, err
 	}
+	// Withdrawing changes future resolution only (JUR-NEG-19); what was already decided with the version is tracked, in this same transaction, by a
+	// remediation case, so it cannot be forgotten. No decisions, no case.
+	rc, err := s.openRemediationTx(ctx, tx, v.id, domain.RemediationWithdraw, "", "", nil, "version withdrawn: "+reason, evidenceRef, actor)
+	if err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, s.registryFail("WithdrawPackVersion commit", err, nil)
 	}
 	res.Changed = true
+	if rc != nil {
+		res.RemediationCaseID = &rc.CaseID
+		res.RemediationOpened, res.RemediationDecisions = rc.Opened, rc.DecisionsTotal
+	}
 	return res, nil
 }
 
@@ -705,14 +729,23 @@ func (s *PgStore) RollbackDeployment(ctx context.Context, ref, version, ring, re
 	if err != nil {
 		return nil, s.registryFail("RollbackDeployment read", err, nil)
 	}
+	// The decisions already made with the rolled-back version in this scope are tracked by a remediation case, opened in this same transaction.
+	rc, err := s.openRemediationTx(ctx, tx, v.id, domain.RemediationRollback, ring, region, &cur.DeployedAt, "rolled back in "+ring+"/"+region+": "+reason, "", actor)
+	if err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, s.registryFail("RollbackDeployment commit", err, nil)
 	}
 	out := &RollbackResult{RolledBack: rolled, Restored: restored, DecisionsMade: decisions,
 		Reconciliation: "not performed: no reconciliation signal exists in this service"}
+	if rc != nil {
+		out.RemediationCaseID = &rc.CaseID
+		out.RemediationOpened, out.RemediationDecisions = rc.Opened, rc.DecisionsTotal
+	}
 	if decisions > 0 {
-		out.RemediationNote = fmt.Sprintf("%d decision(s) were made with %s@%s in this ring and region. Rollback changes future resolution only; "+
-			"those outcomes are unchanged and need a remediation workflow (not built).", decisions, ref, version)
+		out.RemediationNote = fmt.Sprintf("%d decision(s) were made with %s@%s in this ring and region. Rollback changes future resolution only, so those outcomes are unchanged; "+
+			"remediation case %s tracks them: each needs a disposition with evidence before the case can be closed by someone other than its opener.", decisions, ref, version, rcID(rc))
 	}
 	return out, nil
 }

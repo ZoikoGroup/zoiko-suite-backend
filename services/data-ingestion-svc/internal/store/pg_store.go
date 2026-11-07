@@ -32,6 +32,9 @@ type Store interface {
 	GetRun(ctx context.Context, tenantID, runID string) (*domain.IngestionRun, error)
 	GetCheckpoint(ctx context.Context, tenantID, sourceID string) (*domain.SourceCheckpoint, error)
 	ListQuarantineItems(ctx context.Context, tenantID, runID string) ([]domain.QuarantineItem, error)
+
+	// QueryImportBatchTieout serves the FIN-CTRL-033 control population (see control_population.go).
+	QueryImportBatchTieout(ctx context.Context, tenantID string, q domain.ImportBatchTieoutQuery) (*domain.ControlPopulationPage, error)
 }
 
 type PgStore struct {

@@ -3,6 +3,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -23,6 +24,8 @@ type Principal struct {
 	Status                  PrincipalStatus `json:"status"`
 	CreatedAt               time.Time       `json:"created_at"`
 	DataClassification      string          `json:"data_classification"`
+	// RecordVersion is the optimistic-concurrency token (migration 000016).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -96,11 +99,11 @@ type SessionContext struct {
 	// resolved under; ending it ends this session (AU-01). Empty for a
 	// session resolved from a token minted before login sessions existed.
 	AuthSessionID string `json:"auth_session_id,omitempty"`
-	// ConcurrencyExempt keeps the session-concurrency cap (ZS-IAM-001 §15,
-	// MAX_SESSIONS_PER_PRINCIPAL) off this session. Set by the resolver for
-	// service accounts and API clients: a workload may legitimately hold many
-	// concurrent sessions, and with session status now checked by relying
-	// parties a capped workload session would fail mid-flight. Not persisted.
+	// ConcurrencyExempt keeps the human session-concurrency cap (ZS-IAM-001
+	// §15, MAX_SESSIONS_PER_PRINCIPAL) off this session. Set by the resolver
+	// for service accounts and API clients, which draw on their own, larger
+	// SESSION_CAP_WORKLOAD instead: a workload may legitimately hold many
+	// concurrent sessions, but not an unbounded number. Not persisted.
 	ConcurrencyExempt bool      `json:"-"`
 	IssuedAt          time.Time `json:"issued_at"`
 	ExpiresAt         time.Time `json:"expires_at"`
@@ -197,6 +200,8 @@ type SessionContext struct {
 	// rather than a policy evaluation per row.
 	DispositionDueAt *time.Time `json:"disposition_due_at,omitempty"`
 	DisposedAt       *time.Time `json:"disposed_at,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000016).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +647,9 @@ const (
 const (
 	CredentialTypePassword = "PASSWORD"
 	CredentialTypeTOTP     = "TOTP"
+	// CredentialTypeWebAuthn is a passkey / security key (webauthn_credentials,
+	// AU-11). It is the factor_type its events carry.
+	CredentialTypeWebAuthn = "WEBAUTHN"
 )
 
 // CredentialStatusPending is a TOTP factor generated but not yet proven: it
@@ -748,3 +756,63 @@ var ErrAuthorizationServiceUnavailable = errors.New("authorization service unava
 // foreign key to principals; such a principal cannot hold a session here, so
 // there is nothing for the projection to serve and the event is skipped.
 var ErrUnknownPrincipal = errors.New("principal not known to identity-context-svc")
+
+// ---------------------------------------------------------------------------
+// AuthenticationEvent  (data-model §06.2 — IC-2 console read model)
+//
+// Append-only log of every authentication outcome in the tenant. Backs
+// GET /v1/authentication-events (Sign-in events tab).
+// ---------------------------------------------------------------------------
+
+type AuthenticationEvent struct {
+	EventID        string    `json:"event_id"`
+	TenantID       string    `json:"tenant_id"`
+	PrincipalID    string    `json:"principal_id"`
+	EventType      string    `json:"event_type"`
+	Outcome        string    `json:"outcome"`
+	AssuranceLevel string    `json:"assurance_level,omitempty"`
+	SourceIP       string    `json:"source_ip,omitempty"`
+	UserAgent      string    `json:"user_agent,omitempty"`
+	OccurredAt     time.Time `json:"occurred_at"`
+	CorrelationID  string    `json:"correlation_id,omitempty"`
+	// Details carries the decision basis (e.g. {"basis":"bad_password"}).
+	Details json.RawMessage `json:"details,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// IdentityLink  (data-model §06.2 — IC-3 subject merge / federation links)
+//
+// Binds an external IdP subject (OIDC sub, SAML NameID) to a local principal
+// within a tenant. Backs GET /v1/subjects/{id}/links and the merge path.
+// ---------------------------------------------------------------------------
+
+type IdentityLink struct {
+	LinkID      string `json:"link_id"`
+	TenantID    string `json:"tenant_id"`
+	PrincipalID string `json:"principal_id"`
+	// Source is the store the binding lives in: "federation_link" (INT-10
+	// connection, SCIM / JIT / admin) or "federated_identity" (auth-plane
+	// identity provider login).
+	Source string `json:"source"`
+	// IdentityProvider is the federation connection or identity provider id.
+	IdentityProvider string     `json:"identity_provider"`
+	Issuer           string     `json:"issuer,omitempty"`
+	ProviderSubject  string     `json:"provider_subject"`
+	Status           string     `json:"status"`
+	LinkedBy         string     `json:"linked_by,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	LastLoginAt      *time.Time `json:"last_login_at,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// MergeDuplicateIdentityRequest  (ORG-1 subject merge)
+//
+// POST /v1/subjects/{survivor_id}/merge retires duplicate_id into the
+// survivor. The caller's step-up comes from its verified envelope, never from
+// the body; If-Match carries the duplicate's record version.
+// ---------------------------------------------------------------------------
+
+type MergeDuplicateIdentityRequest struct {
+	DuplicateID string `json:"duplicate_id"`
+	Reason      string `json:"reason"`
+}

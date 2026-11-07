@@ -183,7 +183,9 @@ func (s *PgStore) ExpireDue(ctx context.Context) (int, error) {
 		 WHERE (status = 'ACTIVE' AND expires_at <= NOW())
 		    OR (status = 'PENDING_APPROVAL' AND created_at <= NOW() - make_interval(secs => $1))
 		UNION
-		SELECT tenant_id FROM break_glass_sessions WHERE status = 'ACTIVE' AND expires_at <= NOW()
+		SELECT tenant_id FROM break_glass_sessions
+		 WHERE (status = 'ACTIVE' AND expires_at <= NOW())
+		    OR (status = 'PENDING_APPROVAL' AND request_expires_at <= NOW())
 		UNION
 		SELECT tenant_id FROM support_sessions WHERE status = 'ACTIVE' AND expires_at <= NOW()`
 	var tenants []string
@@ -244,11 +246,13 @@ func (s *PgStore) ExpireDue(ctx context.Context) (int, error) {
 }
 
 // sessionExpiryUpdates mark JIT, break-glass and support sessions that have
-// run out, and JIT requests whose approval window passed.
+// run out, and JIT and break-glass requests whose approval window passed (a
+// lapsed request never started, so it opens no review).
 var sessionExpiryUpdates = []string{
 	`UPDATE privileged_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'ACTIVE' AND expires_at <= NOW()`,
 	`UPDATE privileged_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'PENDING_APPROVAL' AND created_at <= NOW() - make_interval(secs => $2)`,
 	`UPDATE break_glass_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'ACTIVE' AND expires_at <= NOW()`,
+	`UPDATE break_glass_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'PENDING_APPROVAL' AND request_expires_at <= NOW()`,
 	`UPDATE support_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'ACTIVE' AND expires_at <= NOW()`,
 }
 

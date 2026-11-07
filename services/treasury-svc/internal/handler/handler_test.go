@@ -40,6 +40,8 @@ type mockStore struct {
 
 	cashPositions map[string]*domain.CashPositionSnapshot
 	fxExposures   map[string]*domain.FXExposureSnapshot
+
+	pop popStub // control-population stub state (control_population_test.go)
 }
 
 func newMockStore() *mockStore {

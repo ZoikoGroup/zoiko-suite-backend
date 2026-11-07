@@ -421,7 +421,7 @@ func (ix *Indexer) Apply(ctx context.Context, e projection.Event) (Outcome, erro
 			}
 		} else {
 			_ = ix.store.MarkTombstoneState(ctx, result.Restriction.TenantID, result.Restriction.SourceType,
-				result.Restriction.SourceID, result.Restriction.SourceEventID, domain.PropagationApplied, "")
+				result.Restriction.SourceID, result.Restriction.SourceEventID, domain.PropagationApplied, "", 0)
 			ix.metrics.RestrictionsTotal.WithLabelValues(scope, string(domain.PropagationApplied)).Inc()
 		}
 	}
@@ -515,7 +515,7 @@ func (ix *Indexer) VerifyRestrictions(ctx context.Context) {
 			// check" is not the same claim as "we checked and it is gone", and
 			// NP-60 forbids relabelling an unproven state as a pass.
 			_ = ix.store.MarkTombstoneState(ctx, t.TenantID, t.SourceType, t.SourceID, t.SourceEventID,
-				domain.PropagationFailed, "scope has no active generation to verify against")
+				domain.PropagationFailed, "scope has no active generation to verify against", 0)
 			continue
 		}
 
@@ -524,7 +524,7 @@ func (ix *Indexer) VerifyRestrictions(ctx context.Context) {
 		if err != nil {
 			ix.metrics.EngineError("count")
 			_ = ix.store.MarkTombstoneState(ctx, t.TenantID, t.SourceType, t.SourceID, t.SourceEventID,
-				domain.PropagationFailed, "engine unreachable during verification: "+err.Error())
+				domain.PropagationFailed, "engine unreachable during verification: "+err.Error(), 0)
 			continue
 		}
 
@@ -549,7 +549,7 @@ func (ix *Indexer) VerifyRestrictions(ctx context.Context) {
 			age := time.Since(t.EffectiveAt).Seconds()
 			ix.metrics.RestrictionsTotal.WithLabelValues(t.ScopeName, string(domain.PropagationFailed)).Inc()
 			_ = ix.store.MarkTombstoneState(ctx, t.TenantID, t.SourceType, t.SourceID, t.SourceEventID,
-				domain.PropagationFailed, "content is still discoverable after propagation")
+				domain.PropagationFailed, "content is still discoverable after propagation", 0)
 			ix.log.Error("RESTRICTION NOT PROPAGATED — content is still discoverable",
 				zap.String("scope", t.ScopeName),
 				zap.String("source_type", t.SourceType),
@@ -563,7 +563,7 @@ func (ix *Indexer) VerifyRestrictions(ctx context.Context) {
 		}
 
 		if err := ix.store.MarkTombstoneState(ctx, t.TenantID, t.SourceType, t.SourceID, t.SourceEventID,
-			domain.PropagationVerified, ""); err != nil {
+			domain.PropagationVerified, "", 0); err != nil {
 			ix.log.Error("restriction verified but the state write failed", zap.Error(err))
 			continue
 		}

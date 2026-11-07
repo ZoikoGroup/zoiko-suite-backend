@@ -1,0 +1,21 @@
+# Doc 07 register entry
+- Filename: ZoikoSuite_Suivo_Document_07.md
+- Document ID (exact): ZS-SUIVO-ENG-007
+- Title (exact, from the title line, not the ID line): Quality Assurance, Testing Strategy & Acceptance Criteria
+- Version (exact): VERSION 1.0
+- Date (exact): 24 OCTOBER 2026
+- Status / approval wording (quote the full sentence): DOCUMENT APPROVAL STATUS PROPOSED FOR FOUNDER / ENGINEERING APPROVAL. This specification is a test plan and target operating standard—not a report that Suivo has passed these tests, achieved performance targets, or launched. All release thresholds are proposed, and final service-level objectives require CTO/SRE validation against deployed architecture and load data.
+- Approver roles (exactly as written in the status or approval text): FOUNDER / ENGINEERING
+- Classification (if stated): Internal / confidential
+- Other document IDs mentioned in lines 1—80 (list each ID + the line number):
+  - ZS-SUIVO-ENG-007 (line 18)
+  - Docs 01—06 (line 20)
+- Line numbers where each value above was found:
+  - Document ID (exact): line 18
+  - Title (exact): line 7
+  - Version (exact): line 9
+  - Date (exact): line 9
+  - Status / approval wording: line 13
+  - Approver roles: line 13
+  - Classification: not found in lines 1—80
+  - Other document IDs: line 18, line 20

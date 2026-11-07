@@ -12,7 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
+
 	"zoiko.io/mtls-management-svc/internal/authz"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/handler"
@@ -153,9 +156,15 @@ func main() {
 		logger.Fatal("bootstrap tokens", zap.Error(err))
 	}
 	h := handler.New(s, internalCA, ledger, siemClient, authzClient, logger, bootstrapTokens)
-	router := handler.NewRouter(h)
 
-	srv := &http.Server{Addr: ":" + port, Handler: router, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}
+	// Create router with apicontract middleware
+	r := chi.NewRouter()
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
+	// Mount the handler's routes
+	r.Mount("/", handler.NewRouter(h))
+
+	srv := &http.Server{Addr: ":" + port, Handler: r, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("server error", zap.Error(err))

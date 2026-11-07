@@ -1,0 +1,106 @@
+wbs_id,phase,title,status,evidence,depends_on,note
+SUIVO-11-A01,P0/R0,"Catalogue repos, deployments and environments with owners",Partial,docs/suivo/g0-architecture-delta.md;docs/suivo/adr/ADR-001-service-location-isolation.md,G0,Service side documented; hosting inventory and named owners need DEC-01
+SUIVO-11-A02,P0/R0,"Record public URLs, UX assets and widget embedding; check CSP",Partial,frontend:components/assistant/mount.ts;internal/middleware.TestSecurityHeaders,A01,Public URLs are example.invalid (DEC-10); console CSP is an owner decision
+SUIVO-11-A03,P0/R0,"Inventory APIs, IAM, events, model and search as existing/proposed",Partial,docs/suivo/04-architecture-proposal.md;docs/suivo/g0-architecture-delta.md,A01,Real gateway and identity unknown (DEC-01)
+SUIVO-11-A04,P0/R0,"Reconcile ten modules, domains and categories to stable IDs",Blocked,services/public-ai-svc/data/public-kb/taxonomy-crosswalk.json,A01,Decision: crosswalk UNRECONCILED until taxonomy approved (DEC-02)
+SUIVO-11-A05,P0/R0,Confirm owners and sources of market plan/trial claims,Blocked,,A01,Decision: claim approvers and real data (DEC-03); claims are synthetic
+SUIVO-11-A06,P0/R0,"Approve public-only R0 charter, R1 deferrals and public name",Blocked,docs/suivo/r0-readiness.md,A01,Approval: Product Owner; name/brand DEC-04
+SUIVO-11-A07,P0/R0,Open RAID register with owners,Partial,docs/suivo/handover-registers.md,A01,"Register exists; owners are functions, names PENDING"
+SUIVO-11-A08,P0/R0,"Baseline SLA/SLO, traffic and model cost forecasts",Blocked,deployments/prometheus-rules-public-ai.yml,A01,Decision: 99.9% is PROPOSED; needs real traffic and DEC-08
+SUIVO-11-A09,P0/R0,"Record DPO, vendor, privacy, residency and cookie gates",Partial,docs/suivo/handover-registers.md,A01,Gates recorded as DEC-05/06; decisions open
+SUIVO-11-A10,P0/R0,"Set up backlog IDs, traceability tooling and evidence workspace",Built,cmd/traceability.TestCommittedMatrixIsWellFormed;docs/suivo/sec-t-traceability.csv;docs/suivo/qa-t-traceability.md,A01,
+SUIVO-11-B01,P0/R0,"Build launcher and panel, responsive, with approved brand assets",Partial,frontend:components/assistant/AssistantWidget.tsx;frontend:tests/e2e/ui.spec.ts,A02/A06,Built with a neutral name; brand assets not cleared (DEC-04)
+SUIVO-11-B02,P0/R0,"Keyboard focus, screen reader status, contrast, reduced motion",Partial,frontend:tests/e2e/assistant.spec.ts K11 axe;frontend:tests/e2e/assistant.spec.ts K11 keyboard only,B01,Automated checks pass; manual screen-reader pass not done
+SUIVO-11-B03,P0/R0,Bind visitor states from welcome to error,Built,frontend:components/assistant/state.ts;frontend:components/assistant/state.test.mjs,B01/C04,
+SUIVO-11-B04,P0/R0,Official URL route launcher with allowlist and leaving warning,Partial,internal/release.TestRoutesRejectUnsafeURLs;frontend:components/assistant/AssistantWidget.test.tsx leaving for secure support,E08/F06,Mechanism built; route registry has no real URLs (DEC-10)
+SUIVO-11-B05,P0/R0,Show citations and claim evidence without internal controls,Built,internal/acceptance.TestReplyCarriesSourceDateAndDisposition;internal/acceptance.TestCitationTitleAndRouteKey;frontend:components/assistant/AssistantWidget.test.tsx review date,D05/E06,
+SUIVO-11-B06,P0/R0,"Session expiry, clear chat and privacy notice controls",Partial,internal/session.TestIdleExpiry;frontend:components/assistant/AssistantWidget.test.tsx Clear chat,E03/F04,Privacy notice text and retention period need DPO (DEC-06)
+SUIVO-11-B07,P0/R0,Brand/locale responsive visual regression across browsers,Partial,frontend:tests/e2e/ui.spec.ts,B01-B06,"Snapshot tests exist; brand and locales not approved (DEC-04, DEC-15)"
+SUIVO-11-B08,P1/R1,Wire staff-contact destinations after verified receipts,Blocked,,I05,R1: no case system; handoff is route-only (DEC-12)
+SUIVO-11-C01,P0/R0,"Version prompts, classifier and policy with signed review",Partial,internal/policy.TestSignedPolicyDigest;internal/policy.TestIntentAndTemplateVersions,A06,Signed digest built; CODEOWNERS review rules commented out (no reviewers)
+SUIVO-11-C02,P0/R0,Typed intent routing and deterministic deny categories,Built,internal/policy.TestIntents;internal/policy.TestGoldenClassificationRegressions;internal/policy.TestExceptions,C01,
+SUIVO-11-C03,P0/R0,"Safe clarification, multi-turn state and ambiguity limits",Built,internal/orchestrator.TestClarificationGivesUpAfterTwo;internal/orchestrator.TestClarificationCarriesPlan;internal/acceptance.TestDoc02SessionMarketReuse,C02,
+SUIVO-11-C04,P0/R0,"Model gateway: context budget, deadlines, usage, errors",Built,internal/validate.TestGatewayDeadlineAndNoTools;internal/model.TestGroqDeadlineIsATimeout;internal/model.TestGroqErrorsNeverLeakKeyOrBody;internal/limits.TestSpendStages,E01/F05,
+SUIVO-11-C05,P0/R0,Ground model to evidence and schema; no privileged tools,Built,internal/validate.TestClaimToSpan;internal/orchestrator.TestOutputValidation;internal/model.TestGroqOffContractReplyIsAnEmptyDraft,C04/D05,
+SUIVO-11-C06,P0/R0,"Pre/post checks for PII, promises and unsafe URLs",Built,internal/policy.TestRedactSensitiveInput;internal/validate.TestFalseConfirmationsRejected;internal/validate.TestModelLinksAreRemoved,C05,
+SUIVO-11-C07,P0/R0,Transparent safe fallback on missing source or outage,Built,internal/orchestrator.TestProviderFailuresFallBackSafely;internal/orchestrator.TestNoKnowledgeMeansUnavailable;internal/orchestrator.TestExpiredEvidenceAbstains,C05/E08,
+SUIVO-11-C08,P0/R0,Prompt regression fixtures and version comparison,Built,internal/eval.TestBaselineRegression;internal/eval.TestBaselineCoversGoldenSet;cmd/evalrun,C01/J01,
+SUIVO-11-D01,P0/R0,"Source registry with class, owner, jurisdiction, dates, approval",Built,internal/acceptance.TestKB001_UnregisteredSourceRejected;internal/acceptance.TestKB028_OwnerAndReviewDeadline;internal/acceptance.TestPlanRegistryAndRevocationReason,A04/A05,Every real source is still DRAFT_PENDING_REVIEW
+SUIVO-11-D02,P0/R0,"Controlled ingest, chunking, provenance and source identity",Partial,internal/acceptance.TestKB020_IdempotentRerun;internal/knowledge.FuzzParseMarkdownSource,D01,Markdown only; HTML/PDF/DOCX extraction and fetch connectors not built
+SUIVO-11-D03,P0/R0,Four-eyes publishing and signed immutable KB releases,Built,internal/acceptance.TestKB016_SignerNotIndependent;internal/release.TestSignatureEnforced;internal/store.TestPostgresReleasesImmutable,D01,
+SUIVO-11-D04,P0/R0,"Taxonomy aliases, canonical IDs and version checks",Partial,internal/acceptance.TestKB014_CanonicalAPAlias;internal/acceptance.TestKB019_PlanLabelMapsToStableID,A04/D02,Taxonomy itself not approved (DEC-02)
+SUIVO-11-D05,P0/R0,Hybrid retriever with public prefilters and cited provenance,Partial,internal/knowledge.TestHybridFiltersBeforeRanking;internal/knowledge.TestHybridAddsVectorRecall;internal/knowledge.TestHybridFallsBackToLexical,D02/D03,"Lexical in production; embeddings provider not chosen (D03-08, DEC-05)"
+SUIVO-11-D06,P0/R0,Signed market/plan/trial/security claim resolver with expiry,Built,internal/claims.TestDecisionFields;internal/release.TestClaimDecisions;internal/acceptance.TestKB009_ExpiredTrialClaim,A05/D03,Claim data synthetic (DEC-03)
+SUIVO-11-D07,P0/R0,"Contradictions, invalid windows and abstentions",Built,internal/acceptance.TestKB005_TwoActiveClaimsDisagree;internal/acceptance.TestKB023_SupersededAtMidnightUTC;internal/orchestrator.TestConflictingPricesAbstain,D05/D06,
+SUIVO-11-D08,P0/R0,"Atomic source revocation across caches, search and claims",Built,internal/acceptance.TestKB010_RevokedAfterCachePopulated;internal/orchestrator.TestRevocationMidFlightAbstains;internal/release.TestRevokedSinceAtCommit,D03/D05,
+SUIVO-11-D09,P0/R0,Prove release/claim digest pinning with rollback,Built,internal/acceptance.TestKB011_RollbackKeepsRevocation;internal/release.TestRevocationSurvivesRollback;internal/eval.TestPinnedReleaseAndResultHash,D03/D06,
+SUIVO-11-D10,P1/R1,Staff KB editing and review queues behind staff IAM,Blocked,cmd/kbctl,I02,R1: no staff console (DEC-11); kbctl CLI is the interim control plane
+SUIVO-11-E01,P0/R0,"Approve C4, threats, ownership and egress deny-list as ADRs",Partial,docs/suivo/adr;docs/suivo/threat-model.md,A01/A03/A09,ADRs and threat model drafted; approval and owners pending
+SUIVO-11-E02,P0/R0,Freeze API base path and machine-checked OpenAPI,Built,internal/specs.TestOpenAPIBackwardCompatible;internal/specs.TestJSONSchemasMatchOpenAPI;services/public-ai-svc/api/compat/openapi-1.0.yaml,E01,
+SUIVO-11-E03,P0/R0,"Anonymous session create, TTL, encryption, one active turn",Partial,internal/httpapi.TestCT001_CreateSession;internal/session.TestIdleExpiry;internal/httpapi.TestCT011_TurnConflict,E02,No application-level encryption of session data found
+SUIVO-11-E04,P0/R0,"Turn submission, typed envelope and RFC 9457 problems",Built,internal/httpapi.TestTurnHappyPathEnvelope;internal/httpapi.TestBadRequestUsesRFC9457;internal/problem.TestRFC9457ContractFields,E03,
+SUIVO-11-E05,P0/R0,"Idempotency, lock contention, replay and cancellation",Built,internal/httpapi.TestCT009_TurnReplayNoSecondCall;internal/httpapi.TestIdempotencyMismatch;internal/httpapi.TestStopCancelsTheModelCall,E03/E04,
+SUIVO-11-E06,P0/R0,"Integrate policy, search, claims and model internally",Built,internal/e2e.TestEndToEndConversation;internal/orchestrator.TestSliceGroundedAnswer;internal/orchestrator.TestSlicePriceFromVerifiedClaim,C05/D05/D06/E04,
+SUIVO-11-E07,P0/R0,"Event schema registry, outbox/inbox dedupe, DLQ, replay",Partial,internal/events.TestRelayDeliversOnceAndDivertsToDLQ;internal/events.TestDLQReplayRechecks;internal/specs.TestAsyncAPIMatchesEventPayloads,E02,No inbox consumer in R0; broker ACLs need infrastructure
+SUIVO-11-E08,P0/R0,Public config/route resolver with signed redirects and caching,Built,internal/httpapi.TestConfigETag;internal/release.TestRouteResolutionFailsClosed;internal/release.TestRoutesRejectUnsafeURLs,E02/D06,
+SUIVO-11-E09,P0/R0,"API compatibility, concurrency, contract and negative tests",Built,internal/specs.TestAsyncAPIBackwardCompatible;internal/acceptance.TestA26_ConcurrentTurnsSameSession;internal/httpapi.TestByteFlippedGrantRejected,E03-E08,
+SUIVO-11-E10,P1/R1,"Scoped internal adapters for cases, CRM and booking",Blocked,internal/flags.TestDoc10GatesAreHardOff,I05/J03,R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-F01,P0/R0,STRIDE and OWASP LLM/API threat scenarios with owners,Built,docs/suivo/threat-model.md;docs/suivo/owasp-llm-map.md,E01,Owners are functions; names pending
+SUIVO-11-F02,P0/R0,Deny network routes and credentials to private systems,Partial,internal/isolation.TestT12_NoRouteToPrivateSystems;internal/isolation.TestForbiddenDepsRejectsOtherServices,E01,Code side built; NetworkPolicy/egress proof needs infrastructure
+SUIVO-11-F03,P0/R0,"WAF, schema, abuse quotas and token spend ceilings",Partial,internal/limits.TestSharedLimitAcrossReplicas;internal/limits.TestSpendCeilingStopsAnswering;internal/httpapi.TestDeeplyNestedBodyRejected,E02/C04,No WAF deployed; bot-defence vendor undecided
+SUIVO-11-F04,P0/R0,Approve retention and DPIA; implement TTL and deletion,Partial,internal/store.TestMemoryConformance;internal/session.TestIdleExpiry;docs/suivo/data-inventory.md,A09,Purge built; retention values need DPO (DEC-06)
+SUIVO-11-F05,P0/R0,Approve model/search supplier processing and transfers,Blocked,internal/config.TestProductionGates,A09,Approval: DPO + Procurement (DEC-05); code refuses unapproved provider
+SUIVO-11-F06,P0/R0,"Validated links, prompt-injection controls, citation filtering",Built,internal/validate.TestModelLinksAreRemoved;internal/acceptance.TestA19_UserPromptInjection;internal/acceptance.TestA20_InjectionFromRetrievedPage;internal/acceptance.TestKB018_UnapprovedOrigin,C05/D05,
+SUIVO-11-F07,P0/R0,"Secret scanning, dependency policy, SBOM, attestations",Partial,.github/workflows/secret-scan.yml;.github/workflows/ci.yml public-ai-supply-chain;internal/specs.TestSecretScanSelfTest,E01,Build attestations and image signing need a registry and key
+SUIVO-11-F08,P0/R0,"Privacy-safe logs, access audits and incident handling",Partial,internal/telemetry.TestFilterDropsContent;internal/release.TestOperatorActionsAreAudited;services/public-ai-svc/RUNBOOK.md RB-03,F04/E03,Incident roles unassigned (H23)
+SUIVO-11-F09,P0/R0,"Test rights workflow, deletion propagation, provider purge",Blocked,internal/acceptance.TestDataRightsRequestsRouteOnly,F04/F05,Decision: DPO rights policy and provider terms (DEC-05/06)
+SUIVO-11-F10,P0/R0,Red-team and breach simulations; close P0 issues,Partial,internal/policy.TestMultilingualInjection;.github/workflows/public-ai-nightly.yml ZAP API scan;cmd/drill DR-07,C06/E09/D08,Automated adversarial suites; independent red team/pen test not done
+SUIVO-11-F11,P1/R1,"Approve staff IAM, least privilege, step-up and SoD",Blocked,,A03/E01,R1: no staff console (DEC-11)
+SUIVO-11-G01,P0/R0,One requirements-test-evidence matrix for IDs and WBS,Built,cmd/traceability.TestAllMappedP0TestsPass;docs/suivo/sec-t-traceability.csv;docs/suivo/ops-admin-commercial-traceability.csv,A10,
+SUIVO-11-G02,P0/R0,Schema/API and browser smoke tests with fixtures,Built,internal/specs.TestOpenAPIMatchesTurnEnvelope;frontend:tests/e2e/assistant.spec.ts,E02/B01,
+SUIVO-11-G03,P0/R0,Holdout and golden datasets with provenance and rubric versions,Partial,internal/eval.TestGoldenSet;services/public-ai-svc/testdata/golden/golden-v1.json,C01/D05,Holdout partition needs independent authors
+SUIVO-11-G04,P0/R0,"Score groundedness, claims, abstention, multi-turn; adjudicate",Partial,internal/eval.TestGraderCatchesFabrication;internal/eval.TestMacroIntentAccuracyGate;internal/validate.TestClaimToSpan,G03/E06,Human adjudication and real-model runs not done (DEC-05)
+SUIVO-11-G05,P0/R0,"OWASP, injection, leakage and network-negative suites",Partial,internal/acceptance.TestA21_SystemPromptDisclosure;.github/workflows/public-ai-nightly.yml ZAP API scan;internal/acceptance.TestA35_NoEgressToPrivateServices,F10,Network-negative proof needs a deployment
+SUIVO-11-G06,P0/R0,"WCAG 2.2 AA, keyboard, assistive tech, responsive, language",Partial,frontend:tests/e2e/assistant.spec.ts K11 axe;frontend:tests/e2e/assistant.spec.ts K10 header fits at 320 px,B07,Manual assistive-tech pass not done; en-US only
+SUIVO-11-G07,P0/R0,"Load, outage, revocation, retry and recovery simulations",Partial,cmd/loadtest.TestLoadProfiles;cmd/loadtest.TestModelFaultsUnderLoad;cmd/drill,E09/D08/H04,Load rates need SRE approval (DEC-08) and staging
+SUIVO-11-G08,P0/R0,"Test public routes, P1 claims and no false confirmations",Built,internal/acceptance.TestA07_SignedStarterPriceUS;internal/acceptance.TestA09_TrialDisabledNoTrialCTA;internal/validate.TestFalseConfirmationsRejected,D06/E08,Fixtures are synthetic
+SUIVO-11-G09,P0/R0,"Signed non-waivable failure classes, exceptions, golden results",Partial,internal/eval.TestRepeatsAndFlakes;cmd/evalrun,G04-G08,Verdicts and waivers built; signatures pending
+SUIVO-11-G10,P1/R1,"Staff RBAC, case, CRM/booking reconciliation E2E suites",Blocked,,I08/J09,R1: no staff console (DEC-11); R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-H01,P0/R0,"IaC, secrets, no public admin endpoints, isolated runtimes",Partial,internal/httpapi.TestAdminListenerSeparatesInternalEndpoints;internal/config.TestAdminAddr;deployments/docker-compose.public-ai.yml,E01/F02,No IaC or Kubernetes manifests (infrastructure)
+SUIVO-11-H02,P0/R0,Four-artifact manifest with digests,Built,internal/release.TestManifestRequiresImageDigest;internal/release.TestManifestRecordsEvidenceDigests;internal/release.TestManifestRecordAndSignoffs,C01/D03/D06,
+SUIVO-11-H03,P0/R0,"CI/CD gates: unit, contract, eval, security, a11y, provenance",Partial,.github/workflows/ci.yml;.github/workflows/public-ai-nightly.yml,G01/H02,Provenance gate missing (needs signing infrastructure)
+SUIVO-11-H04,P0/R0,"Redacted traces, SLI dashboards, budget and alert routing",Partial,internal/telemetry.TestOTLPExportOverTheWire;deployments/grafana/provisioning/dashboards/public-ai-svc.json;deployments/prometheus-rules-public-ai.yml,E03/C04/F08,No OTel collector or Alertmanager routing deployed
+SUIVO-11-H05,P0/R0,"Independent rollback, kill-switch and safe-static drills",Partial,cmd/drill DR-01;cmd/drill DR-03;cmd/drill DR-05,H02/H03/D08,Run in CI; staging run by an independent operator pending
+SUIVO-11-H06,P0/R0,"Run provider-failure, stale-claim and privacy-incident runbooks",Partial,services/public-ai-svc/RUNBOOK.md RB-01;services/public-ai-svc/RUNBOOK.md RB-02;services/public-ai-svc/RUNBOOK.md RB-03;cmd/drill DR-04,H04/H05,Privacy-incident runbook not exercised with Security/DPO
+SUIVO-11-H07,P0/R0,"Confirm backup/restore, provider quota, regional targets",Blocked,cmd/drill DR-06,H01,"Infrastructure and decision: no backups, RTO/RPO, region (DEC-05/08)"
+SUIVO-11-H08,P0/R0,"Staged canary, telemetry review and signed reversal",Blocked,cmd/canary.TestCanaryJourneyPasses,G09/H06,Infrastructure and people: no canary ramp or pilot
+SUIVO-11-H09,P0/R0,"On-call rota, escalation, change freeze, incident command",Blocked,internal/release.TestPromotionFreeze;services/public-ai-svc/RUNBOOK.md,H04,People: rota and incident commander not named
+SUIVO-11-H10,P0/R0,Immutable release evidence and final four digests,Partial,cmd/kbctl verify-manifest;internal/release.TestManifestRecordAndSignoffs,H02-H09,Tooling built; no signed production release yet
+SUIVO-11-I01,P1/R1,"Confirm staff app origin, SSO/SCIM/MFA, separation from public API",Blocked,,A03/F11,R1: no staff console (DEC-11)
+SUIVO-11-I02,P1/R1,"Staff RBAC/ABAC roles, approvals and authorisation audit",Blocked,,I01,R1: no staff console (DEC-11)
+SUIVO-11-I03,P1/R1,"Admin command centre, work queue and case detail",Blocked,,I02,R1: no staff console (DEC-11)
+SUIVO-11-I04,P1/R1,"Staff knowledge review, publish and revoke workflow",Blocked,cmd/kbctl,I02/D03,R1: no staff console (DEC-11); kbctl publish/revoke is the interim tool
+SUIVO-11-I05,P1/R1,"Route-only, accepted-case and unavailable handoff states",Blocked,internal/orchestrator.TestDemoIsRouteOnly,I02,R1: no case system; handoff is route-only (DEC-12); route-only state built
+SUIVO-11-I06,P1/R1,"Case lifecycle, assignment, SLA and verified receipt",Blocked,,I05,R1: no case system; handoff is route-only (DEC-12)
+SUIVO-11-I07,P1/R1,"Redacted staff analytics, audit search and governance",Blocked,cmd/kbctl audit,I02,R1: no staff console (DEC-11)
+SUIVO-11-I08,P1/R1,"Role, approval, tamper, recovery, SLA and case tests",Blocked,,I03-I07,R1: no staff console (DEC-11)
+SUIVO-11-J01,P1/R1,Select first-party demo/trial/lead routes and forms,Blocked,,A05,R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-J02,P1/R1,"Approve form fields, B2B marketing rules, regional suppression",Blocked,,F04/J01,R1: DPO + Commercial decision (DEC-06/13)
+SUIVO-11-J03,P1/R1,Server-side intake with purpose evidence and receipt,Blocked,internal/flags.TestDoc10GatesAreHardOff,J02/E07,R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-J04,P1/R1,"Per-submission idempotency, org matching, review queue",Blocked,,J03,R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-J05,P1/R1,"Select CRM, map fields, outbox and sync adapter",Blocked,,J03/F05,R1: CRM vendor and contract (DEC-13)
+SUIVO-11-J06,P1/R1,Select scheduler; signed webhooks and real confirmation,Blocked,,J03/F05,R1: scheduler vendor (DEC-14)
+SUIVO-11-J07,P1/R1,"CRM retry, reconciliation and dead-letter operations",Blocked,,J05/J06,R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-J08,P1/R1,Consent withdrawal and suppression propagation,Blocked,,J02/J05,R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-J09,P1/R1,Prove lead/booking/CRM lifecycles are independent,Blocked,,J03-J08,R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-J10,P1/R1,Approve release with CRM/calendar/vendor readiness evidence,Blocked,,J09/G10,R1: lead/CRM/booking flags hard-off (DEC-13/14)
+SUIVO-11-K01,P0/R0,Sign content ownership and revision cadence,Blocked,,D09,Approval: Product and Knowledge owners
+SUIVO-11-K02,P0/R0,"Verify runbooks, owner roster and escalation contacts",Blocked,services/public-ai-svc/RUNBOOK.md,H09,People: runbook is DRAFT; roster names PENDING
+SUIVO-11-K03,P0/R0,"Reconcile open defects, risks, exceptions, rollback rights",Blocked,docs/suivo/handover-registers.md,G09/H10,People: QA + CTO review
+SUIVO-11-K04,P0/R0,Approve legal/IP/privacy/vendor checklist,Blocked,,F05/K01,Approval: Legal + DPO (DEC-04/05/06)
+SUIVO-11-K05,P0/R0,Independent go/no-go with versioned evidence,Blocked,cmd/kbctl verify-manifest,K02-K04,People: release board not formed
+SUIVO-11-K06,P0/R0,"Pilot, sign canary results, record rollback and SLOs",Blocked,,K05/H08,Needs a pilot and canary infrastructure
+SUIVO-11-K07,P0/R0,"Transition to BAU on-call, backups, cadence, reviews",Blocked,,K06,People and infrastructure: operations team
+SUIVO-11-K08,P1/R1,Separate admin/CRM/booking readiness evidence,Blocked,,I08/J10,R1: depends on I08 and J10
+SUIVO-11-K09,P0/R0,Archive signed requirements-to-release dossier,Blocked,,K07,People: needs signed release first
+SUIVO-11-K10,P0/R0,Final ownership transfer acknowledgement,Blocked,,K09,People: Global CTO and receiving teams

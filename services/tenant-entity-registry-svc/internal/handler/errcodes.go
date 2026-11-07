@@ -39,7 +39,9 @@ const (
 	// ORG-02 §4.2 server-resolved context refusals (000013).
 	CodeJurisdictionRestricted = "JURISDICTION_RESTRICTED"
 	CodeNotEntitled            = "NOT_ENTITLED"
-	CodeInternal               = "INTERNAL_ERROR"
+	// ORG-07 MDM-05: a merge the matching rules forbid.
+	CodeMergeProhibited = "MERGE_PROHIBITED"
+	CodeInternal        = "INTERNAL_ERROR"
 )
 
 // errorCodes is checked in order: the specific kinds before the broad
@@ -53,6 +55,8 @@ var errorCodes = []struct {
 	{registry.ErrVersionConflict, CodeVersionConflict},
 	{registry.ErrApprovalFingerprintMismatch, CodeVersionConflict},
 	{registry.ErrOnboardingKeyMismatch, CodeIdempotencyMismatch},
+	{registry.ErrCreateRequestMismatch, CodeIdempotencyMismatch},
+	{registry.ErrMergeProhibited, CodeMergeProhibited},
 	{registry.ErrRegistryConflict, CodeDuplicateCandidate},
 	{registry.ErrApprovalPending, CodeDuplicateCandidate},
 	{registry.ErrJurisdictionRestricted, CodeJurisdictionRestricted},

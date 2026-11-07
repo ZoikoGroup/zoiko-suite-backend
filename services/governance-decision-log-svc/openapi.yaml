@@ -332,16 +332,26 @@ components:
         tenant_id: {type: string}
     Problem:
       type: object
-      required: [title, status]
+      required: [type, title, status, code]
       properties:
-        type: {type: string, description: 'Stable error class, e.g. IDEMPOTENCY_MISMATCH, AUTHORIZATION_DENIED.'}
+        type: {type: string, format: uri, description: 'Stable error class, e.g. IDEMPOTENCY_MISMATCH, AUTHORIZATION_DENIED.'}
         title: {type: string}
         status: {type: integer}
         detail: {type: string}
         instance: {type: string}
-        error: {type: string, description: 'Envelope refusals only: envelope_incomplete.'}
-        service: {type: string, description: 'Envelope refusals only.'}
-        violations: {type: array, items: {type: object}, description: 'Envelope refusals only: one entry per missing or invalid envelope field.'}
+        code: {type: string, description: 'Stable machine-readable error code.'}
+        request_id: {type: string}
+        correlation_id: {type: string}
+        retryable: {type: boolean}
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: {type: string}
+              code: {type: string}
+              detail: {type: string}
+        current_version: {type: integer, format: int64}
   responses:
     BadRequest:
       description: Invalid input, or (on writes) an incomplete envelope.

@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/authorization-svc/internal/domain"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
@@ -206,6 +207,8 @@ type Handler struct {
 	// sessionLimits are the B-01 session maximums; zero fields fall back to
 	// the store's built-in ceilings. See SetSessionLimits.
 	sessionLimits SessionLimits
+	// breakGlassApprovals is the AU-02 quorum; see SetBreakGlassApprovals.
+	breakGlassApprovals int
 }
 
 // SetEntityRegistry lets resolveTenantScope check, with
@@ -250,6 +253,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/role-assignments", h.CreateRoleAssignment)
 	r.Get("/v1/admin/role-assignments", h.ListRoleAssignments)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/revoke", h.RevokeRoleAssignment)
+	// ORG-06 s4.6: suspend and resume, the suspension history, and the
+	// as-of reconstruction (000037).
+	r.Post("/v1/admin/role-assignments/{assignment_id}/suspend", h.SuspendRoleAssignment)
+	r.Post("/v1/admin/role-assignments/{assignment_id}/resume", h.ResumeRoleAssignment)
+	r.Get("/v1/admin/role-assignments/{assignment_id}/suspensions", h.ListAssignmentSuspensions)
+	r.Get("/v1/admin/role-assignments/as-of", h.GetAssignmentsAsOf)
 	// Maker-checker on privileged assignments (GOV-12; ZS-IAM-001 §9, A20).
 	r.Post("/v1/admin/role-assignments/{assignment_id}/approve", h.ApproveRoleAssignment)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/reject", h.RejectRoleAssignment)
@@ -266,6 +275,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/admin/sod-rules", h.ListSoDRules)
 	r.Post("/v1/admin/sod-rules/{sod_rule_id}/retire", h.RetireSoDRule)
 	r.Post("/v1/admin/sod-rules/{sod_rule_id}/reactivate", h.ReactivateSoDRule)
+	// AU-17: a rule change takes effect when someone else publishes it.
+	r.Post("/v1/admin/sod-rules/{sod_rule_id}/approve", h.ApproveSoDRule)
+	r.Post("/v1/admin/sod-rules/{sod_rule_id}/reject", h.RejectSoDRule)
 	// GOV-04 compensating-control exceptions.
 	r.Post("/v1/admin/sod-exceptions", h.RequestSoDException)
 	r.Get("/v1/admin/sod-exceptions", h.ListSoDExceptions)
@@ -277,6 +289,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/admin/abac-rules", h.ListABACRules)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/retire", h.RetireABACRule)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/reactivate", h.ReactivateABACRule)
+	r.Post("/v1/admin/abac-rules/{abac_rule_id}/approve", h.ApproveABACRule)
+	r.Post("/v1/admin/abac-rules/{abac_rule_id}/reject", h.RejectABACRule)
+	// AU-03: approval and signing authority limits under maker-checker.
+	r.Get("/v1/admin/authority-limits", h.ListAuthorityLimits)
+	r.Post("/v1/admin/authority-limits", h.CreateAuthorityLimit)
+	r.Post("/v1/admin/authority-limits/{authority_limit_id}/change", h.ChangeAuthorityLimit)
+	r.Post("/v1/admin/authority-limits/{authority_limit_id}/retire", h.RetireAuthorityLimit)
+	r.Post("/v1/admin/authority-limits/{authority_limit_id}/approve", h.ApproveAuthorityLimit)
+	r.Post("/v1/admin/authority-limits/{authority_limit_id}/reject", h.RejectAuthorityLimit)
 	// Workload bindings (ZS-IAM-001 §16; Governance audit N-09).
 	r.Post("/v1/admin/workload-bindings", h.SaveWorkloadBinding)
 	r.Get("/v1/admin/workload-bindings", h.ListWorkloadBindings)
@@ -290,30 +311,40 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/admin/v1/privileged-sessions/{session_id}/approve", h.ApprovePrivilegedSession)
 	r.Post("/admin/v1/privileged-sessions/{session_id}/reject", h.RejectPrivilegedSession)
 	r.Post("/admin/v1/privileged-sessions/{session_id}/review", h.ReviewPrivilegedSession)
+	r.Get("/admin/v1/privileged-sessions/{session_id}/activity", h.PrivilegedSessionActivity)
 	r.Post("/v1/admin/privileged-sessions", h.CreatePrivilegedSession)
 	r.Get("/v1/admin/privileged-sessions", h.ListPrivilegedSessions)
 	r.Post("/v1/admin/privileged-sessions/{session_id}/revoke", h.RevokePrivilegedSession)
 	r.Post("/v1/admin/privileged-sessions/{session_id}/approve", h.ApprovePrivilegedSession)
 	r.Post("/v1/admin/privileged-sessions/{session_id}/reject", h.RejectPrivilegedSession)
 	r.Post("/v1/admin/privileged-sessions/{session_id}/review", h.ReviewPrivilegedSession)
+	r.Get("/v1/admin/privileged-sessions/{session_id}/activity", h.PrivilegedSessionActivity)
 
-	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21)
+	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21). AU-02: issue is a
+	// request; approve / reject are GOV-12 ApproveBreakGlass.
 	r.Post("/admin/v1/break-glass-sessions", h.CreateBreakGlassSession)
 	r.Get("/admin/v1/break-glass-sessions", h.ListBreakGlassSessions)
 	r.Get("/admin/v1/break-glass-sessions/{session_id}", h.GetBreakGlassSession)
+	r.Post("/admin/v1/break-glass-sessions/{session_id}/approve", h.ApproveBreakGlassSession)
+	r.Post("/admin/v1/break-glass-sessions/{session_id}/reject", h.RejectBreakGlassSession)
 	r.Post("/admin/v1/break-glass-sessions/{session_id}/revoke", h.RevokeBreakGlassSession)
 	r.Post("/admin/v1/break-glass-sessions/{session_id}/review", h.ReviewBreakGlassSession)
+	r.Get("/admin/v1/break-glass-sessions/{session_id}/activity", h.BreakGlassSessionActivity)
 	r.Post("/v1/admin/break-glass-sessions", h.CreateBreakGlassSession)
 	r.Get("/v1/admin/break-glass-sessions", h.ListBreakGlassSessions)
 	r.Get("/v1/admin/break-glass-sessions/{session_id}", h.GetBreakGlassSession)
+	r.Post("/v1/admin/break-glass-sessions/{session_id}/approve", h.ApproveBreakGlassSession)
+	r.Post("/v1/admin/break-glass-sessions/{session_id}/reject", h.RejectBreakGlassSession)
 	r.Post("/v1/admin/break-glass-sessions/{session_id}/revoke", h.RevokeBreakGlassSession)
 	r.Post("/v1/admin/break-glass-sessions/{session_id}/review", h.ReviewBreakGlassSession)
+	r.Get("/v1/admin/break-glass-sessions/{session_id}/activity", h.BreakGlassSessionActivity)
 
 	// Tenant Support Sessions (ZS-IAM-001 §15 & §21)
 	r.Post("/v1/support/sessions", h.CreateSupportSession)
 	r.Get("/v1/support/sessions", h.ListSupportSessions)
 	r.Get("/v1/support/sessions/{session_id}", h.GetSupportSession)
 	r.Post("/v1/support/sessions/{session_id}/revoke", h.RevokeSupportSession)
+	r.Get("/v1/support/sessions/{session_id}/activity", h.SupportSessionActivity)
 
 	r.Post(AuthorizePath, h.Authorize)
 
@@ -762,14 +793,14 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 		}
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
 	role, err = h.store.SetRoleActive(r.Context(), roleID, tenantScope, active, expectedVersion)
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrRoleNotFound) {
@@ -795,7 +826,7 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 		zap.String("tenant_id", role.TenantID),
 		zap.Bool("active_flag", role.ActiveFlag))
 
-	writeJSON(w, http.StatusOK, role)
+	writeJSONWithETag(w, http.StatusOK, role, role.Version)
 }
 
 // ── POST /v1/admin/roles/{role_id}/permission-bundles ───────────────────────
@@ -883,7 +914,7 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrRoleNotFound) {
@@ -1070,14 +1101,14 @@ func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
 	bundle, err := h.store.SetPermissionBundleActive(r.Context(), bundleID, tenantScope, active, expectedVersion)
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrPermissionBundleNotFound) {
@@ -1101,7 +1132,7 @@ func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Reque
 		zap.Bool("active", bundle.ActiveFlag),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, bundle)
+	writeJSONWithETag(w, http.StatusOK, bundle, bundle.Version)
 }
 
 // ── POST /v1/admin/role-assignments ──────────────────────────────────────────
@@ -1297,7 +1328,7 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, assignment)
 		return
 	}
-	writeJSON(w, http.StatusCreated, assignment)
+	writeJSONWithETag(w, http.StatusCreated, assignment, assignment.Version)
 }
 
 // assignmentSoDConflicts returns the static SoD conflicts assigning roleID to
@@ -1364,11 +1395,13 @@ func (h *Handler) assignmentSoDConflicts(w http.ResponseWriter, r *http.Request,
 	return conflicts, true
 }
 
-func writeVersionConflict(w http.ResponseWriter) {
-	writeJSON(w, http.StatusConflict, map[string]string{
-		"error":   "version_conflict",
-		"message": "the object has changed since expected_version; re-read it and retry",
-	})
+// writeVersionConflict answers a mutation whose expected version (If-Match or
+// expected_version) is no longer current: 412 stale_version (API-3). The
+// stores check the version in the UPDATE itself, so the race between a read
+// and the write cannot slip a stale change through.
+func writeVersionConflict(w http.ResponseWriter, r *http.Request) {
+	apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusPreconditionFailed, "stale_version",
+		"the object has changed since the version you sent; re-read it and retry"))
 }
 
 // roleAssignmentFinder is the store capability behind the platform-scope check
@@ -1439,24 +1472,22 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	if !h.applyReason(w, &r, body.reason()) {
 		return
 	}
+	if body.ExpectedVersion < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_expected_version", "message": "expected_version must be positive"})
+		return
+	}
+	expected, ok := optionalExpectedVersion(w, r, body.ExpectedVersion)
+	if !ok {
+		return
+	}
 
 	// Ending a platform-scope assignment withdraws platform authority, so it
 	// is a platform act too — otherwise any tenant administrator could strip
-	// the platform's own rule authors.
-	if h.platformScopeEntityID != "" {
-		finder, ok := h.store.(roleAssignmentFinder)
+	// the platform's own rule authors. The same read checks a version the
+	// caller sent.
+	if h.platformScopeEntityID != "" || expected > 0 {
+		existing, ok := h.assignmentForMutation(w, r, assignmentID, tenantScope, expected)
 		if !ok {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			return
-		}
-		existing, err := finder.FindRoleAssignmentByID(r.Context(), assignmentID, tenantScope)
-		if err != nil {
-			if errors.Is(err, domain.ErrRoleAssignmentNotFound) {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
-				return
-			}
-			h.log.Error("RevokeRoleAssignment: assignment lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
 		if existing.LegalEntityID != nil && h.isPlatformScopeEntity(*existing.LegalEntityID) &&
@@ -1488,7 +1519,7 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
-		writeJSON(w, http.StatusOK, assignment)
+		writeJSONWithETag(w, http.StatusOK, assignment, assignment.Version)
 		return
 	}
 
@@ -1506,7 +1537,7 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, assignment)
+	writeJSONWithETag(w, http.StatusOK, assignment, assignment.Version)
 }
 
 // ── POST /v1/admin/delegated-authorities ─────────────────────────────────────
@@ -1780,6 +1811,14 @@ type createSoDRuleRequest struct {
 	// TenantID is optional — omit for a rule that applies across every
 	// tenant, matching JurisdictionID's own global-when-nil convention.
 	TenantID *string `json:"tenant_id,omitempty"`
+	// ReasonCode / Purpose: why the rule is proposed, recorded on the
+	// publication request (AU-17).
+	ReasonCode string `json:"reason_code,omitempty"`
+	Purpose    string `json:"purpose,omitempty"`
+}
+
+func (req createSoDRuleRequest) reason() string {
+	return commandFields{ReasonCode: req.ReasonCode, Purpose: req.Purpose}.reason()
 }
 
 func (req createSoDRuleRequest) missingField() string {
@@ -1872,14 +1911,16 @@ func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 	rule, err := h.store.CreateSoDRule(r.Context(), domain.CreateSoDRuleParams{
 		DomainCode: req.DomainCode, ActionA: req.ActionA, ActionB: req.ActionB,
 		ConflictType: req.ConflictType, JurisdictionID: req.JurisdictionID,
-		TenantID: req.TenantID,
+		TenantID: req.TenantID, RequestedBy: principalID, Reason: req.reason(),
 	})
 	if err != nil {
 		h.log.Error("CreateSoDRule: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusCreated, rule)
+	// 202: proposed, not in force — an independent holder of
+	// iam.sod_rule.publish publishes it (AU-17).
+	writeJSON(w, http.StatusAccepted, rule)
 }
 
 // ── POST /v1/admin/sod-rules/{sod_rule_id}/retire|reactivate ────────────────
@@ -2010,36 +2051,49 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 		return
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
-	rule, err := h.store.SetSoDRuleActive(r.Context(), sodRuleID, tenantScope, active, expectedVersion)
+	g, ok := h.governedStore(w, r)
+	if !ok {
+		return
+	}
+	// AU-17: a REQUEST. The rule keeps doing what it does until an
+	// independent holder of iam.sod_rule.publish approves the change.
+	change := domain.RuleChangeRetire
+	if active {
+		change = domain.RuleChangeReactivate
+	}
+	_, _, reason := domain.AuditFrom(r.Context())
+	rule, requested, err := g.RequestSoDRuleChange(r.Context(), sodRuleID, tenantScope, change, principalID, reason, expectedVersion)
 	if err != nil {
-		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
-			return
-		}
 		if errors.Is(err, domain.ErrSoDRuleNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "sod_rule_not_found"})
 			return
 		}
-		h.log.Error("setSoDRuleActive: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		h.writeGovernedErr(w, r, "setSoDRuleActive", err)
 		return
 	}
 
 	// Logged at Info with both actions named: turning an SoD control off is a
 	// governance event in its own right, and the pair is what makes the log
 	// entry mean anything later.
-	h.log.Info("sod rule active flag set",
+	h.log.Info("sod rule change requested",
 		zap.String("sod_rule_id", rule.SoDRuleID),
 		zap.String("action_a", rule.ActionA),
 		zap.String("action_b", rule.ActionB),
-		zap.Bool("active", rule.ActiveFlag),
+		zap.String("change", change),
+		zap.Bool("requested", requested),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, rule)
+	// 200 when the rule is already in the asked-for state (nothing to approve),
+	// 202 when the change now awaits its approver.
+	status := http.StatusOK
+	if requested {
+		status = http.StatusAccepted
+	}
+	writeJSONWithETag(w, status, rule, rule.Version)
 }
 
 // ── /v1/admin/abac-rules ─────────────────────────────────────────────────────
@@ -2063,6 +2117,9 @@ type createABACRuleRequest struct {
 	// tenant, matching sod_rules' convention. Omitting it requires
 	// ActionABACRuleManageGlobal at platform scope.
 	TenantID *string `json:"tenant_id,omitempty"`
+	// ReasonCode / Purpose: why the rule is proposed (AU-17).
+	ReasonCode string `json:"reason_code,omitempty"`
+	Purpose    string `json:"purpose,omitempty"`
 }
 
 func (req createABACRuleRequest) missingField() string {
@@ -2176,6 +2233,7 @@ func (h *Handler) CreateABACRule(w http.ResponseWriter, r *http.Request) {
 		Operator:             req.Operator,
 		AttributeValue:       req.AttributeValue,
 		CreatedByPrincipalID: principalID,
+		Reason:               commandFields{ReasonCode: req.ReasonCode, Purpose: req.Purpose}.reason(),
 	})
 	if err != nil {
 		switch {
@@ -2201,7 +2259,8 @@ func (h *Handler) CreateABACRule(w http.ResponseWriter, r *http.Request) {
 		zap.Bool("platform_wide", rule.TenantID == nil),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusCreated, rule)
+	// 202: proposed; it guards nothing until published (AU-17).
+	writeJSON(w, http.StatusAccepted, rule)
 }
 
 // ListABACRules handles GET /v1/admin/abac-rules — read the attribute
@@ -2288,32 +2347,42 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 	// PLATFORM-WIDE rule answers 404 here rather than being retired from one
 	// tenant's console. That is deliberate and is the point: a rule binding
 	// every tenant must not be disableable by any one of them.
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
-	rule, err := h.store.SetABACRuleActive(r.Context(), abacRuleID, tenantScope, active, expectedVersion)
+	g, ok := h.governedStore(w, r)
+	if !ok {
+		return
+	}
+	// AU-17: a REQUEST, published by an independent holder of iam.policy.publish.
+	change := domain.RuleChangeRetire
+	if active {
+		change = domain.RuleChangeReactivate
+	}
+	_, _, reason := domain.AuditFrom(r.Context())
+	rule, requested, err := g.RequestABACRuleChange(r.Context(), abacRuleID, tenantScope, change, principalID, reason, expectedVersion)
 	if err != nil {
-		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
-			return
-		}
 		if errors.Is(err, domain.ErrABACRuleNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "abac_rule_not_found"})
 			return
 		}
-		h.log.Error("setABACRuleActive: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		h.writeGovernedErr(w, r, "setABACRuleActive", err)
 		return
 	}
 
-	h.log.Info("abac rule active flag set",
+	h.log.Info("abac rule change requested",
 		zap.String("abac_rule_id", rule.ABACRuleID),
 		zap.String("rule_code", rule.RuleCode),
-		zap.Bool("active", rule.ActiveFlag),
+		zap.String("change", change),
+		zap.Bool("requested", requested),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, rule)
+	status := http.StatusOK
+	if requested {
+		status = http.StatusAccepted
+	}
+	writeJSONWithETag(w, status, rule, rule.Version)
 }
 
 // supportedOperators renders domain.ABACOperators for a 400 body, sorted so
@@ -2935,6 +3004,8 @@ func (h *Handler) recordDecision(w http.ResponseWriter, r *http.Request, in eval
 		AttributesDigest: attributesDigest(in.Attributes),
 		SessionAssurance: in.Environment.Assurance,
 		ExpiresAt:        &expires,
+		SessionKind:      res.SessionKind,
+		SessionID:        res.SessionID,
 	}
 	// §11: "Every delegated action records both actor_subject_id and
 	// on_behalf_of_subject_id / delegation_id." The basis named only the
@@ -3087,6 +3158,13 @@ func (h *Handler) ListRoleAssignments(w http.ResponseWriter, r *http.Request) {
 	principalFilter := strings.TrimSpace(r.URL.Query().Get("principal_id"))
 	roleFilter := strings.TrimSpace(r.URL.Query().Get("role_id"))
 	activeOnly := r.URL.Query().Get("include_expired") != "true"
+
+	// as_of: what granted at that instant, from the history (ORG-06
+	// GetAssignmentsAsOf) rather than the current rows.
+	if asOf := strings.TrimSpace(r.URL.Query().Get("as_of")); asOf != "" {
+		h.listRoleAssignmentsAsOf(w, r, tenantScope, principalFilter, roleFilter, asOf)
+		return
+	}
 
 	// Paged / usage form: limit, offset, include_usage=true. The plain form
 	// stops at 500 rows without saying so; a caller that must see every
@@ -3400,6 +3478,10 @@ func removeAll(list []string, target string) []string {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	if p, ok := legacyErrorProblem(w, status, withErrorClass(status, v)); ok {
+		apicontract.WriteProblem(w, nil, p)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(withErrorClass(status, v)); err != nil {
@@ -3573,7 +3655,24 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ps, err := h.store.RevokePrivilegedSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	ps, err := h.store.FindPrivilegedSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrPrivilegedSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "privileged_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokePrivilegedSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, ps.RecordVersion) {
+		return
+	}
+
+	ps, err = h.store.RevokePrivilegedSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrPrivilegedSessionNotFound):
@@ -3587,7 +3686,7 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSON(w, http.StatusOK, ps)
+	writeJSONWithETag(w, http.StatusOK, ps, ps.RecordVersion)
 }
 
 // ── Break-Glass Emergency Session Handlers (ZS-IAM-001 §14 & §21) ───────────
@@ -3674,6 +3773,7 @@ func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request
 		RequestedBy:        callerPrincipalID,
 		MaxDurationSeconds: h.sessionLimits.BreakGlass,
 		StepUp:             stepUp,
+		ApprovalsRequired:  h.breakGlassQuorum(),
 	})
 	if errors.Is(err, domain.ErrSessionDurationExceeded) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "duration_exceeds_maximum", "message": err.Error()})
@@ -3692,19 +3792,22 @@ func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// §14 "immediate security/governance alert to independent recipients".
-	// security.break_glass.started itself is written to the outbox with the
-	// session (000030), so it is delayed by a Kafka outage, never lost.
-	h.siem.Stream(r.Context(), tenantScope, "security.break_glass.started", siem.SeverityCritical,
-		"Break-glass session "+bg.SessionID+" for "+bg.PrincipalID+" (incident "+bg.IncidentID+") issued by "+callerPrincipalID)
+	// §14 "immediate security/governance alert to independent recipients",
+	// at the request — the approvers are who it is for. The session itself
+	// grants nothing until they approve (AU-02; GOV-12 Requested -> Active),
+	// and security.break_glass.requested is written to the outbox with it.
+	h.siem.Stream(r.Context(), tenantScope, "security.break_glass.requested", siem.SeverityCritical,
+		"Break-glass requested for "+bg.PrincipalID+" (incident "+bg.IncidentID+") by "+callerPrincipalID+
+			"; session "+bg.SessionID+" awaits independent approval")
 
-	h.log.Warn("break-glass emergency session created",
+	h.log.Warn("break-glass emergency session requested",
 		zap.String("session_id", bg.SessionID),
 		zap.String("principal_id", bg.PrincipalID),
 		zap.String("incident_id", bg.IncidentID),
+		zap.Int("approvals_required", bg.ApprovalsRequired),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusCreated, bg)
+	writeJSON(w, http.StatusAccepted, bg)
 }
 
 func (h *Handler) GetBreakGlassSession(w http.ResponseWriter, r *http.Request) {
@@ -3747,7 +3850,7 @@ func (h *Handler) GetBreakGlassSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, bg)
+	writeJSONWithETag(w, http.StatusOK, bg, bg.RecordVersion)
 }
 
 func (h *Handler) ListBreakGlassSessions(w http.ResponseWriter, r *http.Request) {
@@ -3802,7 +3905,24 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	bg, err := h.store.RevokeBreakGlassSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	bg, err := h.store.FindBreakGlassSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrBreakGlassSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "break_glass_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokeBreakGlassSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, bg.RecordVersion) {
+		return
+	}
+
+	bg, err = h.store.RevokeBreakGlassSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrBreakGlassSessionNotFound):
@@ -3821,7 +3941,7 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 	// straight to Kafka and discarded the error, so every revoke published the
 	// event twice — the second copy without a tenant (second-pass scan,
 	// 13 Oct 2026). The started event had already moved to the trigger alone.
-	writeJSON(w, http.StatusOK, bg)
+	writeJSONWithETag(w, http.StatusOK, bg, bg.RecordVersion)
 }
 
 // ── Tenant Support Session Handlers (ZS-IAM-001 §15 & §21) ──────────────────
@@ -3970,7 +4090,7 @@ func (h *Handler) GetSupportSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, ss)
+	writeJSONWithETag(w, http.StatusOK, ss, ss.RecordVersion)
 }
 
 func (h *Handler) ListSupportSessions(w http.ResponseWriter, r *http.Request) {
@@ -4025,7 +4145,24 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ss, err := h.store.RevokeSupportSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	ss, err := h.store.FindSupportSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrSupportSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokeSupportSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, ss.RecordVersion) {
+		return
+	}
+
+	ss, err = h.store.RevokeSupportSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSupportSessionNotFound):
@@ -4034,10 +4171,37 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "message": err.Error()})
 		default:
 			h.log.Error("RevokeSupportSession: store failed", zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		}
 		return
 	}
 
-	writeJSON(w, http.StatusOK, ss)
+	writeJSONWithETag(w, http.StatusOK, ss, ss.RecordVersion)
+}
+
+// writeError writes a RFC 9457 problem details response using the shared apicontract package.
+// legacy is the original error code (kept for backward compatibility with callers matching on it).
+// detail is the human-readable message; if empty, legacy is used as the detail.
+func writeError(w http.ResponseWriter, r *http.Request, status int, legacy, detail string, extra map[string]any) {
+	if detail == "" {
+		detail = legacy
+	}
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    status,
+		Code:      legacy,
+		Detail:    detail,
+		Retryable: status >= 500,
+		Extra:     extra,
+	})
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }

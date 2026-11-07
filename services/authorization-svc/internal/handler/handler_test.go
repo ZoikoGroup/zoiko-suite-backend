@@ -20,6 +20,16 @@ import (
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
+	// Governed changes (governed_changes_test.go).
+	governedErr    error
+	bgDecided      *domain.BreakGlassSession
+	gotStepUp      *domain.StepUpEvidence
+	sodFound       *domain.SoDRule
+	abacFound      *domain.ABACRule
+	gotGoverned    *governedCall
+	authorityLimit *domain.AuthorityLimit
+	createdLimit   *domain.CreateAuthorityLimitParams
+
 	// denyAdmin withholds the tenant-scoped iam.* administration permissions
 	// requirePermission checks. By default the test caller is a tenant
 	// administrator (see FindGrantedActions).
@@ -394,6 +404,11 @@ var stubAdminActions = []string{
 	"iam.role.read", "iam.delegation.read", "iam.sod_rule.read",
 	// 000030 session controls: eligibility, approval, review.
 	"iam.pam.eligible", "iam.pam.approve", "iam.break_glass.eligible", "iam.session.review",
+	// 000034-000036 governed changes: approval and publication.
+	"iam.break_glass.approve", "iam.authority_limit.manage", "iam.authority_limit.approve",
+	"iam.sod_rule.publish", "iam.policy.publish",
+	// 000037 assignment suspension (ORG-06).
+	"iam.assignment.suspend", "iam.assignment.resume",
 }
 
 // FindGrantedActions returns the seeded RBAC actions. requirePermission asks
@@ -602,11 +617,12 @@ func (s *stubStore) RevokePrivilegedSession(_ context.Context, sessionID, tenant
 	}
 	now := time.Now().UTC()
 	return &domain.PrivilegedSession{
-		SessionID: sessionID,
-		TenantID:  tenantID,
-		Status:    domain.PrivilegedSessionStatusRevoked,
-		RevokedAt: &now,
-		RevokedBy: &revokedBy,
+		SessionID:     sessionID,
+		TenantID:      tenantID,
+		Status:        domain.PrivilegedSessionStatusRevoked,
+		RevokedAt:     &now,
+		RevokedBy:     &revokedBy,
+		RecordVersion: 2, // Simulate version increment
 	}, nil
 }
 
@@ -638,6 +654,11 @@ func (s *stubStore) FindBreakGlassSessionByID(_ context.Context, sessionID, tena
 	}
 	if s.breakGlassSession != nil {
 		return s.breakGlassSession, nil
+	}
+	if s.revokeBreakGlassSession != nil {
+		bg := *s.revokeBreakGlassSession
+		bg.RecordVersion = 1
+		return &bg, nil
 	}
 	return nil, domain.ErrBreakGlassSessionNotFound
 }
@@ -698,6 +719,11 @@ func (s *stubStore) FindSupportSessionByID(_ context.Context, sessionID, tenantI
 	if s.supportSession != nil {
 		return s.supportSession, nil
 	}
+	if s.revokeSupportSession != nil {
+		ss := *s.revokeSupportSession
+		ss.RecordVersion = 1
+		return &ss, nil
+	}
 	return nil, domain.ErrSupportSessionNotFound
 }
 
@@ -725,12 +751,20 @@ func (s *stubStore) RevokeSupportSession(_ context.Context, sessionID, tenantID,
 	}, nil
 }
 
-func (s *stubStore) CreateAuthorityLimit(_ context.Context, _ domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error) {
-	return &domain.AuthorityLimit{}, nil
+func (s *stubStore) CreateAuthorityLimit(_ context.Context, params domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error) {
+	s.createdLimit = &params
+	if s.governedErr != nil {
+		return nil, s.governedErr
+	}
+	return &domain.AuthorityLimit{AuthorityLimitID: "al-new", Status: domain.AuthorityLimitPending, PrincipalID: params.PrincipalID,
+		RoleID: params.RoleID, AuthorityType: params.AuthorityType, Currency: params.Currency, UpperLimit: params.UpperLimit}, nil
 }
 
 func (s *stubStore) FindAuthorityLimitByID(_ context.Context, _, _ string) (*domain.AuthorityLimit, error) {
-	return &domain.AuthorityLimit{}, nil
+	if s.authorityLimit != nil {
+		return s.authorityLimit, nil
+	}
+	return nil, domain.ErrAuthorityLimitNotFound
 }
 
 func (s *stubStore) ListAuthorityLimits(_ context.Context, _, _, _, _ string) ([]domain.AuthorityLimit, error) {
@@ -1197,6 +1231,7 @@ func TestRetireRole_SetsActiveFalse(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
@@ -1221,6 +1256,7 @@ func TestReactivateRole_SetsActiveTrue(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/reactivate", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
@@ -1244,6 +1280,7 @@ func TestRetireRole_UnknownRoleIs404(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/does-not-exist/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
@@ -1262,6 +1299,7 @@ func TestRetireRole_StoreDownIs503(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	req.Header.Set("If-Match", `"v1"`)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
@@ -1300,8 +1338,9 @@ func TestCreateSoDRule_NoJurisdiction_Created(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	// 202: proposed, published only once someone else approves it (AU-17).
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

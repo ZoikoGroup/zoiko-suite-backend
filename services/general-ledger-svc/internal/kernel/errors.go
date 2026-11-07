@@ -72,4 +72,6 @@ var (
 
 // NewException builds an exception for a collaborator outside this package (the period gate), so every refusal reaches
 // the caller in the one AK-* taxonomy.
-func NewException(family, code, format string, a ...any) *Exception { return exc(family, code, format, a...) }
+func NewException(family, code, format string, a ...any) *Exception {
+	return exc(family, code, format, a...)
+}

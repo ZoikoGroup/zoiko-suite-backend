@@ -31,9 +31,10 @@ func parseIfMatch(w http.ResponseWriter, r *http.Request) (*int64, bool) {
 	v = strings.Trim(v, `"`)
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 1 {
-		writeError(w, http.StatusBadRequest, "invalid_if_match",
+		writeError(w, r, http.StatusBadRequest, "invalid_if_match",
 			`If-Match must be a single ETag from this service, e.g. "3"`)
 		return nil, false
 	}
 	return &n, true
 }
+

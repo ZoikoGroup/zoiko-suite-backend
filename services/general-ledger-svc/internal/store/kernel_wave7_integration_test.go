@@ -11,7 +11,10 @@ import (
 // capitalSetup extends the Wave 5 group: the US membership is replaced from 2025-06-01 by one that carries the capital consolidation
 // (the UK holds the investment on account 1600 against the equity on 3000, 80% owned), the chart gains goodwill and non-controlling
 // interest accounts, and the UK has paid 3200 for its 80% of the 4000 (translated) equity.
-func capitalSetup(t *testing.T) *cenv {
+func capitalSetup(t *testing.T) *cenv { return capitalSetupWith(t, nil) }
+
+// capitalSetupWith is capitalSetup with extra fields on the US membership (an equity rate date, for instance).
+func capitalSetupWith(t *testing.T, extra map[string]any) *cenv {
 	t.Helper()
 	c := consolSetup(t)
 	for _, a := range [][2]string{{"1600", "ASSET"}, {"1700", "ASSET"}, {"3950", "EQUITY"}} {
@@ -30,8 +33,12 @@ func capitalSetup(t *testing.T) *cenv {
 	if st, b := c.call("POST", "/v1/consolidation-groups/"+c.groupID+"/members/"+member+"/end", c.tenant, "group-finance", map[string]any{"effective_to": "2025-06-01"}); st != 200 {
 		t.Fatalf("%d %v", st, b)
 	}
-	if st, b := c.call("POST", "/v1/consolidation-groups/"+c.groupID+"/members", c.tenant, "group-finance", map[string]any{"legal_entity_id": c.us, "source_book_id": c.usBook, "ownership_pct": "80",
-		"effective_from": "2025-06-01", "investor_entity_id": c.uk, "investment_account": "1600", "equity_accounts": []string{"3000"}}); st != 201 {
+	body := map[string]any{"legal_entity_id": c.us, "source_book_id": c.usBook, "ownership_pct": "80",
+		"effective_from": "2025-06-01", "investor_entity_id": c.uk, "investment_account": "1600", "equity_accounts": []string{"3000"}}
+	for k, v := range extra {
+		body[k] = v
+	}
+	if st, b := c.call("POST", "/v1/consolidation-groups/"+c.groupID+"/members", c.tenant, "group-finance", body); st != 201 {
 		t.Fatalf("%d %v", st, b)
 	}
 	if st, r := c.call("PUT", "/v1/consolidation-groups/"+c.groupID+"/mappings", c.tenant, "group-finance", map[string]any{

@@ -1,0 +1,460 @@
+openapi: 3.1.0
+info:
+  title: mtls-management-svc
+  version: 1.0.0
+  description: |
+    mTLS certificate management and communication policy service.
+
+    ## Authentication & Authorization
+
+    Every mutating endpoint requires the standard ZS-ARCH-SVC-001 §4
+    identity envelope headers (`X-Tenant-Id`, `X-Principal-Id`,
+    `X-Correlation-Id`, `Idempotency-Key`). Missing or unverified headers
+    result in 401. Authorization is enforced via `authorization-svc` at the
+    legal entity or tenant scope (see per-route descriptions).
+
+    ## Error responses (RFC 9457)
+
+    All error responses are `application/problem+json` with the stable
+    `code` field. The legacy `error` string is preserved in the body for
+    backward compatibility. Clients should branch on `code`, not on the
+    human-readable `detail`.
+
+servers:
+  - url: http://localhost:8140
+    description: Local development
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      operationId: Healthz
+      responses:
+        '200':
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: mtls-management-svc }
+
+  /v1/mtls/crl:
+    get:
+      summary: Certificate Revocation List (CRL)
+      description: |
+        Returns the CA-signed CRL. Unauthenticated by design — a CRL lists
+        serial numbers only and its signature, not the channel, is what a
+        verifier trusts. DER format by default; `?format=pem` for PEM.
+      operationId: GetCRL
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [pem] }
+      responses:
+        '200':
+          description: CRL
+          content:
+            application/pkix-crl:
+              schema: { type: string, format: binary }
+            application/x-pem-file:
+              schema: { type: string, format: binary }
+
+  /v1/mtls/certificates:
+    post:
+      summary: Provision a new mTLS certificate
+      description: |
+        Issues a leaf certificate for a service. Normal path: authorized on
+        `MTLS_CERT_PROVISION` at the certificate's `legal_entity_id`.
+        Bootstrap path: a service requesting its **own first** certificate
+        presents `X-Mtls-Bootstrap-Token` (no envelope). The token
+        authenticates exactly one service; the requested `service_name` and
+        `common_name` must both match that service.
+      operationId: ProvisionCert
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProvisionCertRequest'
+      responses:
+        '201':
+          description: Certificate issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProvisionCertResult' }
+        '400':
+          description: Invalid request body or validation error
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal, or invalid bootstrap token
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized, or bootstrap token identity mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: Failed to issue certificate
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    get:
+      summary: List certificates
+      description: |
+        Requires `legal_entity_id` query parameter — it is the authorization
+        scope. Optional `status` filter.
+      operationId: ListCerts
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, revoked, expired] }
+      responses:
+        '200':
+          description: List of certificates
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CertListResponse' }
+        '400':
+          description: Missing legal_entity_id
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read in that entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/mtls/certificates/{id}:
+    get:
+      summary: Get a certificate by ID
+      operationId: GetCert
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Certificate
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MtlsCertificate' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read that certificate's entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Certificate not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    delete:
+      summary: Revoke a certificate
+      description: |
+        Adds the certificate's serial to the CRL. Authorized on
+        `MTLS_CERT_REVOKE` at the certificate's own `legal_entity_id`.
+        This is the destructive operation — revocation breaks whatever
+        service-to-service authentication depends on this certificate.
+      operationId: RevokeCert
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RevokeResult' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to revoke that certificate
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Certificate not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/mtls/certificates/{id}/rotate:
+    post:
+      summary: Rotate a certificate
+      description: |
+        Issues a new key pair and certificate for the same service identity.
+        The old private key becomes unusable. Authorized on `MTLS_CERT_ROTATE`
+        at the certificate's own `legal_entity_id`.
+      operationId: RotateCert
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Rotated certificate
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProvisionCertResult' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to rotate that certificate
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Certificate not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: Certificate was revoked; cannot rotate
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /v1/mtls/certificates/csr:
+    post:
+      summary: Sign a CSR
+      description: |
+        Signs a PKCS#10 CSR and returns only the certificate (never a
+        private key). The CSR's subject CN and DNSNames/URI SANs must
+        match the requested `service_name` and the expected SPIFFE URI
+        `spiffe://zoiko/<env>/<service_name>`. Authorized on
+        `MTLS_CERT_PROVISION` at the provided `legal_entity_id`.
+      operationId: SignCSR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignCSRRequest'
+      responses:
+        '201':
+          description: CSR signed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProvisionCertResult' }
+        '400':
+          description: Invalid CSR, or subject/SAN mismatch
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to provision at that entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/mtls/policies:
+    post:
+      summary: Create a communication policy
+      description: |
+        Policies govern service-to-service mTLS requirements across the
+        tenant. Authorized on `MTLS_POLICY_WRITE` at the tenant scope.
+      operationId: CreatePolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePolicyRequest' }
+      responses:
+        '201':
+          description: Policy created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommunicationPolicy' }
+        '400':
+          description: Missing policy_name
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to write policies
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    get:
+      summary: List communication policies
+      description: Authorized on `MTLS_POLICY_READ` at the tenant scope.
+      operationId: ListPolicies
+      responses:
+        '200':
+          description: List of policies
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyListResponse' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read policies
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
+
+    ProvisionCertRequest:
+      type: object
+      required: [service_name, common_name, legal_entity_id, rotation_days]
+      properties:
+        service_name: { type: string }
+        common_name: { type: string }
+        legal_entity_id: { type: string, format: uuid }
+        rotation_days: { type: integer, minimum: 1, maximum: 90, default: 90 }
+        auto_rotate: { type: boolean, default: true }
+
+    ProvisionCertResult:
+      type: object
+      properties:
+        certificate:
+          $ref: '#/components/schemas/MtlsCertificate'
+        private_key_pem: { type: string }
+        ca_cert_pem: { type: string }
+
+    MtlsCertificate:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        service_name: { type: string }
+        common_name: { type: string }
+        issuer: { type: string }
+        serial_number: { type: string }
+        fingerprint: { type: string }
+        certificate_pem: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time }
+        rotation_days: { type: integer }
+        auto_rotate: { type: boolean }
+        status: { type: string, enum: [active, revoked, expired] }
+        prior_serial_numbers: { type: array, items: { type: string } }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CertListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/MtlsCertificate' }
+        count: { type: integer }
+
+    RevokeResult:
+      type: object
+      properties:
+        message: { type: string }
+        revoked_serials:
+          type: array
+          items: { type: string }
+        crl: { type: string, example: "/v1/mtls/crl" }
+
+    SignCSRRequest:
+      type: object
+      required: [csr, service_name, legal_entity_id]
+      properties:
+        csr: { type: string }
+        rotation_days: { type: integer, minimum: 1, maximum: 90, default: 90 }
+        service_name: { type: string }
+        legal_entity_id: { type: string, format: uuid }
+
+    CreatePolicyRequest:
+      type: object
+      required: [policy_name]
+      properties:
+        policy_name: { type: string }
+        source_service: { type: string }
+        target_service: { type: string }
+        action: { type: string }
+        requires_mtls: { type: boolean, default: true }
+
+    CommunicationPolicy:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        policy_name: { type: string }
+        source_service: { type: string }
+        target_service: { type: string }
+        action: { type: string }
+        requires_mtls: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PolicyListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/CommunicationPolicy' }
+        count: { type: integer }

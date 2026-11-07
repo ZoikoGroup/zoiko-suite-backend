@@ -25,6 +25,7 @@ type stubStore struct {
 	checks   map[string]*domain.VendorDDCheck // keyed by check_id
 	byCorr   map[string]string                // correlation_id -> check_id
 	evidence map[string][]domain.VendorDDEvidence
+	profiles map[string]*domain.VendorProfile
 
 	// Injected failures. concludeErr is the important one: the split
 	// AddEvidence/CompleteCheck pair this replaced swallowed the evidence
@@ -44,6 +45,7 @@ func newStubStore() *stubStore {
 		checks:   make(map[string]*domain.VendorDDCheck),
 		byCorr:   make(map[string]string),
 		evidence: make(map[string][]domain.VendorDDEvidence),
+		profiles: make(map[string]*domain.VendorProfile),
 	}
 }
 
@@ -139,6 +141,42 @@ func (s *stubStore) ListEvidence(_ context.Context, checkID string) ([]domain.Ve
 		return nil, domain.ErrTenantMissing
 	}
 	return s.evidence[checkID], nil
+}
+
+func (s *stubStore) CreateVendorProfile(_ context.Context, p *domain.VendorProfile) error {
+	if s.noTenant {
+		return domain.ErrTenantMissing
+	}
+	s.profiles[p.VendorProfileID] = p
+	return nil
+}
+
+func (s *stubStore) GetVendorProfileByID(_ context.Context, profileID string) (*domain.VendorProfile, error) {
+	if s.noTenant {
+		return nil, domain.ErrTenantMissing
+	}
+	p, ok := s.profiles[profileID]
+	if !ok {
+		return nil, domain.ErrVendorProfileNotFound
+	}
+	return p, nil
+}
+
+func (s *stubStore) ListVendorProfiles(_ context.Context, legalEntityID, counterpartyID string) ([]domain.VendorProfile, error) {
+	if s.noTenant {
+		return nil, domain.ErrTenantMissing
+	}
+	var res []domain.VendorProfile
+	for _, p := range s.profiles {
+		if legalEntityID != "" && p.LegalEntityID != legalEntityID {
+			continue
+		}
+		if counterpartyID != "" && p.CounterpartyID != counterpartyID {
+			continue
+		}
+		res = append(res, *p)
+	}
+	return res, nil
 }
 
 type stubPublisher struct {
@@ -999,5 +1037,48 @@ func TestListChecks_FiltersComposeWithAnd(t *testing.T) {
 	}
 	if s.lastListFilter.LegalEntityID != testEntity || s.lastListFilter.CounterpartyID != testCP {
 		t.Errorf("both filters must reach the store, got %+v", s.lastListFilter)
+	}
+}
+
+// ── VENDOR PROFILE TESTS ─────────────────────────────────────────────────────
+
+func TestCreateAndGetVendorProfile(t *testing.T) {
+	st := newStubStore()
+	pub := &stubPublisher{}
+	az := &stubAuthZ{}
+	cp := &stubCounterparty{}
+	r := newRouter(st, pub, az, cp)
+
+	body := domain.CreateVendorProfileRequest{
+		LegalEntityID:  testEntity,
+		CounterpartyID: testCP,
+		VendorName:     "Acme Industrial Ltd",
+		VendorStatus:   "ACTIVE",
+		RiskRating:     "LOW",
+	}
+	rec := doReq(r, http.MethodPost, "/v1/vendor-profiles", body, "user-123")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var created domain.VendorProfile
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("failed to unmarshal created profile: %v", err)
+	}
+
+	if created.VendorProfileID == "" || created.VendorName != "Acme Industrial Ltd" {
+		t.Fatalf("unexpected profile created: %+v", created)
+	}
+
+	// GET by ID
+	getRec := doReq(r, http.MethodGet, "/v1/vendor-profiles/"+created.VendorProfileID, nil, "user-123")
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", getRec.Code, getRec.Body.String())
+	}
+
+	// LIST
+	listRec := doReq(r, http.MethodGet, "/v1/vendor-profiles?legal_entity_id="+testEntity, nil, "user-123")
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for list, got %d: %s", listRec.Code, listRec.Body.String())
 	}
 }

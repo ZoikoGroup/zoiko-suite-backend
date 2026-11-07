@@ -20,8 +20,8 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
-	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -48,7 +48,7 @@ type JurisdictionStore interface {
 	// The bool reports whether anything actually changed (false = already
 	// deactivated; an idempotent replay that must not re-publish).
 	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
-	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
+	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string, expectedRowVersion *int64) (*domain.Jurisdiction, bool, error)
 
 	// FindRuleByID looks up a rule by ID.
 	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
@@ -227,6 +227,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/jurisdictions", h.ListJurisdictions)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}", h.GetJurisdiction)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/ancestors", h.GetAncestors)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/as-of", h.GetJurisdictionAsOf)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/hierarchy", h.GetHierarchy)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/aliases", h.ListJurisdictionAliases)
+	r.Get("/v1/jurisdiction-resolutions", h.ResolveJurisdiction)
+	r.Get("/v1/jurisdiction-code-mappings", h.MapExternalJurisdictionCode)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rules", h.GetRules)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rule-pack", h.GetRulePack)
 	r.Get("/v1/rules/{jurisdiction_rule_id}", h.GetRule)
@@ -236,6 +241,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// ── Admin mutations (AuthZ required on every route) ───────────────────────
 	r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/deactivate", h.DeactivateJurisdiction)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/aliases", h.AmendJurisdictionAlias)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/aliases/{alias_id}/end", h.EndJurisdictionAlias)
+	r.Post("/v1/admin/jurisdiction-imports", h.ImportJurisdictionUpdate)
+	r.Get("/v1/admin/jurisdiction-imports", h.ListJurisdictionImports)
+	r.Get("/v1/admin/jurisdiction-imports/{batch_id}", h.GetJurisdictionImport)
+	r.Post("/v1/admin/jurisdiction-imports/{batch_id}/approve", h.ApproveJurisdictionImport)
+	r.Post("/v1/admin/jurisdiction-imports/{batch_id}/reject", h.RejectJurisdictionImport)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/rules", h.CreateRule)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/transition", h.TransitionRuleStatus)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/drift", h.RecordDrift)
@@ -247,6 +259,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// Entity applicability: mounted only when WithEntityApplicability was called.
 	if h.entities != nil {
 		r.Get("/v1/entities/{legal_entity_id}/jurisdictions", h.GetEntityJurisdictions)
+		if h.registry != nil {
+			r.Post(determinationPath, h.ResolveJurisdictionDecision)
+		}
 	}
 
 	if h.registry != nil {
@@ -292,8 +307,12 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 				zap.String("jurisdiction_id", jurisdictionID),
 				zap.String("correlation_id", correlationID),
 			)
-			problem.Write(w, problem.New(http.StatusNotFound, "jurisdiction_not_found", "").
-				With("jurisdiction_id", jurisdictionID))
+			apicontract.WriteProblem(w, r, apicontract.Problem{
+				Status: http.StatusNotFound,
+				Code:   "jurisdiction_not_found",
+				Detail: "",
+				Extra:  map[string]any{"jurisdiction_id": jurisdictionID},
+			})
 		default:
 			// Store unavailable — log ERROR, return 503.
 			// Callers (tenant-entity-registry-svc) must fail-closed on 503.
@@ -302,7 +321,7 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 				zap.String("correlation_id", correlationID),
 				zap.Error(err),
 			)
-			problem.Write(w, problem.New(http.StatusServiceUnavailable, "store_unavailable", ""))
+			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "store_unavailable", Detail: ""})
 		}
 		return
 	}
@@ -312,6 +331,7 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 		zap.String("jurisdiction_code", j.JurisdictionCode),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, http.StatusOK, j)
 }
 
@@ -333,7 +353,7 @@ func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
-	limit, offset, ok := h.parsePaging(w, q)
+	limit, offset, ok := h.parsePaging(w, r, q)
 	if !ok {
 		return
 	}
@@ -351,7 +371,7 @@ func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		problem.Write(w, problem.New(http.StatusServiceUnavailable, "store_unavailable", ""))
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "store_unavailable", Detail: ""})
 		return
 	}
 
@@ -382,7 +402,7 @@ func (h *Handler) GetAncestors(w http.ResponseWriter, r *http.Request) {
 
 	ancestors, err := h.store.FindAncestors(r.Context(), jurisdictionID)
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -422,11 +442,11 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
-	effectiveAt, ok := h.parseEffectiveAt(w, q)
+	effectiveAt, ok := h.parseEffectiveAt(w, r, q)
 	if !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, q)
+	limit, offset, ok := h.parsePaging(w, r, q)
 	if !ok {
 		return
 	}
@@ -439,7 +459,7 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 		Offset:         offset,
 	})
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -481,7 +501,7 @@ func (h *Handler) GetRulePack(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
-	effectiveAt, ok := h.parseEffectiveAt(w, q)
+	effectiveAt, ok := h.parseEffectiveAt(w, r, q)
 	if !ok {
 		return
 	}
@@ -491,7 +511,7 @@ func (h *Handler) GetRulePack(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("known_at"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_known_at", "known_at must be a valid RFC3339 timestamp")
+			writeError(w, r, http.StatusBadRequest, "invalid_known_at", "known_at must be a valid RFC3339 timestamp")
 			return
 		}
 		knownAt = &t
@@ -513,7 +533,7 @@ func (h *Handler) GetRulePack(w http.ResponseWriter, r *http.Request) {
 		RequiredCodes:  required,
 	})
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -539,7 +559,7 @@ func (h *Handler) GetRule(w http.ResponseWriter, r *http.Request) {
 
 	rule, err := h.store.FindRuleByID(r.Context(), ruleID)
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 	setETag(w, rule.RowVersion)
@@ -562,14 +582,14 @@ func (h *Handler) GetDriftEvents(w http.ResponseWriter, r *http.Request) {
 	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
 
 	history, err := h.store.FindDriftEvents(r.Context(), ruleID, limit, offset)
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 	if history == nil {
@@ -594,14 +614,14 @@ func (h *Handler) GetRuleStatusHistory(w http.ResponseWriter, r *http.Request) {
 	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
 
 	history, err := h.store.FindRuleStatusHistory(r.Context(), ruleID, limit, offset)
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 	if history == nil {
@@ -632,7 +652,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.checkAuthz(r, principalID, "jurisdiction", "create"); err != nil {
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return
 	}
 
@@ -647,30 +667,30 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		requiredField{"jurisdiction_type", req.JurisdictionType},
 		requiredField{"authority_type", req.AuthorityType},
 	); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	// These are VARCHAR(n) columns; an over-length value used to die in
 	// Postgres and surface as 503 store_unavailable. Bound them here so the
 	// client learns the field's limit instead of reading an outage.
 	if len(req.JurisdictionCode) > 32 {
-		writeError(w, http.StatusBadRequest, "invalid_jurisdiction_code", "jurisdiction_code must be at most 32 characters")
+		writeError(w, r, http.StatusBadRequest, "invalid_jurisdiction_code", "jurisdiction_code must be at most 32 characters")
 		return
 	}
 	if len(req.JurisdictionType) > 64 {
-		writeError(w, http.StatusBadRequest, "invalid_jurisdiction_type", "jurisdiction_type must be at most 64 characters")
+		writeError(w, r, http.StatusBadRequest, "invalid_jurisdiction_type", "jurisdiction_type must be at most 64 characters")
 		return
 	}
 	if len(req.AuthorityType) > 64 {
-		writeError(w, http.StatusBadRequest, "invalid_authority_type", "authority_type must be at most 64 characters")
+		writeError(w, r, http.StatusBadRequest, "invalid_authority_type", "authority_type must be at most 64 characters")
 		return
 	}
 	if req.EffectiveFrom.IsZero() {
-		writeMissingField(w, "effective_from")
+		writeMissingField(w, r, "effective_from")
 		return
 	}
 	if !validEffectivePeriod(req.EffectiveFrom, req.EffectiveTo) {
-		writeError(w, http.StatusBadRequest, "invalid_effective_period", "effective_to must be after effective_from")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_period", "effective_to must be after effective_from")
 		return
 	}
 
@@ -701,7 +721,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -715,6 +735,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, status, j)
 }
 
@@ -726,6 +747,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 //	401 → no caller identity on the request
 //	403 → authorization denied
 //	404 → jurisdiction_id not found
+//	412 → precondition failed (stale If-Match)
 //	503 → authz or store unavailable
 func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request) {
 	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
@@ -736,7 +758,17 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := h.checkAuthz(r, principalID, "jurisdiction", "deactivate"); err != nil {
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
+		return
+	}
+
+	// Check If-Match for optimistic concurrency (API-3).
+	ifMatch, ok := parseIfMatch(w, r)
+	if !ok {
+		return
+	}
+	retireReq, ok := readRetireRequest(w, r)
+	if !ok {
 		return
 	}
 
@@ -745,7 +777,7 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
 		ctx := events.WithBatch(r.Context())
 		var err error
-		j, changed, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
+		j, changed, err = h.retire(r.Context(), q, jurisdictionID, principalID, retireReq, ifMatch)
 		if err != nil {
 			return err
 		}
@@ -761,7 +793,7 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -770,6 +802,7 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, http.StatusOK, j)
 }
 
@@ -795,7 +828,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.checkAuthz(r, principalID, "jurisdiction_rule", "create"); err != nil {
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return
 	}
 
@@ -809,25 +842,25 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		requiredField{"rule_code", req.RuleCode},
 		requiredField{"rule_name", req.RuleName},
 	); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	// rule_domain is VARCHAR(64) and rule_code VARCHAR(128). As with the
 	// jurisdiction create, an over-length value must be a 400, not a 503.
 	if len(req.RuleDomain) > 64 {
-		writeError(w, http.StatusBadRequest, "invalid_rule_domain", "rule_domain must be at most 64 characters")
+		writeError(w, r, http.StatusBadRequest, "invalid_rule_domain", "rule_domain must be at most 64 characters")
 		return
 	}
 	if len(req.RuleCode) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_rule_code", "rule_code must be at most 128 characters")
+		writeError(w, r, http.StatusBadRequest, "invalid_rule_code", "rule_code must be at most 128 characters")
 		return
 	}
 	if req.EffectiveFrom.IsZero() {
-		writeMissingField(w, "effective_from")
+		writeMissingField(w, r, "effective_from")
 		return
 	}
 	if !validEffectivePeriod(req.EffectiveFrom, req.EffectiveTo) {
-		writeError(w, http.StatusBadRequest, "invalid_effective_period", "effective_to must be after effective_from")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_period", "effective_to must be after effective_from")
 		return
 	}
 
@@ -838,14 +871,14 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		ruleStatus = "DRAFT"
 	}
 	if !createableRuleStatuses[ruleStatus] {
-		writeError(w, http.StatusBadRequest, "invalid_rule_status",
+		writeError(w, r, http.StatusBadRequest, "invalid_rule_status",
 			"rule_status must be DRAFT or ACTIVE at creation; SUPERSEDED and RETIRED are reached only via transition")
 		return
 	}
 
 	payload, err := normaliseRulePayload(req.RulePayload)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_rule_payload", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_rule_payload", err.Error())
 		return
 	}
 
@@ -853,21 +886,21 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 	if req.PrecedenceLevel != nil {
 		precedence = *req.PrecedenceLevel
 		if precedence < 0 || precedence > domain.MaxPrecedenceLevel {
-			writeError(w, http.StatusBadRequest, "invalid_precedence_level",
+			writeError(w, r, http.StatusBadRequest, "invalid_precedence_level",
 				fmt.Sprintf("precedence_level must be between 0 and %d (lower wins)", domain.MaxPrecedenceLevel))
 			return
 		}
 	}
 	if req.SupersedesRuleID != nil {
 		if _, err := uuid.Parse(*req.SupersedesRuleID); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_supersedes", "supersedes_rule_id must be a rule id")
+			writeError(w, r, http.StatusBadRequest, "invalid_supersedes", "supersedes_rule_id must be a rule id")
 			return
 		}
 	}
 	requestedVersion := 0
 	if req.RuleVersion != nil {
 		if *req.RuleVersion < 1 {
-			writeError(w, http.StatusBadRequest, "invalid_rule_version", "rule_version must be at least 1")
+			writeError(w, r, http.StatusBadRequest, "invalid_rule_version", "rule_version must be at least 1")
 			return
 		}
 		requestedVersion = *req.RuleVersion
@@ -912,7 +945,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -927,6 +960,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, rule.RowVersion)
 	writeJSON(w, status, rule)
 }
 
@@ -951,7 +985,7 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.checkAuthz(r, principalID, "jurisdiction_rule", "transition"); err != nil {
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return
 	}
 
@@ -967,7 +1001,7 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 
 	allowedPriors, known := ruleStatusAllowedPriors[req.NewStatus]
 	if !known {
-		writeError(w, http.StatusBadRequest, "invalid_status", "new_status must be one of ACTIVE, SUPERSEDED, RETIRED")
+		writeError(w, r, http.StatusBadRequest, "invalid_status", "new_status must be one of ACTIVE, SUPERSEDED, RETIRED")
 		return
 	}
 
@@ -981,7 +1015,7 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 	if req.NewStatus == "ACTIVE" {
 		approvalRef = strings.TrimSpace(r.Header.Get("X-Approval-Reference"))
 		if approvalRef == "" {
-			writeError(w, http.StatusBadRequest, "missing_approval_reference",
+			writeError(w, r, http.StatusBadRequest, "missing_approval_reference",
 				"transition to ACTIVE requires X-Approval-Reference header with approval evidence")
 			return
 		}
@@ -992,18 +1026,18 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		if h.approvals != nil {
 			current, err := h.store.FindRuleByID(r.Context(), ruleID)
 			if err != nil {
-				h.writeStoreError(w, err, correlationID)
+				h.writeStoreError(w, r, err, correlationID)
 				return
 			}
 			if current.RuleStatus != "ACTIVE" {
 				if err := h.approvals.Verify(r.Context(), approvalRef, ruleID, current.CreatedByPrincipalID); err != nil {
 					if errors.Is(err, approval.ErrNotValid) {
-						writeError(w, http.StatusForbidden, "approval_not_valid", err.Error())
+						writeError(w, r, http.StatusForbidden, "approval_not_valid", err.Error())
 						return
 					}
 					h.log.Error("TransitionRuleStatus: workflow-svc unavailable — failing closed",
 						zap.String("jurisdiction_rule_id", ruleID), zap.String("correlation_id", correlationID), zap.Error(err))
-					writeError(w, http.StatusServiceUnavailable, "approval_service_unavailable", "the approval could not be confirmed")
+					writeError(w, r, http.StatusServiceUnavailable, "approval_service_unavailable", "the approval could not be confirmed")
 					return
 				}
 			}
@@ -1046,7 +1080,7 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -1086,7 +1120,7 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.checkAuthz(r, principalID, "jurisdiction_rule", "record_drift"); err != nil {
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return
 	}
 
@@ -1100,7 +1134,7 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !driftStates[req.DriftState] {
-		writeError(w, http.StatusBadRequest, "invalid_drift_state", "drift_state must be one of CURRENT, DRIFTED, UNDER_REVIEW")
+		writeError(w, r, http.StatusBadRequest, "invalid_drift_state", "drift_state must be one of CURRENT, DRIFTED, UNDER_REVIEW")
 		return
 	}
 
@@ -1132,7 +1166,7 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -1166,7 +1200,7 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	if id := strings.TrimSpace(r.Header.Get("X-Workload-Id")); id != "" {
 		return id, true
 	}
-	writeError(w, http.StatusUnauthorized, "missing_principal",
+	writeError(w, r, http.StatusUnauthorized, "missing_principal",
 		"X-Principal-Id or X-Workload-Id is required — this header is set by the gateway from a verified identity envelope")
 	return "", false
 }
@@ -1200,16 +1234,16 @@ func routeResourceID(r *http.Request) string {
 // writeAuthzError maps an AuthorizationClient error to an HTTP response.
 // Both the explicit denial and the unavailable case fail closed — no
 // mutation proceeds without a positive authz decision.
-func (h *Handler) writeAuthzError(w http.ResponseWriter, err error) {
+func (h *Handler) writeAuthzError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, authz.ErrUnauthorized) {
-		problem.Write(w, problem.New(http.StatusForbidden, "unauthorized", ""))
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusForbidden, Code: "unauthorized", Detail: ""})
 		return
 	}
-	problem.Write(w, problem.New(http.StatusServiceUnavailable, "authz_unavailable", ""))
+	apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "authz_unavailable", Detail: ""})
 }
 
 // writeStoreError maps a store error to an HTTP response.
-func (h *Handler) writeStoreError(w http.ResponseWriter, err error, correlationID string) {
+func (h *Handler) writeStoreError(w http.ResponseWriter, r *http.Request, err error, correlationID string) {
 	var status int
 	var code string
 	switch {
@@ -1240,12 +1274,15 @@ func (h *Handler) writeStoreError(w http.ResponseWriter, err error, correlationI
 		status, code = http.StatusConflict, "supersedes_taken"
 	case errors.Is(err, domain.ErrRuleVersionMismatch):
 		status, code = http.StatusConflict, "rule_version_mismatch"
-	case errors.Is(err, domain.ErrPreconditionFailed):
+	// ErrVersionConflict is the jurisdiction stores' stale If-Match (API-3).
+	case errors.Is(err, domain.ErrPreconditionFailed), errors.Is(err, domain.ErrVersionConflict):
 		status, code = http.StatusPreconditionFailed, "precondition_failed"
 	case errors.Is(err, domain.ErrSelfApproval):
 		status, code = http.StatusForbidden, "self_approval_forbidden"
 	case errors.Is(err, domain.ErrInvalidEffectivePeriod):
 		status, code = http.StatusBadRequest, "invalid_effective_period"
+	case errors.Is(err, domain.ErrInvalidSuccessor):
+		status, code = http.StatusBadRequest, "invalid_successor"
 	default:
 		h.log.Error("store operation failed",
 			zap.String("correlation_id", correlationID),
@@ -1253,9 +1290,7 @@ func (h *Handler) writeStoreError(w http.ResponseWriter, err error, correlationI
 		)
 		status, code = http.StatusServiceUnavailable, "store_unavailable"
 	}
-	p := problem.New(status, code, "")
-	p.CorrelationID = correlationID
-	problem.Write(w, p)
+	apicontract.WriteProblem(w, r, apicontract.Problem{Status: status, Code: code, Detail: "", CorrelationID: correlationID})
 }
 
 // publish runs an event emission, logging rather than failing the request if
@@ -1278,26 +1313,26 @@ func (h *Handler) publish(eventType, correlationID string, emit func() error) {
 // fell back to the default and "offset=-1" reached Postgres, which rejects a
 // negative OFFSET — surfacing as 503 store_unavailable, i.e. a client typo
 // presenting as an outage.
-func (h *Handler) parsePaging(w http.ResponseWriter, q map[string][]string) (limit, offset int, ok bool) {
-	limit, ok = parseNonNegativeInt(w, q, "limit")
+func (h *Handler) parsePaging(w http.ResponseWriter, r *http.Request, q map[string][]string) (limit, offset int, ok bool) {
+	limit, ok = parseNonNegativeInt(w, r, q, "limit")
 	if !ok {
 		return 0, 0, false
 	}
-	offset, ok = parseNonNegativeInt(w, q, "offset")
+	offset, ok = parseNonNegativeInt(w, r, q, "offset")
 	if !ok {
 		return 0, 0, false
 	}
 	return limit, offset, true
 }
 
-func parseNonNegativeInt(w http.ResponseWriter, q map[string][]string, key string) (int, bool) {
+func parseNonNegativeInt(w http.ResponseWriter, r *http.Request, q map[string][]string, key string) (int, bool) {
 	vals, present := q[key]
 	if !present || len(vals) == 0 || vals[0] == "" {
 		return 0, true
 	}
 	n, err := strconv.Atoi(vals[0])
 	if err != nil || n < 0 {
-		writeError(w, http.StatusBadRequest, "invalid_"+key, key+" must be a non-negative integer")
+		writeError(w, r, http.StatusBadRequest, "invalid_"+key, key+" must be a non-negative integer")
 		return 0, false
 	}
 	return n, true
@@ -1305,14 +1340,14 @@ func parseNonNegativeInt(w http.ResponseWriter, q map[string][]string, key strin
 
 // parseEffectiveAt reads the point-in-time parameter. A zero value means
 // "now", resolved in the store.
-func (h *Handler) parseEffectiveAt(w http.ResponseWriter, q map[string][]string) (time.Time, bool) {
+func (h *Handler) parseEffectiveAt(w http.ResponseWriter, r *http.Request, q map[string][]string) (time.Time, bool) {
 	vals, present := q["effective_at"]
 	if !present || len(vals) == 0 || vals[0] == "" {
 		return time.Time{}, true
 	}
 	t, err := time.Parse(time.RFC3339, vals[0])
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be a valid RFC3339 timestamp")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_at", "effective_at must be a valid RFC3339 timestamp")
 		return time.Time{}, false
 	}
 	return t, true
@@ -1331,17 +1366,17 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := dec.Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
+			writeError(w, r, http.StatusRequestEntityTooLarge, "request_body_too_large",
 				"request body exceeds "+strconv.Itoa(maxRequestBody)+" bytes")
 			return false
 		}
-		writeError(w, http.StatusBadRequest, "invalid_request_body", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_request_body", err.Error())
 		return false
 	}
 	// Reject trailing content — two concatenated JSON objects would otherwise
 	// decode as just the first.
 	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid_request_body", "body must contain exactly one JSON object")
+		writeError(w, r, http.StatusBadRequest, "invalid_request_body", "body must contain exactly one JSON object")
 		return false
 	}
 	return true
@@ -1392,14 +1427,25 @@ func validEffectivePeriod(from time.Time, to *time.Time) bool {
 	return to == nil || to.After(from)
 }
 
-func writeMissingField(w http.ResponseWriter, field string) {
-	p := problem.New(http.StatusBadRequest, "missing_field", "a required field is missing")
-	p.Field("#/"+field, "missing", field+" is required")
-	problem.Write(w, p)
+func writeMissingField(w http.ResponseWriter, r *http.Request, field string) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status: http.StatusBadRequest,
+		Code:   "missing_field",
+		Detail: field + " is required",
+		Errors: []apicontract.FieldError{{Pointer: "#/" + field, Code: "missing", Detail: field + " is required"}},
+	})
 }
 
-func writeError(w http.ResponseWriter, status int, code, message string) {
-	problem.Write(w, problem.New(status, code, message))
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{Status: status, Code: code, Detail: message})
+}
+
+// writeProblemWith is writeError with extension members (gate reasons, compile
+// reports, verification results) kept beside the contract members.
+func writeProblemWith(w http.ResponseWriter, r *http.Request, status int, code, message string, extra map[string]any) {
+	p := apicontract.ProblemFor(status, code, message)
+	p.Extra = extra
+	apicontract.WriteProblem(w, r, p)
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.
@@ -1411,3 +1457,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		_ = err
 	}
 }
+

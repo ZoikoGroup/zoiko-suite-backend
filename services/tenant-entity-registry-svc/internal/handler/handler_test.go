@@ -43,6 +43,7 @@ const (
 	entityID   = "22222222-2222-2222-2222-222222222222"
 	wsID       = "33333333-3333-3333-3333-333333333333"
 	hierID     = "44444444-4444-4444-4444-444444444444"
+	relID      = "77777777-7777-4777-8777-777777777777"
 	assignID   = "55555555-5555-5555-5555-555555555555"
 	policyID   = "66666666-6666-6666-6666-666666666666"
 	regionID   = "77777777-7777-7777-7777-777777777777"
@@ -85,7 +86,7 @@ func (s *stubSvc) ProvisionTenant(_ context.Context, _ domain.ProvisionTenantReq
 
 func (s *stubSvc) GetTenant(_ context.Context, id string) (*domain.Tenant, error) {
 	s.gotID = id
-	return &domain.Tenant{TenantID: id}, s.err
+	return &domain.Tenant{TenantID: id, RecordVersion: 1}, s.err
 }
 
 func (s *stubSvc) TransitionTenantLifecycle(_ context.Context, id string, _ domain.TransitionTenantLifecycleRequest) error {
@@ -100,7 +101,7 @@ func (s *stubSvc) CreateEntity(_ context.Context, req domain.CreateEntityRequest
 
 func (s *stubSvc) GetEntity(_ context.Context, id string) (*domain.LegalEntity, error) {
 	s.gotID = id
-	return &domain.LegalEntity{LegalEntityID: id}, s.err
+	return &domain.LegalEntity{LegalEntityID: id, RecordVersion: 1}, s.err
 }
 
 func (s *stubSvc) ListEntities(_ context.Context, id string) ([]*domain.LegalEntity, error) {
@@ -115,7 +116,7 @@ func (s *stubSvc) CreateWorkspace(_ context.Context, req domain.CreateWorkspaceR
 
 func (s *stubSvc) GetWorkspace(_ context.Context, id string) (*domain.Workspace, error) {
 	s.gotID = id
-	return &domain.Workspace{WorkspaceID: id}, s.err
+	return &domain.Workspace{WorkspaceID: id, RecordVersion: 1}, s.err
 }
 
 func (s *stubSvc) ListWorkspaces(_ context.Context, id string) ([]*domain.Workspace, error) {
@@ -189,7 +190,7 @@ func (s *stubSvc) CreateResidencyPolicy(_ context.Context, _ domain.CreateReside
 
 func (s *stubSvc) GetResidencyPolicy(_ context.Context, id string) (*domain.DataResidencyPolicy, error) {
 	s.gotID = id
-	return &domain.DataResidencyPolicy{DataResidencyPolicyID: id}, s.err
+	return &domain.DataResidencyPolicy{DataResidencyPolicyID: id, RecordVersion: 1}, s.err
 }
 
 func (s *stubSvc) GetResidencyRegion(_ context.Context, id string) (*domain.ResidencyRegion, error) {
@@ -213,7 +214,17 @@ func (s *stubSvc) CreateTaxIdentityBundle(_ context.Context, id string, _ domain
 
 func (s *stubSvc) GetTaxIdentityBundle(_ context.Context, id string) (*domain.TaxIdentityBundle, error) {
 	s.gotID = id
-	return &domain.TaxIdentityBundle{TaxIdentityBundleID: id}, s.err
+	return &domain.TaxIdentityBundle{TaxIdentityBundleID: id, RecordVersion: 1}, s.err
+}
+
+func (s *stubSvc) GetHierarchyByID(_ context.Context, id string) (*domain.EntityHierarchy, error) {
+	s.gotID = id
+	return &domain.EntityHierarchy{HierarchyID: id, RecordVersion: 1}, s.err
+}
+
+func (s *stubSvc) GetJurisdictionAssignmentByID(_ context.Context, id string) (*domain.EntityJurisdictionAssignment, error) {
+	s.gotID = id
+	return &domain.EntityJurisdictionAssignment{AssignmentID: id, RecordVersion: 1}, s.err
 }
 
 func (s *stubSvc) ListTaxIdentityBundles(_ context.Context, id string) ([]*domain.TaxIdentityBundle, error) {
@@ -242,6 +253,25 @@ func do(r chi.Router, method, path, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Correlation-ID", corrID)
+	// Add If-Match header for mutating requests (required by API-3)
+	if method == http.MethodPatch || method == http.MethodPost || method == http.MethodDelete {
+		// Check if this is a mutation of an existing aggregate (not a create)
+		// Routes that mutate existing aggregates:
+		// - /v1/tenants/{id}/lifecycle
+		// - /v1/workspaces/{id} (PATCH)
+		// - /v1/workspaces/{id}/status
+		// - /v1/entities/{id} (PATCH)
+		// - /v1/entities/{id}/status
+		// - /v1/entity-hierarchies/{id} (DELETE)
+		// - /v1/entity-jurisdictions/{id} (DELETE)
+		// - /v1/tax-identity-bundles/{id}/status
+		if strings.Contains(path, "/lifecycle") ||
+			strings.Contains(path, "/status") ||
+			(method == http.MethodPatch && (strings.Contains(path, "/workspaces/") || strings.Contains(path, "/entities/"))) ||
+			(method == http.MethodDelete && (strings.Contains(path, "/entity-hierarchies/") || strings.Contains(path, "/entity-jurisdictions/"))) {
+			req.Header.Set("If-Match", `"v1"`)
+		}
+	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -326,6 +356,18 @@ func allRoutes() []route {
 		{"get approval request", http.MethodGet, "/v1/approval-requests/apr-1", "", http.StatusOK, "apr-1"},
 		{"approve request", http.MethodPost, "/v1/approval-requests/apr-1/approve", `{"payload_fingerprint":"f"}`, http.StatusOK, "apr-1"},
 		{"reject request", http.MethodPost, "/v1/approval-requests/apr-1/reject", `{"note":"no"}`, http.StatusOK, "apr-1"},
+
+		// ── ORG-04 §4.4 ──────────────────────────────────────────────────────
+		{"propose ownership relationship", http.MethodPost, "/v1/ownership-relationships", `{"parent_legal_entity_id":"p"}`, http.StatusCreated, ""},
+		{"get ownership relationship", http.MethodGet, "/v1/ownership-relationships/" + relID, "", http.StatusOK, relID},
+		{"approve ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/approval", `{"expected_version":1}`, http.StatusOK, relID},
+		{"reject ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/rejection", `{"expected_version":1}`, http.StatusOK, relID},
+		{"supersede ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/supersession", `{"expected_version":2}`, http.StatusCreated, relID},
+		{"end ownership relationship", http.MethodPost, "/v1/ownership-relationships/" + relID + "/end", `{"expected_version":2}`, http.StatusOK, relID},
+		{"ownership graph", http.MethodGet, "/v1/ownership-graph?as_of=2026-03-31", "", http.StatusOK, ""},
+		{"entity group as-of", http.MethodGet, "/v1/entities/" + entityID + "/group?as_of=2026-03-31", "", http.StatusOK, entityID},
+		{"list entity parents", http.MethodGet, "/v1/entities/" + entityID + "/parents", "", http.StatusOK, entityID},
+		{"explain control chain", http.MethodGet, "/v1/entities/" + entityID + "/control-chain?as_of=2026-03-31", "", http.StatusOK, entityID},
 	}
 }
 
@@ -641,9 +683,38 @@ func TestWriteErr_PendingApprovalIs202WithTheRequest(t *testing.T) {
 			if rec.Code != http.StatusAccepted {
 				t.Fatalf("pending approval mapped to %d, want 202", rec.Code)
 			}
-			for _, want := range []string{`"PENDING_APPROVAL"`, `"apr-9"`, `"fp-9"`} {
-				if !strings.Contains(rec.Body.String(), want) {
-					t.Fatalf("202 body %s lacks %s", rec.Body.String(), want)
+			// Check new problem details format
+			var body struct {
+				Code     string `json:"code"`
+				Detail   string `json:"detail"`
+				Extra    map[string]any `json:"-"`
+			}
+			// Parse the full body to check Extra
+			var fullBody map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &fullBody); err != nil {
+				t.Fatalf("body is not JSON: %s", rec.Body.String())
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body is not JSON: %s", rec.Body.String())
+			}
+			if body.Code != "pending_approval" {
+				t.Fatalf("code = %q, want %q", body.Code, "pending_approval")
+			}
+			if body.Detail != "Command filed for independent approval" {
+				t.Fatalf("detail = %q, want %q", body.Detail, "Command filed for independent approval")
+			}
+			// Check Extra contains the approval request
+			if extra, ok := fullBody["approval_status"].(string); !ok || extra != "PENDING_APPROVAL" {
+				t.Fatalf("Extra.approval_status = %v, want %q", fullBody["approval_status"], "PENDING_APPROVAL")
+			}
+			if approvalReq, ok := fullBody["approval_request"].(map[string]any); !ok {
+				t.Fatalf("Extra.approval_request missing or not object")
+			} else {
+				if approvalReq["approval_request_id"] != "apr-9" {
+					t.Fatalf("approval_request.approval_request_id = %v, want %q", approvalReq["approval_request_id"], "apr-9")
+				}
+				if approvalReq["payload_fingerprint"] != "fp-9" {
+					t.Fatalf("approval_request.payload_fingerprint = %v, want %q", approvalReq["payload_fingerprint"], "fp-9")
 				}
 			}
 		})
@@ -731,17 +802,20 @@ func TestWriteErr_EveryRefusalCarriesItsTypedCode(t *testing.T) {
 		t.Run(tc.err.Error(), func(t *testing.T) {
 			rec := do(newRouter(&stubSvc{err: tc.err}), http.MethodGet, "/v1/tenants/"+tenantID, "")
 			var body struct {
-				Error     string `json:"error"`
-				ErrorCode string `json:"error_code"`
+				Code   string `json:"code"`
+				Detail string `json:"detail"`
 			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 				t.Fatalf("body is not JSON: %s", rec.Body.String())
 			}
-			if rec.Code != tc.wantStatus || body.ErrorCode != tc.wantCode {
-				t.Fatalf("got %d %q, want %d %q (body %s)", rec.Code, body.ErrorCode, tc.wantStatus, tc.wantCode, rec.Body.String())
+			if rec.Code != tc.wantStatus || body.Code != tc.wantCode {
+				t.Fatalf("got %d %q, want %d %q (body %s)", rec.Code, body.Code, tc.wantStatus, tc.wantCode, rec.Body.String())
 			}
-			if strings.Contains(body.Error, "already exists") && tc.wantCode != "DUPLICATE_CANDIDATE" {
-				t.Fatalf("a %s must not read as a duplicate: %q", tc.wantCode, body.Error)
+			if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+				t.Fatalf("Content-Type = %q, want application/problem+json (API-2)", ct)
+			}
+			if strings.Contains(body.Detail, "already exists") && tc.wantCode != "DUPLICATE_CANDIDATE" {
+				t.Fatalf("a %s must not read as a duplicate: %q", tc.wantCode, body.Detail)
 			}
 		})
 	}
@@ -750,7 +824,13 @@ func TestWriteErr_EveryRefusalCarriesItsTypedCode(t *testing.T) {
 // A malformed body has no service error behind it and still gets a code.
 func TestWriteErr_MalformedBodyIsValidationFailed(t *testing.T) {
 	rec := do(newRouter(&stubSvc{}), http.MethodPost, "/v1/entities", "{")
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"error_code":"VALIDATION_FAILED"`) {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusBadRequest || body.Code != "VALIDATION_FAILED" {
 		t.Fatalf("got %d %s", rec.Code, rec.Body.String())
 	}
 }
@@ -771,5 +851,209 @@ func TestLegacyWrites_CarryTheEnvelopeCorrelationID(t *testing.T) {
 		if s.gotCorrID != corrID {
 			t.Errorf("%s %s: service saw correlation id %q, want the header's %q", rt.method, rt.path, s.gotCorrID, corrID)
 		}
+	}
+}
+
+// ── API-3 ETag/If-Match tests ──────────────────────────────────────────────────
+
+// TestETag_ReadEndpointsReturnETag verifies that GET endpoints for mutable
+// aggregates return an ETag header with the record_version.
+func TestETag_ReadEndpointsReturnETag(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"get tenant", http.MethodGet, "/v1/tenants/" + tenantID},
+		{"get entity", http.MethodGet, "/v1/entities/" + entityID},
+		{"get workspace", http.MethodGet, "/v1/workspaces/" + wsID},
+		{"get residency policy", http.MethodGet, "/v1/residency-policies/" + policyID},
+		{"get tax bundle", http.MethodGet, "/v1/tax-identity-bundles/" + bundleID},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(newRouter(&stubSvc{}), tc.method, tc.path, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			etag := rec.Header().Get("ETag")
+			if etag == "" {
+				t.Fatal("ETag header is missing")
+			}
+			if etag != `"v1"` {
+				t.Fatalf("ETag = %q, want %q", etag, `"v1"`)
+			}
+		})
+	}
+}
+
+// TestIfMatch_MissingReturns428 verifies that mutations of existing aggregates
+// require an If-Match header and return 428 Precondition Required when missing.
+func TestIfMatch_MissingReturns428(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"tenant lifecycle", http.MethodPost, "/v1/tenants/" + tenantID + "/lifecycle", `{"new_lifecycle_state":"ACTIVE"}`},
+		{"update workspace", http.MethodPatch, "/v1/workspaces/" + wsID, `{"name":"W2"}`},
+		{"workspace status", http.MethodPost, "/v1/workspaces/" + wsID + "/status", `{"new_status":"ARCHIVED"}`},
+		{"update entity", http.MethodPatch, "/v1/entities/" + entityID, `{"legal_name":"New"}`},
+		{"transition entity status", http.MethodPost, "/v1/entities/" + entityID + "/status", `{"new_status":"ACTIVE"}`},
+		{"end-date hierarchy", http.MethodDelete, "/v1/entity-hierarchies/" + hierID + "?end_date=" + endDateRaw, ""},
+		{"end-date jurisdiction", http.MethodDelete, "/v1/entity-jurisdictions/" + assignID + "?end_date=" + endDateRaw, ""},
+		{"tax bundle status", http.MethodPost, "/v1/tax-identity-bundles/" + bundleID + "/status", `{"new_status":"ACTIVE"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Correlation-ID", corrID)
+			// No If-Match header
+			rec := httptest.NewRecorder()
+			newRouter(&stubSvc{}).ServeHTTP(rec, req)
+			if rec.Code != http.StatusPreconditionRequired {
+				t.Fatalf("expected 428, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Code string `json:"code"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body is not JSON: %s", rec.Body.String())
+			}
+			if body.Code != "precondition_required" {
+				t.Fatalf("code = %q, want %q", body.Code, "precondition_required")
+			}
+		})
+	}
+}
+
+// TestIfMatch_StaleReturns412 verifies that mutations with a stale ETag
+// return 412 Precondition Failed.
+func TestIfMatch_StaleReturns412(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"tenant lifecycle", http.MethodPost, "/v1/tenants/" + tenantID + "/lifecycle", `{"new_lifecycle_state":"ACTIVE"}`},
+		{"update workspace", http.MethodPatch, "/v1/workspaces/" + wsID, `{"name":"W2"}`},
+		{"workspace status", http.MethodPost, "/v1/workspaces/" + wsID + "/status", `{"new_status":"ARCHIVED"}`},
+		{"update entity", http.MethodPatch, "/v1/entities/" + entityID, `{"legal_name":"New"}`},
+		{"transition entity status", http.MethodPost, "/v1/entities/" + entityID + "/status", `{"new_status":"ACTIVE"}`},
+		{"end-date hierarchy", http.MethodDelete, "/v1/entity-hierarchies/" + hierID + "?end_date=" + endDateRaw, ""},
+		{"end-date jurisdiction", http.MethodDelete, "/v1/entity-jurisdictions/" + assignID + "?end_date=" + endDateRaw, ""},
+		{"tax bundle status", http.MethodPost, "/v1/tax-identity-bundles/" + bundleID + "/status", `{"new_status":"ACTIVE"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Correlation-ID", corrID)
+			req.Header.Set("If-Match", `"v999"`) // Stale version
+			rec := httptest.NewRecorder()
+			newRouter(&stubSvc{}).ServeHTTP(rec, req)
+			if rec.Code != http.StatusPreconditionFailed {
+				t.Fatalf("expected 412, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Code           string `json:"code"`
+				CurrentVersion int64  `json:"current_version"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body is not JSON: %s", rec.Body.String())
+			}
+			if body.Code != "stale_version" {
+				t.Fatalf("code = %q, want %q", body.Code, "stale_version")
+			}
+			if body.CurrentVersion != 1 {
+				t.Fatalf("current_version = %d, want 1", body.CurrentVersion)
+			}
+			// Response should include the current ETag
+			etag := rec.Header().Get("ETag")
+			if etag != `"v1"` {
+				t.Fatalf("response ETag = %q, want %q", etag, `"v1"`)
+			}
+		})
+	}
+}
+
+// TestIfMatch_CorrectReturns2xx verifies that mutations with a correct ETag
+// succeed with 2xx.
+func TestIfMatch_CorrectReturns2xx(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{"tenant lifecycle", http.MethodPost, "/v1/tenants/" + tenantID + "/lifecycle", `{"new_lifecycle_state":"ACTIVE"}`, http.StatusNoContent},
+		{"update workspace", http.MethodPatch, "/v1/workspaces/" + wsID, `{"name":"W2"}`, http.StatusOK},
+		{"workspace status", http.MethodPost, "/v1/workspaces/" + wsID + "/status", `{"new_status":"ARCHIVED"}`, http.StatusNoContent},
+		{"update entity", http.MethodPatch, "/v1/entities/" + entityID, `{"legal_name":"New"}`, http.StatusOK},
+		{"transition entity status", http.MethodPost, "/v1/entities/" + entityID + "/status", `{"new_status":"ACTIVE"}`, http.StatusNoContent},
+		{"end-date hierarchy", http.MethodDelete, "/v1/entity-hierarchies/" + hierID + "?end_date=" + endDateRaw, "", http.StatusNoContent},
+		{"end-date jurisdiction", http.MethodDelete, "/v1/entity-jurisdictions/" + assignID + "?end_date=" + endDateRaw, "", http.StatusNoContent},
+		{"tax bundle status", http.MethodPost, "/v1/tax-identity-bundles/" + bundleID + "/status", `{"new_status":"ACTIVE"}`, http.StatusNoContent},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Correlation-ID", corrID)
+			req.Header.Set("If-Match", `"v1"`) // Correct version
+			rec := httptest.NewRecorder()
+			newRouter(&stubSvc{}).ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("expected %d, got %d: %s", tc.wantStatus, rec.Code, rec.Body.String())
+			}
+			// For 200 responses, verify ETag is returned with updated version
+			if tc.wantStatus == http.StatusOK {
+				etag := rec.Header().Get("ETag")
+				if etag == "" {
+					t.Fatal("ETag header is missing on 200 response")
+				}
+			}
+		})
+	}
+}
+
+// TestIfMatch_WildcardAcceptsAnyVersion verifies that If-Match: * accepts any
+// current version (per RFC 7232).
+func TestIfMatch_WildcardAcceptsAnyVersion(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPatch, "/v1/entities/"+entityID, strings.NewReader(`{"legal_name":"New"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Correlation-ID", corrID)
+	req.Header.Set("If-Match", "*")
+	rec := httptest.NewRecorder()
+	newRouter(&stubSvc{}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with If-Match: *, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestIfMatch_MalformedReturns400 verifies that a malformed If-Match header
+// returns 400 Bad Request.
+func TestIfMatch_MalformedReturns400(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPatch, "/v1/entities/"+entityID, strings.NewReader(`{"legal_name":"New"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Correlation-ID", corrID)
+	req.Header.Set("If-Match", `"vabc"`) // Malformed
+	rec := httptest.NewRecorder()
+	newRouter(&stubSvc{}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %s", rec.Body.String())
+	}
+	if body.Code != "invalid_if_match" {
+		t.Fatalf("code = %q, want %q", body.Code, "invalid_if_match")
 	}
 }

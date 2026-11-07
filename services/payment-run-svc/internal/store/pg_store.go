@@ -40,6 +40,9 @@ func (n *nullString) Scan(src interface{}) error {
 
 // Store is the interface the handler depends on.
 type Store interface {
+	// QueryUnappliedSupplierPayments serves the FIN-CTRL-030 control population (see control_population.go).
+	QueryUnappliedSupplierPayments(ctx context.Context, tenantID string, q domain.UnappliedPaymentsQuery) (*domain.ControlPopulationPage, error)
+
 	CreateRun(ctx context.Context, tenantID string, req domain.CreateRunRequest, instructions []domain.RunInstruction, principalID string) (*domain.PaymentRun, []domain.RunInstruction, error)
 	FindRun(ctx context.Context, runID string) (*domain.PaymentRun, error)
 	ListInstructions(ctx context.Context, runID string) ([]domain.RunInstruction, error)

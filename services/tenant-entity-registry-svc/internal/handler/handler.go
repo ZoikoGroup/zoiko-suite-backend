@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
@@ -55,11 +56,13 @@ type Service interface {
 	CreateHierarchy(ctx context.Context, req domain.CreateHierarchyRequest) (*domain.EntityHierarchy, error)
 	EndDateHierarchy(ctx context.Context, hierarchyID string, endDate time.Time, correlationID string) error
 	ListHierarchies(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error)
+	GetHierarchyByID(ctx context.Context, hierarchyID string) (*domain.EntityHierarchy, error)
 
 	// Jurisdiction assignment
 	AssignJurisdiction(ctx context.Context, legalEntityID string, req domain.AssignJurisdictionRequest) (*domain.EntityJurisdictionAssignment, error)
 	ListJurisdictions(ctx context.Context, legalEntityID string) ([]*domain.EntityJurisdictionAssignment, error)
 	EndDateJurisdictionAssignment(ctx context.Context, assignmentID string, endDate time.Time, correlationID string) error
+	GetJurisdictionAssignmentByID(ctx context.Context, assignmentID string) (*domain.EntityJurisdictionAssignment, error)
 
 	// Residency policy
 	CreateResidencyPolicy(ctx context.Context, req domain.CreateResidencyPolicyRequest) (*domain.DataResidencyPolicy, error)
@@ -81,6 +84,9 @@ type Service interface {
 
 	// ORG-02/ORG-03 named commands and read surfaces — see org_handler.go.
 	ORGService
+
+	// ORG-04 ownership and control relationships — see ownership.go.
+	OwnershipService
 }
 
 // Handler holds all HTTP handler methods.
@@ -131,6 +137,8 @@ func RegisterRoutes(r chi.Router, h *Handler, mws ...func(http.Handler) http.Han
 		// ORG-02/ORG-03 surfaces, registered inside this same /v1 group so
 		// chi's static-before-parameter matching applies across all of them.
 		registerORGRoutes(r, h)
+		registerOwnershipRoutes(r, h)
+		registerPartyRoutes(r, h)
 
 		// ── Tenants ─────────────────────────────────────────────────────────
 		r.Post("/tenants", h.ProvisionTenant)
@@ -207,7 +215,7 @@ func (h *Handler) GetTenant(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, t)
+	writeJSONWithETag(w, http.StatusOK, t, t.RecordVersion)
 }
 
 // ResolveTenantRegion handles GET /v1/tenants/{tenantID}/residency-region
@@ -229,7 +237,17 @@ func (h *Handler) TransitionTenantLifecycle(w http.ResponseWriter, r *http.Reque
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := h.svc.TransitionTenantLifecycle(r.Context(), chi.URLParam(r, "tenantID"), req); err != nil {
+	// Check If-Match for mutations of existing aggregates
+	tenantID := chi.URLParam(r, "tenantID")
+	t, err := h.svc.GetTenant(r.Context(), tenantID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, t.RecordVersion) {
+		return
+	}
+	if err := h.svc.TransitionTenantLifecycle(r.Context(), tenantID, req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -262,7 +280,7 @@ func (h *Handler) GetEntity(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSONWithETag(w, http.StatusOK, e, e.RecordVersion)
 }
 
 func (h *Handler) ListEntities(w http.ResponseWriter, r *http.Request) {
@@ -298,7 +316,7 @@ func (h *Handler) GetWorkspace(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ws)
+	writeJSONWithETag(w, http.StatusOK, ws, ws.RecordVersion)
 }
 
 func (h *Handler) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
@@ -321,13 +339,23 @@ func (h *Handler) UpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	req.CorrelationID = correlationID(r)
-	ws, err := h.svc.UpdateWorkspace(r.Context(), chi.URLParam(r, "workspaceID"), req)
+	// Check If-Match for mutations of existing aggregates
+	workspaceID := chi.URLParam(r, "workspaceID")
+	ws, err := h.svc.GetWorkspace(r.Context(), workspaceID)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ws)
+	if !h.requireIfMatch(w, r, ws.RecordVersion) {
+		return
+	}
+	req.CorrelationID = correlationID(r)
+	ws, err = h.svc.UpdateWorkspace(r.Context(), workspaceID, req)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSONWithETag(w, http.StatusOK, ws, ws.RecordVersion)
 }
 
 // TransitionWorkspaceStatus — POST /v1/workspaces/{workspaceID}/status
@@ -337,8 +365,18 @@ func (h *Handler) TransitionWorkspaceStatus(w http.ResponseWriter, r *http.Reque
 	if !decode(w, r, &req) {
 		return
 	}
+	// Check If-Match for mutations of existing aggregates
+	workspaceID := chi.URLParam(r, "workspaceID")
+	ws, err := h.svc.GetWorkspace(r.Context(), workspaceID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, ws.RecordVersion) {
+		return
+	}
 	req.CorrelationID = correlationID(r)
-	if err := h.svc.TransitionWorkspaceStatus(r.Context(), chi.URLParam(r, "workspaceID"), req); err != nil {
+	if err := h.svc.TransitionWorkspaceStatus(r.Context(), workspaceID, req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -350,17 +388,27 @@ func (h *Handler) UpdateEntity(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	// Check If-Match for mutations of existing aggregates
+	entityID := chi.URLParam(r, "entityID")
+	e, err := h.svc.GetEntity(r.Context(), entityID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, e.RecordVersion) {
+		return
+	}
 	// The envelope's correlation id when the body names none, so the
 	// event this write emits can be traced back to the request.
 	if req.CorrelationID == "" {
 		req.CorrelationID = correlationID(r)
 	}
-	e, err := h.svc.UpdateEntity(r.Context(), chi.URLParam(r, "entityID"), req)
+	e, err = h.svc.UpdateEntity(r.Context(), entityID, req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSONWithETag(w, http.StatusOK, e, e.RecordVersion)
 }
 
 // GetEntityStatus — GET /v1/entities/{entityID}/status
@@ -381,8 +429,18 @@ func (h *Handler) TransitionEntityStatus(w http.ResponseWriter, r *http.Request)
 	if !decode(w, r, &req) {
 		return
 	}
+	// Check If-Match for mutations of existing aggregates
+	entityID := chi.URLParam(r, "entityID")
+	e, err := h.svc.GetEntity(r.Context(), entityID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, e.RecordVersion) {
+		return
+	}
 	req.CorrelationID = correlationID(r)
-	if err := h.svc.TransitionEntityStatus(r.Context(), chi.URLParam(r, "entityID"), req); err != nil {
+	if err := h.svc.TransitionEntityStatus(r.Context(), entityID, req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -425,7 +483,21 @@ func (h *Handler) EndDateHierarchy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.svc.EndDateHierarchy(r.Context(), chi.URLParam(r, "hierarchyID"), endDate, correlationID(r)); err != nil {
+	// Check If-Match for mutations of existing aggregates
+	hierarchyID := chi.URLParam(r, "hierarchyID")
+	hier, err := h.svc.GetHierarchyByID(r.Context(), hierarchyID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if hier == nil {
+		h.writeErr(w, r, registry.ErrNotFound)
+		return
+	}
+	if !h.requireIfMatch(w, r, hier.RecordVersion) {
+		return
+	}
+	if err := h.svc.EndDateHierarchy(r.Context(), hierarchyID, endDate, correlationID(r)); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -461,12 +533,27 @@ func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// EndDateJurisdictionAssignment
 func (h *Handler) EndDateJurisdictionAssignment(w http.ResponseWriter, r *http.Request) {
 	endDate, ok := parseEndDate(w, r)
 	if !ok {
 		return
 	}
-	if err := h.svc.EndDateJurisdictionAssignment(r.Context(), chi.URLParam(r, "assignmentID"), endDate, correlationID(r)); err != nil {
+	// Check If-Match for mutations of existing aggregates
+	assignmentID := chi.URLParam(r, "assignmentID")
+	a, err := h.svc.GetJurisdictionAssignmentByID(r.Context(), assignmentID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if a == nil {
+		h.writeErr(w, r, registry.ErrNotFound)
+		return
+	}
+	if !h.requireIfMatch(w, r, a.RecordVersion) {
+		return
+	}
+	if err := h.svc.EndDateJurisdictionAssignment(r.Context(), assignmentID, endDate, correlationID(r)); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -494,7 +581,7 @@ func (h *Handler) GetResidencyPolicy(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSONWithETag(w, http.StatusOK, p, p.RecordVersion)
 }
 
 // ── ResidencyRegion handlers — read-only (IaC-managed) ──────────────────────
@@ -538,7 +625,7 @@ func (h *Handler) GetTaxIdentityBundle(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, b)
+	writeJSONWithETag(w, http.StatusOK, b, b.RecordVersion)
 }
 
 func (h *Handler) ListTaxIdentityBundles(w http.ResponseWriter, r *http.Request) {
@@ -555,7 +642,17 @@ func (h *Handler) TransitionTaxIdentityBundleStatus(w http.ResponseWriter, r *ht
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := h.svc.TransitionTaxIdentityBundleStatus(r.Context(), chi.URLParam(r, "bundleID"), req); err != nil {
+	// Check If-Match for mutations of existing aggregates
+	bundleID := chi.URLParam(r, "bundleID")
+	b, err := h.svc.GetTaxIdentityBundle(r.Context(), bundleID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, b.RecordVersion) {
+		return
+	}
+	if err := h.svc.TransitionTaxIdentityBundleStatus(r.Context(), bundleID, req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -574,82 +671,92 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	// Not a failure: a maker-checker command was filed rather than executed.
 	var pending *registry.PendingApprovalError
 	if errors.As(err, &pending) {
-		writeJSON(w, http.StatusAccepted, pendingApprovalResponse{
-			Status:          "PENDING_APPROVAL",
-			ApprovalRequest: pending.Request,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusAccepted,
+			Code:   "pending_approval",
+			Detail: "Command filed for independent approval",
+			Extra: map[string]any{
+				"approval_status":  "PENDING_APPROVAL",
+				"approval_request": pending.Request,
+			},
 		})
 		return
 	}
 
 	// Every refusal carries its §3 typed code (errcodes.go).
-	writeErrJSON := func(w http.ResponseWriter, status int, msg, corrID string) {
+	writeErrJSON := func(w http.ResponseWriter, r *http.Request, status int, msg, corrID string) {
 		code, ok := errorCodeFor(err)
 		if !ok {
 			code = codeForStatus(status)
 		}
-		writeErrCoded(w, status, code, msg, corrID)
+		writeErrCoded(w, r, status, code, msg, corrID)
 	}
 
 	if status, msg, ok := mapORGError(err); ok {
-		writeErrJSON(w, status, msg, corrID)
+		writeErrJSON(w, r, status, msg, corrID)
 		return
 	}
 
 	switch {
 	case errors.Is(err, registry.ErrNotFound):
-		writeErrJSON(w, http.StatusNotFound, "not found", corrID)
+		writeErrJSON(w, r, http.StatusNotFound, "not found", corrID)
 	case errors.Is(err, registry.ErrInvalidTransition):
-		writeErrJSON(w, http.StatusUnprocessableEntity, err.Error(), corrID)
+		writeErrJSON(w, r, http.StatusUnprocessableEntity, err.Error(), corrID)
 	case errors.Is(err, registry.ErrUnauthenticated):
 		// 401, not 403: the caller was never identified, so there is no
 		// principal to evaluate a grant against. Kept distinct so an operator
 		// can tell "the gateway did not forward an identity" apart from
 		// "this principal is not permitted".
-		writeErrJSON(w, http.StatusUnauthorized, "unauthenticated: no verified principal on request", corrID)
+		writeErrJSON(w, r, http.StatusUnauthorized, "unauthenticated: no verified principal on request", corrID)
 	case errors.Is(err, registry.ErrUnauthorized):
-		writeErrJSON(w, http.StatusForbidden, "forbidden", corrID)
+		writeErrJSON(w, r, http.StatusForbidden, "forbidden", corrID)
 	case errors.Is(err, registry.ErrServiceUnavailable):
-		writeErrJSON(w, http.StatusServiceUnavailable, "upstream service unavailable — request rejected", corrID)
+		writeErrJSON(w, r, http.StatusServiceUnavailable, "upstream service unavailable — request rejected", corrID)
 	case errors.Is(err, registry.ErrInvalidInput):
-		writeErrJSON(w, http.StatusBadRequest, err.Error(), corrID)
+		writeErrJSON(w, r, http.StatusBadRequest, err.Error(), corrID)
 	case errors.Is(err, registry.ErrConflict):
-		writeErrJSON(w, http.StatusConflict, err.Error(), corrID)
+		writeErrJSON(w, r, http.StatusConflict, err.Error(), corrID)
 	case errors.Is(err, registry.ErrRegionUnresolved):
-		writeErrJSON(w, http.StatusConflict, err.Error(), corrID)
+		writeErrJSON(w, r, http.StatusConflict, err.Error(), corrID)
 	default:
 		h.log.Error("unhandled service error", zap.Error(err), zap.String("correlation_id", corrID))
-		writeErrCoded(w, http.StatusInternalServerError, CodeInternal, "internal server error", corrID)
+		writeErrCoded(w, r, http.StatusInternalServerError, CodeInternal, "internal server error", corrID)
 	}
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-type errorResponse struct {
-	Error string `json:"error"`
-	// ErrorCode is the stable §3 typed code; Error is prose and may change.
-	ErrorCode     string `json:"error_code"`
-	CorrelationID string `json:"correlation_id,omitempty"`
+// writeErrJSON writes a refusal that has no service error behind it; the code
+// follows from the status.
+func writeErrJSON(w http.ResponseWriter, r *http.Request, status int, msg, corrID string) {
+	writeErrCoded(w, r, status, codeForStatus(status), msg, corrID)
 }
 
+func writeErrCoded(w http.ResponseWriter, r *http.Request, status int, code, msg, corrID string) {
+	p := apicontract.ProblemFor(status, code, msg)
+	p.CorrelationID = corrID
+	apicontract.WriteProblem(w, r, p)
+}
+
+// writeJSON writes a JSON response with the appropriate headers.
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// writeErrJSON writes a refusal that has no service error behind it; the code
-// follows from the status.
-func writeErrJSON(w http.ResponseWriter, status int, msg, corrID string) {
-	writeErrCoded(w, status, codeForStatus(status), msg, corrID)
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
 }
 
-func writeErrCoded(w http.ResponseWriter, status int, code, msg, corrID string) {
-	writeJSON(w, status, errorResponse{Error: msg, ErrorCode: code, CorrelationID: corrID})
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid request body", correlationID(r))
+		writeErrJSON(w, r, http.StatusBadRequest, "invalid request body", correlationID(r))
 		return false
 	}
 	return true
@@ -671,12 +778,12 @@ func correlationID(r *http.Request) string {
 func parseEndDate(w http.ResponseWriter, r *http.Request) (time.Time, bool) {
 	raw := r.URL.Query().Get("end_date")
 	if raw == "" {
-		writeErrJSON(w, http.StatusBadRequest, "end_date query parameter is required (RFC3339)", correlationID(r))
+		writeErrJSON(w, r, http.StatusBadRequest, "end_date query parameter is required (RFC3339)", correlationID(r))
 		return time.Time{}, false
 	}
 	t, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "end_date must be RFC3339 format", correlationID(r))
+		writeErrJSON(w, r, http.StatusBadRequest, "end_date must be RFC3339 format", correlationID(r))
 		return time.Time{}, false
 	}
 	return t, true

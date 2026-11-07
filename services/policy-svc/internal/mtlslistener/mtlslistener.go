@@ -33,6 +33,7 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 )
 
 // PlatformScopeID is the synthetic legal entity platform infrastructure
@@ -209,9 +210,8 @@ func allowList(allowed []string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cn := verifiedClient(r)
 		if cn == "" || (len(set) > 0 && !set[cn]) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`{"error":"workload_not_registered","message":"the client certificate does not name a service admitted on this listener"}`))
+			apicontract.WriteError(w, r, http.StatusForbidden, "workload_not_registered",
+				"the client certificate does not name a service admitted on this listener")
 			return
 		}
 		r.Header.Set("X-Workload-Id", cn)

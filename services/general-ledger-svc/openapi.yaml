@@ -1,0 +1,5443 @@
+openapi: 3.0.3
+
+# general-ledger-svc - Global Accounting Kernel (standard ZS-ACC-KERNEL-001).
+#
+# This file describes the kernel's /v1 API: the routes registered by RegisterKernelRoutes (books, accounting events, posting rules and
+# postings, dimensions, reconciliation, revaluation, snapshots and period seals, allocation, consolidation, migration and cutover, and the
+# rollout readiness check). The older ledger routes of this service (journals, accounts, trial balance) are not described here.
+#
+# The paths, operations and request/response shapes below are generated from the code and kept in step with the router by a test
+# (internal/handler/openapi_parity_test.go).
+#
+# THINGS A CLIENT CANNOT GUESS FROM THE PATHS
+#
+#  1. IDENTITY. Every operation needs X-Principal-Id (401 identity_missing without it) and a tenant (X-Tenant-Id, 401 tenant_scope_missing
+#     without it). X-Legal-Entity-Id scopes the authorization check to one legal entity; without it the check is made at tenant level.
+#     X-Correlation-ID is carried into the events the operation raises.
+#
+#  2. AUTHORIZATION. Each operation names the authorization-svc action(s) it needs in x-authorization-actions. A missing right is 403
+#     authorization_denied. The check fails closed: when authorization-svc cannot answer, the answer is 503, never "allowed". Approving,
+#     posting and reconciling are separate actions from preparing, so the person who prepared a record cannot also approve it (403
+#     separation_of_duties; the database holds the same rule).
+#
+#  3. FAILURES. Every failure body is the Problem schema. A deterministic accounting exception carries its family and code:
+#        AK-AUTH 403, AK-PERIOD 409, AK-DUP 409, AK-CONC 409, AK-EXT 503, and AK-RULE, AK-COA, AK-DIM, AK-BAL, AK-FX, AK-TAX, AK-DATA 422.
+#     An exception means nothing was written. 503 means a dependency (authorization, period, currency, evidence) could not answer.
+#
+#  4. REPEATS. Commands that create work (registering an accounting event, posting, allocation, consolidation and revaluation runs,
+#     staging and posting a migration batch) are idempotent: the identity of the work is in the request (the event's idempotency_key and
+#     producer ids; the run's entity, book, period and kind), and a repeat returns the earlier result with 200 where the first call
+#     returned 201. The same identity with different content is refused rather than overwritten.
+#
+#  5. NOTHING IS REWRITTEN. A posted journal, a snapshot, a seal, a migration batch's lines and every history are append-only; the database
+#     refuses an update. A mistake is corrected by a reversal, a correcting event or a correction batch, each with its own lineage. A
+#     posting into a sealed period is refused (409 AK-PERIOD).
+#
+#  6. MONEY AND DATES. Amounts are decimal strings, never floating point. Dates are YYYY-MM-DD, instants RFC 3339, periods YYYY-MM.
+#     The ledger stores two decimals; transaction amounts and rates are kept at the precision they were given.
+#
+#  7. LISTS. List operations return an object holding the list and its total, and are bounded; those that can run long take limit and
+#     after (the last ledger entry or id already seen) to page.
+
+info:
+  title: general-ledger-svc - Global Accounting Kernel
+  version: "1.0.0"
+  description: Books, accounting events, versioned posting rules, postings, dimensions, reconciliation, revaluation, snapshots, period seals, allocation, consolidation and migration for the ZoikoSuite general ledger.
+
+servers:
+  - url: http://localhost:8098
+
+security:
+  - principal: []
+
+tags:
+  - {name: accounting-books, description: "Books: one per legal entity and purpose, with their own framework, currency and calendar."}
+  - {name: accounting-events, description: "Canonical accounting events from the business domains, and how far each has been posted."}
+  - {name: accounting-postings, description: "The posting command: an event becomes a balanced journal in a book, atomically."}
+  - {name: posting-rule-sets, description: "Versioned posting rules: draft, test, approve and activate by different people."}
+  - {name: posting-rule-packs, description: "Ready-made rule packs that instantiate as draft rule sets."}
+  - {name: posting-evaluations, description: "Dry-run evaluation of a posting. Nothing is written."}
+  - {name: posting-traces, description: "The lineage of a posting: event, rule version, execution and journals."}
+  - {name: dimensions, description: "The dimension registry and its effective-dated values."}
+  - {name: dimension-values, description: "Dimension values."}
+  - {name: account-applicability, description: "Where an account may be used and how its lines are classified: books, currency, control type, dimension policy, replacement."}
+  - {name: balance-snapshots, description: "Signed balance snapshots, their verification and the trace of an account back to its sources."}
+  - {name: close-evidence, description: "What the kernel can say about whether a period of an entity is ready to close."}
+  - {name: period-seals, description: "Sealing a period at a ledger watermark, and reopening it under named authority."}
+  - {name: reconciliation-runs, description: "Reconciliation of subledgers, bank, intercompany, snapshots and event postings; breaks are governed cases."}
+  - {name: reconciliation-status, description: "The reconciliation picture of one scope for the period close."}
+  - {name: reconciliation-tolerances, description: "Versioned reconciliation thresholds."}
+  - {name: revaluation-runs, description: "Revaluation of open foreign monetary items at the closing rate."}
+  - {name: foreign-positions, description: "Open foreign monetary positions of a book."}
+  - {name: fx-rates, description: "Sourced exchange rates."}
+  - {name: fx-rate-overrides, description: "Hand-keyed rates that need a second person's approval."}
+  - {name: fx-rate-resolutions, description: "Which rate a posting would use."}
+  - {name: allocation-rules, description: "Allocation rules: spread a pool over recipients, in this entity or across entities."}
+  - {name: allocation-runs, description: "Allocation runs and their reversal."}
+  - {name: consolidation-groups, description: "Consolidation groups, members, account mappings and group adjustments."}
+  - {name: consolidation-adjustments, description: "Group policy adjustments: proposed, approved or withdrawn."}
+  - {name: consolidation-runs, description: "Consolidation runs: freeze, translate, eliminate, post the group book; certify or supersede."}
+  - {name: intercompany-pairings, description: "How the members' intercompany positions pair up."}
+  - {name: counterparty-balances, description: "Customer and supplier positions on a control type, for comparing a subledger."}
+  - {name: book-comparison, description: "The consequences of one event in each book, side by side."}
+  - {name: migration-batches, description: "Opening balances: stage, validate, approve, post inside a cutover window, reconcile and freeze."}
+  - {name: rollout-readiness, description: "Whether a tenant's reference data is ready for the kernel to post a given kind of event."}
+
+paths:
+  /v1/account-applicability/{account_code}:
+    get:
+      operationId: GetAccountScope
+      tags: [account-applicability]
+      summary: 'Reports where an account may be used and who owns it'
+      description: |
+        Reports where an account may be used and who owns it: the books it is valid in (none listed = every book),
+        its currency restriction, its control type and whether its lines need a counterparty.
+
+        Needs the authorization action(s): COA_ACCOUNT_VIEW.
+      x-authorization-actions: [COA_ACCOUNT_VIEW]
+      parameters:
+        - name: account_code
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/scopeBody'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    put:
+      operationId: SetAccountScope
+      tags: [account-applicability]
+      summary: 'Sets an account''s books, currency, control type, counterparty rule, dimension policy and replacement account'
+      description: |
+        Sets an account's books, currency, control type, counterparty rule, dimension policy and replacement account. An empty body
+        lifts every restriction.
+
+        Needs the authorization action(s): COA_ACCOUNT_AMEND.
+      x-authorization-actions: [COA_ACCOUNT_AMEND]
+      parameters:
+        - name: account_code
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/scopeBody'
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/scopeBody'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-books:
+    get:
+      operationId: ListBooks
+      tags: [accounting-books]
+      summary: 'List books'
+      description: 'Needs the authorization action(s): GL_BOOK_READ.'
+      x-authorization-actions: [GL_BOOK_READ]
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: status
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: CreateBook
+      tags: [accounting-books]
+      summary: 'Create book'
+      description: 'Needs the authorization action(s): GL_BOOK_MANAGE.'
+      x-authorization-actions: [GL_BOOK_MANAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Book'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-books/{id}:
+    get:
+      operationId: GetBook
+      tags: [accounting-books]
+      summary: 'Get book'
+      description: 'Needs the authorization action(s): GL_BOOK_READ.'
+      x-authorization-actions: [GL_BOOK_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-books/{id}/activate:
+    post:
+      operationId: bookStatus_activate
+      tags: [accounting-books]
+      summary: 'Move an accounting book to ACTIVE'
+      description: 'Needs the authorization action(s): GL_BOOK_MANAGE.'
+      x-authorization-actions: [GL_BOOK_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/versionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-books/{id}/retire:
+    post:
+      operationId: bookStatus_retire
+      tags: [accounting-books]
+      summary: 'Move an accounting book to RETIRED'
+      description: 'Needs the authorization action(s): GL_BOOK_MANAGE.'
+      x-authorization-actions: [GL_BOOK_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/versionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-books/{id}/suspend:
+    post:
+      operationId: bookStatus_suspend
+      tags: [accounting-books]
+      summary: 'Move an accounting book to SUSPENDED'
+      description: 'Needs the authorization action(s): GL_BOOK_MANAGE.'
+      x-authorization-actions: [GL_BOOK_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/versionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-events:
+    get:
+      operationId: ListEvents
+      tags: [accounting-events]
+      summary: 'List events'
+      description: 'Needs the authorization action(s): GL_EVENT_READ.'
+      x-authorization-actions: [GL_EVENT_READ]
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: event_type
+          in: query
+          required: false
+          schema: {type: string}
+        - name: source_object_id
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: RegisterEvent
+      tags: [accounting-events]
+      summary: 'Register event'
+      description: |
+        This is RegisterAccountingEvent: 201 for a new event, 200 with the original for a replay of the same event.
+
+        Needs the authorization action(s): GL_EVENT_REGISTER.
+      x-authorization-actions: [GL_EVENT_REGISTER]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountingEvent'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountingEvent'
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountingEvent'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-events/incomplete:
+    get:
+      operationId: ListIncompleteEvents
+      tags: [accounting-events]
+      summary: 'Lists the entity''s recent accounting events that are not complete across their books'
+      description: |
+        Lists the entity's recent accounting events that are not complete across their books. It looks at the most recent
+        events (scan, at most 500) and skips those registered less than min_age_minutes ago, so an event still on its way is not reported.
+
+        Needs the authorization action(s): GL_POSTING_VIEW.
+      x-authorization-actions: [GL_POSTING_VIEW]
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncompleteResult'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-events/{id}:
+    get:
+      operationId: GetEvent
+      tags: [accounting-events]
+      summary: 'Get event'
+      description: 'Needs the authorization action(s): GL_EVENT_READ.'
+      x-authorization-actions: [GL_EVENT_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountingEvent'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-events/{id}/posting-status:
+    get:
+      operationId: GetEventPostingStatus
+      tags: [accounting-events]
+      summary: 'Says how far one accounting event''s consequences have come across the books of its entity'
+      description: |
+        Says how far one accounting event's consequences have come across the books of its entity (standard §4, §37):
+        COMPLETE when every book that must carry it has posted, INCOMPLETE — naming the books still outstanding and why — until then.
+
+        Needs the authorization action(s): GL_POSTING_VIEW.
+      x-authorization-actions: [GL_POSTING_VIEW]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostingStatus'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/accounting-postings:
+    post:
+      operationId: PostEvent
+      tags: [accounting-postings]
+      summary: 'Post event'
+      description: |
+        This is the kernel's posting command: it turns an accounting event into a posted journal in one book, atomically and
+        exactly once per event, book and basis. A repeat answers 200 with the consequence that already exists.
+
+        Needs the authorization action(s): GL_POSTING_EXECUTE.
+      x-authorization-actions: [GL_POSTING_EXECUTE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostRequest'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostResult'
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostResult'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/allocation-rules:
+    get:
+      operationId: ListAllocationRules
+      tags: [allocation-rules]
+      summary: 'List allocation rules'
+      description: 'Needs the authorization action(s): GL_ALLOCATION_READ.'
+      x-authorization-actions: [GL_ALLOCATION_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: CreateAllocationRule
+      tags: [allocation-rules]
+      summary: 'Create allocation rule'
+      description: 'Needs the authorization action(s): GL_ALLOCATION_MANAGE.'
+      x-authorization-actions: [GL_ALLOCATION_MANAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllocRuleRequest'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocRule'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/allocation-rules/{id}:
+    get:
+      operationId: GetAllocationRule
+      tags: [allocation-rules]
+      summary: 'Get allocation rule'
+      description: 'Needs the authorization action(s): GL_ALLOCATION_READ.'
+      x-authorization-actions: [GL_ALLOCATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocRule'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/allocation-rules/{id}/approve:
+    post:
+      operationId: ApproveAllocationRule
+      tags: [allocation-rules]
+      summary: 'Approve allocation rule'
+      description: 'Needs the authorization action(s): GL_ALLOCATION_APPROVE.'
+      x-authorization-actions: [GL_ALLOCATION_APPROVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocRule'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/allocation-rules/{id}/retire:
+    post:
+      operationId: RetireAllocationRule
+      tags: [allocation-rules]
+      summary: 'Retire allocation rule'
+      description: 'Needs the authorization action(s): GL_ALLOCATION_APPROVE.'
+      x-authorization-actions: [GL_ALLOCATION_APPROVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocRule'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/allocation-runs:
+    get:
+      operationId: ListAllocationRuns
+      tags: [allocation-runs]
+      summary: 'List allocation runs'
+      description: 'Needs the authorization action(s): GL_ALLOCATION_READ.'
+      x-authorization-actions: [GL_ALLOCATION_READ]
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: fiscal_period
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: RunAllocation
+      tags: [allocation-runs]
+      summary: 'Spreads a period pool over the recipients of a rule'
+      description: |
+        Spreads a period pool over the recipients of a rule. One live run exists per rule, book and period.
+
+        Needs the authorization action(s): GL_ALLOCATION_RUN.
+      x-authorization-actions: [GL_ALLOCATION_RUN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllocRunRequest'
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/allocation-runs/{id}:
+    get:
+      operationId: GetAllocationRun
+      tags: [allocation-runs]
+      summary: 'Get allocation run'
+      description: 'Needs the authorization action(s): GL_ALLOCATION_READ.'
+      x-authorization-actions: [GL_ALLOCATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocRun'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/allocation-runs/{id}/reverse:
+    post:
+      operationId: ReverseAllocationRun
+      tags: [allocation-runs]
+      summary: 'Reverse allocation run'
+      description: 'Needs the authorization action(s): GL_ALLOCATION_RUN.'
+      x-authorization-actions: [GL_ALLOCATION_RUN]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocRun'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/balance-snapshots:
+    get:
+      operationId: ListBalanceSnapshots
+      tags: [balance-snapshots]
+      summary: 'List balance snapshots'
+      description: 'Needs the authorization action(s): GL_SNAPSHOT_READ.'
+      x-authorization-actions: [GL_SNAPSHOT_READ]
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: book_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: fiscal_period
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: CreateBalanceSnapshot
+      tags: [balance-snapshots]
+      summary: 'Takes, signs and retains the balances of a book'
+      description: |
+        Takes, signs and retains the balances of a book. A close snapshot is of a sealed period, at its watermark.
+
+        Needs the authorization action(s): GL_SNAPSHOT_SIGN.
+      x-authorization-actions: [GL_SNAPSHOT_SIGN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SnapshotRequest'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceSnapshot'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/balance-snapshots/{id}:
+    get:
+      operationId: GetBalanceSnapshot
+      tags: [balance-snapshots]
+      summary: 'Get balance snapshot'
+      description: 'Needs the authorization action(s): GL_SNAPSHOT_READ.'
+      x-authorization-actions: [GL_SNAPSHOT_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceSnapshot'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/balance-snapshots/{id}/trace:
+    get:
+      operationId: GetBalanceSnapshotTrace
+      tags: [balance-snapshots]
+      summary: 'Explains one account of a retained snapshot'
+      description: |
+        Explains one account of a retained snapshot (standard §31, §32): the ledger entries behind its figure, and
+        for each one the journal, accounting event, rule version and evidence it came from, with a check that they add up to the figure.
+        Reading it needs both the right to read snapshots and the right to see postings in the snapshot's entity.
+
+        Needs the authorization action(s): GL_SNAPSHOT_READ, GL_POSTING_VIEW.
+      x-authorization-actions: [GL_SNAPSHOT_READ, GL_POSTING_VIEW]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: account_code
+          in: query
+          required: false
+          schema: {type: string}
+        - name: after
+          in: query
+          required: false
+          schema: {type: integer, minimum: 0}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 0}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotTrace'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/balance-snapshots/{id}/verify:
+    post:
+      operationId: VerifyBalanceSnapshot
+      tags: [balance-snapshots]
+      summary: 'Recomputes a snapshot from the ledger at its watermark and checks its signature'
+      description: |
+        Recomputes a snapshot from the ledger at its watermark and checks its signature.
+
+        Needs the authorization action(s): GL_SNAPSHOT_READ.
+      x-authorization-actions: [GL_SNAPSHOT_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/book-comparison:
+    get:
+      operationId: GetBookComparison
+      tags: [book-comparison]
+      summary: 'Lays the consequences of one accounting event in each book side by side'
+      description: |
+        Lays the consequences of one accounting event in each book side by side.
+
+        Needs the authorization action(s): GL_POSTING_VIEW.
+      x-authorization-actions: [GL_POSTING_VIEW]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/close-evidence:
+    get:
+      operationId: GetCloseEvidence
+      tags: [close-evidence]
+      summary: 'Get close evidence'
+      description: |
+        This is what the kernel can say about whether a period of an entity is ready to close: open reconciliation cases,
+        failed postings, foreign items awaiting revaluation and journals still in the review queue, per active book, with the seal and the
+        latest signed snapshot. The period close service reads it; closing stays with that service.
+
+        Needs the authorization action(s): GL_CLOSE_EVIDENCE_READ.
+      x-authorization-actions: [GL_CLOSE_EVIDENCE_READ]
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: fiscal_period
+          in: query
+          required: false
+          schema: {type: string}
+        - name: require
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloseEvidence'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-adjustments/{id}/approve:
+    post:
+      operationId: ApproveGroupAdjustment
+      tags: [consolidation-adjustments]
+      summary: 'Approve group adjustment'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_CERTIFY.'
+      x-authorization-actions: [GL_CONSOLIDATION_CERTIFY]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-adjustments/{id}/withdraw:
+    post:
+      operationId: WithdrawGroupAdjustment
+      tags: [consolidation-adjustments]
+      summary: 'Withdraw group adjustment'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_MANAGE.'
+      x-authorization-actions: [GL_CONSOLIDATION_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-groups:
+    get:
+      operationId: ListConsolidationGroups
+      tags: [consolidation-groups]
+      summary: 'List consolidation groups'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_READ.'
+      x-authorization-actions: [GL_CONSOLIDATION_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: CreateConsolidationGroup
+      tags: [consolidation-groups]
+      summary: 'Create consolidation group'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_MANAGE.'
+      x-authorization-actions: [GL_CONSOLIDATION_MANAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupRequest'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolGroup'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-groups/{id}:
+    get:
+      operationId: GetConsolidationGroup
+      tags: [consolidation-groups]
+      summary: 'Get consolidation group'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_READ.'
+      x-authorization-actions: [GL_CONSOLIDATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolGroup'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-groups/{id}/adjustments:
+    get:
+      operationId: ListGroupAdjustments
+      tags: [consolidation-groups]
+      summary: 'List group adjustments'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_READ.'
+      x-authorization-actions: [GL_CONSOLIDATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: ProposeGroupAdjustment
+      tags: [consolidation-groups]
+      summary: 'Proposes a group policy adjustment'
+      description: |
+        Proposes a group policy adjustment: balanced, evidenced, inert until another person approves it.
+
+        Needs the authorization action(s): GL_CONSOLIDATION_MANAGE.
+      x-authorization-actions: [GL_CONSOLIDATION_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdjustmentRequest'
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-groups/{id}/mappings:
+    get:
+      operationId: ListConsolidationMappings
+      tags: [consolidation-groups]
+      summary: 'List consolidation mappings'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_READ.'
+      x-authorization-actions: [GL_CONSOLIDATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    put:
+      operationId: PutConsolidationMapping
+      tags: [consolidation-groups]
+      summary: 'Put consolidation mapping'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_MANAGE.'
+      x-authorization-actions: [GL_CONSOLIDATION_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MappingRequest'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolMapping'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-groups/{id}/members:
+    post:
+      operationId: AddConsolidationMember
+      tags: [consolidation-groups]
+      summary: 'Add consolidation member'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_MANAGE.'
+      x-authorization-actions: [GL_CONSOLIDATION_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemberRequest'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolMember'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-groups/{id}/members/{member}/end:
+    post:
+      operationId: EndConsolidationMember
+      tags: [consolidation-groups]
+      summary: 'End consolidation member'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_MANAGE.'
+      x-authorization-actions: [GL_CONSOLIDATION_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: member
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-runs:
+    get:
+      operationId: ListConsolidationRuns
+      tags: [consolidation-runs]
+      summary: 'List consolidation runs'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_READ.'
+      x-authorization-actions: [GL_CONSOLIDATION_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: RunConsolidation
+      tags: [consolidation-runs]
+      summary: 'Freezes the members'' populations, translates, eliminates and posts the group book'
+      description: |
+        Freezes the members' populations, translates, eliminates and posts the group book. One live run exists per group
+        and period: asking again returns it.
+
+        Needs the authorization action(s): GL_CONSOLIDATION_RUN.
+      x-authorization-actions: [GL_CONSOLIDATION_RUN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolRunRequest'
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-runs/{id}:
+    get:
+      operationId: GetConsolidationRun
+      tags: [consolidation-runs]
+      summary: 'Get consolidation run'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_READ.'
+      x-authorization-actions: [GL_CONSOLIDATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolRun'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-runs/{id}/certify:
+    post:
+      operationId: CertifyConsolidationRun
+      tags: [consolidation-runs]
+      summary: 'Certify consolidation run'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_CERTIFY.'
+      x-authorization-actions: [GL_CONSOLIDATION_CERTIFY]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolRun'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/consolidation-runs/{id}/supersede:
+    post:
+      operationId: SupersedeConsolidationRun
+      tags: [consolidation-runs]
+      summary: 'Supersede consolidation run'
+      description: 'Needs the authorization action(s): GL_CONSOLIDATION_CERTIFY.'
+      x-authorization-actions: [GL_CONSOLIDATION_CERTIFY]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolRun'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/counterparty-balances:
+    get:
+      operationId: GetCounterpartyBalances
+      tags: [counterparty-balances]
+      summary: 'Lists the position of each customer or supplier on a control type as of a date, for comparing a subledger...'
+      description: |
+        Lists the position of each customer or supplier on a control type as of a date, for comparing a
+        subledger with the ledger one counterparty at a time. The balance is on the control type's normal side.
+
+        Needs the authorization action(s): GL_LEDGER_QUERY.
+      x-authorization-actions: [GL_LEDGER_QUERY]
+      parameters:
+        - name: control_type
+          in: query
+          required: false
+          schema: {type: string}
+        - name: as_of
+          in: query
+          required: false
+          schema: {type: string, format: date}
+        - name: book_id
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/dimension-values:
+    get:
+      operationId: ListDimensionValues
+      tags: [dimension-values]
+      summary: 'List dimension values'
+      description: 'Needs the authorization action(s): GL_DIMENSION_READ.'
+      x-authorization-actions: [GL_DIMENSION_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/dimension-values/{id}/retire:
+    post:
+      operationId: RetireDimensionValue
+      tags: [dimension-values]
+      summary: 'Retire dimension value'
+      description: 'Needs the authorization action(s): GL_DIMENSION_MANAGE.'
+      x-authorization-actions: [GL_DIMENSION_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DimensionValue'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/dimensions:
+    get:
+      operationId: ListDimensions
+      tags: [dimensions]
+      summary: 'List dimensions'
+      description: 'Needs the authorization action(s): GL_DIMENSION_READ.'
+      x-authorization-actions: [GL_DIMENSION_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: CreateDimension
+      tags: [dimensions]
+      summary: 'Create dimension'
+      description: 'Needs the authorization action(s): GL_DIMENSION_MANAGE.'
+      x-authorization-actions: [GL_DIMENSION_MANAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/dimensionBody'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dimension'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/dimensions/{code}/values:
+    post:
+      operationId: CreateDimensionValue
+      tags: [dimensions]
+      summary: 'Create dimension value'
+      description: 'Needs the authorization action(s): GL_DIMENSION_MANAGE.'
+      x-authorization-actions: [GL_DIMENSION_MANAGE]
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DimensionValue'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DimensionValue'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/foreign-positions:
+    get:
+      operationId: GetForeignPositions
+      tags: [foreign-positions]
+      summary: 'Lists the open foreign monetary positions of a book as of a date with their carrying amounts'
+      description: |
+        Lists the open foreign monetary positions of a book as of a date with their carrying amounts: what a
+        subledger needs to state the carrying amount of an item it settles.
+
+        Needs the authorization action(s): GL_REVALUATION_READ.
+      x-authorization-actions: [GL_REVALUATION_READ]
+      parameters:
+        - name: as_of
+          in: query
+          required: false
+          schema: {type: string, format: date}
+        - name: book_id
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/fx-rate-overrides:
+    get:
+      operationId: ListFXOverrides
+      tags: [fx-rate-overrides]
+      summary: 'List FX overrides'
+      description: 'Needs the authorization action(s): GL_FX_RATE_READ.'
+      x-authorization-actions: [GL_FX_RATE_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: RequestFXOverride
+      tags: [fx-rate-overrides]
+      summary: 'Asks for a hand-keyed rate; it is not a rate until a second person approves it'
+      description: |
+        Asks for a hand-keyed rate; it is not a rate until a second person approves it.
+
+        Needs the authorization action(s): GL_FX_RATE_MANAGE.
+      x-authorization-actions: [GL_FX_RATE_MANAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/fxRateBody'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FXOverride'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/fx-rate-overrides/{id}/approve:
+    post:
+      operationId: decideFXOverride_approve
+      tags: [fx-rate-overrides]
+      summary: 'Approve a foreign-exchange rate override'
+      description: 'Needs the authorization action(s): GL_FX_RATE_APPROVE.'
+      x-authorization-actions: [GL_FX_RATE_APPROVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/decisionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/fx-rate-overrides/{id}/reject:
+    post:
+      operationId: decideFXOverride_reject
+      tags: [fx-rate-overrides]
+      summary: 'Reject a foreign-exchange rate override'
+      description: 'Needs the authorization action(s): GL_FX_RATE_APPROVE.'
+      x-authorization-actions: [GL_FX_RATE_APPROVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/decisionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/fx-rate-resolutions:
+    get:
+      operationId: ResolveFXRate
+      tags: [fx-rate-resolutions]
+      summary: 'Answers what a posting would use'
+      description: |
+        Answers what a posting would use: the rate the policy selects for a pair on a date, or the exception that says why none.
+
+        Needs the authorization action(s): GL_FX_RATE_READ.
+      x-authorization-actions: [GL_FX_RATE_READ]
+      parameters:
+        - name: date
+          in: query
+          required: false
+          schema: {type: string, format: date}
+        - name: policy_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: from
+          in: query
+          required: false
+          schema: {type: string}
+        - name: to
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FXBasis'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/fx-rates:
+    get:
+      operationId: ListFXRates
+      tags: [fx-rates]
+      summary: 'List FX rates'
+      description: 'Needs the authorization action(s): GL_FX_RATE_READ.'
+      x-authorization-actions: [GL_FX_RATE_READ]
+      parameters:
+        - name: base_currency
+          in: query
+          required: false
+          schema: {type: string}
+        - name: quote_currency
+          in: query
+          required: false
+          schema: {type: string}
+        - name: rate_type
+          in: query
+          required: false
+          schema: {type: string}
+        - name: from
+          in: query
+          required: false
+          schema: {type: string}
+        - name: to
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: IngestFXRate
+      tags: [fx-rates]
+      summary: 'Stores a sourced exchange rate'
+      description: |
+        Stores a sourced exchange rate. A rate is never edited: the same source reference again returns the stored rate,
+        and a different rate under it is refused.
+
+        Needs the authorization action(s): GL_FX_RATE_MANAGE.
+      x-authorization-actions: [GL_FX_RATE_MANAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/fxRateBody'
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/intercompany-pairings:
+    get:
+      operationId: GetIntercompanyPairing
+      tags: [intercompany-pairings]
+      summary: 'Reports how the members'' intercompany positions pair up'
+      description: |
+        Reports how the members' intercompany positions pair up (matched, amount difference, currency difference,
+        unmatched) from the live ledgers, without freezing anything.
+
+        Needs the authorization action(s): GL_CONSOLIDATION_READ.
+      x-authorization-actions: [GL_CONSOLIDATION_READ]
+      parameters:
+        - name: group_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: fiscal_period
+          in: query
+          required: false
+          schema: {type: string}
+        - name: as_of
+          in: query
+          required: false
+          schema: {type: string, format: date}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches:
+    get:
+      operationId: ListMigrationBatches
+      tags: [migration-batches]
+      summary: 'List migration batches'
+      description: 'Needs the authorization action(s): GL_MIGRATION_READ.'
+      x-authorization-actions: [GL_MIGRATION_READ]
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: status
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: StageMigrationBatch
+      tags: [migration-batches]
+      summary: 'Stages a batch of opening lines from a source extract'
+      description: |
+        Stages a batch of opening lines from a source extract. POST /v1/migration-batches
+
+        Needs the authorization action(s): GL_MIGRATION_STAGE.
+      x-authorization-actions: [GL_MIGRATION_STAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StageRequest'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationBatch'
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationBatch'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}:
+    get:
+      operationId: GetMigrationBatch
+      tags: [migration-batches]
+      summary: 'Get migration batch'
+      description: 'Needs the authorization action(s): GL_MIGRATION_READ.'
+      x-authorization-actions: [GL_MIGRATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationBatch'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}/approve:
+    post:
+      operationId: ApproveMigrationBatch
+      tags: [migration-batches]
+      summary: 'Records the migration authority and the cutover window'
+      description: |
+        Records the migration authority and the cutover window. Someone other than the person who staged it.
+
+        Needs the authorization action(s): GL_MIGRATION_APPROVE.
+      x-authorization-actions: [GL_MIGRATION_APPROVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/migrationApproveBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationBatch'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}/cancel:
+    post:
+      operationId: CancelMigrationBatch
+      tags: [migration-batches]
+      summary: 'Cancel migration batch'
+      description: 'Needs the authorization action(s): GL_MIGRATION_STAGE.'
+      x-authorization-actions: [GL_MIGRATION_STAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationBatch'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}/evidence:
+    get:
+      operationId: GetMigrationEvidence
+      tags: [migration-batches]
+      summary: 'Returns the batch with its history and whether its hashes still verify against what is stored'
+      description: |
+        Returns the batch with its history and whether its hashes still verify against what is stored.
+
+        Needs the authorization action(s): GL_MIGRATION_READ.
+      x-authorization-actions: [GL_MIGRATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationEvidence'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}/lines:
+    get:
+      operationId: ListMigrationLines
+      tags: [migration-batches]
+      summary: 'Pages through the staged lines'
+      description: |
+        Pages through the staged lines. GET /v1/migration-batches/{id}/lines?offset=&limit=
+
+        Needs the authorization action(s): GL_MIGRATION_READ.
+      x-authorization-actions: [GL_MIGRATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}/post:
+    post:
+      operationId: PostMigrationBatch
+      tags: [migration-batches]
+      summary: 'Posts an approved batch as one OPENING journal inside its cutover window'
+      description: |
+        Posts an approved batch as one OPENING journal inside its cutover window.
+
+        Needs the authorization action(s): GL_MIGRATION_POST.
+      x-authorization-actions: [GL_MIGRATION_POST]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationBatch'
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationBatch'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}/preview:
+    get:
+      operationId: PreviewMigrationBatch
+      tags: [migration-batches]
+      summary: 'Preview migration batch'
+      description: |
+        This is the migration reconciliation a human reads before anything posts. It writes nothing.
+
+        Needs the authorization action(s): GL_MIGRATION_READ.
+      x-authorization-actions: [GL_MIGRATION_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationPreview'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}/reconcile:
+    post:
+      operationId: ReconcileMigrationBatch
+      tags: [migration-batches]
+      summary: 'Compares the posted opening journal with the source and the subledgers; a match freezes the evidence'
+      description: |
+        Compares the posted opening journal with the source and the subledgers; a match freezes the evidence.
+
+        Needs the authorization action(s): GL_MIGRATION_RECONCILE.
+      x-authorization-actions: [GL_MIGRATION_RECONCILE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationBatch'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/migration-batches/{id}/validate:
+    post:
+      operationId: ValidateMigrationBatch
+      tags: [migration-batches]
+      summary: 'Checks the batch and records the report; a clean one becomes VALIDATED'
+      description: |
+        Checks the batch and records the report; a clean one becomes VALIDATED.
+
+        Needs the authorization action(s): GL_MIGRATION_STAGE.
+      x-authorization-actions: [GL_MIGRATION_STAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/period-seals:
+    get:
+      operationId: ListPeriodSeals
+      tags: [period-seals]
+      summary: 'List period seals'
+      description: 'Needs the authorization action(s): GL_PERIOD_READ.'
+      x-authorization-actions: [GL_PERIOD_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: ApplyPeriodSeal
+      tags: [period-seals]
+      summary: 'Seals a period (hard close), reopens it under named authority, or seals it again after the reopen'
+      description: |
+        Seals a period (hard close), reopens it under named authority, or seals it again after the reopen. Once sealed,
+        no posting transaction writes into the period; the period close service calls this as part of its own state change.
+
+        Needs the authorization action(s): GL_PERIOD_SEAL, GL_PERIOD_REOPEN.
+      x-authorization-actions: [GL_PERIOD_SEAL, GL_PERIOD_REOPEN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/sealBody'
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/period-seals/{entity}/{period}:
+    get:
+      operationId: GetPeriodSeal
+      tags: [period-seals]
+      summary: 'Get period seal'
+      description: 'Needs the authorization action(s): GL_PERIOD_READ.'
+      x-authorization-actions: [GL_PERIOD_READ]
+      parameters:
+        - name: entity
+          in: path
+          required: true
+          schema: {type: string}
+        - name: period
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-evaluations:
+    post:
+      operationId: Evaluate
+      tags: [posting-evaluations]
+      summary: 'Evaluate a posting (dry run, nothing is written)'
+      description: |
+        This is EvaluatePosting: a dry-run journal proposal with its rule provenance. Nothing is written.
+
+        Needs the authorization action(s): GL_POSTING_EVALUATE.
+      x-authorization-actions: [GL_POSTING_EVALUATE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvaluateRequest'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Proposal'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-packs:
+    get:
+      operationId: ListRulePacks
+      tags: [posting-rule-packs]
+      summary: 'List rule packs'
+      description: 'Needs the authorization action(s): GL_RULE_READ.'
+      x-authorization-actions: [GL_RULE_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-packs/{name}/instantiate:
+    post:
+      operationId: InstantiateRulePack
+      tags: [posting-rule-packs]
+      summary: 'Creates a pack''s rules as DRAFT rule sets'
+      description: |
+        Creates a pack's rules as DRAFT rule sets. They still need testing, approval by another person and
+        activation by a third before anything posts: a pack is a starting point, not a shortcut around governance.
+
+        Needs the authorization action(s): GL_RULE_MANAGE.
+      x-authorization-actions: [GL_RULE_MANAGE]
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/instantiateBody'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-sets:
+    get:
+      operationId: ListRuleSets
+      tags: [posting-rule-sets]
+      summary: 'List rule sets'
+      description: 'Needs the authorization action(s): GL_RULE_READ.'
+      x-authorization-actions: [GL_RULE_READ]
+      parameters:
+        - name: event_type
+          in: query
+          required: false
+          schema: {type: string}
+        - name: status
+          in: query
+          required: false
+          schema: {type: string}
+        - name: name
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: CreateRuleSet
+      tags: [posting-rule-sets]
+      summary: 'Create rule set'
+      description: 'Needs the authorization action(s): GL_RULE_MANAGE.'
+      x-authorization-actions: [GL_RULE_MANAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleSet'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-sets/{id}:
+    get:
+      operationId: GetRuleSet
+      tags: [posting-rule-sets]
+      summary: 'Get rule set'
+      description: 'Needs the authorization action(s): GL_RULE_READ.'
+      x-authorization-actions: [GL_RULE_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-sets/{id}/activate:
+    post:
+      operationId: ActivateRuleSet
+      tags: [posting-rule-sets]
+      summary: 'Activate rule set'
+      description: 'Needs the authorization action(s): GL_RULE_ACTIVATE.'
+      x-authorization-actions: [GL_RULE_ACTIVATE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/versionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-sets/{id}/approve:
+    post:
+      operationId: ApproveRuleSet
+      tags: [posting-rule-sets]
+      summary: 'Approve rule set'
+      description: 'Needs the authorization action(s): GL_RULE_APPROVE.'
+      x-authorization-actions: [GL_RULE_APPROVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/versionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-sets/{id}/events:
+    get:
+      operationId: RuleSetEvents
+      tags: [posting-rule-sets]
+      summary: 'Rule set events'
+      description: 'Needs the authorization action(s): GL_RULE_READ.'
+      x-authorization-actions: [GL_RULE_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-sets/{id}/retire:
+    post:
+      operationId: RetireRuleSet
+      tags: [posting-rule-sets]
+      summary: 'Retire rule set'
+      description: 'Needs the authorization action(s): GL_RULE_ACTIVATE.'
+      x-authorization-actions: [GL_RULE_ACTIVATE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/versionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-sets/{id}/return-to-draft:
+    post:
+      operationId: ReturnToDraft
+      tags: [posting-rule-sets]
+      summary: 'Return to draft'
+      description: 'Needs the authorization action(s): GL_RULE_MANAGE.'
+      x-authorization-actions: [GL_RULE_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/versionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-rule-sets/{id}/test:
+    post:
+      operationId: TestRuleSet
+      tags: [posting-rule-sets]
+      summary: 'Runs the rule set''s regression pack through the engine'
+      description: |
+        Runs the rule set's regression pack through the engine. 200 when it passed, 422 with the failed cases
+        when it did not (the rule set stays a draft).
+
+        Needs the authorization action(s): GL_RULE_MANAGE.
+      x-authorization-actions: [GL_RULE_MANAGE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/versionBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuleSet'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/posting-traces:
+    get:
+      operationId: GetPostingTrace
+      tags: [posting-traces]
+      summary: 'Get posting trace'
+      description: |
+        This is the lineage of a posting (standard §32): by journal, accounting event or posting execution.
+
+        Needs the authorization action(s): GL_POSTING_VIEW.
+      x-authorization-actions: [GL_POSTING_VIEW]
+      parameters:
+        - name: journal_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: accounting_event_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: posting_execution_id
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trace'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/reconciliation-runs:
+    get:
+      operationId: ListReconciliationRuns
+      tags: [reconciliation-runs]
+      summary: 'List reconciliation runs'
+      description: 'Needs the authorization action(s): GL_RECON_READ.'
+      x-authorization-actions: [GL_RECON_READ]
+      parameters:
+        - name: reconciliation_type
+          in: query
+          required: false
+          schema: {type: string}
+        - name: status
+          in: query
+          required: false
+          schema: {type: string}
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: book_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: fiscal_period
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: RunReconciliation
+      tags: [reconciliation-runs]
+      summary: 'Run reconciliation'
+      description: 'Needs the authorization action(s): GL_RECON_RUN.'
+      x-authorization-actions: [GL_RECON_RUN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunRequest'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/reconciliation-runs/{id}:
+    get:
+      operationId: GetReconciliationRun
+      tags: [reconciliation-runs]
+      summary: 'Get reconciliation run'
+      description: 'Needs the authorization action(s): GL_RECON_READ.'
+      x-authorization-actions: [GL_RECON_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/reconciliation-runs/{id}/accept:
+    post:
+      operationId: AcceptReconciliationRun
+      tags: [reconciliation-runs]
+      summary: 'Accept reconciliation run'
+      description: 'Needs the authorization action(s): GL_RECON_APPROVE.'
+      x-authorization-actions: [GL_RECON_APPROVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/acceptBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconRun'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/reconciliation-runs/{id}/assign:
+    post:
+      operationId: AssignReconciliationRun
+      tags: [reconciliation-runs]
+      summary: 'Assign reconciliation run'
+      description: 'Needs the authorization action(s): GL_RECON_RESOLVE.'
+      x-authorization-actions: [GL_RECON_RESOLVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/assignBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconRun'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/reconciliation-runs/{id}/resolve:
+    post:
+      operationId: ResolveReconciliationRun
+      tags: [reconciliation-runs]
+      summary: 'Resolve reconciliation run'
+      description: 'Needs the authorization action(s): GL_RECON_RESOLVE.'
+      x-authorization-actions: [GL_RECON_RESOLVE]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/resolveBody'
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconRun'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/reconciliation-runs/{id}/verify:
+    post:
+      operationId: VerifyReconciliationRun
+      tags: [reconciliation-runs]
+      summary: 'Verify reconciliation run'
+      description: 'Needs the authorization action(s): GL_RECON_READ.'
+      x-authorization-actions: [GL_RECON_READ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        '200':
+          description: Done, or the earlier result of the same request.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/reconciliation-status:
+    get:
+      operationId: GetReconciliationStatus
+      tags: [reconciliation-status]
+      summary: 'Get reconciliation status'
+      description: |
+        This is the reconciliation picture of one scope for the period-close gate: open cases, failed postings and
+        which required reconciliations have not been run.
+
+        Needs the authorization action(s): GL_RECON_READ.
+      x-authorization-actions: [GL_RECON_READ]
+      parameters:
+        - name: book_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: fiscal_period
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseStatus'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/reconciliation-tolerances:
+    get:
+      operationId: ListReconciliationTolerances
+      tags: [reconciliation-tolerances]
+      summary: 'List reconciliation tolerances'
+      description: 'Needs the authorization action(s): GL_RECON_READ.'
+      x-authorization-actions: [GL_RECON_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: CreateReconciliationTolerance
+      tags: [reconciliation-tolerances]
+      summary: 'Create reconciliation tolerance'
+      description: 'Needs the authorization action(s): GL_RECON_TOLERANCE_MANAGE.'
+      x-authorization-actions: [GL_RECON_TOLERANCE_MANAGE]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/toleranceBody'
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tolerance'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/revaluation-runs:
+    get:
+      operationId: ListRevaluationRuns
+      tags: [revaluation-runs]
+      summary: 'Lists the revaluation runs of the tenant, optionally for one entity'
+      description: |
+        Lists the revaluation runs of the tenant, optionally for one entity.
+
+        Needs the authorization action(s): GL_REVALUATION_READ.
+      x-authorization-actions: [GL_REVALUATION_READ]
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: RunRevaluation
+      tags: [revaluation-runs]
+      summary: 'Values the open foreign monetary items of a book at the closing rate and posts the unrealized difference,...'
+      description: |
+        Values the open foreign monetary items of a book at the closing rate and posts the unrealized difference, with its
+        reversal on the first day of the next period. One run exists per entity, book and period: asking again returns it.
+
+        Needs the authorization action(s): GL_REVALUATION_RUN.
+      x-authorization-actions: [GL_REVALUATION_RUN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevalRequest'
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/rollout-readiness:
+    get:
+      operationId: GetRolloutReadiness
+      tags: [rollout-readiness]
+      summary: 'Reports whether the rules a tenant is about to run'
+      description: |
+        Reports whether the rules a tenant is about to run (a named standard pack, or every ACTIVE rule set)
+        can resolve everything they name: account mapping keys, the accounts behind them and the dimensions they require. It is
+        read-only. GET /v1/rollout-readiness?pack=<name>&on=YYYY-MM-DD
+
+        Needs the authorization action(s): GL_RULE_READ.
+      x-authorization-actions: [GL_RULE_READ]
+      parameters:
+        - name: on
+          in: query
+          required: false
+          schema: {type: string}
+        - name: pack
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema: {type: object}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
+components:
+  parameters: {}
+  responses:
+    BadRequest:
+      description: The request is malformed, or a mandatory field or query parameter is missing or invalid.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    Unauthenticated:
+      description: The caller's identity or tenant scope is missing (identity_missing, tenant_scope_missing).
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    Forbidden:
+      description: The caller does not hold the authorization action the operation needs, or the family of the exception is AK-AUTH (a cross-entity or segregation-of-duties refusal).
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    NotFound:
+      description: The record does not exist for the tenant. Another tenant's record is indistinguishable from none.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    Conflict:
+      description: The request conflicts with the state of the record, with a closed or sealed period (AK-PERIOD), with a duplicate (AK-DUP) or with a concurrent change (AK-CONC).
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    Unprocessable:
+      description: A deterministic accounting exception (AK-RULE, AK-COA, AK-DIM, AK-BAL, AK-FX, AK-TAX, AK-DATA). Nothing was written; the body says which control refused and why.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    Unavailable:
+      description: A dependency the operation cannot proceed without is unavailable (authorization, period, currency or evidence service; AK-EXT). The operation fails closed and can be retried.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+  schemas:
+    Problem:
+      type: object
+      description: The body of every failure.
+      properties:
+        error: {type: string, description: 'A stable machine-readable code, lower-case. Accounting exceptions are family_code, for example ak-dim_dimension_missing.'}
+        family: {type: string, description: 'The exception family: AK-AUTH, AK-PERIOD, AK-RULE, AK-COA, AK-DIM, AK-BAL, AK-FX, AK-TAX, AK-DUP, AK-CONC, AK-EXT or AK-DATA.'}
+        code: {type: string}
+        detail: {type: string}
+        facts: {type: object, additionalProperties: {}}
+    scopeBody:
+      type: object
+      properties:
+        book_ids:
+          type: array
+          items:
+            type: string
+        currency_restriction:
+          type: string
+        control_type:
+          type: string
+        counterparty_required:
+          type: boolean
+        direct_posting_restricted:
+          type: boolean
+        dimension_policy:
+          type: object
+          additionalProperties:
+            type: string
+        replacement_account:
+          type: string
+    Book:
+      type: object
+      properties:
+        book_id:
+          type: string
+        tenant_id:
+          type: string
+        legal_entity_id:
+          type: string
+        book_code:
+          type: string
+        book_type:
+          type: string
+        accounting_framework_id:
+          type: string
+        jurisdiction:
+          type: string
+        functional_currency:
+          type: string
+        fiscal_calendar_id:
+          type: string
+        chart_of_accounts_id:
+          type: string
+        default_ledger_id:
+          type: string
+        effective_from:
+          type: string
+          format: date-time
+        effective_to:
+          type: string
+          format: date-time
+        status:
+          type: string
+        created_by:
+          type: string
+        version:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    versionBody:
+      type: object
+      properties:
+        expected_version:
+          type: integer
+        book_id:
+          type: string
+        reason:
+          type: string
+    AccountingEvent:
+      type: object
+      properties:
+        accounting_event_id:
+          type: string
+        tenant_id:
+          type: string
+        event_type:
+          type: string
+        event_version:
+          type: integer
+        legal_entity_id:
+          type: string
+        source_system:
+          type: string
+        source_object_type:
+          type: string
+        source_object_id:
+          type: string
+        source_event_id:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        effective_at:
+          type: string
+          format: date-time
+        document_date:
+          type: string
+          format: date-time
+        posting_date_requested:
+          type: string
+          format: date-time
+        transaction_currency:
+          type: string
+        facts:
+          type: object
+          additionalProperties:
+            type: string
+        counterparty_id:
+          type: string
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        evidence_refs:
+          type: array
+          items:
+            type: string
+        idempotency_key:
+          type: string
+        correlation_id:
+          type: string
+        causation_id:
+          type: string
+        supersedes_event_id:
+          type: string
+        payload_hash:
+          type: string
+        registered_by:
+          type: string
+        registered_at:
+          type: string
+          format: date-time
+    IncompleteResult:
+      type: object
+      properties:
+        events_scanned:
+          type: integer
+        incomplete_events:
+          type: array
+          items:
+            $ref: '#/components/schemas/PostingStatus'
+    PostingStatus:
+      type: object
+      properties:
+        accounting_event_id:
+          type: string
+        event_type:
+          type: string
+        legal_entity_id:
+          type: string
+        registered_at:
+          type: string
+          format: date-time
+        status:
+          type: string
+        required_books:
+          type: integer
+        posted_books:
+          type: integer
+        books:
+          type: array
+          items:
+            $ref: '#/components/schemas/BookOutcome'
+        outstanding_book_codes:
+          type: array
+          items:
+            type: string
+    PostRequest:
+      type: object
+      properties:
+        accounting_event_id:
+          type: string
+        book_id:
+          type: string
+        posting_date:
+          type: string
+          format: date-time
+        posting_basis:
+          type: string
+        description:
+          type: string
+        fx_basis:
+          $ref: '#/components/schemas/FXBasis'
+        override_soft_close:
+          type: boolean
+        soft_close_override_reason:
+          type: string
+    PostResult:
+      type: object
+      properties:
+        existing:
+          type: boolean
+        accounting_event_id:
+          type: string
+        book_id:
+          type: string
+        posting_basis:
+          type: string
+        posting_execution_id:
+          type: string
+        journal_id:
+          type: string
+        journal_number:
+          type: string
+        posting_rule_set_id:
+          type: string
+        rule_version:
+          type: string
+        proposal_hash:
+          type: string
+        ledger_watermark:
+          type: integer
+        posted_at:
+          type: string
+          format: date-time
+    AllocRuleRequest:
+      type: object
+      properties:
+        rule_code:
+          type: string
+        effective_from:
+          type: string
+        content:
+          $ref: '#/components/schemas/AllocContent'
+    AllocRule:
+      type: object
+      properties:
+        allocation_rule_id:
+          type: string
+        rule_code:
+          type: string
+        version:
+          type: integer
+        status:
+          type: string
+        content:
+          $ref: '#/components/schemas/AllocContent'
+        content_hash:
+          type: string
+        effective_from:
+          type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        approved_by:
+          type: string
+        approved_at:
+          type: string
+          format: date-time
+        retired_by:
+          type: string
+        retired_at:
+          type: string
+          format: date-time
+    AllocRunRequest:
+      type: object
+      properties:
+        allocation_rule_id:
+          type: string
+        book_id:
+          type: string
+        fiscal_period:
+          type: string
+        as_of:
+          type: string
+        drivers:
+          type: object
+          additionalProperties:
+            type: string
+        driver_ref:
+          type: string
+    AllocRun:
+      type: object
+      properties:
+        allocation_run_id:
+          type: string
+        allocation_rule_id:
+          type: string
+        legal_entity_id:
+          type: string
+        accounting_book_id:
+          type: string
+        fiscal_period:
+          type: string
+        status:
+          type: string
+        ledger_watermark:
+          type: integer
+        pool_amount:
+          type: string
+        population:
+          $ref: '#/components/schemas/AllocPopulation'
+        journal_id:
+          type: string
+        journal_number:
+          type: string
+        reversal_journal_id:
+          type: string
+        reversal_journal_number:
+          type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        reversed_by:
+          type: string
+        reversed_at:
+          type: string
+          format: date-time
+        reversal_reason:
+          type: string
+        existing:
+          type: boolean
+        remote_journals:
+          type: array
+          items:
+            $ref: '#/components/schemas/AllocRemoteJournal'
+    SnapshotRequest:
+      type: object
+      properties:
+        book_id:
+          type: string
+        fiscal_period:
+          type: string
+        as_of:
+          type: string
+        purpose:
+          type: string
+    BalanceSnapshot:
+      type: object
+      properties:
+        snapshot_id:
+          type: string
+        legal_entity_id:
+          type: string
+        accounting_book_id:
+          type: string
+        fiscal_period:
+          type: string
+        as_of:
+          type: string
+        purpose:
+          type: string
+        ledger_watermark:
+          type: integer
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotLine'
+        account_count:
+          type: integer
+        total_debit:
+          type: string
+        total_credit:
+          type: string
+        content_hash:
+          type: string
+        signature:
+          type: string
+        key_id:
+          type: string
+        signed_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    SnapshotTrace:
+      type: object
+      properties:
+        snapshot_id:
+          type: string
+        legal_entity_id:
+          type: string
+        accounting_book_id:
+          type: string
+        book_code:
+          type: string
+        fiscal_period:
+          type: string
+        as_of:
+          type: string
+        ledger_watermark:
+          type: integer
+        content_hash:
+          type: string
+        account_code:
+          type: string
+        snapshot_figure:
+          $ref: '#/components/schemas/SnapshotLine'
+        traced_total:
+          $ref: '#/components/schemas/TraceTotals'
+        reconciles:
+          type: boolean
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotTraceEntry'
+        next_after:
+          type: integer
+    CloseEvidence:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        fiscal_period:
+          type: string
+        ready:
+          type: boolean
+        blocking_issues:
+          type: array
+          items:
+            type: string
+        books:
+          type: array
+          items:
+            $ref: '#/components/schemas/BookEvidence'
+        seal:
+          $ref: '#/components/schemas/PeriodSeal'
+        incomplete_events:
+          $ref: '#/components/schemas/PeriodIncomplete'
+    GroupRequest:
+      type: object
+      properties:
+        group_code:
+          type: string
+        group_name:
+          type: string
+        parent_entity_id:
+          type: string
+        group_book_id:
+          type: string
+        presentation_currency:
+          type: string
+        ic_tolerance:
+          type: string
+    ConsolGroup:
+      type: object
+      properties:
+        group_id:
+          type: string
+        group_code:
+          type: string
+        group_name:
+          type: string
+        parent_entity_id:
+          type: string
+        group_book_id:
+          type: string
+        presentation_currency:
+          type: string
+        ic_tolerance:
+          type: string
+        status:
+          type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConsolMember'
+    AdjustmentRequest:
+      type: object
+      properties:
+        group_id:
+          type: string
+        fiscal_period:
+          type: string
+        description:
+          type: string
+        policy_ref:
+          type: string
+        evidence_ref:
+          type: string
+        source_ref:
+          type: string
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdjustmentLine'
+    MappingRequest:
+      type: object
+      properties:
+        account_map:
+          type: object
+          additionalProperties:
+            type: string
+        ic_roles:
+          type: object
+          additionalProperties:
+            type: string
+    ConsolMapping:
+      type: object
+      properties:
+        group_id:
+          type: string
+        version:
+          type: integer
+        status:
+          type: string
+        account_map:
+          type: object
+          additionalProperties:
+            type: string
+        ic_roles:
+          type: object
+          additionalProperties:
+            type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    MemberRequest:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        source_book_id:
+          type: string
+        ownership_pct:
+          type: string
+        method:
+          type: string
+        effective_from:
+          type: string
+        investment_account:
+          type: string
+        investor_entity_id:
+          type: string
+        equity_accounts:
+          type: array
+          items:
+            type: string
+        equity_rate_date:
+          type: string
+    ConsolMember:
+      type: object
+      properties:
+        member_id:
+          type: string
+        group_id:
+          type: string
+        legal_entity_id:
+          type: string
+        source_book_id:
+          type: string
+        method:
+          type: string
+        ownership_pct:
+          type: string
+        effective_from:
+          type: string
+        effective_to:
+          type: string
+        investment_account:
+          type: string
+        investor_entity_id:
+          type: string
+        equity_accounts:
+          type: array
+          items:
+            type: string
+        equity_rate_date:
+          type: string
+    ConsolRunRequest:
+      type: object
+      properties:
+        group_id:
+          type: string
+        fiscal_period:
+          type: string
+        as_of:
+          type: string
+        allow_unsealed:
+          type: boolean
+        balance_sheet_policy:
+          type: string
+        profit_loss_policy:
+          type: string
+    ConsolRun:
+      type: object
+      properties:
+        consolidation_run_id:
+          type: string
+        group_id:
+          type: string
+        fiscal_period:
+          type: string
+        as_of:
+          type: string
+        status:
+          type: string
+        mapping_version:
+          type: integer
+        prior_run_id:
+          type: string
+        population:
+          $ref: '#/components/schemas/ConsolPopulation'
+        blocking_count:
+          type: integer
+        translation_journal_id:
+          type: string
+        translation_journal_number:
+          type: string
+        elimination_journal_id:
+          type: string
+        elimination_journal_number:
+          type: string
+        adjustment_journal_id:
+          type: string
+        adjustment_journal_number:
+          type: string
+        group_snapshot_id:
+          type: string
+        run_hash:
+          type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        certified_by:
+          type: string
+        certified_at:
+          type: string
+          format: date-time
+        superseded_by:
+          type: string
+        superseded_at:
+          type: string
+          format: date-time
+        supersede_reason:
+          type: string
+        existing:
+          type: boolean
+    DimensionValue:
+      type: object
+      properties:
+        value_id:
+          type: string
+        dimension_code:
+          type: string
+        value_code:
+          type: string
+        name:
+          type: string
+        legal_entity_id:
+          type: string
+        parent_value_code:
+          type: string
+        valid_from:
+          type: string
+          format: date-time
+        valid_to:
+          type: string
+          format: date-time
+        status:
+          type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    dimensionBody:
+      type: object
+      properties:
+        dimension_code:
+          type: string
+        name:
+          type: string
+    Dimension:
+      type: object
+      properties:
+        dimension_code:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    fxRateBody:
+      type: object
+      properties:
+        base_currency:
+          type: string
+        quote_currency:
+          type: string
+        rate:
+          type: string
+        rate_type:
+          type: string
+        effective_at:
+          type: string
+        rate_date:
+          type: string
+        source:
+          type: string
+        source_rate_id:
+          type: string
+        reason:
+          type: string
+    FXOverride:
+      type: object
+      properties:
+        request_id:
+          type: string
+        base_currency:
+          type: string
+        quote_currency:
+          type: string
+        rate:
+          type: string
+        rate_type:
+          type: string
+        effective_at:
+          type: string
+          format: date-time
+        rate_date:
+          type: string
+        source:
+          type: string
+        source_rate_id:
+          type: string
+        reason:
+          type: string
+        requested_by:
+          type: string
+        requested_at:
+          type: string
+          format: date-time
+        status:
+          type: string
+        decided_by:
+          type: string
+        decided_at:
+          type: string
+          format: date-time
+        decision_note:
+          type: string
+        fx_rate_id:
+          type: string
+    decisionBody:
+      type: object
+      properties:
+        note:
+          type: string
+    FXBasis:
+      type: object
+      properties:
+        rate:
+          type: string
+        rate_type:
+          type: string
+        source:
+          type: string
+        as_of:
+          type: string
+        rate_id:
+          type: string
+    StageRequest:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        book_id:
+          type: string
+        batch_code:
+          type: string
+        batch_kind:
+          type: string
+        corrects_batch_id:
+          type: string
+        cutover_date:
+          type: string
+        source_system:
+          type: string
+        source_extract_ref:
+          type: string
+        source_extract_hash:
+          type: string
+        mapping_ref:
+          type: string
+        source_totals:
+          $ref: '#/components/schemas/MigrationTotals'
+        control_totals:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ControlTotal'
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/MigrationLineInput'
+    MigrationBatch:
+      type: object
+      properties:
+        batch_id:
+          type: string
+        legal_entity_id:
+          type: string
+        accounting_book_id:
+          type: string
+        batch_code:
+          type: string
+        batch_kind:
+          type: string
+        corrects_batch_id:
+          type: string
+        cutover_date:
+          type: string
+        currency:
+          type: string
+        source_system:
+          type: string
+        source_extract_ref:
+          type: string
+        source_extract_hash:
+          type: string
+        mapping_ref:
+          type: string
+        source_totals:
+          $ref: '#/components/schemas/MigrationTotals'
+        control_totals:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ControlTotal'
+        line_count:
+          type: integer
+        total_debit:
+          type: string
+        total_credit:
+          type: string
+        lines_hash:
+          type: string
+        status:
+          type: string
+        validation_report:
+          $ref: '#/components/schemas/MigrationReport'
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        validated_by:
+          type: string
+        validated_at:
+          type: string
+          format: date-time
+        approved_by:
+          type: string
+        approved_at:
+          type: string
+          format: date-time
+        authority_ref:
+          type: string
+        window_start:
+          type: string
+          format: date-time
+        window_end:
+          type: string
+          format: date-time
+        journal_id:
+          type: string
+        journal_number:
+          type: string
+        posted_by:
+          type: string
+        posted_at:
+          type: string
+          format: date-time
+        reconciliation:
+          $ref: '#/components/schemas/MigrationReconciliation'
+        reconciled_by:
+          type: string
+        reconciled_at:
+          type: string
+          format: date-time
+        evidence_hash:
+          type: string
+        cancelled_by:
+          type: string
+        cancelled_at:
+          type: string
+          format: date-time
+        cancel_reason:
+          type: string
+        existing:
+          type: boolean
+    migrationApproveBody:
+      type: object
+      properties:
+        authority_ref:
+          type: string
+        window_start:
+          type: string
+          format: date-time
+        window_end:
+          type: string
+          format: date-time
+    MigrationEvidence:
+      type: object
+      properties:
+        batch:
+          $ref: '#/components/schemas/MigrationBatch'
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/MigrationEvent'
+        lines_verified:
+          type: boolean
+        evidence_verified:
+          type: boolean
+    MigrationPreview:
+      type: object
+      properties:
+        batch:
+          $ref: '#/components/schemas/MigrationBatch'
+        analysis:
+          $ref: '#/components/schemas/MigrationAnalysis'
+        ready_to_approve:
+          type: boolean
+    sealBody:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        fiscal_period:
+          type: string
+        action:
+          type: string
+        authority_ref:
+          type: string
+        reason:
+          type: string
+    EvaluateRequest:
+      type: object
+      properties:
+        accounting_event_id:
+          type: string
+        book_id:
+          type: string
+        posting_date:
+          type: string
+          format: date-time
+        fx_basis:
+          $ref: '#/components/schemas/FXBasis'
+    Proposal:
+      type: object
+      properties:
+        accounting_event_id:
+          type: string
+        event_payload_hash:
+          type: string
+        book_id:
+          type: string
+        legal_entity_id:
+          type: string
+        posting_date:
+          type: string
+        transaction_currency:
+          type: string
+        functional_currency:
+          type: string
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProposalLine'
+        total_debit_transaction:
+          type: string
+        total_credit_transaction:
+          type: string
+        total_debit_functional:
+          type: string
+        total_credit_functional:
+          type: string
+        fx_basis:
+          $ref: '#/components/schemas/FXBasis'
+        rounding_policy_id:
+          type: string
+        rounding_mode:
+          type: string
+        provenance:
+          $ref: '#/components/schemas/Provenance'
+        trace:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceStep'
+        proposal_hash:
+          type: string
+    instantiateBody:
+      type: object
+      properties:
+        version:
+          type: string
+        effective_from:
+          type: string
+        book_type:
+          type: string
+        accounting_framework_id:
+          type: string
+    RuleSet:
+      type: object
+      properties:
+        posting_rule_set_id:
+          type: string
+        tenant_id:
+          type: string
+        name:
+          type: string
+        domain:
+          type: string
+        event_type:
+          type: string
+        book_type:
+          type: string
+        accounting_framework_id:
+          type: string
+        jurisdiction:
+          type: string
+        version:
+          type: string
+        status:
+          type: string
+        effective_from:
+          type: string
+          format: date-time
+        effective_to:
+          type: string
+          format: date-time
+        content:
+          $ref: '#/components/schemas/RuleContent'
+        content_hash:
+          type: string
+        test_pack:
+          type: array
+          items:
+            $ref: '#/components/schemas/TestCase'
+        test_pack_id:
+          type: string
+        tests_passed_hash:
+          type: string
+        source_authority_refs:
+          type: array
+          items:
+            type: string
+        created_by:
+          type: string
+        approved_by:
+          type: string
+        approved_at:
+          type: string
+          format: date-time
+        activated_by:
+          type: string
+        activated_at:
+          type: string
+          format: date-time
+        row_version:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Trace:
+      type: object
+      properties:
+        accounting_event:
+          $ref: '#/components/schemas/AccountingEvent'
+        superseded_by_event_ids:
+          type: array
+          items:
+            type: string
+        postings:
+          type: array
+          items:
+            $ref: '#/components/schemas/TracePosting'
+    RunRequest:
+      type: object
+      properties:
+        reconciliation_type:
+          type: string
+        book_id:
+          type: string
+        fiscal_period:
+          type: string
+        as_of:
+          type: string
+        population_a:
+          $ref: '#/components/schemas/Population'
+        owner:
+          type: string
+        sla_hours:
+          type: integer
+        group_by:
+          type: string
+        counterparty_book_id:
+          type: string
+        snapshot_id:
+          type: string
+        include_unbooked:
+          type: boolean
+    acceptBody:
+      type: object
+      properties:
+        note:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+    ReconRun:
+      type: object
+      properties:
+        reconciliation_run_id:
+          type: string
+        tenant_id:
+          type: string
+        reconciliation_type:
+          type: string
+        legal_entity_id:
+          type: string
+        accounting_book_id:
+          type: string
+        fiscal_period:
+          type: string
+        as_of:
+          type: string
+        currency:
+          type: string
+        population_a:
+          $ref: '#/components/schemas/Population'
+        population_b:
+          $ref: '#/components/schemas/Population'
+        expected_total:
+          type: string
+        actual_total:
+          type: string
+        difference:
+          type: string
+        tolerance_rule_id:
+          type: string
+        tolerance_version:
+          type: integer
+        status:
+          type: string
+        owner:
+          type: string
+        sla_due_at:
+          type: string
+          format: date-time
+        resolution_type:
+          type: string
+        resolution_note:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        resolved_by:
+          type: string
+        resolved_at:
+          type: string
+          format: date-time
+        approved_by:
+          type: string
+        approved_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    assignBody:
+      type: object
+      properties:
+        owner:
+          type: string
+        sla_hours:
+          type: integer
+    resolveBody:
+      type: object
+      properties:
+        resolution_type:
+          type: string
+        note:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        journal_id:
+          type: string
+    CaseStatus:
+      type: object
+      properties:
+        open_breaks:
+          type: integer
+        open_warnings:
+          type: integer
+        failed_posting_executions:
+          type: integer
+        latest_status_by_type:
+          type: object
+          additionalProperties:
+            type: string
+        open_case_ids:
+          type: array
+          items:
+            type: string
+        clear:
+          type: boolean
+        required_types_not_run:
+          type: array
+          items:
+            type: string
+    toleranceBody:
+      type: object
+      properties:
+        reconciliation_type:
+          type: string
+        legal_entity_id:
+          type: string
+        match_amount:
+          type: string
+        warning_amount:
+          type: string
+        effective_from:
+          type: string
+    Tolerance:
+      type: object
+      properties:
+        tolerance_rule_id:
+          type: string
+        reconciliation_type:
+          type: string
+        legal_entity_id:
+          type: string
+        match_amount:
+          type: string
+        warning_amount:
+          type: string
+        version:
+          type: integer
+        effective_from:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    RevalRequest:
+      type: object
+      properties:
+        book_id:
+          type: string
+        fiscal_period:
+          type: string
+        valuation_date:
+          type: string
+        policy_id:
+          type: string
+        auto_reverse:
+          type: boolean
+    BookOutcome:
+      type: object
+      properties:
+        accounting_book_id:
+          type: string
+        book_code:
+          type: string
+        book_type:
+          type: string
+        accounting_framework_id:
+          type: string
+        status:
+          type: string
+        posting_rule:
+          type: string
+        journals:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConsequenceJournal'
+        last_failure:
+          $ref: '#/components/schemas/ConsequenceFailure'
+        detail:
+          type: string
+    AllocContent:
+      type: object
+      properties:
+        name:
+          type: string
+        source_accounts:
+          type: array
+          items:
+            type: string
+        source_dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        driver:
+          type: string
+        recipients:
+          type: array
+          items:
+            $ref: '#/components/schemas/AllocRecipient'
+    AllocPopulation:
+      type: object
+      properties:
+        currency:
+          type: string
+        period_start:
+          type: string
+        as_of:
+          type: string
+        rule_code:
+          type: string
+        rule_version:
+          type: integer
+        rule_content_hash:
+          type: string
+        pool:
+          type: array
+          items:
+            $ref: '#/components/schemas/PoolLine'
+        driver:
+          type: string
+        driver_ref:
+          type: string
+        driver_snapshot:
+          type: object
+          additionalProperties:
+            type: string
+        shares:
+          type: array
+          items:
+            $ref: '#/components/schemas/AllocShare'
+        rounding_residual:
+          type: string
+        rounding_account:
+          type: string
+        source_dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        allocated_total:
+          type: string
+        posting_date:
+          type: string
+    AllocRemoteJournal:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        accounting_book_id:
+          type: string
+        book_code:
+          type: string
+        currency:
+          type: string
+        journal_id:
+          type: string
+        journal_number:
+          type: string
+        reversal_journal_id:
+          type: string
+    SnapshotLine:
+      type: object
+      properties:
+        account_code:
+          type: string
+        debit_total:
+          type: string
+        credit_total:
+          type: string
+        net_balance:
+          type: string
+        period_debit:
+          type: string
+        period_credit:
+          type: string
+    TraceTotals:
+      type: object
+      properties:
+        debit_total:
+          type: string
+        credit_total:
+          type: string
+        net_balance:
+          type: string
+        entry_count:
+          type: integer
+    SnapshotTraceEntry:
+      type: object
+      properties:
+        ledger_entry_seq:
+          type: integer
+        journal_id:
+          type: string
+        journal_number:
+          type: string
+        journal_type:
+          type: string
+        journal_purpose:
+          type: string
+        posting_date:
+          type: string
+        fiscal_period:
+          type: string
+        line_no:
+          type: integer
+        debit_amount:
+          type: string
+        credit_amount:
+          type: string
+        description:
+          type: string
+        posting_rule_line_ref:
+          type: string
+        tax_detail_ref:
+          type: string
+        source_line_ref:
+          type: string
+        evidence_bundle_id:
+          type: string
+        evidence_refs:
+          type: array
+          items:
+            type: string
+        source:
+          $ref: '#/components/schemas/TraceSource'
+        posting_rule:
+          $ref: '#/components/schemas/TraceEntryRule'
+    BookEvidence:
+      type: object
+      properties:
+        accounting_book_id:
+          type: string
+        book_code:
+          type: string
+        ready:
+          type: boolean
+        blocking_issues:
+          type: array
+          items:
+            type: string
+        reconciliation:
+          $ref: '#/components/schemas/CaseStatus'
+        revaluation:
+          $ref: '#/components/schemas/RevalStatus'
+        journals_in_review_queue:
+          type: integer
+        latest_snapshot:
+          $ref: '#/components/schemas/SnapshotRef'
+    PeriodSeal:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        fiscal_period:
+          type: string
+        status:
+          type: string
+        ledger_watermark:
+          type: integer
+        sealed_by:
+          type: string
+        sealed_at:
+          type: string
+          format: date-time
+        reopened_by:
+          type: string
+        reopened_at:
+          type: string
+          format: date-time
+        reopen_authority:
+          type: string
+        reopen_reason:
+          type: string
+        seal_count:
+          type: integer
+        entries_since_reopen:
+          type: integer
+        existing:
+          type: boolean
+    PeriodIncomplete:
+      type: object
+      properties:
+        count:
+          type: integer
+        accounting_event_ids:
+          type: array
+          items:
+            type: string
+        truncated:
+          type: boolean
+    AdjustmentLine:
+      type: object
+      properties:
+        account_code:
+          type: string
+        amount:
+          type: string
+        description:
+          type: string
+    ConsolPopulation:
+      type: object
+      properties:
+        presentation_currency:
+          type: string
+        balance_sheet_policy:
+          type: string
+        profit_loss_policy:
+          type: string
+        mapping_version:
+          type: integer
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConsolInput'
+        rates:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConsolRate'
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConsolLine'
+        cta_by_entity:
+          type: object
+          additionalProperties:
+            type: string
+        translation:
+          type: object
+          additionalProperties:
+            type: string
+        elimination:
+          type: object
+          additionalProperties:
+            type: string
+        consolidated:
+          type: object
+          additionalProperties:
+            type: string
+        intercompany_pairs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ICPair'
+        non_controlling_interest:
+          type: array
+          items:
+            $ref: '#/components/schemas/NCIItem'
+        exceptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConsolException'
+        translation_posted:
+          type: object
+          additionalProperties:
+            type: string
+        elimination_posted:
+          type: object
+          additionalProperties:
+            type: string
+        group_adjustment:
+          type: object
+          additionalProperties:
+            type: string
+        group_adjustment_posted:
+          type: object
+          additionalProperties:
+            type: string
+        group_adjustments:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppliedAdjustment'
+        capital_eliminations:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapitalElimination'
+        prior_run_id:
+          type: string
+    MigrationTotals:
+      type: object
+      properties:
+        debit:
+          type: string
+        credit:
+          type: string
+    ControlTotal:
+      type: object
+      properties:
+        total:
+          type: string
+        count:
+          type: integer
+        reference:
+          type: string
+    MigrationLineInput:
+      type: object
+      properties:
+        source_ref:
+          type: string
+        source_account:
+          type: string
+        account_code:
+          type: string
+        debit:
+          type: string
+        credit:
+          type: string
+        counterparty_id:
+          type: string
+        transaction_amount:
+          type: string
+        transaction_currency:
+          type: string
+        exchange_rate:
+          type: string
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        description:
+          type: string
+    MigrationReport:
+      type: object
+      properties:
+        valid:
+          type: boolean
+        checked_at:
+          type: string
+          format: date-time
+        checked_by:
+          type: string
+        issues:
+          type: array
+          items:
+            $ref: '#/components/schemas/MigrationIssue'
+    MigrationReconciliation:
+      type: object
+      properties:
+        status:
+          type: string
+        ledger_debit:
+          type: string
+        ledger_credit:
+          type: string
+        journal_id:
+          type: string
+        journal_number:
+          type: string
+        journal_hash:
+          type: string
+        differences:
+          type: array
+          items:
+            $ref: '#/components/schemas/MigrationDifference'
+        checked_at:
+          type: string
+          format: date-time
+        checked_by:
+          type: string
+    MigrationEvent:
+      type: object
+      properties:
+        kind:
+          type: string
+        actor:
+          type: string
+        at:
+          type: string
+          format: date-time
+        detail:
+          type: object
+          additionalProperties:
+            {}
+    MigrationAnalysis:
+      type: object
+      properties:
+        issues:
+          type: array
+          items:
+            $ref: '#/components/schemas/MigrationIssue'
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/MigrationAccountRow'
+        controls:
+          type: array
+          items:
+            $ref: '#/components/schemas/MigrationControlRow'
+        total_debit:
+          type: string
+        total_credit:
+          type: string
+    ProposalLine:
+      type: object
+      properties:
+        line_no:
+          type: integer
+        line_ref:
+          type: string
+        side:
+          type: string
+        account_code:
+          type: string
+        amount_transaction:
+          type: string
+        transaction_currency:
+          type: string
+        amount_functional:
+          type: string
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        description:
+          type: string
+        rounding_residual:
+          type: boolean
+        realized_fx:
+          type: boolean
+        counterparty_id:
+          type: string
+        control_type:
+          type: string
+        tax_detail_ref:
+          type: string
+        source_line_ref:
+          type: string
+    Provenance:
+      type: object
+      properties:
+        posting_rule_set_id:
+          type: string
+        rule_name:
+          type: string
+        rule_version:
+          type: string
+        content_hash:
+          type: string
+        test_pack_id:
+          type: string
+        line_refs_generated:
+          type: array
+          items:
+            type: string
+    TraceStep:
+      type: object
+      properties:
+        step:
+          type: string
+        detail:
+          type: string
+    RuleContent:
+      type: object
+      properties:
+        conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Condition'
+        line_templates:
+          type: array
+          items:
+            $ref: '#/components/schemas/LineTemplate'
+        rounding_policy_id:
+          type: string
+        rounding_account:
+          $ref: '#/components/schemas/AccountRef'
+        dimension_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/DimensionRule'
+        dimension_combinations:
+          type: array
+          items:
+            $ref: '#/components/schemas/DimensionCombo'
+        balancing_dimension:
+          $ref: '#/components/schemas/BalancingDimension'
+        tax_dependency:
+          $ref: '#/components/schemas/TaxDependency'
+        fx_policy_id:
+          type: string
+        realized_fx:
+          $ref: '#/components/schemas/RealizedFX'
+        approval_policy_id:
+          type: string
+    TestCase:
+      type: object
+      properties:
+        name:
+          type: string
+        event:
+          $ref: '#/components/schemas/TestEvent'
+        accounts:
+          type: object
+          additionalProperties:
+            type: string
+        fx:
+          $ref: '#/components/schemas/FXBasis'
+        functional_currency:
+          type: string
+        minor_units:
+          type: object
+          additionalProperties:
+            type: integer
+        control_types:
+          type: object
+          additionalProperties:
+            type: string
+        expect:
+          $ref: '#/components/schemas/TestExpectation'
+    TracePosting:
+      type: object
+      properties:
+        book:
+          $ref: '#/components/schemas/TraceBook'
+        posting_basis:
+          type: string
+        posting_rule:
+          $ref: '#/components/schemas/TraceRule'
+        posting_execution:
+          $ref: '#/components/schemas/TraceExecution'
+        journals:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceJournal'
+        relations:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceRelation'
+        failed_attempts:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceFailure'
+    Population:
+      type: object
+      properties:
+        source:
+          type: string
+        reference:
+          type: string
+        watermark:
+          type: string
+        count:
+          type: integer
+        total:
+          type: string
+        currency:
+          type: string
+        groups:
+          type: object
+          additionalProperties:
+            type: string
+        detail:
+          type: object
+          additionalProperties:
+            {}
+    ConsequenceJournal:
+      type: object
+      properties:
+        journal_id:
+          type: string
+        posting_basis:
+          type: string
+    ConsequenceFailure:
+      type: object
+      properties:
+        posting_execution_id:
+          type: string
+        status:
+          type: string
+        failure_reason:
+          type: string
+        at:
+          type: string
+          format: date-time
+    AllocRecipient:
+      type: object
+      properties:
+        key:
+          type: string
+        account_code:
+          type: string
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        percent:
+          type: string
+        legal_entity_id:
+          type: string
+        book_id:
+          type: string
+    PoolLine:
+      type: object
+      properties:
+        account_code:
+          type: string
+        net_debit:
+          type: string
+    AllocShare:
+      type: object
+      properties:
+        key:
+          type: string
+        account_code:
+          type: string
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        driver:
+          type: string
+        exact_share:
+          type: string
+        amount:
+          type: string
+        legal_entity_id:
+          type: string
+        book_id:
+          type: string
+    TraceSource:
+      type: object
+      properties:
+        accounting_event_id:
+          type: string
+        event_type:
+          type: string
+        source_system:
+          type: string
+        source_object_type:
+          type: string
+        source_object_id:
+          type: string
+        source_event_id:
+          type: string
+        evidence_refs:
+          type: array
+          items:
+            type: string
+    TraceEntryRule:
+      type: object
+      properties:
+        posting_rule_set_id:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        posting_execution_id:
+          type: string
+    RevalStatus:
+      type: object
+      properties:
+        open_foreign_items:
+          type: integer
+        required:
+          type: boolean
+        revaluation_run_id:
+          type: string
+        done:
+          type: boolean
+    SnapshotRef:
+      type: object
+      properties:
+        snapshot_id:
+          type: string
+        purpose:
+          type: string
+        ledger_watermark:
+          type: integer
+        content_hash:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    ConsolInput:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        accounting_book_id:
+          type: string
+        book_code:
+          type: string
+        functional_currency:
+          type: string
+        ownership_pct:
+          type: string
+        snapshot_id:
+          type: string
+        content_hash:
+          type: string
+        ledger_watermark:
+          type: integer
+        sealed:
+          type: boolean
+        investment_account:
+          type: string
+        investor_entity_id:
+          type: string
+        equity_accounts:
+          type: array
+          items:
+            type: string
+        equity_rate_date:
+          type: string
+    ConsolRate:
+      type: object
+      properties:
+        currency:
+          type: string
+        class:
+          type: string
+        policy_id:
+          type: string
+        rate:
+          type: string
+        rate_id:
+          type: string
+        rate_type:
+          type: string
+        as_of:
+          type: string
+    ConsolLine:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        local_account:
+          type: string
+        group_account:
+          type: string
+        account_type:
+          type: string
+        rate_class:
+          type: string
+        rate:
+          type: string
+        functional_net:
+          type: string
+        translated_net:
+          type: string
+    ICPair:
+      type: object
+      properties:
+        class:
+          type: string
+        entity_a:
+          type: string
+        entity_b:
+          type: string
+        status:
+          type: string
+        currencies:
+          type: array
+          items:
+            $ref: '#/components/schemas/ICCurrencyRow'
+        eliminated:
+          type: boolean
+        translation_residual:
+          type: string
+        reason:
+          type: string
+        positions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ICPosition'
+    NCIItem:
+      type: object
+      properties:
+        legal_entity_id:
+          type: string
+        nci_pct:
+          type: string
+        translated_net_assets:
+          type: string
+        nci_amount:
+          type: string
+    ConsolException:
+      type: object
+      properties:
+        code:
+          type: string
+        blocking:
+          type: boolean
+        legal_entity_id:
+          type: string
+        detail:
+          type: string
+        facts:
+          type: object
+          additionalProperties:
+            {}
+    AppliedAdjustment:
+      type: object
+      properties:
+        adjustment_id:
+          type: string
+        fiscal_period:
+          type: string
+        policy_ref:
+          type: string
+        evidence_ref:
+          type: string
+    CapitalElimination:
+      type: object
+      properties:
+        subsidiary:
+          type: string
+        investor:
+          type: string
+        ownership_pct:
+          type: string
+        investment:
+          type: string
+        eliminated_equity:
+          type: string
+        non_controlling_interest:
+          type: string
+        goodwill:
+          type: string
+    MigrationIssue:
+      type: object
+      properties:
+        line:
+          type: integer
+        source_ref:
+          type: string
+        code:
+          type: string
+        detail:
+          type: string
+    MigrationDifference:
+      type: object
+      properties:
+        what:
+          type: string
+        expected:
+          type: string
+        actual:
+          type: string
+    MigrationAccountRow:
+      type: object
+      properties:
+        account_code:
+          type: string
+        control_type:
+          type: string
+        lines:
+          type: integer
+        debit:
+          type: string
+        credit:
+          type: string
+        net_debit:
+          type: string
+    MigrationControlRow:
+      type: object
+      properties:
+        control_type:
+          type: string
+        staged_balance:
+          type: string
+        subledger_total:
+          type: string
+        reference:
+          type: string
+        match:
+          type: boolean
+    Condition:
+      type: object
+      properties:
+        fact:
+          type: string
+        op:
+          type: string
+        value:
+          {}
+    LineTemplate:
+      type: object
+      properties:
+        line_ref:
+          type: string
+        side:
+          type: string
+        account:
+          $ref: '#/components/schemas/AccountRef'
+        amount:
+          type: string
+        description:
+          type: string
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        when:
+          type: array
+          items:
+            $ref: '#/components/schemas/Condition'
+        keep_zero:
+          type: boolean
+        functional:
+          type: string
+        tax_detail:
+          type: string
+        source_line:
+          type: string
+    AccountRef:
+      type: object
+      properties:
+        account_code:
+          type: string
+        mapping_key:
+          type: string
+    DimensionRule:
+      type: object
+      properties:
+        dimension:
+          type: string
+        mode:
+          type: string
+        from:
+          type: string
+    DimensionCombo:
+      type: object
+      properties:
+        when:
+          $ref: '#/components/schemas/DimensionMatch'
+        require:
+          type: array
+          items:
+            type: string
+        forbid:
+          type: array
+          items:
+            type: string
+    BalancingDimension:
+      type: object
+      properties:
+        dimension:
+          type: string
+        due_to_account:
+          $ref: '#/components/schemas/AccountRef'
+        due_from_account:
+          $ref: '#/components/schemas/AccountRef'
+    TaxDependency:
+      type: object
+      properties:
+        required_facts:
+          type: array
+          items:
+            type: string
+    RealizedFX:
+      type: object
+      properties:
+        gain_account:
+          $ref: '#/components/schemas/AccountRef'
+        loss_account:
+          $ref: '#/components/schemas/AccountRef'
+    TestEvent:
+      type: object
+      properties:
+        event_type:
+          type: string
+        transaction_currency:
+          type: string
+        facts:
+          type: object
+          additionalProperties:
+            type: string
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        counterparty_id:
+          type: string
+    TestExpectation:
+      type: object
+      properties:
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExpectedLine'
+        exception:
+          type: string
+    TraceBook:
+      type: object
+      properties:
+        book_id:
+          type: string
+        book_code:
+          type: string
+        book_type:
+          type: string
+        accounting_framework_id:
+          type: string
+        functional_currency:
+          type: string
+    TraceRule:
+      type: object
+      properties:
+        posting_rule_set_id:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        content_hash:
+          type: string
+        test_pack_id:
+          type: string
+        status:
+          type: string
+    TraceExecution:
+      type: object
+      properties:
+        posting_execution_id:
+          type: string
+        kind:
+          type: string
+        status:
+          type: string
+        proposal_hash:
+          type: string
+        ledger_watermark:
+          type: integer
+        journal_event_id:
+          type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        committed_at:
+          type: string
+          format: date-time
+        calculation_trace:
+          type: string
+    TraceJournal:
+      type: object
+      properties:
+        role:
+          type: string
+        journal_id:
+          type: string
+        journal_number:
+          type: string
+        status:
+          type: string
+        journal_type:
+          type: string
+        posting_date:
+          type: string
+        fiscal_period:
+          type: string
+        currency_code:
+          type: string
+        journal_hash:
+          type: string
+        evidence_bundle_id:
+          type: string
+        posted_by:
+          type: string
+        reversal_of_journal_id:
+          type: string
+        correction_of_journal_id:
+          type: string
+        reversal_reason:
+          type: string
+        correction_kind:
+          type: string
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceLine'
+    TraceRelation:
+      type: object
+      properties:
+        kind:
+          type: string
+        from_journal_id:
+          type: string
+        to_journal_id:
+          type: string
+    TraceFailure:
+      type: object
+      properties:
+        posting_execution_id:
+          type: string
+        status:
+          type: string
+        failure_reason:
+          type: string
+        at:
+          type: string
+          format: date-time
+    ICCurrencyRow:
+      type: object
+      properties:
+        currency:
+          type: string
+        entity_a_balance:
+          type: string
+        entity_b_balance:
+          type: string
+        difference:
+          type: string
+    ICPosition:
+      type: object
+      properties:
+        entity:
+          type: string
+        account_code:
+          type: string
+        counterparty_id:
+          type: string
+        currency:
+          type: string
+        transaction_balance:
+          type: string
+        functional_balance:
+          type: string
+    DimensionMatch:
+      type: object
+      properties:
+        dimension:
+          type: string
+        value:
+          type: string
+    ExpectedLine:
+      type: object
+      properties:
+        side:
+          type: string
+        account_code:
+          type: string
+        amount:
+          type: string
+        functional:
+          type: string
+    TraceLine:
+      type: object
+      properties:
+        line_no:
+          type: integer
+        account_code:
+          type: string
+        debit_amount:
+          type: string
+        credit_amount:
+          type: string
+        transaction_amount:
+          type: string
+        transaction_currency:
+          type: string
+        exchange_rate:
+          type: string
+        rate_ref:
+          type: string
+        posting_rule_line_ref:
+          type: string
+        tax_detail_ref:
+          type: string
+        source_line_ref:
+          type: string
+        dimensions:
+          type: object
+          additionalProperties:
+            type: string
+        ledger_entry_seq:
+          type: integer
+        description:
+          type: string

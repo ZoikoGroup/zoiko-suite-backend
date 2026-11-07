@@ -130,7 +130,7 @@ func TestCompileSignVerify_FullLifecycle(t *testing.T) {
 	mustStatus(t, 201, code, v)
 	code, r := e.do("POST", f.path("2026.08.1", "/compile"), "compiler", nil)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "not_under_review", r["error"])
+	assert.Equal(t, "not_under_review", r["code"])
 	code, _ = e.do("POST", f.path("2026.08.1", "/submit-review"), "author", nil)
 	require.Equal(t, 200, code)
 
@@ -167,7 +167,7 @@ func TestCompileSignVerify_FullLifecycle(t *testing.T) {
 	// Signing with a key that is not registered is refused (the service never signs with an untrusted key).
 	code, r = e.do("POST", f.path("2026.08.1", "/sign"), "signer", nil)
 	mustStatus(t, 503, code, r)
-	assert.Equal(t, "signing_key_not_active", r["error"])
+	assert.Equal(t, "signing_key_not_active", r["code"])
 
 	// Register the PUBLIC key, then sign.
 	code, k := e.do("POST", "/v1/admin/pack-signing-keys", "security", map[string]any{"key_ref": keyRef, "public_key": pubB64})
@@ -177,7 +177,7 @@ func TestCompileSignVerify_FullLifecycle(t *testing.T) {
 	_, otherPub := newSigner(t, "x")
 	code, r = e.do("POST", "/v1/admin/pack-signing-keys", "security", map[string]any{"key_ref": keyRef, "public_key": otherPub})
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "key_mismatch", r["error"], "a key_ref names one key forever")
+	assert.Equal(t, "key_mismatch", r["code"], "a key_ref names one key forever")
 
 	code, signed := e.do("POST", f.path("2026.08.1", "/sign"), "signer", nil)
 	mustStatus(t, 200, code, signed)
@@ -270,7 +270,7 @@ func TestCompile_RejectsBrokenPacksAndStoresNothing(t *testing.T) {
 	f.review(t, e, "2026.08.1", bare.JurisdictionRuleID)
 	code, r := e.do("POST", f.path("2026.08.1", "/compile"), "compiler", nil)
 	mustStatus(t, 422, code, r)
-	assert.Equal(t, "compile_failed", r["error"])
+	assert.Equal(t, "compile_failed", r["code"])
 	var found []string
 	for _, x := range r["report"].(map[string]any)["findings"].([]any) {
 		found = append(found, x.(map[string]any)["code"].(string))
@@ -310,7 +310,7 @@ func TestCompile_RejectsBrokenPacksAndStoresNothing(t *testing.T) {
 	f4 := newFixture(t, e)
 	code, r = e.do("POST", "/v1/admin/packs/"+f4.packRef+"/versions", "author", f4.manifest("2026.08.1", uuid.NewString()))
 	mustStatus(t, 400, code, r)
-	assert.Equal(t, "invalid_manifest", r["error"])
+	assert.Equal(t, "invalid_manifest", r["code"])
 
 	// Unknown pack version.
 	code, _ = e.do("POST", f4.path("9.9.9", "/compile"), "compiler", nil)
@@ -335,7 +335,7 @@ func TestCompile_ChangedInputsUnderSameVersionAreRefused(t *testing.T) {
 	mustStatus(t, 200, code, r)
 	code, r = e.do("POST", f.path("2026.08.1", "/compile"), "compiler", nil)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "already_compiled", r["error"])
+	assert.Equal(t, "already_compiled", r["code"])
 }
 
 func TestSign_FailsClosedWithoutASigner(t *testing.T) {
@@ -346,7 +346,7 @@ func TestSign_FailsClosedWithoutASigner(t *testing.T) {
 	mustStatus(t, 201, code, r)
 	code, r = e.do("POST", f.path("2026.08.1", "/sign"), "signer", nil)
 	mustStatus(t, 503, code, r)
-	assert.Equal(t, "signing_not_configured", r["error"])
+	assert.Equal(t, "signing_not_configured", r["code"])
 
 	// Signing before compiling is a precise error, not a crash.
 	f2 := newFixture(t, e)
@@ -355,7 +355,7 @@ func TestSign_FailsClosedWithoutASigner(t *testing.T) {
 	f2.review(t, e2, "2026.08.1", f2.ruleID)
 	code, r = e2.do("POST", f2.path("2026.08.1", "/sign"), "signer", nil)
 	mustStatus(t, 404, code, r)
-	assert.Equal(t, "not_compiled", r["error"])
+	assert.Equal(t, "not_compiled", r["code"])
 
 	// A version with no artifact fails verification closed.
 	code, r = e2.do("POST", "/v1/packs/"+f2.packRef+"/versions/2026.08.1/verify", "loader", nil)
@@ -377,7 +377,7 @@ func TestSign_RefusesAKeyWhoseRegisteredPublicKeyDiffers(t *testing.T) {
 	mustStatus(t, 201, code, r)
 	code, r = e.do("POST", f.path("2026.08.1", "/sign"), "signer", nil)
 	mustStatus(t, 503, code, r)
-	assert.Equal(t, "signing_key_not_active", r["error"])
+	assert.Equal(t, "signing_key_not_active", r["code"])
 }
 
 func TestArtifactAndKeyTables_AreGuardedInSQL(t *testing.T) {

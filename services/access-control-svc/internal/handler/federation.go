@@ -29,16 +29,16 @@ func (g *Gov) RoleEligibility(w http.ResponseWriter, r *http.Request) {
 	}
 	roleID := strings.TrimSpace(r.URL.Query().Get("role_definition_id"))
 	if roleID == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "role_definition_id is required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "role_definition_id is required")
 		return
 	}
 	role, err := g.h.store.GetRole(r.Context(), roleID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRoleNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			writeError(w, r, http.StatusNotFound, "not_found", err.Error())
 			return
 		}
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	out := domain.FederationRoleEligibility{RoleDefinitionID: role.RoleDefinitionID}
@@ -66,5 +66,5 @@ func (g *Gov) RoleEligibility(w http.ResponseWriter, r *http.Request) {
 	}
 	status, code := classify(err)
 	g.h.log.Error("role eligibility could not be decided", zap.Error(err))
-	writeError(w, status, code, "the role's risk could not be determined")
+	writeError(w, r, status, code, "the role's risk could not be determined")
 }

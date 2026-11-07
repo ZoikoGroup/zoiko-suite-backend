@@ -323,6 +323,45 @@ func TestTaxDependency(t *testing.T) {
 	}
 }
 
+// A line that rests on a tax determination links to it (§8.2): by the reference the event carries or by a fixed one. A line whose
+// determination the event does not carry is refused rather than posted unlinked.
+func TestTaxDetailLinksTheLine(t *testing.T) {
+	c := invoiceContent()
+	c.LineTemplates[2].TaxDetail = "$facts.tax_determination_id"
+	c.LineTemplates[1].TaxDetail = "TAXCODE-STD"
+	if err := rule(c).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	f := okFacts()
+	f["tax_determination_id"] = " td-77 "
+	p, err := eval(t, event(f), rule(c), dir(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, l := range p.Lines {
+		got[l.LineRef] = l.TaxDetailRef
+	}
+	if got["L1"] != "" || got["L2"] != "TAXCODE-STD" || got["L3"] != "td-77" {
+		t.Fatalf("tax detail refs = %v", got)
+	}
+	// the link is part of what was proposed, so a different determination is a different proposal
+	f["tax_determination_id"] = "td-78"
+	p2, err := eval(t, event(f), rule(c), dir(), nil, nil)
+	if err != nil || p2.ProposalHash == p.ProposalHash {
+		t.Fatalf("a different determination must change the proposal: %v", err)
+	}
+	_, err = eval(t, event(okFacts()), rule(c), dir(), nil, nil)
+	wantFam(t, err, FamTax, "TAX_DETAIL_MISSING")
+	// a line that is not produced for this event does not need its determination
+	nt := okFacts()
+	nt["tax"] = "0"
+	nt["gross"], nt["net"] = "100.00", "100.00"
+	if _, err := eval(t, event(nt), rule(c), dir(), nil, nil); err != nil {
+		t.Fatalf("an event with no tax line needs no tax determination: %v", err)
+	}
+}
+
 func TestAccountAndDimensionControls(t *testing.T) {
 	d := dir()
 	d.accounts["map:REV"] = &AccountInfo{Code: "4000", Postable: false, Active: true}
@@ -404,6 +443,12 @@ func TestRuleSetValidation(t *testing.T) {
 		"derived needs from": func(r *RuleSet) { r.Content.DimensionRules = []DimensionRule{{Dimension: "p", Mode: DimDerived}} },
 		"unknown dim mode":   func(r *RuleSet) { r.Content.DimensionRules = []DimensionRule{{Dimension: "p", Mode: "MAYBE"}} },
 		"empty tax facts":    func(r *RuleSet) { r.Content.TaxDependency = &TaxDependency{} },
+		"tax detail fact":    func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = "$facts.not a name" },
+		"tax detail padded":  func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = " TD-1 " },
+		"tax detail long":    func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = strings.Repeat("x", 201) },
+		"source line fact":   func(r *RuleSet) { r.Content.LineTemplates[0].SourceLine = "$facts.not a name" },
+		"source line padded": func(r *RuleSet) { r.Content.LineTemplates[0].SourceLine = " L1 " },
+		"source line long":   func(r *RuleSet) { r.Content.LineTemplates[0].SourceLine = strings.Repeat("x", 201) },
 	} {
 		if err := mut(f); err == nil {
 			t.Errorf("%s must be refused", name)
@@ -518,4 +563,96 @@ func TestTestPackAndLifecycle(t *testing.T) {
 	if a.Overlaps(b) {
 		t.Fatal("different scopes never overlap")
 	}
+}
+
+// rejectRecorder is a repository that only records the rejections raised at intake.
+type rejectRecorder struct {
+	Repo
+	got []OutEvent
+	err error
+}
+
+func (r *rejectRecorder) GetEvent(context.Context, string, string) (*AccountingEvent, error) {
+	return nil, ErrNotFound
+}
+func (r *rejectRecorder) RecordEventRejection(_ context.Context, _ string, o OutEvent) error {
+	r.got = append(r.got, o)
+	return r.err
+}
+
+// An event refused at intake raises AccountingEventRejected (§33); a refusal of the caller or of a dependency is not a verdict on
+// the event, and a failure to record the notice never replaces the refusal the producer is told.
+func TestEventRejectionIsRaisedOnlyForVerdictsOnTheEvent(t *testing.T) {
+	rec := &rejectRecorder{}
+	s := &Service{Repo: rec}
+	a := Actor{PrincipalID: "ar-svc"}
+	bad := *event(okFacts())
+	bad.IdempotencyKey = ""
+	_, _, err := s.RegisterEvent(context.Background(), tenant, a, bad)
+	if _, ok := AsException(err); !ok || len(rec.got) != 1 {
+		t.Fatalf("an invalid event is rejected: %v %d", err, len(rec.got))
+	}
+	o := rec.got[0]
+	if o.Fact != "event.rejected" || o.AggregateID != "ar/se-1" || o.Data["code"] == "" || o.Data["source_event_id"] != "se-1" {
+		t.Fatalf("%+v", o)
+	}
+	if o.LegalEntityID != "" && o.LegalEntityID != entity {
+		t.Fatalf("an entity id that is not an identifier is not passed on: %q", o.LegalEntityID)
+	}
+
+	for name, cause := range map[string]error{
+		"authorization": exc(FamAuth, "FORBIDDEN", "no"),
+		"dependency":    exc(FamExt, "DIRECTORY_DOWN", "down"),
+		"storage":       errors.New("connection reset"),
+	} {
+		rec.got = nil
+		s.eventRejected(context.Background(), tenant, a, *event(okFacts()), cause)
+		if len(rec.got) != 0 {
+			t.Errorf("%s is not a rejection of the event", name)
+		}
+	}
+	rec.got = nil
+	s.eventRejected(context.Background(), tenant, a, *event(okFacts()), exc(FamAuth, "ENTITY_MISMATCH", "wrong entity"))
+	if len(rec.got) != 1 {
+		t.Error("a correction naming another entity's event is rejected")
+	}
+
+	rec.err = errors.New("outbox down")
+	_, _, err = s.RegisterEvent(context.Background(), tenant, a, bad)
+	if e, ok := AsException(err); !ok || e.Code == "" {
+		t.Fatalf("the producer is told the refusal, not the failure to record it: %v", err)
+	}
+}
+
+// A line links back to the line of the source document it came from (§8.2), by a fixed reference or by the one the event carries; the
+// event that does not carry it is refused, and the link is part of what was proposed.
+func TestSourceLineLinksTheLine(t *testing.T) {
+	c := invoiceContent()
+	c.LineTemplates[1].SourceLine = "$facts.invoice_line_id"
+	c.LineTemplates[0].SourceLine = "HEADER"
+	if err := rule(c).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	f := okFacts()
+	f["invoice_line_id"] = " INV-9/3 "
+	p, err := eval(t, event(f), rule(c), dir(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, l := range p.Lines {
+		got[l.LineRef] = l.SourceLineRef
+	}
+	if got["L1"] != "HEADER" || got["L2"] != "INV-9/3" || got["L3"] != "" {
+		t.Fatalf("source line refs = %v", got)
+	}
+	f["invoice_line_id"] = "INV-9/4"
+	if p2, err := eval(t, event(f), rule(c), dir(), nil, nil); err != nil || p2.ProposalHash == p.ProposalHash {
+		t.Fatalf("a different source line must change the proposal: %v", err)
+	}
+	_, err = eval(t, event(okFacts()), rule(c), dir(), nil, nil)
+	wantFam(t, err, FamData, "SOURCE_LINE_MISSING")
+	f["invoice_line_id"] = strings.Repeat("x", 201)
+	_, err = eval(t, event(f), rule(c), dir(), nil, nil)
+	wantFam(t, err, FamData, "SOURCE_LINE_INVALID")
 }

@@ -26,14 +26,18 @@ type AccountInfo struct {
 	Code               string
 	Postable           bool // header/parent accounts are not
 	Active             bool
-	CurrencyRestricted []string          // empty = any
-	BookIDs            []string          // books the account is valid in; empty = every book
+	CurrencyRestricted []string // empty = any
+	BookIDs            []string // books the account is valid in; empty = every book
 	// ControlType is the subledger or system area that owns the account (AR, AP, BANK, ...); empty for an ordinary account.
 	// CounterpartyRequired makes a line on the account carry the counterparty (customer, supplier). The AR and AP control
 	// accounts always do: a receivable or payable with no one it is owed by or to cannot be reconciled to its subledger.
 	ControlType          string
 	CounterpartyRequired bool
-	DimensionPolicy    map[string]string // dimension -> REQUIRED | PROHIBITED | OPTIONAL
+	DimensionPolicy      map[string]string // dimension -> REQUIRED | PROHIBITED | OPTIONAL
+	// Replacement is the account a retired account names as its replacement; ReplacedFrom lists the retired accounts the directory followed
+	// to reach this one, so the evidence can say a posting was mapped forward.
+	Replacement  string
+	ReplacedFrom []string
 }
 
 // Directory is the reference data an evaluation reads: currency precision, the chart and the dimension registry. It is
@@ -69,6 +73,8 @@ type ProposalLine struct {
 	RealizedFX       bool              `json:"realized_fx,omitempty"`
 	CounterpartyID   string            `json:"counterparty_id,omitempty"`
 	ControlType      string            `json:"control_type,omitempty"`
+	TaxDetailRef     string            `json:"tax_detail_ref,omitempty"`
+	SourceLineRef    string            `json:"source_line_ref,omitempty"`
 }
 
 // Provenance identifies the rule that produced a proposal (AK-INV-008).
@@ -119,6 +125,8 @@ type rawLine struct {
 	funcMn *big.Int
 	round  bool
 	cp     string
+	taxRef string
+	srcRef string
 	// fixed is a functional amount the rule stated (carrying basis), exempt from conversion; realized marks the realized-FX line.
 	fixed    *big.Rat
 	realized bool
@@ -208,6 +216,9 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		if aerr != nil {
 			return nil, exc(FamCOA, "ACCOUNT_UNRESOLVED", "%s (%s): %v", t.LineRef, t.Account, aerr).with("line_ref", t.LineRef)
 		}
+		if info != nil && len(info.ReplacedFrom) > 0 {
+			step("coa", t.LineRef+": "+strings.Join(info.ReplacedFrom, ", ")+" is retired and maps forward to "+info.Code)
+		}
 		if info == nil || !info.Active || !info.Postable {
 			return nil, exc(FamCOA, "ACCOUNT_NOT_POSTABLE", "%s resolves to an account that is inactive or a header account", t.LineRef).with("line_ref", t.LineRef)
 		}
@@ -242,7 +253,15 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 			}
 			step("carrying", t.LineRef+": functional "+t.Functional+" = "+ratString(fixed)+" (retired at its carrying amount)")
 		}
-		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact, cp: cp, fixed: fixed})
+		taxRef, terr := lineRef(ev, t, t.TaxDetail, FamTax, "TAX_DETAIL", "the tax determination")
+		if terr != nil {
+			return nil, terr
+		}
+		srcRef, serr := lineRef(ev, t, t.SourceLine, FamData, "SOURCE_LINE", "the source line")
+		if serr != nil {
+			return nil, serr
+		}
+		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact, cp: cp, fixed: fixed, taxRef: taxRef, srcRef: srcRef})
 	}
 	if len(lines) < 2 {
 		return nil, exc(FamRule, "NO_LINES", "the rule produced fewer than two lines for this event")
@@ -339,6 +358,25 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 			}
 		}
 	}
+	if fdr.Cmp(fcr) == 0 && dr.Cmp(cr) == 0 {
+		added, berr := balanceByDimension(ctx, in, c, &lines)
+		if berr != nil {
+			return nil, berr
+		}
+		if len(added) > 0 {
+			step("balancing", "the journal was balanced within each value of "+c.BalancingDimension.Dimension+" with explicit lines: "+strings.Join(added, ", "))
+			dr, cr, fdr, fcr = new(big.Int), new(big.Int), new(big.Int), new(big.Int)
+			for _, l := range lines {
+				if l.t.Side == Debit {
+					dr.Add(dr, l.minor)
+					fdr.Add(fdr, l.funcMn)
+				} else {
+					cr.Add(cr, l.minor)
+					fcr.Add(fcr, l.funcMn)
+				}
+			}
+		}
+	}
 	if fdr.Cmp(fcr) != 0 || dr.Cmp(cr) != 0 {
 		return nil, exc(FamBal, "UNBALANCED", "debits do not equal credits after rounding")
 	}
@@ -352,7 +390,7 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		prov.Branch = append(prov.Branch, l.t.LineRef)
 		p.Lines = append(p.Lines, ProposalLine{LineNo: i + 1, LineRef: l.t.LineRef, Side: l.t.Side, AccountCode: l.acct.Code,
 			AmountTx: FormatMinor(l.minor, tscale), Currency: tccy, AmountFunctional: FormatMinor(l.funcMn, fscale), Dimensions: l.dims,
-			Description: l.t.Description, Rounding: l.round, RealizedFX: l.realized, CounterpartyID: l.cp, ControlType: l.acct.ControlType})
+			Description: l.t.Description, Rounding: l.round, RealizedFX: l.realized, CounterpartyID: l.cp, ControlType: l.acct.ControlType, TaxDetailRef: l.taxRef, SourceLineRef: l.srcRef})
 	}
 	p.Provenance, p.Trace = prov, trace
 	b, _ := json.Marshal(struct {
@@ -464,6 +502,21 @@ func resolveDimensions(ctx context.Context, in EvalInput, c RuleContent, t LineT
 			}
 		}
 	}
+	for _, c := range c.DimensionCombos {
+		if dims[c.When.Dimension] == "" || (c.When.Value != "" && dims[c.When.Dimension] != c.When.Value) {
+			continue
+		}
+		for _, r := range c.Require {
+			if dims[r] == "" {
+				return nil, exc(FamDim, "DIMENSION_COMBINATION_REQUIRED", "line %s: %s%s requires dimension %s", t.LineRef, c.When.Dimension, whenValue(c.When), r).with("line_ref", t.LineRef)
+			}
+		}
+		for _, f := range c.Forbid {
+			if dims[f] != "" {
+				return nil, exc(FamDim, "DIMENSION_COMBINATION_FORBIDDEN", "line %s: %s%s forbids dimension %s", t.LineRef, c.When.Dimension, whenValue(c.When), f).with("line_ref", t.LineRef)
+			}
+		}
+	}
 	for _, d := range sortedKeys(dims) {
 		if dims[d] == "" {
 			delete(dims, d)
@@ -568,4 +621,29 @@ func (d testDirectory) ResolveAccount(_ context.Context, ref AccountRef, _ strin
 
 func (d testDirectory) DimensionAllowed(context.Context, string, string, string, string, time.Time) (bool, error) {
 	return true, nil
+}
+
+// lineRef resolves a line template's link to a tax determination or a source line: a literal, or the fact the event carries. A fact the
+// event does not carry, or one that is too long, is a refusal of the event rather than a line posted without its link.
+func lineRef(ev *AccountingEvent, t LineTemplate, v string, fam, code, what string) (string, error) {
+	f, ok := strings.CutPrefix(v, "$facts.")
+	if !ok {
+		return v, nil
+	}
+	ref := strings.TrimSpace(ev.Facts[f])
+	if ref == "" {
+		return "", exc(fam, code+"_MISSING", "%s links to %s %q and the event does not carry it", t.LineRef, what, f).with("line_ref", t.LineRef).with("fact", f)
+	}
+	if len(ref) > 200 {
+		return "", exc(fam, code+"_INVALID", "%s: the reference %q to %s is longer than 200 characters", t.LineRef, f, what).with("line_ref", t.LineRef)
+	}
+	return ref, nil
+}
+
+// whenValue words the value a combination applies to.
+func whenValue(w DimensionMatch) string {
+	if w.Value == "" {
+		return ""
+	}
+	return " = " + w.Value
 }

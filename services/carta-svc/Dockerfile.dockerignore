@@ -1,0 +1,12 @@
+# Used by BuildKit for builds with -f services/carta-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/carta-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/carta-svc/.gotmp/
+services/carta-svc/**/*.exe
+services/carta-svc/**/*_test.go
+services/identity-envelope/**/*_test.go

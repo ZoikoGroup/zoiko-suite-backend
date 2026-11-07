@@ -49,18 +49,18 @@ func (h *Handler) ResolvePayrollParameters(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"effective_at", req.EffectiveAt}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	at, err := time.Parse(time.RFC3339Nano, req.EffectiveAt)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
 		return
 	}
 	var idemKey *string
 	if k := strings.TrimSpace(r.Header.Get("Idempotency-Key")); k != "" {
 		if len(k) > maxIdempotencyKey {
-			writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long")
+			writeError(w, r, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long")
 			return
 		}
 		idemKey = &k
@@ -74,12 +74,12 @@ func (h *Handler) ResolvePayrollParameters(w http.ResponseWriter, r *http.Reques
 	set, err := h.resolver.ResolveParameterSet(r.Context(), resolver.ParameterSetRequest{Jurisdiction: req.Jurisdiction, At: at,
 		Classes: req.Classes, PackRef: req.PackRef, PackVersion: req.PackVersion})
 	if err != nil {
-		h.writeResolveError(w, err, corr)
+		h.writeResolveError(w, r, err, corr)
 		return
 	}
 	respJSON, err := json.Marshal(set)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encode_failed", "could not encode the parameter set")
+		writeError(w, r, http.StatusInternalServerError, "encode_failed", "could not encode the parameter set")
 		return
 	}
 	rec := store.DecisionRecord{Kind: "PARAMETER_SET", RequestedBy: actor, CorrelationID: corr, IdempotencyKey: idemKey, RequestDigest: reqDigest,
@@ -103,10 +103,10 @@ func (h *Handler) ResolvePayrollParameters(w http.ResponseWriter, r *http.Reques
 	stored, replayed, err := h.registry.RecordDecision(r.Context(), rec)
 	if err != nil {
 		if errors.Is(err, domain.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "idempotency_conflict", err.Error())
 			return
 		}
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 		return
 	}
 	status := http.StatusOK
@@ -118,3 +118,4 @@ func (h *Handler) ResolvePayrollParameters(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, "parameter_set": json.RawMessage(stored.Response)})
 }
+

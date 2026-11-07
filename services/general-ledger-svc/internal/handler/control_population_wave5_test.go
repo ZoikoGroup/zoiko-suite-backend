@@ -19,6 +19,9 @@ type wave5Stub struct {
 	fpCalls    map[string][]domain.FiscalPeriodPopulationQuery
 	unposted   []domain.UnpostedEventsQuery
 	breaks     []domain.EventJournalBreaksQuery
+	aging      []domain.ClearingBalanceAgingQuery
+	postSeal   []domain.PostSealEntriesQuery
+	fxRates    []domain.FXRateObservationsQuery
 	tenantSeen []string
 }
 

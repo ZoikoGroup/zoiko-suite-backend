@@ -73,7 +73,7 @@ func (h *Handler) InvalidateAuthorizationCache(w http.ResponseWriter, r *http.Re
 
 	emitter, ok := h.store.(eventEmitter)
 	if !ok {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	msg, err := events.NewEvent("authorization.cache.invalidated", r.Header.Get("X-Correlation-ID"), tenantScope, principalID,
@@ -89,7 +89,7 @@ func (h *Handler) InvalidateAuthorizationCache(w http.ResponseWriter, r *http.Re
 	}
 	if err != nil {
 		h.log.Error("InvalidateAuthorizationCache: could not announce the invalidation", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	if c, ok := h.store.(tenantInvalidator); ok {
@@ -159,7 +159,7 @@ func (h *Handler) RecomputeSubjectEffectiveAccess(w http.ResponseWriter, r *http
 
 	assignments, err := h.store.ListRoleAssignments(r.Context(), tenantScope, subject, "", false)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	roles := map[string]*domain.Role{}
@@ -170,14 +170,14 @@ func (h *Handler) RecomputeSubjectEffectiveAccess(w http.ResponseWriter, r *http
 	for _, a := range assignments {
 		actions, err := h.roleActiveActions(r.Context(), a.RoleID, tenantScope)
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 			return
 		}
 		role, seen := roles[a.RoleID]
 		if !seen {
 			role, err = h.store.FindRoleByID(r.Context(), a.RoleID)
 			if err != nil && !errors.Is(err, domain.ErrRoleNotFound) {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 				return
 			}
 			roles[a.RoleID] = role

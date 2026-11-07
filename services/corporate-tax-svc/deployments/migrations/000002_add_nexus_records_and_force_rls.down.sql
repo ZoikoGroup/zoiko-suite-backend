@@ -1,0 +1,7 @@
+BEGIN;
+
+DROP TABLE IF EXISTS nexus_records;
+ALTER TABLE corporate_tax_returns NO FORCE ROW LEVEL SECURITY;
+
+COMMIT;
+
