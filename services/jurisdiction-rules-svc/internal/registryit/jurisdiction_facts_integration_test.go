@@ -33,7 +33,7 @@ func TestJurisdictionDecision_EstablishmentsAndRegistrationsSelectAndUnusableFac
 	e := newEnvDetermination()
 	tenant, entity := "tenant-"+uuid.NewString()[:8], "entity-"+uuid.NewString()[:8]
 	gb, fr := seedJurisdiction(t, "GB"), seedJurisdiction(t, "FR")
-	start := time.Now().UTC().Add(-72 * time.Hour)
+	start := time.Now().UTC().Add(-120 * time.Hour)
 	assign(t, tenant, entity, gb, "PRIMARY", start, nil)
 	assign(t, tenant, entity, fr, "SECONDARY", start, nil)
 	day := func(d time.Duration) string { return time.Now().UTC().Add(d).Format("2006-01-02") }
@@ -90,7 +90,7 @@ func TestJurisdictionDecision_EstablishmentsAndRegistrationsSelectAndUnusableFac
 	}
 
 	// An establishment was not in force before it began, and a later deactivation does not rewrite the past.
-	r = decide(t, e, tenant, body(map[string]any{"establishment_id": estID, "effective_at": time.Now().UTC().Add(-66 * time.Hour).Format(time.RFC3339)}), 422)
+	r = decide(t, e, tenant, body(map[string]any{"establishment_id": estID, "effective_at": time.Now().UTC().Add(-73 * time.Hour).Format(time.RFC3339)}), 422)
 	assert.Equal(t, "FACT_NOT_USABLE", determination(r)["outcome"])
 	applyFact(t, tenant, entity, domain.FactRow{FactKind: domain.FactEstablishment, FactID: estID, AddressID: addr, Status: "INACTIVE", EffectiveDate: day(24 * time.Hour), ObjectVersion: 3})
 	decide(t, e, tenant, body(map[string]any{"establishment_id": estID}), 200)
