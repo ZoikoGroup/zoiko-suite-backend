@@ -237,7 +237,7 @@ func envelopePolicy() svcenvelope.Policy {
 		switch r.URL.Path {
 		case "/healthz", "/readyz", "/health", CRLPath:
 			return true
-		case "/v1/mtls/certificates":
+		case "/v1/mtls/certificates", "/v1/mtls/certificates/csr":
 			return r.Method == http.MethodPost && r.Header.Get(bootstrapHeader) != ""
 		}
 		return false
@@ -655,8 +655,19 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
+	// A service bootstrapping its own first certificate has no principal to present (the same PKI bootstrap
+	// problem ProvisionCert solves): a valid bootstrap token authenticates it as the ONE service the token was
+	// issued to, and the CSR must then name that service. An unrecognised token is refused outright.
+	principalID, bootstrapService := "", ""
+	if presented := r.Header.Get(bootstrapHeader); presented != "" {
+		service, found := h.bootstrap.serviceFor(presented)
+		if !found {
+			h.logger.Warn("mtls: bootstrap token presented for a CSR but not recognised: refused")
+			h.errJSONCode(w, r, http.StatusUnauthorized, "invalid_bootstrap_token", "the bootstrap token is not valid for any service")
+			return
+		}
+		bootstrapService, principalID = service, "bootstrap:"+service
+	} else if principalID, ok = h.requirePrincipal(w, r); !ok {
 		return
 	}
 
@@ -682,8 +693,16 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 		h.errJSON(w, r, 400, "legal_entity_id is required")
 		return
 	}
-	// Same decision as ProvisionCert: at the legal entity the certificate is for.
-	if !h.authorize(w, r, principalID, req.LegalEntityID, MtlsCertProvision) {
+	if bootstrapService != "" {
+		if req.ServiceName != bootstrapService {
+			h.logger.Warn("mtls: bootstrap token used for another identity in a CSR: refused",
+				zap.String("token_service", bootstrapService), zap.String("service_name", req.ServiceName))
+			h.errJSONCode(w, r, http.StatusForbidden, "bootstrap_identity_mismatch",
+				"a bootstrap token provisions only its own service: service_name must be "+bootstrapService)
+			return
+		}
+	} else if !h.authorize(w, r, principalID, req.LegalEntityID, MtlsCertProvision) {
+		// Same decision as ProvisionCert: at the legal entity the certificate is for.
 		return
 	}
 	if req.RotationDays <= 0 {
