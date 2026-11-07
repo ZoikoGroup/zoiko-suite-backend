@@ -83,7 +83,7 @@ Delegated authority	kb-delegated-authority|kb-delegations-console	Can a delegati
 Reporting	kb-intelligence-reporting	What reporting does ZoikoSuite have?
 Reporting	kb-intelligence-reporting	What does Intelligence and Reporting do?
 Reporting	kb-intelligence-reporting	Does ZoikoSuite give recommendations?
-Reporting	kb-intelligence-reporting|kb-console-overview	Is there a dashboard?
+Reporting	kb-intelligence-reporting|kb-console-overview|kb-platform-console	Is there a dashboard?
 Reporting	kb-console-overview	What is the Executive Dashboard?
 Security	kb-security-trust|kb-identity-foundation|kb-access-settings-console	How does ZoikoSuite keep data secure?
 Security	kb-security-trust|kb-identity-context|kb-access-settings-console	Does ZoikoSuite support single sign-on?
@@ -167,3 +167,34 @@ Tax page	kb-tax-console	what is the VAT GST engine
 Tax page	kb-tax-console	what is the tax governance process flow
 Tax page	kb-tax-console	what is the jurisdiction overview
 Tax page	kb-tax-console	how is net VAT payable calculated
+Tax page	kb-tax-console	what is the Live VAT GST returns register
+Tax page	kb-tax-console	what is Corporate & Withholding Tax
+Tax page	kb-tax-console	what are withholding tax obligations
+Tax page	kb-tax-console	what is Filing Preparation & Authority Interfaces
+Tax page	kb-tax-console	how do I test a tax authority connection
+Compliance page	kb-compliance-console	how do I create a new statutory filing
+Compliance page	kb-compliance-console	how do I evaluate compliance
+Compliance page	kb-compliance-console	how do I upload an evidence manifest
+Compliance page	kb-compliance-console	what is the statutory compliance governance flow
+Compliance page	kb-compliance-console	what are anomaly detection signals
+Compliance page	kb-compliance-console	what is the Decision Support & Audit Readiness Checklist
+Intelligence page	kb-intelligence-console	what is the intelligence pipeline
+Intelligence page	kb-intelligence-console	what is real-time anomaly detection
+Intelligence page	kb-intelligence-console	what is predictive forecasting
+Intelligence page	kb-intelligence-console	what is reconciliation intelligence
+Intelligence page	kb-intelligence-console	what is decision support
+Intelligence page	kb-intelligence-console	what is migration integrity
+Security page	kb-security-console	how do I issue an mTLS certificate
+Security page	kb-security-console	how do I rotate the active key
+Security page	kb-security-console	what is CARTA zero trust
+Security page	kb-security-console	how do I evaluate a test subject
+Security page	kb-security-console	what is the SIEM threat feed
+Security page	kb-security-console	what is the cryptographic trust chain
+Security page	kb-security-console	what is the action risk registry
+Integration page	kb-integration-console	how do I add a connection
+Integration page	kb-integration-console	how do I sync all feeds
+Integration page	kb-integration-console	what is the Connectivity API Bridge
+Integration page	kb-integration-console	what is HRIS Directory Sync
+Integration page	kb-integration-console|kb-integrations	what are External Market Feeds
+Service Inputs page	kb-platform-console	what is the Service Input & Execution Console
+Service Inputs page	kb-platform-console	how do I execute all services

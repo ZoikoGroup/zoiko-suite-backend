@@ -221,7 +221,7 @@ var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|paymen
 	`|jurisdictions?(?: and rules)?|rule packs?|governance log|polic(?:y|ies)|obligations?|authori[sz]ation|segregation of duties|workflows?(?: and approvals)?|executive dashboard|domain health|dashboard|filing requirements?|evidence requirements?|requirement catalog|no_requirements_defined|journals?|statement lines?|reconciliation)\b`)
 
 // areaDefinitionRe asks what a console area is or does.
-var areaDefinitionRe = regexp.MustCompile(`(?i)^\s*(?:what\s+(?:is|are|does)|what's|explain|describe|define|tell me about|use of|how does)\s+(?:the\s+)?(?:domain health|executive dashboard|dashboards?|governance log)\b`)
+var areaDefinitionRe = regexp.MustCompile(`(?i)^\s*(?:what\s+(?:is|are|does)|what's|explain|describe|define|tell me about|use of|how does)\s+(?:the\s+)?(?:domain health|executive dashboard|dashboards?|governance log|service inputs?)\b`)
 
 // ownDataRe names the visitor's own data.
 var ownDataRe = regexp.MustCompile(`(?i)\b(?:my|our|mine|ours)\b`)

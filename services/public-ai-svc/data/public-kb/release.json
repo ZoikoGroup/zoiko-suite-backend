@@ -189,6 +189,11 @@
                                            "temporary",
                                            "password"
                                        ],
+                     "decision support":  [
+                                             "recommendations",
+                                             "impact",
+                                             "analyses"
+                                         ],
                      "logs":  [
                                   "evidence",
                                   "records"

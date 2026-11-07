@@ -114,3 +114,29 @@ To look up a VAT return:
 ## How net VAT payable is calculated
 
 Net VAT payable is output tax minus input tax: the tax collected on sales minus the tax paid on purchases. For example, output tax of 100000 and input tax of 40000 give a net tax payable of 60000.
+
+## Live VAT / GST Returns Register
+
+The Live VAT / GST Returns Register lists every VAT and GST return with its period, tax registration number, output against input tax, net payable, who filed it and its status: DRAFT, FILED or ACCEPTED. A draft offers **Quick File**, which files it in one step, and every return offers **Audit**, which opens its record and audit lineage.
+
+## Corporate & Withholding Tax
+
+Corporate & Withholding Tax shows corporate income tax returns and withholding tax obligations. Each corporate income tax return runs from gross revenue, less deductions, to taxable income, the tax at the applicable rate, less credits, to net tax payable and the balance due, with its status such as DRAFT or SUBMITTED.
+
+## Withholding tax obligations
+
+Withholding tax obligations list tax withheld at source on payments such as dividends and royalties: the payment reference, type, gross amount, rate, amount withheld, whether a tax treaty applies, and the status, such as CALCULATED or REMITTED.
+
+## Filing Preparation & Authority Interfaces
+
+Filing Preparation & Authority Interfaces shows filing preparation drafts and the connections to tax authorities. Each draft has its filing type (such as VAT100_MTD or US_FORM_1120), period, due date with a countdown or overdue warning, readiness (not started, half-way or ready to file) and validation status (UNVALIDATED, PREPARED or FINALIZED).
+
+## Tax authority connections
+
+Tax authority connections are the secure links used to file with each authority, such as HMRC Making Tax Digital, the US IRS, the Inland Revenue Authority of Singapore and Germany's ELSTER. Each shows its protocol, authentication type (such as OAuth2 or certificate), endpoint and status.
+To test a tax authority connection:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Tax & Compliance**, then select **Tax**.
+3. Scroll to **Filing Preparation & Authority Interfaces**.
+4. In **Tax Authority Connections**, find the authority.
+5. Select **Test** on its row.
