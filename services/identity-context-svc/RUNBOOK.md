@@ -495,3 +495,12 @@ To mint a secret: `openssl rand -base64 32`, then store
 TOTP is not phishing-resistant. It is the interim high-assurance factor
 pending Security's approval (ZS-IAM-001 §31, "session assurance taxonomy") and
 a WebAuthn factor.
+
+## Ingress binding refresh (S1-B3)
+
+A binding that is missing, STALE or INVALIDATED is re-read from tenant-entity-registry-svc (`GET /v1/resolve-tenant`) the next time
+a request arrives on that host, then written fresh, corrected, or deactivated to match the registry. `INGRESS_BINDING_REFRESH_SECONDS`
+(default 30) is the least time between re-reads of one host; 0 turns refresh off and bindings stay as seeded. At most 20 registry
+reads a second are made across all hosts. If the registry cannot answer, nothing changes: a STALE binding is still admitted, an
+INVALIDATED one is refused under the strict policy. After `RefreshTenantContextCache` the first request per host revalidates
+against the registry. The registry has no binding revision number, so `source_version` reads `registry:resolve-tenant:<lifecycle>@<time>`.

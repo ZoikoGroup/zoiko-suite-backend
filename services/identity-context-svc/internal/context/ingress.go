@@ -106,6 +106,8 @@ type IngressChecker struct {
 	bindings IngressBindingReader
 	policy   IngressPolicy
 	log      *zap.Logger
+	// refresh re-reads missing, STALE and INVALIDATED bindings from the registry (S1-B3). Nil leaves the old behaviour.
+	refresh *ingressRefresher
 
 	// bindingTTL is how long a refreshed binding stays FRESH. Zero disables
 	// the staleness bound, which is the default: inventing a TTL would start
@@ -189,6 +191,7 @@ func (c *IngressChecker) Evaluate(ctx context.Context, ingress, claimedTenantID 
 			zap.String("ingress", ingress), zap.Error(err))
 		return IngressDecision{}, ErrUpstreamUnavailable
 	}
+	binding, _ = c.refreshed(ctx, ingress, binding)
 
 	if binding == nil {
 		if c.policy == IngressPolicyStrict {

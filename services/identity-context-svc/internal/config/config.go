@@ -201,6 +201,10 @@ type Config struct {
 	// reads for non-material queries — so this default labels, it does not
 	// refuse. Zero disables staleness.
 	IngressBindingTTLSeconds int
+
+	// IngressBindingRefreshSeconds is the least time between registry re-reads of one ingress binding that is missing,
+	// STALE or INVALIDATED (S1-B3). Zero turns refresh off and leaves bindings as seeded.
+	IngressBindingRefreshSeconds int
 }
 
 type DBConfig struct {
@@ -432,6 +436,7 @@ func Load() (*Config, error) {
 		OutboxRelayPollMillis:         envInt("OUTBOX_RELAY_POLL_MILLIS", 1000),
 		SupportReviewIntervalMinutes:  envInt("SUPPORT_REVIEW_INTERVAL_MINUTES", 60),
 		IngressBindingTTLSeconds:      envInt("INGRESS_BINDING_TTL_SECONDS", 24*60*60),
+		IngressBindingRefreshSeconds:  envInt("INGRESS_BINDING_REFRESH_SECONDS", 30),
 	}
 
 	// Lockout must actually bound guessing. A zero or negative threshold would
