@@ -34,14 +34,15 @@ The Screening register lists every check for your organization, newest first: ea
 
 ## Spend controls
 
-Spend controls set the limits a purchase is checked against, per category and currency.
+Spend controls set spend limits per category and currency. A spend limit applies to one category on one legal entity, per transaction or over a calendar month or year.
 To set a spend limit:
 1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
 2. In the left menu, open **Legal, Corporate & Commercial**, then select **Commercial Ops**.
 3. Go to **Spend controls**.
-4. Enter the **Category**, the **Enforcement window**, the **Limit** and the **Currency**.
-5. Select **Set limit**.
-Limits in force lists the limits that currently apply.
+4. Enter the **Category** (such as PROCUREMENT) and choose the **Enforcement window**, such as per calendar month.
+5. Enter the spend **Limit**, which must be greater than zero, and the **Currency**.
+6. Select **Set limit**.
+A second limit for the same category replaces the first, and the old one stays on record. Spends must use the limit's currency, because nothing is converted.
 
 ## Check a spend before committing it
 
@@ -84,3 +85,33 @@ To read an order's amendments:
 3. Go to the **Amendment ledger**.
 4. Enter the **Purchase order ID**.
 Nothing in the ledger can be edited or deleted.
+
+## Limits in force
+
+Limits in force lists every spend limit with what has been committed against it. Enforcement is atomic, so simultaneous checks cannot all use the same remaining budget.
+To see the limits in force:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Legal, Corporate & Commercial**, then select **Commercial Ops**.
+3. Go to **Limits in force**.
+4. Enter a **Category**, or leave it blank for all.
+5. Select **Filter limits**.
+
+## Procurement Cases
+
+A procurement case tracks one purchase from a spend-checked request through approval to the purchase order.
+To open a procurement case:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Legal, Corporate & Commercial**, then select **Commercial Ops**.
+3. Go to **Procurement Cases**.
+4. Enter **What is being procured**, the **Spend category** (such as SOFTWARE), the **Amount** and the **Currency**.
+5. Optionally add the **Vendor profile ID**.
+6. Select **Open case**.
+The case is checked against the category's spend limit straight away; over the limit it lands SPEND_BLOCKED. A case is then approved, or rejected with a reason.
+
+## Procurement & Commercial Execution Flow
+
+Commercial Ops runs its controls in this order: purchase requisition, counterparty screening, spend control check, purchase order issued, then a 3-way match and payment. Screening the counterparty and checking the limit both come before the commitment.
+
+## Invoice approval and 3-way match
+
+Invoice approval performs a 3-way match between the purchase order, the goods receipt and the supplier invoice before payment is released. On the Commercial Ops page this step is shown in the flow but is not yet connected to the console.

@@ -32,6 +32,14 @@ func TestHowToAnswersAreSteps(t *testing.T) {
 		"how do I provision a tenant":             "**Tenants & Entities**",
 		"how do I draft a contract":               "**Legal & Contracts**",
 		"how do I send a notification":            "**Notifications**",
+		"how do I create a VAT return":            "**Tax**",
+		"how do I create a tax rule":              "**Tax**",
+		"how do I assemble a filing":              "**Tax**",
+		"how do I create a contract":              "**Legal & Contracts**",
+		"how do I propose a resolution":           "**Legal & Contracts**",
+		"how do I open a procurement case":        "**Commercial Ops**",
+		"how do I set a spend limit":              "**Commercial Ops**",
+		"how do I cancel a purchase request":      "**Purchase Requests**",
 	} {
 		r := x.env.Pipeline.Answer(ctx, inputFor(q))
 		if r.Status != contract.Answered {
