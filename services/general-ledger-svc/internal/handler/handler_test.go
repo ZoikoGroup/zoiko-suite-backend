@@ -352,7 +352,7 @@ func (s *stubStore) claimCommand(tenantID, idempotencyKey, command, accountCode 
 // version is enforced, a new version is appended, and the head row advances.
 // An Idempotency-Key already claimed by this command and account replays the
 // account instead of appending a second version.
-func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidence []string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
+func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidence []string, sourcePolicyRef string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
 	if s.amendAccountErr != nil {
 		return nil, nil, false, s.amendAccountErr
 	}
@@ -394,7 +394,7 @@ func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode
 			ChangeID: "change-" + fmt.Sprint(len(s.accountChanges)+1), TenantID: tenantID,
 			AccountID: cur.AccountID, AccountCode: accountCode, ChangeKind: domain.AccountChangeKindAmended,
 			ExpectedVersion: cur.Version, Amendment: &updated, EffectiveFrom: effectiveFrom,
-			Reason: reason, EvidenceRefs: evidence, Status: domain.AccountChangeStatusPending,
+			Reason: reason, EvidenceRefs: evidence, SourcePolicyRef: sourcePolicyRef, Status: domain.AccountChangeStatusPending,
 			ProposedAt: time.Now().UTC(), ProposedByPrincipalID: principalID,
 		}
 		s.accountChanges[change.ChangeID] = change
@@ -464,7 +464,7 @@ func (s *stubStore) GetAccountAsOf(_ context.Context, tenantID, accountCode stri
 // date is refused before any version is written. An Idempotency-Key already
 // claimed by this command and account replays the account instead of
 // appending a second version.
-func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
+func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, sourcePolicyRef string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
 	if replay, acct, ok, err := s.replayCommand(tenantID, idempotencyKey, commandStubReparentAccount, accountCode); err != nil {
 		return nil, nil, false, err
 	} else if ok {
@@ -533,7 +533,7 @@ func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, id
 			ChangeID: "change-" + fmt.Sprint(len(s.accountChanges)+1), TenantID: tenantID,
 			AccountID: a.AccountID, AccountCode: accountCode, ChangeKind: domain.AccountChangeKindReparented,
 			ExpectedVersion: a.Version, NewParentAccountID: parentAccountID, EffectiveFrom: effective,
-			Reason: reason, EvidenceRefs: evidence, Status: domain.AccountChangeStatusPending,
+			Reason: reason, EvidenceRefs: evidence, SourcePolicyRef: sourcePolicyRef, Status: domain.AccountChangeStatusPending,
 			ProposedAt: time.Now().UTC(), ProposedByPrincipalID: principalID,
 		}
 		s.accountChanges[change.ChangeID] = change

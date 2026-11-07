@@ -47,7 +47,7 @@ func TestPgStore_ReparentControlAccount_RequiresApproval(t *testing.T) {
 	}
 
 	moved, pending, _, err := s.ReparentAccount(ctx, tenantID, "1000", uuid.NewString(),
-		&newParent.AccountID, 1, time.Time{}, "moving bank suspense", nil, "preparer-1")
+		&newParent.AccountID, 1, time.Time{}, "moving bank suspense", nil, "", "preparer-1")
 	if err != nil {
 		t.Fatalf("ReparentAccount: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestPgStore_ReparentOntoControlAccountParent_RequiresApproval(t *testing.T)
 	// is — still material under the spec's own "control-account ... change"
 	// wording, since it changes what rolls up under the control account.
 	_, pending, _, err := s.ReparentAccount(ctx, tenantID, "7000", uuid.NewString(),
-		&controlParent.AccountID, 1, time.Time{}, "folding into clearing", nil, "preparer-1")
+		&controlParent.AccountID, 1, time.Time{}, "folding into clearing", nil, "", "preparer-1")
 	if err != nil {
 		t.Fatalf("ReparentAccount: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestPgStore_AmendControlAccount_RequiresApproval(t *testing.T) {
 	updates := *receivable
 	updates.AccountName = "Trade Receivables Control"
 	unchanged, pending, _, err := s.AmendAccountVersion(ctx, tenantID, "1200", uuid.NewString(),
-		1, time.Now().UTC(), &updates, "renaming for clarity", nil, "preparer-1")
+		1, time.Now().UTC(), &updates, "renaming for clarity", nil, "", "preparer-1")
 	if err != nil {
 		t.Fatalf("AmendAccountVersion: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestPgStore_ApproveAccountChange_StaleVersionConflict(t *testing.T) {
 	}
 
 	_, pending, _, err := s.ReparentAccount(ctx, tenantID, "1000", uuid.NewString(),
-		&parent.AccountID, 1, time.Time{}, "moving cash", nil, "preparer-1")
+		&parent.AccountID, 1, time.Time{}, "moving cash", nil, "", "preparer-1")
 	if err != nil {
 		t.Fatalf("ReparentAccount: %v", err)
 	}
@@ -237,18 +237,18 @@ func TestPgStore_MaterialChange_RequiresReason(t *testing.T) {
 	}
 
 	if _, _, _, err := s.ReparentAccount(ctx, tenantID, "1000", uuid.NewString(),
-		&parent.AccountID, 1, time.Time{}, "", nil, "preparer-1"); !errors.Is(err, domain.ErrAccountChangeReasonRequired) {
+		&parent.AccountID, 1, time.Time{}, "", nil, "", "preparer-1"); !errors.Is(err, domain.ErrAccountChangeReasonRequired) {
 		t.Fatalf("expected ErrAccountChangeReasonRequired for a blank reason, got %v", err)
 	}
 	if _, _, _, err := s.ReparentAccount(ctx, tenantID, "1000", uuid.NewString(),
-		&parent.AccountID, 1, time.Time{}, "   ", nil, "preparer-1"); !errors.Is(err, domain.ErrAccountChangeReasonRequired) {
+		&parent.AccountID, 1, time.Time{}, "   ", nil, "", "preparer-1"); !errors.Is(err, domain.ErrAccountChangeReasonRequired) {
 		t.Fatalf("expected ErrAccountChangeReasonRequired for a whitespace-only reason, got %v", err)
 	}
 
 	updates := *cash
 	updates.AccountName = "Petty Cash"
 	if _, _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", uuid.NewString(),
-		1, time.Now().UTC(), &updates, "", nil, "preparer-1"); !errors.Is(err, domain.ErrAccountChangeReasonRequired) {
+		1, time.Now().UTC(), &updates, "", nil, "", "preparer-1"); !errors.Is(err, domain.ErrAccountChangeReasonRequired) {
 		t.Fatalf("expected ErrAccountChangeReasonRequired for a blank amendment reason, got %v", err)
 	}
 
@@ -261,8 +261,47 @@ func TestPgStore_MaterialChange_RequiresReason(t *testing.T) {
 	ordinaryUpdates := *ordinary
 	ordinaryUpdates.AccountName = "Office Supplies (renamed)"
 	if _, pending, _, err := s.AmendAccountVersion(ctx, tenantID, "7000", uuid.NewString(),
-		1, time.Now().UTC(), &ordinaryUpdates, "", nil, "preparer-1"); err != nil || pending != nil {
+		1, time.Now().UTC(), &ordinaryUpdates, "", nil, "", "preparer-1"); err != nil || pending != nil {
 		t.Fatalf("an ordinary account's amendment must not require a reason, got pending=%v err=%v", pending, err)
+	}
+}
+
+// SPEC_DEVIATIONS A8/B18: source_policy_ref is optional, free-text, and
+// round-trips from the proposal through the pending approval to the final
+// account_versions row once approved.
+func TestPgStore_SourcePolicyRef_RoundTrips(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	cash := newControlAccount(tenantID, "1000", "Cash")
+	if err := s.CreateAccount(ctx, cash); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	parent := newTestAccount(tenantID, "1900", "Other Assets")
+	if err := s.CreateAccount(ctx, parent); err != nil {
+		t.Fatalf("CreateAccount(parent): %v", err)
+	}
+
+	_, pending, _, err := s.ReparentAccount(ctx, tenantID, "1000", uuid.NewString(),
+		&parent.AccountID, 1, time.Time{}, "moving cash", nil, "GOV-POLICY-2026-11-07", "preparer-1")
+	if err != nil {
+		t.Fatalf("ReparentAccount: %v", err)
+	}
+	if pending.SourcePolicyRef != "GOV-POLICY-2026-11-07" {
+		t.Fatalf("expected source_policy_ref to round-trip onto the pending change, got %q", pending.SourcePolicyRef)
+	}
+
+	if _, _, err := s.ApproveAccountChange(ctx, tenantID, pending.ChangeID, "approver-1", uuid.NewString()); err != nil {
+		t.Fatalf("ApproveAccountChange: %v", err)
+	}
+	version, err := s.GetAccountAsOf(ctx, tenantID, "1000", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GetAccountAsOf: %v", err)
+	}
+	if version.SourcePolicyRef != "GOV-POLICY-2026-11-07" {
+		t.Fatalf("expected source_policy_ref to round-trip onto the applied account_versions row, got %q", version.SourcePolicyRef)
 	}
 }
 

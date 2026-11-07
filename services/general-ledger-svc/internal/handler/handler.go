@@ -55,10 +55,10 @@ type Store interface {
 	CreateAccount(ctx context.Context, a *domain.Account) error
 	GetAccountByCode(ctx context.Context, tenantID, accountCode string) (*domain.Account, error)
 	ListAccounts(ctx context.Context, tenantID string) ([]domain.Account, error)
-	AmendAccountVersion(ctx context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error)
+	AmendAccountVersion(ctx context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, sourcePolicyRef string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error)
 	ActivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 	DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
-	ReparentAccount(ctx context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error)
+	ReparentAccount(ctx context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, sourcePolicyRef string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error)
 	GetAccountAsOf(ctx context.Context, tenantID, accountCode string, asOf time.Time) (*domain.AccountVersion, error)
 
 	// ApproveAccountChange/GetAccountChangeApproval are ACC-01's maker-checker
@@ -1075,7 +1075,7 @@ func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
 		effectiveFrom = req.EffectiveFrom.Time
 	}
 	result, pending, replay, err := h.store.AmendAccountVersion(r.Context(), tenantID, accountCode, idempotencyKey,
-		req.ExpectedVersion, effectiveFrom, &updated, req.Reason, req.EvidenceRefs, principalID)
+		req.ExpectedVersion, effectiveFrom, &updated, req.Reason, req.EvidenceRefs, req.SourcePolicyRef, principalID)
 	if err != nil {
 		if h.writeAccountVersionErr(w, err) {
 			return
@@ -1339,7 +1339,7 @@ func (h *Handler) ReparentAccount(w http.ResponseWriter, r *http.Request) {
 		effectiveFrom = req.EffectiveFrom.Time
 	}
 	updated, pending, replay, err := h.store.ReparentAccount(r.Context(), tenantID, accountCode, idempotencyKey,
-		req.ParentAccountID, req.ExpectedVersion, effectiveFrom, req.Reason, req.EvidenceRefs, principalID)
+		req.ParentAccountID, req.ExpectedVersion, effectiveFrom, req.Reason, req.EvidenceRefs, req.SourcePolicyRef, principalID)
 	if err != nil {
 		if h.writeAccountVersionErr(w, err) {
 			return

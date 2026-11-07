@@ -495,8 +495,15 @@ type AccountVersion struct {
 	ChangeKind              string      `json:"change_kind"`
 	ChangeReason            string      `json:"change_reason,omitempty"`
 	EvidenceRefs            []string    `json:"evidence_refs,omitempty"`
-	CreatedAt               time.Time   `json:"created_at"`
-	CreatedByPrincipalID    string      `json:"created_by_principal_id"`
+	// SourcePolicyRef is ACC-01's evidence/lineage "source policy" (A8/B18):
+	// an optional, caller-supplied free-text reference to whatever governance
+	// policy or workflow authorized this change. The spec names it but gives
+	// it no shape, so this is a free-text reference, the same posture
+	// EvidenceRefs already takes, not a foreign key into a policy table this
+	// service has no model for.
+	SourcePolicyRef      string    `json:"source_policy_ref,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
 
 // Account change approval lifecycle (SPEC_DEVIATIONS A4/B16): ACC-01's SoD
@@ -533,6 +540,7 @@ type AccountChangeApproval struct {
 	EffectiveFrom         time.Time  `json:"effective_from"`
 	Reason                string     `json:"reason,omitempty"`
 	EvidenceRefs          []string   `json:"evidence_refs,omitempty"`
+	SourcePolicyRef       string     `json:"source_policy_ref,omitempty"`
 	Status                string     `json:"status"`
 	ProposedAt            time.Time  `json:"proposed_at"`
 	ProposedByPrincipalID string     `json:"proposed_by_principal_id"`
@@ -558,6 +566,7 @@ type AmendAccountVersionRequest struct {
 	DirectPostingRestricted *bool          `json:"direct_posting_restricted,omitempty"`
 	Reason                  string         `json:"reason,omitempty"`
 	EvidenceRefs            []string       `json:"evidence_refs,omitempty"`
+	SourcePolicyRef         string         `json:"source_policy_ref,omitempty"`
 }
 
 // ActivateAccountRequest and DeactivateAccountRequest are the optional request
@@ -672,6 +681,7 @@ type ReparentAccountRequest struct {
 	EffectiveFrom      *EffectiveDate `json:"effective_from,omitempty"`
 	Reason             string         `json:"reason,omitempty"`
 	EvidenceRefs       []string       `json:"evidence_refs,omitempty"`
+	SourcePolicyRef    string         `json:"source_policy_ref,omitempty"`
 }
 
 // UnmarshalJSON accepts both parent_account_id and new_parent_account_id and

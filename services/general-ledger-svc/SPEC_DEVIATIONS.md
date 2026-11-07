@@ -19,13 +19,13 @@ B14.
 
 Overall: all nine named commands/queries now exist with real guards (cycles,
 optimistic version checks, append-only version history, half-open effective
-intervals) and tests. Lifecycle events (A5), maker-checker (A4) and a
-mandatory reason (A8) for material control-account/hierarchy changes are
-closed; what remains missing is structural: the account has no
-legal-entity/book dimension (A1), no Draft→Approved state (A3) outside the
-gated path, and evidence/source policy are still optional or absent. Those
-and the rest are A1–A15, recorded rather than guessed. The deliberate design
-decisions a reviewer may want to reverse are B1–B17.
+intervals) and tests. Lifecycle events (A5), maker-checker (A4), mandatory
+reason for material control-account/hierarchy changes, and an optional
+source_policy_ref (A8) are closed; what remains missing is structural: the
+account has no legal-entity/book dimension (A1), no Draft→Approved state (A3)
+outside the gated path, and evidence_refs is still optional everywhere.
+Those and the rest are A1–A15, recorded rather than guessed. The deliberate design
+decisions a reviewer may want to reverse are B1–B18.
 
 ## A. Not implemented / weaker than the spec
 
@@ -117,25 +117,28 @@ decisions a reviewer may want to reverse are B1–B17.
   period was already hard-closed would pass). Revisit when entity/book and a
   period service exist.
 - **A8. Reason and evidence are optional, and no source policy is retained. —
-  `reason` closed 2026-11-07 for material changes (B16); otherwise still
-  open.** §"Evidence / lineage": "Exact account version, approver, reason,
-  effective dates and source policy retained with every material change."
-  Every version row retains version number, effective interval, actor and
-  timestamp. `reason` is now **required**, refused with
+  `reason` closed for material changes (B17); `source_policy_ref` now
+  captured, optional, everywhere (B18); `evidence_refs` optionality remains
+  open (2026-11-07).** §"Evidence / lineage": "Exact account version,
+  approver, reason, effective dates and source policy retained with every
+  material change." Every version row retains version number, effective
+  interval, actor and timestamp. `reason` is now **required**, refused with
   `ErrAccountChangeReasonRequired`, on exactly the same gate A4/B16 already
   defines as "material" — a control account on either side of a reparent or
   amendment — the one place this codebase has a formal definition of
   "material change"; it stays optional everywhere else (an ordinary account's
   change, or Create/Activate/Deactivate, none of which the spec's SoD/evidence
-  lines name as material). `evidence_refs` remains optional everywhere,
-  including on the gated path, and `source_policy` is still not captured at
-  all, even as an optional field — its shape is undefined by the spec (no
-  wireframe gives it a type), so inventing one was judged speculative rather
-  than a real gap-fill; approver is covered for the gated path by A4's
-  `account_change_approvals.approved_by_principal_id`. Making `reason`/
-  `evidence_refs` mandatory for every one of the five commands (not just the
-  gated path) would be a breaking change for every existing caller, not a
-  silent addition, and remains open.
+  lines name as material). `source_policy_ref` is a new optional, free-text
+  column on `account_versions`/`account_change_approvals` (migration 000032):
+  the spec names "source policy" but gives it no shape, so this is a
+  reference string a caller supplies, the same posture `evidence_refs`
+  already takes, not a foreign key into a policy table this service has no
+  model for; approver is covered for the gated path by A4's
+  `account_change_approvals.approved_by_principal_id`. `evidence_refs`
+  remains optional everywhere, including the gated path — making it
+  mandatory too would need the same gated-path treatment `reason` just got,
+  not a platform-wide requirement; recorded as still open rather than
+  bundled in without its own review.
 - **A9. Unregistered account codes remain postable.** Failure semantics say
   "Inactive/non-posting/control-restricted account blocks posting", but ACC-04
   deliberately lets codes the chart has never seen post (the bootstrap gap —
@@ -525,3 +528,22 @@ decisions a reviewer may want to reverse are B1–B17.
     whitespace-only reason is refused on both `ReparentAccount` and
     `AmendAccountVersion` for a control account; an ordinary account's
     amendment with no reason still applies immediately, unaffected).
+- **B18. `source_policy_ref` is a free-text reference, captured on every
+  reparent/amendment, not only the gated path (2026-11-07).** Unlike `reason`
+  (B17), nothing here gates whether `source_policy_ref` may be supplied —
+  it's accepted and stored on `ReparentAccount`/`AmendAccountVersion`
+  regardless of materiality, landing on the pending `AccountChangeApproval`
+  for a gated change or directly on the new `account_versions` row otherwise.
+  It is never required; `Create`/`Activate`/`Deactivate` do not accept it,
+  matching reason/evidence's existing scope to the four commands that produce
+  a version with a story behind it.
+  - *Why free text, not a typed reference:* the spec's wireframe gives
+    "source policy" no type and no referenced entity — this service has no
+    policy/workflow table to point a foreign key at, and inventing one here
+    would be designing a different capability's data model, not filling
+    ACC-01's own gap.
+  - *Verification:* `internal/store/acc01_maker_checker_integration_test.go`
+    — `TestPgStore_SourcePolicyRef_RoundTrips` (real Postgres: a
+    `source_policy_ref` supplied on `ReparentAccount` appears on the pending
+    `AccountChangeApproval` immediately, and on the `account_versions` row
+    once `ApproveAccountChange` applies it).

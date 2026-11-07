@@ -1230,7 +1230,8 @@ func scanAccount(row pgx.Row) (*domain.Account, error) {
 const accountVersionColumns = `account_version_id, tenant_id, account_id, account_code,
 	version, account_name, account_type, parent_account_id, is_control_account,
 	direct_posting_restricted, status, effective_from, effective_to, change_kind,
-	COALESCE(change_reason, ''), evidence_refs, created_at, created_by_principal_id`
+	COALESCE(change_reason, ''), evidence_refs, created_at, created_by_principal_id,
+	COALESCE(source_policy_ref, '')`
 
 func scanAccountVersion(row pgx.Row) (*domain.AccountVersion, error) {
 	var v domain.AccountVersion
@@ -1240,6 +1241,7 @@ func scanAccountVersion(row pgx.Row) (*domain.AccountVersion, error) {
 		&v.Version, &v.AccountName, &accountType, &v.ParentAccountID, &v.IsControlAccount,
 		&v.DirectPostingRestricted, &v.Status, &v.EffectiveFrom, &v.EffectiveTo, &v.ChangeKind,
 		&v.ChangeReason, &v.EvidenceRefs, &v.CreatedAt, &v.CreatedByPrincipalID,
+		&v.SourcePolicyRef,
 	); err != nil {
 		return nil, err
 	}
@@ -1256,12 +1258,14 @@ func insertAccountVersion(ctx context.Context, tx pgx.Tx, v *domain.AccountVersi
 			account_version_id, tenant_id, account_id, account_code, version,
 			account_name, account_type, parent_account_id, is_control_account,
 			direct_posting_restricted, status, effective_from, effective_to,
-			change_kind, change_reason, evidence_refs, created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			change_kind, change_reason, evidence_refs, created_at, created_by_principal_id,
+			source_policy_ref
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 	`, v.AccountVersionID, v.TenantID, v.AccountID, v.AccountCode, v.Version,
 		v.AccountName, string(v.AccountType), v.ParentAccountID, v.IsControlAccount,
 		v.DirectPostingRestricted, v.Status, v.EffectiveFrom, v.EffectiveTo,
-		v.ChangeKind, nullableString(v.ChangeReason), v.EvidenceRefs, v.CreatedAt, v.CreatedByPrincipalID)
+		v.ChangeKind, nullableString(v.ChangeReason), v.EvidenceRefs, v.CreatedAt, v.CreatedByPrincipalID,
+		nullableString(v.SourcePolicyRef))
 	return mapPgError(err)
 }
 
@@ -1280,7 +1284,7 @@ func nullableString(s string) *string {
 	return &s
 }
 
-func accountVersionFromAccount(a *domain.Account, version int64, effectiveFrom time.Time, changeKind, reason, principalID string, evidence []string) *domain.AccountVersion {
+func accountVersionFromAccount(a *domain.Account, version int64, effectiveFrom time.Time, changeKind, reason, principalID string, evidence []string, sourcePolicyRef string) *domain.AccountVersion {
 	return &domain.AccountVersion{
 		AccountVersionID:        uuid.NewString(),
 		AccountID:               a.AccountID,
@@ -1297,6 +1301,7 @@ func accountVersionFromAccount(a *domain.Account, version int64, effectiveFrom t
 		ChangeKind:              changeKind,
 		ChangeReason:            reason,
 		EvidenceRefs:            evidence,
+		SourcePolicyRef:         sourcePolicyRef,
 		CreatedAt:               time.Now().UTC(),
 		CreatedByPrincipalID:    principalID,
 	}
@@ -1336,7 +1341,7 @@ func (s *PgStore) CreateAccount(ctx context.Context, a *domain.Account) error {
 			return mapPgError(err)
 		}
 		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			a, 1, a.CreatedAt, "CREATED", "initial version", a.CreatedByPrincipalID, nil)); err != nil {
+			a, 1, a.CreatedAt, "CREATED", "initial version", a.CreatedByPrincipalID, nil, "")); err != nil {
 			return err
 		}
 		return s.enqueueAccountEvent(ctx, tx, "created", tenantID, a.AccountID, a.CreatedByPrincipalID, map[string]any{
@@ -1461,7 +1466,8 @@ func readAccountForReplay(ctx context.Context, tx pgx.Tx, tenantID, accountCode 
 const accountChangeApprovalColumns = `
 	change_id, tenant_id, account_id, account_code, change_kind, expected_version,
 	new_parent_account_id, amendment, effective_from, reason, evidence_refs, status,
-	proposed_at, proposed_by_principal_id, approved_at, approved_by_principal_id`
+	proposed_at, proposed_by_principal_id, approved_at, approved_by_principal_id,
+	COALESCE(source_policy_ref, '')`
 
 func scanAccountChangeApproval(row pgx.Row) (*domain.AccountChangeApproval, error) {
 	var c domain.AccountChangeApproval
@@ -1470,6 +1476,7 @@ func scanAccountChangeApproval(row pgx.Row) (*domain.AccountChangeApproval, erro
 		&c.ChangeID, &c.TenantID, &c.AccountID, &c.AccountCode, &c.ChangeKind, &c.ExpectedVersion,
 		&c.NewParentAccountID, &amendmentJSON, &c.EffectiveFrom, &c.Reason, &c.EvidenceRefs, &c.Status,
 		&c.ProposedAt, &c.ProposedByPrincipalID, &c.ApprovedAt, &c.ApprovedByPrincipalID,
+		&c.SourcePolicyRef,
 	); err != nil {
 		return nil, err
 	}
@@ -1500,11 +1507,11 @@ func insertAccountChangeApproval(ctx context.Context, tx pgx.Tx, c *domain.Accou
 		INSERT INTO account_change_approvals (
 			change_id, tenant_id, account_id, account_code, change_kind, expected_version,
 			new_parent_account_id, amendment, effective_from, reason, evidence_refs, status,
-			proposed_at, proposed_by_principal_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'PENDING',$12,$13)
+			proposed_at, proposed_by_principal_id, source_policy_ref
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'PENDING',$12,$13,$14)
 	`, c.ChangeID, c.TenantID, c.AccountID, c.AccountCode, c.ChangeKind, c.ExpectedVersion,
 		c.NewParentAccountID, amendmentJSON, c.EffectiveFrom, nullableString(c.Reason), c.EvidenceRefs,
-		c.ProposedAt, c.ProposedByPrincipalID)
+		c.ProposedAt, c.ProposedByPrincipalID, nullableString(c.SourcePolicyRef))
 	return mapPgError(err)
 }
 
@@ -1622,7 +1629,7 @@ func (s *PgStore) ApproveAccountChange(ctx context.Context, tenantID, changeID, 
 			return err
 		}
 		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			&updated, updated.Version, change.EffectiveFrom, changeKind, change.Reason, change.ProposedByPrincipalID, change.EvidenceRefs)); err != nil {
+			&updated, updated.Version, change.EffectiveFrom, changeKind, change.Reason, change.ProposedByPrincipalID, change.EvidenceRefs, change.SourcePolicyRef)); err != nil {
 			return err
 		}
 		tag, err := tx.Exec(ctx, `
@@ -1701,6 +1708,7 @@ func (s *PgStore) AmendAccountVersion(
 	a *domain.Account,
 	reason string,
 	evidenceRefs []string,
+	sourcePolicyRef string,
 	principalID string,
 ) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
 	var out *domain.Account
@@ -1775,6 +1783,7 @@ func (s *PgStore) AmendAccountVersion(
 				EffectiveFrom:         effective,
 				Reason:                reason,
 				EvidenceRefs:          evidenceRefs,
+				SourcePolicyRef:       sourcePolicyRef,
 				Status:                domain.AccountChangeStatusPending,
 				ProposedAt:            time.Now().UTC(),
 				ProposedByPrincipalID: principalID,
@@ -1795,7 +1804,7 @@ func (s *PgStore) AmendAccountVersion(
 			return err
 		}
 		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			&updated, updated.Version, effective, "AMENDED", reason, principalID, evidenceRefs)); err != nil {
+			&updated, updated.Version, effective, "AMENDED", reason, principalID, evidenceRefs, sourcePolicyRef)); err != nil {
 			return err
 		}
 
@@ -2711,7 +2720,7 @@ func (s *PgStore) changeAccountStatus(
 			return err
 		}
 		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			&updated, updated.Version, effective, changeKind, reason, principalID, evidenceRefs)); err != nil {
+			&updated, updated.Version, effective, changeKind, reason, principalID, evidenceRefs, "")); err != nil {
 			return err
 		}
 		tag, err := tx.Exec(ctx, `
@@ -2777,6 +2786,7 @@ func (s *PgStore) ReparentAccount(
 	effectiveFrom time.Time,
 	reason string,
 	evidenceRefs []string,
+	sourcePolicyRef string,
 	principalID string,
 ) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
 	var out *domain.Account
@@ -2888,6 +2898,7 @@ func (s *PgStore) ReparentAccount(
 				EffectiveFrom:         effective,
 				Reason:                reason,
 				EvidenceRefs:          evidenceRefs,
+				SourcePolicyRef:       sourcePolicyRef,
 				Status:                domain.AccountChangeStatusPending,
 				ProposedAt:            time.Now().UTC(),
 				ProposedByPrincipalID: principalID,
@@ -2910,7 +2921,7 @@ func (s *PgStore) ReparentAccount(
 			return err
 		}
 		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			&updated, updated.Version, effective, "REPARENTED", reason, principalID, evidenceRefs)); err != nil {
+			&updated, updated.Version, effective, "REPARENTED", reason, principalID, evidenceRefs, sourcePolicyRef)); err != nil {
 			return err
 		}
 		tag, err := tx.Exec(ctx, `
