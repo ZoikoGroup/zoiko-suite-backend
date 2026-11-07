@@ -53,7 +53,7 @@ func TestPgStore_AmendAccountVersion_AppendsVersionAndAdvancesHead(t *testing.T)
 	effective := time.Now().UTC().Add(time.Minute)
 	updates := *head
 	updates.AccountName = "Cash on hand"
-	amended, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-initial", 1, effective, &updates, "renamed by finance", nil, "test-admin")
+	amended, _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-initial", 1, effective, &updates, "renamed by finance", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("AmendAccountVersion: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestPgStore_ReparentAccount_GuardsHierarchyAndLeavesPostedFactsAlone(t *tes
 
 	entriesBefore := countLedgerEntriesForAccount(t, pool, tenantID, "1010")
 
-	moved, _, err := s.ReparentAccount(ctx, tenantID, "1010", "reparent-under-assets", &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
+	moved, _, _, err := s.ReparentAccount(ctx, tenantID, "1010", "reparent-under-assets", &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("ReparentAccount: %v", err)
 	}
@@ -209,18 +209,18 @@ func TestPgStore_ReparentAccount_GuardsHierarchyAndLeavesPostedFactsAlone(t *tes
 	}
 
 	// A cycle must be refused: assets cannot become a child of its own child.
-	if _, _, err := s.ReparentAccount(ctx, tenantID, "1000", "reparent-cycle", &cash.AccountID, 1, time.Time{}, "cycle attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
+	if _, _, _, err := s.ReparentAccount(ctx, tenantID, "1000", "reparent-cycle", &cash.AccountID, 1, time.Time{}, "cycle attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
 		t.Fatalf("expected ErrAccountHierarchyCycle, got %v", err)
 	}
 	// Self-parenting is the minimal cycle.
-	if _, _, err := s.ReparentAccount(ctx, tenantID, "1000", "reparent-self", &assets.AccountID, 1, time.Time{}, "self-parent attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
+	if _, _, _, err := s.ReparentAccount(ctx, tenantID, "1000", "reparent-self", &assets.AccountID, 1, time.Time{}, "self-parent attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
 		t.Fatalf("expected ErrAccountHierarchyCycle for self-parenting, got %v", err)
 	}
 	// A hierarchy change backdated before today is refused outright, because
 	// this chart has no entity/book with which to ask a close service whether
 	// the target period is open.
 	backdated := time.Now().UTC().AddDate(0, 0, -1)
-	if _, _, err := s.ReparentAccount(ctx, tenantID, "1010", "reparent-backdated", nil, 2, backdated, "backdated", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyBackdated) {
+	if _, _, _, err := s.ReparentAccount(ctx, tenantID, "1010", "reparent-backdated", nil, 2, backdated, "backdated", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyBackdated) {
 		t.Fatalf("expected ErrAccountHierarchyBackdated, got %v", err)
 	}
 	// The refused backdated command must leave the hierarchy exactly as it was.
@@ -268,7 +268,7 @@ func TestPgStore_AmendAccountVersion_StaleExpectedVersionIsRefused(t *testing.T)
 	updates := *head
 	updates.AccountName = "Cash on hand"
 
-	if _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-stale", 99, time.Now().UTC(), &updates, "", nil, "test-admin"); !errors.Is(err, domain.ErrAccountVersionConflict) {
+	if _, _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-stale", 99, time.Now().UTC(), &updates, "", nil, "test-admin"); !errors.Is(err, domain.ErrAccountVersionConflict) {
 		t.Fatalf("expected ErrAccountVersionConflict, got %v", err)
 	}
 	head, _ = s.GetAccountByCode(ctx, tenantID, "1000")
@@ -293,7 +293,7 @@ func TestPgStore_GetAccountAsOf_ReconstructsVersionInForce(t *testing.T) {
 	amendAt := created.Add(24 * time.Hour)
 	updates := *acct
 	updates.AccountName = "Cash on hand"
-	if _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-as-of", 1, amendAt, &updates, "renamed by finance", nil, "test-admin"); err != nil {
+	if _, _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-as-of", 1, amendAt, &updates, "renamed by finance", nil, "test-admin"); err != nil {
 		t.Fatalf("AmendAccountVersion: %v", err)
 	}
 
@@ -362,7 +362,7 @@ func TestPgStore_AmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion(t 
 
 	key := "amend-retry-" + uuid.NewString()
 	effective := time.Now().UTC().Add(time.Minute)
-	first, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", key, 1, effective, &updates, "renamed by finance", nil, "test-admin")
+	first, _, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", key, 1, effective, &updates, "renamed by finance", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("AmendAccountVersion: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestPgStore_AmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion(t 
 	}
 
 	// The retry carries the same key: it replays and appends nothing.
-	retried, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", key, 1, effective, &updates, "renamed by finance", nil, "test-admin")
+	retried, _, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", key, 1, effective, &updates, "renamed by finance", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("replayed AmendAccountVersion: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestPgStore_AmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion(t 
 	})
 
 	// The same key on a different command is a conflict, not a second write.
-	if _, _, err := s.ReparentAccount(ctx, tenantID, "1000", key, nil, 0, time.Time{}, "other command", nil, "test-admin"); !errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+	if _, _, _, err := s.ReparentAccount(ctx, tenantID, "1000", key, nil, 0, time.Time{}, "other command", nil, "test-admin"); !errors.Is(err, domain.ErrIdempotencyKeyConflict) {
 		t.Fatalf("expected ErrIdempotencyKeyConflict when the key is reused for another command, got %v", err)
 	}
 
@@ -418,10 +418,10 @@ func TestPgStore_AmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion(t 
 	staleKey := "amend-refused-" + uuid.NewString()
 	stale := *head
 	stale.AccountName = "never applied"
-	if _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", staleKey, 99, time.Now().UTC(), &stale, "", nil, "test-admin"); !errors.Is(err, domain.ErrAccountVersionConflict) {
+	if _, _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", staleKey, 99, time.Now().UTC(), &stale, "", nil, "test-admin"); !errors.Is(err, domain.ErrAccountVersionConflict) {
 		t.Fatalf("expected ErrAccountVersionConflict, got %v", err)
 	}
-	corrected, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", staleKey, 2, time.Now().UTC().Add(2*time.Minute), &updates, "renamed after a refused attempt", nil, "test-admin")
+	corrected, _, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", staleKey, 2, time.Now().UTC().Add(2*time.Minute), &updates, "renamed after a refused attempt", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("retry after a refused attempt: %v", err)
 	}
@@ -449,7 +449,7 @@ func TestPgStore_ReparentAccount_IdempotencyKeyReplayDoesNotAppendVersion(t *tes
 	}
 
 	key := "reparent-retry-" + uuid.NewString()
-	first, replay, err := s.ReparentAccount(ctx, tenantID, "1010", key, &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
+	first, _, replay, err := s.ReparentAccount(ctx, tenantID, "1010", key, &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("ReparentAccount: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestPgStore_ReparentAccount_IdempotencyKeyReplayDoesNotAppendVersion(t *tes
 		t.Fatalf("expected cash under assets at version 2, got %+v", first)
 	}
 
-	retried, replay, err := s.ReparentAccount(ctx, tenantID, "1010", key, &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
+	retried, _, replay, err := s.ReparentAccount(ctx, tenantID, "1010", key, &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("replayed ReparentAccount: %v", err)
 	}
@@ -530,7 +530,7 @@ func TestPgStore_AccountLifecycle_EmitsNamedEvents(t *testing.T) {
 	if err := s.CreateAccount(ctx, parent); err != nil {
 		t.Fatalf("CreateAccount(parent): %v", err)
 	}
-	if _, _, err := s.ReparentAccount(ctx, tenantID, "7000", uuid.NewString(), &parent.AccountID, 0, time.Time{}, "moved under opex", nil, "test-admin"); err != nil {
+	if _, _, _, err := s.ReparentAccount(ctx, tenantID, "7000", uuid.NewString(), &parent.AccountID, 0, time.Time{}, "moved under opex", nil, "test-admin"); err != nil {
 		t.Fatalf("ReparentAccount: %v", err)
 	}
 	assertEvent(t, acct.AccountID, "hierarchy-changed", 1)
@@ -543,7 +543,7 @@ func TestPgStore_AccountLifecycle_EmitsNamedEvents(t *testing.T) {
 	}
 	updates := *head
 	updates.AccountName = "Office Supplies (renamed)"
-	if _, _, err := s.AmendAccountVersion(ctx, tenantID, "7000", uuid.NewString(), head.Version, time.Now().UTC().Add(time.Minute), &updates, "renamed", nil, "test-admin"); err != nil {
+	if _, _, _, err := s.AmendAccountVersion(ctx, tenantID, "7000", uuid.NewString(), head.Version, time.Now().UTC().Add(time.Minute), &updates, "renamed", nil, "test-admin"); err != nil {
 		t.Fatalf("AmendAccountVersion: %v", err)
 	}
 	assertEvent(t, acct.AccountID, "amended", 0)

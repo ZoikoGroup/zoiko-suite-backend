@@ -499,6 +499,47 @@ type AccountVersion struct {
 	CreatedByPrincipalID    string      `json:"created_by_principal_id"`
 }
 
+// Account change approval lifecycle (SPEC_DEVIATIONS A4/B16): ACC-01's SoD
+// line — "Creator cannot approve material control-account or hierarchy
+// change" — names two things a single principal must never both propose and
+// approve. ReparentAccount and AmendAccountVersion still apply ordinary
+// changes in one call exactly as before; only when a control account is on
+// either side of the change (current or proposed is_control_account true, or
+// — for a reparent — the new parent is a control account) do they instead
+// record a pending AccountChangeApproval and leave the account untouched
+// until a second, different principal calls ApproveAccountChange.
+const (
+	AccountChangeStatusPending  = "PENDING"
+	AccountChangeStatusApproved = "APPROVED"
+
+	AccountChangeKindReparented = "REPARENTED"
+	AccountChangeKindAmended    = "AMENDED"
+)
+
+// AccountChangeApproval is one proposed-but-not-yet-effective material
+// change. NewParentAccountID is set for a REPARENTED change; Amendment holds
+// the fully-resolved proposed account for an AMENDED change (AmendAccountVersion
+// already merges the partial request onto the current account before this is
+// written, so approval re-applies a complete, unambiguous target state).
+type AccountChangeApproval struct {
+	ChangeID              string     `json:"change_id"`
+	TenantID              string     `json:"tenant_id"`
+	AccountID             string     `json:"account_id"`
+	AccountCode           string     `json:"account_code"`
+	ChangeKind            string     `json:"change_kind"`
+	ExpectedVersion       int64      `json:"expected_version"`
+	NewParentAccountID    *string    `json:"new_parent_account_id,omitempty"`
+	Amendment             *Account   `json:"amendment,omitempty"`
+	EffectiveFrom         time.Time  `json:"effective_from"`
+	Reason                string     `json:"reason,omitempty"`
+	EvidenceRefs          []string   `json:"evidence_refs,omitempty"`
+	Status                string     `json:"status"`
+	ProposedAt            time.Time  `json:"proposed_at"`
+	ProposedByPrincipalID string     `json:"proposed_by_principal_id"`
+	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID *string    `json:"approved_by_principal_id,omitempty"`
+}
+
 // AmendAccountVersionRequest is a partial amendment of an existing account:
 // omitted fields keep their current values, so a caller changing one field
 // does not have to echo the whole master. To clear a parent, send
@@ -1243,6 +1284,26 @@ var (
 	// ordinary journal line with no override — the exact bypass the
 	// invariant exists to prevent.
 	ErrControlAccountPostingRestricted = errorString("account is a control account with direct posting restricted — an explicit, authorized override is required")
+
+	// ErrAccountChangeNotFound/ErrAccountChangeNotPending/ErrAccountChangeSelfApproval
+	// are ACC-01's maker-checker lifecycle (SPEC_DEVIATIONS A4/B16): a
+	// control-account reparent or amendment is recorded as a pending
+	// AccountChangeApproval rather than applied, and ApproveAccountChange
+	// enforces that its approver differs from whoever proposed it.
+	ErrAccountChangeNotFound     = errorString("account change approval not found")
+	ErrAccountChangeNotPending   = errorString("account change is not PENDING and cannot be approved again")
+	ErrAccountChangeSelfApproval = errorString("a material control-account or hierarchy change cannot be approved by the principal who proposed it")
+	// ErrAccountChangeAlreadyPending is idx_account_change_approvals_pending
+	// surfacing as a named refusal: a second material reparent/amendment
+	// proposed for an account that already has one outstanding.
+	ErrAccountChangeAlreadyPending = errorString("this account already has a pending material change awaiting approval")
+	// ErrAccountChangeReasonRequired is ACC-01's evidence/lineage line
+	// (SPEC_DEVIATIONS A8): "reason ... retained with every material change."
+	// reason stays optional for every ordinary, ungated change (A8 is
+	// otherwise still open) — this applies only on the same materiality gate
+	// A4 already defines (a control account on either side of the change),
+	// the one place this codebase has a formal notion of "material change".
+	ErrAccountChangeReasonRequired = errorString("reason is required for a material control-account or hierarchy change")
 
 	ErrAccountMappingNotFound = errorString("no effective account mapping found for this key")
 	// ErrMappingTargetAccountInvalid is returned when a mapping names an

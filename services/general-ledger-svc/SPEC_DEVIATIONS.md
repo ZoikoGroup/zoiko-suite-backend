@@ -19,11 +19,13 @@ B14.
 
 Overall: all nine named commands/queries now exist with real guards (cycles,
 optimistic version checks, append-only version history, half-open effective
-intervals) and tests. What is missing is structural: the account has no
-legal-entity/book dimension, no approval workflow or segregation of duties, no
-events, idempotency keys only on the two replay-unsafe commands (B12), and
-reason/evidence are optional. Those are A1–A13, recorded rather than guessed.
-The deliberate design decisions a reviewer may want to reverse are B1–B12.
+intervals) and tests. Lifecycle events (A5), maker-checker (A4) and a
+mandatory reason (A8) for material control-account/hierarchy changes are
+closed; what remains missing is structural: the account has no
+legal-entity/book dimension (A1), no Draft→Approved state (A3) outside the
+gated path, and evidence/source policy are still optional or absent. Those
+and the rest are A1–A15, recorded rather than guessed. The deliberate design
+decisions a reviewer may want to reverse are B1–B17.
 
 ## A. Not implemented / weaker than the spec
 
@@ -53,20 +55,28 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   approval step. The journal lifecycle (ACC-03) has a real prepare/approve
   flow; account-config approval would need the same treatment across
   Create/Amend/Activate/Reparent, which is a control-design decision.
-- **A4. No maker-checker / segregation of duties on high-risk changes.**
+- **A4. No maker-checker / segregation of duties on high-risk changes. —
+  Closed 2026-11-07 for the two changes the spec's own SoD line names.**
   §"Segregation of duties": "Creator cannot approve material control-account or
-  hierarchy change where maker-checker is configured"; §"Authorization":
-  `accounting.config.manage` / `accounting.config.approve for
-  activation/high-risk changes`. The service checks one platform action per
-  command (`COA_ACCOUNT_CREATE`, `COA_ACCOUNT_AMEND`, `COA_ACCOUNT_ACTIVATE`,
-  `COA_ACCOUNT_DEACTIVATE`, `COA_ACCOUNT_REPARENT`, `COA_ACCOUNT_VIEW`) at the
-  platform scope, with no second principal, no materiality notion and no
-  distinction between ordinary and high-risk changes. The control-account
-  posting override is at least a separate action
-  (`COA_CONTROL_ACCOUNT_POSTING_OVERRIDE`). The spec's permission *names* are
-  from the accounting domain; this platform's authorization contracts use the
-  `COA_*` action codes, which is a naming translation, but the missing second
-  signature is a real gap.
+  hierarchy change where maker-checker is configured". `ReparentAccount` and
+  `AmendAccountVersion` no longer apply a change in one call when a control
+  account is on either side of it (the account itself, or — for a reparent —
+  its new parent): they record a pending `AccountChangeApproval` instead (the
+  account is left untouched) and a new command, `ApproveAccountChange`, is the
+  only way to apply it — refusing an approver who is the same principal who
+  proposed it, enforced both in the application layer and by a database CHECK
+  constraint (`sod_account_change_approver_independent`, migration 000031),
+  same pattern as financial-close-svc's own `sod_*` constraints. An ordinary,
+  non-control account's reparent or amendment is completely unaffected: still
+  one call, applied immediately, exactly as before. See B16.
+  Still open: the broader "Authorization" line
+  (`accounting.config.manage` / `accounting.config.approve for
+  activation/high-risk changes`) remains a single platform action per command
+  with no distinct approve-vs-manage permission split, and `CreateAccount`/
+  `ActivateAccount`/`DeactivateAccount` have no maker-checker at all — the spec
+  names only "material control-account or hierarchy change" as requiring it,
+  which these three are not (creating an account is not yet a change to one;
+  activate/deactivate are status flips the spec's own SoD line does not name).
 - **A5. No events are produced. — Closed 2026-11-07.** §23 expects
   AccountCreated, AccountActivated, AccountDeactivated and
   AccountHierarchyChanged. `CreateAccount`, `ActivateAccount`,
@@ -106,14 +116,26 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   (it never consults a close state, and a reparent dated today while the
   period was already hard-closed would pass). Revisit when entity/book and a
   period service exist.
-- **A8. Reason and evidence are optional, and no source policy is retained.**
-  §"Evidence / lineage": "Exact account version, approver, reason, effective
-  dates and source policy retained with every material change." Every version
-  row retains version number, effective interval, actor and timestamp; reason
-  and `evidence_refs` are accepted and stored **when supplied but never
-  required**, and approver/source policy are absent (A3/A4). If evidence is to
-  become mandatory the refusal belongs in the handler/store for all five
-  commands at once.
+- **A8. Reason and evidence are optional, and no source policy is retained. —
+  `reason` closed 2026-11-07 for material changes (B16); otherwise still
+  open.** §"Evidence / lineage": "Exact account version, approver, reason,
+  effective dates and source policy retained with every material change."
+  Every version row retains version number, effective interval, actor and
+  timestamp. `reason` is now **required**, refused with
+  `ErrAccountChangeReasonRequired`, on exactly the same gate A4/B16 already
+  defines as "material" — a control account on either side of a reparent or
+  amendment — the one place this codebase has a formal definition of
+  "material change"; it stays optional everywhere else (an ordinary account's
+  change, or Create/Activate/Deactivate, none of which the spec's SoD/evidence
+  lines name as material). `evidence_refs` remains optional everywhere,
+  including on the gated path, and `source_policy` is still not captured at
+  all, even as an optional field — its shape is undefined by the spec (no
+  wireframe gives it a type), so inventing one was judged speculative rather
+  than a real gap-fill; approver is covered for the gated path by A4's
+  `account_change_approvals.approved_by_principal_id`. Making `reason`/
+  `evidence_refs` mandatory for every one of the five commands (not just the
+  gated path) would be a breaking change for every existing caller, not a
+  silent addition, and remains open.
 - **A9. Unregistered account codes remain postable.** Failure semantics say
   "Inactive/non-posting/control-restricted account blocks posting", but ACC-04
   deliberately lets codes the chart has never seen post (the bootstrap gap —
@@ -458,3 +480,48 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
       journal and keeps its reversal;
     - 000001–000028 applied from empty with `psql --single-transaction -v
       ON_ERROR_STOP=1`, and 000028 taken down and up again by hand.
+- **B16. ACC-01 maker-checker is scoped to control accounts, not every
+  hierarchy change or every account (2026-11-07).** A4 closes the spec's SoD
+  line for exactly what it names — "material control-account or hierarchy
+  change" — not every `ReparentAccount`/`AmendAccountVersion` call.
+  - *Why control-account-scoped, not every reparent:* a control account
+    (`is_control_account = true`) is the fraud-relevant and rollup-relevant
+    case this control exists for — an account other parts of the platform (or
+    a bank/intercompany reconciliation) trust without re-checking, and the one
+    place a single insider moving or redefining it unilaterally is the actual
+    risk. An ordinary account's reparent (e.g. reorganising expense
+    sub-accounts) changes no control account's standing and is not gated,
+    matching the spec's own word "material" rather than reading it as every
+    hierarchy edit.
+  - *Mechanism — a side table, not a new state on `account_versions`:*
+    `account_change_approvals` (migration 000031) records a pending change;
+    `account_versions`/`chart_of_accounts` are untouched until
+    `ApproveAccountChange` applies it. This keeps the existing "at most one
+    open version per account" invariant and the ordinary, ungated path
+    exactly as they were — no existing caller or test changed behaviour.
+  - *Re-validated at approval time, not just at proposal time:* `ApproveAccountChange`
+    re-checks `expected_version` against the account's current version under
+    a fresh row lock, so a change the account has moved past in the meantime
+    is refused (`ErrAccountVersionConflict`), not silently replayed against
+    stale facts.
+  - *Events:* the A5 lifecycle event (`hierarchy-changed` / `amended`) fires
+    at approval time, when the change is real, not at proposal time, when it
+    may never be approved.
+- **B17. `reason` becomes mandatory on the same gate B16 defines as
+  "material", not on every command (2026-11-07).** A8's evidence/lineage line
+  wants reason retained with "every material change"; this codebase has no
+  general notion of "material" to hang that on except the one B16 already
+  built. Reusing it, rather than inventing a second materiality test, means
+  `reason` is required exactly where a human will actually read it back
+  (reviewing a control-account change) and exactly nowhere an existing caller
+  — test or real — was already passing an empty one, since every existing
+  account in this codebase is non-control and so never reaches the gate.
+  - *Why not make it mandatory everywhere:* every one of the five commands'
+    existing callers may omit `reason` today; requiring it platform-wide would
+    refuse live traffic with no deprecation window, not just fail new tests —
+    the same "not a silent addition" reasoning A1 and A9 are recorded under.
+  - *Verification:* `internal/store/acc01_maker_checker_integration_test.go`
+    — `TestPgStore_MaterialChange_RequiresReason` (real Postgres: a blank or
+    whitespace-only reason is refused on both `ReparentAccount` and
+    `AmendAccountVersion` for a control account; an ordinary account's
+    amendment with no reason still applies immediately, unaffected).
