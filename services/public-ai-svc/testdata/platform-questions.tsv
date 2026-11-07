@@ -138,3 +138,32 @@ Source authority	kb-source-authority	What happens when two systems disagree on a
 Tenants	kb-tenants-entities|kb-identity-foundation	What is a tenant?
 Tenants	kb-tenants-entities	What is a workspace?
 Tenants	kb-tenants-entities	Can two entities have the same registration number?
+Legal page	kb-contracts-console	how do I create a contract
+Legal page	kb-contracts-console	how do I draft a clause
+Legal page	kb-contracts-console	how do I propose a resolution
+Legal page	kb-contracts-console	how do I schedule a board meeting
+Legal page	kb-contracts-console	what is Clause Library & Template Governance
+Legal page	kb-contracts-console|kb-obligations	what is Legal Obligation Tracking
+Legal page	kb-contracts-console	what is Corporate Actions & Counterparty Risk
+Legal page	kb-contracts-console|kb-legal-contracts	what is a clause redline
+Commercial page	kb-procurement-console	how do I set a spend limit
+Commercial page	kb-procurement-console	what is Limits in force
+Commercial page	kb-procurement-console	how do I open a procurement case
+Commercial page	kb-procurement-console	what is the procurement and commercial execution flow
+Commercial page	kb-procurement-console	what is 3-way match
+Commercial page	kb-procurement-console|kb-commercial-ops	what is the invoice approval service
+Purchase Requests page	kb-purchase-requests	how do I cancel a purchase request
+Purchase Requests page	kb-purchase-requests	how do I look up a request
+Purchase Requests page	kb-purchase-requests	how do I submit a purchase request for approval
+Purchase Requests page	kb-purchase-requests	what is the Requisition register
+Tax page	kb-tax-console	how do I create a tax rule
+Tax page	kb-tax-console	how do I evaluate a tax determination
+Tax page	kb-tax-console	how do I assemble a filing
+Tax page	kb-tax-console	how do I export the tax report
+Tax page	kb-tax-console	how do I create a VAT return
+Tax page	kb-tax-console	how do I file a VAT return
+Tax page	kb-tax-console	how do I look up a VAT return
+Tax page	kb-tax-console	what is the VAT GST engine
+Tax page	kb-tax-console	what is the tax governance process flow
+Tax page	kb-tax-console	what is the jurisdiction overview
+Tax page	kb-tax-console	how is net VAT payable calculated
