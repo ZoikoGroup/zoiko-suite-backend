@@ -72,7 +72,7 @@ services:
       - ../services/exception-escalation-svc/deployments/migrations:/migrations/exception-escalation:ro
       - postgres_p5_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d postgres"]
       interval: 10s
       timeout: 5s
       retries: 10
