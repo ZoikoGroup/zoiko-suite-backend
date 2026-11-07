@@ -19,8 +19,8 @@ signing_ref: kbctl-dev
 
 ## Executive Dashboard
 
-The Executive Dashboard in the ZoikoSuite console gives a governance overview across all legal entities, jurisdictions and domains, so leaders can see where approvals, obligations and exceptions stand without opening each area.
+The Executive Dashboard in the ZoikoSuite console gives a governance overview across all legal entities, jurisdictions and domains, so leaders can see where approvals, obligations and exceptions stand without opening each area. In the console this page is still being built and shows Coming soon.
 
 ## Domain Health
 
-Domain Health shows the readiness and health of each domain's components, so administrators can see which areas are fully operating. What each organization sees depends on its plan, entities and roles.
+Domain Health shows the readiness and health of each domain's components, so administrators can see which areas are fully operating. What each organization sees depends on its plan, entities and roles. In the console this page is still being built and shows Coming soon.

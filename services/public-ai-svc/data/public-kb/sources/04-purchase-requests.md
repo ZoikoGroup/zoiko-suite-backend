@@ -35,21 +35,44 @@ Approval routes, thresholds and who may approve follow each organization's polic
 
 ## Raise a purchase request
 
-A purchase request asks for something to be bought, and is approved or rejected before any purchase order is created.
+A purchase request asks for something to be bought. It authorizes nothing on its own: no order can be placed against it until somebody else approves it.
 To raise a purchase request:
 1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
 2. In the left menu, open **Legal, Corporate & Commercial**, then select **Purchase Requests**.
 3. Go to **Raise a purchase request**.
-4. Enter **What is being requested**, the **Amount** and the **Currency**.
-5. Select **Raise request**.
-The request then waits for an approver; nobody approves their own request.
+4. Enter **What is being requested** (such as a laptop refresh), the **Amount** and the **Currency**.
+5. Select **Raise request**. The request lands as a DRAFT.
+6. Submit it for approval with **Submit for approval**.
+The same form is also on the Commercial Ops page.
 
 ## Approve or reject a request
 
-Each approve or reject decision is checked against the approver's permissions and recorded with who decided and when.
-To approve or reject a request:
+A request must be submitted before it can be decided, and nobody can approve or reject their own request. One decision, either way, and it is final.
+To submit, approve, reject or cancel a request:
 1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
 2. In the left menu, open **Legal, Corporate & Commercial**, then select **Purchase Requests**.
-3. Go to **Approve or reject a request**.
-4. Enter the **Purchase request ID**.
-5. Approve it, or give a **Reason** and reject it.
+3. Go to **Approve or reject a request** and enter the **Purchase request ID**.
+4. For a DRAFT request, select **Submit for approval**.
+5. To decide it, another person selects **Approve**, or enters a **Reason** and selects **Reject**.
+6. To withdraw it instead, enter a **Reason** and select **Cancel request**.
+Rejection and cancellation need a reason, which is kept as the record of why.
+
+## Requisition register
+
+The Requisition register lists every request for your organization, newest first, with the value awaiting a decision shown per currency.
+To filter the register:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Legal, Corporate & Commercial**, then select **Purchase Requests**.
+3. Go to the **Requisition register**.
+4. Choose a tab: **All**, **Draft**, **Pending**, **Approved**, **Rejected** or **Cancelled**.
+5. Optionally enter a **Legal entity ID (UUID)** and select **Filter by entity**.
+
+## Look up a request
+
+Look up a request reads one request's decision trail: who approved or rejected it, when, and the reason recorded for a rejection.
+To look up a request:
+1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
+2. In the left menu, open **Legal, Corporate & Commercial**, then select **Purchase Requests**.
+3. Go to **Look up a request**.
+4. Enter the **Purchase request ID**, from the register or from an order issued against it.
+5. Select **Look up**.

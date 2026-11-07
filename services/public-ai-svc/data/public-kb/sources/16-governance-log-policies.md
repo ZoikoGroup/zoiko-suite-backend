@@ -85,7 +85,7 @@ Reusing a code with different details is refused, because it would redefine the 
 ## Set the limit
 
 Set the limit is step 2 of 3. Anything at or under the limit goes ahead, and anything above it needs approval.
-To set the limit:
+To set the approval limit:
 1. Sign in to your ZoikoSuite account. If you do not have one yet, ask your organization's administrator for access.
 2. In the left menu, open **Governance Platform**, then select **Policies**.
 3. Go to **Set the limit**.
