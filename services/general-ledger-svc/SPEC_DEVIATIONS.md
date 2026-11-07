@@ -67,13 +67,25 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   from the accounting domain; this platform's authorization contracts use the
   `COA_*` action codes, which is a naming translation, but the missing second
   signature is a real gap.
-- **A5. No events are produced.** §23 expects AccountCreated,
-  AccountActivated, AccountDeactivated and AccountHierarchyChanged;
-  ACC-01 commands enqueue nothing. ACC-04's posting engine emits journal
-  events, so the infrastructure exists, but defining four new cross-service
-  event types (and their payload contracts) is a platform contract decision,
-  not something to invent per command. Consumers that need to react to chart
-  changes today must poll.
+- **A5. No events are produced. — Closed 2026-11-07.** §23 expects
+  AccountCreated, AccountActivated, AccountDeactivated and
+  AccountHierarchyChanged. `CreateAccount`, `ActivateAccount`,
+  `DeactivateAccount` and `ReparentAccount` now each enqueue their named
+  event (`com.zoikosuite.accounting.account.created` /`.activated` /
+  `.deactivated` / `.hierarchy-changed`) to the transactional outbox in the
+  same transaction as the write, the same `envelope`/`outbox` mechanism
+  ACC-02's `enqueueMappingEvent` already uses — no new cross-service
+  contract was invented, this reuses the existing one. Accounts are
+  tenant-scoped, not legal-entity-scoped (A1), so `legal_entity_id` is
+  always "" on these events, the same posture ACC-02's mapping events take.
+  `AmendAccountVersion` names no event in the spec's list and emits none —
+  it is not a hierarchy change or a status change, and inventing an event
+  the spec doesn't name was judged worse than leaving a non-hierarchy
+  amendment silent.
+  - *Manual check:* `internal/store/acc01_account_versioning_integration_test.go`
+    — `TestPgStore_AccountLifecycle_EmitsNamedEvents` (real Postgres: one
+    outbox row per command, keyed by the account's own `aggregate_id`;
+    explicitly asserts `AmendAccountVersion` emits none).
 - **A6. No `Idempotency-Key` handling on ACC-01 commands. — Closed for
   `AmendAccountVersion` and `ReparentAccount` (B12); the other three commands
   remain naturally idempotent as described here.** The wireframe lists it as a

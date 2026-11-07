@@ -483,3 +483,68 @@ func TestPgStore_ReparentAccount_IdempotencyKeyReplayDoesNotAppendVersion(t *tes
 		}
 	})
 }
+
+// SPEC_DEVIATIONS A5: ACC-01's four named lifecycle events were specified
+// but never emitted. One outbox row per command, keyed by the account's own
+// aggregate_id.
+func TestPgStore_AccountLifecycle_EmitsNamedEvents(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	assertEvent := func(t *testing.T, accountID, fact string, want int) {
+		t.Helper()
+		scoped(t, pool, tenantID, func(tx pgx.Tx) {
+			var count int
+			if err := tx.QueryRow(context.Background(), `
+				SELECT COUNT(*) FROM eventing_outbox
+				 WHERE tenant_id = $1 AND event_type = $2 AND aggregate_id = $3`,
+				tenantID, "com.zoikosuite.accounting.account."+fact, accountID).Scan(&count); err != nil {
+				t.Fatalf("count eventing_outbox(%s): %v", fact, err)
+			}
+			if count != want {
+				t.Fatalf("account.%s events = %d, want %d", fact, count, want)
+			}
+		})
+	}
+
+	acct := newTestAccount(tenantID, "7000", "Office Supplies")
+	if err := s.CreateAccount(ctx, acct); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	assertEvent(t, acct.AccountID, "created", 1)
+
+	if _, err := s.DeactivateAccount(ctx, tenantID, "7000", 0, time.Time{}, "no longer used", nil, "test-admin"); err != nil {
+		t.Fatalf("DeactivateAccount: %v", err)
+	}
+	assertEvent(t, acct.AccountID, "deactivated", 1)
+
+	if _, err := s.ActivateAccount(ctx, tenantID, "7000", 0, time.Time{}, "reinstated", nil, "test-admin"); err != nil {
+		t.Fatalf("ActivateAccount: %v", err)
+	}
+	assertEvent(t, acct.AccountID, "activated", 1)
+
+	parent := newTestAccount(tenantID, "7100", "Operating Expenses")
+	parent.AccountType = domain.AccountTypeExpense
+	if err := s.CreateAccount(ctx, parent); err != nil {
+		t.Fatalf("CreateAccount(parent): %v", err)
+	}
+	if _, _, err := s.ReparentAccount(ctx, tenantID, "7000", uuid.NewString(), &parent.AccountID, 0, time.Time{}, "moved under opex", nil, "test-admin"); err != nil {
+		t.Fatalf("ReparentAccount: %v", err)
+	}
+	assertEvent(t, acct.AccountID, "hierarchy-changed", 1)
+
+	// AmendAccountVersion names no event in the spec's list — it must not
+	// invent one.
+	head, err := s.GetAccountByCode(ctx, tenantID, "7000")
+	if err != nil {
+		t.Fatalf("GetAccountByCode: %v", err)
+	}
+	updates := *head
+	updates.AccountName = "Office Supplies (renamed)"
+	if _, _, err := s.AmendAccountVersion(ctx, tenantID, "7000", uuid.NewString(), head.Version, time.Now().UTC().Add(time.Minute), &updates, "renamed", nil, "test-admin"); err != nil {
+		t.Fatalf("AmendAccountVersion: %v", err)
+	}
+	assertEvent(t, acct.AccountID, "amended", 0)
+}

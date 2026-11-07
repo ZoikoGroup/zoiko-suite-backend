@@ -23,6 +23,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -1320,8 +1321,13 @@ func (s *PgStore) CreateAccount(ctx context.Context, a *domain.Account) error {
 		if err != nil {
 			return mapPgError(err)
 		}
-		return insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			a, 1, a.CreatedAt, "CREATED", "initial version", a.CreatedByPrincipalID, nil))
+		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
+			a, 1, a.CreatedAt, "CREATED", "initial version", a.CreatedByPrincipalID, nil)); err != nil {
+			return err
+		}
+		return s.enqueueAccountEvent(ctx, tx, "created", tenantID, a.AccountID, a.CreatedByPrincipalID, map[string]any{
+			"account_code": a.AccountCode, "account_name": a.AccountName, "account_type": string(a.AccountType),
+		})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -2318,6 +2324,35 @@ func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, pri
 	return out, replay, nil
 }
 
+// enqueueAccountEvent writes one ACC-01 account lifecycle event to the
+// transactional outbox (SPEC_DEVIATIONS A5: "AccountCreated; AccountActivated;
+// AccountDeactivated; AccountHierarchyChanged" were specified but never
+// emitted). Accounts are tenant-scoped, not legal-entity-scoped (A1), so
+// legalEntityID is always "", the same posture enqueueMappingEvent already
+// takes for ACC-02.
+func (s *PgStore) enqueueAccountEvent(ctx context.Context, tx pgx.Tx, fact, tenantID, accountID, actorID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.account." + fact,
+		Service:         "general-ledger-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		AggregateType:   "account",
+		AggregateID:     accountID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build account.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue account.%s event: %w", fact, err)
+	}
+	return nil
+}
+
 // enqueueMappingEvent writes one ACC-02 mapping lifecycle event to the
 // transactional outbox, mirroring enqueueJournalEvent's shape. Mappings are
 // tenant-scoped, not legal-entity-scoped, so legalEntityID is always "".
@@ -2412,7 +2447,9 @@ func (s *PgStore) changeAccountStatus(
 			return domain.ErrAccountVersionConflict
 		}
 		out = &updated
-		return nil
+		return s.enqueueAccountEvent(ctx, tx, strings.ToLower(changeKind), tenantID, cur.AccountID, principalID, map[string]any{
+			"account_code": accountCode, "reason": reason,
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -2571,7 +2608,9 @@ func (s *PgStore) ReparentAccount(
 			return err
 		}
 		out = &updated
-		return nil
+		return s.enqueueAccountEvent(ctx, tx, "hierarchy-changed", tenantID, cur.AccountID, principalID, map[string]any{
+			"account_code": accountCode, "new_parent_account_id": parentAccountID, "reason": reason,
+		})
 	})
 	if err != nil {
 		return nil, false, err
