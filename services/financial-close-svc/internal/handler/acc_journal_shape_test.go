@@ -64,7 +64,7 @@ func TestPostingPaths_SendACC03JournalContext(t *testing.T) {
 		cl := &stubClients{trialBalances: map[string]float64{"5000-ITSharedCost": 1000}}
 		r := newRouter(s, &stubAuthZ{}, cl)
 		ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
-		if rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}, "preparer-1"); rr.Code != http.StatusCreated {
+		if rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}, "executor-1"); rr.Code != http.StatusCreated {
 			t.Fatalf("execute: %d %s", rr.Code, rr.Body.String())
 		}
 		assertJournalMeta(t, cl, "RECLASS", day(2026, 1, 31))
@@ -148,7 +148,7 @@ func TestLegacyRecordWithoutCurrency_RefusedBeforeGL(t *testing.T) {
 		r := newRouter(s, &stubAuthZ{}, cl)
 		ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 		s.allocationRules[ruleID].CurrencyCode = ""
-		rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}, "preparer-1")
+		rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}, "executor-1")
 		if rr.Code != http.StatusUnprocessableEntity || !containsErrorCode(rr.Body.Bytes(), "currency_code_missing") {
 			t.Fatalf("expected 422 currency_code_missing, got %d %s", rr.Code, rr.Body.String())
 		}

@@ -181,8 +181,44 @@ const (
 // principal already authorized for CONSOLIDATION_RUN_INITIATE on the
 // calling request — reusing it here, rather than inventing a separate
 // system identity that doesn't exist anywhere on this platform.
-func (c *Clients) FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]IntercompanyEntry, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.intercompanyURL+"/v1/intercompany/entries", nil)
+// FetchEliminableIntercompanyEntries returns every MATCHED-or-CLOSED
+// intercompany entry sourced by any of childLegalEntityIDs. The underlying
+// /v1/intercompany/entries list now requires at least one entity filter
+// (intercompany-accounting-svc SPEC_DEVIATIONS A2: an unfiltered call used
+// to return every entry in the tenant to any caller, with no authorization
+// check at all) — this issues one call per child entity, as the pair's
+// source side, rather than relying on an unfiltered fetch the server no
+// longer allows. Every intercompany pair has exactly one source entity, so
+// looping over every child as the source filter still finds every pair
+// whose source is in scope; a pair this run should eliminate has both its
+// source and target among the run's children (StartRun's own A2 scoping),
+// so the target-side entity is checked again there, not lost here.
+func (c *Clients) FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string, childLegalEntityIDs []string) ([]IntercompanyEntry, error) {
+	var eliminable []IntercompanyEntry
+	for _, childID := range childLegalEntityIDs {
+		list, err := c.fetchIntercompanyEntriesBySource(ctx, tenantID, principalID, childID)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range list {
+			if entry.MatchStatus == intercompanyStatusMatched || entry.MatchStatus == intercompanyStatusClosed {
+				eliminable = append(eliminable, entry)
+			}
+		}
+	}
+	return eliminable, nil
+}
+
+func (c *Clients) fetchIntercompanyEntriesBySource(ctx context.Context, tenantID, principalID, sourceLegalEntityID string) ([]IntercompanyEntry, error) {
+	u, err := url.Parse(c.intercompanyURL + "/v1/intercompany/entries")
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("source_legal_entity_id", sourceLegalEntityID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -204,14 +240,7 @@ func (c *Clients) FetchEliminableIntercompanyEntries(ctx context.Context, tenant
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		return nil, err
 	}
-
-	var eliminable []IntercompanyEntry
-	for _, entry := range list {
-		if entry.MatchStatus == intercompanyStatusMatched || entry.MatchStatus == intercompanyStatusClosed {
-			eliminable = append(eliminable, entry)
-		}
-	}
-	return eliminable, nil
+	return list, nil
 }
 
 // FetchReciprocalBalances reads intercompany-accounting-svc's

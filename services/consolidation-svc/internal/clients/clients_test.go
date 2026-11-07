@@ -46,7 +46,7 @@ func TestFetchEliminableIntercompanyEntries_MatchedAndClosedOnly(t *testing.T) {
 		{"intercompany_entry_id":"ic-closed","match_status":"CLOSED","amount":99999999999999.9999,"source_journal_id":"s7","target_journal_id":"t7"}
 	]`)
 
-	got, err := clients.New("", srv.URL, zap.NewNop()).FetchEliminableIntercompanyEntries(context.Background(), "tenant-1", "principal-1")
+	got, err := clients.New("", srv.URL, zap.NewNop()).FetchEliminableIntercompanyEntries(context.Background(), "tenant-1", "principal-1", []string{"child-a"})
 	if err != nil {
 		t.Fatalf("FetchEliminableIntercompanyEntries: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestFetchEliminableIntercompanyEntries_MatchedAndClosedOnly(t *testing.T) {
 // prefers, and intercompany-accounting-svc already accepts on input.
 func TestFetchEliminableIntercompanyEntries_StringAmount(t *testing.T) {
 	srv := intercompanyServer(t, `[{"intercompany_entry_id":"ic-1","match_status":"MATCHED","amount":"1234.5678"}]`)
-	got, err := clients.New("", srv.URL, zap.NewNop()).FetchEliminableIntercompanyEntries(context.Background(), "tenant-1", "principal-1")
+	got, err := clients.New("", srv.URL, zap.NewNop()).FetchEliminableIntercompanyEntries(context.Background(), "tenant-1", "principal-1", []string{"child-a"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestFetchEliminableIntercompanyEntries_StringAmount(t *testing.T) {
 func TestFetchEliminableIntercompanyEntries_MalformedAmountFails(t *testing.T) {
 	for _, amount := range []string{`"1/3"`, `"abc"`, `true`} {
 		srv := intercompanyServer(t, `[{"intercompany_entry_id":"ic-1","match_status":"MATCHED","amount":`+amount+`}]`)
-		if _, err := clients.New("", srv.URL, zap.NewNop()).FetchEliminableIntercompanyEntries(context.Background(), "tenant-1", "principal-1"); err == nil {
+		if _, err := clients.New("", srv.URL, zap.NewNop()).FetchEliminableIntercompanyEntries(context.Background(), "tenant-1", "principal-1", []string{"child-a"}); err == nil {
 			t.Errorf("amount %s: expected the fetch to fail", amount)
 		}
 	}

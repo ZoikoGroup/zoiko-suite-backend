@@ -59,6 +59,14 @@ func commandConflict(idempotencyKey string, c *commandClaim) error {
 	return fmt.Errorf("%w: key %q was used for %s", domain.ErrIdempotencyKeyConflict, idempotencyKey, c.Command)
 }
 
+// stringPtrEqual compares two *string, treating nil as equal only to nil.
+func stringPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 // isUniqueViolation reports PostgreSQL's unique-constraint error (23505).
 // CreateRun and CreateAdjustment use it to turn a concurrent first attempt
 // with one key into a replay: the loser's transaction rolled back, so nothing

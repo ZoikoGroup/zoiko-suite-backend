@@ -56,6 +56,14 @@ with `TEST_DATABASE_URL` pointed at a real, disposable Postgres instance so
 it could not silently skip; the full `internal/store` `-tags=integration`
 suite was re-run the same way afterward.
 
+Update (2026-11-05, ACC-06 governance pass): narrows A1. The exception
+lifecycle, certification/rejection, maker-checker and the three missing
+queries are implemented by migration 000025; the asynchronous
+Planned/Running/Reperformed state model remains open. The plain and
+integration-tagged suites were re-run against a fresh embedded Postgres 16
+(migrations 000001–000025 applied from empty); every package passed and the
+store integration tests ran rather than skipping.
+
 ## Verified controls
 
 Checked against code and schema, not comments:
@@ -109,7 +117,7 @@ Checked against code and schema, not comments:
 
 ## A. Not implemented, weaker than the spec, or still open
 
-### A1. ACC-06 has no control-run lifecycle, certification or maker-checker
+### A1. ACC-06 has no control-run lifecycle, certification or maker-checker — partially closed 2026-11-05
 
 §9 requires:
 
@@ -152,6 +160,33 @@ On the two questions this survey was asked:
 Building the ACC-06 lifecycle (with financial-control-svc's
 exception/certification model as the obvious reference) is the largest open
 item in this register.
+
+**Update (2026-11-05, ACC-06 governance pass).** The exception, certification,
+maker-checker and query gaps are closed; the asynchronous state model is not.
+
+- Migration 000025 adds `control_exceptions` (one companion row per run,
+  OPEN → ASSIGNED → RESOLVED, resolution note mandatory) and the
+  certification columns on `subledger_control_runs` (`CERTIFIED`/`FAILED`,
+  certifier, timestamp and note). The run's own finding stays append-only:
+  the 000004 trigger now permits only certification-column updates, and still
+  refuses finding changes and deletes.
+- `AssignException`, `RecordResolution`, `CertifyControl` and `RejectControl`
+  are implemented. Certification refuses the run's author and the exception's
+  resolver (maker-checker), refuses `CERTIFIED` while its exception is
+  unresolved, and refuses a second certification. `FAILED` is the explicit
+  reject path and is allowed without resolving the exception.
+- `ListOpenExceptions`, `GetCloseBlockingControls` and `ExplainVariance` are
+  implemented. The blocking query and close readiness share one
+  classification, so they cannot disagree about whether a run blocks.
+- `RemoveCloseRequirement` now refuses (422
+  `control_has_unresolved_exception`) to remove a `SUBLEDGER_CONTROL`
+  requirement whose latest run carries an OPEN/ASSIGNED exception, closing
+  finding 2 above. The AR/AP baseline remains unremovable, and
+  `SUBLEDGER_CONTROL_GATE_MODE=off` still exists (finding 3).
+- Still open: `StartControlRun`/`ReperformControl` and the full
+  Planned/Running/Reperformed state model are not implemented; re-running a
+  control appends a new run rather than transitioning a planned one. A2
+  (period/cutoff population assertion) is unchanged.
 
 ### A2. ACC-06 compares live subledger totals to a period balance, with no population assertion
 
@@ -313,21 +348,45 @@ needs GL to check period state transactionally, for example a period-version
 token re-checked at commit, or a local period mirror read under a row lock.
 That is a general-ledger-svc change.
 
-### A6. ACC-14 does not separate the close certifier from the preparers
+### A6. ACC-14 does not separate the close certifier from the preparers — partially closed 2026-11-06
 
 §17:
 
 > "Segregation of duties | Requester cannot unilaterally reopen hard-closed
 > material book; close certifier independent from preparers where required."
 
-The first clause is enforced (see Verified controls). The second is not.
-`HardClosePeriod` and `ReclosePeriod` require `PERIOD_CLOSE_APPROVE` only, so
-one principal holding both grants can soft-close, enter review and hard-close
-the same period. There is no "where required" policy to switch independence
-on. Reopen scope is also always the whole period: `RequestReopen` takes no
-book or module scope, and §17's evidence list includes "reopen scope".
+The first clause is enforced (see Verified controls). The second clause's
+independence is now enforced too, unconditionally rather than behind a
+materiality switch — the same interpretation B1 already made for every other
+maker-checker gate in this service (see B1's own note on why: applying it to
+every item avoids building a materiality model this spec never defines).
 
-### A7. ACC-09 posts on execution with no review, and its drivers are static percentages
+`HardClosePeriod` and `ReclosePeriod` now also require the certifier to differ
+from the preparer — the principal who most recently performed the transition
+into the state being closed from (`EnterCloseReview` for a hard close, the
+reopen approval into `AUTHORIZED_REOPEN` for a reclose). `GetLatestTransitionPrincipal`
+reads this from `period_state_transitions`, the same append-evidence table
+`GetCloseHistory` already serves from. A period with no such transition on
+record (constructed directly rather than through the tracked lifecycle, e.g.
+a pre-existing or test-seeded row) has no identifiable preparer and the check
+is a no-op for it — in production every period reaches CLOSE_REVIEW or
+AUTHORIZED_REOPEN only through the tracked transition, so this is not a real
+bypass, only a graceful default for untracked history.
+
+Still open: Reopen scope is always the whole period — `RequestReopen` takes
+no book or module scope, and §17's evidence list includes "reopen scope".
+That needs a scoping model this service does not have yet (which books or
+modules a reopen covers), left for a separate pass.
+
+Evidence: `internal/handler/period_close_test.go`
+(`TestHardClose_SamePrincipalAsCloseReviewPreparer_Refused`,
+`TestReclose_SamePrincipalAsReopenApprover_Refused`, plus the existing
+state-machine and kernel-seal tests updated to use independent principals),
+`internal/store/certifier_independence_integration_test.go` (real-Postgres:
+no prior transition, a tracked SOFT_CLOSE preparer, a tracked CLOSE_REVIEW
+preparer, each independently addressable by `toState`).
+
+### A7. ACC-09 posts on execution with no review, and its drivers are static percentages — partially closed 2026-11-06
 
 §12:
 
@@ -344,12 +403,27 @@ book or module scope, and §17's evidence list includes "reopen scope".
 > "Evidence / lineage | Persist source watermark, driver values, rule version,
 > rounding and posting refs."
 
-Rule maker-checker is now enforced (B1). `ExecuteAllocation`, however, moves
-Planned → Calculated → Posted inside one request, with no run review or
-certifier. Drivers are fixed percentages on the rule, not a driver
-population such as headcount or square metres, so "driver population
+Rule maker-checker is now enforced (B1). The run-certifier clause is now
+enforced too: `ExecuteAllocation` refuses a principal who is also the rule's
+`CreatedByPrincipalID` (403 `self_approval_forbidden`, reusing the same
+shared sentinel and literal state model — the spec's own Run state is
+Planned→Calculated→Posted/Failed with no separate Review state, so this is
+enforced as a certifier/driver-owner identity check at execution rather than
+by inventing a state the spec does not name). Applied unconditionally like
+every other maker-checker gate in this service (B1's own interpretation),
+not only for a "high-risk pool" the spec never defines how to identify.
+
+`ExecuteAllocation` still moves Planned → Calculated → Posted inside one
+request — there remains no standalone run-review step distinct from the
+certifier check above. Drivers are fixed percentages on the rule, not a
+driver population such as headcount or square metres, so "driver population
 incomplete" cannot arise and cannot be detected. The source amount is read
-from the trial balance with no watermark persisted on the run.
+from the trial balance with no watermark persisted on the run — GL's trial
+balance endpoint does not expose one to capture.
+
+Evidence: `internal/handler/handler_test.go`
+(`TestExecuteAllocation_SamePrincipalAsRuleCreator_Refused`, plus the
+existing execution tests updated to use an independent executor principal).
 
 ### A8. ACC-10 rates and classification are caller-asserted
 
@@ -407,8 +481,15 @@ real (B6, B1). Still open:
   `MigrationAccountingCertified` (A12).
 - **Certification is not tied to a migration certificate.** It records a
   certifier and a reason only; see migration-integrity-svc A3.
-- **Two concurrent creates for one source system** race on the batch's
-  unique key, and the loser gets 503 instead of the existing batch.
+- **Two concurrent creates for one source system** — closed 2026-11-06. The
+  store's `mapPgError` now recognizes a unique-violation on `migration_batches`
+  (`domain.ErrMigrationBatchRaceLost`) and `CreateMigrationAccountingBatch`
+  re-reads and answers the actual winner (200) instead of a 503 that told the
+  loser to retry a request that would just lose again. Evidence:
+  `internal/store/migration_batch_race_integration_test.go` (real-Postgres:
+  a genuine concurrent-style insert against the live UNIQUE constraint),
+  `internal/handler/acc17_open_item_test.go`
+  (`TestCreateMigrationAccountingBatch_ConcurrentCreateLoses_ReturnsWinner`).
 
 ### A10. ACC-18 lineage is one hop and has no report-fact trace
 
@@ -486,7 +567,7 @@ instead of the original result, or a duplicate append-only row:
 `expected_version` is not implemented on any command. ACC-16's snapshot
 creates have no claim either (outside this survey).
 
-### A12. Most ACC-06..18 domain events are not emitted
+### A12. Most ACC-06..18 domain events are not emitted — partially closed 2026-11-06
 
 §23 lists, among others:
 
@@ -501,9 +582,24 @@ creates have no claim either (outside this survey).
 > "ACC-18 | LineageGapDetected; LineageVerificationFailed"
 
 The outbox carries the period lifecycle events, the subledger-control
-exception and the snapshot integrity failure. No ACC-07/08/09/10/17/18
-lifecycle event is emitted, so consumers named in §23 (close dashboard,
-evidence, reporting) cannot react to them.
+exception and the snapshot integrity failure. ACC-09's `AllocationPosted`
+and ACC-10's `RevaluationPosted` are now emitted too:
+`MarkAllocationRunPosted` and `MarkFXRevaluationPosted` enqueue
+`com.zoikosuite.accounting.allocation-run.posted` /
+`com.zoikosuite.accounting.fx-revaluation-run.posted` to the transactional
+outbox in the same transaction as the POSTED status write — both call sites
+(the first-execution path and the FAILED-run reprocess path for allocation;
+the net-zero no-journal path and the ordinary posting path for FX), so the
+event fires exactly once per run regardless of which path reached POSTED.
+No *Due event precedes either (there is no separate "due" state in this v1's
+collapsed Planned/Calculated model — see each capability's own state-model
+note). Still open: ACC-06's ControlCertified (ACC-06's ControlExceptionRaised
+equivalent, `subledger-control-exception`, was already emitted before this
+pass), and every ACC-17/ACC-18 event listed above.
+
+Evidence: `internal/store/posted_events_integration_test.go` (real-Postgres:
+one `allocation-run.posted` / `fx-revaluation-run.posted` outbox row per
+posted run, keyed by the run's own aggregate_id).
 
 ### A13. Every journal this service posted was refused by general-ledger-svc — closed 2026-10-24
 

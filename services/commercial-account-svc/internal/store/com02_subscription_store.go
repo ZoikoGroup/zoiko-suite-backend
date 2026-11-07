@@ -20,7 +20,7 @@ import (
 // scope set to the customer's organization by the handler, after the
 // operator's platform permission has been checked.
 type SubscriptionStore interface {
-	SetAccountMarket(ctx context.Context, accountID, marketCode, actor string, now time.Time) error
+	SetAccountMarket(ctx context.Context, accountID, marketCode, actor string, now time.Time, claim domain.IdempotencyClaim) error
 	StartSubscription(ctx context.Context, p domain.StartSubscriptionParams, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error)
 	ActivateSubscription(ctx context.Context, c domain.SubscriptionCommand, customerConfirmation bool, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error)
 	ScheduleCancellation(ctx context.Context, c domain.SubscriptionCommand, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error)
@@ -69,8 +69,19 @@ func (s *PgStore) subscriptionTx(ctx context.Context, fn func(pgx.Tx) error) err
 // SetAccountMarket records the market a customer buys in. It is seller-side
 // data: it decides which offers the account is sold, never the account's own
 // tax or business settings.
-func (s *PgStore) SetAccountMarket(ctx context.Context, accountID, marketCode, actor string, now time.Time) error {
+//
+// Claims the caller's Idempotency-Key (SPEC_DEVIATIONS A4): a retry after a
+// lost response returns domain.IdempotentReplayError (resourceID is the
+// account id) instead of silently re-applying the same market change, which
+// would be harmless here only by coincidence (the write is a plain
+// overwrite, not additive) — the claim is the same guarantee every other
+// canonical command in this service already makes, not a reaction to a
+// specific bug this write has.
+func (s *PgStore) SetAccountMarket(ctx context.Context, accountID, marketCode, actor string, now time.Time, claim domain.IdempotencyClaim) error {
 	return s.subscriptionTx(ctx, func(tx pgx.Tx) error {
+		if err := claimIdempotency(ctx, tx, claim); err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE commercial_accounts
 			   SET market_code = $2, market_set_at = $3, market_set_by_principal_id = $4, updated_at = $3

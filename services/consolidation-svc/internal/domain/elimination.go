@@ -2,6 +2,7 @@ package domain
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
 )
 
@@ -107,4 +108,28 @@ func BuildEliminationExplanation(groupLegalEntityID, entityA, entityB, fiscalPer
 		out.Reason = "the pair is not eliminable: no intercompany entries for this pair in this period"
 	}
 	return out
+}
+
+// SumMatchedOrClosedNet sums the MATCHED/CLOSED net currency amounts in
+// balances — the pair-scoped replacement for summing every eliminable
+// intercompany entry in the tenant (A5). Net, not the two gross directions,
+// is the actual reciprocal position; currencies are summed together, the
+// same cross-currency approximation CreateEliminationProposal's own bound
+// check already made before this change (per-line larger-of-debit/credit,
+// A5), now at least scoped to the one pair it names instead of every pair
+// in the tenant.
+func SumMatchedOrClosedNet(balances *ReciprocalBalances) (*big.Rat, error) {
+	if balances == nil {
+		return new(big.Rat), nil
+	}
+	var amounts []string
+	for _, s := range balances.ByMatchStatus {
+		if s.MatchStatus != eliminationStatusMatched && s.MatchStatus != eliminationStatusClosed {
+			continue
+		}
+		for _, net := range s.Net {
+			amounts = append(amounts, string(net.Amount))
+		}
+	}
+	return SumAmounts(amounts)
 }

@@ -66,6 +66,21 @@ func TestMain(m *testing.M) {
 		)
 	}
 
+	// openTestPool and the pg-smoke files skip (not fail) when
+	// TEST_DATABASE_URL is unset. This TestMain has just provided a real
+	// database, so export it: without this, an integration-tagged run starts
+	// embedded Postgres, reports PASS, and silently skips every test that
+	// opens its own pool — a green suite that checked nothing.
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		if err := os.Setenv("TEST_DATABASE_URL", dsn); err != nil {
+			fmt.Printf("failed to export TEST_DATABASE_URL: %v\n", err)
+			if pg != nil {
+				_ = pg.Stop()
+			}
+			os.Exit(1)
+		}
+	}
+
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -94,7 +109,7 @@ func TestMain(m *testing.M) {
 	_, _ = testPool.Exec(ctx, `DROP TABLE IF EXISTS
 		close_workflow_refs, close_evidences, fiscal_periods, period_reopen_events,
 		period_reopen_requests, period_state_transitions,
-		subledger_control_runs,
+		control_exceptions, subledger_control_runs,
 		close_requirements,
 		accrual_recognition_reversals, accrual_recognition_instances, accrual_schedules,
 		prepayment_recognition_instances, prepayment_schedules,

@@ -19,27 +19,37 @@ B14.
 
 Overall: all nine named commands/queries now exist with real guards (cycles,
 optimistic version checks, append-only version history, half-open effective
-intervals) and tests. What is missing is structural: the account has no
-legal-entity/book dimension, no approval workflow or segregation of duties, no
-events, idempotency keys only on the two replay-unsafe commands (B12), and
-reason/evidence are optional. Those are A1–A13, recorded rather than guessed.
-The deliberate design decisions a reviewer may want to reverse are B1–B12.
+intervals) and tests. Lifecycle events (A5), maker-checker (A4), mandatory
+reason for material control-account/hierarchy changes, and an optional
+source_policy_ref (A8) are closed; what remains missing is structural: the
+account has no legal-entity/book dimension (A1), no Draft→Approved state (A3)
+outside the gated path, and evidence_refs is still optional everywhere.
+Those and the rest are A1–A15, recorded rather than guessed. The deliberate design
+decisions a reviewer may want to reverse are B1–B19.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. The account has no legal-entity/book dimension.** The spec's purpose
-  ("Maintain the versioned posting-account master and hierarchy **for each
-  legal entity and accounting book**"), its required inputs (`entity_id;
-  book_id`) and §24's AccountMaster/AccountVersion ("entity, book, code…") all
-  make the entity/book pair part of an account's identity. This service keys
-  accounts by `tenant_id + account_code` only; no `entity_id`/`book_id` column
-  exists anywhere in ACC-01, and nothing in posting/eligibility evaluates an
-  entity/book constraint. Adding them would re-key every existing account and
-  the FKs that reference account codes (journals, ledger entries, mappings), so
-  it is a migration + identity decision for the owning product, not a silent
-  addition here. Consequence: two entities in one tenant cannot hold different
-  versions of the same account code, and `GetAccountAsOf` answers for the
-  tenant, not a book.
+- **A1. The account has no legal-entity/book dimension. — Scoped, not built
+  (2026-11-07).** The spec's purpose ("Maintain the versioned posting-account
+  master and hierarchy **for each legal entity and accounting book**"), its
+  required inputs (`entity_id; book_id`) and §24's AccountMaster/AccountVersion
+  ("entity, book, code…") all make the entity/book pair part of an account's
+  identity. This service keys accounts by `tenant_id + account_code` only; no
+  `entity_id`/`book_id` column exists anywhere in ACC-01, and nothing in
+  posting/eligibility evaluates an entity/book constraint. Consequence: two
+  entities in one tenant cannot hold different versions of the same account
+  code, and `GetAccountAsOf` answers for the tenant, not a book.
+  A written migration plan is at
+  `docs/ACC01_A1_entity_book_migration_plan.md` — not executed here, since
+  re-keying account identity is a multi-service decision, not a single-file
+  fix. Its headline finding: at least 8 other services' own schemas carry
+  `account_code` (financial-close-svc, consolidation-svc,
+  inventory-management-svc, asset-management-svc, financial-statements-svc,
+  financial-control-svc, project-accounting-svc, bank-reconciliation-svc),
+  but every one checked already carries `legal_entity_id` on the same rows —
+  so the plan's shape is additive (nullable entity/book columns here, a
+  relaxed uniqueness constraint, existing-caller behavior unchanged) rather
+  than a hard re-key of 8 services' databases.
 - **A2. `normal_balance` is not implemented. — Closed (B11).** Every
   account response now carries a read-only `normal_balance`, derived from
   `account_type` by `AccountType.NormalBalance()`: ASSET and EXPENSE are
@@ -53,27 +63,47 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   approval step. The journal lifecycle (ACC-03) has a real prepare/approve
   flow; account-config approval would need the same treatment across
   Create/Amend/Activate/Reparent, which is a control-design decision.
-- **A4. No maker-checker / segregation of duties on high-risk changes.**
+- **A4. No maker-checker / segregation of duties on high-risk changes. —
+  Closed 2026-11-07 for the two changes the spec's own SoD line names.**
   §"Segregation of duties": "Creator cannot approve material control-account or
-  hierarchy change where maker-checker is configured"; §"Authorization":
-  `accounting.config.manage` / `accounting.config.approve for
-  activation/high-risk changes`. The service checks one platform action per
-  command (`COA_ACCOUNT_CREATE`, `COA_ACCOUNT_AMEND`, `COA_ACCOUNT_ACTIVATE`,
-  `COA_ACCOUNT_DEACTIVATE`, `COA_ACCOUNT_REPARENT`, `COA_ACCOUNT_VIEW`) at the
-  platform scope, with no second principal, no materiality notion and no
-  distinction between ordinary and high-risk changes. The control-account
-  posting override is at least a separate action
-  (`COA_CONTROL_ACCOUNT_POSTING_OVERRIDE`). The spec's permission *names* are
-  from the accounting domain; this platform's authorization contracts use the
-  `COA_*` action codes, which is a naming translation, but the missing second
-  signature is a real gap.
-- **A5. No events are produced.** §23 expects AccountCreated,
-  AccountActivated, AccountDeactivated and AccountHierarchyChanged;
-  ACC-01 commands enqueue nothing. ACC-04's posting engine emits journal
-  events, so the infrastructure exists, but defining four new cross-service
-  event types (and their payload contracts) is a platform contract decision,
-  not something to invent per command. Consumers that need to react to chart
-  changes today must poll.
+  hierarchy change where maker-checker is configured". `ReparentAccount` and
+  `AmendAccountVersion` no longer apply a change in one call when a control
+  account is on either side of it (the account itself, or — for a reparent —
+  its new parent): they record a pending `AccountChangeApproval` instead (the
+  account is left untouched) and a new command, `ApproveAccountChange`, is the
+  only way to apply it — refusing an approver who is the same principal who
+  proposed it, enforced both in the application layer and by a database CHECK
+  constraint (`sod_account_change_approver_independent`, migration 000031),
+  same pattern as financial-close-svc's own `sod_*` constraints. An ordinary,
+  non-control account's reparent or amendment is completely unaffected: still
+  one call, applied immediately, exactly as before. See B16.
+  Still open: the broader "Authorization" line
+  (`accounting.config.manage` / `accounting.config.approve for
+  activation/high-risk changes`) remains a single platform action per command
+  with no distinct approve-vs-manage permission split, and `CreateAccount`/
+  `ActivateAccount`/`DeactivateAccount` have no maker-checker at all — the spec
+  names only "material control-account or hierarchy change" as requiring it,
+  which these three are not (creating an account is not yet a change to one;
+  activate/deactivate are status flips the spec's own SoD line does not name).
+- **A5. No events are produced. — Closed 2026-11-07.** §23 expects
+  AccountCreated, AccountActivated, AccountDeactivated and
+  AccountHierarchyChanged. `CreateAccount`, `ActivateAccount`,
+  `DeactivateAccount` and `ReparentAccount` now each enqueue their named
+  event (`com.zoikosuite.accounting.account.created` /`.activated` /
+  `.deactivated` / `.hierarchy-changed`) to the transactional outbox in the
+  same transaction as the write, the same `envelope`/`outbox` mechanism
+  ACC-02's `enqueueMappingEvent` already uses — no new cross-service
+  contract was invented, this reuses the existing one. Accounts are
+  tenant-scoped, not legal-entity-scoped (A1), so `legal_entity_id` is
+  always "" on these events, the same posture ACC-02's mapping events take.
+  `AmendAccountVersion` names no event in the spec's list and emits none —
+  it is not a hierarchy change or a status change, and inventing an event
+  the spec doesn't name was judged worse than leaving a non-hierarchy
+  amendment silent.
+  - *Manual check:* `internal/store/acc01_account_versioning_integration_test.go`
+    — `TestPgStore_AccountLifecycle_EmitsNamedEvents` (real Postgres: one
+    outbox row per command, keyed by the account's own `aggregate_id`;
+    explicitly asserts `AmendAccountVersion` emits none).
 - **A6. No `Idempotency-Key` handling on ACC-01 commands. — Closed for
   `AmendAccountVersion` and `ReparentAccount` (B12); the other three commands
   remain naturally idempotent as described here.** The wireframe lists it as a
@@ -94,22 +124,54 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   (it never consults a close state, and a reparent dated today while the
   period was already hard-closed would pass). Revisit when entity/book and a
   period service exist.
-- **A8. Reason and evidence are optional, and no source policy is retained.**
-  §"Evidence / lineage": "Exact account version, approver, reason, effective
-  dates and source policy retained with every material change." Every version
-  row retains version number, effective interval, actor and timestamp; reason
-  and `evidence_refs` are accepted and stored **when supplied but never
-  required**, and approver/source policy are absent (A3/A4). If evidence is to
-  become mandatory the refusal belongs in the handler/store for all five
-  commands at once.
-- **A9. Unregistered account codes remain postable.** Failure semantics say
-  "Inactive/non-posting/control-restricted account blocks posting", but ACC-04
-  deliberately lets codes the chart has never seen post (the bootstrap gap —
-  every historic caller posts codes nothing ever registered).
-  `ResolvePostingEligibility` therefore answers HTTP 200 with
-  `registered=false, eligible=true` for an unknown code, rather than 404 or a
-  block. This is preserved behavior, not an endorsement: closing the gap is a
-  flag-day decision across all posting callers.
+- **A8. Reason and evidence are optional, and no source policy is retained. —
+  `reason` closed for material changes (B17); `source_policy_ref` now
+  captured, optional, everywhere (B18); `evidence_refs` optionality remains
+  open (2026-11-07).** §"Evidence / lineage": "Exact account version,
+  approver, reason, effective dates and source policy retained with every
+  material change." Every version row retains version number, effective
+  interval, actor and timestamp. `reason` is now **required**, refused with
+  `ErrAccountChangeReasonRequired`, on exactly the same gate A4/B16 already
+  defines as "material" — a control account on either side of a reparent or
+  amendment — the one place this codebase has a formal definition of
+  "material change"; it stays optional everywhere else (an ordinary account's
+  change, or Create/Activate/Deactivate, none of which the spec's SoD/evidence
+  lines name as material). `source_policy_ref` is a new optional, free-text
+  column on `account_versions`/`account_change_approvals` (migration 000032):
+  the spec names "source policy" but gives it no shape, so this is a
+  reference string a caller supplies, the same posture `evidence_refs`
+  already takes, not a foreign key into a policy table this service has no
+  model for; approver is covered for the gated path by A4's
+  `account_change_approvals.approved_by_principal_id`. `evidence_refs`
+  remains optional everywhere, including the gated path — making it
+  mandatory too would need the same gated-path treatment `reason` just got,
+  not a platform-wide requirement; recorded as still open rather than
+  bundled in without its own review.
+- **A9. Unregistered account codes remain postable. — Investigated and made
+  observable 2026-11-07 (B19); enforcement remains an open, cross-service
+  decision.** Failure semantics say "Inactive/non-posting/control-restricted
+  account blocks posting", but ACC-04 deliberately lets codes the chart has
+  never seen post (the bootstrap gap). `ResolvePostingEligibility` therefore
+  answers HTTP 200 with `registered=false, eligible=true` for an unknown
+  code, rather than 404 or a block. This is preserved behavior, not an
+  endorsement.
+  Investigation found the real exposure is narrower than "every historic
+  caller": `/v1/postings/events` (ACC-04, used by payroll-run-svc,
+  inventory-management-svc, treasury-svc, accounts-receivable-svc,
+  accounts-payable-svc, expense-claim-svc, asset-management-svc,
+  project-accounting-svc, goods-service-receipt-svc) resolves accounts only
+  via `mapping_key`, and ACC-02's `CreateMapping`/`SetAccountMapping` already
+  refuse to map onto an account that is not registered and ACTIVE
+  (`ErrMappingTargetAccountInvalid`) — those 9 services cannot hit this gap.
+  The exposure is `CreateJournal`'s raw `account_code` path; the one
+  confirmed real caller is financial-close-svc (`createGLJournal`, posting
+  accrual/prepayment/FX-revaluation/allocation entries configured with a
+  literal `debit_account_code`/`credit_account_code`). Whether every
+  configured code financial-close-svc actually uses is already registered in
+  every tenant's chart of accounts is deployment data this service cannot
+  see — closing the gap is still a decision for whoever owns that data, not
+  something to default here. See B19 for what *is* now built: the fact is
+  observable, so real usage can be measured before anyone enforces.
 - **A10. Negative path 4 ("Activate duplicate account code") has no literal
   counterpart.** Account codes are uniquely constrained per tenant at
   creation, so two accounts cannot share a code and "activating a duplicate"
@@ -446,3 +508,90 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
       journal and keeps its reversal;
     - 000001–000028 applied from empty with `psql --single-transaction -v
       ON_ERROR_STOP=1`, and 000028 taken down and up again by hand.
+- **B16. ACC-01 maker-checker is scoped to control accounts, not every
+  hierarchy change or every account (2026-11-07).** A4 closes the spec's SoD
+  line for exactly what it names — "material control-account or hierarchy
+  change" — not every `ReparentAccount`/`AmendAccountVersion` call.
+  - *Why control-account-scoped, not every reparent:* a control account
+    (`is_control_account = true`) is the fraud-relevant and rollup-relevant
+    case this control exists for — an account other parts of the platform (or
+    a bank/intercompany reconciliation) trust without re-checking, and the one
+    place a single insider moving or redefining it unilaterally is the actual
+    risk. An ordinary account's reparent (e.g. reorganising expense
+    sub-accounts) changes no control account's standing and is not gated,
+    matching the spec's own word "material" rather than reading it as every
+    hierarchy edit.
+  - *Mechanism — a side table, not a new state on `account_versions`:*
+    `account_change_approvals` (migration 000031) records a pending change;
+    `account_versions`/`chart_of_accounts` are untouched until
+    `ApproveAccountChange` applies it. This keeps the existing "at most one
+    open version per account" invariant and the ordinary, ungated path
+    exactly as they were — no existing caller or test changed behaviour.
+  - *Re-validated at approval time, not just at proposal time:* `ApproveAccountChange`
+    re-checks `expected_version` against the account's current version under
+    a fresh row lock, so a change the account has moved past in the meantime
+    is refused (`ErrAccountVersionConflict`), not silently replayed against
+    stale facts.
+  - *Events:* the A5 lifecycle event (`hierarchy-changed` / `amended`) fires
+    at approval time, when the change is real, not at proposal time, when it
+    may never be approved.
+- **B17. `reason` becomes mandatory on the same gate B16 defines as
+  "material", not on every command (2026-11-07).** A8's evidence/lineage line
+  wants reason retained with "every material change"; this codebase has no
+  general notion of "material" to hang that on except the one B16 already
+  built. Reusing it, rather than inventing a second materiality test, means
+  `reason` is required exactly where a human will actually read it back
+  (reviewing a control-account change) and exactly nowhere an existing caller
+  — test or real — was already passing an empty one, since every existing
+  account in this codebase is non-control and so never reaches the gate.
+  - *Why not make it mandatory everywhere:* every one of the five commands'
+    existing callers may omit `reason` today; requiring it platform-wide would
+    refuse live traffic with no deprecation window, not just fail new tests —
+    the same "not a silent addition" reasoning A1 and A9 are recorded under.
+  - *Verification:* `internal/store/acc01_maker_checker_integration_test.go`
+    — `TestPgStore_MaterialChange_RequiresReason` (real Postgres: a blank or
+    whitespace-only reason is refused on both `ReparentAccount` and
+    `AmendAccountVersion` for a control account; an ordinary account's
+    amendment with no reason still applies immediately, unaffected).
+- **B18. `source_policy_ref` is a free-text reference, captured on every
+  reparent/amendment, not only the gated path (2026-11-07).** Unlike `reason`
+  (B17), nothing here gates whether `source_policy_ref` may be supplied —
+  it's accepted and stored on `ReparentAccount`/`AmendAccountVersion`
+  regardless of materiality, landing on the pending `AccountChangeApproval`
+  for a gated change or directly on the new `account_versions` row otherwise.
+  It is never required; `Create`/`Activate`/`Deactivate` do not accept it,
+  matching reason/evidence's existing scope to the four commands that produce
+  a version with a story behind it.
+  - *Why free text, not a typed reference:* the spec's wireframe gives
+    "source policy" no type and no referenced entity — this service has no
+    policy/workflow table to point a foreign key at, and inventing one here
+    would be designing a different capability's data model, not filling
+    ACC-01's own gap.
+  - *Verification:* `internal/store/acc01_maker_checker_integration_test.go`
+    — `TestPgStore_SourcePolicyRef_RoundTrips` (real Postgres: a
+    `source_policy_ref` supplied on `ReparentAccount` appears on the pending
+    `AccountChangeApproval` immediately, and on the `account_versions` row
+    once `ApproveAccountChange` applies it).
+- **B19. An unregistered account code posted via `CreateJournal` enriches the
+  existing `journal.created` event rather than refusing the post or adding a
+  new event type (2026-11-07).** A9 investigated enforcing registration and
+  found real cross-service exposure (see A9); this is the non-breaking first
+  step — make the fact observable before anyone decides to enforce it.
+  - *Why enrich, not a new event:* `created_data` already carries optional,
+    conditionally-present facts (`soft_close_override_reason`,
+    `close_journal_designation`) — `unregistered_account_codes` follows the
+    same shape, present only when at least one line's account code names no
+    row in this tenant's chart of accounts, absent otherwise.
+  - *Why in the same transaction as the write, not a side query:* the check
+    (`unregisteredAccountCodes`) runs inside `CreateJournal`'s own
+    transaction, so the fact is exactly as durable as the journal it
+    describes — no separate process can fail to record it.
+  - *Also logs:* `s.log.Warn` with the journal id, tenant and the codes, for
+    anyone watching logs rather than the event stream.
+  - *Deduplicated, not per-line:* two lines naming the same unregistered code
+    (a debit and its offsetting credit) appear once in
+    `unregistered_account_codes`, not twice.
+  - *Verification:* `internal/store/acc01_unregistered_account_code_test.go`
+    on real Postgres — an unregistered code still posts successfully and the
+    event names it exactly once; an all-registered journal carries no such
+    field at all.

@@ -382,6 +382,14 @@ var (
 	// ErrResolutionOutcomeInvalid is ResolveMismatch's outcome guard.
 	ErrResolutionOutcomeInvalid = errorString("outcome is required to resolve a disputed intercompany pair: ACCEPTED, CORRECTED or WRITTEN_OFF")
 
+	// ErrResolverIsDisputer (SPEC_DEVIATIONS A8): "One entity cannot certify
+	// both sides of material mismatch without compensating control."
+	// Applied unconditionally — resolver must differ from whoever raised
+	// the dispute — rather than building a materiality model the spec
+	// never defines, the same interpretation financial-close-svc's B1 made
+	// for every maker-checker gate in that register.
+	ErrResolverIsDisputer = errorString("segregation of duties: the principal who disputed this mismatch cannot also resolve it")
+
 	// ErrCloseReasonRequired is ClosePair's guard: a terminal close with no
 	// recorded reason is not evidence of anything.
 	ErrCloseReasonRequired = errorString("reason is required to close an intercompany pair")

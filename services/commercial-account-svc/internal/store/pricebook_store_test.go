@@ -70,7 +70,7 @@ func (f *pbFixture) currency(code string, minor int, enabled bool) {
 	f.t.Helper()
 	if _, err := f.s.UpsertCurrency(f.ctx, &domain.CommercialCurrency{
 		CurrencyCode: code, MinorUnits: minor, SaleEnabled: enabled, UpdatedByPrincipalID: maker,
-	}); err != nil {
+	}, f.claim(maker, "PutCurrency", code)); err != nil {
 		f.t.Fatalf("upsert currency %s: %v", code, err)
 	}
 }
@@ -770,11 +770,48 @@ func TestPriceBook_CurrencyScaleAndMinorUnits(t *testing.T) {
 	}
 
 	if _, err := f.s.UpsertCurrency(f.ctx, &domain.CommercialCurrency{CurrencyCode: "USD", MinorUnits: 3, SaleEnabled: true,
-		UpdatedByPrincipalID: maker}); !errors.Is(err, store.ErrCurrencyMinorUnitsFixed) {
+		UpdatedByPrincipalID: maker}, f.claim(maker, "PutCurrency", "USD")); !errors.Is(err, store.ErrCurrencyMinorUnitsFixed) {
 		t.Fatalf("minor units were changed under existing prices: %v", err)
 	}
 	if _, err := f.sellerExec(`UPDATE commercial_currencies SET minor_units = 3 WHERE currency_code = 'USD'`); pgCode(err) != "CP001" {
 		t.Fatalf("raw minor-unit change was accepted: %v", err)
+	}
+}
+
+// SPEC_DEVIATIONS A4: UpsertCurrency now claims an Idempotency-Key. A retry
+// under the same key with a DIFFERENT sale_enabled value must still replay
+// the original state, not silently apply the new one — proving the claim,
+// not just natural upsert idempotency, is what blocks the second write.
+func TestPutCurrency_IsIdempotent(t *testing.T) {
+	f := newPB(t)
+	claim := f.claim(maker, "PutCurrency", "GBP")
+	if _, err := f.s.UpsertCurrency(f.ctx, &domain.CommercialCurrency{
+		CurrencyCode: "GBP", MinorUnits: 2, SaleEnabled: true, UpdatedByPrincipalID: maker}, claim); err != nil {
+		t.Fatalf("first put: %v", err)
+	}
+
+	_, err := f.s.UpsertCurrency(f.ctx, &domain.CommercialCurrency{
+		CurrencyCode: "GBP", MinorUnits: 2, SaleEnabled: false, UpdatedByPrincipalID: maker}, claim)
+	var replay *domain.IdempotentReplayError
+	if !errors.As(err, &replay) || replay.ResourceID != "GBP" {
+		t.Fatalf("a retried put must replay, got: %v", err)
+	}
+
+	cs, err := f.s.ListCurrencies(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, c := range cs {
+		if c.CurrencyCode == "GBP" {
+			found = true
+			if !c.SaleEnabled {
+				t.Fatalf("sale_enabled = false, want true (the replayed call must not have re-applied)")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("GBP not found")
 	}
 }
 
