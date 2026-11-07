@@ -1,12 +1,12 @@
 -- Migration 000007 down.
-DO $$
+DO $migration_000007_down$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zoiko_app') THEN
         GRANT UPDATE, DELETE ON refused_escalations TO zoiko_app;
         GRANT INSERT, UPDATE, DELETE ON protected_permissions TO zoiko_app;
     END IF;
 END
-$$;
+$migration_000007_down$;
 
 DROP POLICY IF EXISTS refused_escalations_append ON refused_escalations;
 DROP POLICY IF EXISTS refused_escalations_read ON refused_escalations;

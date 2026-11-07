@@ -544,7 +544,11 @@ func TestPgStore_ListPendingSubmissions_OnlySubmittedOrValidating(t *testing.T) 
 	// A fully ACCEPTED submission must not appear either.
 	acceptedSubmissionForTest(t, s, ctx, form.FormID, "submitter-3", "pending-accepted", map[string]string{"amount": "20"})
 
-	pending, err := s.ListPendingSubmissions(ctx, testTenantID, form.FormID, 100, 0)
+	pending, _, err := s.ListPendingSubmissions(ctx, testTenantID, form.FormID, domain.ListPendingSubmissionsParams{
+		TenantID: testTenantID,
+		FormID:   form.FormID,
+		Limit:    100,
+	})
 	if err != nil {
 		t.Fatalf("list pending: %v", err)
 	}

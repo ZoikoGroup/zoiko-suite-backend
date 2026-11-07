@@ -465,6 +465,26 @@ func (p *Publisher) PublishTenantContextInvalidated(
 	})
 }
 
+// PublishSessionRevoked emits one event per revoked session (IC-16 / S1-12 K-6).
+// This is the per-session counterpart to PublishTenantContextInvalidated: instead
+// of a summary count, each individual session context ID gets its own event.
+// The event goes to the outbox (identity.session.revoked) and is streamed to SIEM.
+func (p *Publisher) PublishSessionRevoked(
+	ctx context.Context,
+	tenantID, sessionContextID, principalID string,
+	reason domain.InvalidationReason,
+	actorID, correlationID string,
+) error {
+	return p.emit(ctx, EventSessionRevoked, tenantID, "", actorID, correlationID, sessionContextID, map[string]any{
+		"session_context_id":  sessionContextID,
+		"principal_id":        principalID,
+		"tenant_id":           tenantID,
+		"invalidation_reason": reason,
+		"actor":               actorID,
+		"correlation_id":      correlationID,
+	})
+}
+
 // PublishDispositionExecuted reports a completed retention sweep with its
 // certificate id.
 func (p *Publisher) PublishDispositionExecuted(

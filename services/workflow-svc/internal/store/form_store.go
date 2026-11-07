@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -546,14 +547,42 @@ func (s *PgStore) GetValidationResult(ctx context.Context, tenantID, submissionI
 // reviewer/validator works through. Scoped to one form (not the whole
 // tenant) so authorization stays meaningful: a caller is authorized per
 // legal entity, and a form is the unit that carries one.
-func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID string, limit, offset int) ([]*domain.FormSubmission, error) {
+// Uses cursor paging (API-4) with keyset pagination on (created_at DESC, form_submission_id DESC).
+func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	// Build cursor condition for keyset pagination
+	var cursorCondition string
+	var cursorArgs []any
+	if params.Cursor != nil && params.Cursor.StartedAt != "" && params.Cursor.InstanceID != "" {
+		cursorCondition = "AND (created_at, form_submission_id) < ($2, $3)"
+		cursorArgs = []any{params.Cursor.StartedAt, params.Cursor.InstanceID}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM form_submissions
+		WHERE form_id = $1
+		  AND status IN ('SUBMITTED', 'VALIDATING')
+		  %s
+		ORDER BY created_at DESC, form_submission_id DESC
+		LIMIT $%d`,
+		formSubmissionColumns, cursorCondition, len(cursorArgs)+2)
+
+	args := make([]any, 0, 1+len(cursorArgs)+1)
+	args = append(args, formID)
+	args = append(args, cursorArgs...)
+	args = append(args, limit+1) // Fetch one extra to determine if there's a next page
+
 	var out []*domain.FormSubmission
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT `+formSubmissionColumns+` FROM form_submissions
-			WHERE form_id=$1 AND status IN ('SUBMITTED', 'VALIDATING')
-			ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-			formID, limit, offset)
+		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -568,7 +597,20 @@ func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID s
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return out, nil
+
+	// Determine next cursor
+	var nextCursor *domain.PaginationCursor
+	if len(out) > limit {
+		// We fetched limit+1 rows, so there's a next page
+		last := out[limit-1] // The last item of the actual page
+		out = out[:limit]
+		nextCursor = &domain.PaginationCursor{
+			StartedAt:  last.CreatedAt.UTC().Format(time.RFC3339),
+			InstanceID: last.SubmissionID,
+		}
+	}
+
+	return out, nextCursor, nil
 }

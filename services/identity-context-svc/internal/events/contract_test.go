@@ -108,6 +108,17 @@ func producedEventTypes() []string {
 		events.EventSupportContextReviewed,
 		events.EventDispositionExecuted,
 		events.EventDispositionBlocked,
+		// Lifecycle events (IC-13, IC-16, IC-14)
+		events.EventPasswordResetRequest,
+		events.EventPasswordResetDecided,
+		events.EventSubjectInvited,
+		events.EventIdPRegistered,
+		events.EventIdPStatusChanged,
+		events.EventFederatedLogin,
+		events.EventGroupMappingProposed,
+		events.EventGroupMappingDecided,
+		events.EventGroupMembershipChange,
+		events.EventSCIMConnectionCreated,
 	}, events.FederationEventTypes()...)
 }
 

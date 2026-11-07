@@ -642,11 +642,19 @@ func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, dupli
 	}
 	m, created, err := s.store.MergeIdentities(ctx, a.TenantID, survivorID, duplicateID, reason, a.PrincipalID, a.CorrelationID,
 		func(m store.IdentityMerge) ([]outbox.Record, error) {
-			rec, err := events.Render(events.EventSubjectMerged, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,
-				map[string]any{"merge_id": m.MergeID, "tenant_id": m.TenantID, "survivor_id": m.SurvivorID,
-					"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": m.Reason, "link_outcomes": m.LinkOutcomes,
-					"merged_at": m.MergedAt, "correlation_id": a.CorrelationID})
-			return []outbox.Record{rec}, err
+			recs := []outbox.Record{}
+			// IC-14 (S1-14 merge route parity): emit the same three events as Merge (POST /v1/subjects/{id}/merge)
+			for _, et := range []string{events.EventSubjectMerged, events.EventPrincipalStatusChanged, events.EventSubjectDisabled} {
+				rec, err := events.Render(et, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,
+					map[string]any{"merge_id": m.MergeID, "tenant_id": m.TenantID, "survivor_id": m.SurvivorID,
+						"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": m.Reason, "link_outcomes": m.LinkOutcomes,
+						"merged_at": m.MergedAt, "correlation_id": a.CorrelationID})
+				if err != nil {
+					return nil, err
+				}
+				recs = append(recs, rec)
+			}
+			return recs, nil
 		})
 	switch {
 	case errors.Is(err, store.ErrMergeConflict):

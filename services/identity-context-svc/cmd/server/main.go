@@ -491,7 +491,7 @@ func main() {
 		zap.String("authenticate_endpoint", cfg.AuthPlane.PasswordEndpoint))
 
 	lifecycleSvc, err := newLifecycle(cfg, principalRepo, hasher,
-		principalSessionEnder(principalRepo, provider, sessionCache), loginLimiter, log)
+		principalSessionEnder(principalRepo, provider, sessionCache, publisher, log), loginLimiter, log)
 	if err != nil {
 		log.Fatal("failed to build the subject lifecycle", zap.Error(err))
 	}

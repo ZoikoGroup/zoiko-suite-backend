@@ -189,11 +189,143 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", p, err)
 		}
-		if _, err := pool.Exec(ctx, string(sqlBytes)); err != nil {
-			return fmt.Errorf("apply %s: %w", filepath.Base(p), err)
+		stmts := splitSQL(string(sqlBytes))
+		for _, stmt := range stmts {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("apply %s: %w", filepath.Base(p), err)
+			}
 		}
 	}
 	return nil
+}
+
+// splitSQL splits a SQL string into individual statements.
+// It handles single-quoted strings ('...' with '' escapes),
+// PostgreSQL dollar-quoted strings ($tag$...$tag$),
+// single-line comments (-- ...), and block comments (/* ... */).
+// This is a best-effort splitter; the project's migrations are written
+// to avoid semicolons inside strings.
+func splitSQL(sql string) []string {
+	var stmts []string
+	var current strings.Builder
+	inSingleQuote := false
+	inDollarQuote := false
+	inLineComment := false
+	inBlockComment := false
+	dollarTag := ""
+
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+
+		// Handle block comment end
+		if inBlockComment {
+			current.WriteByte(c)
+			if c == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+				current.WriteByte('/')
+				i++
+				inBlockComment = false
+			}
+			continue
+		}
+
+		// Handle line comment end
+		if inLineComment {
+			if c == '\n' {
+				current.WriteByte(c)
+				inLineComment = false
+			} else {
+				current.WriteByte(c)
+			}
+			continue
+		}
+
+		if inDollarQuote {
+			current.WriteByte(c)
+			// Check for end of dollar-quoted string ($tag$ or $$)
+			if c == '$' && i+len(dollarTag) <= len(sql) && sql[i:i+len(dollarTag)] == dollarTag {
+				inDollarQuote = false
+				dollarTag = ""
+				// Advance past the rest of the end marker (already wrote first $)
+				i += len(dollarTag) - 1
+				continue
+			}
+			continue
+		}
+
+		if inSingleQuote {
+			current.WriteByte(c)
+			if c == '\'' {
+				// Check for escaped quote ''
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					current.WriteByte('\'')
+					i++
+				} else {
+					inSingleQuote = false
+				}
+			}
+			continue
+		}
+
+		// Not in any quoted string or comment
+		if c == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			inLineComment = true
+			current.WriteByte(c)
+			current.WriteByte('-')
+			i++
+			continue
+		}
+
+		if c == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			inBlockComment = true
+			current.WriteByte(c)
+			current.WriteByte('*')
+			i++
+			continue
+		}
+
+		if c == '\'' {
+			inSingleQuote = true
+			current.WriteByte(c)
+		} else if c == '$' && i+1 < len(sql) {
+			// Check for dollar quote start ($tag$ or $$)
+			j := i + 1
+			tag := ""
+			// Allow empty tag ($$) or tagged ($tag$)
+			for j < len(sql) && (sql[j] >= 'a' && sql[j] <= 'z' || sql[j] >= 'A' && sql[j] <= 'Z' || sql[j] >= '0' && sql[j] <= '9' || sql[j] == '_') {
+				tag += string(sql[j])
+				j++
+			}
+			if j < len(sql) && sql[j] == '$' {
+				inDollarQuote = true
+				dollarTag = "$" + tag + "$"
+				// Write the opening $tag$
+				for k := i + 1; k <= j; k++ {
+					current.WriteByte(sql[k])
+				}
+				i = j
+				continue
+			} else {
+				current.WriteByte(c)
+			}
+		} else if c == ';' {
+			// End of statement
+			stmts = append(stmts, current.String())
+			current.Reset()
+		} else {
+			current.WriteByte(c)
+		}
+	}
+
+	// Add any remaining
+	if current.Len() > 0 {
+		stmts = append(stmts, current.String())
+	}
+
+	return stmts
 }
 
 func createAppRole(ctx context.Context, pool *pgxpool.Pool, dbName string) error {

@@ -62,8 +62,9 @@ type Store interface {
 	SuspendWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 	RetireWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 
-	// Additional workflow instance methods
-	ListPendingApprovals(ctx context.Context, tenantID string, limit, offset int) ([]*domain.WorkflowInstance, error)
+// Additional workflow instance methods
+	ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
+	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
 	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
 }
@@ -1088,24 +1089,53 @@ func (s *PgStore) GetWorkflowDefinition(ctx context.Context, params domain.GetWo
 	return definition, nil
 }
 
-// ListPendingApprovals lists workflows pending approval for a tenant.
-func (s *PgStore) ListPendingApprovals(ctx context.Context, tenantID string, limit, offset int) ([]*domain.WorkflowInstance, error) {
-	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE tenant_id = $1 AND workflow_status IN ('PENDING','ESCALATED') ORDER BY started_at DESC, workflow_instance_id DESC LIMIT $2 OFFSET $3;`
+// ListPendingApprovals lists workflows pending approval for a tenant using cursor paging (API-4).
+func (s *PgStore) ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	// Build cursor condition for keyset pagination
+	var cursorCondition string
+	var cursorArgs []any
+	if params.Cursor != nil && params.Cursor.StartedAt != "" && params.Cursor.InstanceID != "" {
+		cursorCondition = "AND (started_at, workflow_instance_id) < ($2, $3)"
+		cursorArgs = []any{params.Cursor.StartedAt, params.Cursor.InstanceID}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM workflow_instances
+		WHERE tenant_id = $1
+		  AND workflow_status IN ('PENDING','ESCALATED')
+		  %s
+		ORDER BY started_at DESC, workflow_instance_id DESC
+		LIMIT $%d`,
+		instanceColumns, cursorCondition, len(cursorArgs)+2)
+
+	args := make([]any, 0, 1+len(cursorArgs)+1)
+	args = append(args, tenantID)
+	args = append(args, cursorArgs...)
+	args = append(args, limit+1) // Fetch one extra to determine if there's a next page
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.log.Error("pg ListPendingApprovals failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
-		return nil, fmt.Errorf("%w: set_config app.tenant_id: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: set_config app.tenant_id: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	rows, err := tx.Query(ctx, query, tenantID, limit, offset)
+	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		s.log.Error("pg ListPendingApprovals failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
 
@@ -1113,15 +1143,28 @@ func (s *PgStore) ListPendingApprovals(ctx context.Context, tenantID string, lim
 	for rows.Next() {
 		inst, err := scanInstance(rows)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		instances = append(instances, inst)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return instances, nil
+
+	// Determine next cursor
+	var nextCursor *domain.PaginationCursor
+	if len(instances) > limit {
+		// We fetched limit+1 rows, so there's a next page
+		last := instances[limit-1] // The last item of the actual page
+		instances = instances[:limit]
+		nextCursor = &domain.PaginationCursor{
+			StartedAt:  last.StartedAt.UTC().Format(time.RFC3339),
+			InstanceID: last.WorkflowInstanceID,
+		}
+	}
+
+	return instances, nextCursor, nil
 }

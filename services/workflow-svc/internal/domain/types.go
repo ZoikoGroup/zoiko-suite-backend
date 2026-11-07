@@ -6,7 +6,11 @@
 // CANCELLED | INVALIDATED, enforced in application code.
 package domain
 
-import "time"
+import (
+	"encoding/base64"
+	"encoding/json"
+	"time"
+)
 
 // Canonical workflow statuses per ZS-STATE-001 §6.
 const (
@@ -338,6 +342,21 @@ type ListWorkflowDefinitionsParams struct {
 	Offset       int
 }
 
+// ListPendingApprovalsParams holds input for listing pending approvals with cursor paging (API-4).
+type ListPendingApprovalsParams struct {
+	TenantID string
+	Limit    int
+	Cursor   *PaginationCursor
+}
+
+// ListPendingSubmissionsParams holds input for listing pending submissions with cursor paging (API-4).
+type ListPendingSubmissionsParams struct {
+	TenantID string
+	FormID   string
+	Limit    int
+	Cursor   *PaginationCursor
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var ErrWorkflowNotFound = errorString("workflow not found")
@@ -387,6 +406,42 @@ var ErrQuorumThresholdExceedsPool = errorString("required_approvals cannot excee
 var ErrQuorumDuplicateApprover = errorString("quorum_approvers must not list the same principal twice")
 var ErrNotQuorumStage = errorString("the current stage is not a QUORUM stage")
 var ErrNotEligibleQuorumApprover = errorString("actor is not an eligible approver for this quorum stage")
+
+// PaginationCursor is an opaque cursor for keyset pagination (API-4).
+// It encodes the sort key of the last item returned (started_at DESC, workflow_instance_id DESC).
+// The cursor is base64.RawURLEncoding encoded JSON.
+type PaginationCursor struct {
+	StartedAt  string `json:"started_at"`   // RFC3339 timestamp
+	InstanceID string `json:"instance_id"`  // workflow_instance_id
+}
+
+// EncodePaginationCursor encodes a cursor for transport.
+func EncodePaginationCursor(c *PaginationCursor) (string, error) {
+	if c == nil {
+		return "", nil
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// DecodePaginationCursor decodes a cursor from transport.
+func DecodePaginationCursor(s string) (*PaginationCursor, error) {
+	if s == "" {
+		return nil, nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	var c PaginationCursor
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
 
 type errorString string
 

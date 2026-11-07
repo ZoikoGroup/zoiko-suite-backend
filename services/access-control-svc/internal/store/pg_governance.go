@@ -48,19 +48,25 @@ func NewPermissionCatalogue(s *PgStore) *PermissionCatalogue { return &Permissio
 
 const permissionColumns = `
 	p.action_name, p.naming, p.risk_tier, p.description,
-	EXISTS (SELECT 1 FROM protected_permissions pp WHERE pp.action_name = p.action_name AND pp.active_flag) AS protected
+	EXISTS (SELECT 1 FROM protected_permissions pp WHERE pp.action_name = p.action_name AND pp.active_flag) AS protected,
+	p.alias_for
 `
 
 // Lookup returns the ACTIVE definitions among actions, keyed by exact name.
 // An action absent from the map is unregistered. Exact match on purpose:
 // "Payment.Release" is not "payment.release", and a bundle granting the
 // former would grant something no service checks.
+//
+// S9-D1 aliases: if an action has an alias_for pointing to a canonical
+// action, the canonical action's definition is also included in the map
+// under the alias name, so that checkTaxonomy and roleRisk see them as
+// equivalent.
 func (c *PermissionCatalogue) Lookup(ctx context.Context, actions []string) (map[string]domain.PermissionDefinition, error) {
 	tenantID, err := requestTenant(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]domain.PermissionDefinition, len(actions))
+	out := make(map[string]domain.PermissionDefinition, len(actions)*2)
 	if len(actions) == 0 {
 		return out, nil
 	}
@@ -72,10 +78,22 @@ func (c *PermissionCatalogue) Lookup(ctx context.Context, actions []string) (map
 		defer rows.Close()
 		for rows.Next() {
 			var d domain.PermissionDefinition
-			if err := rows.Scan(&d.ActionName, &d.Naming, &d.RiskTier, &d.Description, &d.Protected); err != nil {
+			var aliasFor *string
+			if err := rows.Scan(&d.ActionName, &d.Naming, &d.RiskTier, &d.Description, &d.Protected, &aliasFor); err != nil {
 				return err
 			}
 			out[d.ActionName] = d
+			// S9-D1: if this is a LEGACY entry with an alias_for, also include
+			// the canonical definition under the alias name.
+			if aliasFor != nil && *aliasFor != "" {
+				// Fetch the canonical definition
+				var cd domain.PermissionDefinition
+				err := tx.QueryRow(ctx, "SELECT "+permissionColumns+" FROM permission_definitions WHERE action_name = $1 AND active_flag", *aliasFor).Scan(&cd.ActionName, &cd.Naming, &cd.RiskTier, &cd.Description, &cd.Protected, &aliasFor)
+				if err == nil {
+					// Add the canonical definition under the alias name
+					out[*aliasFor] = cd
+				}
+			}
 		}
 		return rows.Err()
 	})

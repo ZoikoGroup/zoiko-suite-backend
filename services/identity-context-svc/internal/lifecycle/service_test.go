@@ -121,6 +121,7 @@ type resetStore struct {
 	decideReq func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
 		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error)
 	createReq func(ctx context.Context, r domain.PasswordResetRequest, recs ...outbox.Record) error
+	insertCredToken func(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error
 }
 
 func (s *resetStore) GetResetRequest(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error) {
@@ -141,6 +142,13 @@ func (s *resetStore) DecideResetRequest(ctx context.Context, tenantID, requestID
 func (s *resetStore) CreateResetRequest(ctx context.Context, r domain.PasswordResetRequest, recs ...outbox.Record) error {
 	if s.createReq != nil {
 		return s.createReq(ctx, r, recs...)
+	}
+	return nil
+}
+
+func (s *resetStore) InsertCredentialTokenTx(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error {
+	if s.insertCredToken != nil {
+		return s.insertCredToken(ctx, tx, t)
 	}
 	return nil
 }
@@ -319,12 +327,22 @@ func TestIC13_LinkDeliveryFailureReturnsError(t *testing.T) {
 		for _, rec := range recs {
 			events = append(events, rec)
 		}
+		// Call the issue function to set the issued token (simulating the store's behavior)
+		// The issue function captures the issued token in a closure variable in the service.
+		// We call it with nil tx since this is a unit test without a real transaction.
+		_ = issue(ctx, nil, &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+		})
 		now := time.Now().UTC()
 		return &domain.PasswordResetRequest{
 			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
 			Status: "ISSUED", DecidedAt: &now,
 			Approvals: []domain.ResetApproval{{ApproverID: a.ApproverID, Decision: "APPROVE", At: now}},
 		}, nil
+	}
+	// Allow the issue function to call InsertCredentialTokenTx with nil tx
+	st.insertCredToken = func(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error {
+		return nil // Accept nil tx for testing
 	}
 	notifier := &fakeNotifier{fail: true}
 	svc := newResetService(st, notifier, nil)

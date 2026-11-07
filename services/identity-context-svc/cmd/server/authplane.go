@@ -18,6 +18,7 @@ import (
 	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/credential"
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/keys"
 	"zoiko.io/identity-context-svc/internal/lifecycle"
 	"zoiko.io/identity-context-svc/internal/oidc"
@@ -130,7 +131,10 @@ func skipProtocolPaths(mw func(http.Handler) http.Handler) func(http.Handler) ht
 // login session (with its refresh tokens and the session contexts resolved
 // under it) and then any session context left over. It is what a disable or
 // suspension calls (termination priority, IAM §17).
-func principalSessionEnder(st *store.PgStore, provider *oidc.Provider, sessions *session.DurableCache) lifecycle.SessionEnder {
+//
+// IC-16 (S1-12 K-6): emits identity.session.revoked for each individual
+// session context ID revoked, not just a summary count.
+func principalSessionEnder(st *store.PgStore, provider *oidc.Provider, sessions *session.DurableCache, pub *events.Publisher, log *zap.Logger) lifecycle.SessionEnder {
 	return func(ctx context.Context, tenantID, principalID, reason, actor, correlationID string) (int, error) {
 		ended := 0
 		sids, err := st.LiveAuthSessionIDs(ctx, tenantID, principalID, time.Now().UTC())
@@ -144,8 +148,17 @@ func principalSessionEnder(st *store.PgStore, provider *oidc.Provider, sessions 
 			}
 			ended += n
 		}
-		n, err := sessions.EvictAllForPrincipal(ctx, principalID, tenantID, domain.InvalidationReasonAdminRevoke)
-		return ended + n, err
+		// Evict session contexts and emit per-session revoked events
+		scIDs, err := sessions.EvictAllForPrincipalWithIDs(ctx, principalID, tenantID, domain.InvalidationReasonAdminRevoke)
+		if err != nil {
+			return ended, err
+		}
+		for _, scID := range scIDs {
+			if err := pub.PublishSessionRevoked(ctx, tenantID, scID, principalID, domain.InvalidationReasonAdminRevoke, actor, correlationID); err != nil {
+				log.Error("session revoked event not recorded", zap.String("session_context_id", scID), zap.Error(err))
+			}
+		}
+		return ended + len(scIDs), nil
 	}
 }
 

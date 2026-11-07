@@ -2258,7 +2258,29 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	instances, err := h.store.ListPendingApprovals(r.Context(), tenantScope, getIntQuery(r, "limit", 50), getIntQuery(r, "offset", 0))
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
+	}
+
+	var cursor *domain.PaginationCursor
+	if cursorStr := r.URL.Query().Get("cursor"); cursorStr != "" {
+		c, err := domain.DecodePaginationCursor(cursorStr)
+		if err != nil {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_cursor",
+				"message": "cursor is not valid",
+			})
+			return
+		}
+		cursor = c
+	}
+
+	instances, nextCursor, err := h.store.ListPendingApprovals(r.Context(), tenantScope, domain.ListPendingApprovalsParams{
+		TenantID: tenantScope,
+		Limit:    limit,
+		Cursor:   cursor,
+	})
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "ListPendingApprovals")
 		return
@@ -2266,7 +2288,23 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 	if instances == nil {
 		instances = []*domain.WorkflowInstance{}
 	}
-	writeJSON(w, r, http.StatusOK, instances)
+
+	type listResponse struct {
+		Records    []*domain.WorkflowInstance   `json:"records"`
+		NextCursor string                       `json:"next_cursor,omitempty"`
+		Watermark  string                       `json:"watermark,omitempty"`
+	}
+
+	resp := listResponse{
+		Records: instances,
+	}
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			resp.NextCursor = encoded
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, resp)
 }
 
 // GetApprovalEvidence handles GET /v1/workflows/{workflow_instance_id}/evidence.

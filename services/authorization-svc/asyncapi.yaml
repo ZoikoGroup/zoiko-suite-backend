@@ -1,0 +1,354 @@
+asyncapi: "2.6.0"
+
+info:
+  title: Authorization Service — Event Contract
+  version: "1.0"
+  description: |
+    The published and consumed event surface of authorization-svc (IAM / AuthZ).
+
+    This document closes half of DoD gate 1: the OpenAPI document published the
+    synchronous contract, but the event contract — which is how every
+    authorization decision, every SoD violation, and every grant/revocation
+    reaches the estate — existed only as Go code.
+
+    ## Delivery semantics
+
+    Every event below is written to a **transactional outbox** in the same
+    Postgres transaction as the fact it attests, and a relay drains that to
+    Kafka. This is the spec's invariant 10: "Outbox publication occurs only
+    after authoritative commit; consumers assume at-least-once delivery."
+
+    Consumers **must** deduplicate on `event_id`. Delivery is at-least-once:
+    a relay that writes to Kafka and then fails to mark the row will redeliver
+    on its next pass, which is a deliberate trade — a duplicate is recoverable,
+    a loss is not.
+
+    ## Ordering
+
+    Ordering is per partition, and the partition key is the SUBJECT of the
+    event (an access decision id, a principal id, a role assignment id) rather
+    than the event id. Two events about one principal are therefore ordered
+    with respect to each other; two events about different principals are not.
+
+    ## Self-consumption
+
+    The reader and the writer are pointed at the same topic, so everything this
+    service publishes comes back to it. The consumer drops any event whose
+    `source_service` is `authorization-svc`.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+  cluster:
+    url: kafka:9092
+    protocol: kafka
+
+channels:
+  zoiko.authorization.events:
+    description: |
+      This service's own topic. Everything it produces goes here. The reader is
+      also subscribed to it, which is why the self-source guard exists.
+
+      The events it CONSUMES from other services are published on each
+      producer's own topic, listed as the channels below.
+    publish:
+      summary: Events authorization-svc produces
+      message:
+        oneOf:
+          - $ref: "#/components/messages/AuthorizationGranted"
+          - $ref: "#/components/messages/AuthorizationDenied"
+          - $ref: "#/components/messages/SoDViolationDetected"
+    subscribe:
+      summary: Events authorization-svc consumes
+      message:
+        oneOf:
+          - $ref: "#/components/messages/AssignmentGranted"
+          - $ref: "#/components/messages/AssignmentRevoked"
+          - $ref: "#/components/messages/AssignmentSuspended"
+          - $ref: "#/components/messages/AssignmentResumed"
+          - $ref: "#/components/messages/AssignmentExpired"
+          - $ref: "#/components/messages/AssignmentApproved"
+
+  zoiko.delegated-authority.events:
+    description: Owned by delegated-authority-svc. Consumed only.
+    subscribe:
+      summary: Delegation lifecycle — an ended delegation revokes the delegate's sessions
+      message:
+        oneOf:
+          - $ref: "#/components/messages/AuthorityEnded"
+
+  zoiko.access-control.events:
+    description: Owned by access-control-svc. Consumed only.
+    subscribe:
+      summary: Role changes — every holder's sessions are revoked
+      message:
+        oneOf:
+          - $ref: "#/components/messages/RoleUpdated"
+
+components:
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The platform event contract. Fields with no real value at the call
+        site are OMITTED rather than fabricated — an event that has no
+        tenant genuinely has no tenant_id, and inventing one would put a
+        false fact into the evidence stream.
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, payload]
+      properties:
+        event_id:
+          type: string
+          description: Fresh UUID per publish. The deduplication key.
+        event_type:
+          type: string
+        event_version:
+          type: string
+        emitted_at:
+          type: string
+          format: date-time
+        schema_version:
+          type: string
+        source_service:
+          type: string
+          description: |
+            Consumers use this to drop their own events. This service does.
+        tenant_id:
+          type: string
+        legal_entity_id:
+          type: string
+        actor_id:
+          type: string
+        correlation_id:
+          type: string
+        payload:
+          type: object
+
+  messages:
+    # -- Published -----------------------------------------------------------------
+
+    AuthorizationGranted:
+      name: authorization.granted
+      title: An authorization request was permitted
+      summary: |
+        Written in the SAME transaction as the access_decision_log row, so a
+        decision with no event and an event with no decision are both
+        unreachable states.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [access_decision_id, principal_id, tenant_id, legal_entity_id, action_type, decision_basis]
+                properties:
+                  access_decision_id:
+                    type: string
+                    format: uuid
+                  principal_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  legal_entity_id:
+                    type: string
+                  action_type:
+                    type: string
+                  decision_basis:
+                    type: string
+                    description: |
+                      One of: rbac:role=..., delegated:from=..., no_grant
+                  correlation_id:
+                    type: string
+                  ingress_source:
+                    type: string
+                  environment:
+                    type: string
+                  assurance_level:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+
+    AuthorizationDenied:
+      name: authorization.denied
+      title: An authorization request was denied
+      summary: |
+        Written in the SAME transaction as the access_decision_log row. The
+        decision_basis names exactly which layer produced the denial.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [access_decision_id, principal_id, tenant_id, legal_entity_id, action_type, decision_basis]
+                properties:
+                  access_decision_id:
+                    type: string
+                    format: uuid
+                  principal_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  legal_entity_id:
+                    type: string
+                  action_type:
+                    type: string
+                  decision_basis:
+                    type: string
+                    description: |
+                      One of: no_grant, sod:conflict_with=..., sod:own_object_forbidden,
+                      abac:forbidden=..., abac:require_failed=..., abac:rule_unevaluable=...
+                  correlation_id:
+                    type: string
+                  ingress_source:
+                    type: string
+                  environment:
+                    type: string
+                  assurance_level:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+
+    SoDViolationDetected:
+      name: sod.violation.detected
+      title: A Separation-of-Duties conflict was detected
+      summary: |
+        Fired in ADDITION to authorization.denied when the denial reason
+        was an SoD conflict (decision_basis starting with "sod:"). This is
+        a separate signal for security teams who only care about SoD
+        violations, not general denials.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [access_decision_id, principal_id, tenant_id, legal_entity_id, action_type, conflict_with]
+                properties:
+                  access_decision_id:
+                    type: string
+                    format: uuid
+                  principal_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  legal_entity_id:
+                    type: string
+                  action_type:
+                    type: string
+                  conflict_with:
+                    type: string
+                    description: The conflicting action that triggered the SoD rule
+                  decision_basis:
+                    type: string
+                    description: sod:conflict_with=... or sod:own_object_forbidden
+                  correlation_id:
+                    type: string
+                  ingress_source:
+                    type: string
+                  environment:
+                    type: string
+                  assurance_level:
+                    type: string
+
+    # -- Consumed ------------------------------------------------------------------
+
+    AuthorityEnded:
+      name: authority.revoked
+      title: A delegated authority was revoked or expired
+      summary: |
+        Also matches `authority.expired` — an expired authority grants nothing,
+        so the response is identical. Events older than the envelope TTL plus
+        one minute are skipped — no live session can predate them. The
+        delegate is read from `payload.delegate_principal_id`, never from
+        `actor_id`, which on a revocation is the revoker. Revokes EVERY session
+        the delegate holds: an active session must stop carrying a delegation
+        that no longer exists, and it must stop now rather than at envelope
+        expiry.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RoleUpdated:
+      name: role.updated
+      title: A role's grants changed
+      summary: |
+        Envelopes already issued carry the permission bundles the role granted
+        BEFORE the change, so every holder's sessions are revoked and the next
+        resolve re-derives them.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentGranted:
+      name: iam.assignment.granted
+      title: An access assignment became effective
+      summary: |
+        Emitted by access-control-svc once a governed assignment is
+        provisioned in authorization-svc. Projected into
+        principal_role_assignments, the table the resolver frames session
+        roles from and handleRoleUpdated finds a role's holders in; it had no
+        other feed. A principal unknown here is skipped. Revokes nothing.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentRevoked:
+      name: iam.assignment.revoked
+      title: An access assignment was revoked
+      summary: |
+        Emitted by access-control-svc when a governed assignment is revoked
+        (POST /v1/iam/access-assignments/{id}:revoke, or a REVOKE decision in
+        an access review). role.updated cannot cover this: it re-resolves the
+        role's CURRENT holders, and the revoked principal is no longer one.
+        The subject is read from `payload.principal_id`, never from
+        `actor_id` (the revoker). Every session of the subject is revoked;
+        events older than the envelope TTL plus one minute are skipped.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentSuspended:
+      name: iam.assignment.suspended
+      title: An access assignment was suspended
+      summary: |
+        Emitted by authorization-svc (ORG-06 SuspendAssignment). The assignment
+        is withheld, not ended: it can be resumed. Handled like a revocation for
+        the subject's sessions, which are all revoked, because a live session may
+        still assert the role. The projection is held back FIRST (suspended_at)
+        so the re-resolve the eviction forces does not frame the role again.
+        Nothing is tombstoned, since a suspension is reversible. The subject is
+        `payload.principal_id`, never `actor_id` (the administrator); the
+        assignment is `payload.principal_role_assignment_id` (or `assignment_id`
+        from access-control-svc). The state is derived from the producer's
+        emitted_at, so redelivery and reordering cannot leave it wrong.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentResumed:
+      name: iam.assignment.resumed
+      title: A suspended access assignment was resumed
+      summary: |
+        Emitted by authorization-svc. Lifts the hold (resumed_at); revokes
+        nothing, because a resume only adds access, and the next resolve frames
+        the role again. It cannot reopen an assignment that ended while
+        suspended: effective_to is untouched.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentExpired:
+      name: iam.assignment.expired
+      title: An assignment reached its end date
+      summary: Handled as iam.assignment.revoked.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentApproved:
+      name: iam.assignment.approved
+      title: A pending assignment was approved
+      summary: Handled as iam.assignment.granted.
+      payload:
+        $ref: "#/components/schemas/Envelope"

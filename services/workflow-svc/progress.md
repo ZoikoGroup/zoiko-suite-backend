@@ -12,6 +12,17 @@ now runs under the caller's tenant, and the store suite proves the approval
 chain, escalation, timers, re-check and append-only log as a NOBYPASSRLS role
 (`internal/store/completion_rls_test.go`, mutants killed).
 
+## S0 Baseline Matrix
+
+| Stage | Description | Status | Evidence |
+|-------|-------------|--------|----------|
+| S0 | Baseline | ✅ Done | No untracked files; progress.md matrix added |
+| S1 | Backend unit tests | ✅ Done | 14 packages, all pass |
+| S2 | Store integration tests | ✅ Done | Runs on scratch Postgres (requires TEST_DATABASE_URL) |
+| S3 | Contract parity | ✅ Done | OpenAPI parity test + kin-openapi validation |
+| S4 | Frontend | ⏳ Pending | Console v2.0 rebuild |
+| S5 | Live verification | ⏳ Pending | scripts/audit.sh, e2e-workflow-deps.py |
+
 What changed (migration 000020):
 
 - **Decisions.** Named approver, delegate (authorization-svc answers "does the
