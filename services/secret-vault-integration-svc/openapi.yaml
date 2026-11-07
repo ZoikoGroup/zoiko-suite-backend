@@ -679,6 +679,54 @@ paths:
         "404": {description: No applicable secret policy, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "503": {description: Vault backend or audit store unavailable (fails closed), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
+  /v1/secret-paths/status:
+    get:
+      tags: [Policy administration]
+      summary: Does an ACTIVE policy govern this path in the caller's scope?
+      operationId: secretPathStatus
+      description: |
+        S3-B3. Lets a service that stores a secret REFERENCE (configuration-feature-flag-svc) refuse one that
+        names nothing. It reads policy metadata only: no material, no lease, and not the policy's
+        `allowed_workload_ids`. `200` says a policy governs the path; `404 no_applicable_secret_policy` says none
+        does, the same deny-by-absence answer the broker gives.
+
+        Requires the `SECRET_POLICY_LIST` action.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/CorrelationId"
+        - name: secret_path
+          in: query
+          required: true
+          schema: { type: string }
+        - name: tenant_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: A policy governs the path.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret_path: { type: string }
+                  applicable: { type: boolean }
+                  secret_class: { type: string }
+                  secret_policy_version_id: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "404":
+          description: No ACTIVE policy governs the path in this scope.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
   /v1/secrets/broker:
     post:
       tags: [Brokering]

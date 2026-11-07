@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"zoiko.io/configuration-feature-flag-svc/internal/vaultref"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -83,6 +84,9 @@ type Handler struct {
 	// flags, which are platform-scoped rather than entity-scoped.
 	// authorization-svc rejects an empty legal_entity_id.
 	authzPlatformScopeID string
+
+	// secretRefs checks that a secret reference names a vault-governed path (S3-B3). Nil checks shape only.
+	secretRefs vaultref.Verifier
 }
 
 // New constructs a Handler.
@@ -216,7 +220,7 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteTenantMismatch).Inc()
 		return
 	}
@@ -238,6 +242,11 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		if global {
 			h.metrics.GlobalScopeWrites.WithLabelValues("config", telemetry.WriteForbidden).Inc()
 		}
+		return
+	}
+
+	if !h.verifySecretRefs(w, r, tenantScope, correlationID, req.Value) {
+		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
 		return
 	}
 
@@ -338,7 +347,7 @@ func (h *Handler) GetConfigEntry(w http.ResponseWriter, r *http.Request) {
 	}
 	// Omitting ?tenant_id= still asks for the GLOBAL default for this
 	// environment, which is a real scope. Naming another tenant is refused.
-	if 	h.refuseForeignTenant(w, r, tenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, tenantID, tenantScope) {
 		return
 	}
 
@@ -486,7 +495,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteTenantMismatch).Inc()
 		return
 	}
@@ -594,7 +603,7 @@ func (h *Handler) GetFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("tenant_id"); v != "" {
 		tenantID = &v
 	}
-	if 	h.refuseForeignTenant(w, r, tenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, tenantID, tenantScope) {
 		return
 	}
 
@@ -720,7 +729,7 @@ func (h *Handler) refuseForeignTenant(w http.ResponseWriter, r *http.Request, cl
 	if claimed == nil || *claimed == "" || *claimed == tenantID {
 		return false
 	}
-		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
+	writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 	return true
 }
 
@@ -1243,7 +1252,7 @@ func (h *Handler) ResolveConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -1407,7 +1416,7 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 	// here, before anything is written.
 	switch {
 	case layer == domain.ScopeTenant:
-		if 	h.refuseForeignTenant(w, r, req.ScopeID, tenantScope) {
+		if h.refuseForeignTenant(w, r, req.ScopeID, tenantScope) {
 			return
 		}
 	case domain.IsExtendedLayer(layer):
@@ -1425,6 +1434,10 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 	action := governedAction("config", tenantIDForOverride(layer, req, tenantScope))
 	if outcome := h.authorizeGoverned(w, r, principalID, action); outcome != "" {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
+		return
+	}
+
+	if !h.verifySecretRefs(w, r, tenantScope, correlationID, req.Value) {
 		return
 	}
 
@@ -1549,13 +1562,21 @@ func (h *Handler) CreateChange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
 	action := governedAction("config", req.TenantID)
 	if outcome := h.authorizeGoverned(w, r, principalID, action); outcome != "" {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
+		return
+	}
+
+	partValues := make([]json.RawMessage, 0, len(req.Parts))
+	for _, p := range req.Parts {
+		partValues = append(partValues, p.NewValue)
+	}
+	if !h.verifySecretRefs(w, r, tenantScope, r.Header.Get("X-Correlation-ID"), partValues...) {
 		return
 	}
 
@@ -1798,13 +1819,17 @@ func (h *Handler) CreateEmergencyChange(w http.ResponseWriter, r *http.Request) 
 		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
 	action := governedAction("config", req.TenantID)
 	if outcome := h.authorizeGoverned(w, r, principalID, action); outcome != "" {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
+		return
+	}
+
+	if !h.verifySecretRefs(w, r, tenantScope, correlationID, req.NewValue) {
 		return
 	}
 
@@ -1944,7 +1969,7 @@ func (h *Handler) RecordAttestation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	// §10.1 "workload identity": a runtime attests for itself. runtime_id
@@ -2052,7 +2077,7 @@ func (h *Handler) CreateReleasePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "strategy")
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -2134,7 +2159,7 @@ func (h *Handler) EvaluateFlag(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "subject_key")
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
