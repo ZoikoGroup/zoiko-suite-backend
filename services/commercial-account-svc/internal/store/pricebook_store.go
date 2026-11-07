@@ -20,8 +20,9 @@ import (
 // takes the caller's IdempotencyClaim and records it in the same transaction
 // as the change, so a replayed command can never apply twice.
 type PriceBookStore interface {
-	UpsertCurrency(ctx context.Context, c *domain.CommercialCurrency) (*domain.CommercialCurrency, error)
+	UpsertCurrency(ctx context.Context, c *domain.CommercialCurrency, claim domain.IdempotencyClaim) (*domain.CommercialCurrency, error)
 	ListCurrencies(ctx context.Context) ([]domain.CommercialCurrency, error)
+	GetCurrency(ctx context.Context, code string) (*domain.CommercialCurrency, error)
 
 	CreateProduct(ctx context.Context, p *domain.Product, claim domain.IdempotencyClaim) (*domain.Product, error)
 	GetProduct(ctx context.Context, productID string, seller bool) (*domain.Product, error)
@@ -195,9 +196,19 @@ func scanCurrency(row pgx.Row) (*domain.CommercialCurrency, error) {
 // UpsertCurrency is a full-representation PUT, idempotent by nature: sending
 // the same body twice leaves the same state. minor_units may be written once
 // and never changed.
-func (s *PgStore) UpsertCurrency(ctx context.Context, c *domain.CommercialCurrency) (*domain.CommercialCurrency, error) {
+//
+// Also claims the caller's Idempotency-Key (SPEC_DEVIATIONS A4): natural
+// idempotency only covers an identical retry. It does not catch a key
+// reused for a genuinely different body (e.g. a different sale_enabled
+// value), which this UPSERT would otherwise accept silently, each call
+// quietly winning over the last — the claim's request-hash check is what
+// turns that into ErrIdempotencyKeyReused instead.
+func (s *PgStore) UpsertCurrency(ctx context.Context, c *domain.CommercialCurrency, claim domain.IdempotencyClaim) (*domain.CommercialCurrency, error) {
 	var out *domain.CommercialCurrency
 	err := s.withSellerPlane(ctx, func(tx pgx.Tx) error {
+		if err := claimIdempotency(ctx, tx, claim); err != nil {
+			return err
+		}
 		got, err := scanCurrency(tx.QueryRow(ctx, `
 			INSERT INTO commercial_currencies
 				(currency_code, minor_units, sale_enabled, created_by_principal_id, updated_by_principal_id)
@@ -213,6 +224,18 @@ func (s *PgStore) UpsertCurrency(ctx context.Context, c *domain.CommercialCurren
 			return ErrCurrencyMinorUnitsFixed
 		}
 		out = got
+		return err
+	})
+	return out, err
+}
+
+// GetCurrency loads one currency by code — used to reload the resource on
+// an idempotent PutCurrency replay.
+func (s *PgStore) GetCurrency(ctx context.Context, code string) (*domain.CommercialCurrency, error) {
+	var out *domain.CommercialCurrency
+	err := s.catalogTx(ctx, false, func(tx pgx.Tx) error {
+		c, err := loadCurrency(ctx, tx, code)
+		out = c
 		return err
 	})
 	return out, err
