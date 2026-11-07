@@ -144,7 +144,7 @@ remaining routes were not retired in this pass because existing tests and
 callers depend on them. Retiring them requires a consumer migration plan and
 is the main structural follow-up from this survey.
 
-### A4. Command idempotency and outbox coverage is incomplete
+### A4. Command idempotency and outbox coverage is incomplete — partially closed 2026-11-07
 
 §3 requires:
 
@@ -162,7 +162,7 @@ therefore cannot return the original result for a repeated idempotency key:
 
 | Command | Missing claim | Outbox |
 |---|---|---|
-| `PUT /v1/commercial/accounts/{id}/market` (`SetAccountMarket`) | yes | none |
+| `PUT /v1/commercial/accounts/{id}/market` (`SetAccountMarket`) | **closed** | none |
 | `PUT /v1/commercial/currencies/{code}` (`PutCurrency`) | yes | none |
 | legacy `POST /v1/commercial-accounts` (`CreateCommercialAccount`) | yes | present |
 | legacy `POST /v1/memberships` (`CreateMembership`) | yes | present |
@@ -186,6 +186,28 @@ therefore cannot return the original result for a repeated idempotency key:
 `StatementAction`, and the COM-05 invoice/payment/dunning/dispute/credit
 commands all have claims and replay paths. The table is the remaining gap, not
 a claim that every command in the service is unguarded.
+
+`SetAccountMarket` now claims the caller's `Idempotency-Key` via
+`commandFor`/`claimIdempotency`, the same mechanism every closed command in
+this table uses: a retry under the same key returns
+`domain.IdempotentReplayError` (`Idempotent-Replayed: true`, 200 with the
+requested market unchanged from the original call) instead of silently
+re-applying — this write happened to be a harmless overwrite either way, but
+the guarantee is now uniform with the rest of the service rather than an
+accidental exception. The remaining rows (one more canonical command,
+`PutCurrency`, plus the fourteen legacy/retire/remove/recompute paths) are
+left for a separate pass — most are the service's deprecated legacy surface
+(A3), which is a smaller population to carry the same fix through than the
+table suggests at a glance, but each still needs its own request-hash and
+replay-load wiring checked individually.
+- *Manual check:* `internal/handler/com02_subscription_handler_test.go` —
+  `TestSetAccountMarket_RequiresIdempotencyKey`,
+  `TestSetAccountMarket_ReplayUnderSameKeyDoesNotReapply`;
+  `internal/store/com02_subscription_store_test.go` —
+  `TestSetAccountMarket_IsIdempotent` (real Postgres: a retry under the same
+  key with a *different* market code still replays the original value,
+  proving the claim — not just a no-op overwrite — is what blocks the
+  second write).
 
 ### A5. COM-03 policy publication invalidates globally, not per tenant
 
