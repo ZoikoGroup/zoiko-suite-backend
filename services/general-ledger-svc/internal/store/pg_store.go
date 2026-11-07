@@ -256,6 +256,52 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 // retry must answer with the journal that exists, and the caller's own
 // unstored description/status would otherwise be echoed back attached to a
 // stranger's journal_id.
+// unregisteredAccountCodes answers which of this journal's distinct line
+// account codes name no row in this tenant's chart of accounts — ACC-01's
+// bootstrap gap (SPEC_DEVIATIONS A9) made observable without refusing
+// anything. Returns nil (not an error) when every code is registered, so a
+// caller can cheaply skip enriching the event in the common case.
+func unregisteredAccountCodes(ctx context.Context, tx pgx.Tx, tenantID string, lines []domain.JournalLine) ([]string, error) {
+	seen := map[string]bool{}
+	var codes []string
+	for _, l := range lines {
+		if l.AccountCode == "" || seen[l.AccountCode] {
+			continue
+		}
+		seen[l.AccountCode] = true
+		codes = append(codes, l.AccountCode)
+	}
+	if len(codes) == 0 {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT account_code FROM chart_of_accounts
+		WHERE tenant_id = $1 AND account_code = ANY($2)
+	`, tenantID, codes)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+	registered := make(map[string]bool, len(codes))
+	for rows.Next() {
+		var code string
+		if err := rows.Scan(&code); err != nil {
+			return nil, err
+		}
+		registered[code] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPgError(err)
+	}
+	var unregistered []string
+	for _, c := range codes {
+		if !registered[c] {
+			unregistered = append(unregistered, c)
+		}
+	}
+	return unregistered, nil
+}
+
 func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.JournalHeader, lines []domain.JournalLine) (resultLines []domain.JournalLine, created bool, err error) {
 	now := time.Now().UTC()
 	if h.CreatedAt.IsZero() {
@@ -435,6 +481,23 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 		// alone. Emit it alongside the created fact.
 		if h.CloseJournalDesignation != nil && *h.CloseJournalDesignation != "" {
 			createdData["close_journal_designation"] = *h.CloseJournalDesignation
+		}
+		// SPEC_DEVIATIONS A9 (general-ledger-svc): an account code this
+		// journal posted to but the chart has never heard of is still
+		// deliberately let through (the bootstrap gap — see
+		// checkAccountRestrictions' own comment) rather than refused. This
+		// does not change that; it makes the fact observable, so real usage
+		// can be measured before any enforcement is considered. Enriches the
+		// existing "created" event rather than inventing a second one, the
+		// same pattern soft_close_override_reason/close_journal_designation
+		// already use.
+		if unregistered, err := unregisteredAccountCodes(ctx, tx, tenantID, lines); err != nil {
+			return err
+		} else if len(unregistered) > 0 {
+			createdData["unregistered_account_codes"] = unregistered
+			s.log.Warn("journal posted to unregistered account code(s)",
+				zap.String("journal_id", h.JournalID), zap.String("tenant_id", h.TenantID),
+				zap.Strings("account_codes", unregistered))
 		}
 		if err := s.enqueueJournalEvent(ctx, tx, "created", h.TenantID, h.LegalEntityID,
 			h.JournalID, h.CreatedByPrincipalID, h.CorrelationID, createdData); err != nil {

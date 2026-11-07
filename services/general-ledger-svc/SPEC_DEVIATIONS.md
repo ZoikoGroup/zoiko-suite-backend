@@ -25,23 +25,31 @@ source_policy_ref (A8) are closed; what remains missing is structural: the
 account has no legal-entity/book dimension (A1), no Draft→Approved state (A3)
 outside the gated path, and evidence_refs is still optional everywhere.
 Those and the rest are A1–A15, recorded rather than guessed. The deliberate design
-decisions a reviewer may want to reverse are B1–B18.
+decisions a reviewer may want to reverse are B1–B19.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. The account has no legal-entity/book dimension.** The spec's purpose
-  ("Maintain the versioned posting-account master and hierarchy **for each
-  legal entity and accounting book**"), its required inputs (`entity_id;
-  book_id`) and §24's AccountMaster/AccountVersion ("entity, book, code…") all
-  make the entity/book pair part of an account's identity. This service keys
-  accounts by `tenant_id + account_code` only; no `entity_id`/`book_id` column
-  exists anywhere in ACC-01, and nothing in posting/eligibility evaluates an
-  entity/book constraint. Adding them would re-key every existing account and
-  the FKs that reference account codes (journals, ledger entries, mappings), so
-  it is a migration + identity decision for the owning product, not a silent
-  addition here. Consequence: two entities in one tenant cannot hold different
-  versions of the same account code, and `GetAccountAsOf` answers for the
-  tenant, not a book.
+- **A1. The account has no legal-entity/book dimension. — Scoped, not built
+  (2026-11-07).** The spec's purpose ("Maintain the versioned posting-account
+  master and hierarchy **for each legal entity and accounting book**"), its
+  required inputs (`entity_id; book_id`) and §24's AccountMaster/AccountVersion
+  ("entity, book, code…") all make the entity/book pair part of an account's
+  identity. This service keys accounts by `tenant_id + account_code` only; no
+  `entity_id`/`book_id` column exists anywhere in ACC-01, and nothing in
+  posting/eligibility evaluates an entity/book constraint. Consequence: two
+  entities in one tenant cannot hold different versions of the same account
+  code, and `GetAccountAsOf` answers for the tenant, not a book.
+  A written migration plan is at
+  `docs/ACC01_A1_entity_book_migration_plan.md` — not executed here, since
+  re-keying account identity is a multi-service decision, not a single-file
+  fix. Its headline finding: at least 8 other services' own schemas carry
+  `account_code` (financial-close-svc, consolidation-svc,
+  inventory-management-svc, asset-management-svc, financial-statements-svc,
+  financial-control-svc, project-accounting-svc, bank-reconciliation-svc),
+  but every one checked already carries `legal_entity_id` on the same rows —
+  so the plan's shape is additive (nullable entity/book columns here, a
+  relaxed uniqueness constraint, existing-caller behavior unchanged) rather
+  than a hard re-key of 8 services' databases.
 - **A2. `normal_balance` is not implemented. — Closed (B11).** Every
   account response now carries a read-only `normal_balance`, derived from
   `account_type` by `AccountType.NormalBalance()`: ASSET and EXPENSE are
@@ -139,14 +147,31 @@ decisions a reviewer may want to reverse are B1–B18.
   mandatory too would need the same gated-path treatment `reason` just got,
   not a platform-wide requirement; recorded as still open rather than
   bundled in without its own review.
-- **A9. Unregistered account codes remain postable.** Failure semantics say
-  "Inactive/non-posting/control-restricted account blocks posting", but ACC-04
-  deliberately lets codes the chart has never seen post (the bootstrap gap —
-  every historic caller posts codes nothing ever registered).
-  `ResolvePostingEligibility` therefore answers HTTP 200 with
-  `registered=false, eligible=true` for an unknown code, rather than 404 or a
-  block. This is preserved behavior, not an endorsement: closing the gap is a
-  flag-day decision across all posting callers.
+- **A9. Unregistered account codes remain postable. — Investigated and made
+  observable 2026-11-07 (B19); enforcement remains an open, cross-service
+  decision.** Failure semantics say "Inactive/non-posting/control-restricted
+  account blocks posting", but ACC-04 deliberately lets codes the chart has
+  never seen post (the bootstrap gap). `ResolvePostingEligibility` therefore
+  answers HTTP 200 with `registered=false, eligible=true` for an unknown
+  code, rather than 404 or a block. This is preserved behavior, not an
+  endorsement.
+  Investigation found the real exposure is narrower than "every historic
+  caller": `/v1/postings/events` (ACC-04, used by payroll-run-svc,
+  inventory-management-svc, treasury-svc, accounts-receivable-svc,
+  accounts-payable-svc, expense-claim-svc, asset-management-svc,
+  project-accounting-svc, goods-service-receipt-svc) resolves accounts only
+  via `mapping_key`, and ACC-02's `CreateMapping`/`SetAccountMapping` already
+  refuse to map onto an account that is not registered and ACTIVE
+  (`ErrMappingTargetAccountInvalid`) — those 9 services cannot hit this gap.
+  The exposure is `CreateJournal`'s raw `account_code` path; the one
+  confirmed real caller is financial-close-svc (`createGLJournal`, posting
+  accrual/prepayment/FX-revaluation/allocation entries configured with a
+  literal `debit_account_code`/`credit_account_code`). Whether every
+  configured code financial-close-svc actually uses is already registered in
+  every tenant's chart of accounts is deployment data this service cannot
+  see — closing the gap is still a decision for whoever owns that data, not
+  something to default here. See B19 for what *is* now built: the fact is
+  observable, so real usage can be measured before anyone enforces.
 - **A10. Negative path 4 ("Activate duplicate account code") has no literal
   counterpart.** Account codes are uniquely constrained per tenant at
   creation, so two accounts cannot share a code and "activating a duplicate"
@@ -547,3 +572,26 @@ decisions a reviewer may want to reverse are B1–B18.
     `source_policy_ref` supplied on `ReparentAccount` appears on the pending
     `AccountChangeApproval` immediately, and on the `account_versions` row
     once `ApproveAccountChange` applies it).
+- **B19. An unregistered account code posted via `CreateJournal` enriches the
+  existing `journal.created` event rather than refusing the post or adding a
+  new event type (2026-11-07).** A9 investigated enforcing registration and
+  found real cross-service exposure (see A9); this is the non-breaking first
+  step — make the fact observable before anyone decides to enforce it.
+  - *Why enrich, not a new event:* `created_data` already carries optional,
+    conditionally-present facts (`soft_close_override_reason`,
+    `close_journal_designation`) — `unregistered_account_codes` follows the
+    same shape, present only when at least one line's account code names no
+    row in this tenant's chart of accounts, absent otherwise.
+  - *Why in the same transaction as the write, not a side query:* the check
+    (`unregisteredAccountCodes`) runs inside `CreateJournal`'s own
+    transaction, so the fact is exactly as durable as the journal it
+    describes — no separate process can fail to record it.
+  - *Also logs:* `s.log.Warn` with the journal id, tenant and the codes, for
+    anyone watching logs rather than the event stream.
+  - *Deduplicated, not per-line:* two lines naming the same unregistered code
+    (a debit and its offsetting credit) appear once in
+    `unregistered_account_codes`, not twice.
+  - *Verification:* `internal/store/acc01_unregistered_account_code_test.go`
+    on real Postgres — an unregistered code still posts successfully and the
+    event names it exactly once; an all-registered journal carries no such
+    field at all.
