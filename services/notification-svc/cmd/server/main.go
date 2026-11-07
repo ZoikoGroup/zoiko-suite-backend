@@ -41,6 +41,7 @@ import (
 	"zoiko.io/notification-svc/internal/outbox"
 	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/privacy"
+	"zoiko.io/notification-svc/internal/recordvault"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/senderauth"
 	"zoiko.io/notification-svc/internal/store"
@@ -329,6 +330,11 @@ func main() {
 	ncdSvc := ncd.NewService(ncdStore, identityClient,
 		ncd.RouterTransport{Email: deliverer, Inbox: ncdStore, Unsubscribe: ncdUnsub}, ncd.DefaultLimits(), log)
 	ncdSvc.SetMetrics(telemetry.NewNCD("notification-svc", prometheus.DefaultRegisterer))
+	// S7-B2: with a document vault configured, the notice evidence package is declared as a record by this service.
+	if cfg.DocumentVaultURL != "" {
+		ncdSvc.SetRecordVault(recordvault.NewClient(cfg.DocumentVaultURL, cfg.DocumentVaultTimeout, log))
+		log.Info("notice record declaration through document-vault-svc is on", zap.String("document_vault_url", cfg.DocumentVaultURL))
+	}
 	gatedDeliverer := ncd.GatedDeliverer{Inner: deliverer, Svc: ncdSvc}
 
 	// ── 4b. Retry policy and worker ──────────────────────────────────────────
@@ -385,7 +391,10 @@ func main() {
 	}
 	directDeliverer.WithPreferences(ncd.LegacyPreferenceSource{Svc: ncdSvc})
 	if cfg.PrivacyEnforcement {
-		gate, gerr := privacy.NewGate(privacy.NewClient(cfg.PrivacyDecisionURL, cfg.PrivacyTimeout, log), pgStore, log)
+		privacyClient := privacy.NewClient(cfg.PrivacyDecisionURL, cfg.PrivacyTimeout, log)
+		// S7-B1: the NCD channel decision asks privacy-decision-svc itself; a caller-supplied permission is ignored.
+		ncdSvc.SetPrivacyDecider(privacyClient)
+		gate, gerr := privacy.NewGate(privacyClient, pgStore, log)
 		if gerr != nil {
 			log.Fatal("failed to construct the privacy gate", zap.Error(gerr))
 		}

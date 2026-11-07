@@ -87,6 +87,11 @@ type Config struct {
 	PrivacyDecisionURL string
 	PrivacyTimeout     time.Duration
 
+	// DocumentVaultURL is document-vault-svc (DRC). When set, a regulated notice's evidence package is declared as a
+	// record by this service (S7-B2); unset, a record reference must be supplied by the caller.
+	DocumentVaultURL     string
+	DocumentVaultTimeout time.Duration
+
 	// QuotaEnabled turns on the send quotas (ZS-SVC-Y-001 6.5): per tenant, recipient and intent,
 	// with protected capacity for security messages. NOTIFICATION_QUOTA_ENABLED, default false,
 	// because the right limits depend on the largest legitimate batch an environment sends (a
@@ -325,6 +330,9 @@ func Load() (*Config, error) {
 		PrivacyEnforcement: env("NOTIFICATION_PRIVACY_ENFORCEMENT", "false") == "true",
 		PrivacyDecisionURL: env("PRIVACY_DECISION_URL", ""),
 		PrivacyTimeout:     envDuration("PRIVACY_DECISION_TIMEOUT", 3*time.Second),
+
+		DocumentVaultURL:     env("DOCUMENT_VAULT_URL", ""),
+		DocumentVaultTimeout: envDuration("DOCUMENT_VAULT_TIMEOUT", 10*time.Second),
 
 		QuotaEnabled: env("NOTIFICATION_QUOTA_ENABLED", "false") == "true",
 		QuotaLimits: quota.Limits{

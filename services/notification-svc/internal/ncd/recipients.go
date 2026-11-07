@@ -209,6 +209,8 @@ type DecisionRequest struct {
 // persists the decision on tx.
 func (s *Service) decide(ctx context.Context, tx Tx, a Actor, intent Intent, plan *RecipientPlan, privacy, marketing PermissionDecision,
 	regions []string, communicationID string) (*ChannelDecision, error) {
+	prv := s.resolvePrivacy(ctx, a, intent, plan, privacy)
+	privacy = prv.Permission
 	now := s.now()
 	pref, err := tx.GetPreference(plan.RecipientPrincipalID)
 	if err != nil {
@@ -226,14 +228,15 @@ func (s *Service) decide(ctx context.Context, tx Tx, a Actor, intent Intent, pla
 		Privacy: privacy, Marketing: marketing, ResidencyRegions: regions, Now: now})
 	inputs := map[string]any{
 		"privacy_permission":      privacy,
+		"privacy_source":          prv.Source,
 		"marketing_permission":    marketing,
 		"residency_regions":       regions,
 		"suppressions_considered": len(sups),
 		"preference_version":      0,
 		"overrides":               res.Overrides,
 	}
-	if privacy.Decision == "" {
-		inputs["privacy_permission_note"] = "no PRV decision supplied; PRV is not deployed. Marketing and INDETERMINATE fail closed; other purposes proceed on the recorded absence"
+	if prv.Note != "" {
+		inputs["privacy_permission_note"] = prv.Note
 	}
 	if pref != nil {
 		inputs["preference_version"] = pref.Version

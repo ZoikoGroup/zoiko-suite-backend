@@ -35,14 +35,18 @@ type IntentInput struct {
 	AttachmentContract        []AttachmentSlot `json:"attachment_contract,omitempty"`
 	ApprovedURLDomains        []string         `json:"approved_url_domains,omitempty"`
 	DefaultExpirySeconds      int              `json:"default_expiry_seconds,omitempty"`
+	PrivacyActivityID         string           `json:"privacy_activity_id,omitempty"`
+	PrivacyPurposeID          string           `json:"privacy_purpose_id,omitempty"`
 }
 
 var (
-	identRE  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
-	domainRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+	identRE     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+	domainRE    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+	privacyIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 )
 
 func (in *IntentInput) normalize() {
+	in.PrivacyActivityID, in.PrivacyPurposeID = strings.TrimSpace(in.PrivacyActivityID), strings.TrimSpace(in.PrivacyPurposeID)
 	if in.QuietHoursPolicy == "" {
 		in.QuietHoursPolicy = "RESPECT"
 	}
@@ -90,6 +94,10 @@ func (in IntentInput) validate() *Error {
 		return Invalid("invalid_ack_requirement", "ack_requirement must be NONE, RECEIPT, AUTHENTICATED_ACK or ACCEPTANCE")
 	case in.DefaultExpirySeconds < 60:
 		return Invalid("invalid_expiry", "default_expiry_seconds must be at least 60")
+	case (in.PrivacyActivityID == "") != (in.PrivacyPurposeID == ""):
+		return Invalid("invalid_privacy_binding", "privacy_activity_id and privacy_purpose_id are given together or not at all")
+	case (in.PrivacyActivityID != "" && !privacyIDRE.MatchString(in.PrivacyActivityID)) || (in.PrivacyPurposeID != "" && !privacyIDRE.MatchString(in.PrivacyPurposeID)):
+		return Invalid("invalid_privacy_binding", "privacy_activity_id and privacy_purpose_id must start with a letter or digit and use only letters, digits and _ . : - (at most 128)")
 	}
 	for _, c := range in.AllowedChannels {
 		if !ValidChannel(c) {
@@ -166,6 +174,7 @@ func (in IntentInput) toIntent() Intent {
 		BulkAllowed: in.BulkAllowed, RecordRequirement: in.RecordRequirement, AckRequirement: in.AckRequirement,
 		VariableContract: nonNilSpecs(in.VariableContract), AttachmentContract: nonNilSlots(in.AttachmentContract),
 		ApprovedURLDomains: nonNilStrings(in.ApprovedURLDomains), DefaultExpirySeconds: in.DefaultExpirySeconds,
+		PrivacyActivityID: in.PrivacyActivityID, PrivacyPurposeID: in.PrivacyPurposeID,
 	}
 }
 

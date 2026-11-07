@@ -220,7 +220,9 @@ sufficiency is always `NOT_DETERMINED_BY_NCD` (§8.5).
    `{"kind":…, "artifact_ref":…, "reason":…}` creates an approval for a second principal.
 3. `NotificationRecordHandoffOverdue`: a concluded notice has no DRC record
    declaration. Declare it once DRC has the package:
-   `POST /v1/regulated-notices/{id}/record-declaration` with `{"drc_record_ref":…}`.
+   `POST /v1/regulated-notices/{id}/record-declaration` with `{"drc_record_ref":…}`. With `DOCUMENT_VAULT_URL` set the
+   service declares the package itself: send `{"jurisdiction_scope":"GB","retention_schedule_ref":…}` instead and it stores
+   the package in document-vault-svc and attaches the record id. A vault outage leaves the notice undeclared (503, retry).
 
 ### 4.8 Stuck UNKNOWN attempts
 
@@ -286,3 +288,13 @@ address that was never suppressed, not a suppression that was ignored.
 - **The four operator actions** (`TEMPLATE_MANAGE`, `TEMPLATE_APPROVE`,
   `NOTIFICATION_SUPPRESS`, `NOTIFICATION_RESOLVE_OUTCOME`) are in the dev RBAC
   seed only. Check that the on-call role holds them before an incident needs them.
+
+### S7-B1 privacy decisions in the NCD channel decision
+
+With `NOTIFICATION_PRIVACY_ENFORCEMENT=true` (and `PRIVACY_DECISION_URL`), `POST /v1/channel-decision` and the communication
+prepare/dispatch paths ask privacy-decision-svc for the recipient, using the `privacy_activity_id` and `privacy_purpose_id`
+on the intent version (migration 000034, both or neither, immutable once published). A `privacy_permission` in the request is
+ignored and the decision records `privacy_source: PRV`. PERMIT proceeds; BLOCK is a refusal (NCD-008); REVIEW_REQUIRED,
+INDETERMINATE, an outage and an intent with no binding go to review, never to permission; a RESTRICT is carried only when every
+constraint is `NO_<CHANNEL>`, otherwise it is refused because this service cannot enforce the duty. **Turn it on only after
+the intents in use carry a binding**, or they will all be held for review. Marketing permission is still caller-supplied.
