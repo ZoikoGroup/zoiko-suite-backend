@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/accounts-receivable-svc/internal/domain"
+	"zoiko.io/accounts-receivable-svc/internal/catalogref"
 	"zoiko.io/accounts-receivable-svc/internal/kit"
 	"zoiko.io/accounts-receivable-svc/internal/taxdet"
 )
@@ -609,6 +610,9 @@ func (m *Module) approveQuote(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if _, err := m.profile(ctx, c.TenantID, h); err != nil {
+				return err
+			}
+			if err := catalogref.Require(ctx, m.catalog, catalogref.AsSystem(c.SvcCaller()), v.CatalogVersionRef); err != nil {
 				return err
 			}
 			if v.RequestTaxEstimate && v.TaxEstimate == nil {

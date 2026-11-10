@@ -17,7 +17,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Events (5) | Published; contract in `asyncapi.biz07.yaml` | `internal/events/publisher.go` |
 | API contract | `openapi.biz07.yaml` | this directory |
 | Failure: missing required mapping blocks use | Enforced at activation (TAX + ACCOUNTING required) in the handler and by a database trigger (migration 000013) | `ActivateOffering` |
-| Failure: historical transactions pin the version | Data layer supports it (immutable versions, `version-as-of`); `GET .../versions/{versionID}/usability` lets a consumer check a version before pinning it. No consumer calls it yet (AR `catalog_version_ref` is still an opaque string) | migration 000006, `catalog.go` |
+| Failure: historical transactions pin the version | Data layer supports it (immutable versions, `version-as-of`). `GET ./versions/{versionID}/usability` lets a consumer check a version before pinning it. accounts-receivable-svc now calls it at quote and sales-order approval when `catalog_version_ref` is `catalog:<offering_id>:<version_id>`; opaque refs are untouched. AP and inventory consumers do not yet | migration 000006, `catalog.go`, AR `internal/catalogref` |
 | Dependency: REF-09 units | **Not met** — REF-09 does not exist; `unit` is free text | — |
 | Boundary: not the SaaS price book (COM-01) | Respected; no price fields | — |
 
@@ -60,7 +60,14 @@ Date: 2026-11-10. The Postgres container was disposable and has been removed.
 2. ~~Add a cross-tenant negative test.~~ Done, including an RLS probe under a non-superuser role.
 3. Decide classification/retention for catalog records and implement or document it.
 4. ~~Move the mapping-required rule into the database (trigger).~~ Done: migration 000013; tested via the store and a raw UPDATE.
-5. Validate `catalog_version_ref` in AR quotes/sales orders against an ACTIVE catalog version.
+5. ~~Validate `catalog_version_ref` in AR quotes/sales orders against an ACTIVE catalog version.~~ Done for AR quotes (ar02) and orders (ar03), opt-in by the `catalog:` ref format, fail-closed. Not done: AP, and the authorization-svc grant of `CATALOG_READ` to `system:ar-catalog` (deployment config, unverified).
 6. Replace free-text `unit` with REF-09 validation once REF-09 exists.
 7. ~~Add an event-name contract test for `asyncapi.biz07.yaml`.~~ Done: `internal/events/catalog_contract_test.go` (verified to fail on a renamed event).
 8. Confirm the TAX + ACCOUNTING required-mapping set with the spec owner (the spec does not enumerate it).
+
+## AR consumer (accounts-receivable-svc) — added after the sections above
+
+- Format: `catalog_version_ref = catalog:<offering_id>:<version_id>` (UUIDs). Anything else is an opaque ref and is never sent to the catalog, so existing quotes and orders are unaffected. A `catalog:` ref that does not parse is rejected `400` when the document is written.
+- Check: at `approveQuote` (ar02) and `approveOrder` (ar03), AR calls the usability endpoint as the system principal `system:ar-catalog`. Unknown or unusable version -> `422 CATALOG_VERSION_INVALID`. Catalog down, unwired or answering 401/403/5xx -> `503`, fail closed; the document stays pending.
+- Verified: `internal/catalogref` unit tests; `TestCatalogVersionPinning_CheckedAtApproval` in ar02 and ar03 (integration tag, embedded Postgres); full AR unit suite and full ar02/ar03 integration suites pass.
+- NOT verified: a live AR -> inventory call. Not run: the docker-compose stack. The `system:ar-catalog` principal needs `CATALOG_READ` on the legal entity in authorization-svc; that grant was not created or checked, and without it every `catalog:` approval will fail closed with 503.

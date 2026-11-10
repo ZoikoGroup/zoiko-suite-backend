@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"zoiko.io/accounts-receivable-svc/internal/catalogref"
 	"zoiko.io/accounts-receivable-svc/internal/kit"
 )
 
@@ -358,6 +359,11 @@ func (c Content) Validate() error {
 	for name, v := range map[string]string{"price_source_ref": c.PriceSourceRef, "catalog_version_ref": c.CatalogVersionRef, "customer_po_ref": c.CustomerPORef} {
 		if v != "" && !refRe.MatchString(v) {
 			return kit.Invalid(name + " must be 1-255 characters of letters, digits and _ . : / # -")
+		}
+		if name == "catalog_version_ref" && catalogref.IsCatalogRef(v) {
+			if _, _, _, err := catalogref.Parse(v); err != nil {
+				return kit.Invalid(err.Error())
+			}
 		}
 	}
 	if len(c.Lines) == 0 {

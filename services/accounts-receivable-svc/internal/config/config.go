@@ -39,6 +39,9 @@ type Config struct {
 
 	// TaxDeterminationURL is tax-determination-svc (TAX-03): AR never computes tax.
 	TaxDeterminationURL string
+	// CatalogServiceURL is the BIZ-07 catalog (inventory-management-svc): a quote or order whose
+	// catalog_version_ref is catalog:<offering_id>:<version_id> is verified against it at approval.
+	CatalogServiceURL string
 	// WorkflowURL is workflow-svc: invoice / correction / write-off approvals.
 	WorkflowURL string
 	// DelegatedAuthorityURL is delegated-authority-svc: approval limits.
@@ -121,6 +124,7 @@ func Load() (*Config, error) {
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 
 		TaxDeterminationURL:   env("TAX_DETERMINATION_URL", "http://tax-determination-svc:8126"),
+		CatalogServiceURL:     env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
 		WorkflowURL:           env("WORKFLOW_SERVICE_URL", "http://workflow-svc:8090"),
 		DelegatedAuthorityURL: env("DELEGATED_AUTHORITY_URL", "http://delegated-authority-svc:8136"),
 		NotificationURL:       env("NOTIFICATION_SERVICE_URL", "http://notification-svc:8133"),

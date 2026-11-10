@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/accounts-receivable-svc/internal/catalogref"
 	"zoiko.io/accounts-receivable-svc/internal/kit"
 	"zoiko.io/accounts-receivable-svc/internal/taxdet"
 )
@@ -58,6 +59,7 @@ type Module struct {
 	profiles kit.ProfileResolver // AR-01
 	tax      taxdet.Client       // optional estimate source; nil = estimates unavailable
 	orders   OrderCreator        // AR-03; nil until wired -> ConvertQuoteToOrder is 503
+	catalog  catalogref.Checker   // BIZ-07; nil = a catalog:<offering>:<version> ref cannot be verified -> approval is 503
 }
 
 // New builds the module. profiles is required (AR-01's Module implements it). tax
@@ -135,4 +137,11 @@ func (m *Module) fail(w http.ResponseWriter, err error) {
 		m.deps.Log.Error("ar02 request failed", zap.Error(err))
 	}
 	kit.WriteErr(w, err)
+}
+
+// WithCatalog wires the BIZ-07 catalog check used at approval for quotes whose
+// catalog_version_ref is a catalog:<offering_id>:<version_id> ref.
+func (m *Module) WithCatalog(c catalogref.Checker) *Module {
+	m.catalog = c
+	return m
 }
