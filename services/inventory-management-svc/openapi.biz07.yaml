@@ -1,0 +1,414 @@
+openapi: "3.1.0"
+
+info:
+  title: Inventory Management Service — BIZ-07 Product & Service Catalog
+  version: "1.0.0"
+  description: |
+    Contract for the BIZ-07 (Product & Service Catalog) surface hosted by
+    inventory-management-svc, from ZS-SVC-P-001 section 9. The INV-01..INV-05
+    inventory routes are outside this file.
+
+    **Authority boundary.** BIZ-07 owns tenant/business offering identity, variants,
+    units, operational attributes and version lifecycle. It is NOT the ZoikoSuite SaaS
+    price book (COM-01) and owns no transaction pricing (AR/AP).
+
+    **Lifecycle.** DRAFT -> APPROVED -> ACTIVE -> SUSPENDED / RETIRED -> SUPERSEDED.
+    Version content is immutable once created; only lifecycle columns move. Activating a
+    version supersedes the previously ACTIVE version in the same transaction, so a
+    historical transaction can pin the version it used (see `version-as-of`).
+
+    **Required mappings.** A version cannot be activated until it carries both a `TAX`
+    and an `ACCOUNTING` mapping (`PRODUCT` is optional). Activation without them is
+    refused `422 CATALOG_MAPPING_REQUIRED`, naming the missing types.
+
+    **Authorization (SoD).** Reads need `CATALOG_READ`; create/version/activate/suspend/
+    retire need `CATALOG_MANAGE`; approve needs `CATALOG_APPROVE`; linking a mapping
+    needs `CATALOG_MAPPING_LINK`, a distinct action so specialist review of tax/
+    accounting mappings is separable from catalog management.
+
+    **Headers.** Every call needs `X-Principal-Id`; tenant comes from the verified
+    identity context. `X-Correlation-ID` is propagated onto emitted events.
+
+servers:
+  - url: http://localhost:8168
+    description: Local development
+
+tags:
+  - name: Offerings
+  - name: Versions
+  - name: Mappings
+
+paths:
+  /v1/catalog/offerings:
+    post:
+      tags: [Offerings]
+      operationId: CreateOffering
+      summary: Create an offering with its first (DRAFT) version
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOfferingRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  offering: { $ref: "#/components/schemas/Offering" }
+                  version: { $ref: "#/components/schemas/OfferingVersion" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "422":
+          description: duplicate_sku — sku_code already exists for this legal entity
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      tags: [Offerings]
+      operationId: SearchCatalog
+      summary: Search offerings of a legal entity
+      parameters:
+        - { name: legal_entity_id, in: query, required: true, schema: { type: string } }
+        - { name: category, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: Offerings (empty array when none)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Offering" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /v1/catalog/offerings/{id}:
+    get:
+      tags: [Offerings]
+      operationId: GetOffering
+      parameters: [{ $ref: "#/components/parameters/OfferingId" }]
+      responses:
+        "200":
+          description: Offering and its current version
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  offering: { $ref: "#/components/schemas/Offering" }
+                  current_version: { $ref: "#/components/schemas/OfferingVersion" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/catalog/offerings/{id}/version-as-of:
+    get:
+      tags: [Versions]
+      operationId: GetVersionAsOf
+      summary: The version that was ACTIVE at an instant (transaction version pinning)
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { name: at, in: query, required: true, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: Version in force at `at`
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OfferingVersion" }
+        "422":
+          description: CATALOG_VERSION_INVALID — no version was active at that instant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/catalog/offerings/{id}/versions:
+    post:
+      tags: [Versions]
+      operationId: CreateVersion
+      summary: Create a new DRAFT version (content is immutable afterwards)
+      parameters: [{ $ref: "#/components/parameters/OfferingId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateVersionRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OfferingVersion" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/catalog/offerings/{id}/versions/{versionID}:
+    get:
+      tags: [Versions]
+      operationId: GetOfferingVersion
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      responses:
+        "200":
+          description: Version
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OfferingVersion" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/catalog/offerings/{id}/versions/{versionID}/variants:
+    get:
+      tags: [Versions]
+      operationId: ListVariants
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      responses:
+        "200":
+          description: Variants of the version
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CatalogVariant" }
+
+  /v1/catalog/offerings/{id}/versions/{versionID}/approve:
+    post:
+      tags: [Versions]
+      operationId: ApproveOffering
+      summary: DRAFT -> APPROVED (CATALOG_APPROVE)
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      responses:
+        "200":
+          description: Approved version
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OfferingVersion" }
+        "422": { $ref: "#/components/responses/InvalidTransition" }
+
+  /v1/catalog/offerings/{id}/versions/{versionID}/activate:
+    post:
+      tags: [Versions]
+      operationId: Activate
+      summary: APPROVED -> ACTIVE; supersedes the prior ACTIVE version
+      description: |
+        Refused `422 CATALOG_MAPPING_REQUIRED` unless the version carries both a TAX and
+        an ACCOUNTING mapping.
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      responses:
+        "200":
+          description: Activated version
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OfferingVersion" }
+        "422":
+          description: invalid_transition, or CATALOG_MAPPING_REQUIRED
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/catalog/offerings/{id}/versions/{versionID}/suspend:
+    post:
+      tags: [Versions]
+      operationId: Suspend
+      summary: ACTIVE -> SUSPENDED
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonRequest" }
+      responses:
+        "200":
+          description: Suspended version
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OfferingVersion" }
+        "422": { $ref: "#/components/responses/InvalidTransition" }
+
+  /v1/catalog/offerings/{id}/versions/{versionID}/retire:
+    post:
+      tags: [Versions]
+      operationId: Retire
+      summary: ACTIVE or SUSPENDED -> RETIRED
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReasonRequest" }
+      responses:
+        "200":
+          description: Retired version
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OfferingVersion" }
+        "422": { $ref: "#/components/responses/InvalidTransition" }
+
+  /v1/catalog/offerings/{id}/versions/{versionID}/mappings:
+    post:
+      tags: [Mappings]
+      operationId: LinkMapping
+      summary: Link a tax/accounting/product mapping to a version (CATALOG_MAPPING_LINK)
+      description: Append-only. One mapping per type per version.
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LinkMappingRequest" }
+      responses:
+        "201":
+          description: Linked
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogMapping" }
+        "400": { $ref: "#/components/responses/Error" }
+    get:
+      tags: [Mappings]
+      operationId: GetMappings
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      responses:
+        "200":
+          description: Mappings of the version
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CatalogMapping" }
+
+components:
+  parameters:
+    OfferingId: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    VersionId: { name: versionID, in: path, required: true, schema: { type: string, format: uuid } }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InvalidTransition:
+      description: invalid_transition — version is not in a status that allows this action
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error_code: { type: string, examples: [CATALOG_MAPPING_REQUIRED] }
+        error_message: { type: string }
+
+    Offering:
+      type: object
+      properties:
+        offering_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        sku_code: { type: string }
+        category: { type: string }
+        owner_principal_id: { type: string }
+        created_at: { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+
+    OfferingVersion:
+      type: object
+      properties:
+        version_id: { type: string, format: uuid }
+        offering_id: { type: string, format: uuid }
+        version_number: { type: integer }
+        description: { type: string }
+        unit: { type: string }
+        availability_rules: { type: string }
+        status:
+          type: string
+          enum: [DRAFT, APPROVED, ACTIVE, SUSPENDED, RETIRED, SUPERSEDED]
+        created_at: { type: string, format: date-time }
+        approved_at: { type: string, format: date-time }
+        activated_at: { type: string, format: date-time }
+        suspended_at: { type: string, format: date-time }
+        suspension_reason: { type: string }
+        retired_at: { type: string, format: date-time }
+        retirement_reason: { type: string }
+        superseded_at: { type: string, format: date-time }
+        variants:
+          type: array
+          items: { $ref: "#/components/schemas/CatalogVariant" }
+
+    CatalogVariant:
+      type: object
+      properties:
+        variant_id: { type: string, format: uuid }
+        version_id: { type: string, format: uuid }
+        variant_code: { type: string }
+        variant_name: { type: string }
+
+    CatalogVariantInput:
+      type: object
+      required: [variant_code, variant_name]
+      properties:
+        variant_code: { type: string }
+        variant_name: { type: string }
+
+    CreateOfferingRequest:
+      type: object
+      required: [legal_entity_id, sku_code, category, owner_principal_id, description, unit]
+      properties:
+        legal_entity_id: { type: string }
+        sku_code: { type: string }
+        category: { type: string }
+        owner_principal_id: { type: string }
+        description: { type: string }
+        unit: { type: string }
+        availability_rules: { type: string }
+        variants:
+          type: array
+          items: { $ref: "#/components/schemas/CatalogVariantInput" }
+
+    CreateVersionRequest:
+      type: object
+      required: [description, unit]
+      properties:
+        description: { type: string }
+        unit: { type: string }
+        availability_rules: { type: string }
+        variants:
+          type: array
+          items: { $ref: "#/components/schemas/CatalogVariantInput" }
+
+    ReasonRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string }
+
+    LinkMappingRequest:
+      type: object
+      required: [mapping_type, mapping_ref]
+      properties:
+        mapping_type: { type: string, enum: [TAX, ACCOUNTING, PRODUCT] }
+        mapping_ref: { type: string }
+
+    CatalogMapping:
+      type: object
+      properties:
+        mapping_id: { type: string, format: uuid }
+        version_id: { type: string, format: uuid }
+        mapping_type: { type: string, enum: [TAX, ACCOUNTING, PRODUCT] }
+        mapping_ref: { type: string }
+        linked_at: { type: string, format: date-time }
+        linked_by_principal_id: { type: string }

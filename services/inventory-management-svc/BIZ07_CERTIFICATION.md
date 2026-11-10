@@ -26,7 +26,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Gate | Evidence | State |
 |---|---|---|
 | Authority boundary | No price/plan fields in domain or routes (by inspection). No test asserts it. | Partial |
-| Tenant isolation | RLS enabled and forced on all four catalog tables (migration 000006); store queries carry `tenant_id`. No cross-tenant negative test. | Partial |
+| Tenant isolation | RLS enabled and forced on all four catalog tables (migration 000006); store queries carry `tenant_id`. `TestPgStore_Catalog_TenantIsolation` passes on Postgres 16: tenant B cannot read, search, map, activate, suspend or retire tenant A's offering, and A's data is unchanged. Run as the Postgres superuser, which bypasses RLS, so this proves the query-level `tenant_id` filtering, not the RLS policies. | Covered (query level); RLS policies not proven |
 | Classification / retention | Nothing catalog-specific found. | **Missing** |
 | Negative paths | Duplicate SKU, content immutability, activate-requires-approved, append-only mappings, unknown version, version-as-of with none active (store tests); missing/partial/PRODUCT-only mappings (handler tests). | Mostly covered |
 | Evidence lineage | Version rows record creator/approver/activator and reasons; mappings record linker. No test asserts downstream-usage references (spec lists them). | Partial |
@@ -35,20 +35,29 @@ A certificate listing only successes certifies nothing, so the last two sections
 
 ```
 go build ./... && go vet ./...   clean
-go test ./...                    all packages pass; handler suite includes the 5 mapping-gate tests
+go test ./... -count=1           all packages pass with TEST_DATABASE_URL set to a throwaway
+                                 postgres:16-alpine container (store suite 81 s); handler suite
+                                 includes the 5 mapping-gate tests
+catalog store tests              12/12 pass (11 existing + the tenant-isolation test)
+docker build                     image builds (first attempt failed on a transient go mod download)
+container smoke run              starts, connects to Postgres, /healthz and /readyz 200,
+                                 catalog route without identity -> 401
 ```
+
+Date: 2026-11-10. The Postgres container was disposable and has been removed.
 
 ## NOT verified
 
-- **The catalog store tests did not run.** They are Postgres-backed and report `SKIP` on this machine (no test database). Their pass/fail is unknown here. They must be run against a real Postgres before certification.
-- The mapping gate and RLS policies were not exercised against a live database or a running service.
+- **RLS policies are unproven.** The tests connect as the Postgres superuser, which bypasses RLS. Re-run the isolation test under a non-superuser role to prove the policies themselves.
+- The mapping gate was tested through handler tests with a stub store, not against a live database through the running service.
+- The full docker-compose stack was not run: no real authorization-svc, Kafka or end-to-end flow.
 - OpenAPI/AsyncAPI files parse as YAML but were not run through a linter, and no test ties the event names in `asyncapi.biz07.yaml` to the Go publisher.
 - Authorization was tested only with a stub; real authorization-svc decisions for the `CATALOG_*` actions were not checked, nor that those actions are registered there.
 
 ## Open items to reach certification
 
-1. Run the store suite on Postgres and record the result.
-2. Add a cross-tenant negative test (tenant B cannot read or activate tenant A's offering).
+1. ~~Run the store suite on Postgres and record the result.~~ Done, 12/12.
+2. ~~Add a cross-tenant negative test.~~ Done at query level; re-run under a non-superuser role to prove RLS.
 3. Decide classification/retention for catalog records and implement or document it.
 4. Move the mapping-required rule into the database (trigger), so a direct write cannot bypass it.
 5. Validate `catalog_version_ref` in AR quotes/sales orders against an ACTIVE catalog version.
