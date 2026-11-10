@@ -25,7 +25,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/reconciliation-engine-svc/internal/domain"
-	"zoiko.io/reconciliation-engine-svc/internal/outbox"
 )
 
 // Store is the DATA-07 persistence contract.
@@ -64,11 +63,16 @@ type Store interface {
 }
 
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 var _ Store = (*PgStore)(nil)
@@ -327,8 +331,7 @@ func (s *PgStore) StartRun(ctx context.Context, tenantID string, req domain.Star
 			}
 		}
 		out = created.run
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: out.RunID,
-			EventType: "CONTROL.ReconciliationStarted", TenantID: &tenantID, Payload: out})
+		return s.enqueueEvent(ctx, tx, evRunStarted, tenantID, created.def.LegalEntityID, out.RunID, actor, claim, out)
 	})
 	return out, err
 }
@@ -360,8 +363,7 @@ func (s *PgStore) RecordFailedRun(ctx context.Context, tenantID string, req doma
 			return err
 		}
 		out = failed
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: out.RunID,
-			EventType: "CONTROL.ReconciliationFailed", TenantID: &tenantID, Payload: out})
+		return s.enqueueEvent(ctx, tx, evRunFailed, tenantID, created.def.LegalEntityID, out.RunID, actor, claim, out)
 	})
 	return out, err
 }
@@ -857,13 +859,12 @@ func (s *PgStore) Match(ctx context.Context, tenantID, runID string, req domain.
 		if err != nil {
 			return err
 		}
-		eventType := "CONTROL.ReconciliationCompleted"
+		kind := evRunCompleted
 		if updated.ResultState == domain.ResultVariance {
-			eventType = "CONTROL.ExceptionRaised"
+			kind = evRunVarianceFound
 		}
 		out = updated
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: runID,
-			EventType: eventType, TenantID: &tenantID, Payload: updated})
+		return s.enqueueEvent(ctx, tx, kind, tenantID, run.LegalEntityID, runID, actor, claim, updated)
 	})
 	return out, err
 }
@@ -989,8 +990,7 @@ func (s *PgStore) RaiseException(ctx context.Context, tenantID, runID string, re
 		}
 
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_exception", AggregateID: got.ExceptionID,
-			EventType: "CONTROL.ExceptionRaised", TenantID: &tenantID, Payload: got})
+		return s.enqueueEvent(ctx, tx, evBreakDetected, tenantID, run.LegalEntityID, got.ExceptionID, actor, claim, got)
 	})
 	return out, err
 }
@@ -1247,8 +1247,7 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, pops []
 			return err
 		}
 		out = updated
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: runID,
-			EventType: "CONTROL.ReconciliationCompleted", TenantID: &tenantID, Payload: updated})
+		return s.enqueueEvent(ctx, tx, evRunReperformed, tenantID, run.LegalEntityID, runID, actor, claim, updated)
 	})
 	return out, err
 }
@@ -1585,8 +1584,7 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		}
 
 		out = cert
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "certification", AggregateID: cert.CertificationID,
-			EventType: "CONTROL.Certified", TenantID: &tenantID, Payload: cert})
+		return s.enqueueEvent(ctx, tx, evCertIssued, tenantID, run.LegalEntityID, cert.CertificationID, actor, claim, cert)
 	})
 	return out, err
 }
@@ -1683,8 +1681,7 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req 
 			return err
 		}
 		out = updated
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: runID,
-			EventType: "CONTROL.ReconciliationSuperseded", TenantID: &tenantID, Payload: updated})
+		return s.enqueueEvent(ctx, tx, evRunSuperseded, tenantID, run.LegalEntityID, runID, actor, claim, updated)
 	})
 	return out, err
 }

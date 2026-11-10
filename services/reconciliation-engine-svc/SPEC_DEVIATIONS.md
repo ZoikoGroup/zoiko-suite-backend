@@ -1079,3 +1079,70 @@ B32–B33 close A12's manifest part and B34–B35 its revocation part.
   - *Suite.* The full suite (`go test -count=1 -p 1 ./...`, with
     `TEST_DATABASE_URL` set) ran against a fresh, disposable Postgres 16
     container. All 131 tests passed, and none was skipped.
+
+- **B36. Events go through the shared transactional outbox (tracker #63).**
+  `internal/outbox` and `internal/events` are retired. Every write now
+  enqueues through one helper, `enqueueEvent` (`internal/store/events.go`):
+  - `outbox.Enqueue` runs on the write's own transaction. That is still one
+    INSERT, so there is no extra round-trip.
+  - The shared relay in `cmd/server` delivers the events. It uses leased
+    claims, bounded retries with backoff, quarantine and `acks=all`.
+  - Migration 000012 adds `eventing_outbox` as `outbox.SchemaSQL` plus
+    `outbox.HardeningSQL`, both verbatim, and `VerifySchema` gates startup.
+
+  What changed:
+  - *Canonical types.* The domain segment is `accounting`, because the
+    Enterprise Domain Event Catalogue lists the Reconciliation Engine's
+    events as `accounting.reconciliation-break.*`. An exception is that
+    catalogue's *reconciliation break*, so raising one is
+    `accounting.reconciliation-break.detected`.
+  - *Legacy names.* The aggregates are `reconciliation-run`,
+    `reconciliation-break`, `reconciliation-certification` and
+    `reconciliation-definition`. Each existing `CONTROL.*` name is still
+    emitted as the legacy `event_type`.
+  - *Two old names now split.* `CONTROL.ReconciliationCompleted` becomes
+    `reconciliation-run.completed` or `.reperformed`.
+    `CONTROL.ExceptionUpdated` becomes `reconciliation-break.assigned` or
+    `.status-changed`.
+  - *Variance on a run.* A run's `CONTROL.ExceptionRaised`, emitted when
+    Match settles VARIANCE, is `reconciliation-run.variance-found`. This
+    keeps it distinct from a break being detected.
+  - *Tenant and legal entity.* `tenant_id` is the transaction's own tenant,
+    the one `withTenant` declared for RLS. `legal_entity_id` is the
+    record's entity, which is empty only for records from before 000004.
+  - *Actor and correlation.* The actor is the write's actor.
+    `correlation_id` is the request's `X-Correlation-ID`. The §4 envelope
+    makes it mandatory on writes, and it reaches the store on
+    `IdempotencyClaim.CorrelationID`. Before this change, relayed events
+    carried neither field.
+  - *Region.* `residencyregion` is `EVENT_RESIDENCY_REGION`. It is required
+    at startup, with no default.
+  - *Partitioning.* Events used to be keyed on the tenant id. They are now
+    keyed per aggregate (the library's partition key), so events for one
+    run, break, certification or definition stay ordered. Across aggregates
+    of one tenant there is no order.
+  - *RLS.* `eventing_outbox` has the same policy 000002 gave
+    `outbox_events`: the tenant match, or the relay's `app.outbox_relay`.
+  - *Carry-over.* Undelivered `outbox_events` rows are carried over as the
+    body the old publisher sent, with region `legacy`.
+    - Their `event_id` is `'evt-' || outbox_event_id`. It is stable, unlike
+      the per-attempt id the old publisher minted.
+    - `outbox_events` itself is kept as delivery evidence (ZS-EVENT-001
+      §6.1), and nothing writes to it any more.
+
+  Verification (`internal/store/eventing_outbox_test.go`; app role, so RLS
+  applies):
+  - Each of the thirteen writes enqueues exactly one event. The test checks
+    the type, legacy type, tenant, entity, region, aggregate, partition key,
+    actor and correlation of each.
+  - An event enqueued on a transaction that then fails is gone. A write
+    whose event cannot be built leaves no definition, rule version or
+    idempotency key.
+  - A replay enqueues nothing.
+  - Another tenant can neither see nor write a tenant's events.
+  - The shared relay, running as the app role, delivers both tenants'
+    events and retries a failure under the same id.
+  - The carry-over rebuilds the old body, keys it like new events, keeps
+    `outbox_events`, and is delivered by the relay.
+  - An unmapped legacy aggregate type fails the migration atomically
+    instead of being keyed on a guess.

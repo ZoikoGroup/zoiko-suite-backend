@@ -45,6 +45,12 @@ type IdempotencyClaim struct {
 	Operation     string
 	RequestSHA256 string
 	ResourceID    string
+
+	// CorrelationID is the request's X-Correlation-ID (the §4 envelope's
+	// correlation_id, mandatory on every write). It is not part of the
+	// idempotency key; it rides on the claim because every write carries
+	// one, and the write's outbox event needs it (ZS-EVENT-001 §4).
+	CorrelationID string
 }
 
 const SellerScope = "seller"
