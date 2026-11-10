@@ -35,7 +35,20 @@ func TestPgStore_Catalog_ActivationRequiresMappings_EnforcedInDatabase(t *testin
 	}
 
 	// Raw SQL bypassing the store: also blocked.
-	_, err := pool.Exec(context.Background(), `UPDATE inventory_catalog_offering_versions SET status = 'ACTIVE' WHERE version_id = $1`, v.VersionID)
+	// The tenant context is set so the row is visible under RLS for any role,
+	// not only a superuser; the trigger is what must refuse it.
+	var err error
+	func() {
+		tx, txErr := pool.Begin(context.Background())
+		if txErr != nil {
+			t.Fatalf("begin: %v", txErr)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		if _, txErr = tx.Exec(context.Background(), `SELECT set_config('app.tenant_id', $1, true)`, tenantID); txErr != nil {
+			t.Fatalf("set tenant: %v", txErr)
+		}
+		_, err = tx.Exec(context.Background(), `UPDATE inventory_catalog_offering_versions SET status = 'ACTIVE' WHERE version_id = $1`, v.VersionID)
+	}()
 	if err == nil {
 		t.Fatal("expected direct UPDATE to ACTIVE to be refused by the database")
 	}

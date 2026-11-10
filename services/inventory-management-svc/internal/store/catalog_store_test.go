@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/inventory-management-svc/internal/domain"
 	svcmiddleware "zoiko.io/inventory-management-svc/internal/middleware"
@@ -160,7 +161,7 @@ func TestPgStore_OfferingVersionContent_IsImmutable(t *testing.T) {
 		t.Fatalf("CreateOffering failed: %v", err)
 	}
 
-	if _, err := pool.Exec(context.Background(), `UPDATE inventory_catalog_offering_versions SET description = 'tampered' WHERE version_id = $1`, v.VersionID); err == nil {
+	if err := execAsTenant(t, pool, tenantID, `UPDATE inventory_catalog_offering_versions SET description = 'tampered' WHERE version_id = $1`, v.VersionID); err == nil {
 		t.Fatal("expected the append-only trigger to reject a direct content mutation, got no error")
 	}
 }
@@ -381,7 +382,7 @@ func TestPgStore_CatalogMappings_AreAppendOnly(t *testing.T) {
 	if err := s.LinkMapping(ctx, m); err != nil {
 		t.Fatalf("LinkMapping failed: %v", err)
 	}
-	if _, err := pool.Exec(context.Background(), `UPDATE inventory_catalog_mappings SET mapping_ref = 'GL-9999' WHERE mapping_id = $1`, m.MappingID); err == nil {
+	if err := execAsTenant(t, pool, tenantID, `UPDATE inventory_catalog_mappings SET mapping_ref = 'GL-9999' WHERE mapping_id = $1`, m.MappingID); err == nil {
 		t.Fatal("expected the append-only trigger to reject a direct mapping mutation, got no error")
 	}
 }
@@ -414,4 +415,22 @@ func linkRequiredMappings(t *testing.T, ctx context.Context, s *store.PgStore, v
 			t.Fatalf("link %s mapping failed: %v", mt, err)
 		}
 	}
+}
+
+// execAsTenant runs raw SQL in a transaction with app.tenant_id set, so the
+// target row is visible under RLS for any role (not only a superuser) and a
+// trigger — not row invisibility — is what must refuse the statement.
+func execAsTenant(t *testing.T, pool *pgxpool.Pool, tenantID, sql string, args ...any) error {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantID); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	_, err = tx.Exec(ctx, sql, args...)
+	return err
 }

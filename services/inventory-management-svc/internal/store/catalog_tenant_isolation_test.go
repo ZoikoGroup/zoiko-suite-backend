@@ -57,6 +57,37 @@ func TestPgStore_Catalog_TenantIsolation(t *testing.T) {
 		t.Fatalf("GetVersionAsOf as B: expected ErrCatalogVersionInvalid, got %v", err)
 	}
 
+	// RLS itself, bypassing the store's own tenant_id predicates: with B's
+	// tenant context and no WHERE tenant_id, A's rows must still be invisible.
+	// Only meaningful when the connecting role is not a superuser / BYPASSRLS;
+	// otherwise it is skipped rather than reported as a pass.
+	ctx := context.Background()
+	var bypass bool
+	if err := pool.QueryRow(ctx, `SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user`).Scan(&bypass); err != nil {
+		t.Fatalf("role probe failed: %v", err)
+	}
+	if bypass {
+		t.Log("connecting role bypasses RLS; skipping the raw RLS probe")
+	} else {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantB); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		for _, table := range []string{"inventory_catalog_offerings", "inventory_catalog_offering_versions", "inventory_catalog_variants", "inventory_catalog_mappings"} {
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+table+` WHERE tenant_id = $1`, tenantA).Scan(&n); err != nil {
+				t.Fatalf("%s: %v", table, err)
+			}
+			if n != 0 {
+				t.Fatalf("RLS leak: tenant B context sees %d of tenant A's rows in %s", n, table)
+			}
+		}
+	}
+
 	// Writes: B cannot map, activate, suspend or retire A's version.
 	mB := &domain.CatalogMapping{MappingID: uuid.New().String(), VersionID: v.VersionID, MappingType: "ACCOUNTING", MappingRef: "ACC-B", LinkedAt: now, LinkedByPrincipalID: "attacker"}
 	if err := s.LinkMapping(ctxB, mB); !errors.Is(err, domain.ErrOfferingVersionNotFound) {

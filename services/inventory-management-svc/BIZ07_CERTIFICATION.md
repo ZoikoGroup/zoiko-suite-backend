@@ -26,7 +26,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Gate | Evidence | State |
 |---|---|---|
 | Authority boundary | No price/plan fields in domain or routes (by inspection). No test asserts it. | Partial |
-| Tenant isolation | RLS enabled and forced on all four catalog tables (migration 000006); store queries carry `tenant_id`. `TestPgStore_Catalog_TenantIsolation` passes on Postgres 16: tenant B cannot read, search, map, activate, suspend or retire tenant A's offering, and A's data is unchanged. Run as the Postgres superuser, which bypasses RLS, so this proves the query-level `tenant_id` filtering, not the RLS policies. | Covered (query level); RLS policies not proven |
+| Tenant isolation | RLS enabled and forced on all four catalog tables (migration 000006); store queries carry `tenant_id`. `TestPgStore_Catalog_TenantIsolation` passes on Postgres 16 as both a superuser and a non-superuser role (`NOSUPERUSER NOBYPASSRLS`, owning the tables): tenant B cannot read, search, map, activate, suspend or retire tenant A's offering, A's data is unchanged, and a raw count with B's tenant context and no `tenant_id` predicate sees none of A's rows in any of the four tables (the RLS probe, skipped automatically for a bypassing role). | Covered, including RLS |
 | Classification / retention | Nothing catalog-specific found. | **Missing** |
 | Negative paths | Duplicate SKU, content immutability, activate-requires-approved, append-only mappings, unknown version, version-as-of with none active (store tests); missing/partial/PRODUCT-only mappings (handler tests). | Mostly covered |
 | Evidence lineage | Version rows record creator/approver/activator and reasons; mappings record linker. No test asserts downstream-usage references (spec lists them). | Partial |
@@ -48,7 +48,7 @@ Date: 2026-11-10. The Postgres container was disposable and has been removed.
 
 ## NOT verified
 
-- **RLS policies are unproven.** The tests connect as the Postgres superuser, which bypasses RLS. Re-run the isolation test under a non-superuser role to prove the policies themselves.
+- Only the 13 catalog store tests were run as the non-superuser role; the rest of the store suite and the cross-service flows were not.
 - The mapping gate was tested through handler tests with a stub store, not against a live database through the running service.
 - The full docker-compose stack was not run: no real authorization-svc, Kafka or end-to-end flow.
 - OpenAPI/AsyncAPI files parse as YAML but were not run through a linter. Event names (and envelope constants) are tied to the publisher by a test; payload fields are not.
@@ -57,9 +57,9 @@ Date: 2026-11-10. The Postgres container was disposable and has been removed.
 ## Open items to reach certification
 
 1. ~~Run the store suite on Postgres and record the result.~~ Done, 12/12.
-2. ~~Add a cross-tenant negative test.~~ Done at query level; re-run under a non-superuser role to prove RLS.
+2. ~~Add a cross-tenant negative test.~~ Done, including an RLS probe under a non-superuser role.
 3. Decide classification/retention for catalog records and implement or document it.
-4. ~~Move the mapping-required rule into the database (trigger).~~ Done: migration 000013; tested via the store and a raw UPDATE (as superuser).
+4. ~~Move the mapping-required rule into the database (trigger).~~ Done: migration 000013; tested via the store and a raw UPDATE.
 5. Validate `catalog_version_ref` in AR quotes/sales orders against an ACTIVE catalog version.
 6. Replace free-text `unit` with REF-09 validation once REF-09 exists.
 7. ~~Add an event-name contract test for `asyncapi.biz07.yaml`.~~ Done: `internal/events/catalog_contract_test.go` (verified to fail on a renamed event).
