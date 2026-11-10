@@ -1,0 +1,22 @@
+# Build context is services/ (see Dockerfile). Send only what the build reads.
+# This replaces the service-local .dockerignore, which Docker no longer reads
+# once the context is services/; its exclusions are carried over below.
+*
+!financial-control-svc
+!eventing
+
+# Test artifacts
+**/*_test.go
+**/testdata/
+
+# Deployment files and docs that are not needed inside the image
+financial-control-svc/deployments
+financial-control-svc/context.md
+financial-control-svc/progress.md
+
+# IDE / OS / git noise
+**/.idea
+**/.vscode
+**/.DS_Store
+**/Thumbs.db
+**/.git

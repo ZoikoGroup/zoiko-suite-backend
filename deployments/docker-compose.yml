@@ -3288,8 +3288,9 @@ services:
   # authorization-svc, fail-closed. Postgres RLS + explicit tenant_id filters.
   financial-control-svc:
     build:
-      context: ../services/financial-control-svc
-      dockerfile: Dockerfile
+      # Context is services/ so the go.mod replace ../eventing resolves.
+      context: ../services
+      dockerfile: financial-control-svc/Dockerfile
     container_name: financial-control-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -3306,6 +3307,9 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.financial-control.events"
       KAFKA_GROUP_ID: "financial-control-svc"
+      # Required ZS-EVENT-001 envelope attributes (no default; startup refuses without them).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      EVENT_CLASSIFICATION: "${EVENT_CLASSIFICATION_FINANCIAL_CONTROL:-confidential}"
       # Registered source systems for control populations (name=base-url). A run can select a
       # registered system by name but can never supply a URL. Each source must implement
       # docs/architecture/control-population-contract.md; until then, runs against it end

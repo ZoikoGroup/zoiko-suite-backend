@@ -10,8 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/financial-control-svc/internal/domain"
-	"zoiko.io/financial-control-svc/internal/events"
-	"zoiko.io/financial-control-svc/internal/outbox"
 )
 
 // ─── Command idempotency + start ─────────────────────────────────────────────
@@ -47,7 +45,7 @@ func (s *PgStore) BeginExecution(ctx context.Context, tenantID, runID, idempoten
 
 		// Advance first: it takes the row lock and validates the edge, so a run that is
 		// not SCHEDULED never consumes the key.
-		r, err := advanceTx(ctx, tx, tenantID, runID, AdvanceParams{
+		r, err := s.advanceTx(ctx, tx, tenantID, runID, AdvanceParams{
 			ExpectedVersion: expectedVersion, ToLifecycle: domain.LifecyclePreparing,
 			Reason: "execution started", Actor: actor, CorrelationID: correlationID})
 		if err != nil {
@@ -190,7 +188,7 @@ func (s *PgStore) FreezePopulations(ctx context.Context, tenantID, runID, actor,
 				}
 			}
 		}
-		r, err := advanceTx(ctx, tx, tenantID, runID, AdvanceParams{
+		r, err := s.advanceTx(ctx, tx, tenantID, runID, AdvanceParams{
 			ExpectedVersion: SkipVersionCheck, ToLifecycle: domain.LifecyclePopulationFroze,
 			Reason: "population frozen", Actor: actor, CorrelationID: correlationID})
 		if err != nil {
@@ -248,7 +246,7 @@ func (s *PgStore) RecordExecution(ctx context.Context, tenantID, runID, actor, c
 	}
 	var run *domain.ControlRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		if _, err := advanceTx(ctx, tx, tenantID, runID, AdvanceParams{
+		if _, err := s.advanceTx(ctx, tx, tenantID, runID, AdvanceParams{
 			ExpectedVersion: SkipVersionCheck, ToLifecycle: domain.LifecycleExecuting,
 			Reason: "comparison executing", Actor: actor, CorrelationID: correlationID}); err != nil {
 			return err
@@ -289,7 +287,7 @@ func (s *PgStore) RecordExecution(ctx context.Context, tenantID, runID, actor, c
 			return err
 		}
 		for _, e := range rec.Exceptions {
-			if err := openException(ctx, tx, cur, e, "opened by control execution", actor, correlationID, nil); err != nil {
+			if err := s.openException(ctx, tx, cur, e, "opened by control execution", actor, correlationID, nil); err != nil {
 				return err
 			}
 		}
@@ -305,7 +303,7 @@ func (s *PgStore) RecordExecution(ctx context.Context, tenantID, runID, actor, c
 			next = domain.LifecycleExceptionReview
 		}
 		res := rec.Result
-		r, err := advanceTx(ctx, tx, tenantID, runID, AdvanceParams{
+		r, err := s.advanceTx(ctx, tx, tenantID, runID, AdvanceParams{
 			ExpectedVersion: SkipVersionCheck, ToLifecycle: next, ToResult: &res,
 			Reason: fmt.Sprintf("execution complete: %d matched, %d exceptions", len(rec.Matches), len(rec.Exceptions)),
 			Actor:  actor, CorrelationID: correlationID})
@@ -518,7 +516,7 @@ func (s *PgStore) AssignException(ctx context.Context, tenantID, exceptionID, ac
 			WHERE tenant_id = $1 AND run_id = $2`, tenantID, out.RunID), &run); err != nil {
 			return err
 		}
-		return emitException(ctx, tx, run, exceptionID, events.ExceptionAssigned, actor, correlationID, map[string]any{
+		return s.emitException(ctx, tx, run, exceptionID, ExceptionAssigned, actor, correlationID, map[string]any{
 			"exception_id": exceptionID, "run_id": out.RunID, "owner_principal_id": req.OwnerPrincipalID,
 			"due_at": due.UTC().Format(time.RFC3339), "reason": req.Reason,
 		})
@@ -531,7 +529,7 @@ func (s *PgStore) AssignException(ctx context.Context, tenantID, exceptionID, ac
 
 // openException inserts e on run as OPEN, with its opening transition and its
 // control.exception.opened event, inside tx. extra is added to the event payload.
-func openException(ctx context.Context, tx pgx.Tx, run domain.ControlRun, e domain.ControlException,
+func (s *PgStore) openException(ctx context.Context, tx pgx.Tx, run domain.ControlRun, e domain.ControlException,
 	reason, actor, correlationID string, extra map[string]any) error {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO control_exceptions (exception_id, tenant_id, run_id, legal_entity_id, category, reason_code,
@@ -553,22 +551,13 @@ func openException(ctx context.Context, tx pgx.Tx, run domain.ControlRun, e doma
 	for k, v := range extra {
 		payload[k] = v
 	}
-	return emitException(ctx, tx, run, e.ExceptionID, events.ExceptionOpened, actor, correlationID, payload)
+	return s.emitException(ctx, tx, run, e.ExceptionID, ExceptionOpened, actor, correlationID, payload)
 }
 
 func insertExceptionTransition(ctx context.Context, tx pgx.Tx, tenantID, exceptionID, from, to, reason, actor, correlationID string) error {
 	_, err := tx.Exec(ctx, `INSERT INTO exception_transitions (tenant_id, exception_id, from_state, to_state, reason, actor_id, correlation_id)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`, tenantID, exceptionID, from, to, reason, actor, correlationID)
 	return err
-}
-
-func emitException(ctx context.Context, tx pgx.Tx, r domain.ControlRun, exceptionID, eventType, actor, correlationID string, payload map[string]any) error {
-	payload["occurred_at"] = time.Now().UTC().Format(time.RFC3339Nano)
-	a, c := actor, correlationID
-	return outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "control_exception", AggregateID: exceptionID, EventType: eventType,
-		TenantID: r.TenantID, LegalEntityID: r.LegalEntityID, ActorID: &a, CorrelationID: &c, Payload: payload,
-	})
 }
 
 // ─── Evidence ────────────────────────────────────────────────────────────────

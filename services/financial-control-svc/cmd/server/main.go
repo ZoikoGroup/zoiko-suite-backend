@@ -21,19 +21,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
-	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 
 	"zoiko.io/financial-control-svc/internal/authz"
 	"zoiko.io/financial-control-svc/internal/config"
 	"zoiko.io/financial-control-svc/internal/engine"
 	svcenvelope "zoiko.io/financial-control-svc/internal/envelope"
-	"zoiko.io/financial-control-svc/internal/events"
 	"zoiko.io/financial-control-svc/internal/handler"
 	"zoiko.io/financial-control-svc/internal/health"
 	svcmiddleware "zoiko.io/financial-control-svc/internal/middleware"
 	"zoiko.io/financial-control-svc/internal/mtls"
-	"zoiko.io/financial-control-svc/internal/outbox"
 	"zoiko.io/financial-control-svc/internal/source"
 	"zoiko.io/financial-control-svc/internal/store"
 	"zoiko.io/financial-control-svc/internal/telemetry"
@@ -88,7 +88,7 @@ func main() {
 	if err != nil {
 		log.Fatal("failed to create db pool", zap.Error(err))
 	}
-	defer pool.Close()
+	// Closed explicitly at the end of shutdown, after the relay has drained.
 
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer pingCancel()
@@ -97,37 +97,35 @@ func main() {
 	}
 	log.Info("db pool connected")
 
-	pgStore := store.New(pool, log)
+	// The shared outbox table must exist with the library's exact shape
+	// (migration 000012) before anything is enqueued or relayed.
+	if err := outbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema check failed", zap.Error(err))
+	}
+	pgStore := store.New(pool, log,
+		store.WithEventProfile(cfg.EventResidencyRegion, envelope.Classification(cfg.EventClassification)))
 
 	// Kafka is not a fail-fast dependency: control state is durable in Postgres
-	// and events are relayed from the outbox whenever the broker is reachable.
-	//
-	// RequiredAcks is explicit: kafka-go defaults to RequireNone
-	// (fire-and-forget), under which WriteMessages returns success before any
-	// broker has durably stored the record. The relay then marks the row
-	// published and never retries — a lost broker write becomes a silently
-	// lost event, exactly what the transactional outbox exists to prevent
-	// (ZS-EVENT-001 §6-7; tracker item 106, which found this unset across the
-	// whole estate except services/eventing's adopters).
-	kafkaWriter := &kafka.Writer{
-		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
-		BatchTimeout:           10 * time.Millisecond,
-		RequiredAcks:           kafka.RequireAll,
+	// and the shared relay (services/eventing) delivers eventing_outbox rows
+	// whenever the broker is reachable — leased claims, bounded retries with
+	// backoff, a broker probe so an outage spends no event's attempts, and
+	// quarantine instead of a silent drop. kafkaout writes with acks=all.
+	writer, err := kafkaout.New(kafkaout.Config{Brokers: cfg.Kafka.Brokers, Topic: cfg.Kafka.Topic})
+	if err != nil {
+		log.Fatal("eventing outbox writer", zap.Error(err))
 	}
-	defer func() { _ = kafkaWriter.Close() }()
-
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter).
-		WithProfile(cfg.EventResidencyRegion, cfg.EventClassification).
-		WithBrokers(cfg.Kafka.Brokers)
+	relay, err := outbox.NewRelay(pool, writer, outbox.DefaultConfig(), log)
+	if err != nil {
+		log.Fatal("eventing outbox relay", zap.Error(err))
+	}
+	// relayCtx also stops the housekeeping and late-data loops below.
 	relayCtx, stopRelay := context.WithCancel(context.Background())
 	defer stopRelay()
-	// WithProber: an extended broker outage must not spend outbox_events'
-	// publish_attempts, or it permanently dead-letters real control facts
-	// (certifications, exceptions) that were only ever unlucky in timing.
-	go outbox.NewRelay(pool, publisher, 0, 0, log).WithProber(publisher).Start(relayCtx)
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		relay.Run(relayCtx)
+	}()
 
 	endpoints, err := source.ParseEndpoints(cfg.SourceEndpoints)
 	if err != nil {
@@ -243,6 +241,17 @@ func main() {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
 	log.Info("server stopped")
+
+	// Stop the relay and the background loops after the last request has
+	// committed, let the relay's in-flight pass finish, then close the pool.
+	stopRelay()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		log.Warn("eventing outbox relay did not stop before the shutdown deadline")
+	}
+	_ = writer.Close()
+	pool.Close()
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
