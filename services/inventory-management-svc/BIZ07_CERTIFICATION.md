@@ -17,7 +17,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Events (5) | Published; contract in `asyncapi.biz07.yaml` | `internal/events/publisher.go` |
 | API contract | `openapi.biz07.yaml` | this directory |
 | Failure: missing required mapping blocks use | Enforced at activation (TAX + ACCOUNTING required) in the handler and by a database trigger (migration 000013) | `ActivateOffering` |
-| Failure: historical transactions pin the version | Data layer supports it (immutable versions, `version-as-of`); no consumer enforces it yet | migration 000006 |
+| Failure: historical transactions pin the version | Data layer supports it (immutable versions, `version-as-of`); `GET .../versions/{versionID}/usability` lets a consumer check a version before pinning it. No consumer calls it yet (AR `catalog_version_ref` is still an opaque string) | migration 000006, `catalog.go` |
 | Dependency: REF-09 units | **Not met** — REF-09 does not exist; `unit` is free text | — |
 | Boundary: not the SaaS price book (COM-01) | Respected; no price fields | — |
 

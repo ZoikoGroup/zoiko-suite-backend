@@ -253,6 +253,29 @@ paths:
               schema: { $ref: "#/components/schemas/OfferingVersion" }
         "422": { $ref: "#/components/responses/InvalidTransition" }
 
+  /v1/catalog/offerings/{id}/versions/{versionID}/usability:
+    get:
+      tags: [Versions]
+      operationId: VersionUsability
+      summary: Is this version usable in a protected transaction? (read-only)
+      description: |
+        For consuming domains (AR/AP/inventory) to call before pinning a version.
+        `usable` is true only when the version is ACTIVE and carries every required
+        mapping (TAX and ACCOUNTING). Re-checked on every call because a version can
+        be suspended or retired after activation. Always 200 for a version that exists
+        under the named offering in the caller's tenant; 404 otherwise. Needs
+        `CATALOG_READ`. Changes nothing and publishes no event.
+      parameters:
+        - { $ref: "#/components/parameters/OfferingId" }
+        - { $ref: "#/components/parameters/VersionId" }
+      responses:
+        "200":
+          description: Usability verdict
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionUsability" }
+        "404": { $ref: "#/components/responses/Error" }
+
   /v1/catalog/offerings/{id}/versions/{versionID}/mappings:
     post:
       tags: [Mappings]
@@ -348,6 +371,22 @@ components:
         variants:
           type: array
           items: { $ref: "#/components/schemas/CatalogVariant" }
+
+    VersionUsability:
+      type: object
+      properties:
+        offering_id: { type: string, format: uuid }
+        version_id: { type: string, format: uuid }
+        version_number: { type: integer }
+        status:
+          type: string
+          enum: [DRAFT, APPROVED, ACTIVE, SUSPENDED, RETIRED, SUPERSEDED]
+        unit: { type: string }
+        usable: { type: boolean }
+        missing_mappings:
+          type: array
+          items: { type: string, enum: [TAX, ACCOUNTING] }
+        reason: { type: string, description: "Empty when usable." }
 
     CatalogVariant:
       type: object

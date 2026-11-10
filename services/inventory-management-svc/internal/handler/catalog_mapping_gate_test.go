@@ -106,3 +106,86 @@ func TestMissingRequiredCatalogMappings(t *testing.T) {
 		t.Fatalf("expected none missing, got %v", got)
 	}
 }
+
+// ── VersionUsability ─────────────────────────────────────────────────────────
+
+func usabilityPath(offeringID, versionID string) string {
+	return "/v1/catalog/offerings/" + offeringID + "/versions/" + versionID + "/usability"
+}
+
+type usabilityBody struct {
+	Usable          bool     `json:"usable"`
+	Status          string   `json:"status"`
+	MissingMappings []string `json:"missing_mappings"`
+	Reason          string   `json:"reason"`
+}
+
+func getUsability(t *testing.T, r chi.Router, offeringID, versionID string) usabilityBody {
+	t.Helper()
+	rr := doReq(r, http.MethodGet, usabilityPath(offeringID, versionID), nil, "consumer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("usability: %d %s", rr.Code, rr.Body.String())
+	}
+	var b usabilityBody
+	_ = json.NewDecoder(rr.Body).Decode(&b)
+	return b
+}
+
+func TestVersionUsability_ApprovedNotActive_NotUsable(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	oid, vid := createApprovedOffering(t, r, "SKU-U1")
+	b := getUsability(t, r, oid, vid)
+	if b.Usable || b.Status != domain.CatalogVersionStatusApproved || len(b.MissingMappings) != 2 {
+		t.Fatalf("expected not usable, APPROVED, 2 missing; got %+v", b)
+	}
+}
+
+func TestVersionUsability_ActiveWithMappings_Usable(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	oid, vid := createApprovedOffering(t, r, "SKU-U2")
+	linkMapping(t, r, oid, vid, "TAX")
+	linkMapping(t, r, oid, vid, "ACCOUNTING")
+	if rr := doReq(r, http.MethodPost, activatePath(oid, vid), nil, "reviewer-1"); rr.Code != http.StatusOK {
+		t.Fatalf("activate: %d %s", rr.Code, rr.Body.String())
+	}
+	b := getUsability(t, r, oid, vid)
+	if !b.Usable || b.Reason != "" || len(b.MissingMappings) != 0 {
+		t.Fatalf("expected usable; got %+v", b)
+	}
+}
+
+func TestVersionUsability_SuspendedAfterActivation_NotUsable(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	oid, vid := createApprovedOffering(t, r, "SKU-U3")
+	linkMapping(t, r, oid, vid, "TAX")
+	linkMapping(t, r, oid, vid, "ACCOUNTING")
+	doReq(r, http.MethodPost, activatePath(oid, vid), nil, "reviewer-1")
+	rr := doReq(r, http.MethodPost, "/v1/catalog/offerings/"+oid+"/versions/"+vid+"/suspend", map[string]string{"reason": "recall"}, "reviewer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("suspend: %d %s", rr.Code, rr.Body.String())
+	}
+	b := getUsability(t, r, oid, vid)
+	if b.Usable || b.Status != domain.CatalogVersionStatusSuspended {
+		t.Fatalf("expected not usable, SUSPENDED; got %+v", b)
+	}
+}
+
+func TestVersionUsability_WrongOfferingOrUnknownVersion_404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	oid, vid := createApprovedOffering(t, r, "SKU-U4")
+	otherOID, _ := createApprovedOffering(t, r, "SKU-U5")
+	if rr := doReq(r, http.MethodGet, usabilityPath(otherOID, vid), nil, "consumer-1"); rr.Code != http.StatusNotFound {
+		t.Fatalf("version under the wrong offering: expected 404, got %d", rr.Code)
+	}
+	if rr := doReq(r, http.MethodGet, usabilityPath(oid, "00000000-0000-0000-0000-000000000000"), nil, "consumer-1"); rr.Code != http.StatusNotFound {
+		t.Fatalf("unknown version: expected 404, got %d", rr.Code)
+	}
+}
+
+func TestVersionUsability_RequiresPrincipal(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	oid, vid := createApprovedOffering(t, r, "SKU-U6")
+	if rr := doReq(r, http.MethodGet, usabilityPath(oid, vid), nil, ""); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without a principal, got %d", rr.Code)
+	}
+}

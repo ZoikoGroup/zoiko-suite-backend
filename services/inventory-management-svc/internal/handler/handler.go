@@ -478,6 +478,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 			r.Get("/", h.GetOfferingVersion)
 			r.Get("/variants", h.ListVariants)
 			r.Get("/mappings", h.GetMappings)
+			r.Get("/usability", h.VersionUsability)
 			r.Post("/approve", h.ApproveOffering)
 			r.Post("/activate", h.ActivateOffering)
 			r.Post("/suspend", h.SuspendOfferingVersion)

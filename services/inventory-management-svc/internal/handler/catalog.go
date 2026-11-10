@@ -558,3 +558,70 @@ func (h *Handler) writeCatalogErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 	}
 }
+
+// ── GET /v1/catalog/offerings/{id}/versions/{versionID}/usability ──────────
+
+// VersionUsability answers a consuming domain's question before it pins a
+// version in a protected transaction: "is this version usable?". Usable means
+// the version is ACTIVE and carries every required mapping — the same two
+// conditions the activation gate enforces, re-checked now because a version
+// can be suspended or retired after activation. Always 200 for a version that
+// exists in the caller's tenant under the named offering; 404 otherwise.
+// Read-only: it changes nothing and publishes nothing.
+func (h *Handler) VersionUsability(w http.ResponseWriter, r *http.Request) {
+	offeringID := chi.URLParam(r, "id")
+	versionID := chi.URLParam(r, "versionID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	v, err := h.store.GetOfferingVersion(r.Context(), versionID)
+	if err != nil {
+		h.writeCatalogErr(w, err)
+		return
+	}
+	if v.OfferingID != offeringID {
+		writeError(w, http.StatusNotFound, "offering_version_not_found", "")
+		return
+	}
+	o, err := h.store.GetOffering(r.Context(), v.OfferingID)
+	if err != nil {
+		h.writeCatalogErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, o.LegalEntityID, actionCatalogRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	linked, err := h.store.GetMappings(r.Context(), versionID)
+	if err != nil {
+		h.log.Error("VersionUsability: mappings unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	missing := domain.MissingRequiredCatalogMappings(linked)
+	if missing == nil {
+		missing = []string{}
+	}
+	usable := v.Status == domain.CatalogVersionStatusActive && len(missing) == 0
+	reason := ""
+	switch {
+	case v.Status != domain.CatalogVersionStatusActive:
+		reason = "version status is " + v.Status + ", not ACTIVE"
+	case len(missing) > 0:
+		reason = "missing required mapping(s): " + strings.Join(missing, ", ")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"offering_id":      v.OfferingID,
+		"version_id":       v.VersionID,
+		"version_number":   v.VersionNumber,
+		"status":           v.Status,
+		"unit":             v.Unit,
+		"usable":           usable,
+		"missing_mappings": missing,
+		"reason":           reason,
+	})
+}
