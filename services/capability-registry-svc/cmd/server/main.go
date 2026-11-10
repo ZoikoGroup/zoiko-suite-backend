@@ -17,20 +17,21 @@ import (
 
 	"zoiko.io/capability-registry-svc/internal/authz"
 	"zoiko.io/capability-registry-svc/internal/config"
+	"zoiko.io/capability-registry-svc/internal/domain"
 	svcenvelope "zoiko.io/capability-registry-svc/internal/envelope"
-	"zoiko.io/capability-registry-svc/internal/events"
 	"zoiko.io/capability-registry-svc/internal/handler"
 	"zoiko.io/capability-registry-svc/internal/health"
 	"zoiko.io/capability-registry-svc/internal/middleware"
 	"zoiko.io/capability-registry-svc/internal/mtls"
-	"zoiko.io/capability-registry-svc/internal/outbox"
 	"zoiko.io/capability-registry-svc/internal/store"
 	"zoiko.io/capability-registry-svc/internal/telemetry"
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 )
 
 // platformScopeID mirrors authorization-svc's own constant of the same
 // name — this service's mTLS identity is infrastructure, not tenant data.
-const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+const platformScopeID = domain.PlatformScopeID
 
 func main() {
 	logger, err := telemetry.NewLogger("capability-registry-svc")
@@ -57,27 +58,50 @@ func main() {
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 1 * time.Minute
+	// pgxpool connects lazily, so an error here is a bad config, not an
+	// unreachable database. The old code carried on with a nil pool; the
+	// schema check below needs a pool, and a service with no pool cannot
+	// serve a single request, so this is fatal now.
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		logger.Warn("unable to connect to database on startup", zap.Error(err))
-	} else {
-		logger.Info("connected to postgres database")
+		logger.Fatal("failed to create database pool", zap.Error(err))
 	}
 
-	pgStore := store.NewPgStore(pool)
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	relayCtx, stopRelay := context.WithCancel(context.Background())
-	relayDone := make(chan struct{})
-	if pool != nil {
-		relay := outbox.NewRelay(pool, publisher, 5*time.Second, 50, logger)
-		go func() {
-			defer close(relayDone)
-			relay.Start(relayCtx)
-		}()
-	} else {
-		close(relayDone)
+	// The eventing outbox table must exist before the first business write
+	// tries to enqueue into it; fail here, at deploy time, not on a request.
+	if err := outbox.VerifySchema(ctx, pool); err != nil {
+		logger.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
+	logger.Info("connected to postgres database")
+
+	pgStore := store.NewPgStore(pool, store.WithEventRegion(cfg.EventResidencyRegion))
+
+	// Transactional outbox relay (ZS-EVENT-001 §6). Every write enqueues its
+	// event into eventing_outbox in the same transaction as the state change;
+	// this relay delivers them with leased claims (safe across replicas),
+	// capped backoff with jitter, quarantine and a broker-health probe.
+	// kafkaout's writer acknowledges with RequireAll — a fire-and-forget
+	// writer must never back the outbox, or a "published" event could be one
+	// no broker actually stored.
+	outboxWriter, err := kafkaout.New(kafkaout.Config{
+		Brokers: strings.Split(cfg.KafkaBrokers, ","),
+		Topic:   cfg.KafkaEventsTopic,
+	})
+	if err != nil {
+		logger.Fatal("outbox kafka writer", zap.Error(err))
+	}
+	defer func() { _ = outboxWriter.Close() }()
+	relay, err := outbox.NewRelay(pool, outboxWriter, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("outbox relay", zap.Error(err))
+	}
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	relayDone := make(chan struct{}, 1)
+	go func() {
+		relay.Run(relayCtx)
+		relayDone <- struct{}{}
+	}()
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
@@ -137,13 +161,15 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
 	}
+	// Stop the relay after the server: requests finishing during Shutdown
+	// may still commit events. Anything not delivered stays in the outbox
+	// for the next process — stopping loses nothing.
 	stopRelay()
-	<-relayDone
-	if err := publisher.Close(); err != nil {
-		logger.Warn("failed to close Kafka publisher", zap.Error(err))
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("outbox relay did not stop before the shutdown deadline")
 	}
-	if pool != nil {
-		pool.Close()
-	}
+	pool.Close()
 	logger.Info("server stopped cleanly")
 }

@@ -4479,8 +4479,9 @@ services:
   # separate objects — never compressed into one feature flag.
   capability-registry-svc:
     build:
-      context: ../services/capability-registry-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: capability-registry-svc/Dockerfile
     container_name: capability-registry-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4503,6 +4504,9 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/capability_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
+      # Required: stamped on every event (ZS-EVENT-001 §4); the service
+      # refuses to start without it. Same default as the other adopters.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
