@@ -115,7 +115,14 @@ services:
       - ../services/evidence-requirements-svc/deployments/migrations:/migrations/evidence-requirements:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      # Over TCP (-h 127.0.0.1), not the Unix socket. On a first start the
+      # image runs init-db.sh against a temporary server that listens on the
+      # socket only, then restarts it; a socket check reported healthy during
+      # that window, so dependants connected to a server that was "starting
+      # up" (SQLSTATE 57P03), exited on their fail-fast ping, and compose gave
+      # up with "dependency purchase-request-svc failed to start". Only the
+      # real server listens on TCP.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d postgres"]
       interval: 5s
       timeout: 5s
       retries: 10

@@ -25,7 +25,7 @@ services:
       - public-ai-pgdata:/var/lib/postgresql/data
     networks: [public-ai]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U public_ai_app -d public_ai"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U public_ai_app -d public_ai"]
       interval: 10s
       timeout: 5s
       retries: 5

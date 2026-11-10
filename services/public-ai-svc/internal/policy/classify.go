@@ -221,7 +221,7 @@ var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|paymen
 	`|jurisdictions?(?: and rules)?|rule packs?|governance log|polic(?:y|ies)|obligations?|authori[sz]ation|segregation of duties|workflows?(?: and approvals)?|executive dashboard|domain health|dashboard|filing requirements?|evidence requirements?|requirement catalog|no_requirements_defined|journals?|statement lines?|reconciliation)\b`)
 
 // areaDefinitionRe asks what a console area is or does.
-var areaDefinitionRe = regexp.MustCompile(`(?i)^\s*(?:what\s+(?:is|are|does)|what's|explain|describe|define|tell me about|use of|how does)\s+(?:the\s+)?(?:domain health|executive dashboard|dashboards?|governance log)\b`)
+var areaDefinitionRe = regexp.MustCompile(`(?i)^\s*(?:what\s+(?:is|are|does)|what's|explain|describe|define|tell me about|use of|how does)\s+(?:the\s+)?(?:domain health|executive dashboard|dashboards?|governance log|service inputs?)\b`)
 
 // ownDataRe names the visitor's own data.
 var ownDataRe = regexp.MustCompile(`(?i)\b(?:my|our|mine|ours)\b`)
@@ -229,7 +229,7 @@ var ownDataRe = regexp.MustCompile(`(?i)\b(?:my|our|mine|ours)\b`)
 // consoleJurisdictionRe is a question about the Jurisdictions & Rules area
 // (registering, rules, rule packs), not about which markets ZoikoSuite is
 // offered in (I04).
-var consoleJurisdictionRe = regexp.MustCompile(`(?i)\b(?:register(?:ing|ed)?|add(?:ing)?|creat(?:e|ing)|delet\w*|remov\w*|deactivat\w*|resolv\w*|nest\w*|rule packs?|rules|jurisdictions?\s*(?:&|and)\s*rules|legal drift|effective[- ]dated)\b`)
+var consoleJurisdictionRe = regexp.MustCompile(`(?i)\b(?:register(?:ing|ed)?|add(?:ing)?|creat(?:e|ing)|delet\w*|remov\w*|deactivat\w*|resolv\w*|nest\w*|rule packs?|rules|jurisdictions?\s*(?:&|and)\s*rules|legal drift|effective[- ]dated|overview|tax\s+jurisdictions?|jurisdiction\s+cards?)\b`)
 
 // IsModuleQuestion reports whether a message names a known area, module or
 // alias.
