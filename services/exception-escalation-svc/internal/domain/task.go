@@ -204,6 +204,8 @@ type ListQueueParams struct {
 var (
 	ErrCaseNotFound        = errors.New("case not found")
 	ErrCaseAlreadyClosedWC = errors.New("case is already closed")
+	// ErrCaseEntityMismatch: a task may only join a case of its own legal entity.
+	ErrCaseEntityMismatch = errors.New("task legal entity does not match the case legal entity")
 	ErrTaskNotFound        = errors.New("task not found")
 	ErrTaskInvalidState    = errors.New("task is not in a state that permits this action")
 )

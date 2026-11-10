@@ -583,6 +583,8 @@ func (h *taskHandler) writeTaskErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "case not found")
 	case errors.Is(err, domain.ErrCaseAlreadyClosedWC):
 		writeError(w, http.StatusConflict, "case is already closed")
+	case errors.Is(err, domain.ErrCaseEntityMismatch):
+		writeError(w, http.StatusUnprocessableEntity, "task legal entity does not match the case legal entity")
 	case errors.Is(err, domain.ErrTaskNotFound):
 		writeError(w, http.StatusNotFound, "task not found")
 	case errors.Is(err, domain.ErrTaskInvalidState):

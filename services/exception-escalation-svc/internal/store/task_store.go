@@ -208,6 +208,20 @@ func (s *PgStore) CreateTask(ctx context.Context, p domain.CreateTaskParams) (*d
 	}
 	var caseID any
 	if p.CaseID != "" {
+		// A task may only join an existing, OPEN case of its own legal entity. FOR SHARE
+		// makes a concurrent CloseCase wait, so a task cannot slip into a case being closed.
+		var caseStatus, caseEntity string
+		cErr := tx.QueryRow(ctx, `SELECT status, legal_entity_id FROM cases WHERE case_id=$1 AND tenant_id=$2 FOR SHARE`, p.CaseID, p.TenantID).Scan(&caseStatus, &caseEntity)
+		switch {
+		case errors.Is(cErr, pgx.ErrNoRows):
+			return nil, domain.ErrCaseNotFound
+		case cErr != nil:
+			return nil, fmt.Errorf("check case: %w", cErr)
+		case domain.WorkCaseStatus(caseStatus) == domain.WorkCaseClosed:
+			return nil, domain.ErrCaseAlreadyClosedWC
+		case caseEntity != p.LegalEntityID:
+			return nil, domain.ErrCaseEntityMismatch
+		}
 		caseID = p.CaseID
 	}
 	row := tx.QueryRow(ctx, `INSERT INTO tasks (
@@ -487,7 +501,7 @@ func (s *PgStore) ReopenTask(ctx context.Context, p domain.ReopenTaskParams) (*d
 		return nil, domain.ErrTaskInvalidState
 	}
 	t, err := scanTask(tx.QueryRow(ctx, `
-		UPDATE tasks SET status='IN_PROGRESS', reopened_count=reopened_count+1, completed_at=NULL, closed_at=NULL, updated_at=now()
+		UPDATE tasks SET status='IN_PROGRESS', reopened_count=reopened_count+1, completed_at=NULL, closed_at=NULL, closed_by='', updated_at=now()
 		WHERE task_id=$1 AND tenant_id=$2 RETURNING `+taskColumns,
 		p.TaskID, p.TenantID))
 	if err != nil {
