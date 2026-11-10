@@ -115,7 +115,7 @@ func (c *AuthzAdminClient) SetRoleActive(ctx context.Context, roleID string, act
 	if active {
 		action, code = "reactivate", "ROLE_DEFINITION_REACTIVATED"
 	}
-	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/%s", roleID, action), commandBody(s, code, nil), s)
+	return c.postCommand(ctx, fmt.Sprintf("/v1/admin/roles/%s/%s", roleID, action), commandBody(s, code, nil), s)
 }
 
 // CreatePermissionBundle calls POST /v1/admin/roles/{roleID}/permission-bundles.
@@ -161,7 +161,7 @@ func (c *AuthzAdminClient) SetPermissionBundleActive(ctx context.Context, roleID
 		if active {
 			action, code = "reactivate", "PERMISSION_BUNDLE_REACTIVATED"
 		}
-		return c.post(ctx, fmt.Sprintf("/v1/admin/permission-bundles/%s/%s", b.PermissionBundleID, action), commandBody(s, code, nil), s)
+		return c.postCommand(ctx, fmt.Sprintf("/v1/admin/permission-bundles/%s/%s", b.PermissionBundleID, action), commandBody(s, code, nil), s)
 	}
 	return domain.ErrAuthzBundleNotFound
 }
@@ -215,11 +215,31 @@ func (c *AuthzAdminClient) listPermissionBundles(ctx context.Context, roleID str
 // with no indication that the request rather than the service was at fault.
 // The error now carries the response body for exactly that reason.
 func (c *AuthzAdminClient) post(ctx context.Context, path string, body []byte, s Scope) error {
+	return c.send(ctx, path, body, s, "")
+}
+
+// postCommand is post for a command on an existing, versioned aggregate in
+// authorization-svc (role / bundle retire and reactivate, assignment revoke).
+// authorization-svc requires If-Match on those (API-3: 428 without one; on
+// assignments since 10 Nov 2026, AZ-1). This service holds none of
+// authorization-svc's versions — it acts on its own governed decisions (an
+// access review's REVOKE, a template retirement) and its commands are
+// monotonic state transitions it means to apply whatever changed in between —
+// so it sends the explicit unconditional form, "If-Match: *". That is a
+// recorded choice, not an omission: a missing header is refused.
+func (c *AuthzAdminClient) postCommand(ctx context.Context, path string, body []byte, s Scope) error {
+	return c.send(ctx, path, body, s, "*")
+}
+
+func (c *AuthzAdminClient) send(ctx context.Context, path string, body []byte, s Scope, ifMatch string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
 
 	// Verified scope. Set unconditionally: an empty value here is a bug in the
 	// caller, and sending the empty header lets authorization-svc say so
@@ -341,7 +361,7 @@ func (c *AuthzAdminClient) CreateRoleAssignment(ctx context.Context, assignmentI
 // there) is domain.ErrAuthzAssignmentAbsent so the caller can decide whether
 // that is the outcome it wanted.
 func (c *AuthzAdminClient) RevokeRoleAssignment(ctx context.Context, assignmentID string, s Scope) error {
-	err := c.post(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), commandBody(s, "ASSIGNMENT_REVOKED", nil), s)
+	err := c.postCommand(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), commandBody(s, "ASSIGNMENT_REVOKED", nil), s)
 	if err != nil && strings.Contains(err.Error(), "returned 404") {
 		return fmt.Errorf("%w: %v", domain.ErrAuthzAssignmentAbsent, err)
 	}
@@ -352,7 +372,7 @@ func (c *AuthzAdminClient) RevokeRoleAssignment(ctx context.Context, assignmentI
 // (an effective-dated revoke). 404 is domain.ErrAuthzAssignmentAbsent.
 func (c *AuthzAdminClient) ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID string, at time.Time, s Scope) error {
 	body := commandBody(s, "ASSIGNMENT_END_SCHEDULED", map[string]any{"effective_to": at.UTC()})
-	err := c.post(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), body, s)
+	err := c.postCommand(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), body, s)
 	if err != nil && strings.Contains(err.Error(), "returned 404") {
 		return fmt.Errorf("%w: %v", domain.ErrAuthzAssignmentAbsent, err)
 	}

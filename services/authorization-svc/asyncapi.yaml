@@ -2,39 +2,37 @@ asyncapi: "2.6.0"
 
 info:
   title: Authorization Service — Event Contract
-  version: "1.0"
+  version: "2.0"
   description: |
-    The published and consumed event surface of authorization-svc (IAM / AuthZ).
-
-    This document closes half of DoD gate 1: the OpenAPI document published the
-    synchronous contract, but the event contract — which is how every
-    authorization decision, every SoD violation, and every grant/revocation
-    reaches the estate — existed only as Go code.
+    Every event authorization-svc (IAM / AuthZ) produces and consumes.
+    Checked against the code in both directions by
+    internal/events/contract_test.go: an event emitted from Go or a migration
+    that is not declared here fails the build, and so does a declaration the
+    code does not produce or consume.
 
     ## Delivery semantics
 
-    Every event below is written to a **transactional outbox** in the same
-    Postgres transaction as the fact it attests, and a relay drains that to
-    Kafka. This is the spec's invariant 10: "Outbox publication occurs only
-    after authoritative commit; consumers assume at-least-once delivery."
-
-    Consumers **must** deduplicate on `event_id`. Delivery is at-least-once:
-    a relay that writes to Kafka and then fails to mark the row will redeliver
-    on its next pass, which is a deliberate trade — a duplicate is recoverable,
-    a loss is not.
+    Every produced event is written to the transactional outbox
+    (outbox_events, migration 000020) in the same Postgres transaction as the
+    fact it attests: decision events with the access_decision_log row; IAM,
+    rule, session and exception events by the triggers of migrations
+    000026-000041; workload-binding and cache events by their handlers. The
+    relay drains the outbox to Kafka at least once. There is no dead-letter:
+    a failing row stays pending and is retried (metric
+    authorization_outbox_stuck). Consumers must deduplicate on event_id.
 
     ## Ordering
 
-    Ordering is per partition, and the partition key is the SUBJECT of the
-    event (an access decision id, a principal id, a role assignment id) rather
-    than the event id. Two events about one principal are therefore ordered
-    with respect to each other; two events about different principals are not.
+    Per partition. The partition key is the subject of the event (decision id,
+    assignment id, session id), so events about one subject are ordered.
 
-    ## Self-consumption
+    ## Consumers
 
-    The reader and the writer are pointed at the same topic, so everything this
-    service publishes comes back to it. The consumer drops any event whose
-    `source_service` is `authorization-svc`.
+    The delegation projector reads zoiko.delegated-authority.events. The
+    lifecycle consumer reads the identity, access-control and entity topics in
+    one shared group. A per-replica invalidator reads the lifecycle topics and
+    this service's own topic in a group of its own, so every replica drops its
+    cached grants when the grant graph changes.
 
 defaultContentType: application/json
 
@@ -49,11 +47,9 @@ servers:
 channels:
   zoiko.authorization.events:
     description: |
-      This service's own topic. Everything it produces goes here. The reader is
-      also subscribed to it, which is why the self-source guard exists.
-
-      The events it CONSUMES from other services are published on each
-      producer's own topic, listed as the channels below.
+      This service's own topic. Everything it produces is published here. The
+      per-replica invalidator also reads it, for the IAM events listed under
+      subscribe.
     publish:
       summary: Events authorization-svc produces
       message:
@@ -61,294 +57,439 @@ channels:
           - $ref: "#/components/messages/AuthorizationGranted"
           - $ref: "#/components/messages/AuthorizationDenied"
           - $ref: "#/components/messages/SoDViolationDetected"
-    subscribe:
-      summary: Events authorization-svc consumes
-      message:
-        oneOf:
+          - $ref: "#/components/messages/AuthorizationCacheInvalidated"
+          - $ref: "#/components/messages/RolePublished"
           - $ref: "#/components/messages/AssignmentGranted"
           - $ref: "#/components/messages/AssignmentRevoked"
           - $ref: "#/components/messages/AssignmentSuspended"
           - $ref: "#/components/messages/AssignmentResumed"
           - $ref: "#/components/messages/AssignmentExpired"
-          - $ref: "#/components/messages/AssignmentApproved"
+          - $ref: "#/components/messages/DelegationGranted"
+          - $ref: "#/components/messages/DelegationRevoked"
+          - $ref: "#/components/messages/AuthorityLimitChanged"
+          - $ref: "#/components/messages/SoDPolicyPublished"
+          - $ref: "#/components/messages/PolicySetPublished"
+          - $ref: "#/components/messages/SoDRuleChangeRequested"
+          - $ref: "#/components/messages/SoDRuleChangeRejected"
+          - $ref: "#/components/messages/ABACRuleChangeRequested"
+          - $ref: "#/components/messages/ABACRuleChangeRejected"
+          - $ref: "#/components/messages/WorkloadBindingSaved"
+          - $ref: "#/components/messages/WorkloadBindingDeactivated"
+          - $ref: "#/components/messages/WorkloadBindingReactivated"
+          - $ref: "#/components/messages/PrivilegedSessionStarted"
+          - $ref: "#/components/messages/PrivilegedSessionEnded"
+          - $ref: "#/components/messages/BreakGlassRequested"
+          - $ref: "#/components/messages/BreakGlassApprovalRecorded"
+          - $ref: "#/components/messages/BreakGlassStarted"
+          - $ref: "#/components/messages/BreakGlassEnded"
+          - $ref: "#/components/messages/BreakGlassRejected"
+          - $ref: "#/components/messages/BreakGlassExpired"
+          - $ref: "#/components/messages/SupportSessionStarted"
+          - $ref: "#/components/messages/SupportSessionEnded"
+          - $ref: "#/components/messages/CompensatingControlApproved"
+          - $ref: "#/components/messages/CompensatingControlRevoked"
+          - $ref: "#/components/messages/SoDExceptionExpired"
+    subscribe:
+      summary: Own IAM events the invalidator reads to drop cached grants on every replica
+      message:
+        oneOf:
+          - $ref: "#/components/messages/RolePublished"
+          - $ref: "#/components/messages/AssignmentGranted"
+          - $ref: "#/components/messages/AssignmentRevoked"
 
   zoiko.delegated-authority.events:
-    description: Owned by delegated-authority-svc. Consumed only.
+    description: Owned by delegated-authority-svc. Projected into delegated_authorities, the delegation layer of /v1/authorize.
     subscribe:
-      summary: Delegation lifecycle — an ended delegation revokes the delegate's sessions
+      summary: Consumed only
       message:
         oneOf:
-          - $ref: "#/components/messages/AuthorityEnded"
+          - $ref: "#/components/messages/AuthorityDelegated"
+          - $ref: "#/components/messages/AuthorityExtended"
+          - $ref: "#/components/messages/AuthorityResumed"
+          - $ref: "#/components/messages/AuthorityRevoked"
+          - $ref: "#/components/messages/AuthorityExpired"
+          - $ref: "#/components/messages/AuthoritySuspended"
+
+  zoiko.identity.events:
+    description: Owned by identity-context-svc. Principal standing (layer 0) and subject merges.
+    subscribe:
+      summary: Consumed only
+      message:
+        oneOf:
+          - $ref: "#/components/messages/PrincipalStatusChanged"
+          - $ref: "#/components/messages/IdentitySubjectDisabled"
+          - $ref: "#/components/messages/IdentitySubjectEnabled"
+          - $ref: "#/components/messages/IdentitySubjectMerged"
 
   zoiko.access-control.events:
-    description: Owned by access-control-svc. Consumed only.
+    description: Owned by access-control-svc. Grant-graph changes invalidate cached grants; employment exits project TERMINATED.
     subscribe:
-      summary: Role changes — every holder's sessions are revoked
+      summary: Consumed only
       message:
         oneOf:
+          - $ref: "#/components/messages/RoleCreated"
           - $ref: "#/components/messages/RoleUpdated"
+          - $ref: "#/components/messages/PermissionBundleUpdated"
+          - $ref: "#/components/messages/EmploymentChanged"
+
+  zoiko.entity.events:
+    description: Owned by tenant-entity-registry-svc. Entity standing (layer 0.1) and tenant ownership.
+    subscribe:
+      summary: Consumed only
+      message:
+        oneOf:
+          - $ref: "#/components/messages/EntityCreated"
+          - $ref: "#/components/messages/EntityStatusChanged"
+          - $ref: "#/components/messages/EntityUpdated"
+          - $ref: "#/components/messages/EntityHierarchyChanged"
+          - $ref: "#/components/messages/EntityJurisdictionChanged"
 
 components:
   schemas:
     Envelope:
       type: object
       description: |
-        The platform event contract. Fields with no real value at the call
-        site are OMITTED rather than fabricated — an event that has no
-        tenant genuinely has no tenant_id, and inventing one would put a
-        false fact into the evidence stream.
+        The platform event contract (Doc 03 §19). Fields with no real value at
+        the call site are omitted rather than fabricated.
       required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, payload]
       properties:
-        event_id:
-          type: string
-          description: Fresh UUID per publish. The deduplication key.
-        event_type:
-          type: string
-        event_version:
-          type: string
-        emitted_at:
-          type: string
-          format: date-time
-        schema_version:
-          type: string
-        source_service:
-          type: string
-          description: |
-            Consumers use this to drop their own events. This service does.
-        tenant_id:
-          type: string
-        legal_entity_id:
-          type: string
-        actor_id:
-          type: string
-        correlation_id:
-          type: string
-        payload:
-          type: object
+        event_id: { type: string, description: Fresh UUID per publish. The deduplication key. }
+        event_type: { type: string }
+        event_version: { type: string }
+        emitted_at: { type: string, format: date-time }
+        schema_version: { type: string }
+        source_service: { type: string }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        actor_id: { type: string }
+        correlation_id: { type: string }
+        command_reason: { type: string, description: "The §16 reason on IAM events (000029)." }
+        payload: { type: object }
 
   messages:
-    # -- Published -----------------------------------------------------------------
-
+    # -- Produced ------------------------------------------------------------
     AuthorizationGranted:
       name: authorization.granted
-      title: An authorization request was permitted
-      summary: |
-        Written in the SAME transaction as the access_decision_log row, so a
-        decision with no event and an event with no decision are both
-        unreachable states.
+      title: AuthorizationGranted
+      summary: "A recorded PERMIT. Partition key: access_decision_id. Written with the access_decision_log row (outbox). (ZS-IAM-001 §18)"
       payload:
-        allOf:
-          - $ref: "#/components/schemas/Envelope"
-          - type: object
-            properties:
-              payload:
-                type: object
-                required: [access_decision_id, principal_id, tenant_id, legal_entity_id, action_type, decision_basis]
-                properties:
-                  access_decision_id:
-                    type: string
-                    format: uuid
-                  principal_id:
-                    type: string
-                  tenant_id:
-                    type: string
-                  legal_entity_id:
-                    type: string
-                  action_type:
-                    type: string
-                  decision_basis:
-                    type: string
-                    description: |
-                      One of: rbac:role=..., delegated:from=..., no_grant
-                  correlation_id:
-                    type: string
-                  ingress_source:
-                    type: string
-                  environment:
-                    type: string
-                  assurance_level:
-                    type: string
-                  expires_at:
-                    type: string
-                    format: date-time
-
+        $ref: "#/components/schemas/Envelope"
     AuthorizationDenied:
       name: authorization.denied
-      title: An authorization request was denied
-      summary: |
-        Written in the SAME transaction as the access_decision_log row. The
-        decision_basis names exactly which layer produced the denial.
+      title: AuthorizationDenied
+      summary: "A recorded DENY / STEP_UP / REQUIRE_APPROVAL. Also streamed to siem-integration-svc. (ZS-IAM-001 §18)"
       payload:
-        allOf:
-          - $ref: "#/components/schemas/Envelope"
-          - type: object
-            properties:
-              payload:
-                type: object
-                required: [access_decision_id, principal_id, tenant_id, legal_entity_id, action_type, decision_basis]
-                properties:
-                  access_decision_id:
-                    type: string
-                    format: uuid
-                  principal_id:
-                    type: string
-                  tenant_id:
-                    type: string
-                  legal_entity_id:
-                    type: string
-                  action_type:
-                    type: string
-                  decision_basis:
-                    type: string
-                    description: |
-                      One of: no_grant, sod:conflict_with=..., sod:own_object_forbidden,
-                      abac:forbidden=..., abac:require_failed=..., abac:rule_unevaluable=...
-                  correlation_id:
-                    type: string
-                  ingress_source:
-                    type: string
-                  environment:
-                    type: string
-                  assurance_level:
-                    type: string
-                  expires_at:
-                    type: string
-                    format: date-time
-
+        $ref: "#/components/schemas/Envelope"
     SoDViolationDetected:
       name: sod.violation.detected
-      title: A Separation-of-Duties conflict was detected
-      summary: |
-        Fired in ADDITION to authorization.denied when the denial reason
-        was an SoD conflict (decision_basis starting with "sod:"). This is
-        a separate signal for security teams who only care about SoD
-        violations, not general denials.
-      payload:
-        allOf:
-          - $ref: "#/components/schemas/Envelope"
-          - type: object
-            properties:
-              payload:
-                type: object
-                required: [access_decision_id, principal_id, tenant_id, legal_entity_id, action_type, conflict_with]
-                properties:
-                  access_decision_id:
-                    type: string
-                    format: uuid
-                  principal_id:
-                    type: string
-                  tenant_id:
-                    type: string
-                  legal_entity_id:
-                    type: string
-                  action_type:
-                    type: string
-                  conflict_with:
-                    type: string
-                    description: The conflicting action that triggered the SoD rule
-                  decision_basis:
-                    type: string
-                    description: sod:conflict_with=... or sod:own_object_forbidden
-                  correlation_id:
-                    type: string
-                  ingress_source:
-                    type: string
-                  environment:
-                    type: string
-                  assurance_level:
-                    type: string
-
-    # -- Consumed ------------------------------------------------------------------
-
-    AuthorityEnded:
-      name: authority.revoked
-      title: A delegated authority was revoked or expired
-      summary: |
-        Also matches `authority.expired` — an expired authority grants nothing,
-        so the response is identical. Events older than the envelope TTL plus
-        one minute are skipped — no live session can predate them. The
-        delegate is read from `payload.delegate_principal_id`, never from
-        `actor_id`, which on a revocation is the revoker. Revokes EVERY session
-        the delegate holds: an active session must stop carrying a delegation
-        that no longer exists, and it must stop now rather than at envelope
-        expiry.
+      title: SoDViolationDetected
+      summary: "A decision denied by a static or dynamic segregation-of-duties layer; carries the conflicting action. (ZS-IAM-001 §18)"
       payload:
         $ref: "#/components/schemas/Envelope"
-
-    RoleUpdated:
-      name: role.updated
-      title: A role's grants changed
-      summary: |
-        Envelopes already issued carry the permission bundles the role granted
-        BEFORE the change, so every holder's sessions are revoked and the next
-        resolve re-derives them.
+    AuthorizationCacheInvalidated:
+      name: authorization.cache.invalidated
+      title: AuthorizationCacheInvalidated
+      summary: "GOV-03 InvalidateAuthorizationCache: every replica's invalidator flushes the named scope. (GOV-03)"
       payload:
         $ref: "#/components/schemas/Envelope"
-
+    RolePublished:
+      name: iam.role.published
+      title: RolePublished
+      summary: "A role or its permission bundles changed (trigger, 000026). (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
     AssignmentGranted:
       name: iam.assignment.granted
-      title: An access assignment became effective
-      summary: |
-        Emitted by access-control-svc once a governed assignment is
-        provisioned in authorization-svc. Projected into
-        principal_role_assignments, the table the resolver frames session
-        roles from and handleRoleUpdated finds a role's holders in; it had no
-        other feed. A principal unknown here is skipped. Revokes nothing.
+      title: AssignmentGranted
+      summary: "An assignment became effective (insert APPROVED, or approval of a pending one). (ZS-IAM-001 §23)"
       payload:
         $ref: "#/components/schemas/Envelope"
-
     AssignmentRevoked:
       name: iam.assignment.revoked
-      title: An access assignment was revoked
-      summary: |
-        Emitted by access-control-svc when a governed assignment is revoked
-        (POST /v1/iam/access-assignments/{id}:revoke, or a REVOKE decision in
-        an access review). role.updated cannot cover this: it re-resolves the
-        role's CURRENT holders, and the revoked principal is no longer one.
-        The subject is read from `payload.principal_id`, never from
-        `actor_id` (the revoker). Every session of the subject is revoked;
-        events older than the envelope TTL plus one minute are skipped.
+      title: AssignmentRevoked
+      summary: "An assignment was ended or its end scheduled; carries command_reason. (ZS-IAM-001 §23)"
       payload:
         $ref: "#/components/schemas/Envelope"
-
     AssignmentSuspended:
       name: iam.assignment.suspended
-      title: An access assignment was suspended
-      summary: |
-        Emitted by authorization-svc (ORG-06 SuspendAssignment). The assignment
-        is withheld, not ended: it can be resumed. Handled like a revocation for
-        the subject's sessions, which are all revoked, because a live session may
-        still assert the role. The projection is held back FIRST (suspended_at)
-        so the re-resolve the eviction forces does not frame the role again.
-        Nothing is tombstoned, since a suspension is reversible. The subject is
-        `payload.principal_id`, never `actor_id` (the administrator); the
-        assignment is `payload.principal_role_assignment_id` (or `assignment_id`
-        from access-control-svc). The state is derived from the producer's
-        emitted_at, so redelivery and reordering cannot leave it wrong.
+      title: AssignmentSuspended
+      summary: "APPROVED to SUSPENDED (ORG-06 SuspendAssignment). (ORG-06)"
       payload:
         $ref: "#/components/schemas/Envelope"
-
     AssignmentResumed:
       name: iam.assignment.resumed
-      title: A suspended access assignment was resumed
-      summary: |
-        Emitted by authorization-svc. Lifts the hold (resumed_at); revokes
-        nothing, because a resume only adds access, and the next resolve frames
-        the role again. It cannot reopen an assignment that ended while
-        suspended: effective_to is untouched.
+      title: AssignmentResumed
+      summary: "SUSPENDED to APPROVED. Not a second grant. (ORG-06)"
       payload:
         $ref: "#/components/schemas/Envelope"
-
     AssignmentExpired:
       name: iam.assignment.expired
-      title: An assignment reached its end date
-      summary: Handled as iam.assignment.revoked.
+      title: AssignmentExpired
+      summary: "An assignment's window closed; emitted once by the expiry sweep (000038). No actor. (ORG-06)"
       payload:
         $ref: "#/components/schemas/Envelope"
-
-    AssignmentApproved:
-      name: iam.assignment.approved
-      title: A pending assignment was approved
-      summary: Handled as iam.assignment.granted.
+    DelegationGranted:
+      name: iam.delegation.granted
+      title: DelegationGranted
+      summary: "A delegation became effective. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    DelegationRevoked:
+      name: iam.delegation.revoked
+      title: DelegationRevoked
+      summary: "A delegation ended; carries command_reason. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    AuthorityLimitChanged:
+      name: iam.authority_limit.changed
+      title: AuthorityLimitChanged
+      summary: "An authority limit was approved, changed or retired (AU-03). (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    SoDPolicyPublished:
+      name: iam.sod_policy.published
+      title: SoDPolicyPublished
+      summary: "An SoD rule set change took effect. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    PolicySetPublished:
+      name: iam.policy_set.published
+      title: PolicySetPublished
+      summary: "A new authorization policy version (config watermark) is active. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    SoDRuleChangeRequested:
+      name: iam.sod_rule.change_requested
+      title: SoDRuleChangeRequested
+      summary: "A publish / retire / reactivate of an SoD rule awaits an independent approver. (AU-17)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    SoDRuleChangeRejected:
+      name: iam.sod_rule.change_rejected
+      title: SoDRuleChangeRejected
+      summary: "A requested SoD rule change was rejected. (AU-17)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    ABACRuleChangeRequested:
+      name: iam.abac_rule.change_requested
+      title: ABACRuleChangeRequested
+      summary: "A change to an ABAC rule awaits an independent approver. (AU-17)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    ABACRuleChangeRejected:
+      name: iam.abac_rule.change_rejected
+      title: ABACRuleChangeRejected
+      summary: "A requested ABAC rule change was rejected. (AU-17)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    WorkloadBindingSaved:
+      name: iam.workload_binding.saved
+      title: WorkloadBindingSaved
+      summary: "A workload binding was created or replaced (N-09). (ZS-IAM-001 §16)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    WorkloadBindingDeactivated:
+      name: iam.workload_binding.deactivated
+      title: WorkloadBindingDeactivated
+      summary: "A workload binding was deactivated. (ZS-IAM-001 §16)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    WorkloadBindingReactivated:
+      name: iam.workload_binding.reactivated
+      title: WorkloadBindingReactivated
+      summary: "A workload binding was reactivated. (ZS-IAM-001 §16)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    PrivilegedSessionStarted:
+      name: security.privileged_session.started
+      title: PrivilegedSessionStarted
+      summary: "A JIT session became ACTIVE. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    PrivilegedSessionEnded:
+      name: security.privileged_session.ended
+      title: PrivilegedSessionEnded
+      summary: "A JIT session was revoked or expired. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    BreakGlassRequested:
+      name: security.break_glass.requested
+      title: BreakGlassRequested
+      summary: "A break-glass session was requested (PENDING_APPROVAL). (AU-02)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    BreakGlassApprovalRecorded:
+      name: security.break_glass.approval_recorded
+      title: BreakGlassApprovalRecorded
+      summary: "One independent, stepped-up approval was recorded toward the quorum. (AU-02)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    BreakGlassStarted:
+      name: security.break_glass.started
+      title: BreakGlassStarted
+      summary: "The quorum was met; emergency access is active. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    BreakGlassEnded:
+      name: security.break_glass.ended
+      title: BreakGlassEnded
+      summary: "A break-glass session was revoked or expired. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    BreakGlassRejected:
+      name: security.break_glass.rejected
+      title: BreakGlassRejected
+      summary: "A pending break-glass request was rejected. (AU-02)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    BreakGlassExpired:
+      name: security.break_glass.expired
+      title: BreakGlassExpired
+      summary: "A pending break-glass request expired unapproved. (AU-02)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    SupportSessionStarted:
+      name: support.session.started
+      title: SupportSessionStarted
+      summary: "A tenant support session began. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    SupportSessionEnded:
+      name: support.session.ended
+      title: SupportSessionEnded
+      summary: "A tenant support session ended. (ZS-IAM-001 §23)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    CompensatingControlApproved:
+      name: sod.compensating_control.approved
+      title: CompensatingControlApproved
+      summary: "A GOV-04 SoD exception was approved with its compensating control. (GOV-04)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    CompensatingControlRevoked:
+      name: sod.compensating_control.revoked
+      title: CompensatingControlRevoked
+      summary: "A GOV-04 SoD exception was withdrawn early. (GOV-04)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    SoDExceptionExpired:
+      name: sod.exception.expired
+      title: SoDExceptionExpired
+      summary: "A GOV-04 SoD exception reached its expiry and stopped applying. (GOV-04)"
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    # -- Consumed ------------------------------------------------------------
+    AuthorityDelegated:
+      name: authority.delegated
+      title: AuthorityDelegated
+      summary: "Project the delegation as ACTIVE."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    AuthorityExtended:
+      name: authority.extended
+      title: AuthorityExtended
+      summary: "Re-project with the new window."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    AuthorityResumed:
+      name: authority.resumed
+      title: AuthorityResumed
+      summary: "Re-project as ACTIVE."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    AuthorityRevoked:
+      name: authority.revoked
+      title: AuthorityRevoked
+      summary: "End the projected delegation."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    AuthorityExpired:
+      name: authority.expired
+      title: AuthorityExpired
+      summary: "End the projected delegation."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    AuthoritySuspended:
+      name: authority.suspended
+      title: AuthoritySuspended
+      summary: "A suspended grant confers nothing until resumed."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    PrincipalStatusChanged:
+      name: principal.status.changed
+      title: PrincipalStatusChanged
+      summary: "Project into principal_status_projection; a non-ACTIVE principal is denied everything."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    IdentitySubjectDisabled:
+      name: identity.subject.disabled
+      title: IdentitySubjectDisabled
+      summary: "Project DISABLED."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    IdentitySubjectEnabled:
+      name: identity.subject.enabled
+      title: IdentitySubjectEnabled
+      summary: "Project ACTIVE."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    IdentitySubjectMerged:
+      name: identity.subject.merged
+      title: IdentitySubjectMerged
+      summary: "Re-point the duplicate's assignments to the survivor (IC-3)."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    RoleCreated:
+      name: role.created
+      title: RoleCreated
+      summary: "Invalidate cached grants for the tenant."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    RoleUpdated:
+      name: role.updated
+      title: RoleUpdated
+      summary: "Invalidate cached grants for the tenant."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    PermissionBundleUpdated:
+      name: permission.bundle.updated
+      title: PermissionBundleUpdated
+      summary: "Invalidate cached grants for the tenant."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    EmploymentChanged:
+      name: employment.changed
+      title: EmploymentChanged
+      summary: "A linked employee's exit is projected as principal status TERMINATED."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    EntityCreated:
+      name: entity.created
+      title: EntityCreated
+      summary: "Project the entity's owning tenant and status."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    EntityStatusChanged:
+      name: entity.status.changed
+      title: EntityStatusChanged
+      summary: "SUSPENDED / DISSOLVED deny; DORMANT permits with ENTITY_DORMANT_REVIEW."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    EntityUpdated:
+      name: entity.updated
+      title: EntityUpdated
+      summary: "Invalidate cached grants."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    EntityHierarchyChanged:
+      name: entity.hierarchy.changed
+      title: EntityHierarchyChanged
+      summary: "Invalidate cached grants."
+      payload:
+        $ref: "#/components/schemas/Envelope"
+    EntityJurisdictionChanged:
+      name: entity.jurisdiction.changed
+      title: EntityJurisdictionChanged
+      summary: "Invalidate cached grants."
       payload:
         $ref: "#/components/schemas/Envelope"

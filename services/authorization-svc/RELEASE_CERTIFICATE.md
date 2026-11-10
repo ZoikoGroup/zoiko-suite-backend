@@ -1,216 +1,122 @@
 # Release Certificate — authorization-svc (IAM / AuthZ)
 
-**Service:** IAM / AuthZ — Evaluation Engine
-**Assessed against:** `ZoikoSuite_Governance_Control_Plane_Detailed_Service_Specifications` §6–§15, §18–§21
-**Date:** 2026-11-07
-**Scope:** the IAM completion change (AZ-1 through AZ-5, IAM-7, IAM-8, IAM-11, IAM-13)
+**Assessed against:** ZS-IAM-001 (Global Authorization, RBAC/ABAC & SoD Standard) §19–§29;
+Governance Control Plane GOV-03 / GOV-04 / GOV-12; Doc 03 §8.3; ORG-06 (role half)
+**Date:** 2026-11-10 (replaces the 7 Nov certificate)
+**Build:** working tree on `shashi-changes` after the 10 Nov gap closure (AZ-1, AZ-4 delegation
+half, AZ-5, IAM-8, §26 telemetry, pipeline hardening)
 
-This is DoD gate 12. It records the state of the other eleven **and what has
-not been verified**, because a release certificate that only lists successes
-certifies nothing.
+The 7 Nov certificate cited routes (`/v1/bindings`, `/v1/assignments`, `PUT …`), tests
+(`TestIAM11_*`, `TestUpdateBinding_*`, `contract_test.go`), a telemetry file, a dashboard and
+alert rules that did not exist. Every line below was produced by a command run on 10 Nov 2026
+and can be re-run.
 
 ---
 
 ## Verification performed
 
-```
-go build ./...     clean
-go vet  ./...      clean
-go test ./...      all packages pass
-                   (with TEST_DATABASE_URL against Postgres 16)
-```
+| Check | Command | Result |
+|---|---|---|
+| Build, vet | `go build ./... && go vet ./...` | clean |
+| Unit + integration suites, all packages | `go test -count=1 -p 1 -v ./...` in `golang:1.26-alpine`, `AUTHZ_IT_DSN` as `app_authorization` (NOBYPASSRLS) and `TEST_DATABASE_URL` as owner, Postgres 16 | 15 packages ok; **900 tests pass, 0 fail, 1 skip** (`TestSecondPassIT_PrincipalStatusTableMissingFailsClosed`, by design) |
+| Mutation checks on the 10 Nov controls | 10 mutants in a throwaway copy | **10 / 10 killed** (fact-hash ×2, currency ×2, If-Match ×2, cursor scope, FX config, record-failure metric, §21 alias) |
+| OpenAPI ↔ router, both directions | `TestOpenAPI_MatchesTheRouter` (kin-openapi validated) | pass — 86 paths, 101 operations |
+| AsyncAPI ↔ code, both directions | `internal/events/contract_test.go` (declared vs `ProducedEventTypes` / consumers; every literal emitter in Go and SQL scanned) | pass — 35 produced, 19 consumed |
+| Alert rules | `promtool check rules deployments/prometheus-rules.yml` | SUCCESS, 79 rules (8 in group `authorization-svc`) |
+| Live audit | `SKIP_SUITES=1 bash scripts/audit.sh` against the compose stack | **49 / 49** |
+| Persona scenarios | `deployments/scripts/e2e-authorization-scenarios.py` | **78 / 78** |
+| Dependency E2E | `deployments/scripts/e2e-authorization-deps.py` | 28 / 32 — the 4 not passed are siem-integration-svc and Jaeger, not started (Docker VM memory) |
+| Strict modes | identity `require`, step-up unknown age `step_up`, tenant enforce; evaluation mTLS `require` + allow-list | 7 / 7 and 2 / 2 |
+| access-control-svc (caller change) | `go test ./...` | all packages ok |
+| Console (caller change) | `tsc --noEmit`, `eslint` on changed files | clean (one pre-existing parse error in another session's uncommitted `lib/api/governance.ts`) |
 
-Including **integration tests executed against a real Postgres 16** — the
-store suite covering every authorization-svc store method.
+Stack for the live checks: postgres, kafka, redis, mtls-management-svc, identity-context-svc,
+tenant-entity-registry-svc, access-control-svc, authorization-svc (+ jurisdiction-rules-svc and
+delegated-authority-svc for the dependency E2E).
 
-### Database verification (Postgres 16, scratch container)
+---
 
-| Check | Result |
+## Contract surface
+
+86 paths / 101 operations. The `/admin/v1/…` and `/v1/admin/…` session spellings, the two
+available-actions spellings and the §21 delegation aliases are distinct routes; unique
+capabilities are fewer.
+
+| ZS-IAM-001 §21 | Served |
 |---|---|
-| Migrations 000001–000011 apply in order | Pass |
-| 000009 down migration reverses cleanly (partitioned table + helper functions) | Pass |
-| 000009 re-applies after a down (the redeploy path) | Pass |
-| `access_decision_log` partitioned by month, default partition present | Pass |
-| `FORCE ROW LEVEL SECURITY` on all tenant-scoped tables | Pass |
-| Tenant isolation, as a non-superuser (app_authorization) | Pass |
-| `app.outbox_relay` sees every tenant's events — and **nothing else** | Pass |
-| `app.retention_sweep` creates and detaches partitions correctly | Pass |
-| Unscoped connection matches **zero** rows, not all rows | Pass |
-| CHECK/FK constraints refuse what they should | Pass |
+| `POST /internal/authorization/decisions` | yes (and `POST /v1/authorize`) |
+| `GET /v1/me/capabilities` | yes |
+| `GET /v1/{resource}/{id}/available-actions` | yes |
+| `POST /v1/iam/access-assignments`, `…:revoke` | access-control-svc (provisions into `/v1/admin/role-assignments`) |
+| `POST /v1/iam/delegations`, `…/{id}:revoke` | **yes, since 10 Nov** (aliases; colon and slash forms) |
+| `POST /admin/v1/privileged-sessions`, `/admin/v1/break-glass-sessions`, `/v1/support/sessions` | yes |
+| `GET /v1/iam/access-reviews` | access-control-svc |
 
 ---
 
-## IAM / AuthZ contract surface (spec §6–§15)
+## What changed on 10 Nov 2026
 
-| Spec operation | Route | Status |
+| Area | Change | Evidence |
 |---|---|---|
-| `EvaluateAuthorization` | `POST /v1/authorize` | Implemented |
-| `CreateAssignment` | `POST /v1/assignments` | Implemented |
-| `GetAssignment` | `GET /v1/assignments/{id}` | Implemented |
-| `ListAssignments` | `GET /v1/assignments` | Implemented |
-| `SuspendAssignment` | `POST /v1/assignments/{id}:suspend` | Implemented |
-| `ResumeAssignment` | `POST /v1/assignments/{id}:resume` | Implemented |
-| `RevokeAssignment` | `POST /v1/assignments/{id}:revoke` | Implemented |
-| `CreateBinding` | `POST /v1/bindings` | Implemented |
-| `GetBinding` | `GET /v1/bindings/{id}` | Implemented |
-| `ListBindings` | `GET /v1/bindings` | Implemented |
-| `UpdateBinding` | `PUT /v1/bindings/{id}` | Implemented |
-| `DeleteBinding` | `DELETE /v1/bindings/{id}` | Implemented |
-| `CreateSoDRule` | `POST /v1/admin/sod-rules` | Implemented |
-| `GetSoDRule` | `GET /v1/admin/sod-rules/{id}` | Implemented |
-| `ListSoDRules` | `GET /v1/admin/sod-rules` | Implemented |
-| `RetireSoDRule` | `POST /v1/admin/sod-rules/{id}:retire` | **Added (AZ-2 4th pass)** |
-| `CreateABACRule` | `POST /v1/admin/abac-rules` | Implemented |
-| `GetABACRule` | `GET /v1/admin/abac-rules/{id}` | Implemented |
-| `ListABACRules` | `GET /v1/admin/abac-rules` | Implemented |
-| `SetABACRuleActive` | `PUT /v1/admin/abac-rules/{id}/active` | Implemented |
-| `ListAccessDecisions` | `GET /v1/admin/access-decisions` | Implemented |
-
-15 of 15. The operationIds are the spec's names verbatim and are asserted by
-`internal/handler/contract_test.go`, so the estate can check this service
-implements the **named** surface rather than something that resembles it.
-
-### Named events (spec §18)
-
-| Spec event | Published as | Status |
-|---|---|---|
-| `AuthorizationGranted` | `authorization.granted` | Implemented |
-| `AuthorizationDenied` | `authorization.denied` | Implemented |
-| `SoDViolationDetected` | `sod.violation.detected` | **Added** |
-
-3 of 3, plus the consumed events from delegated-authority-svc and
-access-control-svc. All published and consumed events are declared in
-`asyncapi.yaml` and asserted against the code by `internal/events/contract_test.go`.
-
-### AccessDecisionLog (spec §19)
-
-`decision_id, principal_id, tenant_id, legal_entity_id, action_type,
-decision_basis, ingress_source, environment, assurance_level, expires_at`
-— all ten now present. `ingress_source` and `environment` were added in
-migration 000009; their absence was why negative path #2 was previously
-untestable.
+| API-3 (AZ-1) | If-Match **required** on assignment approve / reject / revoke / suspend / resume and workload-binding deactivate / reactivate (428 / 412). Callers updated: access-control-svc sends `If-Match: *` on its monotonic commands (and on role / bundle retire, which already required it and was failing with 428); the console sends each row's version. | `TestRevokeRoleAssignment_IfMatchRequired`, `TestWorkloadBindings_IfMatchRequired`, `TestAuthzAdmin_CommandsSendIfMatchStar`; scenarios "If-Match: …" |
+| API-4 (AZ-1) | Opt-in cursor paging on 15 admin lists (`page_size`, `cursor` → `{records, next_cursor}`); assignments keyset in SQL. | `paging_test.go` (6), `TestAZ1IT_AssignmentKeysetTraversal`; scenarios "cursor …" |
+| §21 (AZ-4, delegation half) | `/v1/iam/delegations` aliases. | `iam_delegations_test.go` (3); scenarios "§21 …" |
+| §26 | Metrics: decisions by decision / outcome / layer and by action, pipeline latency, record failures, cache hits / misses / invalidations / entries, watermark age, outbox pending / oldest / stuck, sessions by kind / state and expiring, projection events and lag, SIEM drops. Dashboard `authorization-svc.json`; 8 alert rules. | `telemetry/authz_test.go`, `metrics_test.go`, `observer_test.go`, `TestOpsIT_OperationalSnapshotReads`; audit §7–8 |
+| A10 fail-closed | Revalidation needs both hashes: approved without current → DENY `CURRENT_FACT_HASH_REQUIRED`; requested without approved → DENY `APPROVED_FACT_HASH_REQUIRED`. | `TestRevalidation_*` (3), mutants M1/M2 |
+| A09 basis | No currency against a currency-bearing limit or delegation ceiling → DENY `CURRENCY_REQUIRED` (was read as GBP / the cap's currency). Reference rates configurable (`AUTHZ_FX_REFERENCE_RATES`); converted decisions carry `FX_BASIS:REFERENCE_RATES:<from>/<to>` and `FX_RATE:<r>`. | `TestAuthorityLimit_*` (3), `TestParseFXReferenceRates`, `TestDelegationCeiling`; mutants M3/M4/M8 |
+| AZ-5 artefacts | `asyncapi.yaml` (complete), `RUNBOOK.md`, `SPEC_DEVIATIONS.md`, `scripts/audit.sh` rewritten against the code. | contract test; audit 49/49 |
+| Housekeeping | Untracked 18 MB `handler_test.exe` removed. access-control-svc migration 000048 rewritten so it can apply (it could not on any database). | `migrate.py up --db access_control` applied; re-run idempotent |
 
 ---
 
-## Minimum negative-path acceptance (spec §6–§15)
+## Measured (IAM-8), local stack only
 
-| # | Scenario | Evidence |
-|---|---|---|
-| 1 | Missing `Idempotency-Key` on mutation refused (428) | `TestAuthorize_MissingIdempotencyKeyRefused`, Postman NP1 |
-| 2 | Stale `If-Match` refused (412) | `TestUpdateBinding_StaleIfMatchRefused`, `TestSuspendAssignment_StaleIfMatchRefused`, Postman NP2 |
-| 3 | Cache cannot serve stale grants (watermark invalidates) | `TestCache_InvalidatedOnAssignmentWrite`, `TestWatermark_BumpsOnAssignmentWrite` |
-| 4 | Delegated authority requires a real delegation row | `TestEvaluate_DelegatedAuthority_RequiresActiveRow`, Postman NP3 |
-| 5 | SoD rule missing jurisdiction refuses (503) | `TestSOD_JurisdictionUnavailableReturns503`, Postman NP4 |
-| 6 | ABAC rule with unknown operator denies (abac:rule_unevaluable) | `TestABAC_UnknownOperatorDenies`, Postman NP5 |
-| 7 | Identity envelope required on admin routes (step-up for JIT/break-glass) | `TestAdminRoute_RequiresMFAVerified`, `TestStepUp_RequiresRecentAuthTime` |
-| 8 | mTLS enforced on evaluation endpoints when `AUTHZ_EVALUATION_MTLS=require` | `TestEvaluate_RequiresMTLS` |
-| 9 | IAM-11 aliases: canonical grant satisfies legacy check, legacy grant satisfies canonical check | `TestIAM11_CanonicalGrantSatisfiesLegacyCheck`, `TestIAM11_LegacyGrantSatisfiesCanonicalCheck` |
+| Measurement | Result |
+|---|---|
+| `/v1/authorize`, 200 concurrent × 60 s (RUNBOOK §11) | 19,467 decisions, 0 errors, 321.6/s; p50 578 ms, p95 1011 ms, p99 1376 ms |
+| `/v1/authorize`, 50 concurrent × 30 s | 10,263 decisions, 0 errors, 341.0/s; p50 126 ms, p95 208 ms, p99 297 ms |
+| Revocation through the admin API → next decision DENY | 9–35 ms (6 runs) |
+| Projection lag over Kafka (`authorization_projection_lag_seconds`) | delegation 0.23 s mean (2 events), lifecycle 0.42 s mean (5 events) |
 
-9 of 9.
+One replica, `cpus: 0.5`, `mem_limit: 256m`, a 2 GB Docker VM on a laptop. Throughput is
+CPU-bound; latency above 50 concurrent is queueing. **These are not production SLO
+measurements** and certify nothing about a production class.
 
 ---
 
-## Definition of Done (spec §21)
+## Definition of Done (ZS-IAM-001 §29)
 
-| # | Gate | State |
-|---|---|---|
-| 1 | Machine contract published and compatibility certified | **Met, with a dependency** |
-| 2 | Authoritative datastore and ownership constraints implemented | Met |
-| 3 | No generic path bypasses named governance commands | Met |
-| 4 | Authorization/SoD enforcement verified server-side | Met |
-| 5 | Outbox/inbox and idempotency tests pass | Met |
-| 6 | Historical version/as-of reconstruction demonstrated | Met |
-| 7 | Evidence chain complete for material actions | Met |
-| 8 | Retention/hold/privacy behaviour tested where applicable | Met |
-| 9 | NFR/load/failure tests meet approved class | **Met in CI; end-to-end unrun** |
-| 10 | Security/residency tests pass | Met |
-| 11 | Operational dashboards/runbooks exercised | **Authored; not exercised** |
-| 12 | Release certificate with no unresolved mandatory control | This document |
-
-### Gate 1 — the dependency
-
-OpenAPI (21 paths, 27 schemas) and AsyncAPI (6 messages) are published, and
-contract tests assert them against the router and the event constants **in both
-directions**: a route with no spec entry fails, and a spec entry with no route
-fails.
-
-**What is not certified:** cross-version compatibility. That requires GOV-08's
-schema registry, which nothing here publishes to. The contract is checked
-against *this* build, not against what consumers were compiled from.
-
-### Gate 9 — what was measured
-
-The evaluator's own per-call cost is measured and gated in CI at P99 ≤ target
-ms sequential and ≤ target ms under concurrency. Observed: **p99 < target** in
-CI (stubbed dependencies).
-
-**Not measured:** end-to-end latency against a running stack, which is the
-number the P99 target actually refers to. The CI test stubs out the registries,
-Postgres, Redis and Kafka. The load profile to run against a live stack is in
-`RUNBOOK.md` §13 and has not been executed.
-
-### Gate 11 — authored, not exercised
-
-Dashboard (`deployments/grafana/.../authorization-svc.json`), alert rules
-(`deployments/prometheus-rules.yml`) and `RUNBOOK.md` exist, and every metric
-they reference is emitted by `internal/telemetry/iam.go`.
-
-**"Exercised" means run against a live system during an incident or a game
-day.** That has not happened. The alert expressions are unproven against real
-data.
+| Gate | State |
+|---|---|
+| PEP enforcement — one logical policy contract | Met (one pipeline for `/v1/authorize`, the canonical API and available actions) |
+| No UI bypass | Met (server-side; available actions computed by the same pipeline) |
+| Scope isolation | Met (RLS NOBYPASSRLS suites; cross-tenant entity 403 live) |
+| SoD incl. dynamic own-object | Met (unit + live scenarios) |
+| Revocation measured end to end | **Met locally**, not against a production objective |
+| Evidence reconstructable with policy / assignment versions | Met (`policy_set_version`, `matched_grants`, history tables) |
+| Load / performance against an approved SLO | **Local measurement only** |
+| Security: session / token tests; secrets absent from logs | Met in code and unit tests; production mTLS / identity `require` not exercised outside the local proof |
+| Provisioning (SCIM / federation) | Not this service |
+| Privileged access controls and retrospective evidence | Met in code and tests; live run proves refusals only |
+| Available-action / denial UX | Console: commands send versions; resume / as-of screens not built (AZ-FE-1) |
+| Operational readiness: dashboards, alerts, runbook | **Authored and validated**; not exercised in an incident or game day |
 
 ---
 
-## Defects found and fixed during this change
+## Unresolved, stated
 
-| Defect | Severity | Resolution |
-|---|---|---|
-| Cache served stale grants after assignment suspend/revoke | High | Watermark `authz_versions.assignment_version` bumps on every assignment write; cache decorator checks it before serving |
-| `If-Match` not required on mutation routes (assignments/bindings) | High | Added `If-Match` requirement returning 428 missing / 412 stale; cursor paging (API-4) added to all lists |
-| SoD rules could not be retired (no `:retire` endpoint) | Medium | Added `POST /v1/admin/sod-rules/{id}:retire` with idempotent semantics |
-| Delegated authority projection did not include `revocation_status` | Medium | Added `revocation_status` (ACTIVE/REVOKED/EXPIRED); projection updates on `authority.ended` |
-| ABAC rules accepted unsupported operators at authoring time | Medium | Authoring validates operator and effect; unsupported = 400; unevaluable at evaluation = deny with `abac:rule_unevaluable` |
-| Admin routes accepted envelope without `mfa_verified` | High | Admin routes now require `mfa_verified` with `auth_time` ≤ 15 min (step-up) |
-| mTLS not enforced on evaluation endpoints | Medium | Added `AUTHZ_EVALUATION_MTLS` flag; when `require`, mTLS is required on `/v1/authorize` and admin routes |
-| IAM-11 aliases not implemented for /v1/iam/* | High | Added `alias_for` to `permission_definitions`; Lookup resolves canonical↔legacy |
-| Identity-context-svc envelope not verified on admin routes | High | `RequireEnvelope` middleware added to admin routes with `AUTHZ_IDENTITY_ASSERTION=require` |
-| Outbox relay called `WriteMessages` once per record (1 msg/sec drain) | High | Batch the whole claimed slice in one call; bound `BatchTimeout` to 20ms |
+1. Cross-version contract compatibility (GOV-08 schema registry).
+2. Alert rules have never fired against production data.
+3. Production load and revocation SLOs (only the local numbers above exist).
+4. siem-integration-svc and Jaeger edges not run on 10 Nov.
+5. JIT / break-glass approval with a real TOTP step-up not re-run on 10 Nov (14 Oct run only).
+6. Compose keeps identity `warn`, mTLS `permit`, step-up unknown age `permit`, tenant enforce
+   `false` until callers migrate; each strict mode was proven locally.
+7. Console screens for suspend / resume, suspension history and as-of (AZ-FE-1) and the UI
+   E2E (AZ-FE-2).
+8. Quorum, cooling window, related party and resource state remain PEP-asserted
+   (SPEC_DEVIATIONS #5).
 
----
-
-## Unresolved, and deliberately so
-
-These are **not** IAM / AuthZ gaps. Each is recorded so nobody reads this
-certificate as claiming more than it does.
-
-1. **Cross-version compatibility** — requires GOV-08 schema registry.
-2. **End-to-end load profile** (`RUNBOOK.md` §13) — not run against a live stack.
-3. **Alert rules exercised** — syntactically valid, every metric emitted, but no
-   expression has fired against real data.
-4. **`jurisdiction-rules-svc` live** — SoD jurisdiction check returns 503 on
-   local stack; gate 4 is met in code, not exercised.
-5. **Production mTLS** — `AUTHZ_EVALUATION_MTLS=require` not exercised in local
-   stack (requires mtls-management-svc enrolment).
-6. **IAM-8 SLOs (load and revocation)** — shared with identity-context-svc; not
-   measured end-to-end.
-
----
-
-## Certification
-
-Every mandatory control in IAM / AuthZ's §6–§15 contract is implemented, and
-every control is enforced server-side and fails closed. The nine negative-path
-acceptance scenarios pass. Ten of twelve DoD gates are met outright; the two
-that are not — 9 and 11 — are met in code and unverified against running
-infrastructure, which is stated rather than claimed.
-
-**No unresolved *mandatory* control.** Four verification activities remain,
-and none can be completed without infrastructure this change does not deploy:
-
-- run the end-to-end load profile (`RUNBOOK.md` §13) against a live stack;
-- exercise the alert rules against real metric data;
-- run `e2e-authorization-deps.py` against a live stack with SoD and delegation;
-- exercise `AUTHZ_EVALUATION_MTLS=require` and `AUTHZ_IDENTITY_ASSERTION=require` in production.
-
-All are verification, not implementation. Nothing in the contract is
-unimplemented.
+No mandatory control in this service's contract is unimplemented; the open items are
+verification against infrastructure this stack does not run, cross-team migrations, and
+console screens.

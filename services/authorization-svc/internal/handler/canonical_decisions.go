@@ -87,6 +87,7 @@ type evalResult struct {
 // could be offered actions /v1/authorize then refused (GOV-03 negative path
 // #4: "AvailableActions equals backend-authorized actions").
 func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEntityID string) (*evalResult, error) {
+	defer h.observeEvaluation(time.Now())
 	res, err := h.evaluateDecision(ctx, in, evaluationEntityID)
 	if err != nil {
 		return nil, err
@@ -671,6 +672,8 @@ func (h *Handler) evaluateDecisionLayers(ctx context.Context, in evalContext, ev
 	if grantedViaDelegation {
 		res.ReasonCodes = append(res.ReasonCodes, "DELEGATED_AUTHORITY")
 	}
+	// The FX basis of a converted limit comparison (§20 authority result).
+	res.ReasonCodes = append(res.ReasonCodes, limitReasonCodes...)
 	if entityStatus == domain.EntityStatusDormant {
 		res.ReasonCodes = append(res.ReasonCodes, "ENTITY_DORMANT")
 		res.Obligations = append(res.Obligations, "ENTITY_DORMANT_REVIEW")

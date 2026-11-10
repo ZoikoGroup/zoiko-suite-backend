@@ -1,200 +1,60 @@
 # Specification Deviations — authorization-svc
 
-**Service:** authorization-svc  
-**Date:** 2026-11-07  
-**Tracker:** DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md (D2-5)
+**Service:** authorization-svc (IAM / AuthZ)
+**Date:** 2026-11-10 (replaces the 7 Nov version)
+**Specs:** ZS-IAM-001 (Global Authorization, RBAC/ABAC & SoD Standard), Governance
+Control Plane GOV-03 / GOV-04 / GOV-12, Doc 03 §8.3, ORG-06 (role half)
+**Tracker:** DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md, D2-5
 
-This document records deliberate deviations from the original spec (ZS-SVC-M-001 INT-01 §6–§15, IAM / AuthZ §18–§21) and the AUTH-PLANE plan, as required by AZ-5 (IAM-7).
-
----
-
-## 1. Gate 1 dependency (Cross-version compatibility)
-
-**Spec requirement (DoD gate 1):** Machine contract published and compatibility certified.
-
-**Deviation:** OpenAPI (21 paths, 27 schemas) and AsyncAPI (6 messages) are published, and contract tests assert them against the router and the event constants **in both directions**. However, **cross-version compatibility is not certified**. That requires GOV-08's schema registry, which nothing here publishes to. The contract is checked against *this* build, not against what consumers were compiled from.
-
-**Status:** 🧭 Decision — tracked as D2-5.F23 in the tracker. Platform team to provision schema registry.
-
-**Reference:** DoD gate 1; tracker D2-5.F23.
+The 7 Nov version described a different service in places: 21 paths and 27
+schemas (there are 86 paths, 101 operations), a `/v1/bindings` surface, migration 000048 and
+`alias_for` (those are access-control-svc's), and federation routes (those are
+identity-context-svc's and access-control-svc's). This version lists only what
+differs from the specs in this service's code today.
 
 ---
 
-## 2. Gate 9 (End-to-end load profile)
-
-**Spec requirement (DoD gate 9):** NFR/load/failure tests meet approved class.
-
-**Deviation:** The evaluator's own per-call cost is measured and gated in CI at P99 ≤ target ms sequential and ≤ target ms under concurrency. **Not measured:** end-to-end latency against a running stack, which is the number the P99 target actually refers to. The CI test stubs out the registries, Postgres, Redis and Kafka. The load profile to run against a live stack is in `RUNBOOK.md` §13 and has not been executed.
-
-**Status:** 🧭 Decision — tracked as D2-5.F24 in the tracker. Requires full compose stack.
-
-**Reference:** DoD gate 9; tracker D2-5.F24; RUNBOOK.md §13.
-
----
-
-## 3. Gate 11 (Alert rules exercised)
-
-**Spec requirement (DoD gate 11):** Operational dashboards/runbooks exercised.
-
-**Deviation:** Dashboard, 8 alert rules and `RUNBOOK.md` exist, and every metric they reference is emitted. **"Exercised" means run against a live system during an incident or a game day.** That has not happened. The alert expressions are unproven against real data.
-
-**Status:** 🧭 Decision — tracked as D2-5.F25 in the tracker. Requires full compose stack and a game day.
-
-**Reference:** DoD gate 11; tracker D2-5.F25; RUNBOOK.md.
-
----
-
-## 4. SoD jurisdiction check live (jurisdiction-rules-svc)
-
-**Spec requirement (spec §9):** Separation of Duties rules scoped to a jurisdiction require the jurisdiction-rules-svc to resolve the jurisdiction's active flag.
-
-**Deviation:** The SoD jurisdiction check returns 503 on local stack when jurisdiction-rules-svc is not running. Gate 4 is met in code, not exercised. `JURISDICTION_SERVICE_URL` is required in staging/production; the service refuses to start without it.
-
-**Status:** 🧭 Decision — tracked as D2-5.F26 in the tracker. Requires jurisdiction-rules-svc running.
-
-**Reference:** Spec §9; tracker D2-5.F26; RUNBOOK.md §5.1.
-
----
-
-## 5. Production mTLS enforcement (AUTHZ_EVALUATION_MTLS=require)
-
-**Spec requirement (IAM / AuthZ §13):** mTLS enforced on evaluation endpoints when `AUTHZ_EVALUATION_MTLS=require`.
-
-**Deviation:** The flag is implemented and tested, but `AUTHZ_EVALUATION_MTLS=require` not exercised in local stack (requires mtls-management-svc enrolment). The service works without mTLS in development/staging (flag defaults to `off`).
-
-**Status:** ⏳ Pending — tracked as D2-5.F27 in the tracker. Requires mtls-management-svc enrolment.
-
-**Reference:** IAM / AuthZ §13; tracker D2-5.F27; RUNBOOK.md §11.
-
----
-
-## 6. Identity assertion enforcement (AUTHZ_IDENTITY_ASSERTION=require)
-
-**Spec requirement (IAM / AuthZ §12):** Admin routes require a verified identity envelope with `mfa_verified` and recent `auth_time`.
-
-**Deviation:** The middleware is implemented and tested, but `AUTHZ_IDENTITY_ASSERTION=require` not exercised in local stack (requires identity-context-svc with `IDP_CLIENT_AUTH=required`). The service works without it in development (flag defaults to `off`).
-
-**Status:** ⏳ Pending — tracked as D2-5.F28 in the tracker. Requires identity-context-svc with client auth.
-
-**Reference:** IAM / AuthZ §12; tracker D2-5.F28; RUNBOOK.md §2.
-
----
-
-## 7. IAM-8 SLOs (Load and revocation)
-
-**Spec requirement (IAM-8 / SLO-1, SLO-2):** Load SLO (P99 ≤ target ms) and revocation SLO (≤ 30s).
-
-**Deviation:** The SLO definitions exist but have not been measured end-to-end. The load profile in `RUNBOOK.md` §13 measures them but has not been run. Revocation SLO requires the full chain: identity-context-svc revocation → authorization-svc cache invalidation → next evaluate = DENY.
-
-**Status:** 🧭 Decision — tracked as D2-5.F29 in the tracker. Shared with identity-context-svc; requires full stack.
-
-**Reference:** IAM-8; tracker D2-5.F29; RUNBOOK.md §13.
-
----
-
-## 8. Federation and SCIM (INT-10, AU-07/AU-08)
-
-**Spec requirement:** Federation and SCIM routes available when `FEDERATION_ENABLED=true`.
-
-**Deviation:** Off unless the operator turns it on. With `FEDERATION_ENABLED=false` (the default) none of the `/v1/federation/*` or `/scim/v2/*` routes are mounted (404), and the console's Federation tab says so. This is a deliberate default, not a gap.
-
-**Status:** Documented — tracked as D2-5.F30 in the tracker.
-
-**Reference:** RUNBOOK.md §15; Spec INT-10.
-
----
-
-## 9. IAM-11 aliases cross-service rollout
-
-**Spec requirement (IAM-11):** Canonical grant satisfies legacy check, legacy grant satisfies canonical check.
-
-**Deviation:** The `alias_for` column is added to `permission_definitions` and the Lookup resolves canonical↔legacy. However, the rollout mode is controlled by `IDENTITY_ACCEPT_LEGACY_AUDIENCE=true` kept in compose/k8s for all services. Strict mode (audience validation enforced) is blocked on S5-B2 (console routing). The access-control permission taxonomy is registered and the aliases are populated in migration 000048.
-
-**Status:** 🟡 Partial — tracked as D2-5.F31 in the tracker. Cross-team coordination needed.
-
-**Reference:** IAM-11; tracker D2-5.F31; migration 000048.
-
----
-
-## 10. Commercial-account-svc live dependency
-
-**Spec requirement:** `X-Commercial-Plan` / `X-Org-Unit-Id` edge-set headers require commercial-account-svc to be running.
-
-**Deviation:** The gateway's commercial client is implemented and tested (unit tests pass), but the live half is blocked because commercial-account-svc does not run locally. Compose does not include it in the default stack.
-
-**Status:** 🟡 Partial — tracked as D2-5.F32 in the tracker.
-
-**Reference:** AUTH-PLANE plan GW-3, S3-D1; tracker D2-5.F32.
-
----
-
-## 11. Document upload in E2E (document-vault-svc)
-
-**Spec requirement:** Document uploads in E2E tests require document-vault-svc.
-
-**Deviation:** Document upload in E2E is skipped because document-vault-svc needs clamd in compose. The store and handler suites cover the functionality.
-
-**Status:** ⛔ Blocked — tracked as D2-5.F33 in the tracker. Requires clamd in compose.
-
-**Reference:** ER-W4; tracker D2-5.F33.
-
----
-
-## 12. Caller gates (cross-team)
-
-**Spec requirement:** Caller services must enforce their own gates (GL, financial-close, vat-gst, corporate-tax).
-
-**Deviation:** These are cross-team dependencies. Authorization-svc provides the evaluation engine; the callers must wire it up. Not a gap in this service.
-
-**Status:** 🟡 Partial — tracked as D2-5.F34 in the tracker. Cross-team.
-
-**Reference:** AUTH-PLANE plan caller gates; tracker D2-5.F34.
-
----
-
-## 13. Full envelope from callers (cross-team)
-
-**Spec requirement:** Callers must present the full identity envelope (not just principal_id).
-
-**Deviation:** Cross-team dependency. Authorization-svc accepts the envelope; the callers must send it. Not a gap in this service.
-
-**Status:** 🟡 Partial — tracked as D2-5.F35 in the tracker. Cross-team.
-
-**Reference:** AUTH-PLANE plan envelope; tracker D2-5.F35.
-
----
-
-## 14. Production mTLS to authorization-svc
-
-**Spec requirement:** Production mTLS from callers to authorization-svc.
-
-**Deviation:** `AUTHZ_MTLS_ENABLED=true` not exercised in local stack. Requires mtls-management-svc enrolment and Traefik serversTransport configuration.
-
-**Status:** ⏳ Pending — tracked as D2-5.F36 in the tracker. Infrastructure blocked.
-
-**Reference:** M-01 / S4-B1; tracker D2-5.F36.
-
----
-
-## Summary
-
-| Deviation | Spec Ref | Tracker | Status |
+## Deliberate deviations
+
+| # | Spec | What the spec says | What this service does | Why / status |
+|---|---|---|---|---|
+| 1 | ZS-IAM-001 §21 | `POST /v1/iam/access-assignments`, `…:revoke`, `GET /v1/iam/access-reviews` | Served by **access-control-svc** (governed request workflow + access reviews), which provisions into this service's `/v1/admin/role-assignments`. | Ownership decided 13 Oct (N-03/N-10). Not a gap. |
+| 2 | ZS-IAM-001 §21 | `POST /v1/iam/delegations`, `…/{id}:revoke` | Served here since 10 Nov as aliases of `/v1/admin/delegated-authorities` (same handler; colon and slash forms). | Closed (D2-5.F19 delegation half). |
+| 3 | ZS-IAM-001 §17 / §29 | Federation, SSO, SCIM | Not in this service: identity-context-svc (SCIM, federation) and access-control-svc (role eligibility). | Ownership. |
+| 4 | ZS-IAM-001 §12, §27 A09 | Deterministic FX basis for limit comparisons | Reference-rate table, operator-set with `AUTHZ_FX_REFERENCE_RATES` (default GBP-based table); each converted decision records `FX_BASIS:REFERENCE_RATES:<from>/<to>` and `FX_RATE:<r>`. No live FX source is wired. | §31 lists the authoritative FX basis as a pre-production decision. |
+| 5 | ZS-IAM-001 §10.2, §12 | Quorum, cooling window, related party, fact-hash revalidation, resource state | Judged from attributes the PEP supplies (`approved_by`, `required_approvals`, `supplier_bank_changed_by`, `approved_fact_hash`, `status`, …), not from approval or resource records held here. Fails closed where a fact is half-supplied (approved hash without current hash; amount without currency against a limit). | This service holds no workflow or business-object state; the owning services do. Callers must send the facts. |
+| 6 | API-4 | Cursor paging on every list | Opt-in (`page_size` / `cursor`) on all 15 admin lists; role assignments page in SQL (keyset), the other registers in memory over the store's tenant read (capped at 500 rows, flagged `truncated`). `/v1/access-decisions` pages in SQL. | Registers are tenant-bounded; unpaged callers keep their array. |
+| 7 | ZS-IAM-001 §19 | Short TTL, version-aware cache | 5 s TTL plus a database watermark in every key (1 s refresh, bypass after 3 s). | Met; noted because the TTL alone is not the staleness bound. |
+
+## Enforcement switches held lax in local compose
+
+Each was proven in strict mode on the local stack on 10 Nov 2026 and is the
+code default outside `ENV=local`; compose keeps the lax value so callers that
+have not migrated keep working.
+
+| Switch | Compose | Default outside local | Waiting on |
 |---|---|---|---|
-| Gate 1 cross-version compat | DoD gate 1 | D2-5.F23 | 🧭 Decision |
-| Gate 9 end-to-end load | DoD gate 9 | D2-5.F24 | 🧭 Decision |
-| Gate 11 alerts exercised | DoD gate 11 | D2-5.F25 | 🧭 Decision |
-| SoD jurisdiction live | Spec §9 | D2-5.F26 | 🧭 Decision |
-| Production mTLS enforcement | IAM §13 | D2-5.F27 | ⏳ Pending |
-| Identity assertion enforcement | IAM §12 | D2-5.F28 | ⏳ Pending |
-| IAM-8 SLOs | IAM-8 | D2-5.F29 | 🧭 Decision |
-| Federation/SCIM default off | INT-10 | D2-5.F30 | Documented |
-| IAM-11 aliases rollout | IAM-11 | D2-5.F31 | 🟡 Partial |
-| Commercial-account-svc live | GW-3, S3-D1 | D2-5.F32 | 🟡 Partial |
-| Document upload in E2E | ER-W4 | D2-5.F33 | ⛔ Blocked |
-| Caller gates | caller gates | D2-5.F34 | 🟡 Partial |
-| Full envelope from callers | envelope | D2-5.F35 | 🟡 Partial |
-| Production mTLS to authz | M-01, S4-B1 | D2-5.F36 | ⏳ Pending |
+| `AUTHZ_IDENTITY_ASSERTION` | `warn` | `require` | every console/admin caller forwarding the envelope (F-1) |
+| `AUTHZ_EVALUATION_MTLS` | `permit` | `require` | every PEP holding a client certificate (M-02) |
+| `AUTHZ_STEP_UP_UNKNOWN_AGE` | `permit` | `step_up` | PEPs forwarding `X-Authn-Age-Seconds` (X-3) |
+| `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE` | `false` | `false` | tenantless callers sending `X-Tenant-Id` (X-1) |
 
----
+## Not verified (verification, not implementation)
 
-**Next review:** After AZ-5 completes (live audit, RELEASE_CERTIFICATE re-certification).
+| Item | State |
+|---|---|
+| Cross-version contract compatibility | Needs GOV-08's schema registry; the contracts are checked against this build only (`TestOpenAPI_MatchesTheRouter`, `internal/events/contract_test.go`). |
+| Alert rules exercised in an incident / game day | Rules are valid (`promtool`) and every metric they read is emitted; none has fired against production data. |
+| Production SLO | Load and revocation were measured on the local single-replica stack (RUNBOOK §11), not a production class. |
+| Break-glass / JIT approval with real TOTP step-up | Covered by unit tests and the 14 Oct live run; the 10 Nov persona run proves only the refusals (no step-up, over-long). |
+| siem-integration-svc and Jaeger edges | Not started in the 10 Nov run (Docker VM memory); `e2e-authorization-deps.py` 28/32 with those four checks unrun. |
+
+## Cross-team items this service cannot close
+
+- Callers' own gates (GL, financial close, VAT, corporate tax) and full envelopes
+  from callers (D2-5.F34/F35).
+- access-control-svc's permission aliases (its 000048): the 7 Nov file could not
+  apply on any database; rewritten 10 Nov to apply idempotently, and its
+  `PermissionCatalogue.Lookup` alias read has its own defect (the canonical
+  lookup's query has no table alias, so it never resolves) — recorded for
+  access-control-svc.

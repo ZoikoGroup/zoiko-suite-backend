@@ -180,3 +180,54 @@ func TestAuthzAdmin_CommandFieldsAndPendingAnswer(t *testing.T) {
 		t.Errorf("pending answer: want ErrAuthzApprovalPending with the id, got %q %v", id, err)
 	}
 }
+
+// authorization-svc requires If-Match on commands against existing aggregates
+// (API-3; assignments since AZ-1, 10 Nov 2026). This client holds none of its
+// versions and sends the explicit unconditional "*" on exactly those commands —
+// never on a create, where it would mean nothing.
+func TestAuthzAdmin_CommandsSendIfMatchStar(t *testing.T) {
+	ifMatch := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ifMatch[r.Method+" "+r.URL.Path] = r.Header.Get("If-Match")
+		switch {
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[{"permission_bundle_id":"b-1","role_id":"r-1","bundle_code":"AP","active_flag":true}]`))
+		case r.URL.Path == "/v1/admin/role-assignments":
+			_, _ = w.Write([]byte(`{"principal_role_assignment_id":"a-1","approval_status":"APPROVED"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	c := NewAuthzAdminClient(srv.URL)
+	s := Scope{PrincipalID: "p", TenantID: "t", LegalEntityID: "le", CorrelationID: "c"}
+	ctx := context.Background()
+	if err := c.SetRoleActive(ctx, "r-1", false, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPermissionBundleActive(ctx, "r-1", "AP", false, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RevokeRoleAssignment(ctx, "a-1", s); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ScheduleRoleAssignmentEnd(ctx, "a-2", time.Now().Add(time.Hour), s); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CreateRole(ctx, "r-2", "CODE", "Name", "TENANT", s); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{
+		"POST /v1/admin/roles/r-1/retire",
+		"POST /v1/admin/permission-bundles/b-1/retire",
+		"POST /v1/admin/role-assignments/a-1/revoke",
+		"POST /v1/admin/role-assignments/a-2/revoke",
+	} {
+		if ifMatch[k] != "*" {
+			t.Errorf("%s: If-Match = %q, want *", k, ifMatch[k])
+		}
+	}
+	if v := ifMatch["POST /v1/admin/roles"]; v != "" {
+		t.Errorf("create sent If-Match %q, want none", v)
+	}
+}

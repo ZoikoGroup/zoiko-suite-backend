@@ -78,7 +78,9 @@ func TestEnvelopeRefusal_AdmittedReadPassesThrough(t *testing.T) {
 	req.Header.Set("X-Principal-Id", testPrincipal)
 	w := httptest.NewRecorder()
 	envelopedRouter().ServeHTTP(w, req)
-	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/json" || strings.TrimSpace(w.Body.String()) != "[]" {
-		t.Fatalf("expected the read's own 200 [], got %d %s — %s", w.Code, w.Header().Get("Content-Type"), w.Body.String())
+	// New response format: {"records":[],"next_cursor":"","total_count":0}
+	expected := `{"records":[],"next_cursor":"","total_count":0}`
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/json" || strings.TrimSpace(w.Body.String()) != expected {
+		t.Fatalf("expected the read's own 200 %s, got %d %s — %s", expected, w.Code, w.Header().Get("Content-Type"), w.Body.String())
 	}
 }

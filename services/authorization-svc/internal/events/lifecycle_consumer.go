@@ -127,6 +127,8 @@ type LifecycleProjector interface {
 type LifecycleConsumer struct {
 	log   *zap.Logger
 	store LifecycleProjector
+	// observer is the projection telemetry; nil records nothing.
+	observer ProjectionObserver
 
 	// seen is the same in-process event-id set Consumer carries, for the same
 	// reason: the writes are idempotent (an upsert keyed on
@@ -378,6 +380,7 @@ func (c *LifecycleConsumer) Run(ctx context.Context, reader *kafka.Reader) {
 			c.log.Info("lifecycle consumer stopping with an unapplied message — not committed, so it is redelivered")
 			return
 		}
+		observeApplied(c.observer, ObserverLifecycle, msg.Value, c.interesting, time.Now())
 		if err := reader.CommitMessages(ctx, msg); err != nil {
 			c.log.Error("failed to commit offset", zap.Error(err))
 		}

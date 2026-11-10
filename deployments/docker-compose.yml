@@ -697,14 +697,19 @@ services:
       MFA_RECENT_AUTH_SECONDS: "900"
       # ── OIDC provider and login throttling (wired 19 Oct 2026, F-5) ─────────
       # The provider is mounted at /.well-known/openid-configuration and
-      # /oauth2/*. The local registry holds one public loopback client for
-      # trying the code flow by hand; the console is registered here when it
-      # moves from /v1/authenticate to /oauth2/authorize.
+      # /oauth2/*. The local registry holds a public loopback client for
+      # trying the code flow by hand, and the console ("zoiko-console",
+      # confidential, same local secret as IDP_CLIENT_SECRETS_FILE). The
+      # console signs in through /oauth2/authorize with offline_access and
+      # renews its 300 s envelope with the refresh token (AU-10); before that
+      # it used /v1/authenticate, which has no refresh, and every session
+      # failed 401 identity_assertion_invalid five minutes after sign-in.
       OIDC_ISSUER: "http://localhost:8080"
       OIDC_CLIENTS_FILE: "/idp-clients/oidc-clients.json"
-      # The console still logs in through POST /v1/authenticate, so it stays
-      # open locally. The default is "internal" (mTLS platform tooling only),
-      # and config.Load refuses "open" in staging and production (IAM §18).
+      # Still open locally: the console falls back to POST /v1/authenticate
+      # when OIDC sign-in is not configured, and the E2E scripts use it. The
+      # default is "internal" (mTLS platform tooling only), and config.Load
+      # refuses "open" in staging and production (IAM §18).
       AUTHENTICATE_ENDPOINT: "open"
       # Source-level login throttling (AU-04): per-IP attempt rate and failure
       # budgets, per-tenant failure budget, in Redis.

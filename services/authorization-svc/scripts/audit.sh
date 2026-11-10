@@ -1,197 +1,131 @@
 #!/usr/bin/env bash
-# Audit test — authorization-svc (IAM / AuthZ) only.
+# Audit — authorization-svc (IAM / AuthZ), against the code and a live local stack.
+#
+#   B=http://127.0.0.1:8089 bash services/authorization-svc/scripts/audit.sh
+#
+# Needs: go on PATH (build/vet), Docker (the test suites run in a throwaway
+# golang container because Windows Application Control blocks host test
+# binaries; promtool runs from prom/prometheus), the compose stack with
+# authorization-svc up (deployments/scripts/e2e-authorization-scenarios.py
+# --seed-only run once), and zoiko-postgres for the database checks.
+# Set SKIP_SUITES=1 to skip sections 2-3 (the slow ones).
+set -u
 SVC="${SVC:-$(cd "$(dirname "$0")/.." && pwd)}"
-B=${B:-http://localhost:8089}
+ROOT="$(cd "$SVC/../.." && pwd)"
+B=${B:-http://127.0.0.1:8089}
 TEN=11111111-1111-1111-1111-111111111111
-PRIN=33333333-3333-3333-3333-333333333333
 ENT=22222222-2222-2222-2222-222222222222
-# Idempotency keys are recorded for days: a fixed key replayed by the next run
-# with a different body is a 409 IDEMPOTENCY_MISMATCH, so every run uses its own.
-RUN=$(date +%s)$$
-PROM=${PROM:-http://127.0.0.1:9090}
-# The break-glass approver: never the caller (PRIN) nor the grantee (SUP) — S1-1.
-APPR=55555555-5555-5555-5555-555555555555
-H=(-H "Content-Type: application/json" -H "X-Tenant-Id: $TEN" -H "X-Principal-Id: $PRIN" -H "X-Legal-Entity-Id: $ENT" -H "X-Source-Channel: api")
+ADMIN=33333333-3333-3333-3333-333333333333
+CHECKER=a1000000-0000-4000-8000-000000000001
+PY=${PY:-python}
+MODCACHE=${MODCACHE:-$(go env GOMODCACHE 2>/dev/null)}
 PASS=0; FAIL=0
-ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
-bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
-chk()  { if [ "$2" = "$3" ]; then ok "$1 ($3)"; else bad "$1 (got $2, want $3)"; fi; }
-
-code() { curl -s -m 25 -o /dev/null -w '%{http_code}' "$@"; }
+ok()  { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
+bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
+chk() { if [ "$2" = "$3" ]; then ok "$1 ($3)"; else bad "$1 (got $2, want $3)"; fi; }
+hdr() { # principal [write]
+  local id; id=$(date +%s%N)$RANDOM
+  H=(-H "Content-Type: application/json" -H "X-Tenant-Id: $TEN" -H "X-Principal-Id: $1" -H "X-Legal-Entity-Id: $ENT"
+     -H "X-Correlation-ID: audit-$id" -H "X-Request-Id: audit-$id" -H "X-Source-Channel: api")
+  [ "${2:-}" = w ] && H+=(-H "Idempotency-Key: audit-$id")
+  return 0
+}
+code() { curl -s -m 20 -o /dev/null -w '%{http_code}' "$@"; }
+body() { curl -s -m 20 "$@"; }
+gotest() { # args...: run go test in a throwaway container
+  MSYS_NO_PATHCONV=1 docker run --rm --memory=1400m -e GOFLAGS=-mod=mod -e GOPROXY=off -e CGO_ENABLED=0 \
+    -e "AUTHZ_IT_DSN=${AUTHZ_IT_DSN:-}" -e "TEST_DATABASE_URL=${TEST_DATABASE_URL:-}" -e "REQUIRE_DB_TESTS=${REQUIRE_DB_TESTS:-}" \
+    -v "$(cd "$SVC/.." && pwd -W 2>/dev/null || cd "$SVC/.." && pwd):/src" -v "$MODCACHE:/go/pkg/mod" \
+    -w /src/authorization-svc golang:1.26-alpine go test "$@"
+}
 
 echo "==================================================================="
-echo " AUDIT — authorization-svc (IAM / AuthZ)"
-echo " $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo " AUDIT — authorization-svc (IAM / AuthZ)   $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "==================================================================="
 
-echo
-echo "-- 1. Static analysis ---------------------------------------------"
+echo; echo "-- 1. Static analysis --------------------------------------------"
 cd "$SVC" || exit 1
-if [ -z "$(go build ./... 2>&1)" ]; then ok "go build ./... clean"; else bad "go build"; fi
-if [ -z "$(go vet ./... 2>&1)" ]; then ok "go vet ./... clean"; else bad "go vet"; fi
+if [ -z "$(go build ./... 2>&1)" ]; then ok "go build ./..."; else bad "go build ./..."; fi
+if [ -z "$(go vet ./... 2>&1)" ]; then ok "go vet ./..."; else bad "go vet ./..."; fi
 
-echo
-echo "-- 2. Test suite ---------------------------------------------------"
-for i in 1 2 3 4 5; do
-  OUT=$(go test -count=1 ./... 2>&1)
-  echo "$OUT" | grep -q "Application Control" && continue
-  break
+if [ "${SKIP_SUITES:-}" != 1 ]; then
+  echo; echo "-- 2. Unit suites (container) -------------------------------------"
+  OUT=$(gotest -p 2 -count=1 ./... 2>&1)
+  chk "packages failing" "$(echo "$OUT" | grep -cE '^(FAIL|--- FAIL)')" "0"
+  echo "        packages passing: $(echo "$OUT" | grep -cE '^ok ')"
+
+  echo; echo "-- 3. Store integration vs Postgres 16 (NOBYPASSRLS + owner) -------"
+  export AUTHZ_IT_DSN=${AUTHZ_IT_DSN:-postgres://app_authorization:postgres@host.docker.internal:5432/authorization_it?sslmode=disable}
+  export TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgres://postgres:postgres@host.docker.internal:5432/authorization_test?sslmode=disable}
+  export REQUIRE_DB_TESTS=1
+  SOUT=$(gotest -count=1 -p 1 -v ./internal/store/ ./internal/idempotency/ 2>&1)
+  chk "integration tests failing" "$(echo "$SOUT" | grep -cE -- '--- FAIL')" "0"
+  echo "        passing: $(echo "$SOUT" | grep -cE -- '--- PASS')   skipped (by design): $(echo "$SOUT" | grep -cE -- '--- SKIP')"
+fi
+
+echo; echo "-- 4. Live service ------------------------------------------------"
+chk "GET /healthz" "$(code $B/healthz)" "200"
+chk "GET /readyz" "$(code $B/readyz)" "200"
+
+echo; echo "-- 5. Contract surface (openapi.yaml: 86 paths, 101 operations) ----"
+# Every documented GET without a path parameter answers 200 for the admin.
+for p in /v1/admin/roles /v1/admin/role-assignments /v1/admin/delegated-authorities /v1/iam/delegations \
+         /v1/admin/sod-rules /v1/admin/sod-exceptions /v1/admin/abac-rules /v1/admin/authority-limits \
+         /v1/admin/workload-bindings /v1/admin/privileged-sessions /admin/v1/privileged-sessions \
+         /v1/admin/break-glass-sessions /admin/v1/break-glass-sessions /v1/support/sessions \
+         /v1/access-decisions "/v1/sod/conflicting-permissions?action_type=zt.payment.prepare" \
+         "/v1/me/capabilities?legal_entity_id=$ENT"; do
+  hdr $ADMIN; chk "GET $p" "$(code "${H[@]}" "$B$p")" "200"
 done
-PKG_OK=$(echo "$OUT" | grep -cE '^ok ')
-PKG_FAIL=$(echo "$OUT" | grep -cE '^FAIL')
-chk "packages failing" "$PKG_FAIL" "0"
-echo "        packages passing: $PKG_OK"
+hdr $ADMIN; chk "POST /v1/authorize answers" "$(code -X POST "${H[@]}" $B/v1/authorize \
+  -d "{\"principal_id\":\"$ADMIN\",\"legal_entity_id\":\"$ENT\",\"action_type\":\"iam.role.read\",\"tenant_id\":\"$TEN\"}")" "200"
 
-echo
-echo "-- 3. Store integration vs real Postgres 16 ------------------------"
-docker exec zoiko-postgres psql -U postgres -c "DROP DATABASE IF EXISTS authz_audit_scratch;" >/dev/null 2>&1
-docker exec zoiko-postgres psql -U postgres -c "CREATE DATABASE authz_audit_scratch;" >/dev/null 2>&1
-SOUT=$(TEST_DATABASE_URL="postgres://postgres:postgres@localhost:5432/authz_audit_scratch?sslmode=disable" go test -count=1 -v ./internal/store/ 2>&1)
-SP=$(echo "$SOUT" | grep -cE '^--- PASS|^    --- PASS')
-SF=$(echo "$SOUT" | grep -cE '^--- FAIL|^    --- FAIL')
-SS=$(echo "$SOUT" | grep -cE '^--- SKIP')
-chk "store tests failing" "$SF" "0"
-chk "store tests skipped" "$SS" "0"
-echo "        store tests passing: $SP"
+echo; echo "-- 6. Negative paths ----------------------------------------------"
+hdr $ADMIN w
+A=$(body "${H[@]}" "$B/v1/admin/role-assignments?principal_id=$CHECKER" | $PY -c "import sys,json;r=json.load(sys.stdin);print(r[0]['principal_role_assignment_id'] if r else '')" 2>/dev/null)
+if [ -n "$A" ]; then
+  hdr $ADMIN w; chk "assignment revoke without If-Match is 428 (AZ-1)" "$(code -X POST "${H[@]}" "$B/v1/admin/role-assignments/$A/revoke" -d '{"reason_code":"AUDIT"}')" "428"
+  hdr $ADMIN w; chk "assignment revoke with a stale If-Match is 412" "$(code -X POST "${H[@]}" -H 'If-Match: "v99999"' "$B/v1/admin/role-assignments/$A/revoke" -d '{"reason_code":"AUDIT"}')" "412"
+else bad "a checker assignment to probe (run e2e-authorization-scenarios.py --seed-only)"; fi
+hdr $ADMIN w; chk "binding deactivate without If-Match is 428 (AZ-1)" "$(code -X POST "${H[@]}" "$B/v1/admin/workload-bindings/zt-invoice-batch-worker/deactivate" -d '{"reason_code":"AUDIT"}')" "428"
+hdr $ADMIN w; chk "ABAC rule with an unknown operator is 400" "$(code -X POST "${H[@]}" $B/v1/admin/abac-rules \
+  -d "{\"rule_code\":\"AUDIT_X\",\"action_type\":\"zt.x\",\"effect\":\"FORBID\",\"attribute_key\":\"k\",\"operator\":\"approximately\",\"attribute_value\":\"1\",\"tenant_id\":\"$TEN\",\"reason_code\":\"AUDIT\"}")" "400"
+hdr $ADMIN; chk "cross-tenant entity on /v1/authorize is 403" "$(code -X POST "${H[@]}" $B/v1/authorize \
+  -d "{\"principal_id\":\"$ADMIN\",\"legal_entity_id\":\"$(cat /proc/sys/kernel/random/uuid 2>/dev/null || $PY -c 'import uuid;print(uuid.uuid4())')\",\"action_type\":\"iam.role.read\",\"tenant_id\":\"$TEN\"}")" "403"
+hdr $ADMIN; chk "forged paging cursor is 400 (API-4)" "$(code "${H[@]}" "$B/v1/admin/roles?cursor=forged")" "400"
+KEY="audit-idem-$(date +%s%N)"; RB="{\"tenant_id\":\"$TEN\",\"role_code\":\"AUDIT_$(date +%s)\",\"role_name\":\"audit\",\"role_scope_type\":\"TENANT\",\"created_by_principal_id\":\"$ADMIN\"}"
+hdr $ADMIN; R1=$(code -X POST "${H[@]}" -H "Idempotency-Key: $KEY" $B/v1/admin/roles -d "$RB")
+hdr $ADMIN; R2=$(curl -s -m 20 -o /dev/null -D - -X POST "${H[@]}" -H "Idempotency-Key: $KEY" $B/v1/admin/roles -d "$RB" | grep -ci '^X-Idempotent-Replay: true')
+hdr $ADMIN; R3=$(code -X POST "${H[@]}" -H "Idempotency-Key: $KEY" $B/v1/admin/roles -d "${RB/audit/different}")
+chk "idempotent create, replay, mismatch" "$R1/$R2/$R3" "201/1/409"
 
-echo
-echo "-- 4. Silent-skip guard -------------------------------------------"
-GOUT=$(REQUIRE_DB_TESTS=1 go test -count=1 ./internal/store/ 2>&1 | grep -c "claims to verify")
-if [ "$GOUT" -gt 0 ]; then ok "store suite fails loudly when REQUIRE_DB_TESTS is set ($GOUT tests)"; else bad "silent-skip guard"; fi
-
-echo
-echo "-- 5. Live service health ------------------------------------------"
-HJ=$(curl -s -m 20 $B/health)
-chk "GET /health" "$(code $B/health)" "200"
-for c in postgres outbox; do
-  if echo "$HJ" | grep -q "\"$c\":\"ok\""; then ok "health check: $c"; else bad "health check: $c"; fi
-done
-
-echo
-echo "-- 6. IAM contract surface (spec §6–§15) ---------------------------"
-# Admin routes require step-up (mfa_verified). We can't easily do that here,
-# so we just check the routes exist and are protected.
-for path in \
-  "/v1/admin/roles" \
-  "/v1/admin/assignments" \
-  "/v1/admin/bindings" \
-  "/v1/admin/sod-rules" \
-  "/v1/admin/abac-rules" \
-  "/v1/admin/access-decisions"; do
-  chk "admin route $path requires auth" "$(code -X GET $B$path "${H[@]}" -H 'X-Request-Id: ia1' -H 'X-Correlation-ID: ia1')" "401"
-done
-
-# The evaluation endpoint requires a valid envelope (identity assertion)
-chk "POST /v1/authorize requires auth" "$(code -X POST $B/v1/authorize "${H[@]}" -H 'X-Request-Id: ia2' -H 'X-Correlation-ID: ia2' -d '{"principal_id":"'"$PRIN"'","legal_entity_id":"'"$ENT"'","action_type":"payment.approve"}')" "401"
-
-# If-Match required on mutations
-KM=$(uuidgen)
-chk "POST /v1/assignments requires If-Match" "$(code -X POST $B/v1/assignments "${H[@]}" -H 'X-Request-Id: ia3' -H 'X-Correlation-ID: ia3' -d "{\"tenant_id\":\"$TEN\",\"principal_id\":\"$PRIN\",\"role_id\":\"role-1\",\"action_types\":[\"payment.approve\"],\"correlation_id\":\"$KM\"}')" "428"
-chk "POST /v1/bindings requires If-Match" "$(code -X POST $B/v1/bindings "${H[@]}" -H 'X-Request-Id: ia4' -H 'X-Correlation-ID: ia4' -d "{\"tenant_id\":\"$TEN\",\"role_id\":\"role-1\",\"principal_id\":\"$PRIN\",\"correlation_id\":\"$KM\"}')" "428"
-
-# Idempotency-Key required on mutations
-chk "POST /v1/assignments requires Idempotency-Key" "$(code -X POST $B/v1/assignments "${H[@]}" -H 'If-Match: *' -H 'X-Request-Id: ia5' -H 'X-Correlation-ID: ia5' -d "{\"tenant_id\":\"$TEN\",\"principal_id\":\"$PRIN\",\"role_id\":\"role-1\",\"action_types\":[\"payment.approve\"],\"correlation_id\":\"$KM\"}')" "428"
-
-# Cursor paging on lists
-s=$(code -X GET $B/v1/assignments "${H[@]}" -H 'X-Request-Id: ia6' -H 'X-Correlation-ID: ia6')
-# No auth = 401, but we check the route exists
-if [ "$s" = "401" ]; then ok "GET /v1/assignments exists (401 as expected)"; else bad "GET /v1/assignments (got $s)"; fi
-
-echo
-echo "-- 7. Negative-path acceptance (spec §6–§15) -----------------------"
-# NP1: Missing Idempotency-Key on mutation refused (428)
-KM=$(uuidgen)
-s=$(code -X POST $B/v1/assignments "${H[@]}" -H 'If-Match: *' -H 'X-Request-Id: np1' -H 'X-Correlation-ID: np1' -d "{\"tenant_id\":\"$TEN\",\"principal_id\":\"$PRIN\",\"role_id\":\"role-1\",\"action_types\":[\"payment.approve\"],\"correlation_id\":\"$KM\"}")
-chk "NP1 missing Idempotency-Key refused" "$s" "428"
-
-# NP2: Stale If-Match refused (412)
-s=$(code -X POST $B/v1/assignments "${H[@]}" -H 'If-Match: "stale-etag"' -H 'X-Request-Id: np2' -H "Idempotency-Key: np2-$RUN" -H 'X-Correlation-ID: np2' -d "{\"tenant_id\":\"$TEN\",\"principal_id\":\"$PRIN\",\"role_id\":\"role-1\",\"action_types\":[\"payment.approve\"],\"correlation_id\":\"$KM\"}")
-chk "NP2 stale If-Match refused" "$s" "412"
-
-# NP3: Delegated authority requires a real delegation row
-# Can't easily test without Kafka projection, but check the route exists
-s=$(code -X GET $B/v1/admin/delegations "${H[@]}" -H 'X-Request-Id: np3' -H 'X-Correlation-ID: np3')
-if [ "$s" = "401" ]; then ok "NP3 delegations route exists (401 as expected)"; else bad "NP3 delegations route (got $s)"; fi
-
-# NP4: SoD rule missing jurisdiction returns 503
-s=$(code -X POST $B/v1/admin/sod-rules "${H[@]}" -H 'X-Request-Id: np4' -H "Idempotency-Key: np4-$RUN" -H 'X-Correlation-ID: np4' -d "{\"domain_code\":\"E2E\",\"action_a\":\"E2E_A\",\"action_b\":\"E2E_B\",\"conflict_type\":\"STATIC_HIGH\",\"tenant_id\":\"$TEN\",\"jurisdiction_id\":\"00000000-0000-0000-0000-000000000000\",\"reason_code\":\"E2E_VERIFICATION\",\"purpose\":\"audit\"}")
-chk "NP4 unknown jurisdiction refused" "$s" "503"
-
-# NP5: ABAC rule with unknown operator refused at authoring (400)
-s=$(code -X POST $B/v1/admin/abac-rules "${H[@]}" -H 'X-Request-Id: np5' -H "Idempotency-Key: np5-$RUN" -H 'X-Correlation-ID: np5' -d "{\"tenant_id\":\"$TEN\",\"domain_code\":\"E2E\",\"action_types\":[\"payment.approve\"],\"effect\":\"FORBID\",\"operator\":\"UNKNOWN_OP\",\"value\":\"x\",\"correlation_id\":\"e2e\"}")
-chk "NP5 unknown ABAC operator refused" "$s" "400"
-
-echo
-echo "-- 8. IAM-11 aliases -----------------------------------------------"
-# Test that canonical grant satisfies legacy check and vice versa
-# This requires the access-control permission taxonomy to be registered
-# and the alias_for column populated. We just verify the route exists.
-s=$(code -X GET $B/v1/iam/permission-definitions "${H[@]}" -H 'X-Request-Id: iam1' -H 'X-Correlation-ID: iam1')
-if [ "$s" = "401" ]; then ok "GET /v1/iam/permission-definitions exists (401 as expected)"; else bad "GET /v1/iam/permission-definitions (got $s)"; fi
-
-echo
-echo "-- 9. Telemetry ----------------------------------------------------"
+echo; echo "-- 7. §26 telemetry ------------------------------------------------"
 M=$(curl -s -m 20 $B/metrics)
-IAMN=$(echo "$M" | grep -c '^authorization_')
-if [ "$IAMN" -ge 12 ]; then ok "IAM metric families emitted ($IAMN series)"; else bad "IAM metrics ($IAMN)"; fi
-for fam in authorization_evaluations_total authorization_cache authorization_sod_checks_total \
-           authorization_abac_evaluations_total authorization_delegated_evaluations_total \
-           authorization_outbox_pending authorization_siem_queue_drops_total \
-           authorization_outbox_dead_letter authorization_cache_invalidations_total \
-           authorization_watermark authorization_assignments_total authorization_bindings_total; do
-  if echo "$M" | grep -q "^$fam"; then ok "  $fam"; else bad "  $fam missing"; fi
+for fam in authorization_decisions_total authorization_decisions_by_action_total authorization_evaluation_seconds_bucket \
+           authorization_decision_record_failures_total authorization_cache_hits_total authorization_cache_misses_total \
+           authorization_cache_invalidations_total authorization_cache_entries authorization_watermark_age_seconds \
+           authorization_outbox_pending authorization_outbox_oldest_pending_seconds authorization_outbox_stuck \
+           authorization_sessions authorization_sessions_expiring_soon authorization_projection_lag_seconds_count; do
+  if echo "$M" | grep -q "^$fam"; then ok "$fam"; else bad "$fam missing"; fi
 done
-echo "$M" | grep -q '^authorization_cache_hits_total' && ok "  cache hits counter present" || bad "  cache hits counter missing"
-echo "$M" | grep -q '^authorization_cache_misses_total' && ok "  cache misses counter present" || bad "  cache misses counter missing"
 
-echo
-echo "-- 10. Alert rules (gate 11) ---------------------------------------"
-RULES=$(curl -s -m 20 "$PROM/api/v1/rules")
-NR=$(echo "$RULES" | python -c "
-import sys,json
-d=json.load(sys.stdin)
-n=sum(len(g['rules']) for g in d['data']['groups'] if 'iam' in g['name'] or 'authorization' in g['name'])
-print(n)" 2>/dev/null)
-NH=$(echo "$RULES" | python -c "
-import sys,json
-d=json.load(sys.stdin)
-n=sum(1 for g in d['data']['groups'] if ('iam' in g['name'] or 'authorization' in g['name']) for r in g['rules'] if r.get('health')=='ok')
-print(n)" 2>/dev/null)
-chk "IAM/authorization alert rules loaded" "$NR" "8"
-chk "alert rules evaluating (health ok)" "$NH" "8"
-UP=$(curl -s -m 20 --get "$PROM/api/v1/query" --data-urlencode 'query=up{job="authorization-svc"}' | python -c "
-import sys,json
-r=json.load(sys.stdin)['data']['result']
-print(r[0]['value'][1] if r else '0')" 2>/dev/null)
-chk "prometheus scraping the service" "$UP" "1"
+echo; echo "-- 8. Alert rules and dashboard -----------------------------------"
+R=$(MSYS_NO_PATHCONV=1 docker run --rm --entrypoint promtool -v "$(cd "$ROOT/deployments" && pwd -W 2>/dev/null || pwd):/d:ro" \
+    prom/prometheus:v2.55.1 check rules /d/prometheus-rules.yml 2>&1)
+if echo "$R" | grep -q SUCCESS; then ok "prometheus-rules.yml valid ($(echo "$R" | grep -oE '[0-9]+ rules'))"; else bad "promtool: $R"; fi
+chk "authorization-svc alert group" "$(grep -c '^      - alert: Authorization' "$ROOT/deployments/prometheus-rules.yml")" "8"
+if $PY -c "import json,sys;json.load(open(sys.argv[1],encoding='utf-8'))" "$ROOT/deployments/grafana/provisioning/dashboards/authorization-svc.json" 2>/dev/null; then
+  ok "grafana dashboard authorization-svc.json parses"; else bad "grafana dashboard"; fi
 
-echo
-echo "-- 11. Outbox drain ------------------------------------------------"
-PENDING=$(docker exec zoiko-postgres psql -U postgres -d authorization -tAc "select count(*) filter (where published_at is null) from event_outbox;" 2>/dev/null | tr -d '[:space:]')
-PUB=$(docker exec zoiko-postgres psql -U postgres -d authorization -tAc "select count(published_at) from event_outbox;" 2>/dev/null | tr -d '[:space:]')
-echo "        published=$PUB pending=$PENDING"
-if [ "${PENDING:-1}" -lt 100 ]; then ok "outbox at baseline"; else bad "outbox backlog $PENDING"; fi
+echo; echo "-- 9. Outbox drain -------------------------------------------------"
+P=$(docker exec zoiko-postgres psql -U postgres -d authorization_svc -tAc "select count(*) from outbox_events where published_at is null" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$P" ] && [ "$P" -lt 100 ]; then ok "outbox_events unpublished = $P"; else bad "outbox_events unpublished = ${P:-unreadable}"; fi
 
-echo
-echo "-- 12. Contract parity ---------------------------------------------"
-# OpenAPI parity test
-cd "$SVC"
-if [ -f internal/handler/openapi_parity_test.go ]; then
-  OUT=$(go test -count=1 ./internal/handler -run OpenAPI 2>&1)
-  if echo "$OUT" | grep -q "PASS"; then ok "OpenAPI parity test passes"; else bad "OpenAPI parity test fails"; fi
-else
-  echo "  SKIP  OpenAPI parity test not found"
+echo; echo "-- 10. Scenario suites ---------------------------------------------"
+if [ "${SKIP_E2E:-}" != 1 ]; then
+  S=$($PY "$ROOT/deployments/scripts/e2e-authorization-scenarios.py" 2>&1 | tail -1)
+  case "$S" in *passed) N=${S%%/*}; T=${S#*/}; T=${T%% *}; chk "persona scenarios ($S)" "$N" "$T";; *) bad "persona scenarios: $S";; esac
 fi
-
-# AsyncAPI parity test
-if [ -f internal/events/contract_test.go ]; then
-  OUT=$(go test -count=1 ./internal/events -run Contract 2>&1)
-  if echo "$OUT" | grep -q "PASS"; then ok "AsyncAPI parity test passes"; else bad "AsyncAPI parity test fails"; fi
-else
-  echo "  SKIP  AsyncAPI parity test not found"
-fi
-
-docker exec zoiko-postgres psql -U postgres -c "DROP DATABASE IF EXISTS authz_audit_scratch;" >/dev/null 2>&1
 
 echo
 echo "==================================================================="

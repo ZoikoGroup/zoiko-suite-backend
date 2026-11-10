@@ -35,9 +35,19 @@ until 7 Oct 2026 existed only in code. For the evaluation endpoints see
   `authz_config_history`. With `AUTHZ_COMMAND_CONTRACT=enforce` (the default) a
   missing reason is `400`; with `warn` it is admitted and marked
   `X-Command-Contract: violated`.
-- **Optimistic concurrency.** Commands marked **V** take an optional
-  `expected_version`; a stale one is `409 version_conflict`. Every role, bundle,
-  SoD and ABAC rule carries `version`.
+- **Optimistic concurrency (API-3).** Every command on an existing, versioned
+  aggregate — role, bundle, SoD and ABAC rule, authority limit, session, and
+  since 10 Nov 2026 (AZ-1) role assignment and workload binding — needs
+  `If-Match: "v<version>"` (or `expected_version` in the body): none is
+  `428 precondition_required`, a stale one `412`. `If-Match: *` is the explicit
+  unconditional form for machine callers that hold no version
+  (access-control-svc's revocations). Responses carry the new `ETag`.
+- **Paging (API-4).** Every admin list takes `page_size` (1–200, default 50)
+  and `cursor`; sending either returns `{"records": [...], "next_cursor": "..."}`
+  ordered by record id (`truncated: true` on the last page when the store's
+  500-row cap was reached). A cursor is bound to its query (path, tenant,
+  filters): replayed elsewhere it is `400 invalid_cursor`. Without either
+  parameter a list answers exactly as before.
 - **Events.** Every change below is announced through the transactional outbox
   on `zoiko.authorization.events` (ZS-IAM-001 §23 names): `iam.role.published`,
   `iam.assignment.granted` / `.revoked` / `.suspended` / `.resumed`, `iam.delegation.granted` / `.revoked`,
@@ -76,6 +86,7 @@ until 7 Oct 2026 existed only in code. For the evaluation endpoints see
 | `POST /v1/admin/delegated-authorities` | `iam.delegation.grant` | The delegator must be the caller; no self-delegation. `delegated_actions` may not name an `iam.*` or protected platform action (`400 protected_privilege_not_delegable`), and a full-authority delegation never confers them. `effective_to` is required under `enforce`; under `warn` it defaults to 90 days. `reason` (**R**) and `approval_reference` are recorded. |
 | `GET /v1/admin/delegated-authorities` | `iam.delegation.read` | |
 | `POST /v1/admin/delegated-authorities/{id}/revoke` | `iam.delegation.revoke` | **R**. Delegator only. |
+| `POST /v1/iam/delegations` · `GET /v1/iam/delegations` · `POST /v1/iam/delegations/{id}:revoke` (and `/revoke`) | as above | ZS-IAM-001 §21 names, aliases of the three routes above (10 Nov 2026): same handler, same checks, same responses. |
 
 ## Segregation of duties (GOV-04)
 
@@ -320,3 +331,20 @@ to the list.
   Unlike roles, bundles, rules and limits it is **not yet required** (no `428`): the console
   and access-control-svc's revocation call send none. Migration **000039** adds
   `workload_bindings.version`. Making it mandatory is a change to those two callers first.
+
+## Decision-time controls changed 10 Nov 2026
+
+- **Authority limits.** An amount with no `currency` against a currency-bearing
+  limit (or a capped delegation) is `DENY authority_limit:currency_required`
+  (`CURRENCY_REQUIRED`) — it used to be read as GBP. Conversions use the reference
+  table set by `AUTHZ_FX_REFERENCE_RATES` (`GBP=1,USD=0.78,...`; default the
+  built-in GBP table) and add `FX_BASIS:REFERENCE_RATES:<from>/<to>` and
+  `FX_RATE:<r>` to the decision's reason codes. Authoring a MONETARY limit accepts
+  exactly the configured currencies.
+- **Execution revalidation (A10).** With `execution_revalidation=true` or an
+  `approved_fact_hash`, both hashes are required: no current hash is
+  `DENY revalidation:current_fact_hash_missing` (`CURRENT_FACT_HASH_REQUIRED`),
+  no approved hash `DENY revalidation:approved_fact_hash_missing`.
+- **Telemetry (ZS-IAM-001 §26).** `/metrics` carries `authorization_decisions_total{decision,outcome,layer}`,
+  `authorization_evaluation_seconds`, cache, outbox, session, projection-lag and
+  SIEM-drop families — see RUNBOOK.md.

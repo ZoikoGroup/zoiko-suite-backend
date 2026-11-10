@@ -8,6 +8,7 @@
 package domain
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"time"
@@ -133,4 +134,55 @@ type ReplayManifest struct {
 	// are bookkeeping, not part of the manifest a caller reads.
 	IdempotencyKey string `json:"-"`
 	RequestHash    []byte `json:"-"`
+}
+
+// PaginationCursor is an opaque cursor for keyset pagination (API-4).
+// It encodes the sort key of the last item returned (decided_at DESC, decision_id DESC).
+// The cursor is base64.RawURLEncoding encoded JSON.
+type PaginationCursor struct {
+	DecidedAt  string `json:"decided_at"`   // RFC3339 timestamp
+	DecisionID string `json:"decision_id"`  // decision_id
+}
+
+// EncodePaginationCursor encodes a cursor for transport.
+func EncodePaginationCursor(c *PaginationCursor) (string, error) {
+	if c == nil {
+		return "", nil
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// DecodePaginationCursor decodes a cursor from transport.
+func DecodePaginationCursor(s string) (*PaginationCursor, error) {
+	if s == "" {
+		return nil, nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	var c PaginationCursor
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// ErrPackageNotFound is returned when a sealed package lookup finds no match.
+var ErrPackageNotFound = errors.New("evidence package not found")
+
+// EvidencePackage represents a sealed package (Merkle root snapshot) of the
+// evidence ledger for a tenant.
+type EvidencePackage struct {
+	PackageID     string    `json:"package_id"`
+	TenantID      string    `json:"tenant_id"`
+	MerkleRoot    string    `json:"merkle_root"` // hex-encoded
+	LeafCount     int64     `json:"leaf_count"`
+	LastDecisionID string   `json:"last_decision_id"`
+	SealedAt      time.Time `json:"sealed_at"`
+	SealedBy      string    `json:"sealed_by"`
 }

@@ -1016,13 +1016,24 @@ func (s *PgStore) QueryRoleAssignments(ctx context.Context, q domain.AssignmentQ
 		   AND a.effective_from <= NOW()
 		   AND (a.effective_to IS NULL OR a.effective_to > NOW())`
 	}
-	query += `
+	args := []any{q.TenantID, q.PrincipalID, q.RoleID, limit}
+	if q.Keyset {
+		// API-4: a total order on the primary key, resumed after the cursor.
+		query += `
+		   AND ($5 = '' OR a.principal_role_assignment_id::text > $5)
+		 ORDER BY a.principal_role_assignment_id::text
+		 LIMIT $4;`
+		args = append(args, q.AfterID)
+	} else {
+		query += `
 		 ORDER BY a.created_at DESC, a.principal_role_assignment_id
 		 LIMIT $4 OFFSET $5;`
+		args = append(args, offset)
+	}
 
 	var out []domain.PrincipalRoleAssignment
 	err := s.withRLS(ctx, q.TenantID, func(tx pgx.Tx) error {
-		rows, qErr := tx.Query(ctx, query, q.TenantID, q.PrincipalID, q.RoleID, limit, offset)
+		rows, qErr := tx.Query(ctx, query, args...)
 		if qErr != nil {
 			return qErr
 		}

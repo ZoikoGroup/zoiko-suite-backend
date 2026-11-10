@@ -74,6 +74,7 @@ func datesDo(t *testing.T, s *datedStore, method, path, body string) *httptest.R
 	req := httptest.NewRequest(method, path, rdr)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", datesTenant)
+	req.Header.Set("If-Match", "*") // required on assignment mutations (AZ-1)
 	w := httptest.NewRecorder()
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, &stubValidator{}, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", false, zap.NewNop()))

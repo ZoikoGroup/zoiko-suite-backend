@@ -146,6 +146,11 @@ func (h *Handler) ListSoDExceptions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, list, func(x domain.SoDException) string { return x.SoDExceptionID }, 500)
+		return
+	}
 	writeJSON(w, http.StatusOK, list)
 }
 

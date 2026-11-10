@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	"zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/authorization-svc/internal/domain"
 )
@@ -30,17 +29,11 @@ type assignmentHistoryReader interface {
 	FindRoleAssignmentsAsOf(ctx context.Context, tenantID, principalID string, asOf time.Time) ([]domain.PrincipalRoleAssignment, error)
 }
 
-// optionalExpectedVersion is expectedVersion for the aggregates whose callers
-// predate API-3 — role assignments and workload bindings. The console and
-// access-control-svc send no version on these yet, so none means
-// unconditional (0) instead of 428; one that is sent is honoured exactly as on
-// the other aggregates, and a stale one is refused.
-func optionalExpectedVersion(w http.ResponseWriter, r *http.Request, bodyVersion int64) (int64, bool) {
-	if _, _, present, _ := apicontract.IfMatchVersion(r); !present && bodyVersion == 0 {
-		return 0, true
-	}
-	return expectedVersion(w, r, bodyVersion)
-}
+// Role assignments and workload bindings were the last aggregates where
+// If-Match was optional (optionalExpectedVersion, 2 Nov). Since 10 Nov 2026
+// (AZ-1) they use expectedVersion like every other versioned aggregate: no
+// If-Match and no expected_version is 428; "If-Match: *" is the explicit
+// unconditional form.
 
 // assignmentForMutation reads the assignment a mutation acts on and checks
 // the caller's expected version against it. Writes the 404 / 412 / 503.

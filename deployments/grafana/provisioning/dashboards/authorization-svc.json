@@ -1,0 +1,388 @@
+{
+  "uid": "authorization-svc-iam",
+  "title": "authorization-svc (IAM / AuthZ)",
+  "tags": [
+    "tier-0",
+    "governance",
+    "iam",
+    "authorization"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "description": "ZS-IAM-001 §26 signals for the policy decision point: decision rates by deciding layer, pipeline latency, cache health, revocation (projection) lag, outbox health and privileged sessions. Golden signals for every service are on service-golden-signals.",
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Availability and decisions",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Up",
+      "description": "Tier 0: every material write on the platform asks this service first.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(up{job=\"authorization-svc\"})",
+          "legendFormat": "instances",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Decision record failures (1h)",
+      "description": "Decisions refused with 503 because the access_decision_log row could not be written. Must be 0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(authorization_decision_record_failures_total{service=\"authorization-svc\"}[1h]))",
+          "legendFormat": "failures",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Decisions per second by decision",
+      "description": "PERMIT / DENY / STEP_UP / REQUIRE_APPROVAL, as recorded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum by (decision) (rate(authorization_decisions_total{service=\"authorization-svc\"}[5m]))",
+          "legendFormat": "{{decision}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Denials by deciding layer",
+      "description": "Which layer of the pipeline refused: no_grant, sod, abac, authority_limit, workload, principal_status, ...",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "sum by (layer) (rate(authorization_decisions_total{service=\"authorization-svc\", decision!=\"PERMIT\"}[5m]))",
+          "legendFormat": "{{layer}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "title": "Top actions (1h)",
+      "description": "Decisions by protected action and decision.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "topk(15, sum by (action, decision) (increase(authorization_decisions_by_action_total{service=\"authorization-svc\"}[1h])))",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Latency and cache",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Pipeline time p50 / p95 / p99",
+      "description": "authorization_evaluation_seconds: the decision pipeline alone, without HTTP queueing or the decision write.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(authorization_evaluation_seconds_bucket{service=\"authorization-svc\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(authorization_evaluation_seconds_bucket{service=\"authorization-svc\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(authorization_evaluation_seconds_bucket{service=\"authorization-svc\"}[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache hit ratio",
+      "description": "Evaluation reads answered from the cache (watermark-keyed, never stale).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(authorization_cache_hits_total{service=\"authorization-svc\"}[5m])) / clamp_min(sum(rate(authorization_cache_hits_total{service=\"authorization-svc\"}[5m])) + sum(rate(authorization_cache_misses_total{service=\"authorization-svc\"}[5m])), 1e-9)",
+          "legendFormat": "hit ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Watermark age",
+      "description": "Past 3 s the cache is bypassed (every read goes to Postgres).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 18
+      },
+      "targets": [
+        {
+          "expr": "max(authorization_watermark_age_seconds{service=\"authorization-svc\"})",
+          "legendFormat": "age",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Revocation and events",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Projection lag p95 by consumer",
+      "description": "Upstream emitted_at to projected here: the PDP half of revocation lag (IAM-8 objective 30 s).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, consumer) (rate(authorization_projection_lag_seconds_bucket{service=\"authorization-svc\"}[10m])))",
+          "legendFormat": "{{consumer}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox",
+      "description": "Unpublished events, age of the oldest, and rows that failed 5+ publish attempts.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "targets": [
+        {
+          "expr": "max(authorization_outbox_pending{service=\"authorization-svc\"})",
+          "legendFormat": "pending",
+          "refId": "A"
+        },
+        {
+          "expr": "max(authorization_outbox_oldest_pending_seconds{service=\"authorization-svc\"})",
+          "legendFormat": "oldest (s)",
+          "refId": "B"
+        },
+        {
+          "expr": "max(authorization_outbox_stuck{service=\"authorization-svc\"})",
+          "legendFormat": "stuck",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Privileged access",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Sessions by kind and state",
+      "description": "JIT, break-glass and support sessions: ACTIVE and PENDING_APPROVAL.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "expr": "max by (kind, state) (authorization_sessions{service=\"authorization-svc\"})",
+          "legendFormat": "{{kind}} {{state}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Ending within 15 min",
+      "description": "ACTIVE sessions about to expire.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 36
+      },
+      "targets": [
+        {
+          "expr": "sum by (kind) (authorization_sessions_expiring_soon{service=\"authorization-svc\"})",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

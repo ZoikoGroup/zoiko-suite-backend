@@ -523,7 +523,7 @@ func nonEmpty(p *string) *string {
 // parse, a currency the conversion table knows (an unknown one would fail
 // every evaluation closed), and an order to the dates. A QUANTITY limit has
 // no currency and whole-number bounds. It writes the 400.
-func validateLimit(w http.ResponseWriter, req *authorityLimitRequest) (from time.Time, to *time.Time, ok bool) {
+func validateLimit(w http.ResponseWriter, req *authorityLimitRequest, rates map[string]float64) (from time.Time, to *time.Time, ok bool) {
 	fail := func(field, msg string) (time.Time, *time.Time, bool) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": field, "message": msg})
 		return time.Time{}, nil, false
@@ -538,8 +538,13 @@ func validateLimit(w http.ResponseWriter, req *authorityLimitRequest) (from time
 		if req.Currency == "" {
 			req.Currency = "GBP"
 		}
-		if _, known := StandardReferenceFXRates[req.Currency]; !known {
-			return fail("currency", "currency must be one the platform converts: GBP, USD, EUR, CAD, AUD, JPY or CHF")
+		if _, known := rates[req.Currency]; !known {
+			codes := make([]string, 0, len(rates))
+			for c := range rates {
+				codes = append(codes, c)
+			}
+			sort.Strings(codes)
+			return fail("currency", "currency must be one the platform converts: "+strings.Join(codes, ", "))
 		}
 	case domain.AuthorityLimitQuantity:
 		if req.Currency != "" {
@@ -613,6 +618,11 @@ func (h *Handler) ListAuthorityLimits(w http.ResponseWriter, r *http.Request) {
 			out = append(out, l)
 		}
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, out, func(x domain.AuthorityLimit) string { return x.AuthorityLimitID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"authority_limits": out})
 }
 
@@ -649,7 +659,7 @@ func (h *Handler) CreateAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	if !h.applyReason(w, &r, req.reason()) {
 		return
 	}
-	from, to, ok := validateLimit(w, &req)
+	from, to, ok := validateLimit(w, &req, h.fxReferenceRates())
 	if !ok {
 		return
 	}
@@ -745,7 +755,7 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	if req.EffectiveTo == "" && cur.EffectiveTo != nil {
 		req.EffectiveTo = cur.EffectiveTo.UTC().Format(time.RFC3339)
 	}
-	from, to, ok := validateLimit(w, &req)
+	from, to, ok := validateLimit(w, &req, h.fxReferenceRates())
 	if !ok {
 		return
 	}

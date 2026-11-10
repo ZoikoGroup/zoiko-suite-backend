@@ -114,6 +114,7 @@ func TestCacheWiring_SuspensionRoutesReachTheStore(t *testing.T) {
 		req := httptest.NewRequest(c.method, c.path, bytes.NewBufferString(c.body))
 		req.Header.Set("X-Principal-Id", "admin-1")
 		req.Header.Set("X-Tenant-Id", ownRoleTenant)
+		req.Header.Set("If-Match", "*") // required on assignment mutations (AZ-1)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {

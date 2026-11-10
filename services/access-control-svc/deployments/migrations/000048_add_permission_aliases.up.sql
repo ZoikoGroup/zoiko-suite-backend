@@ -1,717 +1,705 @@
--- Migration 000048: add alias_for column to permission_definitions for S9-D1 aliases.
+-- Migration 000048: alias_for on permission_definitions (S9-D1 / IAM-11 aliases).
 --
--- The permission taxonomy has two naming conventions:
---   TAXONOMY  (canonical, e.g. payment.release)
---   LEGACY    (legacy, e.g. PAYMENT_RELEASE)
+-- The permission taxonomy has two naming conventions, TAXONOMY (canonical,
+-- e.g. payment.release) and LEGACY (e.g. PAYMENT_RELEASE). Both are separate
+-- rows for the SAME capability. alias_for links a LEGACY row to its TAXONOMY
+-- name, so a grant of one is read as a grant of the other (pg_governance.go).
 --
--- Both are registered as separate rows, but they represent the SAME capability.
--- The alias_for column links a LEGACY entry to its TAXONOMY canonical name
--- (or vice versa), so that when a bundle grants one, the other is also
--- considered granted. This is the S9-D1 aliases feature: canonical grants
--- satisfy legacy checks, and legacy grants satisfy canonical checks.
+-- Rewritten 10 Nov 2026. The first version could not apply on any database:
+-- its FOREIGN KEY made each UPDATE naming a canonical row that is not
+-- registered (e.g. payment.initiate) fail the whole file, about half of its
+-- 696 statements ended in '.' instead of ';', and the constraint was added
+-- without IF NOT EXISTS, so a partial run could not be re-run. This version
+-- is idempotent: it links a pair only when BOTH rows exist, and links the
+-- rest automatically the day the missing row is registered and this file is
+-- re-applied by hand (or a later migration repeats the UPDATE).
 
 ALTER TABLE permission_definitions ADD COLUMN IF NOT EXISTS alias_for VARCHAR(200);
 
--- The alias must point to an existing permission_definition.
-ALTER TABLE permission_definitions ADD CONSTRAINT permission_definitions_alias_for_fk
-    FOREIGN KEY (alias_for) REFERENCES permission_definitions(action_name)
-    ON DELETE SET NULL;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'permission_definitions_alias_for_fk') THEN
+        ALTER TABLE permission_definitions ADD CONSTRAINT permission_definitions_alias_for_fk
+            FOREIGN KEY (alias_for) REFERENCES permission_definitions(action_name)
+            ON DELETE SET NULL;
+    END IF;
+END
+$$;
 
--- Populate alias_for for known canonical/legacy pairs.
--- Each pair should have the LEGACY entry point to the TAXONOMY entry.
-UPDATE permission_definitions SET alias_for = 'payment.release' WHERE action_name = 'PAYMENT_RELEASE';
-UPDATE permission_definitions SET alias_for = 'payment.initiate' WHERE action_name = 'PAYMENT_INITIATE';
-UPDATE permission_definitions SET alias_for = 'payment.approve' WHERE action_name = 'PAYMENT_APPROVE';
-UPDATE permission_definitions SET alias_for = 'journal.post' WHERE action_name = 'JOURNAL_POST';
-UPDATE permission_definitions SET alias_for = 'journal.reverse' WHERE action_name = 'JOURNAL_REVERSE';
-UPDATE permission_definitions SET alias_for = 'period.close' WHERE action_name = 'PERIOD_CLOSE';
-UPDATE permission_definitions SET alias_for = 'period.reopen' WHERE action_name = 'PERIOD_REOPEN';
-UPDATE permission_definitions SET alias_for = 'tax_return.file' WHERE action_name = 'TAX_RETURN_FILE';
-UPDATE permission_definitions SET alias_for = 'contract.execute' WHERE action_name = 'CONTRACT_EXECUTE';
-UPDATE permission_definitions SET alias_for = 'iam.assignment.grant' WHERE action_name = 'IAM_ASSIGNMENT_GRANT';
-UPDATE permission_definitions SET alias_for = 'iam.assignment.revoke' WHERE action_name = 'IAM_ASSIGNMENT_REVOKE';
-UPDATE permission_definitions SET alias_for = 'iam.role.manage' WHERE action_name = 'ROLE_MANAGE';
-UPDATE permission_definitions SET alias_for = 'iam.permission_bundle.manage' WHERE action_name = 'IAM_PERMISSION_BUNDLE_MANAGE';
-UPDATE permission_definitions SET alias_for = 'iam.sod_rule.manage' WHERE action_name = 'SOD_RULE_MANAGE_GLOBAL';
-UPDATE permission_definitions SET alias_for = 'iam.abac_rule.manage' WHERE action_name = 'ABAC_RULE_MANAGE_GLOBAL';
-UPDATE permission_definitions SET alias_for = 'iam.delegation.grant' WHERE action_name = 'DELEGATION_ADMINISTER';
-UPDATE permission_definitions SET alias_for = 'iam.delegation.revoke' WHERE action_name = 'DELEGATION_REVOKE';
-UPDATE permission_definitions SET alias_for = 'iam.pam.manage' WHERE action_name = 'IAM_PAM_MANAGE';
-UPDATE permission_definitions SET alias_for = 'iam.break_glass.manage' WHERE action_name = 'IAM_BREAK_GLASS_MANAGE';
-UPDATE permission_definitions SET alias_for = 'iam.support.manage' WHERE action_name = 'IAM_SUPPORT_MANAGE';
-UPDATE permission_definitions SET alias_for = 'supplier.bank_details.edit' WHERE action_name = 'SUPPLIER_BANK_DETAILS_EDIT';
-UPDATE permission_definitions SET alias_for = 'audit_evidence.export' WHERE action_name = 'AUDIT_EVIDENCE_EXPORT';
-UPDATE permission_definitions SET alias_for = 'customer_invoice.approve' WHERE action_name = 'COMMERCIAL_INVOICE_APPROVE';
-UPDATE permission_definitions SET alias_for = 'customer_invoice.issue' WHERE action_name = 'COMMERCIAL_INVOICE_ISSUE';
-UPDATE permission_definitions SET alias_for = 'supplier_invoice.approve' WHERE action_name = 'AP_INVOICE_APPROVE';
-UPDATE permission_definitions SET alias_for = 'supplier_invoice.match' WHERE action_name = 'BANKREC_MATCH';
-UPDATE permission_definitions SET alias_for = 'supplier_invoice.submit' WHERE action_name = 'AP_PAYMENT_REQUEST';
-UPDATE permission_definitions SET alias_for = 'gl.journal.post' WHERE action_name = 'GL_JOURNAL_POST';
-UPDATE permission_definitions SET alias_for = 'gl.journal.reverse' WHERE action_name = 'GL_JOURNAL_REVERSE';
-UPDATE permission_definitions SET alias_for = 'gl.posting.execute' WHERE action_name = 'GL_POSTING_EXECUTE';
-UPDATE permission_definitions SET alias_for = 'gl.posting.reverse' WHERE action_name = 'GL_POSTING_REVERSE';
-UPDATE permission_definitions SET alias_for = 'bank_account.close' WHERE action_name = 'BANK_ACCOUNT_CLOSE';
-UPDATE permission_definitions SET alias_for = 'bank_account.manage' WHERE action_name = 'BANK_ACCOUNT_MANAGE';
-UPDATE permission_definitions SET alias_for = 'bank_account.verify' WHERE action_name = 'BANK_ACCOUNT_VERIFY';
-UPDATE permission_definitions SET alias_for = 'payment.approve' WHERE action_name = 'PAYMENT_APPROVE';
-UPDATE permission_definitions SET alias_for = 'payment.release' WHERE action_name = 'PAYMENT_RELEASE';
-UPDATE permission_definitions SET alias_for = 'financial_close_control.population_read' WHERE action_name = 'FINANCIAL_CLOSE_CONTROL_POPULATION_READ';
-UPDATE permission_definitions SET alias_for = 'finctrl.approve_rule' WHERE action_name = 'FINCTRL_APPROVE_RULE';
-UPDATE permission_definitions SET alias_for = 'finctrl.certify' WHERE action_name = 'FINCTRL_CERTIFY';
-UPDATE permission_definitions SET alias_for = 'finctrl.define' WHERE action_name = 'FINCTRL_DEFINE';
-UPDATE permission_definitions SET alias_for = 'finctrl.evidence_export' WHERE action_name = 'FINCTRL_EVIDENCE_EXPORT';
-UPDATE permission_definitions SET alias_for = 'finctrl.exception_assign' WHERE action_name = 'FINCTRL_EXCEPTION_ASSIGN';
-UPDATE permission_definitions SET alias_for = 'finctrl.exception_resolve' WHERE action_name = 'FINCTRL_EXCEPTION_RESOLVE';
-UPDATE permission_definitions SET alias_for = 'finctrl.exception_waive' WHERE action_name = 'FINCTRL_EXCEPTION_WAIVE';
-UPDATE permission_definitions SET alias_for = 'finctrl.execute' WHERE action_name = 'FINCTRL_EXECUTE';
-UPDATE permission_definitions SET alias_for = 'finctrl.policy_manage' WHERE action_name = 'FINCTRL_POLICY_MANAGE';
-UPDATE permission_definitions SET alias_for = 'finctrl.read' WHERE action_name = 'FINCTRL_READ';
-UPDATE permission_definitions SET alias_for = 'finctrl.reperform' WHERE action_name = 'FINCTRL_REPERFORM';
-UPDATE permission_definitions SET alias_for = 'finctrl.run_create' WHERE action_name = 'FINCTRL_RUN_CREATE';
-UPDATE permission_definitions SET alias_for = 'configuration.global_write' WHERE action_name = 'CONFIGURATION_GLOBAL_WRITE';
-UPDATE permission_definitions SET alias_for = 'configuration.write' WHERE action_name = 'CONFIGURATION_WRITE';
-UPDATE permission_definitions SET alias_for = 'feature_flag.global_write' WHERE action_name = 'FEATURE_FLAG_GLOBAL_WRITE';
-UPDATE permission_definitions SET alias_for = 'feature_flag.write' WHERE action_name = 'FEATURE_FLAG_WRITE';
-UPDATE permission_definitions SET alias_for = 'secret.policy_create' WHERE action_name = 'SECRET_POLICY_CREATE';
-UPDATE permission_definitions SET alias_for = 'secret.policy_version_activate' WHERE action_name = 'SECRET_POLICY_VERSION_ACTIVATE';
-UPDATE permission_definitions SET alias_for = 'secret.policy_version_create' WHERE action_name = 'SECRET_POLICY_VERSION_CREATE';
-UPDATE permission_definitions SET alias_for = 'secret.policy_version_list' WHERE action_name = 'SECRET_POLICY_VERSION_LIST';
-UPDATE permission_definitions SET alias_for = 'secret.rotate' WHERE action_name = 'SECRET_ROTATE';
-UPDATE permission_definitions SET alias_for = 'secret.emergency_retrieval' WHERE action_name = 'SECRET_EMERGENCY_RETRIEVAL';
-UPDATE permission_definitions SET alias_for = 'secret.exception_create' WHERE action_name = 'SECRET_EXCEPTION_CREATE';
-UPDATE permission_definitions SET alias_for = 'secret.exception_list' WHERE action_name = 'SECRET_EXCEPTION_LIST';
-UPDATE permission_definitions SET alias_for = 'secret.exception_revoke' WHERE action_name = 'SECRET_EXCEPTION_REVOKE';
-UPDATE permission_definitions SET alias_for = 'secret.lease_read' WHERE action_name = 'SECRET_LEASE_READ';
-UPDATE permission_definitions SET alias_for = 'secret.lease_revoke' WHERE action_name = 'SECRET_LEASE_REVOKE';
-UPDATE permission_definitions SET alias_for = 'secret.material_write' WHERE action_name = 'SECRET_MATERIAL_WRITE';
-UPDATE permission_definitions SET alias_for = 'secret.audit_read' WHERE action_name = 'SECRET_AUDIT_READ';
-UPDATE permission_definitions SET alias_for = 'security_policy.manage' WHERE action_name = 'SECURITY_POLICY_MANAGE';
-UPDATE permission_definitions SET alias_for = 'schema.publish' WHERE action_name = 'SCHEMA_PUBLISH';
-UPDATE permission_definitions SET alias_for = 'platform.admin' WHERE action_name = 'PLATFORM_ADMIN';
-UPDATE permission_definitions SET alias_for = 'tenant.admin' WHERE action_name = 'TENANT_ADMIN';
-UPDATE permission_definitions SET alias_for = 'tenant.provision' WHERE action_name = 'TENANT_PROVISION';
-UPDATE permission_definitions SET alias_for = 'tenant.activate' WHERE action_name = 'TENANT_ACTIVATE';
-UPDATE permission_definitions SET alias_for = 'tenant.suspend' WHERE action_name = 'TENANT_SUSPEND';
-UPDATE permission_definitions SET alias_for = 'tenant.resume' WHERE action_name = 'TENANT_RESUME';
-UPDATE permission_definitions SET alias_for = 'tenant.lifecycle_transition' WHERE action_name = 'TENANT_LIFECYCLE_TRANSITION';
-UPDATE permission_definitions SET alias_for = 'entity.create' WHERE action_name = 'ENTITY_CREATE';
-UPDATE permission_definitions SET alias_for = 'entity.update' WHERE action_name = 'ENTITY_UPDATE';
-UPDATE permission_definitions SET alias_for = 'entity.manage' WHERE action_name = 'ENTITY_MANAGE';
-UPDATE permission_definitions SET alias_for = 'entity.verify' WHERE action_name = 'ENTITY_VERIFY';
-UPDATE permission_definitions SET alias_for = 'entity.merge' WHERE action_name = 'ENTITY_MERGE';
-UPDATE permission_definitions SET alias_for = 'entity.unmerge' WHERE action_name = 'ENTITY_UNMERGE';
-UPDATE permission_definitions SET alias_for = 'identity.subject_read' WHERE action_name = 'IDENTITY_SUBJECT_READ';
-UPDATE permission_definitions SET alias_for = 'identity.auth_event_read' WHERE action_name = 'IDENTITY_AUTH_EVENT_READ';
-UPDATE permission_definitions SET alias_for = 'identity.merge' WHERE action_name = 'IDENTITY_MERGE';
-UPDATE permission_definitions SET alias_for = 'identity.context_cache_refresh' WHERE action_name = 'IDENTITY_CONTEXT_CACHE_REFRESH';
-UPDATE permission_definitions SET alias_for = 'identity.context_tenant_invalidate' WHERE action_name = 'IDENTITY_CONTEXT_TENANT_INVALIDATE';
-UPDATE permission_definitions SET alias_for = 'identity.support_context_attach' WHERE action_name = 'IDENTITY_SUPPORT_CONTEXT_ATTACH';
-UPDATE permission_definitions SET alias_for = 'identity.support_context_review' WHERE action_name = 'IDENTITY_SUPPORT_CONTEXT_REVIEW';
-UPDATE permission_definitions SET alias_for = 'identity.support_context_revoke' WHERE action_name = 'IDENTITY_SUPPORT_CONTEXT_REVOKE';
-UPDATE permission_definitions SET alias_for = 'obligation.create' WHERE action_name = 'OBLIGATION_CREATE';
-UPDATE permission_definitions SET alias_for = 'obligation.fulfill' WHERE action_name = 'OBLIGATION_FULFILL';
-UPDATE permission_definitions SET alias_for = 'obligation.read' WHERE action_name = 'OBLIGATION_READ';
-UPDATE permission_definitions SET alias_for = 'obligation.update' WHERE action_name = 'OBLIGATION_UPDATE';
-UPDATE permission_definitions SET alias_for = 'obligation.rule_create' WHERE action_name = 'OBLIGATION_RULE_CREATE';
-UPDATE permission_definitions SET alias_for = 'obligation.rule_publish' WHERE action_name = 'OBLIGATION_RULE_PUBLISH';
-UPDATE permission_definitions SET alias_for = 'obligation.rule_set_provenance' WHERE action_name = 'OBLIGATION_RULE_SET_PROVENANCE';
-UPDATE permission_definitions SET alias_for = 'obligation.status_update' WHERE action_name = 'OBLIGATION_STATUS_UPDATE';
-UPDATE permission_definitions SET alias_for = 'workflow.approve' WHERE action_name = 'WORKFLOW_APPROVE';
-UPDATE permission_definitions SET alias_for = 'evidence.manifest_generate' WHERE action_name = 'EVIDENCE_MANIFEST_GENERATE';
-UPDATE permission_definitions SET alias_for = 'evidence.manifest_read' WHERE action_name = 'EVIDENCE_MANIFEST_READ';
-UPDATE permission_definitions SET alias_for = 'evidence.request_create' WHERE action_name = 'EVIDENCE_REQUEST_CREATE';
-UPDATE permission_definitions SET alias_for = 'evidence.request_evaluate' WHERE action_name = 'EVIDENCE_REQUEST_EVALUATE';
-UPDATE permission_definitions SET alias_for = 'evidence.request_manage' WHERE action_name = 'EVIDENCE_REQUEST_MANAGE';
-UPDATE permission_definitions SET alias_for = 'evidence.request_submit_response' WHERE action_name = 'EVIDENCE_REQUEST_SUBMIT_RESPONSE';
-UPDATE permission_definitions SET alias_for = 'evidence.requirement_create' WHERE action_name = 'EVIDENCE_REQUIREMENT_CREATE';
-UPDATE permission_definitions SET alias_for = 'evidence.requirement_retire' WHERE action_name = 'EVIDENCE_REQUIREMENT_RETIRE';
-UPDATE permission_definitions SET alias_for = 'obligation.calculation_calculate' WHERE action_name = 'OBLIGATION_CALCULATION_CALCULATE';
-UPDATE permission_definitions SET alias_for = 'party.create' WHERE action_name = 'PARTY_CREATE';
-UPDATE permission_definitions SET alias_for = 'party.amend' WHERE action_name = 'PARTY_AMEND';
-UPDATE permission_definitions SET alias_for = 'party.role_manage' WHERE action_name = 'PARTY_ROLE_MANAGE';
-UPDATE permission_definitions SET alias_for = 'party.identifier_link' WHERE action_name = 'PARTY_IDENTIFIER_LINK';
-UPDATE permission_definitions SET alias_for = 'party.identifier_reveal' WHERE action_name = 'PARTY_IDENTIFIER_REVEAL';
-UPDATE permission_definitions SET alias_for = 'party.merge' WHERE action_name = 'PARTY_MERGE';
-UPDATE permission_definitions SET alias_for = 'party.split' WHERE action_name = 'PARTY_SPLIT';
-UPDATE permission_definitions SET alias_for = 'party.resolution_decide' WHERE action_name = 'PARTY_RESOLUTION_DECIDE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.alias_amend' WHERE action_name = 'JURISDICTION_ALIAS_AMEND';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.alias_end' WHERE action_name = 'JURISDICTION_ALIAS_END';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.import_propose' WHERE action_name = 'JURISDICTION_IMPORT_PROPOSE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.import_approve' WHERE action_name = 'JURISDICTION_IMPORT_APPROVE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.import_view' WHERE action_name = 'JURISDICTION_IMPORT_VIEW';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rule_create' WHERE action_name = 'JURISDICTION_RULE_CREATE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rule_record_drift' WHERE action_name = 'JURISDICTION_RULE_RECORD_DRIFT';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rule_set_parameters' WHERE action_name = 'JURISDICTION_RULE_SET_PARAMETERS';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rule_set_provenance' WHERE action_name = 'JURISDICTION_RULE_SET_PROVENANCE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rule_transition' WHERE action_name = 'JURISDICTION_RULE_TRANSITION';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_create' WHERE action_name = 'JURISDICTION_PACK_VERSION_CREATE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_publish' WHERE action_name = 'JURISDICTION_PACK_VERSION_PUBLISH';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_verify' WHERE action_name = 'JURISDICTION_PACK_VERSION_VERIFY';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_deploy' WHERE action_name = 'JURISDICTION_PACK_VERSION_DEPLOY';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rollout_create' WHERE action_name = 'JURISDICTION_ROLLOUT_CREATE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rollout_transition' WHERE action_name = 'JURISDICTION_ROLLOUT_TRANSITION';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rollout_attest' WHERE action_name = 'JURISDICTION_ROLLOUT_ATTEST';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rollout_seed' WHERE action_name = 'JURISDICTION_ROLLOUT_SEED';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rollout_link_packs' WHERE action_name = 'JURISDICTION_ROLLOUT_LINK_PACKS';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rollout_set_owner' WHERE action_name = 'JURISDICTION_ROLLOUT_SET_OWNER';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rollout_expert_approve' WHERE action_name = 'JURISDICTION_ROLLOUT_EXPERT_APPROVE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.rollout_view' WHERE action_name = 'JURISDICTION_ROLLOUT_VIEW';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_author_tests' WHERE action_name = 'JURISDICTION_PACK_VERSION_AUTHOR_TESTS';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_block' WHERE action_name = 'JURISDICTION_PACK_VERSION_BLOCK';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_complete_retrospective' WHERE action_name = 'JURISDICTION_PACK_VERSION_COMPLETE_RETROSPECTIVE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_compile' WHERE action_name = 'JURISDICTION_PACK_VERSION_COMPILE';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_declare_hotfix' WHERE action_name = 'JURISDICTION_PACK_VERSION_DECLARE_HOTFIX';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_review' WHERE action_name = 'JURISDICTION_PACK_VERSION_REVIEW';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_rollback' WHERE action_name = 'JURISDICTION_PACK_VERSION_ROLLBACK';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_sign' WHERE action_name = 'JURISDICTION_PACK_VERSION_SIGN';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_submit' WHERE action_name = 'JURISDICTION_PACK_VERSION_SUBMIT';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_unblock' WHERE action_name = 'JURISDICTION_PACK_VERSION_UNBLOCK';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.pack_version_withdraw' WHERE action_name = 'JURISDICTION_PACK_VERSION_WITHDRAW';
-UPDATE permission_definitions SET alias_for = 'jurisdiction.support_view' WHERE action_name = 'JURISDICTION_SUPPORT_VIEW';
-UPDATE permission_definitions SET alias_for = 'accounting.policy_draft' WHERE action_name = 'ACCOUNTING_POLICY_DRAFT';
-UPDATE permission_definitions SET alias_for = 'accounting.policy_approve' WHERE action_name = 'ACCOUNTING_POLICY_APPROVE';
-UPDATE permission_definitions SET alias_for = 'accounting.policy_activate' WHERE action_name = 'ACCOUNTING_POLICY_ACTIVATE';
-UPDATE permission_definitions SET alias_for = 'accounting.policy_emergency_suspend' WHERE action_name = 'ACCOUNTING_POLICY_EMERGENCY_SUSPEND';
-UPDATE permission_definitions SET alias_for = 'payment_term.create' WHERE action_name = 'PAYMENT_TERM_CREATE';
-UPDATE permission_definitions SET alias_for = 'payment_term.approve' WHERE action_name = 'PAYMENT_TERM_APPROVE';
-UPDATE permission_definitions SET alias_for = 'payment_term.supersede' WHERE action_name = 'PAYMENT_TERM_SUPERSEDE';
-UPDATE permission_definitions SET alias_for = 'payment_term.retire' WHERE action_name = 'PAYMENT_TERM_RETIRE';
-UPDATE permission_definitions SET alias_for = 'accretion.create' WHERE action_name = 'ACCRUAL_CREATE';
-UPDATE permission_definitions SET alias_for = 'accretion.amend' WHERE action_name = 'ACCRUAL_AMEND';
-UPDATE permission_definitions SET alias_for = 'accretion.approve' WHERE action_name = 'ACCRUAL_APPROVE';
-UPDATE permission_definitions SET alias_for = 'accretion.cancel' WHERE action_name = 'ACCRUAL_CANCEL';
-UPDATE permission_definitions SET alias_for = 'accretion.recognize' WHERE action_name = 'ACCRUAL_RECOGNIZE';
-UPDATE permission_definitions SET alias_for = 'accretion.recognition_reverse' WHERE action_name = 'ACCRUAL_RECOGNITION_REVERSE';
-UPDATE permission_definitions SET alias_for = 'accretion.view' WHERE action_name = 'ACCRUAL_VIEW';
-UPDATE permission_definitions SET alias_for = 'allocation.execute' WHERE action_name = 'ALLOCATION_EXECUTE';
-UPDATE permission_definitions SET alias_for = 'allocation.rule_create' WHERE action_name = 'ALLOCATION_RULE_CREATE';
-UPDATE permission_definitions SET alias_for = 'allocation.rule_approve' WHERE action_name = 'ALLOCATION_RULE_APPROVE';
-UPDATE permission_definitions SET alias_for = 'allocation.rule_supersede' WHERE action_name = 'ALLOCATION_RULE_SUPERSEDE';
-UPDATE permission_definitions SET alias_for = 'allocation.view' WHERE action_name = 'ALLOCATION_VIEW';
-UPDATE permission_definitions SET alias_for = 'analytical_data_platform.manage' WHERE action_name = 'ANALYTICAL_DATA_PLATFORM_MANAGE';
-UPDATE permission_definitions SET alias_for = 'analytical_data_platform.read' WHERE action_name = 'ANALYTICAL_DATA_PLATFORM_READ';
-UPDATE permission_definitions SET alias_for = 'applicability_decision.read' WHERE action_name = 'APPLICABILITY_DECISION_READ';
-UPDATE permission_definitions SET alias_for = 'applicability_decision.record' WHERE action_name = 'APPLICABILITY_DECISION_RECORD';
-UPDATE permission_definitions SET alias_for = 'approval_request.read' WHERE action_name = 'APPROVAL_REQUEST_READ';
-UPDATE permission_definitions SET alias_for = 'ap_control.population_read' WHERE action_name = 'AP_CONTROL_POPULATION_READ';
-UPDATE permission_definitions SET alias_for = 'ap.invoice_create' WHERE action_name = 'AP_INVOICE_CREATE';
-UPDATE permission_definitions SET alias_for = 'ap.invoice_validate' WHERE action_name = 'AP_INVOICE_VALIDATE';
-UPDATE permission_definitions SET alias_for = 'ar_control.population_read' WHERE action_name = 'AR_CONTROL_POPULATION_READ';
-UPDATE permission_definitions SET alias_for = 'ar.invoice_issue' WHERE action_name = 'AR_INVOICE_ISSUE';
-UPDATE permission_definitions SET alias_for = 'ar.invoice_send' WHERE action_name = 'AR_INVOICE_SEND';
-UPDATE permission_definitions SET alias_for = 'ar.mark_overdue' WHERE action_name = 'AR_MARK_OVERDUE';
-UPDATE permission_definitions SET alias_for = 'ar.payment_receive' WHERE action_name = 'AR_PAYMENT_RECEIVE';
-UPDATE permission_definitions SET alias_for = 'asset.approve_registration' WHERE action_name = 'ASSET_APPROVE_REGISTRATION';
-UPDATE permission_definitions SET alias_for = 'asset.book_assign' WHERE action_name = 'ASSET_BOOK_ASSIGN';
-UPDATE permission_definitions SET alias_for = 'asset.component_manage' WHERE action_name = 'ASSET_COMPONENT_MANAGE';
-UPDATE permission_definitions SET alias_for = 'asset.create' WHERE action_name = 'ASSET_CREATE';
-UPDATE permission_definitions SET alias_for = 'asset.event_apply' WHERE action_name = 'ASSET_EVENT_APPLY';
-UPDATE permission_definitions SET alias_for = 'asset.event_approve' WHERE action_name = 'ASSET_EVENT_APPROVE';
-UPDATE permission_definitions SET alias_for = 'asset.event_correct' WHERE action_name = 'ASSET_EVENT_CORRECT';
-UPDATE permission_definitions SET alias_for = 'asset.event_create' WHERE action_name = 'ASSET_EVENT_CREATE';
-UPDATE permission_definitions SET alias_for = 'asset.event_view' WHERE action_name = 'ASSET_EVENT_VIEW';
-UPDATE permission_definitions SET alias_for = 'asset.merge_split' WHERE action_name = 'ASSET_MERGE_SPLIT';
-UPDATE permission_definitions SET alias_for = 'asset.metadata_manage' WHERE action_name = 'ASSET_METADATA_MANAGE';
-UPDATE permission_definitions SET alias_for = 'asset.request_capitalization' WHERE action_name = 'ASSET_REQUEST_CAPITALIZATION';
-UPDATE permission_definitions SET alias_for = 'asset.suspend' WHERE action_name = 'ASSET_SUSPEND';
-UPDATE permission_definitions SET alias_for = 'asset.view' WHERE action_name = 'ASSET_VIEW';
-UPDATE permission_definitions SET alias_for = 'assistant.manage' WHERE action_name = 'ASSISTANT_MANAGE';
-UPDATE permission_definitions SET alias_for = 'assistant.read' WHERE action_name = 'ASSISTANT_READ';
-UPDATE permission_definitions SET alias_for = 'attestation.create' WHERE action_name = 'ATTESTATION_CREATE';
-UPDATE permission_definitions SET alias_for = 'attestation.read' WHERE action_name = 'ATTESTATION_READ';
-UPDATE permission_definitions SET alias_for = 'attestation.revoke' WHERE action_name = 'ATTESTATION_REVOKE';
-UPDATE permission_definitions SET alias_for = 'audit_engagement.acceptance_decide' WHERE action_name = 'AUDIT_ENGAGEMENT_ACCEPTANCE_DECIDE';
-UPDATE permission_definitions SET alias_for = 'audit_engagement.acceptance_submit' WHERE action_name = 'AUDIT_ENGAGEMENT_ACCEPTANCE_SUBMIT';
-UPDATE permission_definitions SET alias_for = 'audit_engagement.create' WHERE action_name = 'AUDIT_ENGAGEMENT_CREATE';
-UPDATE permission_definitions SET alias_for = 'audit_engagement.manage' WHERE action_name = 'AUDIT_ENGAGEMENT_MANAGE';
-UPDATE permission_definitions SET alias_for = 'audit_engagement.read' WHERE action_name = 'AUDIT_ENGAGEMENT_READ';
-UPDATE permission_definitions SET alias_for = 'audit_entry.remediate' WHERE action_name = 'AUDIT_ENTRY_REMEDIATE';
-UPDATE permission_definitions SET alias_for = 'audit_evidence.manage' WHERE action_name = 'AUDIT_EVIDENCE_MANAGE';
-UPDATE permission_definitions SET alias_for = 'audit_evidence.read' WHERE action_name = 'AUDIT_EVIDENCE_READ';
-UPDATE permission_definitions SET alias_for = 'audit_evidence.register' WHERE action_name = 'AUDIT_EVIDENCE_REGISTER';
-UPDATE permission_definitions SET alias_for = 'audit_finding.close' WHERE action_name = 'AUDIT_FINDING_CLOSE';
-UPDATE permission_definitions SET alias_for = 'audit_finding.create' WHERE action_name = 'AUDIT_FINDING_CREATE';
-UPDATE permission_definitions SET alias_for = 'audit_finding.manage' WHERE action_name = 'AUDIT_FINDING_MANAGE';
-UPDATE permission_definitions SET alias_for = 'audit_plan.approve' WHERE action_name = 'AUDIT_PLAN_APPROVE';
-UPDATE permission_definitions SET alias_for = 'audit_plan.manage' WHERE action_name = 'AUDIT_PLAN_MANAGE';
-UPDATE permission_definitions SET alias_for = 'audit_plan.read' WHERE action_name = 'AUDIT_PLAN_READ';
-UPDATE permission_definitions SET alias_for = 'audit.read' WHERE action_name = 'AUDIT_READ';
-UPDATE permission_definitions SET alias_for = 'audit.review_manage' WHERE action_name = 'AUDIT_REVIEW_MANAGE';
-UPDATE permission_definitions SET alias_for = 'audit.review_read' WHERE action_name = 'AUDIT_REVIEW_READ';
-UPDATE permission_definitions SET alias_for = 'audit.review_signoff' WHERE action_name = 'AUDIT_REVIEW_SIGNOFF';
-UPDATE permission_definitions SET alias_for = 'audit_workpaper.lock' WHERE action_name = 'AUDIT_WORKPAPER_LOCK';
-UPDATE permission_definitions SET alias_for = 'audit_workpaper.manage' WHERE action_name = 'AUDIT_WORKPAPER_MANAGE';
-UPDATE permission_definitions SET alias_for = 'audit_workpaper.read' WHERE action_name = 'AUDIT_WORKPAPER_READ';
-UPDATE permission_definitions SET alias_for = 'automation.action_decide' WHERE action_name = 'AUTOMATION_ACTION_DECIDE';
-UPDATE permission_definitions SET alias_for = 'automation.action_propose' WHERE action_name = 'AUTOMATION_ACTION_PROPOSE';
-UPDATE permission_definitions SET alias_for = 'banking_control.population_read' WHERE action_name = 'BANKING_CONTROL_POPULATION_READ';
-UPDATE permission_definitions SET alias_for = 'bankrec.certify' WHERE action_name = 'BANKREC_CERTIFY';
-UPDATE permission_definitions SET alias_for = 'bankrec.complete_statement' WHERE action_name = 'BANKREC_COMPLETE_STATEMENT';
-UPDATE permission_definitions SET alias_for = 'bankrec.conflict_resolve' WHERE action_name = 'BANKREC_CONFLICT_RESOLVE';
-UPDATE permission_definitions SET alias_for = 'bankrec.flag_exception' WHERE action_name = 'BANKREC_FLAG_EXCEPTION';
-UPDATE permission_definitions SET alias_for = 'bankrec.read' WHERE action_name = 'BANKREC_READ';
-UPDATE permission_definitions SET alias_for = 'bankrec.run' WHERE action_name = 'BANKREC_RUN';
-UPDATE permission_definitions SET alias_for = 'bankrec.statement_ingest' WHERE action_name = 'BANKREC_STATEMENT_INGEST';
-UPDATE permission_definitions SET alias_for = 'benefits.cancel' WHERE action_name = 'BENEFITS_CANCEL';
-UPDATE permission_definitions SET alias_for = 'benefits.create' WHERE action_name = 'BENEFITS_CREATE';
-UPDATE permission_definitions SET alias_for = 'benefits.enroll' WHERE action_name = 'BENEFITS_ENROLL';
-UPDATE permission_definitions SET alias_for = 'benefits.update' WHERE action_name = 'BENEFITS_UPDATE';
-UPDATE permission_definitions SET alias_for = 'benefits.view' WHERE action_name = 'BENEFITS_VIEW';
-UPDATE permission_definitions SET alias_for = 'billing.admin' WHERE action_name = 'BILLING_ADMIN';
-UPDATE permission_definitions SET alias_for = 'bonus.approve' WHERE action_name = 'BONUS_APPROVE';
-UPDATE permission_definitions SET alias_for = 'bonus.grant' WHERE action_name = 'BONUS_GRANT';
-UPDATE permission_definitions SET alias_for = 'catalog.approve' WHERE action_name = 'CATALOG_APPROVE';
-UPDATE permission_definitions SET alias_for = 'catalog.manage' WHERE action_name = 'CATALOG_MANAGE';
-UPDATE permission_definitions SET alias_for = 'catalog.mapping_link' WHERE action_name = 'CATALOG_MAPPING_LINK';
-UPDATE permission_definitions SET alias_for = 'catalog.read' WHERE action_name = 'CATALOG_READ';
-UPDATE permission_definitions SET alias_for = 'classification.manage' WHERE action_name = 'CLASSIFICATION_MANAGE';
-UPDATE permission_definitions SET alias_for = 'classification.read' WHERE action_name = 'CLASSIFICATION_READ';
-UPDATE permission_definitions SET alias_for = 'classify_record' WHERE action_name = 'CLASSIFY_RECORD';
-UPDATE permission_definitions SET alias_for = 'clause.create' WHERE action_name = 'CLAUSE_CREATE';
-UPDATE permission_definitions SET alias_for = 'clause.update' WHERE action_name = 'CLAUSE_UPDATE';
-UPDATE permission_definitions SET alias_for = 'coa.account_create' WHERE action_name = 'COA_ACCOUNT_CREATE';
-UPDATE permission_definitions SET alias_for = 'coa.account_deactivate' WHERE action_name = 'COA_ACCOUNT_DEACTIVATE';
-UPDATE permission_definitions SET alias_for = 'coa.account_view' WHERE action_name = 'COA_ACCOUNT_VIEW';
-UPDATE permission_definitions SET alias_for = 'coa.control_account_posting_override' WHERE action_name = 'COA_CONTROL_ACCOUNT_POSTING_OVERRIDE';
-UPDATE permission_definitions SET alias_for = 'coa.mapping_set' WHERE action_name = 'COA_MAPPING_SET';
-UPDATE permission_definitions SET alias_for = 'coa.mapping_view' WHERE action_name = 'COA_MAPPING_VIEW';
-UPDATE permission_definitions SET alias_for = 'comment.create' WHERE action_name = 'COMMENT_CREATE';
-UPDATE permission_definitions SET alias_for = 'comment.manage' WHERE action_name = 'COMMENT_MANAGE';
-UPDATE permission_definitions SET alias_for = 'comment.read' WHERE action_name = 'COMMENT_READ';
-UPDATE permission_definitions SET alias_for = 'comment.read_restricted' WHERE action_name = 'COMMENT_READ_RESTRICTED';
-UPDATE permission_definitions SET alias_for = 'commercial_account.market_set' WHERE action_name = 'COMMERCIAL_ACCOUNT_MARKET_SET';
-UPDATE permission_definitions SET alias_for = 'commercial_balance.read' WHERE action_name = 'COMMERCIAL_BALANCE_READ';
-UPDATE permission_definitions SET alias_for = 'commercial_billing_account.manage' WHERE action_name = 'COMMERCIAL_BILLING_ACCOUNT_MANAGE';
-UPDATE permission_definitions SET alias_for = 'commercial.credit_note_issue' WHERE action_name = 'COMMERCIAL_CREDIT_NOTE_ISSUE';
-UPDATE permission_definitions SET alias_for = 'commercial.currency_manage' WHERE action_name = 'COMMERCIAL_CURRENCY_MANAGE';
-UPDATE permission_definitions SET alias_for = 'commercial.discount_approve' WHERE action_name = 'COMMERCIAL_DISCOUNT_APPROVE';
-UPDATE permission_definitions SET alias_for = 'commercial.discount_propose' WHERE action_name = 'COMMERCIAL_DISCOUNT_PROPOSE';
-UPDATE permission_definitions SET alias_for = 'commercial.dispute_manage' WHERE action_name = 'COMMERCIAL_DISPUTE_MANAGE';
-UPDATE permission_definitions SET alias_for = 'commercial.dispute_read' WHERE action_name = 'COMMERCIAL_DISPUTE_READ';
-UPDATE permission_definitions SET alias_for = 'commercial.dunning_manage' WHERE action_name = 'COMMERCIAL_DUNNING_MANAGE';
-UPDATE permission_definitions SET alias_for = 'commercial.dunning_policy_manage' WHERE action_name = 'COMMERCIAL_DUNNING_POLICY_MANAGE';
-UPDATE permission_definitions SET alias_for = 'commercial.dunning_read' WHERE action_name = 'COMMERCIAL_DUNNING_READ';
-UPDATE permission_definitions SET alias_for = 'commercial.entitlement_policy_manage' WHERE action_name = 'COMMERCIAL_ENTITLEMENT_POLICY_MANAGE';
-UPDATE permission_definitions SET alias_for = 'commercial.entitlement_read' WHERE action_name = 'COMMERCIAL_ENTITLEMENT_READ';
-UPDATE permission_definitions SET alias_for = 'commercial.entitlement_snapshot_manage' WHERE action_name = 'COMMERCIAL_ENTITLEMENT_SNAPSHOT_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'commercial.invoice_generate' WHERE action_name = 'COMMERCIAL_INVOICE_GENERATE'.
-UPDATE permission_definitions SET alias_for = 'commercial.invoice_read' WHERE action_name = 'COMMERCIAL_INVOICE_READ'.
-UPDATE permission_definitions SET alias_for = 'commercial.meter_definition_manage' WHERE action_name = 'COMMERCIAL_METER_DEFINITION_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'commercial.payment_collect' WHERE action_name = 'COMMERCIAL_PAYMENT_COLLECT'.
-UPDATE permission_definitions SET alias_for = 'commercial.payment_outcome_record' WHERE action_name = 'COMMERCIAL_PAYMENT_OUTCOME_RECORD'.
-UPDATE permission_definitions SET alias_for = 'commercial.price_book_approve' WHERE action_name = 'COMMERCIAL_PRICE_BOOK_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'commercial.price_book_propose' WHERE action_name = 'COMMERCIAL_PRICE_BOOK_PROPOSE'.
-UPDATE permission_definitions SET alias_for = 'commercial.price_book_publish' WHERE action_name = 'COMMERCIAL_PRICE_BOOK_PUBLISH'.
-UPDATE permission_definitions SET alias_for = 'commercial.price_book_read' WHERE action_name = 'COMMERCIAL_PRICE_BOOK_READ'.
-UPDATE permission_definitions SET alias_for = 'commercial.price_book_retire' WHERE action_name = 'COMMERCIAL_PRICE_BOOK_RETIRE'.
-UPDATE permission_definitions SET alias_for = 'commercial.reconciliation_read' WHERE action_name = 'COMMERCIAL_RECONCILIATION_READ'.
-UPDATE permission_definitions SET alias_for = 'commercial.reconciliation_run' WHERE action_name = 'COMMERCIAL_RECONCILIATION_RUN'.
-UPDATE permission_definitions SET alias_for = 'commercial.refund_request' WHERE action_name = 'COMMERCIAL_REFUND_REQUEST'.
-UPDATE permission_definitions SET alias_for = 'commercial.refund_settle' WHERE action_name = 'COMMERCIAL_REFUND_SETTLE'.
-UPDATE permission_definitions SET alias_for = 'commercial.restriction_apply' WHERE action_name = 'COMMERCIAL_RESTRICTION_APPLY'.
-UPDATE permission_definitions SET alias_for = 'commercial.restriction_read' WHERE action_name = 'COMMERCIAL_RESTRICTION_READ'.
-UPDATE permission_definitions SET alias_for = 'commercial.subscription_activate' WHERE action_name = 'COMMERCIAL_SUBSCRIPTION_ACTIVATE'.
-UPDATE permission_definitions SET alias_for = 'commercial.subscription_assist' WHERE action_name = 'COMMERCIAL_SUBSCRIPTION_ASSIST'.
-UPDATE permission_definitions SET alias_for = 'commercial.subscription_manage' WHERE action_name = 'COMMERCIAL_SUBSCRIPTION_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'commercial.subscription_read' WHERE action_name = 'COMMERCIAL_SUBSCRIPTION_READ'.
-UPDATE permission_definitions SET alias_for = 'commercial.usage_adjustment_create' WHERE action_name = 'COMMERCIAL_USAGE_ADJUSTMENT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'commercial.usage_certify' WHERE action_name = 'COMMERCIAL_USAGE_CERTIFY'.
-UPDATE permission_definitions SET alias_for = 'commercial.usage_ingest' WHERE action_name = 'COMMERCIAL_USAGE_INGEST'.
-UPDATE permission_definitions SET alias_for = 'commercial.usage_read' WHERE action_name = 'COMMERCIAL_USAGE_READ'.
-UPDATE permission_definitions SET alias_for = 'commercial.write_off_apply' WHERE action_name = 'COMMERCIAL_WRITE_OFF_APPLY'.
-UPDATE permission_definitions SET alias_for = 'compensation.create' WHERE action_name = 'COMPENSATION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'compensation.view' WHERE action_name = 'COMPENSATION_VIEW'.
-UPDATE permission_definitions SET alias_for = 'compliance.alert_resolve' WHERE action_name = 'COMPLIANCE_ALERT_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'compliance.gap_create' WHERE action_name = 'COMPLIANCE_GAP_CREATE'.
-UPDATE permission_definitions SET alias_for = 'compliance.gap_resolve' WHERE action_name = 'COMPLIANCE_GAP_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'compliance.hours_log' WHERE action_name = 'COMPLIANCE_HOURS_LOG'.
-UPDATE permission_definitions SET alias_for = 'compliance.status_evaluate' WHERE action_name = 'COMPLIANCE_STATUS_EVALUATE'.
-UPDATE permission_definitions SET alias_for = 'compliance.visa_create' WHERE action_name = 'COMPLIANCE_VISA_CREATE'.
-UPDATE permission_definitions SET alias_for = 'compliance.visa_flag' WHERE action_name = 'COMPLIANCE_VISA_FLAG'.
-UPDATE permission_definitions SET alias_for = 'compliance.work_auth_create' WHERE action_name = 'COMPLIANCE_WORK_AUTH_CREATE'.
-UPDATE permission_definitions SET alias_for = 'compliance.work_auth_verify' WHERE action_name = 'COMPLIANCE_WORK_AUTH_VERIFY'.
-UPDATE permission_definitions SET alias_for = 'confirm.classification' WHERE action_name = 'CONFIRM_CLASSIFICATION'.
-UPDATE permission_definitions SET alias_for = 'consolidation.adjustment_approve' WHERE action_name = 'CONSOLIDATION_ADJUSTMENT_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'consolidation.adjustment_create' WHERE action_name = 'CONSOLIDATION_ADJUSTMENT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'consolidation.adjustment_post' WHERE action_name = 'CONSOLIDATION_ADJUSTMENT_POST'.
-UPDATE permission_definitions SET alias_for = 'consolidation.adjustment_reverse' WHERE action_name = 'CONSOLIDATION_ADJUSTMENT_REVERSE'.
-UPDATE permission_definitions SET alias_for = 'consolidation.adjustment_view' WHERE action_name = 'CONSOLIDATION_ADJUSTMENT_VIEW'.
-UPDATE permission_definitions SET alias_for = 'consolidation.control_population_read' WHERE action_name = 'CONSOLIDATION_CONTROL_POPULATION_READ'.
-UPDATE permission_definitions SET alias_for = 'consolidation.run_initiate' WHERE action_name = 'CONSOLIDATION_RUN_INITIATE'.
-UPDATE permission_definitions SET alias_for = 'consolidation.run_view' WHERE action_name = 'CONSOLIDATION_RUN_VIEW'.
-UPDATE permission_definitions SET alias_for = 'contract.activate' WHERE action_name = 'CONTRACT_ACTIVATE'.
-UPDATE permission_definitions SET alias_for = 'contract.amend' WHERE action_name = 'CONTRACT_AMEND'.
-UPDATE permission_definitions SET alias_for = 'contract.submit_for_approval' WHERE action_name = 'CONTRACT_SUBMIT_FOR_APPROVAL'.
-UPDATE permission_definitions SET alias_for = 'contract.terminate' WHERE action_name = 'CONTRACT_TERMINATE'.
-UPDATE permission_definitions SET alias_for = 'control_effectiveness.read' WHERE action_name = 'CONTROL_EFFECTIVENESS_READ'.
-UPDATE permission_definitions SET alias_for = 'control_test_definition.create' WHERE action_name = 'CONTROL_TEST_DEFINITION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'control_test_definition.read' WHERE action_name = 'CONTROL_TEST_DEFINITION_READ'.
-UPDATE permission_definitions SET alias_for = 'control_test_execution.read' WHERE action_name = 'CONTROL_TEST_EXECUTION_READ'.
-UPDATE permission_definitions SET alias_for = 'control_test_execution.record' WHERE action_name = 'CONTROL_TEST_EXECUTION_RECORD'.
-UPDATE permission_definitions SET alias_for = 'corporate_action.create' WHERE action_name = 'CORPORATE_ACTION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'corporate_action.execute' WHERE action_name = 'CORPORATE_ACTION_EXECUTE'.
-UPDATE permission_definitions SET alias_for = 'corporate_action.update' WHERE action_name = 'CORPORATE_ACTION_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'counterparty.compliance_update' WHERE action_name = 'COUNTERPARTY_COMPLIANCE_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'counterparty.create' WHERE action_name = 'COUNTERPARTY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'counterparty.update' WHERE action_name = 'COUNTERPARTY_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'crm.close' WHERE action_name = 'CRM_CLOSE'.
-UPDATE permission_definitions SET alias_for = 'crm.create' WHERE action_name = 'CRM_CREATE'.
-UPDATE permission_definitions SET alias_for = 'crm.manage' WHERE action_name = 'CRM_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'data_ingestion.manage' WHERE action_name = 'DATA_INGESTION_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'data_ingestion.read' WHERE action_name = 'DATA_INGESTION_READ'.
-UPDATE permission_definitions SET alias_for = 'data_lineage.manage' WHERE action_name = 'DATA_LINEAGE_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'data_lineage.read' WHERE action_name = 'DATA_LINEAGE_READ'.
-UPDATE permission_definitions SET alias_for = 'data_quality.manage' WHERE action_name = 'DATA_QUALITY_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'data_quality.read' WHERE action_name = 'DATA_QUALITY_READ'.
-UPDATE permission_definitions SET alias_for = 'deadline.create' WHERE action_name = 'DEADLINE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'deadline.manage' WHERE action_name = 'DEADLINE_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'decision_support.request' WHERE action_name = 'DECISION_SUPPORT_REQUEST'.
-UPDATE permission_definitions SET alias_for = 'decision_support.view' WHERE action_name = 'DECISION_SUPPORT_VIEW'.
-UPDATE permission_definitions SET alias_for = 'deployment.region_create' WHERE action_name = 'DEPLOYMENT_REGION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'deployment.ring_create' WHERE action_name = 'DEPLOYMENT_RING_CREATE'.
-UPDATE permission_definitions SET alias_for = 'depreciation.approve' WHERE action_name = 'DEPRECIATION_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'depreciation.run' WHERE action_name = 'DEPRECIATION_RUN'.
-UPDATE permission_definitions SET alias_for = 'depreciation.schedule_build' WHERE action_name = 'DEPRECIATION_SCHEDULE_BUILD'.
-UPDATE permission_definitions SET alias_for = 'depreciation.supersede' WHERE action_name = 'DEPRECIATION_SUPERSEDE'.
-UPDATE permission_definitions SET alias_for = 'depreciation.view' WHERE action_name = 'DEPRECIATION_VIEW'.
-UPDATE permission_definitions SET alias_for = 'dividend.declaration' WHERE action_name = 'DIVIDEND_DECLARATION'.
-UPDATE permission_definitions SET alias_for = 'document.access_log_read' WHERE action_name = 'DOCUMENT_ACCESS_LOG_READ'.
-UPDATE permission_definitions SET alias_for = 'document.archive' WHERE action_name = 'DOCUMENT_ARCHIVE'.
-UPDATE permission_definitions SET alias_for = 'document.create' WHERE action_name = 'DOCUMENT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'document.declare_record' WHERE action_name = 'DOCUMENT_DECLARE_RECORD'.
-UPDATE permission_definitions SET alias_for = 'document.download' WHERE action_name = 'DOCUMENT_DOWNLOAD'.
-UPDATE permission_definitions SET alias_for = 'document.extraction_manage' WHERE action_name = 'DOCUMENT_EXTRACTION_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'document.extraction_read' WHERE action_name = 'DOCUMENT_EXTRACTION_READ'.
-UPDATE permission_definitions SET alias_for = 'document.link' WHERE action_name = 'DOCUMENT_LINK'.
-UPDATE permission_definitions SET alias_for = 'document.read' WHERE action_name = 'DOCUMENT_READ'.
-UPDATE permission_definitions SET alias_for = 'document.request_disposition' WHERE action_name = 'DOCUMENT_REQUEST_DISPOSITION'.
-UPDATE permission_definitions SET alias_for = 'document.supersede' WHERE action_name = 'DOCUMENT_SUPERSEDE'.
-UPDATE permission_definitions SET alias_for = 'document.version_create' WHERE action_name = 'DOCUMENT_VERSION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'employee.create' WHERE action_name = 'EMPLOYEE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'employee.update' WHERE action_name = 'EMPLOYEE_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'employee.update_status' WHERE action_name = 'EMPLOYEE_UPDATE_STATUS'.
-UPDATE permission_definitions SET alias_for = 'employee.view' WHERE action_name = 'EMPLOYEE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'entity.hierarchy_create' WHERE action_name = 'ENTITY_HIERARCHY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'entity.hierarchy_end_date' WHERE action_name = 'ENTITY_HIERARCHY_END_DATE'.
-UPDATE permission_definitions SET alias_for = 'entity.jurisdiction_assign' WHERE action_name = 'ENTITY_JURISDICTION_ASSIGN'.
-UPDATE permission_definitions SET alias_for = 'entity.jurisdiction_end_date' WHERE action_name = 'ENTITY_JURISDICTION_END_DATE'.
-UPDATE permission_definitions SET alias_for = 'entity.profile_amend' WHERE action_name = 'ENTITY_PROFILE_AMEND'.
-UPDATE permission_definitions SET alias_for = 'entity.profile_amend_approve' WHERE action_name = 'ENTITY_PROFILE_AMEND_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'entity.registry_conflict_read' WHERE action_name = 'ENTITY_REGISTRY_CONFLICT_READ'.
-UPDATE permission_definitions SET alias_for = 'entity.registry_conflict_resolve' WHERE action_name = 'ENTITY_REGISTRY_CONFLICT_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'entity.registry_conflict_resolve_approve' WHERE action_name = 'ENTITY_REGISTRY_CONFLICT_RESOLVE_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'entity.sensitive_identifier_read' WHERE action_name = 'ENTITY_SENSITIVE_IDENTIFIER_READ'.
-UPDATE permission_definitions SET alias_for = 'entity.status_transition' WHERE action_name = 'ENTITY_STATUS_TRANSITION'.
-UPDATE permission_definitions SET alias_for = 'evidence_request.create' WHERE action_name = 'EVIDENCE_REQUEST_CREATE'.
-UPDATE permission_definitions SET alias_for = 'evidence_request.evaluate' WHERE action_name = 'EVIDENCE_REQUEST_EVALUATE'.
-UPDATE permission_definitions SET alias_for = 'evidence_request.manage' WHERE action_name = 'EVIDENCE_REQUEST_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'evidence_request.submit_response' WHERE action_name = 'EVIDENCE_REQUEST_SUBMIT_RESPONSE'.
-UPDATE permission_definitions SET alias_for = 'exception.create' WHERE action_name = 'EXCEPTION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'exception.escalate' WHERE action_name = 'EXCEPTION_ESCALATE'.
-UPDATE permission_definitions SET alias_for = 'exception.raise' WHERE action_name = 'EXCEPTION_RAISE'.
-UPDATE permission_definitions SET alias_for = 'exception.resolve' WHERE action_name = 'EXCEPTION_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'exception.view' WHERE action_name = 'EXCEPTION_VIEW'.
-UPDATE permission_definitions SET alias_for = 'exception.waive' WHERE action_name = 'EXCEPTION_WAIVE'.
-UPDATE permission_definitions SET alias_for = 'filing.confirm' WHERE action_name = 'FILING_CONFIRM'.
-UPDATE permission_definitions SET alias_for = 'filing.draft_create' WHERE action_name = 'FILING_DRAFT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'filing.draft_finalize' WHERE action_name = 'FILING_DRAFT_FINALIZE'.
-UPDATE permission_definitions SET alias_for = 'filing.draft_update' WHERE action_name = 'FILING_DRAFT_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'filing.draft_validate' WHERE action_name = 'FILING_DRAFT_VALIDATE'.
-UPDATE permission_definitions SET alias_for = 'filing.mark_overdue' WHERE action_name = 'FILING_MARK_OVERDUE'.
-UPDATE permission_definitions SET alias_for = 'filing.requirement_create' WHERE action_name = 'FILING_REQUIREMENT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'filing.requirement_read' WHERE action_name = 'FILING_REQUIREMENT_READ'.
-UPDATE permission_definitions SET alias_for = 'filing.requirement_update' WHERE action_name = 'FILING_REQUIREMENT_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'filing.submit' WHERE action_name = 'FILING_SUBMIT'.
-UPDATE permission_definitions SET alias_for = 'fx.revaluation_approve' WHERE action_name = 'FX_REVALUATION_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'fx.revaluation_post' WHERE action_name = 'FX_REVALUATION_POST'.
-UPDATE permission_definitions SET alias_for = 'fx.revaluation_start' WHERE action_name = 'FX_REVALUATION_START'.
-UPDATE permission_definitions SET alias_for = 'fx.revaluation_view' WHERE action_name = 'FX_REVALUATION_VIEW'.
-UPDATE permission_definitions SET alias_for = 'global_search.manage' WHERE action_name = 'GLOBAL_SEARCH_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'global_search.read' WHERE action_name = 'GLOBAL_SEARCH_READ'.
-UPDATE permission_definitions SET alias_for = 'gl.control_population_read' WHERE action_name = 'GL_CONTROL_POPULATION_READ'.
-UPDATE permission_definitions SET alias_for = 'gl.journal.amend' WHERE action_name = 'GL_JOURNAL_AMEND'.
-UPDATE permission_definitions SET alias_for = 'gl.journal.approve' WHERE action_name = 'GL_JOURNAL_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'gl.journal.correct' WHERE action_name = 'GL_JOURNAL_CORRECT'.
-UPDATE permission_definitions SET alias_for = 'gl.journal.create' WHERE action_name = 'GL_JOURNAL_CREATE'.
-UPDATE permission_definitions SET alias_for = 'gl.journal.reject' WHERE action_name = 'GL_JOURNAL_REJECT'.
-UPDATE permission_definitions SET alias_for = 'gl.journal.submit' WHERE action_name = 'GL_JOURNAL_SUBMIT'.
-UPDATE permission_definitions SET alias_for = 'gl.journal.validate' WHERE action_name = 'GL_JOURNAL_VALIDATE'.
-UPDATE permission_definitions SET alias_for = 'gl.ledger_query' WHERE action_name = 'GL_LEDGER_QUERY'.
-UPDATE permission_definitions SET alias_for = 'gl.ledger_rebuild_balances' WHERE action_name = 'GL_LEDGER_REBUILD_BALANCES'.
-UPDATE permission_definitions SET alias_for = 'gl.posting_reprocess' WHERE action_name = 'GL_POSTING_REPROCESS'.
-UPDATE permission_definitions SET alias_for = 'gl.trial_balance_compile' WHERE action_name = 'GL_TRIAL_BALANCE_COMPILE'.
-UPDATE permission_definitions SET alias_for = 'gl.trial_balance_view' WHERE action_name = 'GL_TRIAL_BALANCE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'governance_decision.read' WHERE action_name = 'GOVERNANCE_DECISION_READ'.
-UPDATE permission_definitions SET alias_for = 'governance_decision.record' WHERE action_name = 'GOVERNANCE_DECISION_RECORD'.
-UPDATE permission_definitions SET alias_for = 'governance_decision.replay' WHERE action_name = 'GOVERNANCE_DECISION_REPLAY'.
-UPDATE permission_definitions SET alias_for = 'holiday.create' WHERE action_name = 'HOLIDAY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'holiday.deactivate' WHERE action_name = 'HOLIDAY_DEACTIVATE'.
-UPDATE permission_definitions SET alias_for = 'holiday.view' WHERE action_name = 'HOLIDAY_VIEW'.
-UPDATE permission_definitions SET alias_for = 'intercompany.control_population_read' WHERE action_name = 'INTERCOMPANY_CONTROL_POPULATION_READ'.
-UPDATE permission_definitions SET alias_for = 'intercompany.entry_acknowledge' WHERE action_name = 'INTERCOMPANY_ENTRY_ACKNOWLEDGE'.
-UPDATE permission_definitions SET alias_for = 'intercompany.entry_create' WHERE action_name = 'INTERCOMPANY_ENTRY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'intercompany.entry_dispute' WHERE action_name = 'INTERCOMPANY_ENTRY_DISPUTE'.
-UPDATE permission_definitions SET alias_for = 'intercompany.entry_match' WHERE action_name = 'INTERCOMPANY_ENTRY_MATCH'.
-UPDATE permission_definitions SET alias_for = 'intercompany.entry_resolve' WHERE action_name = 'INTERCOMPANY_ENTRY_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'intercompany.entry_view' WHERE action_name = 'INTERCOMPANY_ENTRY_VIEW'.
-UPDATE permission_definitions SET alias_for = 'interpretation_record.approve' WHERE action_name = 'INTERPRETATION_RECORD_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'interpretation_record.create' WHERE action_name = 'INTERPRETATION_RECORD_CREATE'.
-UPDATE permission_definitions SET alias_for = 'inventory.control_population_read' WHERE action_name = 'INVENTORY_CONTROL_POPULATION_READ'.
-UPDATE permission_definitions SET alias_for = 'inventory.count_approve' WHERE action_name = 'INVENTORY_COUNT_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'inventory.count_certify' WHERE action_name = 'INVENTORY_COUNT_CERTIFY'.
-UPDATE permission_definitions SET alias_for = 'inventory.count_plan' WHERE action_name = 'INVENTORY_COUNT_PLAN'.
-UPDATE permission_definitions SET alias_for = 'inventory.count_read' WHERE action_name = 'INVENTORY_COUNT_READ'.
-UPDATE permission_definitions SET alias_for = 'inventory.count_record' WHERE action_name = 'INVENTORY_COUNT_RECORD'.
-UPDATE permission_definitions SET alias_for = 'inventory.item_manage' WHERE action_name = 'INVENTORY_ITEM_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'inventory.item_read' WHERE action_name = 'INVENTORY_ITEM_READ'.
-UPDATE permission_definitions SET alias_for = 'inventory.location_manage' WHERE action_name = 'INVENTORY_LOCATION_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'inventory.location_quarantine' WHERE action_name = 'INVENTORY_LOCATION_QUARANTINE'.
-UPDATE permission_definitions SET alias_for = 'inventory.location_read' WHERE action_name = 'INVENTORY_LOCATION_READ'.
-UPDATE permission_definitions SET alias_for = 'inventory.movement_adjust' WHERE action_name = 'INVENTORY_MOVEMENT_ADJUST'.
-UPDATE permission_definitions SET alias_for = 'inventory.movement_create' WHERE action_name = 'INVENTORY_MOVEMENT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'inventory.movement_read' WHERE action_name = 'INVENTORY_MOVEMENT_READ'.
-UPDATE permission_definitions SET alias_for = 'inventory.movement_reverse' WHERE action_name = 'INVENTORY_MOVEMENT_REVERSE'.
-UPDATE permission_definitions SET alias_for = 'inventory.policy_assign' WHERE action_name = 'INVENTORY_POLICY_ASSIGN'.
-UPDATE permission_definitions SET alias_for = 'inventory.valuation_adjust' WHERE action_name = 'INVENTORY_VALUATION_ADJUST'.
-UPDATE permission_definitions SET alias_for = 'inventory.valuation_approve' WHERE action_name = 'INVENTORY_VALUATION_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'inventory.valuation_read' WHERE action_name = 'INVENTORY_VALUATION_READ'.
-UPDATE permission_definitions SET alias_for = 'inventory.valuation_run' WHERE action_name = 'INVENTORY_VALUATION_RUN'.
-UPDATE permission_definitions SET alias_for = 'invoice.approval_decide' WHERE action_name = 'INVOICE_APPROVAL_DECIDE'.
-UPDATE permission_definitions SET alias_for = 'invoice.approval_initiate' WHERE action_name = 'INVOICE_APPROVAL_INITIATE'.
-UPDATE permission_definitions SET alias_for = 'invoice.approval_view' WHERE action_name = 'INVOICE_APPROVAL_VIEW'.
-UPDATE permission_definitions SET alias_for = 'intercompany_control.population_read' WHERE action_name = 'INTERCOMPANY_CONTROL_POPULATION_READ'.
-UPDATE permission_definitions SET alias_for = 'intercompany_entry.acknowledge' WHERE action_name = 'INTERCOMPANY_ENTRY_ACKNOWLEDGE'.
-UPDATE permission_definitions SET alias_for = 'intercompany_entry.create' WHERE action_name = 'INTERCOMPANY_ENTRY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'intercompany_entry.dispute' WHERE action_name = 'INTERCOMPANY_ENTRY_DISPUTE'.
-UPDATE permission_definitions SET alias_for = 'intercompany_entry.match' WHERE action_name = 'INTERCOMPANY_ENTRY_MATCH'.
-UPDATE permission_definitions SET alias_for = 'intercompany_entry.resolve' WHERE action_name = 'INTERCOMPANY_ENTRY_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'intercompany_entry.view' WHERE action_name = 'INTERCOMPANY_ENTRY_VIEW'.
-UPDATE permission_definitions SET alias_for = 'leave.balance_update' WHERE action_name = 'LEAVE_BALANCE_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'leave.balance_view' WHERE action_name = 'LEAVE_BALANCE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'leave.request_approve' WHERE action_name = 'LEAVE_REQUEST_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'leave.request_reject' WHERE action_name = 'LEAVE_REQUEST_REJECT'.
-UPDATE permission_definitions SET alias_for = 'leave.request_submit' WHERE action_name = 'LEAVE_REQUEST_SUBMIT'.
-UPDATE permission_definitions SET alias_for = 'leave.request_view' WHERE action_name = 'LEAVE_REQUEST_VIEW'.
-UPDATE permission_definitions SET alias_for = 'leave.type_create' WHERE action_name = 'LEAVE_TYPE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'leave.type_view' WHERE action_name = 'LEAVE_TYPE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'legal_hold.create' WHERE action_name = 'LEGAL_HOLD_CREATE'.
-UPDATE permission_definitions SET alias_for = 'legal_hold.manage' WHERE action_name = 'LEGAL_HOLD_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'legal_hold.read' WHERE action_name = 'LEGAL_HOLD_READ'.
-UPDATE permission_definitions SET alias_for = 'legal_hold.release' WHERE action_name = 'LEGAL_HOLD_RELEASE'.
-UPDATE permission_definitions SET alias_for = 'lineage.quarantine' WHERE action_name = 'LINEAGE_QUARANTINE'.
-UPDATE permission_definitions SET alias_for = 'lineage.rebuild' WHERE action_name = 'LINEAGE_REBUILD'.
-UPDATE permission_definitions SET alias_for = 'lineage.verify_path' WHERE action_name = 'LINEAGE_VERIFY_PATH'.
-UPDATE permission_definitions SET alias_for = 'lineage.view' WHERE action_name = 'LINEAGE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'meeting.create' WHERE action_name = 'MEETING_CREATE'.
-UPDATE permission_definitions SET alias_for = 'migration.batch_approve' WHERE action_name = 'MIGRATION_BATCH_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'migration.batch_certify' WHERE action_name = 'MIGRATION_BATCH_CERTIFY'.
-UPDATE permission_definitions SET alias_for = 'migration.batch_commit' WHERE action_name = 'MIGRATION_BATCH_COMMIT'.
-UPDATE permission_definitions SET alias_for = 'migration.batch_create' WHERE action_name = 'MIGRATION_BATCH_CREATE'.
-UPDATE permission_definitions SET alias_for = 'migration.batch_validate' WHERE action_name = 'MIGRATION_BATCH_VALIDATE'.
-UPDATE permission_definitions SET alias_for = 'migration.batch_view' WHERE action_name = 'MIGRATION_BATCH_VIEW'.
-UPDATE permission_definitions SET alias_for = 'migration.job_archive' WHERE action_name = 'MIGRATION_JOB_ARCHIVE'.
-UPDATE permission_definitions SET alias_for = 'migration.job_validate' WHERE action_name = 'MIGRATION_JOB_VALIDATE'.
-UPDATE permission_definitions SET alias_for = 'normalized_fact.record' WHERE action_name = 'NORMALIZED_FACT_RECORD'.
-UPDATE permission_definitions SET alias_for = 'normalized_fact.view' WHERE action_name = 'NORMALIZED_FACT_VIEW'.
-UPDATE permission_definitions SET alias_for = 'notification.resolve_outcome' WHERE action_name = 'NOTIFICATION_RESOLVE_OUTCOME'.
-UPDATE permission_definitions SET alias_for = 'notification.send' WHERE action_name = 'NOTIFICATION_SEND'.
-UPDATE permission_definitions SET alias_for = 'notification.suppress' WHERE action_name = 'NOTIFICATION_SUPPRESS'.
-UPDATE permission_definitions SET alias_for = 'notification.view' WHERE action_name = 'NOTIFICATION_VIEW'.
-UPDATE permission_definitions SET alias_for = 'pack_ops.metrics_view' WHERE action_name = 'PACK_OPS_METRICS_VIEW'.
-UPDATE permission_definitions SET alias_for = 'pack_signing_key.register' WHERE action_name = 'PACK_SIGNING_KEY_REGISTER'.
-UPDATE permission_definitions SET alias_for = 'pack_signing_key.retire' WHERE action_name = 'PACK_SIGNING_KEY_RETIRE'.
-UPDATE permission_definitions SET alias_for = 'pack_signing_key.revoke' WHERE action_name = 'PACK_SIGNING_KEY_REVOKE'.
-UPDATE permission_definitions SET alias_for = 'payee_banking_control.population_read' WHERE action_name = 'PAYEE_BANKING_CONTROL_POPULATION_READ'.
-UPDATE permission_definitions SET alias_for = 'payroll.control_population_read' WHERE action_name = 'PAYROLL_CONTROL_POPULATION_READ'.
-UPDATE permission_definitions SET alias_for = 'payroll.parameters_resolve' WHERE action_name = 'PAYROLL_PARAMETERS_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'payroll.run_calculate' WHERE action_name = 'PAYROLL_RUN_CALCULATE'.
-UPDATE permission_definitions SET alias_for = 'payroll.run_create' WHERE action_name = 'PAYROLL_RUN_CREATE'.
-UPDATE permission_definitions SET alias_for = 'payroll.run_finalize' WHERE action_name = 'PAYROLL_RUN_FINALIZE'.
-UPDATE permission_definitions SET alias_for = 'payroll.run_view' WHERE action_name = 'PAYROLL_RUN_VIEW'.
-UPDATE permission_definitions SET alias_for = 'period_close.config' WHERE action_name = 'PERIOD_CLOSE_CONFIG'.
-UPDATE permission_definitions SET alias_for = 'period_close.initiate' WHERE action_name = 'PERIOD_CLOSE_INITIATE'.
-UPDATE permission_definitions SET alias_for = 'period_close.view' WHERE action_name = 'PERIOD_CLOSE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'period.reopen' WHERE action_name = 'PERIOD_REOPEN'.
-UPDATE permission_definitions SET alias_for = 'policy.create' WHERE action_name = 'POLICY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'policy.version_activate' WHERE action_name = 'POLICY_VERSION_ACTIVATE'.
-UPDATE permission_definitions SET alias_for = 'policy.version_activate_global' WHERE action_name = 'POLICY_VERSION_ACTIVATE_GLOBAL'.
-UPDATE permission_definitions SET alias_for = 'policy.version_create' WHERE action_name = 'POLICY_VERSION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'policy.version_create_global' WHERE action_name = 'POLICY_VERSION_CREATE_GLOBAL'.
-UPDATE permission_definitions SET alias_for = 'po.amend' WHERE action_name = 'PO_AMEND'.
-UPDATE permission_definitions SET alias_for = 'po.close' WHERE action_name = 'PO_CLOSE'.
-UPDATE permission_definitions SET alias_for = 'po.issue' WHERE action_name = 'PO_ISSUE'.
-UPDATE permission_definitions SET alias_for = 'prepayment.approve' WHERE action_name = 'PREPAYMENT_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'prepayment.create' WHERE action_name = 'PREPAYMENT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'prepayment.modify' WHERE action_name = 'PREPAYMENT_MODIFY'.
-UPDATE permission_definitions SET alias_for = 'prepayment.recognize' WHERE action_name = 'PREPAYMENT_RECOGNIZE'.
-UPDATE permission_definitions SET alias_for = 'prepayment.terminate' WHERE action_name = 'PREPAYMENT_TERMINATE'.
-UPDATE permission_definitions SET alias_for = 'prepayment.view' WHERE action_name = 'PREPAYMENT_VIEW'.
-UPDATE permission_definitions SET alias_for = 'principal_status.manage' WHERE action_name = 'PRINCIPAL_STATUS_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'procurement.case_approve' WHERE action_name = 'PROCUREMENT_CASE_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'procurement.case_create' WHERE action_name = 'PROCUREMENT_CASE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'procurement.case_issue_order' WHERE action_name = 'PROCUREMENT_CASE_ISSUE_ORDER'.
-UPDATE permission_definitions SET alias_for = 'procurement.case_reject' WHERE action_name = 'PROCUREMENT_CASE_REJECT'.
-UPDATE permission_definitions SET alias_for = 'procurement.case_view' WHERE action_name = 'PROCUREMENT_CASE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'project.approve' WHERE action_name = 'PROJECT_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'project.close_reopen' WHERE action_name = 'PROJECT_CLOSE_REOPEN'.
-UPDATE permission_definitions SET alias_for = 'project.cost_adjust' WHERE action_name = 'PROJECT_COST_ADJUST'.
-UPDATE permission_definitions SET alias_for = 'project.cost_capture' WHERE action_name = 'PROJECT_COST_CAPTURE'.
-UPDATE permission_definitions SET alias_for = 'project.cost_certify' WHERE action_name = 'PROJECT_COST_CERTIFY'.
-UPDATE permission_definitions SET alias_for = 'project.cost_read' WHERE action_name = 'PROJECT_COST_READ'.
-UPDATE permission_definitions SET alias_for = 'project.cost_reclassify' WHERE action_name = 'PROJECT_COST_RECLASSIFY'.
-UPDATE permission_definitions SET alias_for = 'project.create' WHERE action_name = 'PROJECT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'project.estimate_manage' WHERE action_name = 'PROJECT_ESTIMATE_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'project.financial_manage' WHERE action_name = 'PROJECT_FINANCIAL_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'project.profitability_certify' WHERE action_name = 'PROJECT_PROFITABILITY_CERTIFY'.
-UPDATE permission_definitions SET alias_for = 'project.profitability_read' WHERE action_name = 'PROJECT_PROFITABILITY_READ'.
-UPDATE permission_definitions SET alias_for = 'project.read' WHERE action_name = 'PROJECT_READ'.
-UPDATE permission_definitions SET alias_for = 'project.revenue_approve' WHERE action_name = 'PROJECT_REVENUE_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'project.revenue_read' WHERE action_name = 'PROJECT_REVENUE_READ'.
-UPDATE permission_definitions SET alias_for = 'project.revenue_run' WHERE action_name = 'PROJECT_REVENUE_RUN'.
-UPDATE permission_definitions SET alias_for = 'project.revenue_supersede' WHERE action_name = 'PROJECT_REVENUE_SUPERSEDE'.
-UPDATE permission_definitions SET alias_for = 'pr_request.approve' WHERE action_name = 'PR_REQUEST_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'pr_request.create' WHERE action_name = 'PR_REQUEST_CREATE'.
-UPDATE permission_definitions SET alias_for = 'pr_request.reject' WHERE action_name = 'PR_REQUEST_REJECT'.
-UPDATE permission_definitions SET alias_for = 'reclassify_record' WHERE action_name = 'RECLASSIFY_RECORD'.
-UPDATE permission_definitions SET alias_for = 'reconciliation.manage' WHERE action_name = 'RECONCILIATION_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'reconciliation.read' WHERE action_name = 'RECONCILIATION_READ'.
-UPDATE permission_definitions SET alias_for = 'record.declare' WHERE action_name = 'RECORD_DECLARE'.
-UPDATE permission_definitions SET alias_for = 'record.read' WHERE action_name = 'RECORD_READ'.
-UPDATE permission_definitions SET alias_for = 'record.relate' WHERE action_name = 'RECORD_RELATE'.
-UPDATE permission_definitions SET alias_for = 'regulatory.calculation_execute' WHERE action_name = 'REGULATORY_CALCULATION_EXECUTE'.
-UPDATE permission_definitions SET alias_for = 'regulatory.calendar_create' WHERE action_name = 'REGULATORY_CALENDAR_CREATE'.
-UPDATE permission_definitions SET alias_for = 'regulatory.calendar_version_create' WHERE action_name = 'REGULATORY_CALENDAR_VERSION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'regulatory.calendar_version_publish' WHERE action_name = 'REGULATORY_CALENDAR_VERSION_PUBLISH'.
-UPDATE permission_definitions SET alias_for = 'regulatory.calendar_version_set_sources' WHERE action_name = 'REGULATORY_CALENDAR_VERSION_SET_SOURCES'.
-UPDATE permission_definitions SET alias_for = 'regulatory.regime_create' WHERE action_name = 'REGULATORY_REGIME_CREATE'.
-UPDATE permission_definitions SET alias_for = 'regulatory.source_create' WHERE action_name = 'REGULATORY_SOURCE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'regulatory.source_review' WHERE action_name = 'REGULATORY_SOURCE_REVIEW'.
-UPDATE permission_definitions SET alias_for = 'regulatory.source_supersede' WHERE action_name = 'REGULATORY_SOURCE_SUPERSEDE'.
-UPDATE permission_definitions SET alias_for = 'regulatory.submission_create' WHERE action_name = 'REGULATORY_SUBMISSION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'regulatory.submission_record_event' WHERE action_name = 'REGULATORY_SUBMISSION_RECORD_EVENT'.
-UPDATE permission_definitions SET alias_for = 'regulatory.submission_view' WHERE action_name = 'REGULATORY_SUBMISSION_VIEW'.
-UPDATE permission_definitions SET alias_for = 'residency_policy.create' WHERE action_name = 'RESIDENCY_POLICY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'resolution.create' WHERE action_name = 'RESOLUTION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'resolution.pass' WHERE action_name = 'RESOLUTION_PASS'.
-UPDATE permission_definitions SET alias_for = 'resolution.vote' WHERE action_name = 'RESOLUTION_VOTE'.
-UPDATE permission_definitions SET alias_for = 'resolver.cache_invalidate' WHERE action_name = 'RESOLVER_CACHE_INVALIDATE'.
-UPDATE permission_definitions SET alias_for = 'retention.policy_create' WHERE action_name = 'RETENTION_POLICY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'retention.read' WHERE action_name = 'RETENTION_READ'.
-UPDATE permission_definitions SET alias_for = 'retention.rule_approve' WHERE action_name = 'RETENTION_RULE_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'retention.rule_manage' WHERE action_name = 'RETENTION_RULE_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'retention.rule_resolve' WHERE action_name = 'RETENTION_RULE_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'retention.state_manage' WHERE action_name = 'RETENTION_STATE_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'review_cycle.close' WHERE action_name = 'REVIEW_CYCLE_CLOSE'.
-UPDATE permission_definitions SET alias_for = 'review_cycle.create' WHERE action_name = 'REVIEW_CYCLE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'review_cycle.view' WHERE action_name = 'REVIEW_CYCLE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'review_record.complete' WHERE action_name = 'REVIEW_RECORD_COMPLETE'.
-UPDATE permission_definitions SET alias_for = 'review_record.create' WHERE action_name = 'REVIEW_RECORD_CREATE'.
-UPDATE permission_definitions SET alias_for = 'review_record.submit' WHERE action_name = 'REVIEW_RECORD_SUBMIT'.
-UPDATE permission_definitions SET alias_for = 'review_record.view' WHERE action_name = 'REVIEW_RECORD_VIEW'.
-UPDATE permission_definitions SET alias_for = 'risk_assessment.archive' WHERE action_name = 'RISK_ASSESSMENT_ARCHIVE'.
-UPDATE permission_definitions SET alias_for = 'risk_score.create' WHERE action_name = 'RISK_SCORE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'risk_threshold_rule.create' WHERE action_name = 'RISK_THRESHOLD_RULE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'rule_decision.view' WHERE action_name = 'RULE_DECISION_VIEW'.
-UPDATE permission_definitions SET alias_for = 'rule_resolution.resolve' WHERE action_name = 'RULE_RESOLUTION_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'search.contract_create' WHERE action_name = 'SEARCH_CONTRACT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'search.contract_transition' WHERE action_name = 'SEARCH_CONTRACT_TRANSITION'.
-UPDATE permission_definitions SET alias_for = 'search.export' WHERE action_name = 'SEARCH_EXPORT'.
-UPDATE permission_definitions SET alias_for = 'search.generation_activate' WHERE action_name = 'SEARCH_GENERATION_ACTIVATE'.
-UPDATE permission_definitions SET alias_for = 'search.generation_create' WHERE action_name = 'SEARCH_GENERATION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'search.restriction_apply' WHERE action_name = 'SEARCH_RESTRICTION_APPLY'.
-UPDATE permission_definitions SET alias_for = 'search.source_register' WHERE action_name = 'SEARCH_SOURCE_REGISTER'.
-UPDATE permission_definitions SET alias_for = 'secret.audit_read' WHERE action_name = 'SECRET_AUDIT_READ'.
-UPDATE permission_definitions SET alias_for = 'secret.emergency_retrieval' WHERE action_name = 'SECRET_EMERGENCY_RETRIEVAL'.
-UPDATE permission_definitions SET alias_for = 'secret.exception_create' WHERE action_name = 'SECRET_EXCEPTION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'secret.exception_list' WHERE action_name = 'SECRET_EXCEPTION_LIST'.
-UPDATE permission_definitions SET alias_for = 'secret.exception_revoke' WHERE action_name = 'SECRET_EXCEPTION_REVOKE'.
-UPDATE permission_definitions SET alias_for = 'secret.lease_read' WHERE action_name = 'SECRET_LEASE_READ'.
-UPDATE permission_definitions SET alias_for = 'secret.lease_revoke' WHERE action_name = 'SECRET_LEASE_REVOKE'.
-UPDATE permission_definitions SET alias_for = 'secret.material_write' WHERE action_name = 'SECRET_MATERIAL_WRITE'.
-UPDATE permission_definitions SET alias_for = 'secret.policy_create' WHERE action_name = 'SECRET_POLICY_CREATE'.
-UPDATE permission_definitions SET alias_for = 'secret.policy_version_activate' WHERE action_name = 'SECRET_POLICY_VERSION_ACTIVATE'.
-UPDATE permission_definitions SET alias_for = 'secret.policy_version_create' WHERE action_name = 'SECRET_POLICY_VERSION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'secret.policy_version_list' WHERE action_name = 'SECRET_POLICY_VERSION_LIST'.
-UPDATE permission_definitions SET alias_for = 'secret.rotate' WHERE action_name = 'SECRET_ROTATE'.
-UPDATE permission_definitions SET alias_for = 'semantic_model.manage' WHERE action_name = 'SEMANTIC_MODEL_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'semantic_model.read' WHERE action_name = 'SEMANTIC_MODEL_READ'.
-UPDATE permission_definitions SET alias_for = 'share.buyback' WHERE action_name = 'SHARE_BUYBACK'.
-UPDATE permission_definitions SET alias_for = 'share.issuance' WHERE action_name = 'SHARE_ISSUANCE'.
-UPDATE permission_definitions SET alias_for = 'snapshot.certify' WHERE action_name = 'SNAPSHOT_CERTIFY'.
-UPDATE permission_definitions SET alias_for = 'snapshot.create' WHERE action_name = 'SNAPSHOT_CREATE'.
-UPDATE permission_definitions SET alias_for = 'snapshot.seal' WHERE action_name = 'SNAPSHOT_SEAL'.
-UPDATE permission_definitions SET alias_for = 'snapshot.supersede' WHERE action_name = 'SNAPSHOT_SUPERSEDE'.
-UPDATE permission_definitions SET alias_for = 'snapshot.view' WHERE action_name = 'SNAPSHOT_VIEW'.
-UPDATE permission_definitions SET alias_for = 'source_authority_map.create' WHERE action_name = 'SOURCE_AUTHORITY_MAP_CREATE'.
-UPDATE permission_definitions SET alias_for = 'source_authority_map.supersede' WHERE action_name = 'SOURCE_AUTHORITY_MAP_SUPERSEDE'.
-UPDATE permission_definitions SET alias_for = 'source_authority_map.view' WHERE action_name = 'SOURCE_AUTHORITY_MAP_VIEW'.
-UPDATE permission_definitions SET alias_for = 'source_change_notice.close' WHERE action_name = 'SOURCE_CHANGE_NOTICE_CLOSE'.
-UPDATE permission_definitions SET alias_for = 'source_change_notice.create' WHERE action_name = 'SOURCE_CHANGE_NOTICE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'source_change_notice.review' WHERE action_name = 'SOURCE_CHANGE_NOTICE_REVIEW'.
-UPDATE permission_definitions SET alias_for = 'spend_check.submit' WHERE action_name = 'SPEND_CHECK_SUBMIT'.
-UPDATE permission_definitions SET alias_for = 'spend_policy.manage' WHERE action_name = 'SPEND_POLICY_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'spend_policy.view' WHERE action_name = 'SPEND_POLICY_VIEW'.
-UPDATE permission_definitions SET alias_for = 'subledger.control_run' WHERE action_name = 'SUBLEDGER_CONTROL_RUN'.
-UPDATE permission_definitions SET alias_for = 'subledger.control_view' WHERE action_name = 'SUBLEDGER_CONTROL_VIEW'.
-UPDATE permission_definitions SET alias_for = 'submission_profile.resolve' WHERE action_name = 'SUBMISSION_PROFILE_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'supersede.classification' WHERE action_name = 'SUPERSEDE_CLASSIFICATION'.
-UPDATE permission_definitions SET alias_for = 'task.close' WHERE action_name = 'TASK_CLOSE'.
-UPDATE permission_definitions SET alias_for = 'task.create' WHERE action_name = 'TASK_CREATE'.
-UPDATE permission_definitions SET alias_for = 'task.manage' WHERE action_name = 'TASK_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'tax.adjust' WHERE action_name = 'TAX_ADJUST'.
-UPDATE permission_definitions SET alias_for = 'tax.authority_control_population_read' WHERE action_name = 'TAX_AUTHORITY_CONTROL_POPULATION_READ'.
-UPDATE permission_definitions SET alias_for = 'tax.calculate' WHERE action_name = 'TAX_CALCULATE'.
-UPDATE permission_definitions SET alias_for = 'tax.determination_create' WHERE action_name = 'TAX_DETERMINATION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'tax.determination_override' WHERE action_name = 'TAX_DETERMINATION_OVERRIDE'.
-UPDATE permission_definitions SET alias_for = 'tax.filing_submit' WHERE action_name = 'TAX_FILING_SUBMIT'.
-UPDATE permission_definitions SET alias_for = 'tax.identity_bundle_create' WHERE action_name = 'TAX_IDENTITY_BUNDLE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'tax.interface_create' WHERE action_name = 'TAX_INTERFACE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'tax.profile_create' WHERE action_name = 'TAX_PROFILE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'tax.profile_view' WHERE action_name = 'TAX_PROFILE_VIEW'.
-UPDATE permission_definitions SET alias_for = 'tax.return_assess' WHERE action_name = 'TAX_RETURN_ASSESS'.
-UPDATE permission_definitions SET alias_for = 'tax.return_create' WHERE action_name = 'TAX_RETURN_CREATE'.
-UPDATE permission_definitions SET alias_for = 'tax.return_submit' WHERE action_name = 'TAX_RETURN_SUBMIT'.
-UPDATE permission_definitions SET alias_for = 'tax.return_update' WHERE action_name = 'TAX_RETURN_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'tax.rule_create' WHERE action_name = 'TAX_RULE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'tax.rule_update' WHERE action_name = 'TAX_RULE_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'tax.view' WHERE action_name = 'TAX_VIEW'.
-UPDATE permission_definitions SET alias_for = 'template.approve' WHERE action_name = 'TEMPLATE_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'template.create' WHERE action_name = 'TEMPLATE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'template.manage' WHERE action_name = 'TEMPLATE_MANAGE'.
-UPDATE permission_definitions SET alias_for = 'template.update' WHERE action_name = 'TEMPLATE_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'tenant.defaults_change' WHERE action_name = 'TENANT_DEFAULTS_CHANGE'.
-UPDATE permission_definitions SET alias_for = 'tenant.home_region_change' WHERE action_name = 'TENANT_HOME_REGION_CHANGE'.
-UPDATE permission_definitions SET alias_for = 'tenant.home_region_change_approve' WHERE action_name = 'TENANT_HOME_REGION_CHANGE_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'tenant.host_binding_create' WHERE action_name = 'TENANT_HOST_BINDING_CREATE'.
-UPDATE permission_definitions SET alias_for = 'tenant.initiate_termination' WHERE action_name = 'TENANT_INITIATE_TERMINATION'.
-UPDATE permission_definitions SET alias_for = 'tenant.initiate_termination_approve' WHERE action_name = 'TENANT_INITIATE_TERMINATION_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'tenant.provisioning_abandon' WHERE action_name = 'TENANT_PROVISIONING_ABANDON'.
-UPDATE permission_definitions SET alias_for = 'tenant.provisioning_abandon_approve' WHERE action_name = 'TENANT_PROVISIONING_ABANDON_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'tenant.provisioning_retry' WHERE action_name = 'TENANT_PROVISIONING_RETRY'.
-UPDATE permission_definitions SET alias_for = 'tenant.provision_approve' WHERE action_name = 'TENANT_PROVISION_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'treasury.account_register' WHERE action_name = 'TREASURY_ACCOUNT_REGISTER'.
-UPDATE permission_definitions SET alias_for = 'treasury.cash_position_calculate' WHERE action_name = 'TREASURY_CASH_POSITION_CALCULATE'.
-UPDATE permission_definitions SET alias_for = 'treasury.cash_position_publish' WHERE action_name = 'TREASURY_CASH_POSITION_PUBLISH'.
-UPDATE permission_definitions SET alias_for = 'treasury.fx_exposure_calculate' WHERE action_name = 'TREASURY_FX_EXPOSURE_CALCULATE'.
-UPDATE permission_definitions SET alias_for = 'treasury.fx_exposure_publish' WHERE action_name = 'TREASURY_FX_EXPOSURE_PUBLISH'.
-UPDATE permission_definitions SET alias_for = 'treasury.fx_rate_record' WHERE action_name = 'TREASURY_FX_RATE_RECORD'.
-UPDATE permission_definitions SET alias_for = 'treasury.positions_view' WHERE action_name = 'TREASURY_POSITIONS_VIEW'.
-UPDATE permission_definitions SET alias_for = 'treasury.threshold_set' WHERE action_name = 'TREASURY_THRESHOLD_SET'.
-UPDATE permission_definitions SET alias_for = 'treasury.transfer_approve' WHERE action_name = 'TREASURY_TRANSFER_APPROVE'.
-UPDATE permission_definitions SET alias_for = 'treasury.transfer_authorize' WHERE action_name = 'TREASURY_TRANSFER_AUTHORIZE'.
-UPDATE permission_definitions SET alias_for = 'treasury.transfer_execute' WHERE action_name = 'TREASURY_TRANSFER_EXECUTE'.
-UPDATE permission_definitions SET alias_for = 'treasury.transfer_initiate' WHERE action_name = 'TREASURY_TRANSFER_INITIATE'.
-UPDATE permission_definitions SET alias_for = 'treasury.transfer_modify' WHERE action_name = 'TREASURY_TRANSFER_MODIFY'.
-UPDATE permission_definitions SET alias_for = 'treasury.transfer_resolve' WHERE action_name = 'TREASURY_TRANSFER_RESOLVE'.
-UPDATE permission_definitions SET alias_for = 'user_provision' WHERE action_name = 'USER_PROVISION'.
-UPDATE permission_definitions SET alias_for = 'vendor_dd.initiate' WHERE action_name = 'VENDOR_DD_INITIATE'.
-UPDATE permission_definitions SET alias_for = 'vendor_dd.view' WHERE action_name = 'VENDOR_DD_VIEW'.
-UPDATE permission_definitions SET alias_for = 'wage_revise' WHERE action_name = 'WAGE_REVISE'.
-UPDATE permission_definitions SET alias_for = 'withholding.obligation_cancel' WHERE action_name = 'WITHHOLDING_OBLIGATION_CANCEL'.
-UPDATE permission_definitions SET alias_for = 'withholding.obligation_create' WHERE action_name = 'WITHHOLDING_OBLIGATION_CREATE'.
-UPDATE permission_definitions SET alias_for = 'withholding.obligation_remit' WHERE action_name = 'WITHHOLDING_OBLIGATION_REMIT'.
-UPDATE permission_definitions SET alias_for = 'withholding.obligation_update' WHERE action_name = 'WITHHOLDING_OBLIGATION_UPDATE'.
-UPDATE permission_definitions SET alias_for = 'withholding.tax_calculate' WHERE action_name = 'WITHHOLDING_TAX_CALCULATE'.
-UPDATE permission_definitions SET alias_for = 'workspace.create' WHERE action_name = 'WORKSPACE_CREATE'.
-UPDATE permission_definitions SET alias_for = 'workspace.status_transition' WHERE action_name = 'WORKSPACE_STATUS_TRANSITION'.
-UPDATE permission_definitions SET alias_for = 'workspace.update' WHERE action_name = 'WORKSPACE_UPDATE'.
+UPDATE permission_definitions p
+   SET alias_for = v.canonical
+  FROM (VALUES
+    ('PAYMENT_RELEASE', 'payment.release'),
+    ('PAYMENT_INITIATE', 'payment.initiate'),
+    ('PAYMENT_APPROVE', 'payment.approve'),
+    ('JOURNAL_POST', 'journal.post'),
+    ('JOURNAL_REVERSE', 'journal.reverse'),
+    ('PERIOD_CLOSE', 'period.close'),
+    ('PERIOD_REOPEN', 'period.reopen'),
+    ('TAX_RETURN_FILE', 'tax_return.file'),
+    ('CONTRACT_EXECUTE', 'contract.execute'),
+    ('IAM_ASSIGNMENT_GRANT', 'iam.assignment.grant'),
+    ('IAM_ASSIGNMENT_REVOKE', 'iam.assignment.revoke'),
+    ('ROLE_MANAGE', 'iam.role.manage'),
+    ('IAM_PERMISSION_BUNDLE_MANAGE', 'iam.permission_bundle.manage'),
+    ('SOD_RULE_MANAGE_GLOBAL', 'iam.sod_rule.manage'),
+    ('ABAC_RULE_MANAGE_GLOBAL', 'iam.abac_rule.manage'),
+    ('DELEGATION_ADMINISTER', 'iam.delegation.grant'),
+    ('DELEGATION_REVOKE', 'iam.delegation.revoke'),
+    ('IAM_PAM_MANAGE', 'iam.pam.manage'),
+    ('IAM_BREAK_GLASS_MANAGE', 'iam.break_glass.manage'),
+    ('IAM_SUPPORT_MANAGE', 'iam.support.manage'),
+    ('SUPPLIER_BANK_DETAILS_EDIT', 'supplier.bank_details.edit'),
+    ('AUDIT_EVIDENCE_EXPORT', 'audit_evidence.export'),
+    ('COMMERCIAL_INVOICE_APPROVE', 'customer_invoice.approve'),
+    ('COMMERCIAL_INVOICE_ISSUE', 'customer_invoice.issue'),
+    ('AP_INVOICE_APPROVE', 'supplier_invoice.approve'),
+    ('BANKREC_MATCH', 'supplier_invoice.match'),
+    ('AP_PAYMENT_REQUEST', 'supplier_invoice.submit'),
+    ('GL_JOURNAL_POST', 'gl.journal.post'),
+    ('GL_JOURNAL_REVERSE', 'gl.journal.reverse'),
+    ('GL_POSTING_EXECUTE', 'gl.posting.execute'),
+    ('GL_POSTING_REVERSE', 'gl.posting.reverse'),
+    ('BANK_ACCOUNT_CLOSE', 'bank_account.close'),
+    ('BANK_ACCOUNT_MANAGE', 'bank_account.manage'),
+    ('BANK_ACCOUNT_VERIFY', 'bank_account.verify'),
+    ('FINANCIAL_CLOSE_CONTROL_POPULATION_READ', 'financial_close_control.population_read'),
+    ('FINCTRL_APPROVE_RULE', 'finctrl.approve_rule'),
+    ('FINCTRL_CERTIFY', 'finctrl.certify'),
+    ('FINCTRL_DEFINE', 'finctrl.define'),
+    ('FINCTRL_EVIDENCE_EXPORT', 'finctrl.evidence_export'),
+    ('FINCTRL_EXCEPTION_ASSIGN', 'finctrl.exception_assign'),
+    ('FINCTRL_EXCEPTION_RESOLVE', 'finctrl.exception_resolve'),
+    ('FINCTRL_EXCEPTION_WAIVE', 'finctrl.exception_waive'),
+    ('FINCTRL_EXECUTE', 'finctrl.execute'),
+    ('FINCTRL_POLICY_MANAGE', 'finctrl.policy_manage'),
+    ('FINCTRL_READ', 'finctrl.read'),
+    ('FINCTRL_REPERFORM', 'finctrl.reperform'),
+    ('FINCTRL_RUN_CREATE', 'finctrl.run_create'),
+    ('CONFIGURATION_GLOBAL_WRITE', 'configuration.global_write'),
+    ('CONFIGURATION_WRITE', 'configuration.write'),
+    ('FEATURE_FLAG_GLOBAL_WRITE', 'feature_flag.global_write'),
+    ('FEATURE_FLAG_WRITE', 'feature_flag.write'),
+    ('SECRET_POLICY_CREATE', 'secret.policy_create'),
+    ('SECRET_POLICY_VERSION_ACTIVATE', 'secret.policy_version_activate'),
+    ('SECRET_POLICY_VERSION_CREATE', 'secret.policy_version_create'),
+    ('SECRET_POLICY_VERSION_LIST', 'secret.policy_version_list'),
+    ('SECRET_ROTATE', 'secret.rotate'),
+    ('SECRET_EMERGENCY_RETRIEVAL', 'secret.emergency_retrieval'),
+    ('SECRET_EXCEPTION_CREATE', 'secret.exception_create'),
+    ('SECRET_EXCEPTION_LIST', 'secret.exception_list'),
+    ('SECRET_EXCEPTION_REVOKE', 'secret.exception_revoke'),
+    ('SECRET_LEASE_READ', 'secret.lease_read'),
+    ('SECRET_LEASE_REVOKE', 'secret.lease_revoke'),
+    ('SECRET_MATERIAL_WRITE', 'secret.material_write'),
+    ('SECRET_AUDIT_READ', 'secret.audit_read'),
+    ('SECURITY_POLICY_MANAGE', 'security_policy.manage'),
+    ('SCHEMA_PUBLISH', 'schema.publish'),
+    ('PLATFORM_ADMIN', 'platform.admin'),
+    ('TENANT_ADMIN', 'tenant.admin'),
+    ('TENANT_PROVISION', 'tenant.provision'),
+    ('TENANT_ACTIVATE', 'tenant.activate'),
+    ('TENANT_SUSPEND', 'tenant.suspend'),
+    ('TENANT_RESUME', 'tenant.resume'),
+    ('TENANT_LIFECYCLE_TRANSITION', 'tenant.lifecycle_transition'),
+    ('ENTITY_CREATE', 'entity.create'),
+    ('ENTITY_UPDATE', 'entity.update'),
+    ('ENTITY_MANAGE', 'entity.manage'),
+    ('ENTITY_VERIFY', 'entity.verify'),
+    ('ENTITY_MERGE', 'entity.merge'),
+    ('ENTITY_UNMERGE', 'entity.unmerge'),
+    ('IDENTITY_SUBJECT_READ', 'identity.subject_read'),
+    ('IDENTITY_AUTH_EVENT_READ', 'identity.auth_event_read'),
+    ('IDENTITY_MERGE', 'identity.merge'),
+    ('IDENTITY_CONTEXT_CACHE_REFRESH', 'identity.context_cache_refresh'),
+    ('IDENTITY_CONTEXT_TENANT_INVALIDATE', 'identity.context_tenant_invalidate'),
+    ('IDENTITY_SUPPORT_CONTEXT_ATTACH', 'identity.support_context_attach'),
+    ('IDENTITY_SUPPORT_CONTEXT_REVIEW', 'identity.support_context_review'),
+    ('IDENTITY_SUPPORT_CONTEXT_REVOKE', 'identity.support_context_revoke'),
+    ('OBLIGATION_CREATE', 'obligation.create'),
+    ('OBLIGATION_FULFILL', 'obligation.fulfill'),
+    ('OBLIGATION_READ', 'obligation.read'),
+    ('OBLIGATION_UPDATE', 'obligation.update'),
+    ('OBLIGATION_RULE_CREATE', 'obligation.rule_create'),
+    ('OBLIGATION_RULE_PUBLISH', 'obligation.rule_publish'),
+    ('OBLIGATION_RULE_SET_PROVENANCE', 'obligation.rule_set_provenance'),
+    ('OBLIGATION_STATUS_UPDATE', 'obligation.status_update'),
+    ('WORKFLOW_APPROVE', 'workflow.approve'),
+    ('EVIDENCE_MANIFEST_GENERATE', 'evidence.manifest_generate'),
+    ('EVIDENCE_MANIFEST_READ', 'evidence.manifest_read'),
+    ('EVIDENCE_REQUEST_CREATE', 'evidence.request_create'),
+    ('EVIDENCE_REQUEST_EVALUATE', 'evidence.request_evaluate'),
+    ('EVIDENCE_REQUEST_MANAGE', 'evidence.request_manage'),
+    ('EVIDENCE_REQUEST_SUBMIT_RESPONSE', 'evidence.request_submit_response'),
+    ('EVIDENCE_REQUIREMENT_CREATE', 'evidence.requirement_create'),
+    ('EVIDENCE_REQUIREMENT_RETIRE', 'evidence.requirement_retire'),
+    ('OBLIGATION_CALCULATION_CALCULATE', 'obligation.calculation_calculate'),
+    ('PARTY_CREATE', 'party.create'),
+    ('PARTY_AMEND', 'party.amend'),
+    ('PARTY_ROLE_MANAGE', 'party.role_manage'),
+    ('PARTY_IDENTIFIER_LINK', 'party.identifier_link'),
+    ('PARTY_IDENTIFIER_REVEAL', 'party.identifier_reveal'),
+    ('PARTY_MERGE', 'party.merge'),
+    ('PARTY_SPLIT', 'party.split'),
+    ('PARTY_RESOLUTION_DECIDE', 'party.resolution_decide'),
+    ('JURISDICTION_ALIAS_AMEND', 'jurisdiction.alias_amend'),
+    ('JURISDICTION_ALIAS_END', 'jurisdiction.alias_end'),
+    ('JURISDICTION_IMPORT_PROPOSE', 'jurisdiction.import_propose'),
+    ('JURISDICTION_IMPORT_APPROVE', 'jurisdiction.import_approve'),
+    ('JURISDICTION_IMPORT_VIEW', 'jurisdiction.import_view'),
+    ('JURISDICTION_RULE_CREATE', 'jurisdiction.rule_create'),
+    ('JURISDICTION_RULE_RECORD_DRIFT', 'jurisdiction.rule_record_drift'),
+    ('JURISDICTION_RULE_SET_PARAMETERS', 'jurisdiction.rule_set_parameters'),
+    ('JURISDICTION_RULE_SET_PROVENANCE', 'jurisdiction.rule_set_provenance'),
+    ('JURISDICTION_RULE_TRANSITION', 'jurisdiction.rule_transition'),
+    ('JURISDICTION_PACK_VERSION_CREATE', 'jurisdiction.pack_version_create'),
+    ('JURISDICTION_PACK_VERSION_PUBLISH', 'jurisdiction.pack_version_publish'),
+    ('JURISDICTION_PACK_VERSION_VERIFY', 'jurisdiction.pack_version_verify'),
+    ('JURISDICTION_PACK_VERSION_DEPLOY', 'jurisdiction.pack_version_deploy'),
+    ('JURISDICTION_ROLLOUT_CREATE', 'jurisdiction.rollout_create'),
+    ('JURISDICTION_ROLLOUT_TRANSITION', 'jurisdiction.rollout_transition'),
+    ('JURISDICTION_ROLLOUT_ATTEST', 'jurisdiction.rollout_attest'),
+    ('JURISDICTION_ROLLOUT_SEED', 'jurisdiction.rollout_seed'),
+    ('JURISDICTION_ROLLOUT_LINK_PACKS', 'jurisdiction.rollout_link_packs'),
+    ('JURISDICTION_ROLLOUT_SET_OWNER', 'jurisdiction.rollout_set_owner'),
+    ('JURISDICTION_ROLLOUT_EXPERT_APPROVE', 'jurisdiction.rollout_expert_approve'),
+    ('JURISDICTION_ROLLOUT_VIEW', 'jurisdiction.rollout_view'),
+    ('JURISDICTION_PACK_VERSION_AUTHOR_TESTS', 'jurisdiction.pack_version_author_tests'),
+    ('JURISDICTION_PACK_VERSION_BLOCK', 'jurisdiction.pack_version_block'),
+    ('JURISDICTION_PACK_VERSION_COMPLETE_RETROSPECTIVE', 'jurisdiction.pack_version_complete_retrospective'),
+    ('JURISDICTION_PACK_VERSION_COMPILE', 'jurisdiction.pack_version_compile'),
+    ('JURISDICTION_PACK_VERSION_DECLARE_HOTFIX', 'jurisdiction.pack_version_declare_hotfix'),
+    ('JURISDICTION_PACK_VERSION_REVIEW', 'jurisdiction.pack_version_review'),
+    ('JURISDICTION_PACK_VERSION_ROLLBACK', 'jurisdiction.pack_version_rollback'),
+    ('JURISDICTION_PACK_VERSION_SIGN', 'jurisdiction.pack_version_sign'),
+    ('JURISDICTION_PACK_VERSION_SUBMIT', 'jurisdiction.pack_version_submit'),
+    ('JURISDICTION_PACK_VERSION_UNBLOCK', 'jurisdiction.pack_version_unblock'),
+    ('JURISDICTION_PACK_VERSION_WITHDRAW', 'jurisdiction.pack_version_withdraw'),
+    ('JURISDICTION_SUPPORT_VIEW', 'jurisdiction.support_view'),
+    ('ACCOUNTING_POLICY_DRAFT', 'accounting.policy_draft'),
+    ('ACCOUNTING_POLICY_APPROVE', 'accounting.policy_approve'),
+    ('ACCOUNTING_POLICY_ACTIVATE', 'accounting.policy_activate'),
+    ('ACCOUNTING_POLICY_EMERGENCY_SUSPEND', 'accounting.policy_emergency_suspend'),
+    ('PAYMENT_TERM_CREATE', 'payment_term.create'),
+    ('PAYMENT_TERM_APPROVE', 'payment_term.approve'),
+    ('PAYMENT_TERM_SUPERSEDE', 'payment_term.supersede'),
+    ('PAYMENT_TERM_RETIRE', 'payment_term.retire'),
+    ('ACCRUAL_CREATE', 'accretion.create'),
+    ('ACCRUAL_AMEND', 'accretion.amend'),
+    ('ACCRUAL_APPROVE', 'accretion.approve'),
+    ('ACCRUAL_CANCEL', 'accretion.cancel'),
+    ('ACCRUAL_RECOGNIZE', 'accretion.recognize'),
+    ('ACCRUAL_RECOGNITION_REVERSE', 'accretion.recognition_reverse'),
+    ('ACCRUAL_VIEW', 'accretion.view'),
+    ('ALLOCATION_EXECUTE', 'allocation.execute'),
+    ('ALLOCATION_RULE_CREATE', 'allocation.rule_create'),
+    ('ALLOCATION_RULE_APPROVE', 'allocation.rule_approve'),
+    ('ALLOCATION_RULE_SUPERSEDE', 'allocation.rule_supersede'),
+    ('ALLOCATION_VIEW', 'allocation.view'),
+    ('ANALYTICAL_DATA_PLATFORM_MANAGE', 'analytical_data_platform.manage'),
+    ('ANALYTICAL_DATA_PLATFORM_READ', 'analytical_data_platform.read'),
+    ('APPLICABILITY_DECISION_READ', 'applicability_decision.read'),
+    ('APPLICABILITY_DECISION_RECORD', 'applicability_decision.record'),
+    ('APPROVAL_REQUEST_READ', 'approval_request.read'),
+    ('AP_CONTROL_POPULATION_READ', 'ap_control.population_read'),
+    ('AP_INVOICE_CREATE', 'ap.invoice_create'),
+    ('AP_INVOICE_VALIDATE', 'ap.invoice_validate'),
+    ('AR_CONTROL_POPULATION_READ', 'ar_control.population_read'),
+    ('AR_INVOICE_ISSUE', 'ar.invoice_issue'),
+    ('AR_INVOICE_SEND', 'ar.invoice_send'),
+    ('AR_MARK_OVERDUE', 'ar.mark_overdue'),
+    ('AR_PAYMENT_RECEIVE', 'ar.payment_receive'),
+    ('ASSET_APPROVE_REGISTRATION', 'asset.approve_registration'),
+    ('ASSET_BOOK_ASSIGN', 'asset.book_assign'),
+    ('ASSET_COMPONENT_MANAGE', 'asset.component_manage'),
+    ('ASSET_CREATE', 'asset.create'),
+    ('ASSET_EVENT_APPLY', 'asset.event_apply'),
+    ('ASSET_EVENT_APPROVE', 'asset.event_approve'),
+    ('ASSET_EVENT_CORRECT', 'asset.event_correct'),
+    ('ASSET_EVENT_CREATE', 'asset.event_create'),
+    ('ASSET_EVENT_VIEW', 'asset.event_view'),
+    ('ASSET_MERGE_SPLIT', 'asset.merge_split'),
+    ('ASSET_METADATA_MANAGE', 'asset.metadata_manage'),
+    ('ASSET_REQUEST_CAPITALIZATION', 'asset.request_capitalization'),
+    ('ASSET_SUSPEND', 'asset.suspend'),
+    ('ASSET_VIEW', 'asset.view'),
+    ('ASSISTANT_MANAGE', 'assistant.manage'),
+    ('ASSISTANT_READ', 'assistant.read'),
+    ('ATTESTATION_CREATE', 'attestation.create'),
+    ('ATTESTATION_READ', 'attestation.read'),
+    ('ATTESTATION_REVOKE', 'attestation.revoke'),
+    ('AUDIT_ENGAGEMENT_ACCEPTANCE_DECIDE', 'audit_engagement.acceptance_decide'),
+    ('AUDIT_ENGAGEMENT_ACCEPTANCE_SUBMIT', 'audit_engagement.acceptance_submit'),
+    ('AUDIT_ENGAGEMENT_CREATE', 'audit_engagement.create'),
+    ('AUDIT_ENGAGEMENT_MANAGE', 'audit_engagement.manage'),
+    ('AUDIT_ENGAGEMENT_READ', 'audit_engagement.read'),
+    ('AUDIT_ENTRY_REMEDIATE', 'audit_entry.remediate'),
+    ('AUDIT_EVIDENCE_MANAGE', 'audit_evidence.manage'),
+    ('AUDIT_EVIDENCE_READ', 'audit_evidence.read'),
+    ('AUDIT_EVIDENCE_REGISTER', 'audit_evidence.register'),
+    ('AUDIT_FINDING_CLOSE', 'audit_finding.close'),
+    ('AUDIT_FINDING_CREATE', 'audit_finding.create'),
+    ('AUDIT_FINDING_MANAGE', 'audit_finding.manage'),
+    ('AUDIT_PLAN_APPROVE', 'audit_plan.approve'),
+    ('AUDIT_PLAN_MANAGE', 'audit_plan.manage'),
+    ('AUDIT_PLAN_READ', 'audit_plan.read'),
+    ('AUDIT_READ', 'audit.read'),
+    ('AUDIT_REVIEW_MANAGE', 'audit.review_manage'),
+    ('AUDIT_REVIEW_READ', 'audit.review_read'),
+    ('AUDIT_REVIEW_SIGNOFF', 'audit.review_signoff'),
+    ('AUDIT_WORKPAPER_LOCK', 'audit_workpaper.lock'),
+    ('AUDIT_WORKPAPER_MANAGE', 'audit_workpaper.manage'),
+    ('AUDIT_WORKPAPER_READ', 'audit_workpaper.read'),
+    ('AUTOMATION_ACTION_DECIDE', 'automation.action_decide'),
+    ('AUTOMATION_ACTION_PROPOSE', 'automation.action_propose'),
+    ('BANKING_CONTROL_POPULATION_READ', 'banking_control.population_read'),
+    ('BANKREC_CERTIFY', 'bankrec.certify'),
+    ('BANKREC_COMPLETE_STATEMENT', 'bankrec.complete_statement'),
+    ('BANKREC_CONFLICT_RESOLVE', 'bankrec.conflict_resolve'),
+    ('BANKREC_FLAG_EXCEPTION', 'bankrec.flag_exception'),
+    ('BANKREC_READ', 'bankrec.read'),
+    ('BANKREC_RUN', 'bankrec.run'),
+    ('BANKREC_STATEMENT_INGEST', 'bankrec.statement_ingest'),
+    ('BENEFITS_CANCEL', 'benefits.cancel'),
+    ('BENEFITS_CREATE', 'benefits.create'),
+    ('BENEFITS_ENROLL', 'benefits.enroll'),
+    ('BENEFITS_UPDATE', 'benefits.update'),
+    ('BENEFITS_VIEW', 'benefits.view'),
+    ('BILLING_ADMIN', 'billing.admin'),
+    ('BONUS_APPROVE', 'bonus.approve'),
+    ('BONUS_GRANT', 'bonus.grant'),
+    ('CATALOG_APPROVE', 'catalog.approve'),
+    ('CATALOG_MANAGE', 'catalog.manage'),
+    ('CATALOG_MAPPING_LINK', 'catalog.mapping_link'),
+    ('CATALOG_READ', 'catalog.read'),
+    ('CLASSIFICATION_MANAGE', 'classification.manage'),
+    ('CLASSIFICATION_READ', 'classification.read'),
+    ('CLASSIFY_RECORD', 'classify_record'),
+    ('CLAUSE_CREATE', 'clause.create'),
+    ('CLAUSE_UPDATE', 'clause.update'),
+    ('COA_ACCOUNT_CREATE', 'coa.account_create'),
+    ('COA_ACCOUNT_DEACTIVATE', 'coa.account_deactivate'),
+    ('COA_ACCOUNT_VIEW', 'coa.account_view'),
+    ('COA_CONTROL_ACCOUNT_POSTING_OVERRIDE', 'coa.control_account_posting_override'),
+    ('COA_MAPPING_SET', 'coa.mapping_set'),
+    ('COA_MAPPING_VIEW', 'coa.mapping_view'),
+    ('COMMENT_CREATE', 'comment.create'),
+    ('COMMENT_MANAGE', 'comment.manage'),
+    ('COMMENT_READ', 'comment.read'),
+    ('COMMENT_READ_RESTRICTED', 'comment.read_restricted'),
+    ('COMMERCIAL_ACCOUNT_MARKET_SET', 'commercial_account.market_set'),
+    ('COMMERCIAL_BALANCE_READ', 'commercial_balance.read'),
+    ('COMMERCIAL_BILLING_ACCOUNT_MANAGE', 'commercial_billing_account.manage'),
+    ('COMMERCIAL_CREDIT_NOTE_ISSUE', 'commercial.credit_note_issue'),
+    ('COMMERCIAL_CURRENCY_MANAGE', 'commercial.currency_manage'),
+    ('COMMERCIAL_DISCOUNT_APPROVE', 'commercial.discount_approve'),
+    ('COMMERCIAL_DISCOUNT_PROPOSE', 'commercial.discount_propose'),
+    ('COMMERCIAL_DISPUTE_MANAGE', 'commercial.dispute_manage'),
+    ('COMMERCIAL_DISPUTE_READ', 'commercial.dispute_read'),
+    ('COMMERCIAL_DUNNING_MANAGE', 'commercial.dunning_manage'),
+    ('COMMERCIAL_DUNNING_POLICY_MANAGE', 'commercial.dunning_policy_manage'),
+    ('COMMERCIAL_DUNNING_READ', 'commercial.dunning_read'),
+    ('COMMERCIAL_ENTITLEMENT_POLICY_MANAGE', 'commercial.entitlement_policy_manage'),
+    ('COMMERCIAL_ENTITLEMENT_READ', 'commercial.entitlement_read'),
+    ('COMMERCIAL_ENTITLEMENT_SNAPSHOT_MANAGE', 'commercial.entitlement_snapshot_manage'),
+    ('COMMERCIAL_INVOICE_GENERATE', 'commercial.invoice_generate'),
+    ('COMMERCIAL_INVOICE_READ', 'commercial.invoice_read'),
+    ('COMMERCIAL_METER_DEFINITION_MANAGE', 'commercial.meter_definition_manage'),
+    ('COMMERCIAL_PAYMENT_COLLECT', 'commercial.payment_collect'),
+    ('COMMERCIAL_PAYMENT_OUTCOME_RECORD', 'commercial.payment_outcome_record'),
+    ('COMMERCIAL_PRICE_BOOK_APPROVE', 'commercial.price_book_approve'),
+    ('COMMERCIAL_PRICE_BOOK_PROPOSE', 'commercial.price_book_propose'),
+    ('COMMERCIAL_PRICE_BOOK_PUBLISH', 'commercial.price_book_publish'),
+    ('COMMERCIAL_PRICE_BOOK_READ', 'commercial.price_book_read'),
+    ('COMMERCIAL_PRICE_BOOK_RETIRE', 'commercial.price_book_retire'),
+    ('COMMERCIAL_RECONCILIATION_READ', 'commercial.reconciliation_read'),
+    ('COMMERCIAL_RECONCILIATION_RUN', 'commercial.reconciliation_run'),
+    ('COMMERCIAL_REFUND_REQUEST', 'commercial.refund_request'),
+    ('COMMERCIAL_REFUND_SETTLE', 'commercial.refund_settle'),
+    ('COMMERCIAL_RESTRICTION_APPLY', 'commercial.restriction_apply'),
+    ('COMMERCIAL_RESTRICTION_READ', 'commercial.restriction_read'),
+    ('COMMERCIAL_SUBSCRIPTION_ACTIVATE', 'commercial.subscription_activate'),
+    ('COMMERCIAL_SUBSCRIPTION_ASSIST', 'commercial.subscription_assist'),
+    ('COMMERCIAL_SUBSCRIPTION_MANAGE', 'commercial.subscription_manage'),
+    ('COMMERCIAL_SUBSCRIPTION_READ', 'commercial.subscription_read'),
+    ('COMMERCIAL_USAGE_ADJUSTMENT_CREATE', 'commercial.usage_adjustment_create'),
+    ('COMMERCIAL_USAGE_CERTIFY', 'commercial.usage_certify'),
+    ('COMMERCIAL_USAGE_INGEST', 'commercial.usage_ingest'),
+    ('COMMERCIAL_USAGE_READ', 'commercial.usage_read'),
+    ('COMMERCIAL_WRITE_OFF_APPLY', 'commercial.write_off_apply'),
+    ('COMPENSATION_CREATE', 'compensation.create'),
+    ('COMPENSATION_VIEW', 'compensation.view'),
+    ('COMPLIANCE_ALERT_RESOLVE', 'compliance.alert_resolve'),
+    ('COMPLIANCE_GAP_CREATE', 'compliance.gap_create'),
+    ('COMPLIANCE_GAP_RESOLVE', 'compliance.gap_resolve'),
+    ('COMPLIANCE_HOURS_LOG', 'compliance.hours_log'),
+    ('COMPLIANCE_STATUS_EVALUATE', 'compliance.status_evaluate'),
+    ('COMPLIANCE_VISA_CREATE', 'compliance.visa_create'),
+    ('COMPLIANCE_VISA_FLAG', 'compliance.visa_flag'),
+    ('COMPLIANCE_WORK_AUTH_CREATE', 'compliance.work_auth_create'),
+    ('COMPLIANCE_WORK_AUTH_VERIFY', 'compliance.work_auth_verify'),
+    ('CONFIRM_CLASSIFICATION', 'confirm.classification'),
+    ('CONSOLIDATION_ADJUSTMENT_APPROVE', 'consolidation.adjustment_approve'),
+    ('CONSOLIDATION_ADJUSTMENT_CREATE', 'consolidation.adjustment_create'),
+    ('CONSOLIDATION_ADJUSTMENT_POST', 'consolidation.adjustment_post'),
+    ('CONSOLIDATION_ADJUSTMENT_REVERSE', 'consolidation.adjustment_reverse'),
+    ('CONSOLIDATION_ADJUSTMENT_VIEW', 'consolidation.adjustment_view'),
+    ('CONSOLIDATION_CONTROL_POPULATION_READ', 'consolidation.control_population_read'),
+    ('CONSOLIDATION_RUN_INITIATE', 'consolidation.run_initiate'),
+    ('CONSOLIDATION_RUN_VIEW', 'consolidation.run_view'),
+    ('CONTRACT_ACTIVATE', 'contract.activate'),
+    ('CONTRACT_AMEND', 'contract.amend'),
+    ('CONTRACT_SUBMIT_FOR_APPROVAL', 'contract.submit_for_approval'),
+    ('CONTRACT_TERMINATE', 'contract.terminate'),
+    ('CONTROL_EFFECTIVENESS_READ', 'control_effectiveness.read'),
+    ('CONTROL_TEST_DEFINITION_CREATE', 'control_test_definition.create'),
+    ('CONTROL_TEST_DEFINITION_READ', 'control_test_definition.read'),
+    ('CONTROL_TEST_EXECUTION_READ', 'control_test_execution.read'),
+    ('CONTROL_TEST_EXECUTION_RECORD', 'control_test_execution.record'),
+    ('CORPORATE_ACTION_CREATE', 'corporate_action.create'),
+    ('CORPORATE_ACTION_EXECUTE', 'corporate_action.execute'),
+    ('CORPORATE_ACTION_UPDATE', 'corporate_action.update'),
+    ('COUNTERPARTY_COMPLIANCE_UPDATE', 'counterparty.compliance_update'),
+    ('COUNTERPARTY_CREATE', 'counterparty.create'),
+    ('COUNTERPARTY_UPDATE', 'counterparty.update'),
+    ('CRM_CLOSE', 'crm.close'),
+    ('CRM_CREATE', 'crm.create'),
+    ('CRM_MANAGE', 'crm.manage'),
+    ('DATA_INGESTION_MANAGE', 'data_ingestion.manage'),
+    ('DATA_INGESTION_READ', 'data_ingestion.read'),
+    ('DATA_LINEAGE_MANAGE', 'data_lineage.manage'),
+    ('DATA_LINEAGE_READ', 'data_lineage.read'),
+    ('DATA_QUALITY_MANAGE', 'data_quality.manage'),
+    ('DATA_QUALITY_READ', 'data_quality.read'),
+    ('DEADLINE_CREATE', 'deadline.create'),
+    ('DEADLINE_MANAGE', 'deadline.manage'),
+    ('DECISION_SUPPORT_REQUEST', 'decision_support.request'),
+    ('DECISION_SUPPORT_VIEW', 'decision_support.view'),
+    ('DEPLOYMENT_REGION_CREATE', 'deployment.region_create'),
+    ('DEPLOYMENT_RING_CREATE', 'deployment.ring_create'),
+    ('DEPRECIATION_APPROVE', 'depreciation.approve'),
+    ('DEPRECIATION_RUN', 'depreciation.run'),
+    ('DEPRECIATION_SCHEDULE_BUILD', 'depreciation.schedule_build'),
+    ('DEPRECIATION_SUPERSEDE', 'depreciation.supersede'),
+    ('DEPRECIATION_VIEW', 'depreciation.view'),
+    ('DIVIDEND_DECLARATION', 'dividend.declaration'),
+    ('DOCUMENT_ACCESS_LOG_READ', 'document.access_log_read'),
+    ('DOCUMENT_ARCHIVE', 'document.archive'),
+    ('DOCUMENT_CREATE', 'document.create'),
+    ('DOCUMENT_DECLARE_RECORD', 'document.declare_record'),
+    ('DOCUMENT_DOWNLOAD', 'document.download'),
+    ('DOCUMENT_EXTRACTION_MANAGE', 'document.extraction_manage'),
+    ('DOCUMENT_EXTRACTION_READ', 'document.extraction_read'),
+    ('DOCUMENT_LINK', 'document.link'),
+    ('DOCUMENT_READ', 'document.read'),
+    ('DOCUMENT_REQUEST_DISPOSITION', 'document.request_disposition'),
+    ('DOCUMENT_SUPERSEDE', 'document.supersede'),
+    ('DOCUMENT_VERSION_CREATE', 'document.version_create'),
+    ('EMPLOYEE_CREATE', 'employee.create'),
+    ('EMPLOYEE_UPDATE', 'employee.update'),
+    ('EMPLOYEE_UPDATE_STATUS', 'employee.update_status'),
+    ('EMPLOYEE_VIEW', 'employee.view'),
+    ('ENTITY_HIERARCHY_CREATE', 'entity.hierarchy_create'),
+    ('ENTITY_HIERARCHY_END_DATE', 'entity.hierarchy_end_date'),
+    ('ENTITY_JURISDICTION_ASSIGN', 'entity.jurisdiction_assign'),
+    ('ENTITY_JURISDICTION_END_DATE', 'entity.jurisdiction_end_date'),
+    ('ENTITY_PROFILE_AMEND', 'entity.profile_amend'),
+    ('ENTITY_PROFILE_AMEND_APPROVE', 'entity.profile_amend_approve'),
+    ('ENTITY_REGISTRY_CONFLICT_READ', 'entity.registry_conflict_read'),
+    ('ENTITY_REGISTRY_CONFLICT_RESOLVE', 'entity.registry_conflict_resolve'),
+    ('ENTITY_REGISTRY_CONFLICT_RESOLVE_APPROVE', 'entity.registry_conflict_resolve_approve'),
+    ('ENTITY_SENSITIVE_IDENTIFIER_READ', 'entity.sensitive_identifier_read'),
+    ('ENTITY_STATUS_TRANSITION', 'entity.status_transition'),
+    ('EXCEPTION_CREATE', 'exception.create'),
+    ('EXCEPTION_ESCALATE', 'exception.escalate'),
+    ('EXCEPTION_RAISE', 'exception.raise'),
+    ('EXCEPTION_RESOLVE', 'exception.resolve'),
+    ('EXCEPTION_VIEW', 'exception.view'),
+    ('EXCEPTION_WAIVE', 'exception.waive'),
+    ('FILING_CONFIRM', 'filing.confirm'),
+    ('FILING_DRAFT_CREATE', 'filing.draft_create'),
+    ('FILING_DRAFT_FINALIZE', 'filing.draft_finalize'),
+    ('FILING_DRAFT_UPDATE', 'filing.draft_update'),
+    ('FILING_DRAFT_VALIDATE', 'filing.draft_validate'),
+    ('FILING_MARK_OVERDUE', 'filing.mark_overdue'),
+    ('FILING_REQUIREMENT_CREATE', 'filing.requirement_create'),
+    ('FILING_REQUIREMENT_READ', 'filing.requirement_read'),
+    ('FILING_REQUIREMENT_UPDATE', 'filing.requirement_update'),
+    ('FILING_SUBMIT', 'filing.submit'),
+    ('FX_REVALUATION_APPROVE', 'fx.revaluation_approve'),
+    ('FX_REVALUATION_POST', 'fx.revaluation_post'),
+    ('FX_REVALUATION_START', 'fx.revaluation_start'),
+    ('FX_REVALUATION_VIEW', 'fx.revaluation_view'),
+    ('GLOBAL_SEARCH_MANAGE', 'global_search.manage'),
+    ('GLOBAL_SEARCH_READ', 'global_search.read'),
+    ('GL_CONTROL_POPULATION_READ', 'gl.control_population_read'),
+    ('GL_JOURNAL_AMEND', 'gl.journal.amend'),
+    ('GL_JOURNAL_APPROVE', 'gl.journal.approve'),
+    ('GL_JOURNAL_CORRECT', 'gl.journal.correct'),
+    ('GL_JOURNAL_CREATE', 'gl.journal.create'),
+    ('GL_JOURNAL_REJECT', 'gl.journal.reject'),
+    ('GL_JOURNAL_SUBMIT', 'gl.journal.submit'),
+    ('GL_JOURNAL_VALIDATE', 'gl.journal.validate'),
+    ('GL_LEDGER_QUERY', 'gl.ledger_query'),
+    ('GL_LEDGER_REBUILD_BALANCES', 'gl.ledger_rebuild_balances'),
+    ('GL_POSTING_REPROCESS', 'gl.posting_reprocess'),
+    ('GL_TRIAL_BALANCE_COMPILE', 'gl.trial_balance_compile'),
+    ('GL_TRIAL_BALANCE_VIEW', 'gl.trial_balance_view'),
+    ('GOVERNANCE_DECISION_READ', 'governance_decision.read'),
+    ('GOVERNANCE_DECISION_RECORD', 'governance_decision.record'),
+    ('GOVERNANCE_DECISION_REPLAY', 'governance_decision.replay'),
+    ('HOLIDAY_CREATE', 'holiday.create'),
+    ('HOLIDAY_DEACTIVATE', 'holiday.deactivate'),
+    ('HOLIDAY_VIEW', 'holiday.view'),
+    ('INTERCOMPANY_CONTROL_POPULATION_READ', 'intercompany.control_population_read'),
+    ('INTERCOMPANY_ENTRY_ACKNOWLEDGE', 'intercompany.entry_acknowledge'),
+    ('INTERCOMPANY_ENTRY_CREATE', 'intercompany.entry_create'),
+    ('INTERCOMPANY_ENTRY_DISPUTE', 'intercompany.entry_dispute'),
+    ('INTERCOMPANY_ENTRY_MATCH', 'intercompany.entry_match'),
+    ('INTERCOMPANY_ENTRY_RESOLVE', 'intercompany.entry_resolve'),
+    ('INTERCOMPANY_ENTRY_VIEW', 'intercompany.entry_view'),
+    ('INTERPRETATION_RECORD_APPROVE', 'interpretation_record.approve'),
+    ('INTERPRETATION_RECORD_CREATE', 'interpretation_record.create'),
+    ('INVENTORY_CONTROL_POPULATION_READ', 'inventory.control_population_read'),
+    ('INVENTORY_COUNT_APPROVE', 'inventory.count_approve'),
+    ('INVENTORY_COUNT_CERTIFY', 'inventory.count_certify'),
+    ('INVENTORY_COUNT_PLAN', 'inventory.count_plan'),
+    ('INVENTORY_COUNT_READ', 'inventory.count_read'),
+    ('INVENTORY_COUNT_RECORD', 'inventory.count_record'),
+    ('INVENTORY_ITEM_MANAGE', 'inventory.item_manage'),
+    ('INVENTORY_ITEM_READ', 'inventory.item_read'),
+    ('INVENTORY_LOCATION_MANAGE', 'inventory.location_manage'),
+    ('INVENTORY_LOCATION_QUARANTINE', 'inventory.location_quarantine'),
+    ('INVENTORY_LOCATION_READ', 'inventory.location_read'),
+    ('INVENTORY_MOVEMENT_ADJUST', 'inventory.movement_adjust'),
+    ('INVENTORY_MOVEMENT_CREATE', 'inventory.movement_create'),
+    ('INVENTORY_MOVEMENT_READ', 'inventory.movement_read'),
+    ('INVENTORY_MOVEMENT_REVERSE', 'inventory.movement_reverse'),
+    ('INVENTORY_POLICY_ASSIGN', 'inventory.policy_assign'),
+    ('INVENTORY_VALUATION_ADJUST', 'inventory.valuation_adjust'),
+    ('INVENTORY_VALUATION_APPROVE', 'inventory.valuation_approve'),
+    ('INVENTORY_VALUATION_READ', 'inventory.valuation_read'),
+    ('INVENTORY_VALUATION_RUN', 'inventory.valuation_run'),
+    ('INVOICE_APPROVAL_DECIDE', 'invoice.approval_decide'),
+    ('INVOICE_APPROVAL_INITIATE', 'invoice.approval_initiate'),
+    ('INVOICE_APPROVAL_VIEW', 'invoice.approval_view'),
+    ('LEAVE_BALANCE_UPDATE', 'leave.balance_update'),
+    ('LEAVE_BALANCE_VIEW', 'leave.balance_view'),
+    ('LEAVE_REQUEST_APPROVE', 'leave.request_approve'),
+    ('LEAVE_REQUEST_REJECT', 'leave.request_reject'),
+    ('LEAVE_REQUEST_SUBMIT', 'leave.request_submit'),
+    ('LEAVE_REQUEST_VIEW', 'leave.request_view'),
+    ('LEAVE_TYPE_CREATE', 'leave.type_create'),
+    ('LEAVE_TYPE_VIEW', 'leave.type_view'),
+    ('LEGAL_HOLD_CREATE', 'legal_hold.create'),
+    ('LEGAL_HOLD_MANAGE', 'legal_hold.manage'),
+    ('LEGAL_HOLD_READ', 'legal_hold.read'),
+    ('LEGAL_HOLD_RELEASE', 'legal_hold.release'),
+    ('LINEAGE_QUARANTINE', 'lineage.quarantine'),
+    ('LINEAGE_REBUILD', 'lineage.rebuild'),
+    ('LINEAGE_VERIFY_PATH', 'lineage.verify_path'),
+    ('LINEAGE_VIEW', 'lineage.view'),
+    ('MEETING_CREATE', 'meeting.create'),
+    ('MIGRATION_BATCH_APPROVE', 'migration.batch_approve'),
+    ('MIGRATION_BATCH_CERTIFY', 'migration.batch_certify'),
+    ('MIGRATION_BATCH_COMMIT', 'migration.batch_commit'),
+    ('MIGRATION_BATCH_CREATE', 'migration.batch_create'),
+    ('MIGRATION_BATCH_VALIDATE', 'migration.batch_validate'),
+    ('MIGRATION_BATCH_VIEW', 'migration.batch_view'),
+    ('MIGRATION_JOB_ARCHIVE', 'migration.job_archive'),
+    ('MIGRATION_JOB_VALIDATE', 'migration.job_validate'),
+    ('NORMALIZED_FACT_RECORD', 'normalized_fact.record'),
+    ('NORMALIZED_FACT_VIEW', 'normalized_fact.view'),
+    ('NOTIFICATION_RESOLVE_OUTCOME', 'notification.resolve_outcome'),
+    ('NOTIFICATION_SEND', 'notification.send'),
+    ('NOTIFICATION_SUPPRESS', 'notification.suppress'),
+    ('NOTIFICATION_VIEW', 'notification.view'),
+    ('PACK_OPS_METRICS_VIEW', 'pack_ops.metrics_view'),
+    ('PACK_SIGNING_KEY_REGISTER', 'pack_signing_key.register'),
+    ('PACK_SIGNING_KEY_RETIRE', 'pack_signing_key.retire'),
+    ('PACK_SIGNING_KEY_REVOKE', 'pack_signing_key.revoke'),
+    ('PAYEE_BANKING_CONTROL_POPULATION_READ', 'payee_banking_control.population_read'),
+    ('PAYROLL_CONTROL_POPULATION_READ', 'payroll.control_population_read'),
+    ('PAYROLL_PARAMETERS_RESOLVE', 'payroll.parameters_resolve'),
+    ('PAYROLL_RUN_CALCULATE', 'payroll.run_calculate'),
+    ('PAYROLL_RUN_CREATE', 'payroll.run_create'),
+    ('PAYROLL_RUN_FINALIZE', 'payroll.run_finalize'),
+    ('PAYROLL_RUN_VIEW', 'payroll.run_view'),
+    ('PERIOD_CLOSE_CONFIG', 'period_close.config'),
+    ('PERIOD_CLOSE_INITIATE', 'period_close.initiate'),
+    ('PERIOD_CLOSE_VIEW', 'period_close.view'),
+    ('POLICY_CREATE', 'policy.create'),
+    ('POLICY_VERSION_ACTIVATE', 'policy.version_activate'),
+    ('POLICY_VERSION_ACTIVATE_GLOBAL', 'policy.version_activate_global'),
+    ('POLICY_VERSION_CREATE', 'policy.version_create'),
+    ('POLICY_VERSION_CREATE_GLOBAL', 'policy.version_create_global'),
+    ('PO_AMEND', 'po.amend'),
+    ('PO_CLOSE', 'po.close'),
+    ('PO_ISSUE', 'po.issue'),
+    ('PREPAYMENT_APPROVE', 'prepayment.approve'),
+    ('PREPAYMENT_CREATE', 'prepayment.create'),
+    ('PREPAYMENT_MODIFY', 'prepayment.modify'),
+    ('PREPAYMENT_RECOGNIZE', 'prepayment.recognize'),
+    ('PREPAYMENT_TERMINATE', 'prepayment.terminate'),
+    ('PREPAYMENT_VIEW', 'prepayment.view'),
+    ('PRINCIPAL_STATUS_MANAGE', 'principal_status.manage'),
+    ('PROCUREMENT_CASE_APPROVE', 'procurement.case_approve'),
+    ('PROCUREMENT_CASE_CREATE', 'procurement.case_create'),
+    ('PROCUREMENT_CASE_ISSUE_ORDER', 'procurement.case_issue_order'),
+    ('PROCUREMENT_CASE_REJECT', 'procurement.case_reject'),
+    ('PROCUREMENT_CASE_VIEW', 'procurement.case_view'),
+    ('PROJECT_APPROVE', 'project.approve'),
+    ('PROJECT_CLOSE_REOPEN', 'project.close_reopen'),
+    ('PROJECT_COST_ADJUST', 'project.cost_adjust'),
+    ('PROJECT_COST_CAPTURE', 'project.cost_capture'),
+    ('PROJECT_COST_CERTIFY', 'project.cost_certify'),
+    ('PROJECT_COST_READ', 'project.cost_read'),
+    ('PROJECT_COST_RECLASSIFY', 'project.cost_reclassify'),
+    ('PROJECT_CREATE', 'project.create'),
+    ('PROJECT_ESTIMATE_MANAGE', 'project.estimate_manage'),
+    ('PROJECT_FINANCIAL_MANAGE', 'project.financial_manage'),
+    ('PROJECT_PROFITABILITY_CERTIFY', 'project.profitability_certify'),
+    ('PROJECT_PROFITABILITY_READ', 'project.profitability_read'),
+    ('PROJECT_READ', 'project.read'),
+    ('PROJECT_REVENUE_APPROVE', 'project.revenue_approve'),
+    ('PROJECT_REVENUE_READ', 'project.revenue_read'),
+    ('PROJECT_REVENUE_RUN', 'project.revenue_run'),
+    ('PROJECT_REVENUE_SUPERSEDE', 'project.revenue_supersede'),
+    ('PR_REQUEST_APPROVE', 'pr_request.approve'),
+    ('PR_REQUEST_CREATE', 'pr_request.create'),
+    ('PR_REQUEST_REJECT', 'pr_request.reject'),
+    ('RECLASSIFY_RECORD', 'reclassify_record'),
+    ('RECONCILIATION_MANAGE', 'reconciliation.manage'),
+    ('RECONCILIATION_READ', 'reconciliation.read'),
+    ('RECORD_DECLARE', 'record.declare'),
+    ('RECORD_READ', 'record.read'),
+    ('RECORD_RELATE', 'record.relate'),
+    ('REGULATORY_CALCULATION_EXECUTE', 'regulatory.calculation_execute'),
+    ('REGULATORY_CALENDAR_CREATE', 'regulatory.calendar_create'),
+    ('REGULATORY_CALENDAR_VERSION_CREATE', 'regulatory.calendar_version_create'),
+    ('REGULATORY_CALENDAR_VERSION_PUBLISH', 'regulatory.calendar_version_publish'),
+    ('REGULATORY_CALENDAR_VERSION_SET_SOURCES', 'regulatory.calendar_version_set_sources'),
+    ('REGULATORY_REGIME_CREATE', 'regulatory.regime_create'),
+    ('REGULATORY_SOURCE_CREATE', 'regulatory.source_create'),
+    ('REGULATORY_SOURCE_REVIEW', 'regulatory.source_review'),
+    ('REGULATORY_SOURCE_SUPERSEDE', 'regulatory.source_supersede'),
+    ('REGULATORY_SUBMISSION_CREATE', 'regulatory.submission_create'),
+    ('REGULATORY_SUBMISSION_RECORD_EVENT', 'regulatory.submission_record_event'),
+    ('REGULATORY_SUBMISSION_VIEW', 'regulatory.submission_view'),
+    ('RESIDENCY_POLICY_CREATE', 'residency_policy.create'),
+    ('RESOLUTION_CREATE', 'resolution.create'),
+    ('RESOLUTION_PASS', 'resolution.pass'),
+    ('RESOLUTION_VOTE', 'resolution.vote'),
+    ('RESOLVER_CACHE_INVALIDATE', 'resolver.cache_invalidate'),
+    ('RETENTION_POLICY_CREATE', 'retention.policy_create'),
+    ('RETENTION_READ', 'retention.read'),
+    ('RETENTION_RULE_APPROVE', 'retention.rule_approve'),
+    ('RETENTION_RULE_MANAGE', 'retention.rule_manage'),
+    ('RETENTION_RULE_RESOLVE', 'retention.rule_resolve'),
+    ('RETENTION_STATE_MANAGE', 'retention.state_manage'),
+    ('REVIEW_CYCLE_CLOSE', 'review_cycle.close'),
+    ('REVIEW_CYCLE_CREATE', 'review_cycle.create'),
+    ('REVIEW_CYCLE_VIEW', 'review_cycle.view'),
+    ('REVIEW_RECORD_COMPLETE', 'review_record.complete'),
+    ('REVIEW_RECORD_CREATE', 'review_record.create'),
+    ('REVIEW_RECORD_SUBMIT', 'review_record.submit'),
+    ('REVIEW_RECORD_VIEW', 'review_record.view'),
+    ('RISK_ASSESSMENT_ARCHIVE', 'risk_assessment.archive'),
+    ('RISK_SCORE_CREATE', 'risk_score.create'),
+    ('RISK_THRESHOLD_RULE_CREATE', 'risk_threshold_rule.create'),
+    ('RULE_DECISION_VIEW', 'rule_decision.view'),
+    ('RULE_RESOLUTION_RESOLVE', 'rule_resolution.resolve'),
+    ('SEARCH_CONTRACT_CREATE', 'search.contract_create'),
+    ('SEARCH_CONTRACT_TRANSITION', 'search.contract_transition'),
+    ('SEARCH_EXPORT', 'search.export'),
+    ('SEARCH_GENERATION_ACTIVATE', 'search.generation_activate'),
+    ('SEARCH_GENERATION_CREATE', 'search.generation_create'),
+    ('SEARCH_RESTRICTION_APPLY', 'search.restriction_apply'),
+    ('SEARCH_SOURCE_REGISTER', 'search.source_register'),
+    ('SEMANTIC_MODEL_MANAGE', 'semantic_model.manage'),
+    ('SEMANTIC_MODEL_READ', 'semantic_model.read'),
+    ('SHARE_BUYBACK', 'share.buyback'),
+    ('SHARE_ISSUANCE', 'share.issuance'),
+    ('SNAPSHOT_CERTIFY', 'snapshot.certify'),
+    ('SNAPSHOT_CREATE', 'snapshot.create'),
+    ('SNAPSHOT_SEAL', 'snapshot.seal'),
+    ('SNAPSHOT_SUPERSEDE', 'snapshot.supersede'),
+    ('SNAPSHOT_VIEW', 'snapshot.view'),
+    ('SOURCE_AUTHORITY_MAP_CREATE', 'source_authority_map.create'),
+    ('SOURCE_AUTHORITY_MAP_SUPERSEDE', 'source_authority_map.supersede'),
+    ('SOURCE_AUTHORITY_MAP_VIEW', 'source_authority_map.view'),
+    ('SOURCE_CHANGE_NOTICE_CLOSE', 'source_change_notice.close'),
+    ('SOURCE_CHANGE_NOTICE_CREATE', 'source_change_notice.create'),
+    ('SOURCE_CHANGE_NOTICE_REVIEW', 'source_change_notice.review'),
+    ('SPEND_CHECK_SUBMIT', 'spend_check.submit'),
+    ('SPEND_POLICY_MANAGE', 'spend_policy.manage'),
+    ('SPEND_POLICY_VIEW', 'spend_policy.view'),
+    ('SUBLEDGER_CONTROL_RUN', 'subledger.control_run'),
+    ('SUBLEDGER_CONTROL_VIEW', 'subledger.control_view'),
+    ('SUBMISSION_PROFILE_RESOLVE', 'submission_profile.resolve'),
+    ('SUPERSEDE_CLASSIFICATION', 'supersede.classification'),
+    ('TASK_CLOSE', 'task.close'),
+    ('TASK_CREATE', 'task.create'),
+    ('TASK_MANAGE', 'task.manage'),
+    ('TAX_ADJUST', 'tax.adjust'),
+    ('TAX_AUTHORITY_CONTROL_POPULATION_READ', 'tax.authority_control_population_read'),
+    ('TAX_CALCULATE', 'tax.calculate'),
+    ('TAX_DETERMINATION_CREATE', 'tax.determination_create'),
+    ('TAX_DETERMINATION_OVERRIDE', 'tax.determination_override'),
+    ('TAX_FILING_SUBMIT', 'tax.filing_submit'),
+    ('TAX_IDENTITY_BUNDLE_CREATE', 'tax.identity_bundle_create'),
+    ('TAX_INTERFACE_CREATE', 'tax.interface_create'),
+    ('TAX_PROFILE_CREATE', 'tax.profile_create'),
+    ('TAX_PROFILE_VIEW', 'tax.profile_view'),
+    ('TAX_RETURN_ASSESS', 'tax.return_assess'),
+    ('TAX_RETURN_CREATE', 'tax.return_create'),
+    ('TAX_RETURN_SUBMIT', 'tax.return_submit'),
+    ('TAX_RETURN_UPDATE', 'tax.return_update'),
+    ('TAX_RULE_CREATE', 'tax.rule_create'),
+    ('TAX_RULE_UPDATE', 'tax.rule_update'),
+    ('TAX_VIEW', 'tax.view'),
+    ('TEMPLATE_APPROVE', 'template.approve'),
+    ('TEMPLATE_CREATE', 'template.create'),
+    ('TEMPLATE_MANAGE', 'template.manage'),
+    ('TEMPLATE_UPDATE', 'template.update'),
+    ('TENANT_DEFAULTS_CHANGE', 'tenant.defaults_change'),
+    ('TENANT_HOME_REGION_CHANGE', 'tenant.home_region_change'),
+    ('TENANT_HOME_REGION_CHANGE_APPROVE', 'tenant.home_region_change_approve'),
+    ('TENANT_HOST_BINDING_CREATE', 'tenant.host_binding_create'),
+    ('TENANT_INITIATE_TERMINATION', 'tenant.initiate_termination'),
+    ('TENANT_INITIATE_TERMINATION_APPROVE', 'tenant.initiate_termination_approve'),
+    ('TENANT_PROVISIONING_ABANDON', 'tenant.provisioning_abandon'),
+    ('TENANT_PROVISIONING_ABANDON_APPROVE', 'tenant.provisioning_abandon_approve'),
+    ('TENANT_PROVISIONING_RETRY', 'tenant.provisioning_retry'),
+    ('TENANT_PROVISION_APPROVE', 'tenant.provision_approve'),
+    ('TREASURY_ACCOUNT_REGISTER', 'treasury.account_register'),
+    ('TREASURY_CASH_POSITION_CALCULATE', 'treasury.cash_position_calculate'),
+    ('TREASURY_CASH_POSITION_PUBLISH', 'treasury.cash_position_publish'),
+    ('TREASURY_FX_EXPOSURE_CALCULATE', 'treasury.fx_exposure_calculate'),
+    ('TREASURY_FX_EXPOSURE_PUBLISH', 'treasury.fx_exposure_publish'),
+    ('TREASURY_FX_RATE_RECORD', 'treasury.fx_rate_record'),
+    ('TREASURY_POSITIONS_VIEW', 'treasury.positions_view'),
+    ('TREASURY_THRESHOLD_SET', 'treasury.threshold_set'),
+    ('TREASURY_TRANSFER_APPROVE', 'treasury.transfer_approve'),
+    ('TREASURY_TRANSFER_AUTHORIZE', 'treasury.transfer_authorize'),
+    ('TREASURY_TRANSFER_EXECUTE', 'treasury.transfer_execute'),
+    ('TREASURY_TRANSFER_INITIATE', 'treasury.transfer_initiate'),
+    ('TREASURY_TRANSFER_MODIFY', 'treasury.transfer_modify'),
+    ('TREASURY_TRANSFER_RESOLVE', 'treasury.transfer_resolve'),
+    ('USER_PROVISION', 'user_provision'),
+    ('VENDOR_DD_INITIATE', 'vendor_dd.initiate'),
+    ('VENDOR_DD_VIEW', 'vendor_dd.view'),
+    ('WAGE_REVISE', 'wage_revise'),
+    ('WITHHOLDING_OBLIGATION_CANCEL', 'withholding.obligation_cancel'),
+    ('WITHHOLDING_OBLIGATION_CREATE', 'withholding.obligation_create'),
+    ('WITHHOLDING_OBLIGATION_REMIT', 'withholding.obligation_remit'),
+    ('WITHHOLDING_OBLIGATION_UPDATE', 'withholding.obligation_update'),
+    ('WITHHOLDING_TAX_CALCULATE', 'withholding.tax_calculate'),
+    ('WORKSPACE_CREATE', 'workspace.create'),
+    ('WORKSPACE_STATUS_TRANSITION', 'workspace.status_transition'),
+    ('WORKSPACE_UPDATE', 'workspace.update')
+  ) AS v(legacy, canonical)
+ WHERE p.action_name = v.legacy
+   AND p.action_name <> v.canonical
+   AND p.alias_for IS DISTINCT FROM v.canonical
+   AND EXISTS (SELECT 1 FROM permission_definitions c WHERE c.action_name = v.canonical);

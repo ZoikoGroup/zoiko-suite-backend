@@ -15,6 +15,11 @@ import (
 // StandardReferenceFXRates provides deterministic fallback conversion rates
 // between major platform currencies (ZS-IAM-001 §12, Scenario A09).
 // Rates represent value relative to GBP base (1 unit of currency = X GBP).
+//
+// These are the DEFAULT reference basis. ZS-IAM-001 §31 leaves "authoritative
+// FX basis for approval-limit comparisons" as a pre-production decision, so
+// the operator sets the table with AUTHZ_FX_REFERENCE_RATES
+// (SetFXReferenceRates); every decision that converts names the basis it used.
 var StandardReferenceFXRates = map[string]float64{
 	"GBP": 1.0,
 	"USD": 0.78,   // 1 USD = 0.78 GBP
@@ -23,6 +28,54 @@ var StandardReferenceFXRates = map[string]float64{
 	"AUD": 0.51,   // 1 AUD = 0.51 GBP
 	"JPY": 0.0052, // 1 JPY = 0.0052 GBP
 	"CHF": 0.89,   // 1 CHF = 0.89 GBP
+}
+
+// FXBasisReferenceRates names the conversion basis in reason codes.
+const FXBasisReferenceRates = "REFERENCE_RATES"
+
+// SetFXReferenceRates replaces the reference table (AUTHZ_FX_REFERENCE_RATES).
+// nil or empty keeps StandardReferenceFXRates.
+func (h *Handler) SetFXReferenceRates(rates map[string]float64) {
+	if len(rates) == 0 {
+		h.fxRates = nil
+		return
+	}
+	h.fxRates = make(map[string]float64, len(rates))
+	for k, v := range rates {
+		h.fxRates[strings.ToUpper(strings.TrimSpace(k))] = v
+	}
+}
+
+// fxReferenceRates is the table every conversion and limit authoring reads.
+func (h *Handler) fxReferenceRates() map[string]float64 {
+	if len(h.fxRates) > 0 {
+		return h.fxRates
+	}
+	return StandardReferenceFXRates
+}
+
+// ParseFXReferenceRates reads "GBP=1,USD=0.78,EUR=0.85": units of the base
+// currency per one unit of each. Every rate must be a positive number. An
+// empty string is (nil, nil): keep the default table.
+func ParseFXReferenceRates(raw string) (map[string]float64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	rates := map[string]float64{}
+	for _, pair := range strings.Split(raw, ",") {
+		code, val, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		code = strings.ToUpper(strings.TrimSpace(code))
+		if !ok || code == "" {
+			return nil, fmt.Errorf("fx reference rate %q is not CODE=rate", pair)
+		}
+		rate, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+		if err != nil || rate <= 0 {
+			return nil, fmt.Errorf("fx reference rate for %s must be a positive number, got %q", code, val)
+		}
+		rates[code] = rate
+	}
+	return rates, nil
 }
 
 // evaluateAuthorityLimits evaluates monetary limits and currency conversion for the request (Phase 3.6 & 3.7, Scenario A09).
@@ -110,21 +163,32 @@ func (h *Handler) evaluateAuthorityLimits(ctx context.Context, in evalContext, e
 	}
 
 	// 4. Currency and FX conversion handling (Phase 3.7, Scenario A09)
-	reqCurrency := "GBP"
-	if in.Attributes != nil && in.Attributes["currency"] != "" {
-		reqCurrency = strings.ToUpper(in.Attributes["currency"])
-	}
 	limitCurrency := strings.ToUpper(limit.Currency)
 	if limitCurrency == "" {
 		limitCurrency = "GBP"
+	}
+	// No currency is no comparison. It used to be read as GBP, so an amount in
+	// yen or dollars sent without its currency was judged as pounds.
+	reqCurrency := ""
+	if in.Attributes != nil {
+		reqCurrency = strings.ToUpper(strings.TrimSpace(in.Attributes["currency"]))
+	}
+	if reqCurrency == "" {
+		return true, "authority_limit:currency_required",
+			fmt.Sprintf("The amount states no currency; the applicable authority limit is in %s", limitCurrency),
+			[]string{"CURRENCY_REQUIRED"},
+			[]string{"authority_limit:currency_required"}, nil
 	}
 
 	convertedAmount := new(big.Float).Copy(reqAmount)
 	currenciesDiffer := reqCurrency != limitCurrency
 	fxConversionApplied := false
+	// §20 "SoD/authority result": a converted comparison names its basis, so
+	// the decision can be reconstructed against the table that was in force.
+	var fxBasis []string
 
 	if currenciesDiffer {
-		rate, rateFound := resolveFXRate(reqCurrency, limitCurrency)
+		rate, rateFound := h.resolveFXRate(reqCurrency, limitCurrency)
 		if !rateFound {
 			// Fail-closed when no deterministic FX conversion basis exists
 			return true, "authority_limit:currency_conversion_missing",
@@ -135,6 +199,8 @@ func (h *Handler) evaluateAuthorityLimits(ctx context.Context, in evalContext, e
 
 		convertedAmount.Mul(convertedAmount, big.NewFloat(rate))
 		fxConversionApplied = true
+		fxBasis = []string{"FX_BASIS:" + FXBasisReferenceRates + ":" + reqCurrency + "/" + limitCurrency,
+			"FX_RATE:" + strconv.FormatFloat(rate, 'f', -1, 64)}
 	}
 
 	// 5. Upper limit evaluation
@@ -145,7 +211,7 @@ func (h *Handler) evaluateAuthorityLimits(ctx context.Context, in evalContext, e
 				// Scenario A09: Authority limit exceeded after FX conversion
 				return true, "authority_limit:exceeded:after_fx_conversion",
 					"Authority limit exceeded after FX conversion (Scenario A09)",
-					[]string{"AUTHORITY_LIMIT_EXCEEDED", "FX_CONVERSION_LIMIT_EXCEEDED"},
+					append([]string{"AUTHORITY_LIMIT_EXCEEDED", "FX_CONVERSION_LIMIT_EXCEEDED"}, fxBasis...),
 					[]string{"authority_limit:exceeded:after_fx_conversion"}, nil
 			}
 			return true, "authority_limit:exceeded:upper_limit",
@@ -161,12 +227,14 @@ func (h *Handler) evaluateAuthorityLimits(ctx context.Context, in evalContext, e
 		if convertedAmount.Cmp(lowerLimit) < 0 {
 			return true, "authority_limit:below_lower_limit",
 				fmt.Sprintf("Requested amount %s %s is below authority lower limit %s %s", amountStr, reqCurrency, limit.LowerLimit, limit.Currency),
-				[]string{"AUTHORITY_LIMIT_BELOW_MINIMUM"},
+				append([]string{"AUTHORITY_LIMIT_BELOW_MINIMUM"}, fxBasis...),
 				[]string{"authority_limit:below_lower_limit"}, nil
 		}
 	}
 
-	return false, "", "", nil, nil, nil
+	// Within the limit: no denial, but the FX basis (if any) travels with the
+	// PERMIT as evidence.
+	return false, "", "", fxBasis, nil, nil
 }
 
 // evaluateQuorum evaluates quorum and dual-approval requirements (Phase 3.8).
@@ -247,8 +315,25 @@ func (h *Handler) evaluateExecutionRevalidation(in evalContext) (denied bool, ba
 		currentHash = in.Attributes["fact_hash"]
 	}
 
+	// Fail closed (10 Nov 2026): a revalidation that is asked for, or implied by
+	// an approval fingerprint, needs BOTH hashes. Either one missing used to
+	// skip the comparison, so a PEP that sent the approved hash and forgot the
+	// current one executed on facts nobody had compared.
+	if approvedHash == "" {
+		return true, "revalidation:approved_fact_hash_missing",
+			"Execution revalidation requested but the approved fact hash was not supplied",
+			[]string{"APPROVED_FACT_HASH_REQUIRED", "REAPPROVAL_REQUIRED"},
+			[]string{"revalidation:approved_fact_hash_missing"}
+	}
+	if currentHash == "" {
+		return true, "revalidation:current_fact_hash_missing",
+			"An approval fingerprint was supplied without the current fact hash to compare it with",
+			[]string{"CURRENT_FACT_HASH_REQUIRED", "REAPPROVAL_REQUIRED"},
+			[]string{"revalidation:current_fact_hash_missing"}
+	}
+
 	// Scenario A10: Approval facts mutate after approval -> Object fingerprint changes -> Invalidate
-	if approvedHash != "" && currentHash != "" && approvedHash != currentHash {
+	if approvedHash != currentHash {
 		return true, "revalidation:fact_hash_mismatch",
 			"Approval facts mutate after approval: Object fingerprint changes (Scenario A10)",
 			[]string{"FACT_HASH_MUTATION_DETECTED", "REAPPROVAL_REQUIRED"},
@@ -410,10 +495,10 @@ func selectEffectiveLimit(limits []domain.AuthorityLimit) domain.AuthorityLimit 
 // was whatever the caller said it was. A request-supplied rate is now ignored
 // (decision 5 Oct 2026); a pair the reference table cannot convert fails closed
 // in the caller, as it always did.
-func resolveFXRate(fromCurrency, toCurrency string) (float64, bool) {
-	// Look up in StandardReferenceFXRates
-	rateFrom, okFrom := StandardReferenceFXRates[fromCurrency]
-	rateTo, okTo := StandardReferenceFXRates[toCurrency]
+func (h *Handler) resolveFXRate(fromCurrency, toCurrency string) (float64, bool) {
+	rates := h.fxReferenceRates()
+	rateFrom, okFrom := rates[fromCurrency]
+	rateTo, okTo := rates[toCurrency]
 
 	if okFrom && okTo && rateTo > 0 {
 		return rateFrom / rateTo, true

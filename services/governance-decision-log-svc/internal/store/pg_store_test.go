@@ -319,7 +319,7 @@ func TestPgStore_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 	if _, err := s.FindByID(ctx, "tenant-1", "dec-unavailable"); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("FindByID: expected error to wrap ErrStoreUnavailable, got %v", err)
 	}
-	if _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1"}); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1"}); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("List: expected error to wrap ErrStoreUnavailable, got %v", err)
 	}
 }
@@ -363,7 +363,7 @@ func TestPgStore_List_NoFilters_ReturnsAllNewestFirst(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1"})
+	results, _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -383,7 +383,7 @@ func TestPgStore_List_FilterByActor(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActorID: "actor-2"})
+	results, _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActorID: "actor-2"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -400,7 +400,7 @@ func TestPgStore_List_FilterByEntity(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", LegalEntityID: "entity-A"})
+	results, _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", LegalEntityID: "entity-A"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestPgStore_List_FilterByAction(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActionType: "TAX_FILING"})
+	results, _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActionType: "TAX_FILING"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -432,7 +432,7 @@ func TestPgStore_List_FilterByRuleBasis(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", RuleBasis: "policy-v3-sod"})
+	results, _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", RuleBasis: "policy-v3-sod"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -450,7 +450,7 @@ func TestPgStore_List_FilterByTimeRange(t *testing.T) {
 	seedListFixtures(t, ctx, s)
 
 	base := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
-	results, err := s.List(ctx, store.ListParams{
+	results, _, err := s.List(ctx, store.ListParams{
 		TenantID: "tenant-1",
 		From:     base.AddDate(0, 0, 1),
 		To:       base.AddDate(0, 0, 2),
@@ -471,7 +471,7 @@ func TestPgStore_List_ScopedToTenant(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s) // all fixtures are tenant-1
 
-	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-OTHER"})
+	results, _, err := s.List(ctx, store.ListParams{TenantID: "tenant-OTHER"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -488,7 +488,7 @@ func TestPgStore_List_FiltersCompose(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{
+	results, _, err := s.List(ctx, store.ListParams{
 		TenantID:      "tenant-1",
 		ActorID:       "actor-1",
 		LegalEntityID: "entity-A",
@@ -510,7 +510,7 @@ func TestPgStore_List_NoMatch_ReturnsEmptyNotError(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActorID: "does-not-exist"})
+	results, _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActorID: "does-not-exist"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

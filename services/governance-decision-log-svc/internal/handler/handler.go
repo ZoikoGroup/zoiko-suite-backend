@@ -34,11 +34,17 @@ import (
 type DecisionStore interface {
 	RecordDecision(ctx context.Context, rec store.DecisionRecord) (*domain.GovernanceDecision, bool, error)
 	FindByID(ctx context.Context, tenantID, decisionID string) (*domain.GovernanceDecision, error)
-	List(ctx context.Context, params store.ListParams) ([]*domain.GovernanceDecision, error)
+	List(ctx context.Context, params store.ListParams) ([]*domain.GovernanceDecision, *domain.PaginationCursor, error)
 
 	// ── replay manifests (backlog item 34) ──────────────────────────────────
 	CreateReplayManifest(ctx context.Context, m *domain.ReplayManifest, event *store.ReplayEvent) (*domain.ReplayManifest, bool, error)
 	ListReplayManifestsByDecision(ctx context.Context, tenantID, decisionID string) ([]*domain.ReplayManifest, error)
+
+	// ── G-07 Evidence ledger ───────────────────────────────────────────────
+	VerifyChain(ctx context.Context, tenantID string) (valid bool, checked int, lastDecisionID string, err error)
+	ExportChain(ctx context.Context, tenantID string, encoder *json.Encoder) error
+	SealPackage(ctx context.Context, tenantID, principalID, packageID, lastDecisionID string) ([]byte, error)
+	GetPackage(ctx context.Context, tenantID, packageID string) (*domain.EvidencePackage, error)
 
 	// ── idempotency keys ──────────────────────────────────────────────────────
 	CheckIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (string, []byte, error)
@@ -281,6 +287,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/decisions/{decision_id}", h.GetDecision)
 	r.Post("/v1/decisions/{decision_id}/replay", h.ReplayDecision)
 	r.Get("/v1/decisions/{decision_id}/replay-manifests", h.ListReplayManifests)
+
+	// G-07 Evidence ledger routes
+	r.Get("/v1/evidence/chain/verify", h.VerifyChain)
+	r.Get("/v1/evidence/chain/export", h.ExportChain)
+	r.Post("/v1/evidence/packages/seal", h.SealPackage)
+	r.Get("/v1/evidence/packages/{package_id}", h.GetPackage)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -1083,10 +1095,9 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 		}
 		params.To = t
 	}
-	// A malformed limit or offset is refused, not ignored: silently serving
+	// A malformed limit is refused, not ignored: silently serving
 	// page one to a caller that asked for something else reads as a complete
-	// answer, and a negative offset used to reach Postgres and come back as a
-	// 503 outage.
+	// answer, and a limit > 200 is capped.
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
@@ -1095,7 +1106,16 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 		}
 		params.Limit = n
 	}
-	if v := q.Get("offset"); v != "" {
+	// Cursor-based pagination (API-4): if cursor is provided, offset is ignored.
+	if v := q.Get("cursor"); v != "" {
+		c, err := domain.DecodePaginationCursor(v)
+		if err != nil {
+			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_CURSOR", Detail: "cursor is not valid", Title: "Invalid Cursor"})
+			return
+		}
+		params.Cursor = c
+	} else if v := q.Get("offset"); v != "" {
+		// Legacy offset-based pagination (deprecated, cursor preferred)
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
 			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "offset must be a non-negative integer", Title: "Invalid Offset"})
@@ -1104,7 +1124,7 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 		params.Offset = n
 	}
 
-	results, err := h.store.List(r.Context(), params)
+	results, nextCursor, err := h.store.List(r.Context(), params)
 	if err != nil {
 		h.log.Error("ListDecisions: store unavailable",
 			zap.String("correlation_id", correlationID),
@@ -1118,6 +1138,27 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []*domain.GovernanceDecision{}
 	}
+
+	// Encode next cursor for the response
+	var nextCursorStr string
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			nextCursorStr = encoded
+		}
+	}
+
+	type listResponse struct {
+		Records     []*domain.GovernanceDecision `json:"records"`
+		NextCursor  string                       `json:"next_cursor"`
+		TotalCount  int                          `json:"total_count"`
+	}
+
+	resp := listResponse{
+		Records:    results,
+		NextCursor: nextCursorStr,
+		TotalCount: len(results),
+	}
+
 	// List endpoint: ETag based on count and last item's stored_at for cache validation.
 	var etag string
 	if len(results) > 0 {
@@ -1125,7 +1166,157 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		etag = `"list-0"`
 	}
-	writeJSONWithETag(w, http.StatusOK, results, etag)
+	writeJSONWithETag(w, http.StatusOK, resp, etag)
+}
+
+// ── G-07 Evidence ledger handlers ────────────────────────────────────────
+
+// VerifyChain handles GET /v1/evidence/chain/verify.
+// Verifies the hash chain integrity for the caller's tenant.
+// Returns 200 with {valid: true, checked: N, last_decision_id: "..."}
+// or 503 if store unavailable.
+func (h *Handler) VerifyChain(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "TENANT_SCOPE_MISSING", Detail: "X-Tenant-Id is required", Title: "Tenant Scope Missing"})
+		return
+	}
+	principalID, ok := h.readPrincipal(w, r)
+	if !ok {
+		return
+	}
+	// Authorization: need GOVERNANCE_DECISION_READ on platform scope
+	if !h.authorizeReadOf(w, r, principalID, "") {
+		return
+	}
+
+	valid, checked, lastID, err := h.store.VerifyChain(r.Context(), tenantID)
+	if err != nil {
+		h.log.Error("VerifyChain failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Detail: "Store unavailable", Title: "Service Unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"valid":            valid,
+		"decisions_checked": checked,
+		"last_decision_id": lastID,
+	})
+}
+
+// ExportChain handles GET /v1/evidence/chain/export.
+// Exports the hash chain for the caller's tenant as a JSON stream.
+// Each line is a decision with its prev_hash and curr_hash.
+// Authorization: GOVERNANCE_DECISION_READ on platform scope.
+func (h *Handler) ExportChain(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "TENANT_SCOPE_MISSING", Detail: "X-Tenant-Id is required", Title: "Tenant Scope Missing"})
+		return
+	}
+	principalID, ok := h.readPrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorizeReadOf(w, r, principalID, "") {
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	encoder := json.NewEncoder(w)
+	err := h.store.ExportChain(r.Context(), tenantID, encoder)
+	if err != nil {
+		h.log.Error("ExportChain failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		// Can't change status after writing header, just log
+		return
+	}
+}
+
+// SealPackage handles POST /v1/evidence/packages/seal.
+// Creates a sealed package (Merkle root snapshot) for the caller's tenant.
+// Requires WORKFLOW_LEDGER_PRINCIPAL_ID authorization.
+// Body: { "package_id": "...", "last_decision_id": "..." }
+// Authorization: WORKFLOW_LEDGER_PRINCIPAL_ID (checked via authz service)
+func (h *Handler) SealPackage(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "TENANT_SCOPE_MISSING", Detail: "X-Tenant-Id is required", Title: "Tenant Scope Missing"})
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	// Check WORKFLOW_LEDGER_PRINCIPAL_ID authorization
+	if err := h.authz.CheckAllowed(r.Context(), principalID, h.authzPlatformScopeID, "WORKFLOW_LEDGER_PRINCIPAL_ID"); err != nil {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusForbidden, Code: "AUTHORIZATION_DENIED", Detail: "Principal not authorized to seal packages", Title: "Authorization Denied"})
+		return
+	}
+
+	var req struct {
+		PackageID       string `json:"package_id"`
+		LastDecisionID  string `json:"last_decision_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: err.Error(), Title: "Invalid JSON"})
+		return
+	}
+	if req.PackageID == "" || req.LastDecisionID == "" {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "package_id and last_decision_id are required", Title: "Invalid Request"})
+		return
+	}
+
+	merkleRoot, err := h.store.SealPackage(r.Context(), tenantID, principalID, req.PackageID, req.LastDecisionID)
+	if err != nil {
+		h.log.Error("SealPackage failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Detail: "Store unavailable", Title: "Service Unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"package_id":  req.PackageID,
+		"merkle_root":  fmt.Sprintf("%x", merkleRoot),
+		"sealed_at":   time.Now().UTC().Format(time.RFC3339),
+		"sealed_by":   principalID,
+	})
+}
+
+// GetPackage handles GET /v1/evidence/packages/{package_id}.
+// Retrieves a sealed package by ID.
+// Authorization: GOVERNANCE_DECISION_READ on the package's tenant.
+func (h *Handler) GetPackage(w http.ResponseWriter, r *http.Request) {
+	packageID := chi.URLParam(r, "package_id")
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "TENANT_SCOPE_MISSING", Detail: "X-Tenant-Id is required", Title: "Tenant Scope Missing"})
+		return
+	}
+	principalID, ok := h.readPrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	// First get the package to know its tenant
+	pkg, err := h.store.GetPackage(r.Context(), tenantID, packageID)
+	if err != nil {
+		if errors.Is(err, domain.ErrPackageNotFound) {
+			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusNotFound, Code: "NOT_FOUND", Detail: "Package not found", Title: "Package Not Found"})
+			return
+		}
+		h.log.Error("GetPackage failed", zap.String("package_id", packageID), zap.Error(err))
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Detail: "Store unavailable", Title: "Service Unavailable"})
+		return
+	}
+
+	// Authorization: must be able to read the package's tenant
+	if !h.authorizeReadOf(w, r, principalID, pkg.TenantID) {
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pkg)
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.

@@ -214,8 +214,9 @@ type Store struct {
 	watermarkAt     time.Time
 	watermarkMaxAge time.Duration
 
-	hits   uint64
-	misses uint64
+	hits          uint64
+	misses        uint64
+	invalidations uint64
 }
 
 // New wraps inner. A ttl of zero or less disables caching completely: every
@@ -243,6 +244,18 @@ func (s *Store) Stats() (hits, misses uint64, entries int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.hits, s.misses, len(s.entries)
+}
+
+// Telemetry is Stats plus the invalidation count and the watermark's age, for
+// the §26 cache-health families (telemetry.CacheStats). watermarkOK is false
+// until a watermark source has been read at least once.
+func (s *Store) Telemetry() (hits, misses, invalidations uint64, entries int, watermarkAge time.Duration, watermarkOK bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.watermarkMode && !s.watermarkAt.IsZero() {
+		watermarkAge, watermarkOK = time.Since(s.watermarkAt), true
+	}
+	return s.hits, s.misses, s.invalidations, len(s.entries), watermarkAge, watermarkOK
 }
 
 func (s *Store) key(ns, tenantID string, parts ...string) string {
@@ -383,6 +396,7 @@ func (s *Store) sweepLocked() {
 func (s *Store) invalidate(ns, tenantID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.invalidations++
 	if tenantID == "" {
 		s.globalGen[ns]++
 		return

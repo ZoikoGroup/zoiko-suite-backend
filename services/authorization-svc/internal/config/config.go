@@ -211,6 +211,15 @@ type Config struct {
 	// break-glass request needs before it is active (AU-02; GOV-12; decision
 	// D-3, 14 Oct 2026: default one, quorum by risk class left to GOV §23).
 	BreakGlassApprovals int
+
+	// FXReferenceRates is AUTHZ_FX_REFERENCE_RATES, "GBP=1,USD=0.78,...": the
+	// reference basis authority limits convert with (ZS-IAM-001 §31, A09).
+	// Empty keeps the built-in table. Parsed and validated in main with
+	// handler.ParseFXReferenceRates.
+	FXReferenceRates string
+	// OpsSampleInterval is how often the §26 operational gauges (outbox,
+	// sessions) are read from the database.
+	OpsSampleInterval time.Duration
 }
 
 // Validate refuses a configuration under which no PEP could ever be admitted,
@@ -592,6 +601,9 @@ func Load() (*Config, error) {
 		MaxSupportSeconds:    envInt("AUTHZ_MAX_SUPPORT_SECONDS", 4*3600),
 
 		BreakGlassApprovals: envInt("AUTHZ_BREAK_GLASS_APPROVALS", 1),
+
+		FXReferenceRates:  strings.TrimSpace(env("AUTHZ_FX_REFERENCE_RATES", "")),
+		OpsSampleInterval: time.Duration(envInt("AUTHZ_OPS_SAMPLE_SECONDS", 15)) * time.Second,
 	}, nil
 }
 

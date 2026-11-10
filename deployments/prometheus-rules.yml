@@ -1125,3 +1125,97 @@ groups:
           description: >-
             Determinations are recorded but their evidence.requirement.* events are waiting in the outbox. Check Kafka and the
             outbox worker's log (outbox: failed to publish). Rows are retried every 5 seconds; nothing is lost.
+
+  # authorization-svc (ZS-IAM-001 §26). Every metric below is emitted by
+  # internal/telemetry/authz.go; none of it is authority — alerts point at
+  # something to look at, the decision path never reads them.
+  - name: authorization-svc
+    rules:
+      - alert: AuthorizationDecisionRecordFailures
+        expr: increase(authorization_decision_record_failures_total{service="authorization-svc"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "authorization-svc: decisions refused because their artefact could not be written"
+          description: >-
+            No decision is answered without its access_decision_log row (503 instead), so every PEP calling it is failing
+            closed. Check Postgres write availability and the access_decision_log partitions (RUNBOOK §3.1, §10).
+
+      - alert: AuthorizationPDPLatencyHigh
+        expr: histogram_quantile(0.99, sum by (le) (rate(authorization_evaluation_seconds_bucket{service="authorization-svc"}[5m]))) > 0.25
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: p99 decision-pipeline time {{ $value | humanizeDuration }} for 10m"
+          description: >-
+            The pipeline itself (not the HTTP queue) is slow. Check the cache hit ratio, the watermark age and Postgres
+            latency; a CPU-starved replica shows this too (RUNBOOK §13).
+
+      - alert: AuthorizationCacheWatermarkStale
+        expr: authorization_watermark_age_seconds{service="authorization-svc"} > 3
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: version watermark {{ $value }}s old — the grant cache is bypassed"
+          description: >-
+            Past 3 s the cache stops serving (never serves stale grants), so every evaluation reads Postgres. Decisions stay
+            correct; latency and database load rise. Check authz_versions reads (RUNBOOK §8).
+
+      - alert: AuthorizationOutboxBacklog
+        expr: authorization_outbox_oldest_pending_seconds{service="authorization-svc"} > 120
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: oldest unpublished event is {{ $value | humanizeDuration }} old"
+          description: >-
+            Decisions and IAM changes are recorded, but their events (authorization.denied, iam.assignment.revoked, ...)
+            have not reached Kafka, so downstream caches and SIEM lag. Check Kafka and the relay log (RUNBOOK §4.1).
+
+      - alert: AuthorizationOutboxStuck
+        expr: authorization_outbox_stuck{service="authorization-svc"} > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: {{ $value }} outbox events failed 5+ publish attempts"
+          description: >-
+            There is no dead-letter; the relay keeps retrying. Read last_error on outbox_events for the stuck rows
+            (RUNBOOK §4.2).
+
+      - alert: AuthorizationProjectionLagHigh
+        expr: histogram_quantile(0.95, sum by (le, consumer) (rate(authorization_projection_lag_seconds_bucket{service="authorization-svc"}[10m]))) > 30
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "authorization-svc: {{ $labels.consumer }} projection p95 lag {{ $value | humanizeDuration }}"
+          description: >-
+            Suspensions, disables and delegation revocations reach the decision path more than 30 s late — the
+            revocation objective (IAM-8). Check the Kafka consumer groups authorization-svc-lifecycle /
+            authorization-svc-delegation-projector (RUNBOOK §7).
+
+      - alert: AuthorizationBreakGlassActive
+        expr: authorization_sessions{service="authorization-svc", kind="break_glass", state="ACTIVE"} > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "authorization-svc: {{ $value }} break-glass session(s) active"
+          description: >-
+            Emergency access is in force. Confirm the declared incident and the approvals; every break-glass session is
+            reviewed when it ends (ZS-IAM-001 §14).
+
+      - alert: AuthorizationSoDDenialSpike
+        expr: sum(increase(authorization_decisions_total{service="authorization-svc", layer="sod"}[15m])) > 20
+        for: 0m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: {{ $value }} segregation-of-duties denials in 15m"
+          description: >-
+            Self-approval, own-object, cooling-window or static-conflict attempts above the usual rate (ZS-IAM-001 §26 SoD
+            alerts). Read the access-decision log for decision_basis LIKE 'sod:%' to see who and what.

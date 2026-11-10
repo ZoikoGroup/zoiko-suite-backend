@@ -17,6 +17,21 @@ against `CONTEXT.md` found and fixed one real gap
 service is now fully spec-compliant. PR into `main` not yet opened (to
 be opened manually).
 
+## S0 Baseline Matrix
+
+| Feature Row | Route / Consumer | Test | Console Tab | Status |
+|-------------|------------------|------|-------------|--------|
+| D2-2.F01 | POST /v1/decisions | TestCreateDecision_* | Decisions | 🔵 Built |
+| D2-2.F02 | GET /v1/decisions, GET /v1/decisions/{id} | TestListDecisions_*, TestGetDecision_* | Decisions | 🟡 Partial (needs cursor paging) |
+| D2-2.F03 | POST /v1/decisions/{id}/replay, GET /v1/decisions/{id}/replay-manifests | TestReplayDecision_*, TestListReplayManifests_* | Replays | 🔵 Built |
+| D2-2.F04 | Outbox: governance.decision.recorded/.replayed | TestOutbox_* | — | 🔵 Built |
+| D2-2.F05 | jurisdiction_context, column guards, RFC 9457 | TestCreateDecision_* | — | 🔵 Built |
+| D2-2.F06 | Read authorization (GOVERNANCE_DECISION_READ) | TestAuthorizeRead_* | Decisions | 🟡 Partial (warn mode) |
+| D2-2.F09 | G-07 Evidence ledger | — | Evidence chain | ❌ Missing |
+| D2-2.F10 | Workflow ledger relay | — | Evidence chain | ❌ Missing |
+| D2-2.F12 | Cursor paging (API-4) on GET /v1/decisions | TestListDecisions_CursorPaging | Decisions | ❌ Missing |
+| D2-2.F13 | Dependency E2E, console v2.0 | e2e-governance-decision-log-deps.py | All | ❌ Missing |
+
 ## Roadmap — three phases, three branches, three PRs into `main`
 
 Each phase branches off `main` fresh (not off the previous phase's

@@ -2544,3 +2544,42 @@ first.
   events, history versions 1–4, quantity 10 PERMIT and 11 DENY).
 
 **Deploy:** apply 000038, 000039, 000040.
+
+## 10 Nov: truth check, AZ-1 / AZ-4 (delegations) / AZ-5 / IAM-8, §26 telemetry, A09–A10 hardening
+
+A pasted feature summary was checked against the code. It was mostly right; it overstated four
+controls (quorum, fact-hash, cooling window and resource state are judged from PEP-supplied
+attributes, not stored records), the FX handling (a hard-coded table, missing currency read as
+GBP), and Kafka's role in cache invalidation (the database watermark does it in ~1 s). The 7 Nov
+commit `13a5a97d` claimed AZ-1/2/4/5 done but changed no code, and its RELEASE_CERTIFICATE,
+RUNBOOK, SPEC_DEVIATIONS, asyncapi.yaml and audit.sh described routes, tests, metrics and tables
+that do not exist.
+
+**Changed:**
+- **AZ-1 (API-3):** If-Match required on assignment approve / reject / revoke / suspend / resume
+  and workload-binding deactivate / reactivate (`optionalExpectedVersion` removed). Callers:
+  access-control-svc `postCommand` sends `If-Match: *` on revoke and on role / bundle
+  retire / reactivate — those two already required it and were failing with 428; the console
+  sends each row's `version` (grants, workloads, approvals inbox).
+- **AZ-1 (API-4):** `paging.go` — opt-in `page_size` / `cursor` on 15 admin lists, id-ordered,
+  scope-bound cursors, `truncated` when the store's 500-row cap is hit; assignments keyset in SQL
+  (`AssignmentQuery.Keyset`).
+- **AZ-4 (delegation half):** `/v1/iam/delegations`, `…/{id}:revoke` and `/revoke` as aliases.
+- **§26 telemetry:** `internal/telemetry/authz.go`, `handler/metrics.go`, `events/observer.go`,
+  `store/pg_telemetry.go`, cache `Telemetry()`; dashboard
+  `deployments/grafana/provisioning/dashboards/authorization-svc.json`; 8 alert rules.
+- **A10:** revalidation fails closed when either hash is missing.
+- **A09:** no currency → `CURRENCY_REQUIRED` (limits and delegation ceilings);
+  `AUTHZ_FX_REFERENCE_RATES`; FX basis and rate in reason codes.
+- **AZ-5:** asyncapi.yaml complete (35 produced / 19 consumed) with a two-way contract test;
+  RUNBOOK, SPEC_DEVIATIONS, RELEASE_CERTIFICATE, scripts/audit.sh rewritten against the code.
+- access-control-svc 000048 rewritten so it can apply (FK failures, `.`-terminated statements,
+  non-idempotent constraint).
+
+**Proof:** 900 tests pass / 0 fail / 1 by-design skip (both DSNs, NOBYPASSRLS); 10/10 mutants
+killed; audit 49/49 live; persona scenarios 78/78 (`deployments/scripts/e2e-authorization-scenarios.py`);
+dependency E2E 28/32 (siem, Jaeger not started); strict modes 9/9; load 200×60 s: 321/s,
+p99 1376 ms, 0 errors (0.5 CPU, local); revocation 9–35 ms; projection lag 0.23 s / 0.42 s.
+
+**Deploy:** no migration in this service. Rebuild access-control-svc and authorization-svc
+together (If-Match is now required by one and sent by the other); apply access-control 000048.

@@ -98,9 +98,9 @@ func (s *stubStore) FindByID(_ context.Context, tenantID, decisionID string) (*d
 	return s.findByIDResult, s.findByIDErr
 }
 
-func (s *stubStore) List(_ context.Context, params store.ListParams) ([]*domain.GovernanceDecision, error) {
+func (s *stubStore) List(_ context.Context, params store.ListParams) ([]*domain.GovernanceDecision, *domain.PaginationCursor, error) {
 	s.listGotParams = params
-	return s.listResult, s.listErr
+	return s.listResult, nil, s.listErr
 }
 
 // ── replay manifests ─────────────────────────────────────────────────────────
@@ -130,7 +130,25 @@ func (s *stubStore) CheckIdempotencyKey(_ context.Context, _, idempotencyKey str
 	return "", nil, nil
 }
 
-// stubPolicyClient implements policyclient.Client for unit testing.
+// ── G-07 Evidence ledger ───────────────────────────────────────────────────
+
+func (s *stubStore) VerifyChain(_ context.Context, _ string) (bool, int, string, error) {
+	return true, 0, "", nil
+}
+
+func (s *stubStore) ExportChain(_ context.Context, _ string, _ *json.Encoder) error {
+	return nil
+}
+
+func (s *stubStore) SealPackage(_ context.Context, _, _, _, _ string) ([]byte, error) {
+	return []byte{0x00}, nil
+}
+
+func (s *stubStore) GetPackage(_ context.Context, _, _ string) (*domain.EvidencePackage, error) {
+	return nil, domain.ErrPackageNotFound
+}
+
+// ── idempotency keys ──────────────────────────────────────────────────────────
 type stubPolicyClient struct {
 	version *policyclient.PolicyVersion
 	err     error
@@ -437,7 +455,7 @@ func TestGetDecision_503_StoreUnavailable(t *testing.T) {
 }
 
 // TestListDecisions_200_Empty verifies an empty result set serialises as an
-// empty JSON array, never null.
+// empty JSON object with records array, never null.
 func TestListDecisions_200_Empty(t *testing.T) {
 	h := newTestRouter(&stubStore{listResult: nil})
 	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions", nil))
@@ -449,8 +467,10 @@ func TestListDecisions_200_Empty(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	if strings.TrimSpace(rr.Body.String()) != "[]" {
-		t.Errorf("expected empty JSON array, got %q", rr.Body.String())
+	// New response format: {"records":[],"next_cursor":"","total_count":0}
+	expected := `{"records":[],"next_cursor":"","total_count":0}`
+	if strings.TrimSpace(rr.Body.String()) != expected {
+		t.Errorf("expected %s, got %q", expected, rr.Body.String())
 	}
 }
 
