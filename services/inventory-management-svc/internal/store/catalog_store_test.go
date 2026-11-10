@@ -94,6 +94,7 @@ func TestPgStore_CreateVersion_ThenApproveActivate_SupersedesPrior(t *testing.T)
 	if err := s.ApproveOfferingVersion(ctx, v1.VersionID, "reviewer-1", now); err != nil {
 		t.Fatalf("ApproveOfferingVersion failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v1.VersionID)
 	if superseded, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v1.VersionID, "reviewer-1", now); err != nil {
 		t.Fatalf("ActivateOfferingVersion failed: %v", err)
 	} else if superseded != nil {
@@ -117,6 +118,7 @@ func TestPgStore_CreateVersion_ThenApproveActivate_SupersedesPrior(t *testing.T)
 	if err := s.ApproveOfferingVersion(ctx, v2.VersionID, "reviewer-1", later); err != nil {
 		t.Fatalf("ApproveOfferingVersion v2 failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v2.VersionID)
 	superseded, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v2.VersionID, "reviewer-1", later)
 	if err != nil {
 		t.Fatalf("ActivateOfferingVersion v2 failed: %v", err)
@@ -192,6 +194,7 @@ func TestPgStore_SuspendThenRetireOfferingVersion(t *testing.T) {
 	if err := s.ApproveOfferingVersion(ctx, v.VersionID, "reviewer-1", now); err != nil {
 		t.Fatalf("ApproveOfferingVersion failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v.VersionID)
 	if _, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v.VersionID, "reviewer-1", now); err != nil {
 		t.Fatalf("ActivateOfferingVersion failed: %v", err)
 	}
@@ -229,6 +232,7 @@ func TestPgStore_GetVersionAsOf_PinsHistoricalVersion(t *testing.T) {
 	if err := s.ApproveOfferingVersion(ctx, v1.VersionID, "reviewer-1", t1); err != nil {
 		t.Fatalf("ApproveOfferingVersion v1 failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v1.VersionID)
 	if _, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v1.VersionID, "reviewer-1", t1); err != nil {
 		t.Fatalf("ActivateOfferingVersion v1 failed: %v", err)
 	}
@@ -247,6 +251,7 @@ func TestPgStore_GetVersionAsOf_PinsHistoricalVersion(t *testing.T) {
 	if err := s.ApproveOfferingVersion(ctx, v2.VersionID, "reviewer-1", t2); err != nil {
 		t.Fatalf("ApproveOfferingVersion v2 failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v2.VersionID)
 	if _, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v2.VersionID, "reviewer-1", t2); err != nil {
 		t.Fatalf("ActivateOfferingVersion v2 failed: %v", err)
 	}
@@ -393,5 +398,20 @@ func TestPgStore_LinkMapping_UnknownVersion_ReturnsNotFound(t *testing.T) {
 	}
 	if err := s.LinkMapping(ctx, m); err != domain.ErrOfferingVersionNotFound {
 		t.Fatalf("expected ErrOfferingVersionNotFound, got %v", err)
+	}
+}
+
+// linkRequiredMappings links the TAX and ACCOUNTING mappings a version needs
+// before it may be activated (migration 000013).
+func linkRequiredMappings(t *testing.T, ctx context.Context, s *store.PgStore, versionID string) {
+	t.Helper()
+	for _, mt := range []string{"TAX", "ACCOUNTING"} {
+		m := &domain.CatalogMapping{
+			MappingID: uuid.New().String(), VersionID: versionID, MappingType: mt,
+			MappingRef: mt + "-REF", LinkedAt: time.Now().UTC(), LinkedByPrincipalID: "specialist-1",
+		}
+		if err := s.LinkMapping(ctx, m); err != nil {
+			t.Fatalf("link %s mapping failed: %v", mt, err)
+		}
 	}
 }

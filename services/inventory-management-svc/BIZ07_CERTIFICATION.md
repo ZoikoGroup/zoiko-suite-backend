@@ -16,7 +16,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Authorization / SoD | Distinct actions: `CATALOG_READ`, `CATALOG_MANAGE`, `CATALOG_APPROVE`, `CATALOG_MAPPING_LINK` | handler |
 | Events (5) | Published; contract in `asyncapi.biz07.yaml` | `internal/events/publisher.go` |
 | API contract | `openapi.biz07.yaml` | this directory |
-| Failure: missing required mapping blocks use | Enforced at activation (TAX + ACCOUNTING required) in the **handler only** | `ActivateOffering` |
+| Failure: missing required mapping blocks use | Enforced at activation (TAX + ACCOUNTING required) in the handler and by a database trigger (migration 000013) | `ActivateOffering` |
 | Failure: historical transactions pin the version | Data layer supports it (immutable versions, `version-as-of`); no consumer enforces it yet | migration 000006 |
 | Dependency: REF-09 units | **Not met** — REF-09 does not exist; `unit` is free text | — |
 | Boundary: not the SaaS price book (COM-01) | Respected; no price fields | — |
@@ -51,7 +51,7 @@ Date: 2026-11-10. The Postgres container was disposable and has been removed.
 - **RLS policies are unproven.** The tests connect as the Postgres superuser, which bypasses RLS. Re-run the isolation test under a non-superuser role to prove the policies themselves.
 - The mapping gate was tested through handler tests with a stub store, not against a live database through the running service.
 - The full docker-compose stack was not run: no real authorization-svc, Kafka or end-to-end flow.
-- OpenAPI/AsyncAPI files parse as YAML but were not run through a linter, and no test ties the event names in `asyncapi.biz07.yaml` to the Go publisher.
+- OpenAPI/AsyncAPI files parse as YAML but were not run through a linter. Event names (and envelope constants) are tied to the publisher by a test; payload fields are not.
 - Authorization was tested only with a stub; real authorization-svc decisions for the `CATALOG_*` actions were not checked, nor that those actions are registered there.
 
 ## Open items to reach certification
@@ -59,8 +59,8 @@ Date: 2026-11-10. The Postgres container was disposable and has been removed.
 1. ~~Run the store suite on Postgres and record the result.~~ Done, 12/12.
 2. ~~Add a cross-tenant negative test.~~ Done at query level; re-run under a non-superuser role to prove RLS.
 3. Decide classification/retention for catalog records and implement or document it.
-4. Move the mapping-required rule into the database (trigger), so a direct write cannot bypass it.
+4. ~~Move the mapping-required rule into the database (trigger).~~ Done: migration 000013; tested via the store and a raw UPDATE (as superuser).
 5. Validate `catalog_version_ref` in AR quotes/sales orders against an ACTIVE catalog version.
 6. Replace free-text `unit` with REF-09 validation once REF-09 exists.
-7. Add an event-name contract test for `asyncapi.biz07.yaml`.
+7. ~~Add an event-name contract test for `asyncapi.biz07.yaml`.~~ Done: `internal/events/catalog_contract_test.go` (verified to fail on a renamed event).
 8. Confirm the TAX + ACCOUNTING required-mapping set with the spec owner (the spec does not enumerate it).
