@@ -410,3 +410,34 @@ func TestContactDetailsNotKept(t *testing.T) {
 		t.Fatalf("contact masking: %s %q", r.Status, r.Text)
 	}
 }
+
+// T2 on the public KB: picking "United States" continues the open
+// plans-and-trial question. The tax console article lists "United States
+// (IRS)", so the reply must not be taken for a question about that article.
+func TestT2_UnitedStatesContinuesOpenQuestionOnPublicKB(t *testing.T) {
+	x := publicKBServer(t)
+	c := &conversation{x: x, s: x.session("00000000-0000-4000-8000-0000000000c2")}
+	clarifyPlansAndTrial(t, c)
+	e := c.sayIn("United States", "US")
+	want(t, e, contract.Answered)
+	if !strings.Contains(e.Text, "Starter, Growth and Enterprise plans are available in the United States") || e.MarketCode != "US" {
+		t.Fatalf("got %s %s %q", e.Status, e.MarketCode, e.Text)
+	}
+	without(t, e, "tax rule")
+}
+
+// A full question that names a market is still a new question while the
+// clarifying question is open: it gets the same reply as in a new session.
+func TestT2_QuestionNamingAMarketIsNewWhileClarifying(t *testing.T) {
+	const q = "How do I create a tax rule in the US?"
+	x := publicKBServer(t)
+	fresh := (&conversation{x: x, s: x.session("00000000-0000-4000-8000-0000000000c3")}).say(q)
+	c := &conversation{x: x, s: x.session("00000000-0000-4000-8000-0000000000c4")}
+	clarifyPlansAndTrial(t, c)
+	e := c.say(q)
+	if e.Status != fresh.Status || e.Reason != fresh.Reason || e.IntentID != fresh.IntentID || e.Text != fresh.Text {
+		t.Fatalf("while clarifying: %s %s %s %q; new session: %s %s %s %q",
+			e.Status, e.Reason, e.IntentID, e.Text, fresh.Status, fresh.Reason, fresh.IntentID, fresh.Text)
+	}
+	without(t, e, "Starter, Growth and Enterprise")
+}

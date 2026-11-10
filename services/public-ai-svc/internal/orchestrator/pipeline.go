@@ -287,7 +287,15 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	// rerouted: the question names no area but one KB section covers it, so
 	// it is ranked on content alone, not towards articles tagged I02.
 	rerouted := false
-	if intent == "I29" && (policy.IsModuleQuestion(dec.Redaction.Text) || (snap.KB != nil && snap.KB.Covers(dec.Redaction.Text))) {
+	// A reply to an open question ("United States") is not a new question
+	// because some article mentions the country it names: coverage is judged
+	// without the market it supplies. "How do I create a tax rule in the US?"
+	// is still covered and still rerouted.
+	covered := dec.Redaction.Text
+	if in.Pending != nil && dec.Slots.MarketCode != "" {
+		covered = policy.WithoutMarket(covered)
+	}
+	if intent == "I29" && (policy.IsModuleQuestion(dec.Redaction.Text) || (snap.KB != nil && snap.KB.Covers(covered))) {
 		// Fallback ladder: rules -> (model classifier, none in R0) -> a named
 		// area, module or alias -> only then out of scope.
 		rerouted = !policy.IsModuleQuestion(dec.Redaction.Text)
