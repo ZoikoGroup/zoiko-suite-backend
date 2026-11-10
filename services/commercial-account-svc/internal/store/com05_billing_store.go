@@ -17,7 +17,6 @@ import (
 
 	"zoiko.io/commercial-account-svc/internal/domain"
 	"zoiko.io/commercial-account-svc/internal/money"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // BillingStore is the COM-05 persistence contract, part 5a.
@@ -123,8 +122,7 @@ func (s *PgStore) OpenBillingAccount(ctx context.Context, b *domain.BillingAccou
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "billing_account", AggregateID: got.BillingAccountID,
-			EventType: "billing_account.opened", TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "billing_account.opened", "billing_account", got.BillingAccountID, got.OrganizationID, claim.PrincipalID, got)
 	})
 	return out, err
 }
@@ -405,8 +403,7 @@ func (s *PgStore) GenerateInvoiceCandidate(ctx context.Context, req domain.Gener
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "invoice_candidate", AggregateID: id,
-			EventType: "invoice_candidate.generated", TenantID: &req.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "invoice_candidate.generated", "invoice_candidate", id, req.OrganizationID, claim.PrincipalID, got)
 	})
 	return out, err
 }
@@ -436,8 +433,7 @@ func (s *PgStore) ApproveInvoiceCandidate(ctx context.Context, candidateID, acto
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "invoice_candidate", AggregateID: candidateID,
-			EventType: "invoice_candidate.approved", TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "invoice_candidate.approved", "invoice_candidate", candidateID, got.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -612,12 +608,11 @@ func (s *PgStore) IssueInvoice(ctx context.Context, candidateID, actor string, n
 			return err
 		}
 		out = got
-		if err := emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.TotalAmount, "DEBIT",
+		if err := s.emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.TotalAmount, "DEBIT",
 			"platform_commercial_invoice", invoiceID); err != nil {
 			return err
 		}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "platform_commercial_invoice", AggregateID: invoiceID,
-			EventType: "platform_invoice.issued", TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "platform_invoice.issued", "platform_commercial_invoice", invoiceID, got.OrganizationID, actor, got)
 	})
 	return out, err
 }

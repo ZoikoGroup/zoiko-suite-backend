@@ -51,7 +51,7 @@ func newPB(t *testing.T) *pbFixture {
 	t.Helper()
 	admin := openAdminPool(t)
 	app := appRolePool(t, admin)
-	return &pbFixture{t: t, ctx: context.Background(), admin: admin, app: app, s: store.NewPgStore(app)}
+	return &pbFixture{t: t, ctx: context.Background(), admin: admin, app: app, s: store.NewPgStore(app, testEventProfile)}
 }
 
 func (f *pbFixture) claim(principal, op, resource string) domain.IdempotencyClaim {
@@ -217,7 +217,8 @@ func (f *pbFixture) outboxCount(aggregateID, eventType string) int {
 	f.t.Helper()
 	var n int
 	if err := f.admin.QueryRow(f.ctx,
-		`SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = $2`, aggregateID, eventType,
+		`SELECT count(*) FROM eventing_outbox WHERE aggregate_id = $1
+			AND convert_from(payload, 'UTF8')::jsonb ->> 'event_type' = $2`, aggregateID, eventType,
 	).Scan(&n); err != nil {
 		f.t.Fatalf("count outbox: %v", err)
 	}

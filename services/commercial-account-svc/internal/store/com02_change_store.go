@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // TransitionRuleStore manages plan transition rules on the seller plane.
@@ -84,8 +83,7 @@ func (s *PgStore) CreateTransitionRule(ctx context.Context, r *domain.PlanTransi
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "plan_transition_rule", AggregateID: got.RuleID,
-			EventType: "plan_transition_rule.created", Payload: got})
+		return s.emit(ctx, tx, "plan_transition_rule.created", "plan_transition_rule", got.RuleID, PlatformScopeID, claim.PrincipalID, got)
 	})
 	return out, err
 }
@@ -114,8 +112,7 @@ func (s *PgStore) RetireTransitionRule(ctx context.Context, ruleID, actor, reaso
 		if err != nil {
 			return err
 		}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "plan_transition_rule", AggregateID: ruleID,
-			EventType: "plan_transition_rule.retired", Payload: out})
+		return s.emit(ctx, tx, "plan_transition_rule.retired", "plan_transition_rule", ruleID, PlatformScopeID, actor, out)
 	})
 	return out, err
 }
@@ -446,7 +443,7 @@ func (s *PgStore) RequestChange(ctx context.Context, c domain.SubscriptionComman
 		// which emits a single distinct "_scheduled" event now and leaves
 		// the real one to the boundary worker alone.
 		if q.Timing == domain.TimingNextRenewal {
-			return emitSubscriptionEvent(ctx, tx, "subscription.change_scheduled", a.sub, m, subscriptionEvent{
+			return s.emitSubscriptionEvent(ctx, tx, "subscription.change_scheduled", a.sub, m, subscriptionEvent{
 				ChangeType: changeType, Status: domain.LifecycleActive, EffectiveAt: q.EffectiveAt,
 				PriceVersionID: q.ToPlanPriceVersionID,
 			})
@@ -455,7 +452,7 @@ func (s *PgStore) RequestChange(ctx context.Context, c domain.SubscriptionComman
 			domain.ChangeKindPlan: "subscription.changed", domain.ChangeKindQuantity: "subscription.quantity_changed",
 			domain.ChangeKindAddOn: "subscription.add_on_changed", domain.ChangeKindMigration: "subscription.changed",
 		}[req.Kind]
-		if err := emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
+		if err := s.emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
 			ChangeType: changeType, Status: domain.LifecycleActive, EffectiveAt: q.EffectiveAt,
 			PriceVersionID: q.ToPlanPriceVersionID,
 		}); err != nil {
@@ -464,7 +461,7 @@ func (s *PgStore) RequestChange(ctx context.Context, c domain.SubscriptionComman
 		// COM-03 gap-remediation (B2): an immediate change has no boundary
 		// pass to invalidate entitlement for it later — recompute now, in
 		// the same transaction as the change itself.
-		_, err = recomputeEntitlementsTx(ctx, tx, a.sub.OrganizationID, m.actor, c.Now)
+		_, err = s.recomputeEntitlementsTx(ctx, tx, a.sub.OrganizationID, m.actor, c.Now)
 		return err
 	})
 }

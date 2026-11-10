@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // PriceBookStore is the COM-01 persistence contract. Every mutating method
@@ -167,16 +166,11 @@ type priceVersionEvent struct {
 	OccurredAt     time.Time                 `json:"occurred_at"`
 }
 
-func emitVersionEvent(ctx context.Context, tx pgx.Tx, eventType string, v *domain.PriceVersion, actor, reason string, at time.Time) error {
-	return outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: aggregatePriceVersion,
-		AggregateID:   v.PriceVersionID,
-		EventType:     eventType,
-		Payload: priceVersionEvent{
-			PriceVersionID: v.PriceVersionID, ProductID: v.ProductID, ProductCode: v.ProductCode,
-			VersionNumber: v.VersionNumber, Status: v.Status, RowVersion: v.RowVersion,
-			ContentSHA256: v.ContentSHA256, ActorID: actor, Reason: reason, OccurredAt: at.UTC(),
-		},
+func (s *PgStore) emitVersionEvent(ctx context.Context, tx pgx.Tx, eventType string, v *domain.PriceVersion, actor, reason string, at time.Time) error {
+	return s.emit(ctx, tx, eventType, aggregatePriceVersion, v.PriceVersionID, PlatformScopeID, actor, priceVersionEvent{
+		PriceVersionID: v.PriceVersionID, ProductID: v.ProductID, ProductCode: v.ProductCode,
+		VersionNumber: v.VersionNumber, Status: v.Status, RowVersion: v.RowVersion,
+		ContentSHA256: v.ContentSHA256, ActorID: actor, Reason: reason, OccurredAt: at.UTC(),
 	})
 }
 
@@ -286,9 +280,7 @@ func (s *PgStore) CreateProduct(ctx context.Context, p *domain.Product, claim do
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "commercial_product", AggregateID: got.ProductID, EventType: "product.created", Payload: got,
-		})
+		return s.emit(ctx, tx, "product.created", "commercial_product", got.ProductID, PlatformScopeID, claim.PrincipalID, got)
 	})
 	return out, err
 }
@@ -759,7 +751,7 @@ func (s *PgStore) CreateDraftVersion(ctx context.Context, v *domain.PriceVersion
 			return err
 		}
 		out = created
-		return emitVersionEvent(ctx, tx, "price_version.created", created, v.CreatedByPrincipalID, v.ChangeReason, v.CreatedAt)
+		return s.emitVersionEvent(ctx, tx, "price_version.created", created, v.CreatedByPrincipalID, v.ChangeReason, v.CreatedAt)
 	})
 	return out, err
 }
@@ -888,7 +880,7 @@ func (s *PgStore) PutPriceComponent(ctx context.Context, versionID string, expec
 		meterChanged = c.ComponentType == domain.ComponentMetered ||
 			(replaced != nil && *replaced == domain.ComponentMetered)
 		if meterChanged {
-			if err := emitVersionEvent(ctx, tx, "price_version.meter_binding_changed", v, c.CreatedByPrincipalID, c.ComponentKey, c.CreatedAt); err != nil {
+			if err := s.emitVersionEvent(ctx, tx, "price_version.meter_binding_changed", v, c.CreatedByPrincipalID, c.ComponentKey, c.CreatedAt); err != nil {
 				return false, err
 			}
 		}
@@ -908,7 +900,7 @@ func (s *PgStore) RemovePriceComponent(ctx context.Context, versionID string, ex
 			return false, domain.ErrPriceComponentNotFound
 		}
 		if *removed == domain.ComponentMetered {
-			if err := emitVersionEvent(ctx, tx, "price_version.meter_binding_changed", v, actor, componentKey, time.Now().UTC()); err != nil {
+			if err := s.emitVersionEvent(ctx, tx, "price_version.meter_binding_changed", v, actor, componentKey, time.Now().UTC()); err != nil {
 				return false, err
 			}
 		}
@@ -939,7 +931,7 @@ func (s *PgStore) SetCommercialTerms(ctx context.Context, versionID string, expe
 			return false, err
 		}
 		v.RowVersion++
-		return true, emitVersionEvent(ctx, tx, "price_version.commercial_terms_changed", v, t.SetByPrincipalID, "", t.SetAt)
+		return true, s.emitVersionEvent(ctx, tx, "price_version.commercial_terms_changed", v, t.SetByPrincipalID, "", t.SetAt)
 	})
 }
 
@@ -1015,7 +1007,7 @@ func (s *PgStore) SubmitForApproval(ctx context.Context, versionID string, expec
 			return err
 		}
 		v.Status, v.RowVersion, v.ContentSHA256 = domain.PriceVersionReview, v.RowVersion+1, &hash
-		return emitVersionEvent(ctx, tx, "price_version.submitted", v, actor, "", now)
+		return s.emitVersionEvent(ctx, tx, "price_version.submitted", v, actor, "", now)
 	})
 }
 
@@ -1038,7 +1030,7 @@ func (s *PgStore) ApprovePriceVersion(ctx context.Context, versionID string, exp
 			return err
 		}
 		v.Status, v.RowVersion = domain.PriceVersionApproved, v.RowVersion+1
-		return emitVersionEvent(ctx, tx, "price_version.approved", v, actor, "", now)
+		return s.emitVersionEvent(ctx, tx, "price_version.approved", v, actor, "", now)
 	})
 }
 
@@ -1055,7 +1047,7 @@ func (s *PgStore) RejectPriceVersion(ctx context.Context, versionID string, expe
 			return err
 		}
 		v.Status, v.RowVersion, v.ContentSHA256 = domain.PriceVersionDraft, v.RowVersion+1, nil
-		return emitVersionEvent(ctx, tx, "price_version.rejected", v, actor, reason, now)
+		return s.emitVersionEvent(ctx, tx, "price_version.rejected", v, actor, reason, now)
 	})
 }
 
@@ -1088,7 +1080,7 @@ func (s *PgStore) PublishPriceVersion(ctx context.Context, versionID string, exp
 			return err
 		}
 		v.Status, v.RowVersion = domain.PriceVersionPublished, v.RowVersion+1
-		return emitVersionEvent(ctx, tx, "price_version.published", v, actor, "", now)
+		return s.emitVersionEvent(ctx, tx, "price_version.published", v, actor, "", now)
 	})
 }
 
@@ -1105,6 +1097,6 @@ func (s *PgStore) RetirePriceVersion(ctx context.Context, versionID string, expe
 			return err
 		}
 		v.Status, v.RowVersion = domain.PriceVersionRetired, v.RowVersion+1
-		return emitVersionEvent(ctx, tx, "price_version.retired", v, actor, reason, now)
+		return s.emitVersionEvent(ctx, tx, "price_version.retired", v, actor, reason, now)
 	})
 }

@@ -4439,8 +4439,9 @@ services:
   # Plane 2 tenant/workspace/legal_entity data.
   commercial-account-svc:
     build:
-      context: ../services/commercial-account-svc
-      dockerfile: Dockerfile
+      # Context is services/ so the go.mod replace ../eventing resolves.
+      context: ../services
+      dockerfile: commercial-account-svc/Dockerfile
     container_name: commercial-account-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4460,6 +4461,9 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/commercial_account?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
+      # Required ZS-EVENT-001 envelope attributes (no default; startup refuses without them).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      EVENT_CLASSIFICATION: "${EVENT_CLASSIFICATION_COMMERCIAL_ACCOUNT:-confidential}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:

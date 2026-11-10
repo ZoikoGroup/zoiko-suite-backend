@@ -14,7 +14,6 @@ import (
 
 	"zoiko.io/commercial-account-svc/internal/domain"
 	"zoiko.io/commercial-account-svc/internal/money"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // CreditStore is the COM-05 persistence contract, part 5c.
@@ -156,11 +155,10 @@ func (s *PgStore) IssueCreditNote(ctx context.Context, creditNoteID, invoiceID, 
 		if err != nil {
 			return err
 		}
-		if err := emitAccountingEvent(ctx, tx, orgID, ba.AccountingMappingKey, amount, "CREDIT", "credit_note", creditNoteID); err != nil {
+		if err := s.emitAccountingEvent(ctx, tx, orgID, ba.AccountingMappingKey, amount, "CREDIT", "credit_note", creditNoteID); err != nil {
 			return err
 		}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "credit_note", AggregateID: creditNoteID,
-			EventType: "credit_note.issued", TenantID: &orgID, Payload: got})
+		return s.emit(ctx, tx, "credit_note.issued", "credit_note", creditNoteID, orgID, actor, got)
 	})
 	return out, err
 }
@@ -229,11 +227,10 @@ func (s *PgStore) ApplyWriteOff(ctx context.Context, writeOffID, invoiceID, amou
 		if err != nil {
 			return err
 		}
-		if err := emitAccountingEvent(ctx, tx, orgID, ba.AccountingMappingKey, amount, "CREDIT", "write_off", writeOffID); err != nil {
+		if err := s.emitAccountingEvent(ctx, tx, orgID, ba.AccountingMappingKey, amount, "CREDIT", "write_off", writeOffID); err != nil {
 			return err
 		}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "write_off", AggregateID: writeOffID,
-			EventType: "write_off.applied", TenantID: &orgID, Payload: got})
+		return s.emit(ctx, tx, "write_off.applied", "write_off", writeOffID, orgID, actor, got)
 	})
 	return out, err
 }
@@ -377,8 +374,7 @@ func (s *PgStore) RequestRefund(ctx context.Context, refundID, invoiceID, paymen
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "refund_request", AggregateID: refundID,
-			EventType: "refund.requested", TenantID: &attempt.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "refund.requested", "refund_request", refundID, attempt.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -428,12 +424,11 @@ func (s *PgStore) SettleRefund(ctx context.Context, req domain.SettleRefundReque
 			if err != nil {
 				return err
 			}
-			if err := emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.Amount, "CREDIT", "refund_request", req.RefundID); err != nil {
+			if err := s.emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.Amount, "CREDIT", "refund_request", req.RefundID); err != nil {
 				return err
 			}
 		}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "refund_request", AggregateID: req.RefundID,
-			EventType: eventType, TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, eventType, "refund_request", req.RefundID, got.OrganizationID, claim.PrincipalID, got)
 	})
 	return out, err
 }
