@@ -1,0 +1,364 @@
+openapi: "3.1.0"
+
+info:
+  title: workflow-svc — BIZ-04 Form Definition & Submission
+  version: "1.0.0"
+  description: |
+    Contract for the BIZ-04 surface hosted by workflow-svc, from ZS-SVC-P-001 section 6.
+    `openapi.yaml` covers the governed approval surface and states that the form module
+    is described separately; this is that description.
+
+    **Authority boundary.** BIZ-04 owns structured form definitions and immutable
+    submissions. A submission is a validated *candidate* input: routing to a target
+    domain records the attempt; the protected business change is committed only by the
+    owning domain through its own command, authorization and invariant checks.
+
+    **Lifecycles.** Form: DRAFT -> PUBLISHED -> RETIRED. Submission: DRAFT -> SUBMITTED ->
+    VALIDATING -> ACCEPTED / REJECTED -> SUPERSEDED. Enforced by database CHECK
+    constraints; submitted values are immutable once submitted, and form definitions are
+    guarded by triggers.
+
+    **Routing evidence.** A route attempt is recorded in its own table
+    (`SUCCEEDED` / `FAILED`); a submission stays ACCEPTED as evidence even when the
+    target domain rejects the routed command.
+
+    **Authorization (fail closed).** `FORM_MANAGE` creates forms; `FORM_APPROVE` publishes
+    and retires them (the publisher cannot be the form's owner: 403
+    `self_publish_not_allowed`); `FORM_SUBMIT` for drafts, submit, validate, supersede and
+    route; `FORM_READ` for queries.
+
+    **Headers.** Every route needs a principal and a tenant (`X-Tenant-Id`, a UUID, set by
+    the gateway from a verified identity envelope). Commands also need `X-Correlation-ID`
+    (400 `missing_correlation_id`); CreateForm and SaveDraft are idempotent on it (a
+    replay answers 200 instead of 201).
+
+    **Errors.** The body is `{"error": "<code>"}` (not RFC 9457 on this surface).
+
+servers:
+  - url: http://localhost:8090
+    description: Local development
+
+tags:
+  - name: Forms
+  - name: Submissions
+
+paths:
+  /v1/forms:
+    post:
+      tags: [Forms]
+      operationId: CreateForm
+      summary: Create a DRAFT form definition (FORM_MANAGE); the caller becomes the owner
+      parameters: [{ $ref: "#/components/parameters/CorrelationId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateFormRequest" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/FormDefinition" } } } }
+        "200": { description: Idempotent replay on X-Correlation-ID, content: { application/json: { schema: { $ref: "#/components/schemas/FormDefinition" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /v1/forms/{form_id}:
+    get:
+      tags: [Forms]
+      operationId: GetForm
+      parameters: [{ $ref: "#/components/parameters/FormId" }]
+      responses:
+        "200": { description: Form, content: { application/json: { schema: { $ref: "#/components/schemas/FormDefinition" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/forms/{form_id}/publish:
+    post:
+      tags: [Forms]
+      operationId: PublishForm
+      summary: DRAFT -> PUBLISHED (FORM_APPROVE; not by the owner)
+      parameters:
+        - { $ref: "#/components/parameters/FormId" }
+        - { $ref: "#/components/parameters/CorrelationId" }
+      responses:
+        "200": { description: Published, content: { application/json: { schema: { $ref: "#/components/schemas/FormDefinition" } } } }
+        "403": { description: forbidden, or self_publish_not_allowed, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: form_not_draft, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/forms/{form_id}/retire:
+    post:
+      tags: [Forms]
+      operationId: RetireForm
+      summary: PUBLISHED -> RETIRED (FORM_APPROVE); blocks new drafts
+      parameters:
+        - { $ref: "#/components/parameters/FormId" }
+        - { $ref: "#/components/parameters/CorrelationId" }
+      responses:
+        "200": { description: Retired, content: { application/json: { schema: { $ref: "#/components/schemas/FormDefinition" } } } }
+        "409": { description: form_not_published, or form_already_retired, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/forms/{form_id}/drafts:
+    post:
+      tags: [Submissions]
+      operationId: SaveDraft_New
+      summary: Create the first draft submission for a published form (FORM_SUBMIT)
+      parameters:
+        - { $ref: "#/components/parameters/FormId" }
+        - { $ref: "#/components/parameters/CorrelationId" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SaveDraftRequest" }
+      responses:
+        "201": { description: Draft created, content: { application/json: { schema: { $ref: "#/components/schemas/FormSubmission" } } } }
+        "200": { description: Idempotent replay, content: { application/json: { schema: { $ref: "#/components/schemas/FormSubmission" } } } }
+        "409": { description: form_retired, or form_not_published, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/forms/{form_id}/pending-submissions:
+    get:
+      tags: [Submissions]
+      operationId: ListPendingSubmissions
+      summary: Submissions of the form still SUBMITTED or VALIDATING (FORM_READ)
+      parameters:
+        - { $ref: "#/components/parameters/FormId" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: Pending submissions (empty array when none)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FormSubmission" }
+
+  /v1/form-submissions/{submission_id}:
+    get:
+      tags: [Submissions]
+      operationId: GetSubmission
+      parameters: [{ $ref: "#/components/parameters/SubmissionId" }]
+      responses:
+        "200": { description: Submission, content: { application/json: { schema: { $ref: "#/components/schemas/FormSubmission" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/form-submissions/{submission_id}/drafts:
+    post:
+      tags: [Submissions]
+      operationId: SaveDraft_Update
+      summary: Update an existing DRAFT submission (FORM_SUBMIT)
+      parameters:
+        - { $ref: "#/components/parameters/SubmissionId" }
+        - { $ref: "#/components/parameters/CorrelationId" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SaveDraftRequest" }
+      responses:
+        "200": { description: Draft updated, content: { application/json: { schema: { $ref: "#/components/schemas/FormSubmission" } } } }
+        "409": { description: submission_not_draft, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/form-submissions/{submission_id}/submit:
+    post:
+      tags: [Submissions]
+      operationId: SubmitForm
+      summary: DRAFT -> SUBMITTED; submitted values become immutable (FORM_SUBMIT)
+      parameters:
+        - { $ref: "#/components/parameters/SubmissionId" }
+        - { $ref: "#/components/parameters/CorrelationId" }
+      responses:
+        "200": { description: Submitted (emits form.submission.received), content: { application/json: { schema: { $ref: "#/components/schemas/FormSubmission" } } } }
+        "409": { description: submission_not_draft, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/form-submissions/{submission_id}/validate:
+    post:
+      tags: [Submissions]
+      operationId: ValidateSubmission
+      summary: SUBMITTED -> ACCEPTED or REJECTED against the form schema (FORM_SUBMIT)
+      description: |
+        Returns 200 for both outcomes; inspect `status`. A REJECTED submission carries
+        `rejection_reason` and emits form.submission.rejected; an ACCEPTED one emits
+        form.submission.validated.
+      parameters:
+        - { $ref: "#/components/parameters/SubmissionId" }
+        - { $ref: "#/components/parameters/CorrelationId" }
+      responses:
+        "200": { description: Validated, content: { application/json: { schema: { $ref: "#/components/schemas/FormSubmission" } } } }
+        "409": { description: submission_not_submitted, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/form-submissions/{submission_id}/version:
+    get:
+      tags: [Submissions]
+      operationId: GetSubmissionVersion
+      summary: The form version the submission was made against (FORM_READ)
+      parameters: [{ $ref: "#/components/parameters/SubmissionId" }]
+      responses:
+        "200":
+          description: Version snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  submission_id: { type: string }
+                  form_id: { type: string }
+                  form_version: { type: integer }
+
+  /v1/form-submissions/{submission_id}/validation-result:
+    get:
+      tags: [Submissions]
+      operationId: GetValidationResult
+      parameters: [{ $ref: "#/components/parameters/SubmissionId" }]
+      responses:
+        "200": { description: Recorded validation result, content: { application/json: { schema: { $ref: "#/components/schemas/ValidationResult" } } } }
+        "404": { description: form_submission_not_found, or not_yet_validated, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/form-submissions/{submission_id}/supersede:
+    post:
+      tags: [Submissions]
+      operationId: SupersedeSubmission
+      summary: Mark this (previous) submission superseded by a new one (FORM_SUBMIT)
+      parameters:
+        - { $ref: "#/components/parameters/SubmissionId" }
+        - { $ref: "#/components/parameters/CorrelationId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_submission_id]
+              properties:
+                new_submission_id: { type: string }
+      responses:
+        "200": { description: Superseded, content: { application/json: { schema: { $ref: "#/components/schemas/FormSubmission" } } } }
+        "400": { description: submissions_belong_to_different_forms, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: submission_not_accepted_or_rejected, or submission_already_superseded, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /v1/form-submissions/{submission_id}/route:
+    post:
+      tags: [Submissions]
+      operationId: RouteToDomain
+      summary: Record a routing attempt of an ACCEPTED submission to the form's target domain (FORM_SUBMIT)
+      description: |
+        Records the attempt only; the target domain commits (or refuses) the business
+        change. A FAILED outcome does not change the submission, which stays ACCEPTED.
+      parameters:
+        - { $ref: "#/components/parameters/SubmissionId" }
+        - { $ref: "#/components/parameters/CorrelationId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RouteRequest" }
+      responses:
+        "201": { description: Route recorded (emits form.submission.routed), content: { application/json: { schema: { $ref: "#/components/schemas/FormSubmissionRoute" } } } }
+        "400": { description: invalid_outcome, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: submission_not_accepted, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+components:
+  parameters:
+    FormId: { name: form_id, in: path, required: true, schema: { type: string } }
+    SubmissionId: { name: submission_id, in: path, required: true, schema: { type: string } }
+    CorrelationId: { name: X-Correlation-ID, in: header, required: true, schema: { type: string } }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string, examples: [form_not_published] }
+
+    CreateFormRequest:
+      type: object
+      required: [legal_entity_id, name, business_purpose, target_domain]
+      properties:
+        legal_entity_id: { type: string }
+        name: { type: string }
+        business_purpose: { type: string }
+        target_domain: { type: string }
+        schema:
+          type: array
+          description: Names of the required fields a submission must supply.
+          items: { type: string }
+
+    FormDefinition:
+      type: object
+      properties:
+        form_id: { type: string }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        name: { type: string }
+        business_purpose: { type: string }
+        target_domain: { type: string }
+        schema: { type: array, items: { type: string } }
+        owner_principal_id: { type: string }
+        status: { type: string, enum: [DRAFT, PUBLISHED, RETIRED] }
+        version: { type: integer }
+        published_by_principal_id: { type: string }
+        published_at: { type: string, format: date-time }
+        retired_by_principal_id: { type: string }
+        retired_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    SaveDraftRequest:
+      type: object
+      properties:
+        submitted_values:
+          type: object
+          additionalProperties: { type: string }
+        consent_attestation: { type: string }
+
+    ValidationResult:
+      type: object
+      properties:
+        passed: { type: boolean }
+        missing: { type: array, items: { type: string } }
+
+    FormSubmission:
+      type: object
+      properties:
+        submission_id: { type: string }
+        form_id: { type: string }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        form_version: { type: integer }
+        status:
+          type: string
+          enum: [DRAFT, SUBMITTED, VALIDATING, ACCEPTED, REJECTED, SUPERSEDED]
+        submitted_values:
+          type: object
+          additionalProperties: { type: string }
+        submitter_principal_id: { type: string }
+        consent_attestation: { type: string }
+        validation_result: { $ref: "#/components/schemas/ValidationResult" }
+        rejection_reason: { type: string }
+        superseded_by_submission_id: { type: string }
+        created_at: { type: string, format: date-time }
+        submitted_at: { type: string, format: date-time }
+        validated_at: { type: string, format: date-time }
+
+    RouteRequest:
+      type: object
+      required: [outcome]
+      properties:
+        outcome: { type: string, enum: [SUCCEEDED, FAILED] }
+        command_reference: { type: string }
+        result_reference: { type: string }
+        failure_reason: { type: string }
+
+    FormSubmissionRoute:
+      type: object
+      properties:
+        route_id: { type: string }
+        submission_id: { type: string }
+        tenant_id: { type: string }
+        target_domain: { type: string }
+        command_reference: { type: string }
+        result_reference: { type: string }
+        outcome: { type: string, enum: [SUCCEEDED, FAILED] }
+        failure_reason: { type: string }
+        routed_by_principal_id: { type: string }
+        routed_at: { type: string, format: date-time }
