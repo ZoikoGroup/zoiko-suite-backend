@@ -3,6 +3,7 @@ package handler
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -336,6 +337,17 @@ func (h *Handler) ActivateOffering(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, o.LegalEntityID, actionCatalogManage); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	linked, err := h.store.GetMappings(r.Context(), versionID)
+	if err != nil {
+		h.log.Error("ActivateOffering: mappings unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if missing := domain.MissingRequiredCatalogMappings(linked); len(missing) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, "CATALOG_MAPPING_REQUIRED",
+			domain.ErrCatalogMappingRequired.Error()+": "+strings.Join(missing, ", "))
 		return
 	}
 	now := time.Now().UTC()
