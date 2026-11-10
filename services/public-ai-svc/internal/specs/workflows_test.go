@@ -55,7 +55,7 @@ func TestSecretScanSelfTest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := string(b)
+	s := strings.ReplaceAll(string(b), "\r\n", "\n")
 	for _, want := range []string{"gitleaks self-test", "dir /scan", "ghp_", "did not flag a planted", "exit 1"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("secret-scan.yml lacks %q", want)

@@ -49,6 +49,7 @@ servers:
 tags:
   - name: decisions
   - name: replay
+  - name: evidence
 paths:
   /v1/decisions:
     post:
@@ -244,6 +245,124 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /v1/evidence/chain/verify:
+    get:
+      tags: [evidence]
+      operationId: verifyEvidenceChain
+      summary: Verify the tenant's decision hash chain
+      description: |
+        Walks every decision in `decided_at` order and checks each `prev_hash`
+        against the previous `curr_hash`. Needs `GOVERNANCE_DECISION_READ` on
+        the platform scope.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      responses:
+        '200':
+          description: Chain verification result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChainVerification'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/evidence/chain/export:
+    get:
+      tags: [evidence]
+      operationId: exportEvidenceChain
+      summary: Export the tenant's decision hash chain
+      description: |
+        Streams one JSON object per line, in `decided_at` order, with each
+        decision's `prev_hash` and `curr_hash`. Needs
+        `GOVERNANCE_DECISION_READ` on the platform scope.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      responses:
+        '200':
+          description: Newline-delimited chain records (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ChainExportRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/evidence/packages/seal:
+    post:
+      tags: [evidence]
+      operationId: sealEvidencePackage
+      summary: Seal the chain into an evidence package
+      description: |
+        Creates a Merkle-root snapshot for the tenant up to
+        `last_decision_id`. Needs `WORKFLOW_LEDGER_PRINCIPAL_ID` on the
+        platform scope.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SealPackageRequest'
+      responses:
+        '201':
+          description: Package sealed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SealPackageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/evidence/packages/{package_id}:
+    get:
+      tags: [evidence]
+      operationId: getEvidencePackage
+      summary: Read a sealed evidence package
+      description: |
+        Returns the package when the caller can read its tenant; another
+        tenant's package is indistinguishable from a missing one (404).
+      parameters:
+        - $ref: '#/components/parameters/EvidencePackageId'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      responses:
+        '200':
+          description: The sealed package.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidencePackage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
 components:
   parameters:
     TenantId:
@@ -269,6 +388,11 @@ components:
       schema: {type: string}
     DecisionId:
       name: decision_id
+      in: path
+      required: true
+      schema: {type: string, maxLength: 64}
+    EvidencePackageId:
+      name: package_id
       in: path
       required: true
       schema: {type: string, maxLength: 64}
@@ -330,6 +454,52 @@ components:
         replayed_at: {type: string, format: date-time}
         replayed_by_principal_id: {type: string, description: The authenticated caller who ran the replay.}
         tenant_id: {type: string}
+    ChainVerification:
+      type: object
+      required: [valid, decisions_checked]
+      properties:
+        valid: {type: boolean, description: True when every prev_hash matches the previous curr_hash.}
+        decisions_checked: {type: integer, minimum: 0}
+        last_decision_id: {type: string, description: Empty when the tenant has no decisions.}
+    ChainExportRecord:
+      type: object
+      required: [decision_id, tenant_id, legal_entity_id, actor_id, action_type, outcome, rule_basis, decided_at, prev_hash, curr_hash]
+      properties:
+        decision_id: {type: string}
+        tenant_id: {type: string}
+        legal_entity_id: {type: string}
+        actor_id: {type: string}
+        action_type: {type: string}
+        outcome: {type: string}
+        rule_basis: {type: string}
+        decided_at: {type: string, format: date-time}
+        prev_hash: {type: string, description: Hex-encoded; empty or "00" for the first decision.}
+        curr_hash: {type: string, description: Hex-encoded.}
+    SealPackageRequest:
+      type: object
+      required: [package_id, last_decision_id]
+      properties:
+        package_id: {type: string, maxLength: 64}
+        last_decision_id: {type: string, maxLength: 64}
+    SealPackageResponse:
+      type: object
+      required: [package_id, merkle_root, sealed_at, sealed_by]
+      properties:
+        package_id: {type: string}
+        merkle_root: {type: string, description: Hex-encoded SHA-256 Merkle root.}
+        sealed_at: {type: string, format: date-time}
+        sealed_by: {type: string}
+    EvidencePackage:
+      type: object
+      required: [package_id, tenant_id, merkle_root, leaf_count, last_decision_id, sealed_at, sealed_by]
+      properties:
+        package_id: {type: string}
+        tenant_id: {type: string}
+        merkle_root: {type: string, description: Hex-encoded SHA-256 Merkle root.}
+        leaf_count: {type: integer, format: int64, minimum: 0}
+        last_decision_id: {type: string}
+        sealed_at: {type: string, format: date-time}
+        sealed_by: {type: string}
     Problem:
       type: object
       required: [type, title, status, code]
