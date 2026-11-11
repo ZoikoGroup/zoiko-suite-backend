@@ -294,6 +294,9 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	// rerouted: the question names no area but one KB section covers it, so
 	// it is ranked on content alone, not towards articles tagged I02.
 	rerouted := false
+	// A message without its own intent continues the open question only when
+	// it supplies something for it (a market, plan or billing term).
+	supplies := dec.Slots.MarketCode != "" || dec.Slots.PlanName != "" || dec.Slots.BillingCadence != ""
 	// A reply to an open question ("United States") is not a new question
 	// because some article mentions the country it names: coverage is judged
 	// without the market it supplies. "How do I create a tax rule in the US?"
