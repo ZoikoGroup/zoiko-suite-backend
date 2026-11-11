@@ -12,6 +12,7 @@ import (
 
 	"zoiko.io/banking-connector-svc/internal/domain"
 	"zoiko.io/banking-connector-svc/internal/middleware"
+	"zoiko.io/banking-connector-svc/internal/tokenization"
 	"zoiko.io/eventing/envelope"
 	"zoiko.io/eventing/outbox"
 )
@@ -19,6 +20,10 @@ import (
 type PgStore struct {
 	pool        *pgxpool.Pool
 	eventRegion string
+
+	// tokenizer and tokenizationEnforced: see WithTokenization.
+	tokenizer            tokenization.Tokenizer
+	tokenizationEnforced bool
 }
 
 // Option configures a PgStore at construction.
@@ -106,6 +111,17 @@ func (p *PgStore) CreateConnection(ctx context.Context, c *domain.BankConnection
 	if c.ConnectionID == "" {
 		c.ConnectionID = uuid.New().String()
 	}
+	// The account number is replaced by its token here, before anything is
+	// written, when TOKENIZATION_ENFORCED is on; otherwise it is unchanged.
+	// c carries the stored value from here on, so the event payload and the
+	// returned connection never hold a raw number the database does not.
+	stored, err := p.protectAccountNumber(ctx, tokenization.Scope{TenantID: tenantID, PrincipalID: actorID, CorrelationID: correlationID},
+		c.AccountNumber)
+	if err != nil {
+		return err
+	}
+	c.AccountNumber = stored
+
 	now := time.Now().UTC()
 	c.CreatedAt = now
 	c.UpdatedAt = now
@@ -164,7 +180,7 @@ func (p *PgStore) GetConnectionByID(ctx context.Context, id string) (*domain.Ban
 // narrowed to one legal entity.
 //
 // The tenant predicate is new and, unlike the legal-entity one, is NOT
-// optional. This query was `WHERE ($1 = '' OR legal_entity_id = $1)`, so
+// optional. This query was `WHERE ($1 = ” OR legal_entity_id = $1)`, so
 // omitting legal_entity_id — the shorter, easier request — disabled the
 // only filter present and returned every tenant's bank connections. The
 // legal-entity dimension stays optional because narrowing within your own
