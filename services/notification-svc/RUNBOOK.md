@@ -220,7 +220,9 @@ sufficiency is always `NOT_DETERMINED_BY_NCD` (§8.5).
    `{"kind":…, "artifact_ref":…, "reason":…}` creates an approval for a second principal.
 3. `NotificationRecordHandoffOverdue`: a concluded notice has no DRC record
    declaration. Declare it once DRC has the package:
-   `POST /v1/regulated-notices/{id}/record-declaration` with `{"drc_record_ref":…}`.
+   `POST /v1/regulated-notices/{id}/record-declaration` with `{"drc_record_ref":…}`. With `DOCUMENT_VAULT_URL` set the
+   service declares the package itself: send `{"jurisdiction_scope":"GB","retention_schedule_ref":…}` instead and it stores
+   the package in document-vault-svc and attaches the record id. A vault outage leaves the notice undeclared (503, retry).
 
 ### 4.8 Stuck UNKNOWN attempts
 
@@ -286,3 +288,47 @@ address that was never suppressed, not a suppression that was ignored.
 - **The four operator actions** (`TEMPLATE_MANAGE`, `TEMPLATE_APPROVE`,
   `NOTIFICATION_SUPPRESS`, `NOTIFICATION_RESOLVE_OUTCOME`) are in the dev RBAC
   seed only. Check that the on-call role holds them before an incident needs them.
+
+### S7-B1 privacy decisions in the NCD channel decision
+
+With `NOTIFICATION_PRIVACY_ENFORCEMENT=true` (and `PRIVACY_DECISION_URL`), `POST /v1/channel-decision` and the communication
+prepare/dispatch paths ask privacy-decision-svc for the recipient, using the `privacy_activity_id` and `privacy_purpose_id`
+on the intent version (migration 000034, both or neither, immutable once published). A `privacy_permission` in the request is
+ignored and the decision records `privacy_source: PRV`. PERMIT proceeds; BLOCK is a refusal (NCD-008); REVIEW_REQUIRED,
+INDETERMINATE, an outage and an intent with no binding go to review, never to permission; a RESTRICT is carried only when every
+constraint is `NO_<CHANNEL>`, otherwise it is refused because this service cannot enforce the duty. **Turn it on only after
+the intents in use carry a binding**, or they will all be held for review. Marketing permission is still caller-supplied.
+
+### S7-B3 provider and callback secrets from the vault
+
+Set `NOTIFICATION_SECRETS_VAULT_URL`, `NOTIFICATION_SECRETS_TENANT_ID` (the scope the policies are registered under) and
+`NOTIFICATION_SECRETS_PRINCIPAL` (default `notification-svc`, which every policy must list in `allowed_workload_ids`), then name the vault paths:
+`NOTIFICATION_SMTP_PASSWORD_SECRET_PATH`, `NOTIFICATION_SMTP_SECONDARY_PASSWORD_SECRET_PATH` (class PROVIDER_CREDENTIAL) and
+`NOTIFICATION_WEBHOOK_SECRETS_SECRET_PATH` (class CALLBACK_SECRET; the value is the same JSON as `NOTIFICATION_WEBHOOK_SECRETS`). The secrets are
+leased through `POST /v1/secrets/use` before anything uses them; the service **does not start** if one cannot be obtained. They are re-read every
+`NOTIFICATION_SECRETS_REFRESH_INTERVAL` (default 10m, 0 = once), so a rotation reaches the running SMTP providers and webhook verifier; an outage or a
+malformed rotated value keeps the value in use and is logged. Each read is audited by the vault (USED), so the interval sets the audit volume.
+In production an environment-held `SMTP_PASSWORD`, `SMTP_SECONDARY_PASSWORD` or `NOTIFICATION_WEBHOOK_SECRETS` without a vault path is refused unless
+`NOTIFICATION_ALLOW_ENV_SECRETS=true`. Still in the environment, by decision: `ACTION_TOKEN_SECRET` and `NOTIFICATION_UNSUBSCRIBE_SECRET` (HMAC keys; they
+belong with the vault sign operation) and `NOTIFICATION_DKIM_PRIVATE_KEY` (the vault cannot return it).
+
+### S7-C1 external contacts: a party of the sender's own tenant
+
+Set `PARTY_CONTACTS_URL` (tenant-entity-registry-svc) and, if it differs, `PARTY_CONTACTS_PRINCIPAL` (default `notification-svc`, which needs the registry
+action `PARTY_CONTACT_READ` in each tenant scope; without it the registry's 403 surfaces as `503 party_registry_unavailable`). A communication or recipient
+resolution then accepts `recipient_principal_id: "party:<party_id>"`. The address is the party's VERIFIED, in-force EMAIL contact point, newest verification
+first; the registry owns verification (maker-checker with evidence). A contact is used only for the purpose it was given for: a regulated notice takes
+`LEGAL_NOTICE`, marketing takes `GENERAL`, everything else `GENERAL` or `BILLING`. The plan records provenance `PARTY_MASTER` and the contact-point id, never
+the address in the evidence. A party of another tenant is not found (the call is made under the sender's own tenant); `recipient_tenant_id` of another tenant
+is still refused (NCD-020): no cross-tenant federation model exists (MDM-I-05, MDM-I-29). A party recipient cannot be combined with `free_text_endpoint`, the
+intent must allow EMAIL, and without `PARTY_CONTACTS_URL` the answer is `503 party_contacts_not_configured`.
+
+### S7-C2 notice legal basis checked against policy-svc
+
+Set `LEGAL_BASIS_POLICY_URL` (policy-svc; `LEGAL_BASIS_PRINCIPAL` default `notification-svc`, which needs policy-svc `POLICY_READ` in each tenant scope).
+`POST /v1/regulated-notices` then requires `legal_basis_ref` to be the id of an ACTIVE policy version, in force now, of a policy whose `policy_type` is
+`LEGAL_BASIS`, global or of the sending tenant. Free text, an unknown, superseded, draft, not-yet-effective or ended version, another tenant's version and a
+policy of another type are `400 legal_basis_unverified`; an unreachable policy-svc, or one that refuses this service, is `503 legal_basis_unavailable` and no notice
+is created. A steward creates the legal-basis policy and activates a version of it in policy-svc (policy types are data there, so no policy-svc change is needed);
+the notice keeps the version id, which names the exact immutable version it rests on. The rule is not interpreted and legal sufficiency is still NOT_DETERMINED_BY_NCD.
+Unset, the reference stays caller-supplied. `deadline_at` is still caller-supplied: workflow-svc has no deadline clocks.

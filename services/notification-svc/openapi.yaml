@@ -2413,6 +2413,8 @@ paths:
       tags:
       - NCD-05 notices
       operationId: post_v1_regulated_notices_id_record_declaration
+      summary: Declare the notice evidence package as a record
+      description: "Body {drc_record_ref} attaches a record reference declared elsewhere, as before. Without drc_record_ref, and when DOCUMENT_VAULT_URL is set, this service stores the evidence package in document-vault-svc and declares it a COMPLIANCE_EVIDENCE record (S7-B2); the body then carries jurisdiction_scope (required, a legal judgement the operator names), retention_schedule_ref and declaration_reason. 503 record_vault_not_configured, 503 record_vault_unavailable (the notice stays undeclared), 422 record_declaration_rejected, 409 already_declared."
       parameters:
       - name: id
         in: path

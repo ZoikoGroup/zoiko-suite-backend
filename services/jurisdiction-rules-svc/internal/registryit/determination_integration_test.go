@@ -30,7 +30,7 @@ func newEnvDetermination() *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
 	r := chi.NewRouter()
-	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithEntityApplicability(st)
+	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithEntityApplicability(st).WithEntityFacts(st)
 	handler.RegisterRoutes(r, h)
 	return &env{srv: r, pub: pub, auth: auth}
 }
@@ -95,8 +95,9 @@ func TestJurisdictionDecision_IsDeterminedFromAuthorisedAssignmentsAndAClaimNeve
 
 	// A second authorised jurisdiction: ambiguous until a claim selects inside the set.
 	assign(t, tenant, entity, fr, "SECONDARY", start, nil)
-	r = decide(t, e, tenant, body(nil), 409)
-	assert.Equal(t, "AMBIGUOUS_JURISDICTION", determination(r)["outcome"])
+	r = decide(t, e, tenant, body(nil), 422)
+	assert.Equal(t, "INSUFFICIENT_FACTS", determination(r)["outcome"], "several authorised and nothing selects: the missing fact is named, nothing is guessed")
+	assert.Equal(t, "claimed_jurisdiction", determination(r)["missing_facts"].([]any)[0].(map[string]any)["fact"])
 	assert.Len(t, determination(r)["candidates"], 2)
 	r = decide(t, e, tenant, body(map[string]any{"claimed_jurisdiction": fr.JurisdictionCode}), 200)
 	d = determination(r)

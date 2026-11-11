@@ -235,6 +235,10 @@ type Intent struct {
 	EffectiveFrom             *time.Time       `json:"effective_from,omitempty"`
 	RetiredAt                 *time.Time       `json:"retired_at,omitempty"`
 	RetiredByPrincipalID      string           `json:"retired_by_principal_id,omitempty"`
+	// PrivacyActivityID and PrivacyPurposeID name the privacy processing activity and purpose this intent is governed
+	// under; the channel decision asks privacy-decision-svc about them (S7-B1). Both or neither.
+	PrivacyActivityID string `json:"privacy_activity_id,omitempty"`
+	PrivacyPurposeID  string `json:"privacy_purpose_id,omitempty"`
 }
 
 // Variable returns the contract entry for name.

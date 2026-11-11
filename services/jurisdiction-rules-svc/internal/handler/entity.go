@@ -84,3 +84,15 @@ func (h *Handler) WithApprovalVerifier(v approval.Verifier) *Handler {
 	return h
 }
 
+
+// EntityFactReader reads the establishment and registration facts projection (JUR-1).
+type EntityFactReader interface {
+	ListEntityFacts(ctx context.Context, tenantID, legalEntityID string, at time.Time) ([]domain.FactRow, error)
+}
+
+// WithEntityFacts lets POST /v1/jurisdiction-decisions:resolve use establishments and registrations.
+// Without it a decision rests on assignments alone, and a named establishment or registration is refused as unknown.
+func (h *Handler) WithEntityFacts(r EntityFactReader) *Handler {
+	h.entityFacts = r
+	return h
+}

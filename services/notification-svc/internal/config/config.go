@@ -87,6 +87,23 @@ type Config struct {
 	PrivacyDecisionURL string
 	PrivacyTimeout     time.Duration
 
+	// DocumentVaultURL is document-vault-svc (DRC). When set, a regulated notice's evidence package is declared as a
+	// record by this service (S7-B2); unset, a record reference must be supplied by the caller.
+	DocumentVaultURL     string
+	DocumentVaultTimeout time.Duration
+
+	// PartyContactsURL is tenant-entity-registry-svc. When set, a communication can be addressed to a party of the sender's own
+	// tenant (recipient `party:<id>`) using its verified contact points (S7-C1). PartyContactsPrincipal is the workload
+	// identity asked as; it needs the registry action PARTY_CONTACT_READ in each tenant scope.
+	PartyContactsURL       string
+	PartyContactsPrincipal string
+
+	// LegalBasisPolicyURL is policy-svc. When set, a regulated notice legal_basis_ref must be the id of an ACTIVE LEGAL_BASIS
+	// policy version in force now (S7-C2); unset, it stays caller-supplied. LegalBasisPrincipal is the workload identity asked
+	// as, which needs policy-svc POLICY_READ in each tenant scope.
+	LegalBasisPolicyURL string
+	LegalBasisPrincipal string
+
 	// QuotaEnabled turns on the send quotas (ZS-SVC-Y-001 6.5): per tenant, recipient and intent,
 	// with protected capacity for security messages. NOTIFICATION_QUOTA_ENABLED, default false,
 	// because the right limits depend on the largest legitimate batch an environment sends (a
@@ -96,6 +113,9 @@ type Config struct {
 	QuotaLimits  quota.Limits
 
 	WebhookSecrets map[string][]string
+
+	// Secrets sources provider and callback secrets from the vault instead of the environment (S7-B3).
+	Secrets SecretsConfig
 	// WebhookTolerance is how far a callback timestamp may differ from the clock.
 	// Sourced from NOTIFICATION_WEBHOOK_TOLERANCE (default 5m).
 	WebhookTolerance time.Duration
@@ -326,6 +346,15 @@ func Load() (*Config, error) {
 		PrivacyDecisionURL: env("PRIVACY_DECISION_URL", ""),
 		PrivacyTimeout:     envDuration("PRIVACY_DECISION_TIMEOUT", 3*time.Second),
 
+		DocumentVaultURL:     env("DOCUMENT_VAULT_URL", ""),
+		DocumentVaultTimeout: envDuration("DOCUMENT_VAULT_TIMEOUT", 10*time.Second),
+
+		PartyContactsURL:       env("PARTY_CONTACTS_URL", ""),
+		PartyContactsPrincipal: env("PARTY_CONTACTS_PRINCIPAL", "notification-svc"),
+
+		LegalBasisPolicyURL: env("LEGAL_BASIS_POLICY_URL", ""),
+		LegalBasisPrincipal: env("LEGAL_BASIS_PRINCIPAL", "notification-svc"),
+
 		QuotaEnabled: env("NOTIFICATION_QUOTA_ENABLED", "false") == "true",
 		QuotaLimits: quota.Limits{
 			TenantPerMinute:    envInt("NOTIFICATION_QUOTA_TENANT_PER_MINUTE", quota.DefaultLimits.TenantPerMinute),
@@ -368,6 +397,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.WebhookSecrets = secrets
+
+	cfg.Secrets = loadSecretsConfig()
+	if err := cfg.Secrets.validate(); err != nil {
+		return nil, err
+	}
 
 	// Load returned a nil error unconditionally, so every default above was
 	// also a production default: an empty DB password, and an authz URL that
@@ -417,6 +451,8 @@ func Load() (*Config, error) {
 					"it exists for a local mail catcher on a container network)")
 			}
 		}
+
+		missing = append(missing, cfg.secretsProductionProblems()...)
 
 		if len(missing) > 0 {
 			return nil, errors.New("invalid production config: " + strings.Join(missing, ", "))

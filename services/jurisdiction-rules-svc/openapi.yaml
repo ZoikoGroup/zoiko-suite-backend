@@ -1697,8 +1697,7 @@ paths:
         {decision_id, replayed, decision{outcome, pack{pack_ref, version, artifact_digest, certification_id},
         rule{...payload}, sources[], basis, considered_rule_ids[], packs_consulted[], explanation[]}}.
 
-        NOT BUILT: POST /jurisdiction-decisions:resolve (needs authoritative entity/counterparty/transaction
-        facts and place-of-supply rules) and POST /regulatory-calculations:execute (needs a rule formula
+        NOT BUILT: place-of-supply rules (POST /jurisdiction-decisions:resolve decides from the entity's facts only) and POST /regulatory-calculations:execute (needs a rule formula
         language). Neither is faked.
       operationId: resolveRule
       security: [{ principalHeader: [] }]
@@ -2445,22 +2444,29 @@ paths:
       summary: Determine which jurisdiction applies to a legal entity (a claimed jurisdiction never widens the authorised set)
       description: |
         Action JURISDICTION_DECISION_RESOLVE (ZS-JUR-001 s9, s25). Headers: X-Tenant-Id (required: assignments are tenant data), Idempotency-Key?. Body: legal_entity_id,
-        purpose (TAX, FILING or ANY), effective_at (RFC 3339), claimed_jurisdiction? (a jurisdiction code).
+        purpose (TAX, FILING or ANY), effective_at (RFC 3339), claimed_jurisdiction? (a jurisdiction code), establishment_id? and registration_id? (the establishment or
+        registration the transaction belongs to), counterparty? {country?, business_status? B2B or B2C}, transaction? {supply_type? GOODS or SERVICES}.
 
         The decision rests on the entity's authorised assignments, projected from tenant-entity-registry-svc, in force at effective_at and relevant to the purpose
         (TAX: ENTITY_PRIMARY, PRIMARY, SECONDARY, TAX_ONLY; FILING: ENTITY_PRIMARY, PRIMARY, SECONDARY, FILING_ONLY). A claimed jurisdiction is an input fact: it can select
         among jurisdictions the entity is authorised for and can never add one (JUR-NEG-05), and it is never used when nothing is authorised. Each candidate carries its rollout
         support answer (SUPPORTED, NOT_YET_SUPPORTED, SUSPENDED, NO_RELEASED_PACK or NO_ROLLOUT) and the assignment records it rests on.
 
+        JUR-1: a named establishment (ORG-6) or registration (ORG-7) must exist for the entity, be in force at effective_at (as the registry recorded it then) and point at a jurisdiction
+        the entity is authorised for; it then selects among the authorised ones, exactly as a claim does, and never adds one. An establishment points at its address country. Facts that
+        point at different jurisdictions are FACTS_CONFLICT. With several authorised jurisdictions and nothing selecting, the answer is INSUFFICIENT_FACTS naming the facts that would
+        select (missing_facts); a named fact that cannot be used is FACT_NOT_USABLE naming it. Nothing is guessed. The consulted facts are the evidence chain (facts: kind, a digest of
+        the id, status, jurisdiction, in force, used, source event); the ledger holds digests, never ids. counterparty and transaction facts are recorded under inputs and do not decide.
+
         This does NOT decide place of supply, situs or any transaction-level question (no such rules exist yet). The route exists only where the entity projection is wired.
         Recorded as evidence (decision_kind JURISDICTION); the platform-wide ledger holds a digest of tenant and entity, never their ids. Announced as jurisdiction-decision.resolved.
 
-        HTTP: 200 JURISDICTION_DETERMINED; 409 AMBIGUOUS_JURISDICTION (several authorised and nothing selects between them) or idempotency_conflict;
-        422 NO_APPLICABLE_JURISDICTION or CLAIM_NOT_AUTHORISED; 401 no X-Tenant-Id; 503 store unavailable.
+        HTTP: 200 JURISDICTION_DETERMINED; 409 FACTS_CONFLICT, AMBIGUOUS_JURISDICTION or idempotency_conflict;
+        422 NO_APPLICABLE_JURISDICTION, CLAIM_NOT_AUTHORISED, INSUFFICIENT_FACTS or FACT_NOT_USABLE; 401 no X-Tenant-Id; 503 store unavailable.
       operationId: resolveJurisdictionDecision
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
-      responses: { "200": { description: 'Jurisdiction determined.' }, "400": { $ref: '#/components/responses/BadRequest' }, "401": { description: X-Tenant-Id missing. }, "409": { description: AMBIGUOUS_JURISDICTION or idempotency_conflict. }, "422": { description: NO_APPLICABLE_JURISDICTION or CLAIM_NOT_AUTHORISED. }, "503": { description: Store unavailable. } }
+      responses: { "200": { description: 'Jurisdiction determined.' }, "400": { $ref: '#/components/responses/BadRequest' }, "401": { description: X-Tenant-Id missing. }, "409": { description: 'FACTS_CONFLICT, AMBIGUOUS_JURISDICTION or idempotency_conflict.' }, "422": { description: 'NO_APPLICABLE_JURISDICTION, CLAIM_NOT_AUTHORISED, INSUFFICIENT_FACTS or FACT_NOT_USABLE.' }, "503": { description: Store unavailable. } }
 
   /v1/registration-obligations:resolve:
     post:
