@@ -63,17 +63,33 @@ func TestRegisterVersion_TypeGivenAsArray_IsRefusedAtRegistration(t *testing.T) 
 	assert.Nil(t, s.insertedArg, "nothing is stored")
 }
 
-// Keywords outside the compared subset are accepted and simply not analysed.
+// Keywords the checker does not analyse (here allOf) are accepted and simply not compared.
 func TestRegisterVersion_UnanalysedKeywords_AreAcceptedAndNotCompared(t *testing.T) {
+	s := &stubStore{latest: &domain.EventSchema{EventName: "ref.probe.event", Version: 1,
+		JSONSchema: json.RawMessage(`{"properties":{"status":{"type":"string","allOf":[{"minLength":1}]}}}`)}}
+	r := newRouter(s)
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/ref.probe.event/versions",
+		bytes.NewBufferString(`{"json_schema":{"properties":{"status":{"type":"string","allOf":[{"minLength":9}]}}}}`)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusCreated, rec.Code, "allOf is outside the compared keywords")
+}
+
+// ZS-EVENT-001 section 12: narrowing an enum used to pass unseen (this suite
+// once asserted 201 here and called it "a real-world breaking change the
+// checker does not see"). It is now refused, so a contract cannot silently
+// reject values a consumer was sending.
+func TestRegisterVersion_NarrowedEnum_IsRefused(t *testing.T) {
 	s := &stubStore{latest: &domain.EventSchema{EventName: "enum.probe.event", Version: 1,
 		JSONSchema: json.RawMessage(`{"properties":{"status":{"type":"string","enum":["A","B"]}}}`)}}
 	r := newRouter(s)
-	// The enum is narrowed — a real-world breaking change the checker does not see.
 	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/enum.probe.event/versions",
 		bytes.NewBufferString(`{"json_schema":{"properties":{"status":{"type":"string","enum":["A"]}}}}`)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
-	assert.Equal(t, http.StatusCreated, rec.Code, "enum is outside the supported compatibility subset")
+	assert.Equal(t, http.StatusConflict, rec.Code)
+	assert.Contains(t, rec.Body.String(), "enum value")
+	assert.Nil(t, s.insertedArg)
 }
 
 func TestRegisterVersion_OversizedBody_Is413_AndNothingIsStored(t *testing.T) {

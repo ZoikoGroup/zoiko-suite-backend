@@ -93,7 +93,7 @@ const (
 // contract for an event that does not exist. Worse, the path segment is
 // echoed back in responses and stored as the key, so accepting arbitrary
 // bytes made the registry's primary key a free-text field.
-var eventNameRE = regexp.MustCompile(`^[a-z][a-z0-9]*(\.[a-z0-9]+)+$`)
+var eventNameRE = regexp.MustCompile(`^[a-z][a-z0-9]*(\.[a-z0-9]+(-[a-z0-9]+)*)+$`)
 
 // ValidEventName reports whether name is a well-formed event name.
 func ValidEventName(name string) bool {
@@ -142,8 +142,29 @@ func ValidateJSONSchema(raw json.RawMessage) error {
 	return nil
 }
 
+// Keywords are the JSON Schema validation keywords the compatibility checker
+// compares in addition to type and structure (ZS-EVENT-001 section 12: enum,
+// tightened or relaxed validation). They are kept raw and parsed leniently by
+// the checker, so an odd value in an already-stored schema can never make it
+// unparseable.
+type Keywords struct {
+	Enum                 []json.RawMessage `json:"enum,omitempty"`
+	Pattern              json.RawMessage   `json:"pattern,omitempty"`
+	Format               json.RawMessage   `json:"format,omitempty"`
+	Minimum              json.RawMessage   `json:"minimum,omitempty"`
+	Maximum              json.RawMessage   `json:"maximum,omitempty"`
+	ExclusiveMinimum     json.RawMessage   `json:"exclusiveMinimum,omitempty"`
+	ExclusiveMaximum     json.RawMessage   `json:"exclusiveMaximum,omitempty"`
+	MinLength            json.RawMessage   `json:"minLength,omitempty"`
+	MaxLength            json.RawMessage   `json:"maxLength,omitempty"`
+	MinItems             json.RawMessage   `json:"minItems,omitempty"`
+	MaxItems             json.RawMessage   `json:"maxItems,omitempty"`
+	AdditionalProperties json.RawMessage   `json:"additionalProperties,omitempty"`
+}
+
 // PropertyDef describes a property's declared type and any nested structure.
 type PropertyDef struct {
+	Keywords
 	Type       string                 `json:"type"`
 	Properties map[string]PropertyDef `json:"properties,omitempty"`
 	Required   []string               `json:"required,omitempty"`
@@ -153,7 +174,8 @@ type PropertyDef struct {
 // Shape is the part of a JSON Schema this registry understands: the
 // property types, nested structure, and required list.
 type Shape struct {
-	Type       string                 `json:"type"`
+	Keywords
+	Type      string                 `json:"type"`
 	Properties map[string]PropertyDef `json:"properties"`
 	Required   []string               `json:"required"`
 }
@@ -204,6 +226,13 @@ var (
 	// ErrOwningServiceTooLong is returned when owning_service exceeds the
 	// column width, which used to reach Postgres and answer 503.
 	ErrOwningServiceTooLong = errors.New("owning_service must be at most 255 characters")
+	// ErrOwnershipChange is returned when a new version names a different
+	// owning service than the event already has. Producer ownership is part of
+	// the contract (ZS-EVENT-001 E-02, EV-T23): a second producer must not be
+	// able to claim an event by registering a version, and a change of owner is
+	// a major architecture change needing consumer re-approval, not a schema
+	// registration.
+	ErrOwnershipChange = errors.New("owning_service differs from the event's registered owner; ownership cannot change by registering a version")
 	// ErrFieldTooLong is what a Postgres 22001 becomes — a caller's value was
 	// wider than its column. A 400, not the 503 it used to produce.
 	ErrFieldTooLong = errors.New("a submitted field is too long for its column")

@@ -48,12 +48,12 @@ func parse(raw json.RawMessage) (domain.Shape, error) {
 //
 // The violations are returned sorted, so the result is deterministic.
 //
-// Supported subset (everything else is not compared): per property, the
+// Compared (section 12 of ZS-EVENT-001, see keywords.go for the keyword rules): per property, the
 // declared `type` (a single string), `properties`/`required` of nested objects
 // and the `items` schema of arrays (type and, for object items, nested
-// properties/required). Keywords such as enum, format, pattern, minimum,
-// additionalProperties, $ref, allOf/anyOf/oneOf and `type` given as an array
-// are not analysed; a schema whose `type` is an array is refused at
+// properties/required), plus the validation keywords enum, pattern, format, numeric
+// and length bounds and additionalProperties. $ref, allOf/anyOf/oneOf and `type`
+// given as an array are not analysed; a schema whose `type` is an array is refused at
 // registration (domain.ErrSchemaShapeInvalid) because it cannot be parsed into
 // this shape.
 func Check(oldRaw, newRaw json.RawMessage) ([]string, error) {
@@ -67,6 +67,7 @@ func Check(oldRaw, newRaw json.RawMessage) ([]string, error) {
 	}
 
 	violations := checkProperties("", oldShape.Properties, newShape.Properties, oldShape.Required, newShape.Required)
+	violations = append(violations, keywordViolations("$", oldShape.Keywords, newShape.Keywords)...)
 	// checkProperties walks Go maps, whose iteration order is random, so the
 	// same pair of schemas used to yield the same violations in a different
 	// order from one call to the next. Every message starts with the quoted
@@ -104,6 +105,9 @@ func checkProperties(prefix string, oldProps, newProps map[string]domain.Propert
 			continue
 		}
 
+		// Validation keywords (enum, bounds, pattern, format, additionalProperties)
+		violations = append(violations, keywordViolations(fullPath, oldProp.Keywords, newProp.Keywords)...)
+
 		// Recurse into nested object properties
 		if (oldProp.Type == "object" || len(oldProp.Properties) > 0) &&
 			(newProp.Type == "object" || len(newProp.Properties) > 0) {
@@ -115,6 +119,11 @@ func checkProperties(prefix string, oldProps, newProps map[string]domain.Propert
 		if oldProp.Type == "array" && newProp.Type == "array" && oldProp.Items != nil && newProp.Items != nil {
 			if oldProp.Items.Type != "" && newProp.Items.Type != "" && oldProp.Items.Type != newProp.Items.Type {
 				violations = append(violations, fmt.Sprintf("field %q items changed type from %q to %q", fullPath, oldProp.Items.Type, newProp.Items.Type))
+			} else {
+				violations = append(violations, keywordViolations(fullPath+"[]", oldProp.Items.Keywords, newProp.Items.Keywords)...)
+			}
+			if oldProp.Items.Type != "" && newProp.Items.Type != "" && oldProp.Items.Type != newProp.Items.Type {
+				// already reported above
 			} else if (oldProp.Items.Type == "object" || len(oldProp.Items.Properties) > 0) &&
 				(newProp.Items.Type == "object" || len(newProp.Items.Properties) > 0) {
 				nested := checkProperties(fullPath+"[].", oldProp.Items.Properties, newProp.Items.Properties, oldProp.Items.Required, newProp.Items.Required)
