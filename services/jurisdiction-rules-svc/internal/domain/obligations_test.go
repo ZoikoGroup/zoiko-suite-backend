@@ -204,15 +204,17 @@ func TestValidation_RejectsMalformedCalendarsAndRules(t *testing.T) {
 	require.NoError(t, ValidateCalendarVersion(good))
 	cut := "25:00"
 	for name, mut := range map[string]func(*CalendarVersion){
-		"unknown zone":   func(c *CalendarVersion) { c.Timezone = "Mars/Olympus" },
-		"empty zone":     func(c *CalendarVersion) { c.Timezone = "" },
-		"bad weekend":    func(c *CalendarVersion) { c.WeekendDays = []int{7} },
-		"dup weekend":    func(c *CalendarVersion) { c.WeekendDays = []int{0, 0} },
-		"all weekend":    func(c *CalendarVersion) { c.WeekendDays = []int{0, 1, 2, 3, 4, 5, 6} },
-		"bad cutoff":     func(c *CalendarVersion) { c.CutoffTime = &cut },
-		"bad holiday":    func(c *CalendarVersion) { c.Holidays = []Holiday{{Date: "25-12-2026", Name: "x"}} },
-		"nameless":       func(c *CalendarVersion) { c.Holidays = []Holiday{{Date: "2026-12-25", Name: " "}} },
-		"duplicate date": func(c *CalendarVersion) { c.Holidays = []Holiday{{Date: "2026-12-25", Name: "a"}, {Date: "2026-12-25", Name: "b"}} },
+		"unknown zone": func(c *CalendarVersion) { c.Timezone = "Mars/Olympus" },
+		"empty zone":   func(c *CalendarVersion) { c.Timezone = "" },
+		"bad weekend":  func(c *CalendarVersion) { c.WeekendDays = []int{7} },
+		"dup weekend":  func(c *CalendarVersion) { c.WeekendDays = []int{0, 0} },
+		"all weekend":  func(c *CalendarVersion) { c.WeekendDays = []int{0, 1, 2, 3, 4, 5, 6} },
+		"bad cutoff":   func(c *CalendarVersion) { c.CutoffTime = &cut },
+		"bad holiday":  func(c *CalendarVersion) { c.Holidays = []Holiday{{Date: "25-12-2026", Name: "x"}} },
+		"nameless":     func(c *CalendarVersion) { c.Holidays = []Holiday{{Date: "2026-12-25", Name: " "}} },
+		"duplicate date": func(c *CalendarVersion) {
+			c.Holidays = []Holiday{{Date: "2026-12-25", Name: "a"}, {Date: "2026-12-25", Name: "b"}}
+		},
 	} {
 		c := good
 		mut(&c)

@@ -218,4 +218,3 @@ func (h *Handler) InvalidateResolverCache(w http.ResponseWriter, r *http.Request
 	hits, misses, refreshes := h.resolver.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{"invalidated": true, "cache_hits": hits, "cache_misses": misses, "eligible_list_refreshes": refreshes})
 }
-

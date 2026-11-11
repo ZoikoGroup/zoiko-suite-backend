@@ -224,4 +224,3 @@ func (h *Handler) ExecuteCalculation(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, "calculation": json.RawMessage(stored.Response)})
 }
-

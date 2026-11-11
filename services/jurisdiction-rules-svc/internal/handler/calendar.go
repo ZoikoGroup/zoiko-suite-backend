@@ -487,4 +487,3 @@ func (h *Handler) CalculateObligation(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, status, body)
 }
-

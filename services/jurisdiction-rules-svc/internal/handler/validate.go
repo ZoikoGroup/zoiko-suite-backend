@@ -148,4 +148,3 @@ func (h *Handler) ValidateAction(w http.ResponseWriter, r *http.Request) {
 		zap.String("correlation_id", correlationID))
 	writeJSON(w, status, resp)
 }
-

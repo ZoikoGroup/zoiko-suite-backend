@@ -83,4 +83,3 @@ func (h *Handler) WithApprovalVerifier(v approval.Verifier) *Handler {
 	h.approvals = v
 	return h
 }
-

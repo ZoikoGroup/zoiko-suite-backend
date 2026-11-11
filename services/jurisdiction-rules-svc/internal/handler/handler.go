@@ -15,13 +15,13 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	apicontract "zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
-	apicontract "zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -1457,4 +1457,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		_ = err
 	}
 }
-

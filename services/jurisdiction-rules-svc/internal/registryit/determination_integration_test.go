@@ -53,7 +53,10 @@ func decide(t *testing.T, e *env, tenant string, body map[string]any, want int) 
 	return r
 }
 
-func determination(r map[string]any) map[string]any { m, _ := r["determination"].(map[string]any); return m }
+func determination(r map[string]any) map[string]any {
+	m, _ := r["determination"].(map[string]any)
+	return m
+}
 
 func TestJurisdictionDecision_IsDeterminedFromAuthorisedAssignmentsAndAClaimNeverWidensThem(t *testing.T) {
 	e := newEnvDetermination()

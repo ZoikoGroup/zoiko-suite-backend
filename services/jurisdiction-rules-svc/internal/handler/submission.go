@@ -340,4 +340,3 @@ func (h *Handler) RecordSubmissionEvent(w http.ResponseWriter, r *http.Request) 
 		"replayed": res.Replayed, "applied": res.Event.Disposition == domain.DispApplied, "disposition": res.Event.Disposition,
 		"status": res.Submission.Status, "is_terminal": res.Submission.IsTerminal, "event": res.Event})
 }
-

@@ -118,4 +118,3 @@ func (h *Handler) ResolvePayrollParameters(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, "parameter_set": json.RawMessage(stored.Response)})
 }
-

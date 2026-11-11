@@ -695,4 +695,3 @@ func (h *Handler) GetRuleProvenance(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, p)
 }
-

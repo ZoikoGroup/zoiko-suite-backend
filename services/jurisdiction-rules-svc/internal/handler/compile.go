@@ -250,4 +250,3 @@ func (h *Handler) setKeyStatus(w http.ResponseWriter, r *http.Request, action, s
 	}
 	writeJSON(w, http.StatusOK, k)
 }
-
