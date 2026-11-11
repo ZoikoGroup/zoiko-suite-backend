@@ -122,6 +122,9 @@ const (
 	Stale Outcome = "STALE"
 	// Held: the event is quarantined and waits for an approved repair.
 	Held Outcome = "HELD"
+	// Rejected: a replay delivery reached a consumer that has not opted in to replay. Nothing was written and the
+	// handler did not run (E-17, EV-T11).
+	Rejected Outcome = "REJECTED"
 )
 
 // Message is the identity of one delivery.
@@ -134,6 +137,9 @@ type Message struct {
 	PayloadHash      string
 	// Region is the event's residency region from its envelope; empty for a legacy envelope that names none.
 	Region string
+	// ReplayRunID is set by the consumer's replay-channel reader, never read from the payload: a payload cannot
+	// declare itself live. Empty means the live path (ZS-EVENT-001 section 10, inbox replay_run_id).
+	ReplayRunID string
 }
 
 type wire struct {
@@ -212,6 +218,8 @@ type Receipt struct {
 	// IdempotencyKey is stable across redeliveries. Use it as the idempotency
 	// subject of any effect that cannot join the transaction.
 	IdempotencyKey string
+	// ReplayRunID is non-empty only for an authorized replay delivery.
+	ReplayRunID string
 }
 
 // Handler performs the consumer's business effect inside tx. Returning an
@@ -302,6 +310,7 @@ type Inbox struct {
 	consumer string
 	cfg      Config
 	region   string
+	allowReplay bool
 }
 
 // ErrRegionMismatch means a repair would act on an event whose residency region is not this inbox's (or is unknown).
@@ -344,6 +353,48 @@ func (i *Inbox) Process(ctx context.Context, msg Message, fn Handler) (Result, e
 	if fn == nil {
 		return Result{}, errors.New("inbox: handler is required")
 	}
+	if msg.ReplayRunID != "" {
+		// Replay is an authorized operating mode, not a retry (E-17). The check
+		// runs before any database access so a rejected replay leaves no trace
+		// and no handler can run (EV-T11).
+		if !replayRun.MatchString(msg.ReplayRunID) {
+			return Result{}, ErrInvalidReplayRun
+		}
+		if !i.allowReplay {
+			return Result{Outcome: Rejected}, ErrReplayRejected
+		}
+		// An isolated namespace: the live receipts neither dedupe nor are
+		// changed by the replay, and a rebuild from version 1 is not "stale".
+		ri := *i
+		ri.consumer = i.consumer + replayNamespaceSep + msg.ReplayRunID
+		ri.allowReplay = false
+		return ri.process(ctx, msg, fn, msg.ReplayRunID)
+	}
+	return i.process(ctx, msg, fn, "")
+}
+
+// replayNamespaceSep separates a consumer name from a replay run in the
+// receipt's consumer column. Consumer names cannot contain '#', so a replay
+// namespace can never collide with a live consumer.
+const replayNamespaceSep = "#replay:"
+
+var replayRun = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// ErrReplayRejected means a replay delivery reached a consumer that did not opt
+// in with AllowReplay. This is the default: a live payment, tax-submission,
+// e-signature or communication consumer must never act on a replay (section 10).
+var ErrReplayRejected = errors.New("inbox: replay delivery rejected: this consumer has not opted in to replay")
+
+// ErrInvalidReplayRun means the replay run id is not a plain identifier.
+var ErrInvalidReplayRun = errors.New("inbox: replay run id must be a plain identifier of at most 64 characters")
+
+// AllowReplay opts this consumer in to authorized replay deliveries. Only a
+// consumer whose effect is a rebuildable projection (search, analytics, a read
+// model) may call it; a consumer that causes an irreversible external effect
+// must not. Call before serving.
+func (i *Inbox) AllowReplay() { i.allowReplay = true }
+
+func (i *Inbox) process(ctx context.Context, msg Message, fn Handler, replayRunID string) (Result, error) {
 	var res Result
 	err := i.db.InTx(ctx, msg.TenantID, func(tx pgx.Tx) error {
 		res = Result{}
@@ -370,7 +421,7 @@ func (i *Inbox) Process(ctx context.Context, msg Message, fn Handler) (Result, e
 		res.Gap = r.gap
 		ref, err := fn(ctx, tx, Receipt{
 			Consumer: i.consumer, EventID: msg.EventID, TenantID: msg.TenantID,
-			Attempt: r.attempt, IdempotencyKey: i.consumer + ":" + msg.EventID,
+			Attempt: r.attempt, IdempotencyKey: i.consumer + ":" + msg.EventID, ReplayRunID: replayRunID,
 		})
 		if err != nil {
 			return handlerFailure{err}

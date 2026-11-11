@@ -63,3 +63,25 @@ consumer of a topic reads the canonical names, set
 `TEST_DATABASE_URL=postgres://... go test ./...` runs the outbox suite against
 real Postgres (each test uses its own schema). `TEST_KAFKA_BROKERS=host:port`
 additionally runs the real-broker adapter test.
+
+## Event catalogue (ZS-EVENT-001 §19)
+
+`catalogue` embeds the 196 canonical event types with owner, aggregate and
+consumers. `catalogue.Lookup(type)` resolves one; `catalogue.Lint(entry)` is the
+§21 semantic lint (shape, domain, past tense, no generic CRUD verbs, owner and
+consumers present). Add new event types to `catalogue/catalogue.json`; the
+tests fail on any entry that does not pass lint.
+
+## Replay and quarantine cases (ZS-EVENT-001 sections 10 and 11.1)
+
+- **Replay is rejected by default.** Set `Message.ReplayRunID` from the replay
+  channel reader (never from the payload). `Inbox.Process` then returns
+  `ErrReplayRejected` before touching the database, unless the consumer called
+  `AllowReplay()`. Only rebuildable projections (search, analytics, read models)
+  may opt in; payment, filing, e-signature and communication consumers must not.
+  An opted-in replay is deduplicated in its own namespace per run, so it never
+  changes live receipts.
+- **Quarantine cases.** Append `inbox.CaseSQL` to the consumer's migration.
+  `OpenCase` gives a quarantined receipt an owner, priority, failure class and
+  SLA; `ResolveCase` needs a disposition, a resolver and evidence; the table
+  constraint refuses a half-resolved case. Alert on `UnownedQuarantined > 0`.

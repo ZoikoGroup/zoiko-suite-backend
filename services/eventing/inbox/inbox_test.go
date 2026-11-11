@@ -61,7 +61,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	for _, ddl := range []string{SchemaSQL, repair.SchemaSQL,
+	for _, ddl := range []string{SchemaSQL, CaseSQL, repair.SchemaSQL,
 		`CREATE TABLE effects (id BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL, version BIGINT)`} {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
 			t.Fatalf("apply ddl: %v", err)
