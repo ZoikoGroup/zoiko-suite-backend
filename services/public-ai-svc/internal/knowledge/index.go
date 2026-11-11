@@ -35,12 +35,19 @@ type Query struct {
 	// HowTo marks a question asking how to do something: sections written
 	// as console steps are preferred.
 	HowTo bool
+	// OnlyIntent limits the search to sources tagged for IntentID and returns
+	// the chosen chunks in reading order: a question about ZoikoSuite's
+	// public position is answered from the article written for it, not from
+	// a console how-to that shares a word with it.
+	OnlyIntent bool
 }
 
 // Hit is one eligible chunk with its score.
 type Hit struct {
 	Chunk Chunk
 	Score float64
+	// Named: the question names this chunk's article or section title.
+	Named bool
 }
 
 // Result is the retrieval outcome.
@@ -269,7 +276,7 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 		return res
 	}
 	need := 1
-	if len(qtoks) >= 3 {
+	if len(qtoks) >= 3 && !q.OnlyIntent {
 		need = 2
 	}
 	bestIneligible := eligible
@@ -279,18 +286,25 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 		// may not see are never scored; expired and revoked ones are scored
 		// only to explain a stale answer, never returned.
 		el := x.eligibilityOf(c, q, rev)
-		if el == denied {
+		if el == denied || (q.OnlyIntent && !hasIntent(c.IntentIDs, q.IntentID)) {
 			continue
 		}
 		sc, matched := x.score(i, qtoks)
 		if q.IntentID != "" && hasIntent(c.IntentIDs, q.IntentID) {
 			sc *= intentBoost
+			if q.OnlyIntent && len(c.IntentIDs) > 0 && c.IntentIDs[0] == q.IntentID {
+				// The article written mainly for this topic leads.
+				sc *= intentBoost
+			}
 		}
+		named := false
 		if x.titleNamed(c, qtoks) {
 			sc *= titleBoost
+			named = true
 		}
 		if sectionNamed(c, rawToks) {
 			sc *= titleBoost
+			named = true
 		}
 		if q.HowTo && strings.Contains(c.PlainText, signInStep) {
 			sc *= howToBoost
@@ -305,7 +319,7 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 		switch el {
 		case eligible:
 			res.CandidatesAfterACL++
-			res.Hits = append(res.Hits, Hit{Chunk: c, Score: sc})
+			res.Hits = append(res.Hits, Hit{Chunk: c, Score: sc, Named: named})
 		case expired, revoked:
 			if sc > bestIneligibleScore {
 				bestIneligible, bestIneligibleScore = el, sc
@@ -328,6 +342,23 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 	bestEligible := 0.0
 	if len(res.Hits) > 0 {
 		bestEligible = res.Hits[0].Score
+	}
+	if q.OnlyIntent {
+		// Reading order inside each article, so an overview starts with its
+		// opening sentence; the best-scoring article still comes first.
+		rank := map[string]int{}
+		for i, h := range res.Hits {
+			if _, ok := rank[h.Chunk.SourceVersionID]; !ok {
+				rank[h.Chunk.SourceVersionID] = i
+			}
+		}
+		sort.SliceStable(res.Hits, func(i, j int) bool {
+			a, b := res.Hits[i].Chunk, res.Hits[j].Chunk
+			if a.SourceVersionID != b.SourceVersionID {
+				return rank[a.SourceVersionID] < rank[b.SourceVersionID]
+			}
+			return a.ChunkID < b.ChunkID
+		})
 	}
 	res.TopScore = bestEligible
 	switch {

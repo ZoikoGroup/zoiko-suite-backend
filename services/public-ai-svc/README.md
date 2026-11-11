@@ -19,6 +19,22 @@ TEST-ONLY synthetic data, and the blockers in "Open decisions" below need named 
 
 ## Run it locally (no database)
 
+**Always on (recommended for the console):** run it as a Docker container that
+restarts by itself, so the console's chat never shows "I couldn't connect"
+after a reboot. From the repository root:
+
+```bash
+docker compose -f deployments/docker-compose.public-ai-dev.yml up -d --build
+```
+
+It serves `data/public-kb` in dev mode on `127.0.0.1:8001`. Rerun the same
+command after changing the code; knowledge-base edits need only
+`docker restart public-ai-svc-dev`. Port 8001 is the assistant's: start the main
+gateway with `GATEWAY_PORT` 8000 (its default), never 8001. To run it by hand
+instead, stop the container first (`docker compose -f deployments/docker-compose.public-ai-dev.yml down`).
+
+**By hand:**
+
 ```bash
 cd services/public-ai-svc
 PUBLIC_AI_ENABLED=true PUBLIC_AI_ENVIRONMENT=dev go run ./cmd/server

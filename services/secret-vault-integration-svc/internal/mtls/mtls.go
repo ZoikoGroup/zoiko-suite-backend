@@ -20,12 +20,18 @@ package mtls
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -38,20 +44,46 @@ import (
 // certificate. mtls-management-svc issues in whole days; 1 is its minimum.
 const certLifetimeDays = 1
 
-type provisionRequest struct {
-	LegalEntityID string `json:"legal_entity_id"`
+// csrRequest is the body of POST /v1/mtls/certificates/csr: a certificate signing request, never a key.
+type csrRequest struct {
+	CSR           string `json:"csr"`
 	ServiceName   string `json:"service_name"`
-	CommonName    string `json:"common_name"`
+	LegalEntityID string `json:"legal_entity_id"`
 	RotationDays  int    `json:"rotation_days"`
-	AutoRotate    bool   `json:"auto_rotate"`
 }
 
 type provisionResult struct {
 	Certificate struct {
 		CertificatePEM string `json:"certificate_pem"`
 	} `json:"certificate"`
-	PrivateKeyPEM string `json:"private_key_pem"`
-	CACertPEM     string `json:"ca_certificate_pem"`
+	CACertPEM string `json:"ca_certificate_pem"`
+}
+
+// spiffeURI is the workload identity the issuer requires in the CSR: spiffe://zoiko/<env>/<service>, with the same ENV
+// the issuer reads (default local).
+func spiffeURI(service string) *url.URL {
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "local"
+	}
+	u, _ := url.Parse("spiffe://zoiko/" + env + "/" + service)
+	return u
+}
+
+// newCSR generates a fresh key in this process and a CSR for it. The private key is returned to the caller and is
+// never sent anywhere (Security s9, S4-C2).
+func newCSR(service string) (*ecdsa.PrivateKey, string, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, "", fmt.Errorf("generate client key: %w", err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: service}, DNSNames: []string{service}, URIs: []*url.URL{spiffeURI(service)},
+	}, key)
+	if err != nil {
+		return nil, "", fmt.Errorf("create csr: %w", err)
+	}
+	return key, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})), nil
 }
 
 // provisioner fetches a fresh leaf from mtls-management-svc.
@@ -79,17 +111,15 @@ func (p provisioner) bootstrapToken() string {
 }
 
 func (p provisioner) provision(ctx context.Context) (tls.Certificate, []byte, error) {
-	reqBody, err := json.Marshal(provisionRequest{
-		LegalEntityID: p.platformScopeID,
-		ServiceName:   p.serviceName,
-		CommonName:    p.serviceName,
-		RotationDays:  certLifetimeDays,
-		AutoRotate:    true,
-	})
+	key, csrPEM, err := newCSR(p.serviceName)
 	if err != nil {
-		return tls.Certificate{}, nil, fmt.Errorf("marshal provision request: %w", err)
+		return tls.Certificate{}, nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url+"/v1/mtls/certificates", bytes.NewReader(reqBody))
+	reqBody, err := json.Marshal(csrRequest{CSR: csrPEM, ServiceName: p.serviceName, LegalEntityID: p.platformScopeID, RotationDays: certLifetimeDays})
+	if err != nil {
+		return tls.Certificate{}, nil, fmt.Errorf("marshal csr request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url+"/v1/mtls/certificates/csr", bytes.NewReader(reqBody))
 	if err != nil {
 		return tls.Certificate{}, nil, fmt.Errorf("build provision request: %w", err)
 	}
@@ -123,17 +153,19 @@ func (p provisioner) provision(ctx context.Context) (tls.Certificate, []byte, er
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return tls.Certificate{}, nil, fmt.Errorf("decode provision result: %w", err)
 	}
-	cert, err := tls.X509KeyPair([]byte(result.Certificate.CertificatePEM), []byte(result.PrivateKeyPEM))
+	block, _ := pem.Decode([]byte(result.Certificate.CertificatePEM))
+	if block == nil {
+		return tls.Certificate{}, nil, fmt.Errorf("issuer returned no certificate")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return tls.Certificate{}, nil, fmt.Errorf("load client key pair: %w", err)
+		return tls.Certificate{}, nil, fmt.Errorf("parse client leaf: %w", err)
 	}
-	if cert.Leaf == nil {
-		leaf, err := x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			return tls.Certificate{}, nil, fmt.Errorf("parse client leaf: %w", err)
-		}
-		cert.Leaf = leaf
+	// The certificate must be for the key generated here, or the issuer signed something else.
+	if pub, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok || !pub.Equal(&key.PublicKey) {
+		return tls.Certificate{}, nil, fmt.Errorf("issued certificate does not match the generated key")
 	}
+	cert := tls.Certificate{Certificate: [][]byte{block.Bytes}, PrivateKey: key, Leaf: leaf}
 	return cert, []byte(result.CACertPEM), nil
 }
 

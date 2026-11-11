@@ -375,8 +375,8 @@ func main() {
 			principalRepo,
 			identityctx.IngressPolicy(cfg.IngressPolicy),
 			log,
-		// Without a TTL every binding reads FRESH forever, so §4's STALE state
-		// was unreachable in any deployment. Labels only — STALE is admitted.
+			// Without a TTL every binding reads FRESH forever, so §4's STALE state
+			// was unreachable in any deployment. Labels only — STALE is admitted.
 		).WithBindingTTL(time.Duration(cfg.IngressBindingTTLSeconds) * time.Second)).
 		// Residency has been recorded on every session since migration 000005
 		// and never enforced. Empty allow-list keeps enforcement off.

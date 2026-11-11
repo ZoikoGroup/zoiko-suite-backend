@@ -138,6 +138,33 @@ func New(s store.Store, pubKey string) *Runtime {
 	return &Runtime{store: s, pubKey: pubKey, snap: &Snapshot{rev: &revocationSet{sources: map[string]bool{}, claims: map[string]bool{}}}}
 }
 
+// reject drops the active release and counts why the new one was refused
+// (SEC-T030: a checksum or signature failure must raise an alert, not only
+// turn readiness off).
+func (r *Runtime) reject(err error) error {
+	r.invalidate()
+	metrics.ReleaseRejected(rejectReason(err))
+	return err
+}
+
+func rejectReason(err error) string {
+	switch {
+	case errors.Is(err, signing.ErrBadSignature):
+		return "signature"
+	case errors.Is(err, knowledge.ErrChecksumMismatch):
+		return "checksum"
+	case errors.Is(err, ErrDraftInRelease):
+		return "draft"
+	case errors.Is(err, ErrSyntheticInRelease):
+		return "synthetic"
+	case errors.Is(err, ErrInvalidClaims):
+		return "claims"
+	case errors.Is(err, ErrIncompatibleRelease):
+		return "policy"
+	}
+	return "manifest"
+}
+
 // ErrNotLoaded means no verified release is active.
 var ErrNotLoaded = errors.New("no verified knowledge/claim release is active")
 
@@ -169,30 +196,24 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	if newKB != kbID || cur.KB == nil {
 		var m knowledge.Manifest
 		if err := r.load(ctx, newKB, knowledge.KindKB, &m); err != nil {
-			r.invalidate()
-			return err
+			return r.reject(err)
 		}
 		if err := m.Validate(); err != nil {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w", newKB, err)
+			return r.reject(fmt.Errorf("release %s: %w", newKB, err))
 		}
 		if m.HasDraft() && !r.AllowDraft {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w", newKB, ErrDraftInRelease)
+			return r.reject(fmt.Errorf("release %s: %w", newKB, ErrDraftInRelease))
 		}
 		if m.HasSynthetic() && !r.AllowSynthetic {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease)
+			return r.reject(fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease))
 		}
 		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w", newKB, err)
+			return r.reject(fmt.Errorf("release %s: %w", newKB, err))
 		}
 		// additionally, gate synthetic routes
 		for _, rt := range m.Routes {
 			if rt.Synthetic && !r.AllowSynthetic {
-				r.invalidate()
-				return fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease)
+				return r.reject(fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease))
 			}
 		}
 		next.KB, next.Routes, next.kbManifest = knowledge.NewIndex(m), m.Routes, &m
@@ -216,22 +237,18 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	if newClaims != claimsID || cur.Claims == nil {
 		var m claims.Manifest
 		if err := r.load(ctx, newClaims, claims.KindClaims, &m); err != nil {
-			r.invalidate()
-			return err
+			return r.reject(err)
 		}
 		// Doc 03 §6/§12, CT-043: a claim release is held to the same load
 		// gates as a KB release, not only to the checks it passed at build.
 		if problems := m.StructuralProblems(); len(problems) > 0 {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w: %s", newClaims, ErrInvalidClaims, strings.Join(problems, "; "))
+			return r.reject(fmt.Errorf("release %s: %w: %s", newClaims, ErrInvalidClaims, strings.Join(problems, "; ")))
 		}
 		if m.HasSynthetic() && !r.AllowSynthetic {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w", newClaims, ErrSyntheticInRelease)
+			return r.reject(fmt.Errorf("release %s: %w", newClaims, ErrSyntheticInRelease))
 		}
 		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w", newClaims, err)
+			return r.reject(fmt.Errorf("release %s: %w", newClaims, err))
 		}
 		next.Claims = claims.NewResolver(m)
 		if rel, err := r.store.GetRelease(ctx, newClaims); err == nil {

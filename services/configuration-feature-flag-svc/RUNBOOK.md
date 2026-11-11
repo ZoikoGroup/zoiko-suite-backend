@@ -313,3 +313,13 @@ serving anything — this service's own history records a live demo losing
 matching, producing a misleading empty list or a bare Go `404 page not found`
 rather than this service's JSON error shape. Not a service fault, but worth
 ruling out before suspecting one.
+
+## Secret references checked against the vault (S3-B3)
+
+A `secret://<environment>/<path>` reference (anywhere in a value: direct write, override, change proposal, emergency change) is accepted only if
+secret-vault-integration-svc reports an ACTIVE policy for `<path>` (`GET /v1/secret-paths/status`). A dangling reference is `422
+secret_reference_unresolved`; an unreachable vault, or a vault that refuses this service, is `503 secret_vault_unavailable` and nothing is stored.
+This service never receives or relays a value: the consuming workload fetches the secret from the vault under its own identity. Needs
+`SECRET_VAULT_URL` (required in staging and production) and `SECRET_VAULT_PRINCIPAL_ID` (default `svc-configuration`), which must hold the vault
+action `SECRET_POLICY_LIST` in each tenant scope: a 403 from the vault surfaces as the 503 above. Values approved from a proposal were checked when
+proposed; they are not re-checked when applied. Existing references are not re-checked.

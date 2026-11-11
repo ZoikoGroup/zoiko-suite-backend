@@ -65,6 +65,76 @@ var registeredActionMigrations = []struct {
 		"PARTY_SPLIT":             "HIGH",
 		"PARTY_RESOLUTION_DECIDE": "HIGH",
 	}},
+	{"000046_register_address_actions", "tenant-entity-registry-svc", map[string]string{
+		"ADDRESS_CREATE": "STANDARD",
+		"ADDRESS_AMEND":  "STANDARD",
+		"ADDRESS_VERIFY": "STANDARD",
+		"ADDRESS_LINK":   "STANDARD",
+	}},
+	{"000047_register_establishment_actions", "tenant-entity-registry-svc", map[string]string{
+		"ESTABLISHMENT_CREATE":     "STANDARD",
+		"ESTABLISHMENT_ACTIVATE":   "HIGH",
+		"ESTABLISHMENT_DEACTIVATE": "STANDARD",
+		"ESTABLISHMENT_CLOSE":      "HIGH",
+	}},
+	{"000048_register_registration_actions", "tenant-entity-registry-svc", map[string]string{
+		"REGISTRATION_CREATE":        "STANDARD",
+		"REGISTRATION_VERIFY":        "HIGH",
+		"REGISTRATION_RENEW":         "HIGH",
+		"REGISTRATION_SUSPEND":       "HIGH",
+		"REGISTRATION_EXPIRE":        "STANDARD",
+		"REGISTRATION_REVOKE":        "HIGH",
+		"REGISTRATION_NUMBER_REVEAL": "HIGH",
+	}},
+	{"000049_register_identifier_verify_action", "tenant-entity-registry-svc", map[string]string{
+		"PARTY_IDENTIFIER_VERIFY": "HIGH",
+	}},
+	{"000050_register_fx_actions", "tenant-entity-registry-svc", map[string]string{
+		"FX_SOURCE_MANAGE":         "HIGH",
+		"FX_OBSERVATION_INGEST":    "STANDARD",
+		"FX_OBSERVATION_SUPERSEDE": "HIGH",
+		"FX_RATE_SET_APPROVE":      "HIGH",
+		"FX_RATE_SET_CLOSE":        "HIGH",
+	}},
+	{"000051_register_book_actions", "tenant-entity-registry-svc", map[string]string{
+		"ACCOUNTING_BOOK_CREATE":          "STANDARD",
+		"ACCOUNTING_BOOK_ACTIVATE":        "HIGH",
+		"ACCOUNTING_BOOK_AMEND_BASIS":     "HIGH",
+		"ACCOUNTING_BOOK_SUSPEND_POSTING": "HIGH",
+		"ACCOUNTING_BOOK_RETIRE":          "HIGH",
+	}},
+	{"000052_register_dimension_actions", "tenant-entity-registry-svc", map[string]string{
+		"DIMENSION_TYPE_CREATE":       "STANDARD",
+		"DIMENSION_CREATE":            "STANDARD",
+		"DIMENSION_ACTIVATE":          "STANDARD",
+		"DIMENSION_DEACTIVATE":        "HIGH",
+		"DIMENSION_REPARENT":          "STANDARD",
+		"DIMENSION_APPROVE_HIERARCHY": "HIGH",
+		"DIMENSION_MAP_SOURCE":        "STANDARD",
+	}},
+	{"000053_register_unit_actions", "tenant-entity-registry-svc", map[string]string{
+		"UNIT_DIMENSION_CREATE":   "STANDARD",
+		"UNIT_CREATE":             "STANDARD",
+		"UNIT_PROPOSE_CONVERSION": "STANDARD",
+		"UNIT_APPROVE_CONVERSION": "HIGH",
+		"UNIT_RETIRE":             "HIGH",
+	}},
+	{"000054_register_reference_actions", "tenant-entity-registry-svc", map[string]string{
+		"REFERENCE_CREATE_SET":      "STANDARD",
+		"REFERENCE_STAGE_RELEASE":   "STANDARD",
+		"REFERENCE_PUBLISH_RELEASE": "HIGH",
+	}},
+	{"000055_register_master_import_actions", "tenant-entity-registry-svc", map[string]string{
+		"MASTER_IMPORT_UPLOAD":  "STANDARD",
+		"MASTER_IMPORT_APPROVE": "HIGH",
+		"MASTER_IMPORT_CANCEL":  "STANDARD",
+	}},
+	{"000056_register_party_contact_actions", "tenant-entity-registry-svc", map[string]string{
+		"PARTY_CONTACT_CREATE": "STANDARD",
+		"PARTY_CONTACT_VERIFY": "HIGH",
+		"PARTY_CONTACT_RETIRE": "STANDARD",
+		"PARTY_CONTACT_READ":   "STANDARD",
+	}},
 }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {
