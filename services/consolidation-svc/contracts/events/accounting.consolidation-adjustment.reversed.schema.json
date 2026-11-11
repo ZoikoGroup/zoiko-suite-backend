@@ -1,0 +1,43 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.consolidation-adjustment.reversed (consolidation-svc, schema 1.0.0). OBSERVED contract inferred from 4 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "consolidation_adjustment_id": {
+      "type": "string"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "group_legal_entity_id": {
+      "type": "string"
+    },
+    "reversal_reason": {
+      "type": "string"
+    },
+    "reversed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "reversed_by_principal_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "superseded_by_adjustment_id": {},
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "consolidation_adjustment_id",
+    "fiscal_period",
+    "group_legal_entity_id",
+    "reversal_reason",
+    "reversed_at",
+    "reversed_by_principal_id",
+    "status",
+    "superseded_by_adjustment_id",
+    "tenant_id"
+  ],
+  "type": "object"
+}

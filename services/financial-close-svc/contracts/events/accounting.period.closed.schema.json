@@ -1,0 +1,37 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.period.closed (financial-close-svc, schema 1.0.0). OBSERVED contract inferred from 3 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "evidence_document_id": {
+      "type": "string"
+    },
+    "fiscal_period_id": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "period_name": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "trial_balance_hash": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "evidence_document_id",
+    "fiscal_period_id",
+    "legal_entity_id",
+    "period_name",
+    "tenant_id",
+    "timestamp",
+    "trial_balance_hash"
+  ],
+  "type": "object"
+}

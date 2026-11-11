@@ -1,0 +1,41 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.consolidation-run.completed (consolidation-svc, schema 1.0.0). OBSERVED contract inferred from 3 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "completed_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "consolidation_run_id": {
+      "type": "string"
+    },
+    "exception_count": {
+      "type": "integer"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "group_legal_entity_id": {
+      "type": "string"
+    },
+    "snapshot_count": {
+      "type": "integer"
+    },
+    "status": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "completed_at",
+    "consolidation_run_id",
+    "exception_count",
+    "fiscal_period",
+    "group_legal_entity_id",
+    "snapshot_count",
+    "status",
+    "tenant_id"
+  ],
+  "type": "object"
+}

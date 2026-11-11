@@ -1,0 +1,28 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.consolidation-run.exception-detected (consolidation-svc, schema 1.0.0). OBSERVED contract inferred from 1 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "consolidation_run_id": {
+      "type": "string"
+    },
+    "exceptions": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "group_legal_entity_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

@@ -1,0 +1,63 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.reconciliation.job.resolution-recommended (reconciliation-intelligence-svc, schema 1.0.0). OBSERVED contract inferred from 21 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "authoritative_ref": {
+      "properties": {
+        "journal_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      }
+    },
+    "bank_reconciliation_run_id": {
+      "type": "string"
+    },
+    "candidate_search_outcome": {
+      "type": "string"
+    },
+    "counterpart_journal_id": {
+      "type": "string"
+    },
+    "counterpart_statement_line_id": {
+      "type": "string"
+    },
+    "counterpart_transaction_id": {
+      "type": "string"
+    },
+    "item_id": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "resolution_notes": {
+      "type": "string"
+    },
+    "resolution_status": {
+      "type": "string"
+    },
+    "statement_line_id": {
+      "type": "string"
+    },
+    "suggestion_status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "authoritative_ref",
+    "bank_reconciliation_run_id",
+    "candidate_search_outcome",
+    "counterpart_journal_id",
+    "counterpart_statement_line_id",
+    "counterpart_transaction_id",
+    "item_id",
+    "job_id",
+    "resolution_notes",
+    "resolution_status",
+    "statement_line_id",
+    "suggestion_status"
+  ],
+  "type": "object"
+}

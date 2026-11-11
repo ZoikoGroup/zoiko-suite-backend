@@ -1,0 +1,64 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.reconciliation.variance-resolved (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 3 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "connection_id": {
+      "type": "string"
+    },
+    "refs": {
+      "properties": {
+        "difference": {
+          "type": "integer"
+        },
+        "external": {
+          "type": "integer"
+        },
+        "internal": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "difference",
+        "external",
+        "internal",
+        "name"
+      ],
+      "type": "object"
+    },
+    "repeat_count": {
+      "type": "integer"
+    },
+    "resolution": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "severity": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    },
+    "variance_id": {
+      "type": "string"
+    },
+    "variance_type": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "connection_id",
+    "refs",
+    "repeat_count",
+    "resolution",
+    "run_id",
+    "severity",
+    "state",
+    "variance_id",
+    "variance_type"
+  ],
+  "type": "object"
+}

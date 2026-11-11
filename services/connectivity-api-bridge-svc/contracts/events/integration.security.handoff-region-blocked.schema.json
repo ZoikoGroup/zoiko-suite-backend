@@ -1,0 +1,20 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.security.handoff-region-blocked (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 2 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "exchange_id": {
+      "type": "string"
+    },
+    "reason_code": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "exchange_id",
+    "reason_code",
+    "tenant_id"
+  ],
+  "type": "object"
+}

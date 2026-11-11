@@ -1,0 +1,54 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.canonical-transaction.renormalized (banking-connector-svc, schema 1.0.0). OBSERVED contract inferred from 4 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "amount": {
+      "type": "number"
+    },
+    "category": {
+      "type": "string"
+    },
+    "counterparty": {
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "currency": {
+      "type": "string"
+    },
+    "mapping_version": {
+      "type": "integer"
+    },
+    "statement_line_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "transaction_date": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "transaction_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "amount",
+    "category",
+    "counterparty",
+    "created_at",
+    "currency",
+    "mapping_version",
+    "statement_line_id",
+    "status",
+    "tenant_id",
+    "transaction_date",
+    "transaction_id"
+  ],
+  "type": "object"
+}

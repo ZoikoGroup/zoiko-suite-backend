@@ -1,0 +1,66 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.bank-connection.requested (banking-connector-svc, schema 1.0.0). OBSERVED contract inferred from 27 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "account_id": {
+      "type": "string"
+    },
+    "bank_account_id": {
+      "type": "string"
+    },
+    "bank_name": {
+      "type": "string"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "consent_scope": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "currency": {
+      "type": "string"
+    },
+    "health_status": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "provider_ref": {
+      "type": "string"
+    },
+    "region": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_id",
+    "bank_account_id",
+    "bank_name",
+    "connection_id",
+    "created_at",
+    "currency",
+    "health_status",
+    "legal_entity_id",
+    "status",
+    "tenant_id",
+    "updated_at"
+  ],
+  "type": "object"
+}

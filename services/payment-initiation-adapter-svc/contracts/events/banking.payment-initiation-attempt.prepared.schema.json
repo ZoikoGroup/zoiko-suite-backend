@@ -1,0 +1,111 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.payment-initiation-attempt.prepared (payment-initiation-adapter-svc, schema 1.0.0). OBSERVED contract inferred from 50 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "AmbiguousResolutionNote": {
+      "type": "string"
+    },
+    "Amount": {
+      "type": "number"
+    },
+    "AttemptID": {
+      "type": "string"
+    },
+    "AuthorizationFingerprint": {
+      "type": "string"
+    },
+    "AuthorizationID": {
+      "type": "string"
+    },
+    "AuthorizationSource": {
+      "type": "string"
+    },
+    "CreatedAt": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "CreatedByPrincipalID": {
+      "type": "string"
+    },
+    "Currency": {
+      "type": "string"
+    },
+    "ExecutionDate": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "IdempotencyKey": {
+      "type": "string"
+    },
+    "LegalEntityID": {
+      "type": "string"
+    },
+    "PayeeRef": {
+      "type": "string"
+    },
+    "PayerAccountRef": {
+      "type": "string"
+    },
+    "PayerAccountVerified": {
+      "type": "boolean"
+    },
+    "PaymentReference": {
+      "type": "string"
+    },
+    "ProviderRequestID": {
+      "type": "string"
+    },
+    "ProviderResponseRef": {
+      "type": "string"
+    },
+    "QuarantineReason": {
+      "type": "string"
+    },
+    "RejectionReason": {
+      "type": "string"
+    },
+    "ResolvedAt": {},
+    "SourceReference": {
+      "type": "string"
+    },
+    "Status": {
+      "type": "string"
+    },
+    "SubmittedAt": {},
+    "TenantID": {
+      "type": "string"
+    },
+    "UpdatedAt": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "AmbiguousResolutionNote",
+    "Amount",
+    "AttemptID",
+    "AuthorizationFingerprint",
+    "AuthorizationID",
+    "AuthorizationSource",
+    "CreatedAt",
+    "CreatedByPrincipalID",
+    "Currency",
+    "ExecutionDate",
+    "IdempotencyKey",
+    "LegalEntityID",
+    "PayeeRef",
+    "PayerAccountRef",
+    "PayerAccountVerified",
+    "PaymentReference",
+    "ProviderRequestID",
+    "ProviderResponseRef",
+    "QuarantineReason",
+    "RejectionReason",
+    "ResolvedAt",
+    "SourceReference",
+    "Status",
+    "SubmittedAt",
+    "TenantID",
+    "UpdatedAt"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,15 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.connectivity.external-profile.published (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 15 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "provider_key": {
+      "type": "string"
+    },
+    "provider_type": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer"
+    }
+  },
+  "type": "object"
+}

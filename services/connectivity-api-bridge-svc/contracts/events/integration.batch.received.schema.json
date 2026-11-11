@@ -1,0 +1,40 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.batch.received (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 20 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "batch_id": {
+      "type": "string"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "external_batch_id": {
+      "type": "string"
+    },
+    "file_count": {
+      "type": "integer"
+    },
+    "manifest_hash": {
+      "type": "string"
+    },
+    "operation_id": {
+      "type": "string"
+    },
+    "source_schema": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "batch_id",
+    "connection_id",
+    "external_batch_id",
+    "file_count",
+    "manifest_hash",
+    "operation_id",
+    "source_schema",
+    "tenant_id"
+  ],
+  "type": "object"
+}

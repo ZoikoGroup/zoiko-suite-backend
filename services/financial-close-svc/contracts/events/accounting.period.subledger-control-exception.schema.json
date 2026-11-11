@@ -1,0 +1,37 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.period.subledger-control-exception (financial-close-svc, schema 1.0.0). OBSERVED contract inferred from 1 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "control_account_code": {
+      "type": "string"
+    },
+    "control_run_id": {
+      "type": "string"
+    },
+    "difference_amount": {
+      "type": "integer"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "gl_control_balance_amount": {
+      "type": "integer"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "subledger": {
+      "type": "string"
+    },
+    "subledger_total_amount": {
+      "type": "integer"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

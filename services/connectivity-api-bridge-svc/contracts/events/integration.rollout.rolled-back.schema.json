@@ -1,0 +1,24 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.rollout.rolled-back (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 3 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "automatic": {
+      "type": "boolean"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "from": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "automatic",
+    "connection_id",
+    "from",
+    "tenant_id"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,160 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.bank-statement.ingested (banking-connector-svc, schema 1.0.0). OBSERVED contract inferred from 22 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "closing_balance": {
+      "type": "integer"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "created": {
+      "type": "boolean"
+    },
+    "ingested_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "lines": {
+      "items": {
+        "properties": {
+          "amount": {
+            "type": "number"
+          },
+          "bank_code": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "line_id": {
+            "type": "string"
+          },
+          "line_seq": {
+            "type": "integer"
+          },
+          "posted_date": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "raw_reference": {
+            "type": "string"
+          },
+          "statement_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "amount",
+          "bank_code",
+          "created_at",
+          "currency",
+          "description",
+          "line_id",
+          "line_seq",
+          "posted_date",
+          "raw_reference",
+          "statement_id",
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "opening_balance": {
+      "type": "integer"
+    },
+    "statement": {
+      "properties": {
+        "closing_balance": {
+          "type": "number"
+        },
+        "connection_id": {
+          "type": "string"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "created_by_principal_id": {
+          "type": "string"
+        },
+        "import_batch_id": {
+          "type": "string"
+        },
+        "ingested_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "opening_balance": {
+          "type": "integer"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "statement_date": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "statement_format": {
+          "type": "string"
+        },
+        "statement_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "transaction_count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "closing_balance",
+        "connection_id",
+        "content_hash",
+        "created_by_principal_id",
+        "ingested_at",
+        "opening_balance",
+        "statement_date",
+        "statement_format",
+        "statement_id",
+        "status",
+        "tenant_id",
+        "transaction_count"
+      ],
+      "type": "object"
+    },
+    "statement_date": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "statement_format": {
+      "type": "string"
+    },
+    "statement_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "transaction_count": {
+      "type": "integer"
+    }
+  },
+  "type": "object"
+}

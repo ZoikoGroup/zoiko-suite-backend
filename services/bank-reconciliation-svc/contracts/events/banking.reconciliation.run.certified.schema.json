@@ -1,0 +1,32 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.reconciliation.run.certified (bank-reconciliation-svc, schema 1.0.0). OBSERVED contract inferred from 6 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "bank_account_id": {
+      "type": "string"
+    },
+    "certificate_id": {
+      "type": "string"
+    },
+    "matched_line_count": {
+      "type": "integer"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "statement_date": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "bank_account_id",
+    "certificate_id",
+    "matched_line_count",
+    "run_id",
+    "statement_date",
+    "tenant_id"
+  ],
+  "type": "object"
+}

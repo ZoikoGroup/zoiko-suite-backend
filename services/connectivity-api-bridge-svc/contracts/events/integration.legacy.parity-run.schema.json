@@ -1,0 +1,40 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.legacy.parity-run (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 2 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "compared": {
+      "type": "integer"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "matched": {
+      "type": "integer"
+    },
+    "missing_in_xic": {
+      "type": "integer"
+    },
+    "outcome_differs": {
+      "type": "integer"
+    },
+    "parity_id": {
+      "type": "string"
+    },
+    "passed": {
+      "type": "boolean"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "compared",
+    "connection_id",
+    "matched",
+    "missing_in_xic",
+    "outcome_differs",
+    "parity_id",
+    "passed",
+    "tenant_id"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,49 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.reconciliation.closed (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 4 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "auto": {
+      "type": "boolean"
+    },
+    "basis": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "connector_id": {
+      "type": "string"
+    },
+    "origin": {
+      "type": "string"
+    },
+    "period_from": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "period_to": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "auto",
+    "basis",
+    "connection_id",
+    "connector_id",
+    "origin",
+    "period_from",
+    "period_to",
+    "run_id",
+    "state"
+  ],
+  "type": "object"
+}
