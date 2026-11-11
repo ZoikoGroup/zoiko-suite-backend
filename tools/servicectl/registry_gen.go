@@ -135,8 +135,9 @@ var generatedServices = []Service{
 		Port:   8145,
 		DBName: "capability_registry",
 		Env: map[string]string{
-			"AUTHZ_SERVICE_URL":  "http://127.0.0.1:8089",
-			"KAFKA_EVENTS_TOPIC": "zoiko.capability-registry.events",
+			"AUTHZ_SERVICE_URL":      "http://127.0.0.1:8089",
+			"EVENT_RESIDENCY_REGION": "local",
+			"KAFKA_EVENTS_TOPIC":     "zoiko.capability-registry.events",
 		},
 	},
 	{
@@ -162,8 +163,10 @@ var generatedServices = []Service{
 		Port:   8144,
 		DBName: "commercial_account",
 		Env: map[string]string{
-			"AUTHZ_SERVICE_URL":  "http://127.0.0.1:8089",
-			"KAFKA_EVENTS_TOPIC": "zoiko.commercial-account.events",
+			"AUTHZ_SERVICE_URL":      "http://127.0.0.1:8089",
+			"EVENT_CLASSIFICATION":   "confidential",
+			"EVENT_RESIDENCY_REGION": "local",
+			"KAFKA_EVENTS_TOPIC":     "zoiko.commercial-account.events",
 		},
 	},
 	{
