@@ -426,3 +426,10 @@ func WithPublishedAt(rendered []byte, publishedAt time.Time) ([]byte, error) {
 	out = append(out, rest...)
 	return out, nil
 }
+
+// ValidType reports whether t is an event type New would accept: the
+// canonical com.zoikosuite.<domain>.<aggregate>.<fact> shape with no version
+// suffix (§5.1, §4). The catalogue uses it so the two can never disagree.
+func ValidType(t string) bool {
+	return typePattern.MatchString(t) && !versionSuffix.MatchString(t)
+}
