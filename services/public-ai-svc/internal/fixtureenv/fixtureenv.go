@@ -54,7 +54,16 @@ func PublicKBDir() string {
 }
 
 // DatasetDir maps a PUBLIC_AI_DATASET value to its directory.
+// PUBLIC_AI_DATA_DIR, when set, is the folder that holds seed/ and
+// public-kb/: a container has no source tree, so the dev compose stack
+// mounts the data there (deployments/docker-compose.public-ai-dev.yml).
 func DatasetDir(name string) string {
+	if root := os.Getenv("PUBLIC_AI_DATA_DIR"); root != "" && name != "fixtures" {
+		if name == "seed" {
+			return filepath.Join(root, "seed")
+		}
+		return filepath.Join(root, "public-kb")
+	}
 	switch name {
 	case "fixtures":
 		return FixturesDir()

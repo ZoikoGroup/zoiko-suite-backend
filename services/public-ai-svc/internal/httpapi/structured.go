@@ -125,6 +125,11 @@ func (s *Server) structure(env *contract.Envelope, market string) {
 		if i == 0 && policy.IntentCTA[env.IntentID] != "" && a.RouteKey == policy.DefaultRoute[env.IntentID] {
 			label = policy.IntentCTA[env.IntentID]
 		}
+		// Doc 02 T06: a trial answer that links the pricing page (not a
+		// sign-up page) offers "Review trial options".
+		if i == 0 && env.IntentID == "I06" && a.RouteKey == "pricing" {
+			label = policy.TrialPricingCTA
+		}
 		if label == "" {
 			continue
 		}

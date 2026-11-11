@@ -24,7 +24,10 @@ func TestAlertRulesUseExportedMetrics(t *testing.T) {
 	ObserveStage("model", time.Millisecond)
 	SecuritySignal("RULES_TEST")
 	OutboxOldest(time.Second)
-	CommitRevocation()
+	CommitRevocation("kb-rules-test", "GB")
+	ReleaseRejected("checksum")
+	TurnOutcome("ANSWERED", "kb-rules-test", "GB")
+	TurnCancelled()
 	EventDLPBlocked("rules-test")
 	IndexHealth(1, 1, 0, 0, 1)
 	CTAOffered("rules-test")
@@ -78,6 +81,34 @@ func TestConversionCounters(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing %s", want)
+		}
+	}
+}
+
+// OPR-019 (Doc 08 §13): metric labels are fixed enums. A label that names a
+// visitor, session, request or free text would explode cardinality and leak
+// identifiers into monitoring, so none may exist on any exported metric.
+func TestNoHighCardinalityLabels(t *testing.T) {
+	CommitRevocation("kb-1", "not-a-market-code")
+	TurnOutcome("ANSWERED", "", "united kingdom")
+	forbidden := regexp.MustCompile(`(?i)^(?:session(?:_id)?|request(?:_id)?|turn(?:_id)?|trace(?:_id)?|span(?:_id)?|user(?:_id)?|visitor(?:_id)?|ip|client_ip|email|phone|message|text|query|path|url|grant|token)$`)
+	mfs, err := Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if forbidden.MatchString(l.GetName()) {
+					t.Errorf("%s has high-cardinality label %q", mf.GetName(), l.GetName())
+				}
+				if l.GetName() == "market" && l.GetValue() != "none" && !regexp.MustCompile(`^[A-Z]{2}$`).MatchString(l.GetValue()) {
+					t.Errorf("%s market label %q is not a bounded ISO code", mf.GetName(), l.GetValue())
+				}
+				if l.GetName() == "release" && l.GetValue() == "" {
+					t.Errorf("%s has an empty release label", mf.GetName())
+				}
+			}
 		}
 	}
 }

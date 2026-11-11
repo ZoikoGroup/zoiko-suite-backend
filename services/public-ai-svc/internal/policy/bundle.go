@@ -29,7 +29,7 @@ func BundleDigest(promptTemplateVersion string) string {
 		CTA        map[string]string
 	}{
 		promptTemplateVersion, ExceptionTemplates, RouteTemplates, BoundaryTemplates, DefaultRoute,
-		[]Template{TplAbstainNoEvidence, TplAbstainStale, TplAbstainConflict, TplClarifyMarket, TplClarifyPlan, TplUnavailable,
+		[]Template{TplAbstainNoEvidence, TplAbstainStale, TplAbstainConflict, TplClarifyMarket, TplClarifyTrialMarket, TplClarifyPlan, TplUnavailable,
 			TplOutOfScope, TplClarifyGiveUp, TplAbstainCoverage, TplAbstainCertification, TplDataRights, TplNoApprovedInfo},
 		exceptionOrder, ruleStrings(), Menu, IntentCTA,
 	})

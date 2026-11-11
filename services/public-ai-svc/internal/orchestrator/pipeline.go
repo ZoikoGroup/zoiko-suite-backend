@@ -186,10 +186,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			// Doc 02 S10: "yes" opens the official demo form. Nothing is booked.
 			return p.fromTemplate(policy.TplDemoAccepted, "I08", snap, market, now, releaseID)
 		}
-		if pd.Refused && dec.Exception == "" && policy.HasRecordIdentifiers(dec.Redaction.Text) {
+		if pd.Refused && (dec.Exception == "" || dec.Exception == policy.X01PrivateAction) && policy.HasRecordIdentifiers(dec.Redaction.Text) {
 			// Doc 02 S04: identifiers for the records just refused are
 			// refused again and never repeated.
-			res := p.fromTemplate(policy.ExceptionTemplates[policy.X01PrivateAction], policy.X01PrivateAction, snap, market, now, releaseID)
+			res := p.fromTemplate(policy.TplAvoidSharing, policy.X01PrivateAction, snap, market, now, releaseID)
 			res.Pending = &Pending{Refused: true}
 			return res
 		}
@@ -213,7 +213,14 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		return res
 	}
 	if dec.Exception != "" {
-		res := p.fromTemplate(policy.ExceptionTemplates[dec.Exception], dec.Exception, snap, market, now, releaseID)
+		tpl := policy.ExceptionTemplates[dec.Exception]
+		switch {
+		case dec.Exception == policy.X09UnsupportedCover:
+			tpl = policy.UnsupportedCover(dec.Redaction.Text) // Doc 02 §19, one correction per claim
+		case dec.Exception == policy.X08ClaimVerification && policy.AsksPrice(dec.Redaction.Text):
+			tpl = policy.TplPriceGuarantee // Doc 06 §20
+		}
+		res := p.fromTemplate(tpl, dec.Exception, snap, market, now, releaseID)
 		switch dec.Exception {
 		case policy.X06PromptInjection:
 			res.SecuritySignal = SignalInjection
@@ -278,7 +285,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	}
 	if dec.Slots.PlanName != "" && !policy.AsksPrice(dec.Redaction.Text) && policy.EntitlementRe.MatchString(dec.Redaction.Text) {
 		// Doc 01 AT-12: plan and configuration qualifiers, plus the comparison.
-		return p.fromTemplate(policy.TplPlanEntitlement, "I05", snap, market, now, releaseID)
+		return p.fromTemplate(policy.PlanEntitlement(dec.Redaction.Text), "I05", snap, market, now, releaseID)
 	}
 	if intent == "I29" && policy.IsNonEnglish(dec.Redaction.Text) {
 		// Doc 02 §23: English fallback where the language has no approved content.
@@ -287,7 +294,14 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	// rerouted: the question names no area but one KB section covers it, so
 	// it is ranked on content alone, not towards articles tagged I02.
 	rerouted := false
-	if intent == "I29" && (policy.IsModuleQuestion(dec.Redaction.Text) || (snap.KB != nil && snap.KB.Covers(dec.Redaction.Text))) {
+	// A message without its own intent continues the open question only when
+	// it supplies something for it (a market, plan or billing term).
+	supplies := dec.Slots.MarketCode != "" || dec.Slots.PlanName != "" || dec.Slots.BillingCadence != ""
+	// "United States" answering "Which country?" is not a module question,
+	// even though a KB article mentions "United States (IRS)": the open
+	// question is resumed below instead of rerouting to a module answer.
+	answersPending := in.Pending != nil && supplies
+	if intent == "I29" && !answersPending && (policy.IsModuleQuestion(dec.Redaction.Text) || (snap.KB != nil && snap.KB.Covers(dec.Redaction.Text))) {
 		// Fallback ladder: rules -> (model classifier, none in R0) -> a named
 		// area, module or alias -> only then out of scope.
 		rerouted = !policy.IsModuleQuestion(dec.Redaction.Text)
@@ -299,11 +313,9 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	clarifications := 0
 	carried := false
 	secondary := dec.Secondary
-	// A message without its own intent continues the open question only when
-	// it supplies something for it (a market, plan or billing term). Anything
-	// else is a new question, so an unrelated message never gets the same
-	// clarifying question again (Doc 02 §10, G34).
-	supplies := dec.Slots.MarketCode != "" || dec.Slots.PlanName != "" || dec.Slots.BillingCadence != ""
+	// Anything that supplies nothing (see supplies above) is a new question,
+	// so an unrelated message never gets the same clarifying question again
+	// (Doc 02 §10, G34).
 	if pd := in.Pending; pd != nil && (intent == pd.Intent || ((intent == "I29" || intent == "I04") && supplies) ||
 		policy.IsGeneralOverview(in.Message) || policy.IsOtherMarket(in.Message)) {
 		// A reply to our clarifying question, or a follow-up to an answer
@@ -340,7 +352,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		// It is not a dead end (Doc 02 escalation matrix: unsupported market
 		// -> demo): the question stays open so "Show general overview" still
 		// answers it, and the approved next steps are offered.
-		res := p.fromTemplate(policy.TplAbstainCoverage, intent, snap, "", now, releaseID)
+		res := p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, "", now, releaseID)
 		res.Suggestions = policy.SuggestCoverage
 		res.Pending = &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName,
 			BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications}
@@ -365,6 +377,12 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		if tpl, ok := policy.SupportTemplate(dec.Redaction.Text); ok {
 			return p.fromTemplate(tpl, "I23", snap, market, now, releaseID)
 		}
+	}
+	if intent == "I22" && policy.LoginTroubleRe.MatchString(dec.Redaction.Text) {
+		return p.fromTemplate(policy.TplLoginHelp, intent, snap, market, now, releaseID) // Doc 10 COM-06
+	}
+	if intent == "I24" && policy.SalesContactRe.MatchString(dec.Redaction.Text) {
+		return p.fromTemplate(policy.TplSalesContact, intent, snap, market, now, releaseID) // Doc 10 COM-04
 	}
 	if tpl, ok := policy.RouteTemplates[intent]; ok {
 		ask := false
@@ -409,9 +427,15 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 					// Two failed clarifications: one verified route, no third question (Doc 02 §10).
 					return p.fromTemplate(withRoute(policy.TplClarifyGiveUp, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 				}
-				res := p.fromTemplate(policy.TplClarifyMarket, intent, snap, market, now, releaseID)
+				// A trial question asks for the market in T06/S01 words, a price
+				// question in T05's (Doc 02 §17-18).
+				ask := policy.TplClarifyMarket
+				if intent == "I06" {
+					ask = policy.TplClarifyTrialMarket
+				}
+				res := p.fromTemplate(ask, intent, snap, market, now, releaseID)
 				res.StatusLabel, res.SecondaryIntentID = "MARKET_DEPENDENT", secondary
-				res.Clarification = &contract.Clarification{Slot: "market_code", Question: policy.TplClarifyMarket.Text,
+				res.Clarification = &contract.Clarification{Slot: "market_code", Question: ask.Text,
 					Options: append(snap.Claims.Markets(), contract.OtherOption, contract.OverviewOption)}
 				res.Pending = &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence,
 					Integration: dec.Slots.Integration, Clarifications: clarifications + 1}
@@ -459,7 +483,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				}
 				if req.Subject == claims.PlanAvailability {
 					// No plans are verified for this market: coverage is not assumed.
-					return p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID)
+					return p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, market, now, releaseID)
 				}
 				if req.Subject == claims.Certification {
 					// Doc 02 T10: due-diligence route, never an asserted status.
@@ -474,7 +498,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 					// G06: a named country with no claims at all is not covered
 					// (as for "Other"); the markets with claims and the general
 					// overview are offered, and the question stays open.
-					res := p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID)
+					res := p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, market, now, releaseID)
 					return keepAsking(res, snap, market, &Pending{Intent: intent, Secondary: secondary,
 						PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications})
 				}
@@ -493,6 +517,11 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	var hits []knowledge.Hit
 	if len(verified) == 0 {
 		qtext := policy.SearchText(dec.Redaction.Text)
+		if q, ok := chipQueries[strings.ToLower(strings.Trim(strings.TrimSpace(in.Message), ".!?"))]; ok && !carried {
+			// A menu chip carries no search words of its own (Doc 02 §17
+			// T02/T03): search the general question it stands for.
+			qtext = q
+		}
 		if overview {
 			// The overview reply carries no search terms of its own; search
 			// the fixed general question for the pending intent instead.
@@ -511,6 +540,20 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		kq.HowTo = howToRe.MatchString(dec.Redaction.Text)
 		searchStart := time.Now()
 		r := snap.Retriever.Retrieve(ctx, kq, snap)
+		if positionIntents[intent] && !kq.HowTo && !rerouted && secondary == "" && !policy.MentionsAI(dec.Redaction.Text) && len(knowledge.Tokens(qtext)) <= 4 && (r.Answerability != knowledge.Answerable ||
+			(!r.Hits[0].Named && !hasIntentID(r.Hits[0].Chunk.IntentIDs, intent))) {
+			// Docs 01-02: an overview, multi-entity, trust, privacy, residency,
+			// governance, evidence or comparison question (short, one topic) whose best match is
+			// a console article that only shares a word with it (and does not
+			// name that article) is answered from the article written for the
+			// topic (Doc 02 §17 T02-T15). A question that names a console
+			// area keeps that area's article.
+			only := kq
+			only.OnlyIntent = true
+			if o := snap.Retriever.Retrieve(ctx, only, snap); o.Answerability == knowledge.Answerable {
+				r = o
+			}
+		}
 		metrics.ObserveStage("retrieval", time.Since(searchStart))
 		if r.Answerability == knowledge.NotFound && intent != "I29" {
 			r = snap.Retriever.ByIntent(kq, snap)
@@ -534,6 +577,13 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		// question: without a signed feature-release claim it always gets
 		// Doc 02 T18, never an article that describes the capability (S02).
 		if t, ok := policy.BoundaryTemplates[intent]; ok && (intent == "I25" || !anyTagged(r.Hits, intent)) && r.Answerability != knowledge.Revoked {
+			if intent == "I25" && policy.ConsolidationRe.MatchString(dec.Redaction.Text) {
+				t = policy.TplConsolidationToday // Doc 02 S02 turn 2
+			}
+			if intent == "I14" && policy.TrustCenterRe.MatchString(dec.Redaction.Text) {
+				// Doc 02 S07: the Trust Center was asked about; point to it.
+				t.Text += " The Trust Center has the current published position."
+			}
 			res := p.fromTemplate(t, intent, snap, market, now, releaseID)
 			res.Diag = diag
 			return res
@@ -551,7 +601,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			if regionalIntents[intent] && market != "" && (!hasMarketEvidence(hits, market) ||
 				!snap.Claims.HasVerified(claims.MarketAvailability, market, now, snap)) {
 				// G12/G13: a named country needs country-specific evidence; never assume coverage.
-				return regionalCoverage(p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID))
+				return regionalCoverage(p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, market, now, releaseID))
 			}
 		case knowledge.Stale:
 			return p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
@@ -561,7 +611,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			if regionalIntents[intent] && market != "" {
 				// G13: a named country with no approved material at all is not
 				// assumed covered (same reply as G12 with material elsewhere).
-				return regionalCoverage(p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID))
+				return regionalCoverage(p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, market, now, releaseID))
 			}
 			if intent == "I29" {
 				// Off-topic and nothing approved matches: out of scope, with
@@ -583,7 +633,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 
 	cards := make([]model.ClaimCard, 0, len(verified))
 	for _, c := range verified {
-		cards = append(cards, model.ClaimCard{Ref: c.ClaimID, Statement: c.PublicStatement})
+		// "SYNTHETIC: " marks placeholder statements in the dev datasets; the
+		// marker stays in the data (and synthetic releases are refused
+		// outside dev/test) but is not shown to visitors.
+		cards = append(cards, model.ClaimCard{Ref: c.ClaimID, Statement: strings.TrimPrefix(c.PublicStatement, "SYNTHETIC: ")})
 	}
 	evidence := make([]model.Evidence, 0, len(hits))
 	for _, h := range hits {
@@ -648,6 +701,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	}
 	// Revocation check at commit (Doc 08 §06): fail closed on any doubt.
 	if revoked, err := p.Releases.RevokedSince(ctx, snap.Watermark, sourceIDs, refs(cards)); revoked || err != nil {
+		if revoked {
+			// Pages via PublicAIRevocationRejectedAtCommit (Doc 08 §13, OPR-023).
+			metrics.CommitRevocation(releaseID, market)
+		}
 		return because(p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), contract.ReasonSourceRevoked)
 	}
 
@@ -770,6 +827,10 @@ func (p *Pipeline) citations(snap *release.Snapshot, verified []claims.Claim, hi
 	var ids []string
 	bySource := map[string]int{}
 	seenSource := map[string]bool{}
+	claimByID := make(map[string]claims.Claim, len(verified))
+	for _, c := range verified {
+		claimByID[c.ClaimID] = c
+	}
 	add := func(svid, urlKey, claimID string) {
 		// Doc 03 §14 step 8, KB-026: one link per distinct page. Sources that
 		// share a url_key merge, but every source id is still re-checked for
@@ -803,6 +864,10 @@ func (p *Pipeline) citations(snap *release.Snapshot, verified []claims.Claim, hi
 		if s, ok := snap.KB.Source(svid); ok {
 			ids = append(ids, s.SourceID)
 			c.ReviewedAt = reviewedAt(s)
+		} else if cl, ok := claimByID[claimID]; ok && !cl.ValidFrom.IsZero() {
+			// A claim's own evidence page (the price book) is not a KB
+			// article; its effective date is the date shown (Doc 01 AT-01).
+			c.ReviewedAt = cl.ValidFrom.UTC().Format("2006-01-02")
 		}
 		out = append(out, c)
 		ids = append(ids, svid)
@@ -837,6 +902,16 @@ func (p *Pipeline) actions(snap *release.Snapshot, routeKey, market string, now 
 		// trial CTAs fall back to the general support route.
 		routeKey = "support"
 	}
+	if routeKey == "signup_or_trial" {
+		// Doc 02 T06: with no approved sign-up page but an approved pricing
+		// page, the trial CTA opens the pricing page, which carries the trial
+		// terms (Doc 03 S03). With neither, the route key is kept as before.
+		trial, tok := snap.Route("signup_or_trial", market, now)
+		pricing, pok := snap.Route("pricing", market, now)
+		if (!tok || knowledge.IsPlaceholderURL(trial.URL)) && pok && !knowledge.IsPlaceholderURL(pricing.URL) {
+			routeKey = "pricing"
+		}
+	}
 	if _, ok := snap.Route(routeKey, market, now); !ok {
 		// Sign-in (Doc 02 T17/T21) falls back to the support route where the
 		// release has no sign-in page; any other missing route hides the CTA.
@@ -850,6 +925,29 @@ func (p *Pipeline) actions(snap *release.Snapshot, routeKey, market string, now 
 	}
 	return []contract.Action{{Type: contract.ActionOpenRoute, RouteKey: routeKey}}
 }
+
+// coverage is the no-coverage abstention naming the countries asked about
+// (Doc 02 T12/T13, G12/G13).
+func (p *Pipeline) coverage(intent, text, market string) policy.Template {
+	codes := policy.CountriesIn(text)
+	if len(codes) == 0 && market != "" {
+		codes = []string{market}
+	}
+	return policy.CoverageFor(intent, codes)
+}
+
+func hasIntentID(ids []string, id string) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+// positionIntents ask for ZoikoSuite's public position on a topic rather
+// than how to do something in the console.
+var positionIntents = map[string]bool{"I01": true, "I03": true, "I12": true, "I13": true, "I14": true, "I15": true, "I16": true, "I26": true}
 
 // commercialRoutes are the CTAs gated by commercial_routes_enabled.
 var commercialRoutes = map[string]bool{"demo": true, "pricing": true, "signup_or_trial": true}
@@ -914,6 +1012,14 @@ func slotMap(s policy.Slots, market string) map[string]string {
 
 // overviewQuery is the general, market-free question answered when a visitor
 // picks "Show general overview" instead of naming a market.
+// chipQueries are the general questions behind content-free menu chips.
+var chipQueries = map[string]string{
+	"show general overview": "What is ZoikoSuite and what does it do?",
+	"general overview":      "What is ZoikoSuite and what does it do?",
+	"explore capabilities":  "What are ZoikoSuite's core modules and capabilities?",
+	"privacy":               "How does ZoikoSuite handle privacy and personal data?",
+}
+
 var overviewQuery = map[string]string{
 	"I04": "Which countries and markets is ZoikoSuite available in?",
 	"I05": "What plans are available and how is pricing structured?",
@@ -1269,4 +1375,4 @@ var howToRe = regexp.MustCompile(`(?i)^\s*(?:how\s+(?:do|can|should|would)\s+(?:
 // certificationWordRe asks about a certification ("are you certified",
 // "which certifications"), not a TLS or X.509 certificate ("how do I issue an
 // mTLS certificate"), which is answered from the console articles.
-var certificationWordRe = regexp.MustCompile(`(?i)\bcertif(?:y|ied|ication|ications)\b`)
+var certificationWordRe = regexp.MustCompile(`(?i)\bcertif(?:y|ied|ication|ications)\b|\bindependent\s+assurance\b`)
