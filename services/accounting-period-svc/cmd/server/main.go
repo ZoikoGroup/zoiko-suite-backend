@@ -35,6 +35,8 @@ import (
 	"zoiko.io/accounting-period-svc/internal/service"
 	"zoiko.io/accounting-period-svc/internal/store"
 	"zoiko.io/accounting-period-svc/internal/telemetry"
+	"zoiko.io/eventing/kafkaout"
+	eventingoutbox "zoiko.io/eventing/outbox"
 )
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
@@ -215,6 +217,12 @@ func main() {
 	}
 	log.Info("db pool connected")
 
+	// The eventing outbox table must exist before the first write tries to
+	// enqueue into it; fail here, at deploy time, not on a request.
+	if err := eventingoutbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema missing", zap.Error(err))
+	}
+
 	pgStore := store.New(pool)
 
 	kafkaWriter := &kafka.Writer{
@@ -253,6 +261,30 @@ func main() {
 		relay.Run(relayCtx)
 	}()
 
+	// The eventing relay (ZS-EVENT-001 section 6) delivers the events the store
+	// now writes to eventing_outbox. kafkaout builds its own writer because
+	// delivery must be acknowledged (RequireAll): a fire-and-forget writer must
+	// never back an outbox. The legacy relay above keeps running only to drain
+	// rows still in accounting_period_outbox; nothing new is written there.
+	eventingWriter, err := kafkaout.New(kafkaout.Config{
+		Brokers:                cfg.Kafka.Brokers,
+		Topic:                  cfg.Kafka.Topic,
+		AllowAutoTopicCreation: cfg.Env == "local",
+	})
+	if err != nil {
+		log.Fatal("eventing outbox kafka writer", zap.Error(err))
+	}
+	defer func() { _ = eventingWriter.Close() }()
+	eventingRelay, err := eventingoutbox.NewRelay(pool, eventingWriter, eventingoutbox.DefaultConfig(), log)
+	if err != nil {
+		log.Fatal("eventing outbox relay", zap.Error(err))
+	}
+	eventingRelayDone := make(chan struct{})
+	go func() {
+		defer close(eventingRelayDone)
+		eventingRelay.Run(relayCtx)
+	}()
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -266,6 +298,7 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	svc := service.New(pgStore, clients.NewHTTPCalendar(cfg.FiscalCalendarURL), clients.NewHTTPProvenance(cfg.FinancialCloseURL)).
+		WithEventRegion(cfg.EventResidencyRegion).
 		WithReopenMaxWindow(cfg.ReopenMaxWindow).
 		WithAuditFailureHook(func(err error) {
 			log.Error("PeriodCommandRejected control event could not be recorded", zap.Error(err))
@@ -318,10 +351,13 @@ func main() {
 	// Stop the relay AFTER the server and wait for it, so events committed by
 	// requests still draining are delivered rather than left for the next start.
 	relayCancel()
-	select {
-	case <-relayDone:
-	case <-time.After(10 * time.Second):
-		log.Warn("outbox relay did not stop within 10s; undelivered events remain queued and will be drained at next start")
+	stopDeadline := time.After(10 * time.Second)
+	for _, done := range []chan struct{}{relayDone, eventingRelayDone} {
+		select {
+		case <-done:
+		case <-stopDeadline:
+			log.Warn("outbox relay did not stop within 10s; undelivered events remain queued and will be drained at next start")
+		}
 	}
 	log.Info("server stopped")
 }

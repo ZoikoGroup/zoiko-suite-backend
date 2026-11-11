@@ -16,14 +16,21 @@ import (
 
 	"zoiko.io/accounting-period-svc/internal/domain"
 	"zoiko.io/accounting-period-svc/internal/events"
+	eventingenvelope "zoiko.io/eventing/envelope"
 )
 
 // OutboxEntry is one event to be written to the outbox in the caller's Tx.
 type OutboxEntry struct {
-	TenantID  string
-	ObjectID  string
+	TenantID string
+	ObjectID string
+	// EventType is the service's event name (PeriodHardClosed). It is the legacy
+	// event_type on the wire; the canonical type is on Envelope.
 	EventType string
-	Payload   []byte
+	// Payload is the rendered envelope, for stores and tests that inspect it.
+	Payload []byte
+	// Envelope is the ZS-EVENT-001 envelope the Postgres store writes to the
+	// eventing outbox in the caller's transaction.
+	Envelope *eventingenvelope.Envelope
 }
 
 // IdempotencyRecord remembers the material result of a command.
@@ -81,6 +88,8 @@ type Service struct {
 	newID       func() string
 	maxReopen   time.Duration
 	auditFailed func(error)
+	// eventRegion is the residency region stamped on every event (EVENT_RESIDENCY_REGION).
+	eventRegion string
 }
 
 // DefaultReopenMaxWindow is the default bound on a reopen's expires_at.
@@ -208,11 +217,22 @@ func peekReplay[T any](ctx context.Context, s Store, m Meta, op string) (*T, err
 }
 
 func (s *Service) enqueue(ctx context.Context, tx Tx, ev events.Event) error {
-	key, body, err := events.Build(ev)
+	env, err := events.BuildEnvelope(ev, s.eventRegion)
 	if err != nil {
 		return err
 	}
-	return tx.Enqueue(ctx, OutboxEntry{TenantID: ev.TenantID, ObjectID: key, EventType: ev.Type, Payload: body})
+	body, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("render %s envelope: %w", ev.Type, err)
+	}
+	return tx.Enqueue(ctx, OutboxEntry{TenantID: ev.TenantID, ObjectID: ev.ObjectID, EventType: ev.Type, Payload: body, Envelope: env})
+}
+
+// WithEventRegion sets the residency region stamped on every event
+// (ZS-EVENT-001 section 4). It must be set before the service writes an event.
+func (s *Service) WithEventRegion(region string) *Service {
+	s.eventRegion = region
+	return s
 }
 
 // ── upstream contracts ───────────────────────────────────────────────────────

@@ -130,7 +130,7 @@ func newEnv(t *testing.T) *testEnv {
 		cal: &stubCal{previews: map[string]service.CalendarPreview{"v1": monthly("v1")},
 			resolve: map[string]service.CalendarRef{entityA: {CalendarID: calID, VersionID: "v1"}}},
 		now: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)}
-	svc := service.New(e.store, e.cal, e.prov).WithClock(func() time.Time { return e.now })
+	svc := service.New(e.store, e.cal, e.prov).WithEventRegion("test-region").WithClock(func() time.Time { return e.now })
 	h := handler.New(svc, e.authz, zap.NewNop(), nil)
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)

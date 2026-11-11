@@ -2717,8 +2717,9 @@ services:
   # Needs authz actions PERIOD_STATE_COMMAND / PERIOD_MATERIALIZE seeded.
   accounting-period-svc:
     build:
-      context: ../services/accounting-period-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: accounting-period-svc/Dockerfile
     container_name: accounting-period-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2734,6 +2735,8 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.accounting-period.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       FISCAL_CALENDAR_URL: "http://fiscal-calendar-svc:8173"
       FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"

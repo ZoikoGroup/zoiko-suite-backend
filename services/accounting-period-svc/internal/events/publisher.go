@@ -71,22 +71,10 @@ type envelope struct {
 	Payload       json.RawMessage `json:"payload"`
 }
 
-// Build renders one event into the Kafka key and body. It is called at
-// STATE-CHANGE time, inside the writing transaction, and the bytes are stored
-// in the outbox; the relay never rebuilds them.
-func Build(e Event) (key string, body []byte, err error) {
-	known := false
-	for _, t := range AllEventTypes {
-		if t == e.Type {
-			known = true
-		}
-	}
-	if !known {
-		return "", nil, fmt.Errorf("events: unknown event type %q", e.Type)
-	}
-	if e.TenantID == "" || e.ObjectID == "" {
-		return "", nil, fmt.Errorf("events: %s requires tenant_id and object_id", e.Type)
-	}
+// payloadOf is the event-specific fact payload shared by the legacy envelope
+// (Build) and the ZS-EVENT-001 envelope (BuildEnvelope). Event data can never
+// override the envelope facts listed here.
+func payloadOf(e Event) (map[string]any, error) {
 	payload := map[string]any{
 		"scope":          e.Scope,
 		"tenant_id":      e.TenantID,
@@ -108,6 +96,29 @@ func Build(e Event) (key string, body []byte, err error) {
 		if _, taken := payload[k]; !taken {
 			payload[k] = v
 		}
+	}
+	return payload, nil
+}
+
+// Build renders one event into the Kafka key and body. It is called at
+// STATE-CHANGE time, inside the writing transaction, and the bytes are stored
+// in the outbox; the relay never rebuilds them.
+func Build(e Event) (key string, body []byte, err error) {
+	known := false
+	for _, t := range AllEventTypes {
+		if t == e.Type {
+			known = true
+		}
+	}
+	if !known {
+		return "", nil, fmt.Errorf("events: unknown event type %q", e.Type)
+	}
+	if e.TenantID == "" || e.ObjectID == "" {
+		return "", nil, fmt.Errorf("events: %s requires tenant_id and object_id", e.Type)
+	}
+	payload, err := payloadOf(e)
+	if err != nil {
+		return "", nil, err
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
