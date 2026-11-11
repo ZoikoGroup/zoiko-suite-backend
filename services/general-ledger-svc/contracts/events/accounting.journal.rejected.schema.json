@@ -1,0 +1,1 @@
+{"type":"object","description":"ZS-EVENT-001 payload of com.zoikosuite.accounting.journal.rejected (general-ledger-svc, schema 1.0.0): a journal pending approval was rejected.","properties":{"journal_id":{"type":"string"},"rejected_by":{"type":"string"},"reason":{"type":"string"}},"required":["journal_id","rejected_by","reason"]}

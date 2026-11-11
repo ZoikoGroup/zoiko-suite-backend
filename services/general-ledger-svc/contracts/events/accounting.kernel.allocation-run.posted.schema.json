@@ -1,0 +1,36 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.allocation-run.posted (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 8 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "allocation_rule_id": {
+      "type": "string"
+    },
+    "allocation_run_id": {
+      "type": "string"
+    },
+    "book_id": {
+      "type": "string"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "journal_id": {
+      "type": "string"
+    },
+    "pool_amount": {
+      "type": "string"
+    },
+    "rounding_residual": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "allocation_rule_id",
+    "allocation_run_id",
+    "book_id",
+    "fiscal_period",
+    "journal_id",
+    "pool_amount",
+    "rounding_residual"
+  ],
+  "type": "object"
+}

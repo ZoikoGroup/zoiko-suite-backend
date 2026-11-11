@@ -1,0 +1,24 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.consolidation-mapping.versioned (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 21 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "accounts": {
+      "type": "integer"
+    },
+    "group_id": {
+      "type": "string"
+    },
+    "ic_roles": {
+      "type": "integer"
+    },
+    "version": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "accounts",
+    "group_id",
+    "ic_roles",
+    "version"
+  ],
+  "type": "object"
+}

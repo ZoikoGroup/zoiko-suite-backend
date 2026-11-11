@@ -1,0 +1,28 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.period.sealed (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 33 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "authority_ref": {
+      "type": "string"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "ledger_watermark": {
+      "type": "integer"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "authority_ref",
+    "fiscal_period",
+    "ledger_watermark",
+    "legal_entity_id",
+    "status"
+  ],
+  "type": "object"
+}

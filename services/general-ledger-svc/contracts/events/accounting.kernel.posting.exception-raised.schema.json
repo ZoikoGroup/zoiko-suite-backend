@@ -1,0 +1,77 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.posting.exception-raised (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 130 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "accounting_event_id": {
+      "type": "string"
+    },
+    "book_id": {
+      "type": "string"
+    },
+    "code": {
+      "type": "string"
+    },
+    "detail": {
+      "type": "string"
+    },
+    "facts": {
+      "properties": {
+        "as_of": {
+          "type": "string"
+        },
+        "book_type": {
+          "type": "string"
+        },
+        "event_type": {
+          "type": "string"
+        },
+        "fact": {
+          "type": "string"
+        },
+        "fiscal_period": {
+          "type": "string"
+        },
+        "fx_rate_id": {
+          "type": "string"
+        },
+        "line_ref": {
+          "type": "string"
+        },
+        "max_age_days": {
+          "type": "integer"
+        },
+        "pair": {
+          "type": "string"
+        },
+        "policy_id": {
+          "type": "string"
+        },
+        "rate_date": {
+          "type": "string"
+        },
+        "rate_type": {
+          "type": "string"
+        }
+      }
+    },
+    "family": {
+      "type": "string"
+    },
+    "posting_execution_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "accounting_event_id",
+    "book_id",
+    "code",
+    "detail",
+    "facts",
+    "family",
+    "posting_execution_id",
+    "status"
+  ],
+  "type": "object"
+}

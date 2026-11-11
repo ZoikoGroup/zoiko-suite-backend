@@ -1,0 +1,36 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.rule-set.created (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 1001 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "book_type": {
+      "type": "string"
+    },
+    "content_hash": {
+      "type": "string"
+    },
+    "event_type": {
+      "type": "string"
+    },
+    "framework": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "posting_rule_set_id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "book_type",
+    "content_hash",
+    "event_type",
+    "framework",
+    "name",
+    "posting_rule_set_id",
+    "version"
+  ],
+  "type": "object"
+}

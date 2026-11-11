@@ -1,0 +1,12 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.allocation-rule.retired (general-ledger-svc, schema 1.0.0): an allocation rule version was retired. Derived from the producer code (kernel/alloc.go RetireRule), not from samples: no test emits it.",
+  "properties": {
+    "allocation_rule_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "allocation_rule_id"
+  ],
+  "type": "object"
+}

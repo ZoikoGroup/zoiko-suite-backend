@@ -194,6 +194,11 @@ func TestKernelPostingGolden(t *testing.T) {
 	if e.count(t, `SELECT count(*) FROM eventing_outbox WHERE aggregate_id=$1 AND event_type LIKE '%journal.posted' AND position($2 in convert_from(payload,'UTF8'))>0`, jid, "JE-2026-000001") != 1 {
 		t.Fatal("the journal.posted event is on the outbox with the journal number")
 	}
+	// The kernel's richer journal.posted (lineage: book, execution, rule set, hash, watermark) satisfies the
+	// published schema too, not only the lifecycle path's minimal one (ZS-EVENT-001 section 12.1).
+	if seen := assertEventsMatchSchemas(t, e.admin, journalPrefix); seen["com.zoikosuite.accounting.journal.posted"] != 1 {
+		t.Fatalf("expected the kernel's journal.posted to be validated, saw %v", seen)
+	}
 
 	// a repeat returns the same consequence and writes nothing
 	st, again := e.post(ev, book, nil)

@@ -1,0 +1,1 @@
+{"type":"object","description":"ZS-EVENT-001 payload of com.zoikosuite.accounting.journal.proposed (general-ledger-svc, schema 1.0.0): a draft journal was submitted for approval.","properties":{"journal_id":{"type":"string"},"submitted_by":{"type":"string"}},"required":["journal_id","submitted_by"]}

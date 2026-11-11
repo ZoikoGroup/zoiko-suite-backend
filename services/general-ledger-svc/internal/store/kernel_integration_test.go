@@ -83,6 +83,13 @@ func newKEnv(t *testing.T) *kenv {
 	}
 	t.Cleanup(app.Close)
 	e := &kenv{admin: admin, app: app, tenant: uuid.NewString(), entity: uuid.NewString()}
+	// Every kernel integration test also checks that the events it caused satisfy the published payload
+	// schemas (ZS-EVENT-001 section 12.1). Registered after the pools, so it runs while they are still open.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			assertEventsMatchSchemas(t, admin, "com.zoikosuite.accounting.")
+		}
+	})
 	e.repo = store.NewKernelRepo(app, "uk")
 	e.svc = &kernel.Service{Repo: e.repo}
 	e.periods = &fakePeriods{states: map[string]string{}}

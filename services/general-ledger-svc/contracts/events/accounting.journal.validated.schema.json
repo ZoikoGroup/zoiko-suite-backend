@@ -1,0 +1,1 @@
+{"type":"object","description":"ZS-EVENT-001 payload of com.zoikosuite.accounting.journal.validated (general-ledger-svc, schema 1.0.0): a journal passed validation.","properties":{"journal_id":{"type":"string"}},"required":["journal_id"]}

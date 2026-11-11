@@ -1,0 +1,44 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.revaluation.completed (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 4 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "book_id": {
+      "type": "string"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "items": {
+      "type": "integer"
+    },
+    "journal_id": {
+      "type": "string"
+    },
+    "revaluation_run_id": {
+      "type": "string"
+    },
+    "reversal_journal_id": {
+      "type": "string"
+    },
+    "total_gain": {
+      "type": "string"
+    },
+    "total_loss": {
+      "type": "string"
+    },
+    "valuation_date": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "book_id",
+    "fiscal_period",
+    "items",
+    "journal_id",
+    "revaluation_run_id",
+    "reversal_journal_id",
+    "total_gain",
+    "total_loss",
+    "valuation_date"
+  ],
+  "type": "object"
+}

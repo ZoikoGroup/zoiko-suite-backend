@@ -1,0 +1,45 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.account.scope-changed (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 385 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "account_code": {
+      "type": "string"
+    },
+    "book_ids": {
+      "items": {
+        "type": "string"
+      }
+    },
+    "control_type": {
+      "type": "string"
+    },
+    "counterparty_required": {
+      "type": "boolean"
+    },
+    "currency_restriction": {
+      "type": "string"
+    },
+    "dimension_policy": {
+      "properties": {
+        "cost_center": {
+          "type": "string"
+        },
+        "fund": {
+          "type": "string"
+        }
+      }
+    },
+    "replacement_account": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_code",
+    "book_ids",
+    "control_type",
+    "counterparty_required",
+    "currency_restriction",
+    "dimension_policy",
+    "replacement_account"
+  ],
+  "type": "object"
+}

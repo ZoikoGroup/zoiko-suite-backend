@@ -1,0 +1,45 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.reconciliation.break-raised (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 17 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "book_id": {
+      "type": "string"
+    },
+    "currency": {
+      "type": "string"
+    },
+    "difference": {
+      "type": "string"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "reconciliation_run_id": {
+      "type": "string"
+    },
+    "reconciliation_type": {
+      "type": "string"
+    },
+    "sla_due_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "book_id",
+    "currency",
+    "difference",
+    "fiscal_period",
+    "owner",
+    "reconciliation_run_id",
+    "reconciliation_type",
+    "sla_due_at",
+    "status"
+  ],
+  "type": "object"
+}

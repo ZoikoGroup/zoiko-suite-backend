@@ -1,0 +1,32 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.fx.rate-ingested (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 53 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "fx_rate_id": {
+      "type": "string"
+    },
+    "pair": {
+      "type": "string"
+    },
+    "rate": {
+      "type": "string"
+    },
+    "rate_date": {
+      "type": "string"
+    },
+    "rate_type": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "fx_rate_id",
+    "pair",
+    "rate",
+    "rate_date",
+    "rate_type",
+    "source"
+  ],
+  "type": "object"
+}

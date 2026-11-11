@@ -1,0 +1,1 @@
+{"type":"object","description":"ZS-EVENT-001 payload of com.zoikosuite.accounting.journal.withdrawn (general-ledger-svc, schema 1.0.0): a never-submitted draft was withdrawn; the journal stays on record.","properties":{"journal_id":{"type":"string"},"reason":{"type":"string"}},"required":["journal_id","reason"]}
