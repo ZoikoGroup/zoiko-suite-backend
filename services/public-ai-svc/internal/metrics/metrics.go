@@ -132,10 +132,18 @@ var (
 		Help: "Age of the oldest event in the last relay batch (outbox lag, Doc 05 §25).",
 	})
 
-	commitRevocations = prometheus.NewCounter(prometheus.CounterOpts{
+	commitRevocations = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "public_ai_commit_revocation_rejections_total",
-		Help: "Answers withheld at commit because a cited source or claim was revoked while the turn ran (stale-read rejections).",
-	})
+		Help: "Answers withheld at commit because a cited source or claim was revoked while the turn ran (stale-read rejections), by knowledge release and market (OPR-023).",
+	}, []string{"release", "market"})
+
+	// releaseRejections counts releases refused at load (SEC-T030): a bad
+	// signature, a chunk whose text no longer matches its checksum, draft or
+	// synthetic content, an invalid claim set or an incompatible policy.
+	releaseRejections = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "public_ai_release_rejections_total",
+		Help: "Knowledge or claim releases refused at load, by reason (signature, checksum, draft, synthetic, claims, policy, manifest).",
+	}, []string{"reason"})
 
 	turnsCancelled = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "public_ai_turns_cancelled_total",
@@ -152,7 +160,7 @@ func init() {
 	Registry.MustRegister(httpRequests, httpDuration, turns, turnDuration, modelRequests, modelTokens,
 		rateLimited, eventsPublished, eventsDeadLettered, releaseReady, buildInfo,
 		ctaOffered, handoffClicked, feedback, securitySignals, spendRatio, stageDuration, turnsCancelled, turnOutcomes, outboxOldest, commitRevocations,
-		indexHealth, eventsDLPBlocked,
+		indexHealth, eventsDLPBlocked, releaseRejections,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 }
 
@@ -174,14 +182,39 @@ func SetSpendRatio(window string, ratio float64) { spendRatio.WithLabelValues(wi
 // TurnOutcome counts a turn by status, release and market. market must be
 // an offered market or "none" (bounded cardinality).
 func TurnOutcome(status, release, market string) {
-	turnOutcomes.WithLabelValues(status, release, market).Inc()
+	turnOutcomes.WithLabelValues(status, ReleaseLabel(release), MarketLabel(market)).Inc()
 }
 
 // OutboxOldest records the age of the oldest event in a relay batch.
 func OutboxOldest(age time.Duration) { outboxOldest.Set(age.Seconds()) }
 
-// CommitRevocation counts an answer withheld by the revocation check at commit.
-func CommitRevocation() { commitRevocations.Inc() }
+// CommitRevocation counts an answer withheld by the revocation check at
+// commit, with the release and market it was answering for.
+func CommitRevocation(release, market string) {
+	commitRevocations.WithLabelValues(ReleaseLabel(release), MarketLabel(market)).Inc()
+}
+
+// ReleaseRejected counts a release refused at load. reason is one of the
+// fixed values listed in the metric's help.
+func ReleaseRejected(reason string) { releaseRejections.WithLabelValues(reason).Inc() }
+
+// MarketLabel keeps the market label bounded: an ISO 3166-1 alpha-2 code,
+// otherwise "none" (OPR-019).
+func MarketLabel(m string) string {
+	if len(m) == 2 && m[0] >= 'A' && m[0] <= 'Z' && m[1] >= 'A' && m[1] <= 'Z' {
+		return m
+	}
+	return "none"
+}
+
+// ReleaseLabel is the knowledge release id, or "none". Release ids change
+// only when a release is promoted, so the label stays bounded.
+func ReleaseLabel(r string) string {
+	if r == "" || len(r) > 64 {
+		return "none"
+	}
+	return r
+}
 
 // eventsDLPBlocked counts events refused because a field carried free text
 // or personal data (Doc 05 CT-045): it must stay at zero.

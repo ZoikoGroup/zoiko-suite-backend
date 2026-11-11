@@ -5,8 +5,8 @@ import "zoiko.io/public-ai-svc/internal/contract"
 // Guided topic menu and follow-ups for the structured widget (ADR-008).
 //
 // Nothing here is invented: categories are the Doc 02 §22 public page
-// families, labelled with the Homepage chips (Explore platform, Compare
-// plans, Security & trust, Book demo) and "Support Center"; items are each
+// families, labelled with the Homepage chips in Doc 02 §22 order (Explore
+// platform, Compare plans, Book demo, Security & trust) and "Support Center"; items are each
 // family's recommended chips, mapped to their Doc 02 §06 intent. Follow-ups
 // come from the Doc 02 §08 secondary-intent pairs, then the other items of
 // the same family, in menu order. The model never chooses any of them.
@@ -49,17 +49,17 @@ var Menu = []MenuCategory{
 		{"pricing.entities", "Entity limits", "I03", "How many entities can each plan include?"},
 		{"pricing.sales", "Talk to sales", "I24", "I'd like to talk to sales"},
 	}},
-	{ID: "trust", Label: "Security & trust", Items: []MenuItem{
-		{"trust.assurance", "Independent assurance", "I12", "Which security certifications does ZoikoSuite hold?"},
-		{"trust.residency", "Data residency", "I14", "Where is ZoikoSuite data stored?"},
-		{"trust.privacy", "Privacy", "I13", "How does ZoikoSuite handle privacy and personal data?"},
-		{"trust.review", "Security review", "I12", "How can we run a security review of ZoikoSuite?"},
-	}},
 	{ID: "demo", Label: "Book demo", Items: []MenuItem{
 		{"demo.coverage", "What can be covered", "I08", "What can a demo cover?"},
 		{"demo.plans", "Plans", "I05", "What do the plans cost?"},
 		{"demo.enterprise", "Enterprise", "I09", "Tell me about enterprise options"},
 		{"demo.integrations", "Integrations", "I10", "Which integrations does ZoikoSuite support?"},
+	}},
+	{ID: "trust", Label: "Security & trust", Items: []MenuItem{
+		{"trust.assurance", "Independent assurance", "I12", "Which security certifications does ZoikoSuite hold?"},
+		{"trust.residency", "Data residency", "I14", "Where is ZoikoSuite data stored?"},
+		{"trust.privacy", "Privacy", "I13", "How does ZoikoSuite handle privacy and personal data?"},
+		{"trust.review", "Security review", "I12", "How can we run a security review of ZoikoSuite?"},
 	}},
 	{ID: "support", Label: "Support Center", Items: []MenuItem{
 		{"support.sign_in", "Sign in", "I22", "How do I sign in?"},
@@ -86,6 +86,10 @@ var IntentCTA = map[string]string{
 	"I23": "Submit secure request", "I24": "Open secure form", "I25": "Request update", "I26": "Explore platform",
 	"I27": "Send site feedback", "I28": "Open billing help", "I29": "Help / human route", "I30": "Review responsible AI",
 }
+
+// TrialPricingCTA is Doc 02 T06's CTA when the trial answer links the
+// pricing page rather than a sign-up page.
+const TrialPricingCTA = "Review trial options"
 
 // RouteTitles names the official page behind a route key when a citation
 // points at a route rather than a knowledge source.

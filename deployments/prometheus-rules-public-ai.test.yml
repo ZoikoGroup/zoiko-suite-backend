@@ -126,7 +126,7 @@ tests:
     input_series:
       - series: 'public_ai_events_dlp_blocked_total{type="chat.turn.completed.v1"}'
         values: '0 0 1 1 1'
-      - series: 'public_ai_commit_revocation_rejections_total'
+      - series: 'public_ai_commit_revocation_rejections_total{release="kb-1",market="GB"}'
         values: '0 0 1 1 1'
     alert_rule_test:
       - eval_time: 4m
@@ -145,8 +145,40 @@ tests:
           - exp_labels:
               severity: page
               freeze_promotion: "true"
+              release: kb-1
+              market: GB
             exp_annotations:
               summary: "Assistant: a revoked source reached the commit check; revocation is not propagating"
+              runbook: "RB-04"
+              runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-04-rollback-and-safe-static-doc-08-19"
+
+  # SEC-T030: a checksum refusal pages; a draft-content refusal opens a ticket.
+  - interval: 1m
+    input_series:
+      - series: 'public_ai_release_rejections_total{reason="checksum"}'
+        values: '0 0 1 1 1'
+      - series: 'public_ai_release_rejections_total{reason="draft"}'
+        values: '0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PublicAIReleaseIntegrityRejected
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              freeze_promotion: "true"
+              reason: checksum
+            exp_annotations:
+              summary: "Assistant: a release failed its checksum check and was refused (possible tampering)"
+              runbook: "RB-04"
+              runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-04-rollback-and-safe-static-doc-08-19"
+      - eval_time: 4m
+        alertname: PublicAIReleaseRejected
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              reason: draft
+            exp_annotations:
+              summary: "Assistant: a release was refused at load (draft)"
               runbook: "RB-04"
               runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-04-rollback-and-safe-static-doc-08-19"
 

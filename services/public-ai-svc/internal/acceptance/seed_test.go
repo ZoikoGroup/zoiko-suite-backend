@@ -66,7 +66,9 @@ func TestT1_PlansAndTrialClarifies(t *testing.T) {
 	if !slices.Equal(intents, []string{"I05", "I06"}) {
 		t.Fatalf("intents = %v", intents)
 	}
-	if e.Text != policy.TplClarifyMarket.Text || !strings.HasSuffix(e.Text, "Which country are you evaluating ZoikoSuite for?") || e.Clarification == nil ||
+	// Doc 02 T06 / S01: a question that asks about the trial gets the trial
+	// wording of the market question (a pure price question keeps T05).
+	if e.Text != policy.TplClarifyTrialMarket.Text || !strings.HasSuffix(e.Text, "Which country are you evaluating ZoikoSuite for?") || e.Clarification == nil ||
 		!slices.Equal(e.Clarification.Options, []string{"US", "GB", contract.OtherOption, contract.OverviewOption}) {
 		t.Fatalf("clarification: %q %+v", e.Text, e.Clarification)
 	}

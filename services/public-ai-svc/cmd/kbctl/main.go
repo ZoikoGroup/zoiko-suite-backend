@@ -326,6 +326,39 @@ func dlqReplay(ctx context.Context, args []string) error {
 	return nil
 }
 
+// exportAudit writes the whole audit (oldest first) and its chain check to
+// path. Doc 09 §21, ADM-T006: an export is purpose-bound and approved (the
+// store refuses an audit row without an actor and an approval reference), and
+// it is recorded in the audit before the file is written, so a refused export
+// leaves no file behind.
+func exportAudit(ctx context.Context, st store.Store, path, purpose string, o release.Operator) (int, string, error) {
+	if strings.TrimSpace(purpose) == "" {
+		return 0, "", fmt.Errorf("-purpose is required for an audit export")
+	}
+	if err := st.AppendAudit(ctx, store.AuditEntry{Action: "audit.exported", Target: path, Actor: o.Actor, Approval: o.Approval,
+		Reason: purpose, Environment: o.Environment, At: time.Now().UTC()}); err != nil {
+		return 0, "", fmt.Errorf("audit export refused: %w", err)
+	}
+	all, err := st.ListAudit(ctx, 1<<30)
+	if err != nil {
+		return 0, "", err
+	}
+	chain := make([]store.AuditEntry, 0, len(all))
+	for i := len(all) - 1; i >= 0; i-- {
+		chain = append(chain, all[i])
+	}
+	check := "intact"
+	if err := store.VerifyAuditChain(chain); err != nil {
+		check = "BROKEN: " + err.Error()
+	}
+	b, _ := json.MarshalIndent(map[string]any{"purpose": purpose, "exported_by": o.Actor, "approval": o.Approval,
+		"exported_at": time.Now().UTC(), "chain": check, "entries": chain}, "", "  ")
+	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+		return 0, "", err
+	}
+	return len(chain), check, nil
+}
+
 // audit prints the newest control-audit entries (Doc 06 §21).
 func audit(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
@@ -342,32 +375,11 @@ func audit(ctx context.Context, args []string) error {
 	if *export != "" {
 		// Doc 09 §21, ADM-T006: an export is purpose-bound, approved and
 		// itself recorded in the audit before the file is written.
-		o := op()
-		if strings.TrimSpace(*purpose) == "" {
-			return fmt.Errorf("-purpose is required for an audit export")
-		}
-		if err := st.AppendAudit(ctx, store.AuditEntry{Action: "audit.exported", Target: *export, Actor: o.Actor, Approval: o.Approval,
-			Reason: *purpose, Environment: o.Environment, At: time.Now().UTC()}); err != nil {
-			return err
-		}
-		all, err := st.ListAudit(ctx, 1<<30)
+		n, check, err := exportAudit(ctx, st, *export, *purpose, *op())
 		if err != nil {
 			return err
 		}
-		chain := make([]store.AuditEntry, 0, len(all))
-		for i := len(all) - 1; i >= 0; i-- {
-			chain = append(chain, all[i])
-		}
-		check := "intact"
-		if err := store.VerifyAuditChain(chain); err != nil {
-			check = "BROKEN: " + err.Error()
-		}
-		b, _ := json.MarshalIndent(map[string]any{"purpose": *purpose, "exported_by": o.Actor, "approval": o.Approval,
-			"exported_at": time.Now().UTC(), "chain": check, "entries": chain}, "", "  ")
-		if err := os.WriteFile(*export, append(b, '\n'), 0o600); err != nil {
-			return err
-		}
-		fmt.Printf("exported %d audit rows to %s (chain %s)\n", len(chain), *export, check)
+		fmt.Printf("exported %d audit rows to %s (chain %s)\n", n, *export, check)
 		return nil
 	}
 	if *verify {

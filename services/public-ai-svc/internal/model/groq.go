@@ -199,5 +199,7 @@ func (g *Groq) httpClient() *http.Client {
 		c = *g.Client
 	}
 	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	// SEC-T050: never dial a metadata or link-local address, even via DNS.
+	c.Transport = guardedTransport(c.Transport)
 	return &c
 }

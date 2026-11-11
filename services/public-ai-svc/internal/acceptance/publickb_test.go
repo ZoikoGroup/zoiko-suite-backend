@@ -314,6 +314,72 @@ func TestK12_ExpiredMarketOffersNextSteps(t *testing.T) {
 	}
 }
 
+// Doc 02 §10, T1 (frontend assistant.spec.ts): a bare country answering
+// "Which country?" resumes the open question. The public KB's Tax article
+// mentions "United States (IRS)", which once rerouted the reply to a Tax
+// how-to instead of the plans and trial answer.
+func TestK12b_CountryReplyResumesOpenQuestion(t *testing.T) {
+	k := newKB(t)
+	in := func(msg, market string, pd *orchestrator.Pending) orchestrator.Result {
+		return k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: msg, MarketCode: market, Locale: "en-US", Pending: pd})
+	}
+	for _, q := range []string{"Is there a free trial?", "What plans are available, and is there a free trial?", "How much does ZoikoSuite cost?"} {
+		ask := in(q, "", nil)
+		if ask.Status != contract.Clarify || ask.Pending == nil {
+			t.Fatalf("%q: %s %+v", q, ask.Status, ask.Pending)
+		}
+		for _, market := range []string{"", "US"} { // typed, or the widget's country button
+			r := in("United States", market, ask.Pending)
+			if r.IntentID != ask.Pending.Intent || strings.Contains(strings.ToLower(r.Text), "tax rule") {
+				t.Errorf("%q then United States (market %q): %s %s, want intent %s: %q", q, market, r.Status, r.IntentID, ask.Pending.Intent, r.Text)
+			}
+		}
+	}
+	// With nothing open, a module question that names a country still reaches the module.
+	if r := in("How do I create a tax rule for the United States?", "", nil); r.IntentID == "I05" || r.IntentID == "I06" {
+		t.Fatalf("tax-rule question misread as pricing/trial: %s", r.IntentID)
+	}
+}
+
+// Doc 02 §17 T05/T06 and §18 S01, Doc 01 AT-01: the plans-and-trial
+// exchange as the documents write it. A trial question asks for the country
+// in trial words; the country's answer carries the T06 qualifier and S01's
+// sign-up line, and its source shows a review date. A price-only question
+// keeps T05.
+func TestS01_TrialPathAsDocumented(t *testing.T) {
+	k := newKB(t)
+	in := func(msg, market string, pd *orchestrator.Pending) orchestrator.Result {
+		return k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: msg, MarketCode: market, Locale: "en-US", Pending: pd})
+	}
+	for _, q := range []string{"Do you have a free trial?", "What plans are available, and is there a free trial?"} {
+		ask := in(q, "", nil)
+		if ask.Text != policy.TplClarifyTrialMarket.Text {
+			t.Fatalf("%q: market question %q, want the T06/S01 wording", q, ask.Text)
+		}
+		us := in("United States", "US", ask.Pending)
+		if us.Status != contract.Answered || us.IntentID != "I06" || us.MarketCode != "US" {
+			t.Fatalf("%q then United States: %s %s %s", q, us.Status, us.IntentID, us.MarketCode)
+		}
+		if !strings.Contains(us.Text, "post-trial conditions depend on your market") || !strings.Contains(us.Text, "The sign-up page will present the applicable terms before you decide to proceed.") {
+			t.Errorf("%q then United States: missing the T06 qualifier or the S01 sign-up line: %q", q, us.Text)
+		}
+		if len(us.Citations) == 0 || us.Citations[0].ReviewedAt == "" {
+			t.Errorf("%q then United States: source has no review date: %+v", q, us.Citations)
+		}
+		// Same length as the question before it; no dev marker on screen;
+		// the T06 button opens the documented pricing page (Doc 03 S03).
+		if !strings.Contains(us.Text, "30 days") || strings.Contains(us.Text, "SYNTHETIC") {
+			t.Errorf("%q then United States: want the 30-day trial and no SYNTHETIC marker: %q", q, us.Text)
+		}
+		if len(us.Actions) != 1 || us.Actions[0].RouteKey != "pricing" {
+			t.Errorf("%q then United States: actions %+v, want the pricing page", q, us.Actions)
+		}
+	}
+	if price := in("How much does ZoikoSuite cost?", "", nil); price.Text != policy.TplClarifyMarket.Text {
+		t.Fatalf("price question: %q, want T05", price.Text)
+	}
+}
+
 // Doc 02 golden cases found in manual testing (2026-10-30), as conversations.
 func TestK13_GoldenConversations(t *testing.T) {
 	k := newKB(t)
