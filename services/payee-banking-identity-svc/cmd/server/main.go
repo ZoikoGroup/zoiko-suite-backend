@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/payee-banking-identity-svc/internal/authz"
 	"zoiko.io/payee-banking-identity-svc/internal/config"
 	"zoiko.io/payee-banking-identity-svc/internal/counterparty"
@@ -22,8 +24,7 @@ import (
 	"zoiko.io/payee-banking-identity-svc/internal/health"
 	"zoiko.io/payee-banking-identity-svc/internal/middleware"
 	"zoiko.io/payee-banking-identity-svc/internal/store"
-	"zoiko.io/eventing/kafkaout"
-	"zoiko.io/eventing/outbox"
+	"zoiko.io/payee-banking-identity-svc/internal/tokenization"
 )
 
 func main() {
@@ -64,7 +65,15 @@ func main() {
 		logger.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
 
-	pgStore := store.NewPgStore(pool, logger, store.WithEventRegion(cfg.EventResidencyRegion))
+	// Tokenization of account identifiers (TOKENIZATION_ENFORCED). While it
+	// is off no tokenizer is built and nothing calls key-management-svc.
+	var tokenizer tokenization.Tokenizer
+	if cfg.TokenizationEnforced {
+		tokenizer = tokenization.NewClient(cfg.TokenizationServiceURL)
+		logger.Info("account-identifier tokenization enforced", zap.String("tokenization_service_url", cfg.TokenizationServiceURL))
+	}
+	pgStore := store.NewPgStore(pool, logger, store.WithEventRegion(cfg.EventResidencyRegion),
+		store.WithTokenization(tokenizer, cfg.TokenizationEnforced))
 
 	// Transactional outbox relay (ZS-EVENT-001 §6). Every ORG-10 event is
 	// written to eventing_outbox in the same transaction as the state

@@ -4278,6 +4278,12 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.payee-banking-identity.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       COUNTERPARTY_SERVICE_URL: "http://counterparty-management-svc:8124"
+      # Account-identifier tokenization (Security Standard §14). Off: identifiers
+      # are stored exactly as before. Stays "false" until key-management-svc
+      # (docker-compose.phase6.yml, port 8143) implements the proposed
+      # /v1/tokenize and /v1/detokenize.
+      TOKENIZATION_SERVICE_URL: "http://key-management-svc:8143"
+      TOKENIZATION_ENFORCED: "${TOKENIZATION_ENFORCED:-false}"
     depends_on:
       postgres:
         condition: service_healthy

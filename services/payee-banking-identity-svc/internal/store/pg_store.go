@@ -18,6 +18,7 @@ import (
 	"zoiko.io/eventing/outbox"
 	"zoiko.io/payee-banking-identity-svc/internal/domain"
 	"zoiko.io/payee-banking-identity-svc/internal/middleware"
+	"zoiko.io/payee-banking-identity-svc/internal/tokenization"
 )
 
 func isInvalidUUID(err error) bool {
@@ -64,6 +65,10 @@ type PgStore struct {
 	pool        *pgxpool.Pool
 	log         *zap.Logger
 	eventRegion string
+
+	// tokenizer and tokenizationEnforced: see WithTokenization.
+	tokenizer            tokenization.Tokenizer
+	tokenizationEnforced bool
 }
 
 // Option configures a PgStore at construction.
@@ -224,16 +229,27 @@ func (s *PgStore) lockDestination(ctx context.Context, tx pgx.Tx, destinationID 
 	return d, err
 }
 
-func proposalMatches(d *domain.PayeeDestination, req domain.ProposeDestinationRequest) bool {
+// proposalMatches reports whether a replayed proposal is the same request as
+// the stored destination. With tokenization enforced the stored
+// AccountIdentifier is a token, never equal to the request's raw value, so
+// the account is compared through the fingerprint instead — computed from the
+// raw identifier at write time either way (domain.Fingerprint covers the
+// institution, the account and the currency, all of which are compared).
+// Without tokenization the comparison is exactly what it always was.
+func proposalMatches(d *domain.PayeeDestination, req domain.ProposeDestinationRequest, tokenized bool) bool {
 	scope := req.Scope
 	if scope == "" {
 		scope = "DEFAULT"
+	}
+	sameAccount := d.AccountIdentifier == req.AccountIdentifier
+	if tokenized {
+		sameAccount = d.Fingerprint == domain.Fingerprint(req.FinancialInstitution, req.AccountIdentifier, req.Currency)
 	}
 	return d.LegalEntityID == req.LegalEntityID &&
 		d.PartyRef == req.PartyRef &&
 		d.Scope == scope &&
 		d.FinancialInstitution == req.FinancialInstitution &&
-		d.AccountIdentifier == req.AccountIdentifier &&
+		sameAccount &&
 		d.CountryCode == req.CountryCode &&
 		d.Currency == req.Currency &&
 		d.PayeeName == req.PayeeName &&
@@ -265,7 +281,7 @@ func (s *PgStore) tryReplayProposal(ctx context.Context, tenantID, idempotencyKe
 		if err != nil {
 			return err
 		}
-		if !proposalMatches(existing, req) {
+		if !proposalMatches(existing, req, s.tokenizationEnforced) {
 			return domain.ErrIdempotencyKeyConflict
 		}
 		out = existing
@@ -292,15 +308,26 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 		return nil, false, domain.ErrIdempotencyKeyRequired
 	}
 	destinationID := uuid.New().String()
+	// Fingerprint (duplicate detection) and last-4 (masked display) are
+	// derived from the raw identifier, so they are the same whether or not
+	// the identifier itself is then stored as a token.
 	fingerprint := domain.Fingerprint(req.FinancialInstitution, req.AccountIdentifier, req.Currency)
 	last4 := domain.Last4(req.AccountIdentifier)
+	// The value stored in account_identifier: the token when
+	// TOKENIZATION_ENFORCED is on (refusing the whole write if tokenization
+	// fails), the raw identifier otherwise — exactly as before.
+	storedIdentifier, err := s.protectAccountIdentifier(ctx,
+		tokenization.Scope{TenantID: tenantID, PrincipalID: principalID, CorrelationID: correlationID}, req.AccountIdentifier)
+	if err != nil {
+		return nil, false, err
+	}
 	scope := req.Scope
 	if scope == "" {
 		scope = "DEFAULT"
 	}
 	var d *domain.PayeeDestination
 	replay := false
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+	err = s.withTenant(ctx, func(tx pgx.Tx) error {
 		command, claimedDest, found, err := s.findCommandClaim(ctx, tx, tenantID, idempotencyKey)
 		if err != nil {
 			return err
@@ -314,7 +341,7 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 			if err != nil {
 				return err
 			}
-			if !proposalMatches(existing, req) {
+			if !proposalMatches(existing, req, s.tokenizationEnforced) {
 				return domain.ErrIdempotencyKeyConflict
 			}
 			d, replay = existing, true
@@ -327,7 +354,7 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 				'', '', '', NULL, '', NULL, NULL, '', $14, NOW(), NOW())
 			RETURNING `+destColumns,
 			destinationID, nullableTenant(tenantID), req.LegalEntityID, req.PartyRef, scope, req.FinancialInstitution,
-			req.AccountIdentifier, last4, req.CountryCode, req.Currency, req.PayeeName, req.SourceType, fingerprint,
+			storedIdentifier, last4, req.CountryCode, req.Currency, req.PayeeName, req.SourceType, fingerprint,
 			principalID,
 		))
 		if err != nil {
