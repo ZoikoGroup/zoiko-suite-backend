@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Governance Decision Log Service
-  version: 1.1.0
+  version: 1.2.0
   description: |
     The append-only ledger of governance decisions (Doc 03 §8.7). Every
     decision is tenant-owned, immutable once written, and queryable by actor,
@@ -40,10 +40,40 @@ info:
     `DECISION_LOG_READ_AUTHZ=warn` migration mode, which logs rather than
     refuses an unauthorized read.
 
+    **Evidence ledger (G-07).** Every decision is linked into its tenant's
+    hash chain by the database on insert (`chain_seq`, `prev_hash`,
+    `curr_hash`); no caller can supply its own hashes. Sealing records an RFC
+    6962 Merkle root over the chain so later re-computation proves nothing
+    changed. Sealing needs `GOVERNANCE_EVIDENCE_SEAL` on the platform scope.
+
     **Events.** A newly recorded decision publishes
     `governance.decision.recorded`, and a new replay manifest publishes
     `governance.decision.replayed`, each through a transactional outbox keyed
     by `decision_id`. Both envelopes carry the request's jurisdiction context.
+    Each is also published under its Event Catalogue canonical name
+    (`com.zoikosuite.governance.decision.recorded` / `.replayed`): same
+    payload and `payload_hash`, its own `event_id`, `alias_of_event_id`
+    naming the wire event (group decision C3, rule R9: both names during the
+    deprecation window).
+
+    **Retention (decision D2-2.F11, 11 Nov 2026).** Every decision and event
+    is retention class `EV-REGULATED` (Event Catalogue section 16) and record
+    class `COMPLIANCE_EVIDENCE`; retention-registry-svc resolves the duration
+    per jurisdiction and legal hold. A decision's `decision_id` IS its GOV-07
+    evidence id (the ledger leaf, GCP section 16 `evidence_id`): there is no
+    second identifier.
+
+    **Scheduled sealing.** Besides `POST /v1/evidence/packages/seal`, the
+    service seals every tenant's unsealed decisions each
+    `EVIDENCE_SEAL_INTERVAL` (default 1h) as `svc-governance-decision-log`,
+    after re-verifying the chain; a broken chain is refused, never sealed.
+
+    **Peer workloads (mTLS :8450).** Service callers present a platform
+    client certificate; the identity gate admits the names in
+    `IDENTITY_PEERS` as workloads vouching for `X-Principal-Id`. The listener
+    refuses a certificate on mtls-management-svc's CRL (and every certificate
+    while no current CRL is held), and its own certificate is renewed at two
+    thirds of its lifetime.
 servers:
   - url: http://governance-decision-log-svc:8083
 tags:
@@ -106,27 +136,72 @@ paths:
     get:
       tags: [decisions]
       operationId: listDecisions
-      summary: Query decisions (newest first)
+      summary: Query decisions (newest decided_at first)
+      description: |
+        All filters are optional and compose with AND. `total_count` is every
+        decision matching the filters, not only this page. Page by `offset`
+        (page numbers) or by `cursor` (keyset, API-4): `next_cursor` continues
+        after the last record either way and is empty on the last page.
       parameters:
         - $ref: '#/components/parameters/TenantId'
         - $ref: '#/components/parameters/PrincipalId'
         - {name: actor, in: query, schema: {type: string}, description: actor_id}
-        - {name: entity, in: query, schema: {type: string}, description: legal_entity_id}
+        - {name: entity, in: query, schema: {type: string}, description: 'legal_entity_id; the read is then authorized on that entity'}
         - {name: action, in: query, schema: {type: string}, description: action_type}
         - {name: rule_basis, in: query, schema: {type: string}}
         - {name: from, in: query, schema: {type: string, format: date-time}, description: 'decided_at lower bound (inclusive)'}
         - {name: to, in: query, schema: {type: string, format: date-time}, description: 'decided_at upper bound (inclusive)'}
+        - {name: domain, in: query, schema: {type: string}, description: 'decision_domains code, e.g. FINANCE_TAX'}
+        - {name: status, in: query, schema: {type: string, enum: [APPROVED, PENDING, ESCALATED, DENIED, OTHER]}, description: Status category of the outcome.}
+        - {name: priority, in: query, schema: {type: string, enum: [LOW, MEDIUM, HIGH, CRITICAL, UNSET]}}
+        - {name: jurisdiction, in: query, schema: {type: string}, description: jurisdiction_context}
+        - {name: causation, in: query, schema: {type: string}, description: 'decisions whose causation_id is this decision (its follow-ups)'}
+        - {name: workflow, in: query, schema: {type: string}, description: workflow_instance_id}
+        - {name: correlation, in: query, schema: {type: string, maxLength: 64}, description: 'The "audit" query dimension of Doc 03 section 8.7 (decision D2-2.F11): every decision made under this correlation id, within the caller''s tenant.'}
+        - {name: q, in: query, schema: {type: string, maxLength: 200}, description: 'Free text over id, title, summary, action, actor, subject, rule basis, correlation and obligation; or a display reference GD-<year>-<n>.'}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, default: 50}, description: Values above 200 are capped to 200.}
-        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}, description: Ignored when cursor is sent.}
+        - {name: cursor, in: query, schema: {type: string}, description: next_cursor of a previous page.}
       responses:
         '200':
-          description: Matching decisions (possibly empty).
+          description: One page of matching decisions (records possibly empty).
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/GovernanceDecision'
+                $ref: '#/components/schemas/DecisionPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/decisions/summary:
+    get:
+      tags: [decisions]
+      operationId: summarizeDecisions
+      summary: Register KPIs, breakdowns, daily trend and filter facets
+      description: |
+        Counts decisions whose `decided_at` falls in `[from, to)` by status
+        category, domain, jurisdiction, priority and source, with the same
+        counts for the window of equal length before it. Chain, package and
+        outbox figures cover the tenant's whole ledger. Default window: the 30
+        days to now. A tenant-wide read unless `entity` is set.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - {name: from, in: query, schema: {type: string, format: date-time}}
+        - {name: to, in: query, schema: {type: string, format: date-time}, description: Defaults to now.}
+        - {name: days, in: query, schema: {type: integer, minimum: 1, maximum: 366}, description: 'Window length ending at to; from overrides it.'}
+        - {name: entity, in: query, schema: {type: string}, description: Narrows decision figures to one legal entity.}
+      responses:
+        '200':
+          description: The summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecisionSummary'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -152,6 +227,37 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GovernanceDecision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/decisions/{decision_id}/evidence:
+    get:
+      tags: [evidence]
+      operationId: getDecisionEvidence
+      summary: One decision's chain link, sealing package and events
+      description: |
+        Re-computes this decision's `curr_hash` from its canonical form and
+        checks `prev_hash` against the previous decision; names the first
+        package that sealed it; lists the events queued for it (published
+        events are pruned after OUTBOX_RETENTION). Authorized like getDecision.
+      parameters:
+        - $ref: '#/components/parameters/DecisionId'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      responses:
+        '200':
+          description: The decision's evidence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecisionEvidence'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -245,15 +351,52 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /v1/replay-manifests:
+    get:
+      tags: [replay]
+      operationId: listAllReplayManifests
+      summary: Every replay in the tenant (newest first)
+      description: Each manifest carries the replayed decision's display reference, title and action type. Tenant-wide read.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - {name: mismatches, in: query, schema: {type: boolean}, description: Only replays whose outcome did not reproduce.}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, default: 50}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+      responses:
+        '200':
+          description: One page of manifests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [records, total_count]
+                properties:
+                  records: {type: array, items: {$ref: '#/components/schemas/ReplayManifest'}}
+                  total_count: {type: integer}
+                  limit: {type: integer}
+                  offset: {type: integer}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /v1/evidence/chain/verify:
     get:
       tags: [evidence]
       operationId: verifyEvidenceChain
-      summary: Verify the tenant's decision hash chain
+      summary: Verify the tenant's hash chain and every sealed package
       description: |
-        Walks every decision in `decided_at` order and checks each `prev_hash`
-        against the previous `curr_hash`. Needs `GOVERNANCE_DECISION_READ` on
-        the platform scope.
+        Walks the chain in `chain_seq` order: the sequence is contiguous from
+        1, each `prev_hash` equals the previous `curr_hash` (32 zero bytes for
+        the first), and each `curr_hash` re-computes as
+        sha256(prev_hash || canonical form). Then re-computes every package's
+        Merkle root and package hash. 200 with `valid=false` and
+        `first_break` / failing packages is a finding, not an error. Needs
+        `GOVERNANCE_DECISION_READ` on the platform scope.
       parameters:
         - $ref: '#/components/parameters/TenantId'
         - $ref: '#/components/parameters/PrincipalId'
@@ -276,23 +419,51 @@ paths:
     get:
       tags: [evidence]
       operationId: exportEvidenceChain
-      summary: Export the tenant's decision hash chain
+      summary: Download the tenant's evidence bundle
       description: |
-        Streams one JSON object per line, in `decided_at` order, with each
-        decision's `prev_hash` and `curr_hash`. Needs
-        `GOVERNANCE_DECISION_READ` on the platform scope.
+        One JSON document (Content-Disposition attachment): every decision
+        with its exact canonical form, every package, every replay manifest,
+        and the verification result at export time — enough to re-verify the
+        chain offline. Built before any byte is written, so a failure is a
+        503, never a truncated bundle. Needs `GOVERNANCE_DECISION_READ` on the
+        platform scope.
       parameters:
         - $ref: '#/components/parameters/TenantId'
         - $ref: '#/components/parameters/PrincipalId'
       responses:
         '200':
-          description: Newline-delimited chain records (possibly empty).
+          description: The evidence bundle.
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/ChainExportRecord'
+                $ref: '#/components/schemas/EvidenceBundle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/evidence/packages:
+    get:
+      tags: [evidence]
+      operationId: listEvidencePackages
+      summary: The tenant's sealed packages (newest first)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      responses:
+        '200':
+          description: Packages (possibly none).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [records, total_count]
+                properties:
+                  records: {type: array, items: {$ref: '#/components/schemas/EvidencePackage'}}
+                  total_count: {type: integer}
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -307,14 +478,18 @@ paths:
       operationId: sealEvidencePackage
       summary: Seal the chain into an evidence package
       description: |
-        Creates a Merkle-root snapshot for the tenant up to
-        `last_decision_id`. Needs `WORKFLOW_LEDGER_PRINCIPAL_ID` on the
-        platform scope.
+        Seals decisions 1..n, where n is `through_decision_id`'s chain_seq or
+        the head when omitted: the chain is verified through n first (409
+        CHAIN_BROKEN if it does not), then the package records the RFC 6962
+        Merkle root over their curr_hash and chains to the previous package.
+        409 NOTHING_TO_SEAL when n is already sealed. Idempotent on
+        `Idempotency-Key`. Needs `GOVERNANCE_EVIDENCE_SEAL` on the platform scope.
       parameters:
         - $ref: '#/components/parameters/TenantId'
         - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema:
@@ -325,13 +500,23 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SealPackageResponse'
+                $ref: '#/components/schemas/EvidencePackage'
+        '200':
+          description: Retry of a seal already made under this Idempotency-Key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidencePackage'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '503':
           $ref: '#/components/responses/Unavailable'
   /v1/evidence/packages/{package_id}:
@@ -339,9 +524,7 @@ paths:
       tags: [evidence]
       operationId: getEvidencePackage
       summary: Read a sealed evidence package
-      description: |
-        Returns the package when the caller can read its tenant; another
-        tenant's package is indistinguishable from a missing one (404).
+      description: Another tenant's package is indistinguishable from a missing one (404). Tenant-wide read.
       parameters:
         - $ref: '#/components/parameters/EvidencePackageId'
         - $ref: '#/components/parameters/TenantId'
@@ -353,6 +536,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/EvidencePackage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/evidence/packages/{package_id}/verify:
+    get:
+      tags: [evidence]
+      operationId: verifyEvidencePackage
+      summary: Re-compute one package against the chain as stored now
+      parameters:
+        - $ref: '#/components/parameters/EvidencePackageId'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      responses:
+        '200':
+          description: The check (valid=false with a reason is a finding).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageCheck'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -395,7 +604,7 @@ components:
       name: package_id
       in: path
       required: true
-      schema: {type: string, maxLength: 64}
+      schema: {type: string, format: uuid}
   schemas:
     CreateDecisionRequest:
       type: object
@@ -405,23 +614,29 @@ components:
         tenant_id: {type: string, description: Optional; must equal X-Tenant-Id (403 otherwise).}
         legal_entity_id: {type: string, maxLength: 64, description: 'A UUID, or the PLATFORM sentinel. Defaults to X-Legal-Entity-Id; when both are sent they must match (400 LEGAL_ENTITY_MISMATCH).'}
         action_type: {type: string, maxLength: 128}
-        outcome: {type: string, maxLength: 32, description: 'Data-driven vocabulary, e.g. GRANTED, DENIED, ESCALATED.'}
+        outcome: {type: string, maxLength: 32, description: 'Data-driven vocabulary, e.g. GRANTED, DENIED, ESCALATED; mapped to a status category by decision_outcome_categories.'}
         rule_basis: {type: string, maxLength: 256}
-        jurisdiction_context: {type: string, description: 'Defaults to X-Jurisdiction-Context; when both are sent they must match (400 JURISDICTION_MISMATCH).'}
-        policy_version_id: {type: string, description: 'Derived from a "code:<uuid>" rule_basis when omitted.'}
-        action_subject_type: {type: string}
-        action_subject_id: {type: string}
+        jurisdiction_context: {type: string, maxLength: 64, description: 'Defaults to X-Jurisdiction-Context; when both are sent they must match (400 JURISDICTION_MISMATCH).'}
+        policy_version_id: {type: string, maxLength: 64, description: 'Derived from a "code:<uuid>" rule_basis when omitted.'}
+        action_subject_type: {type: string, maxLength: 64}
+        action_subject_id: {type: string, maxLength: 64, description: 'The record acted on, e.g. a contract reference.'}
         evaluation_context: {type: object, additionalProperties: true}
         correlation_id: {type: string, description: Defaults to X-Correlation-ID.}
-        workflow_instance_id: {type: string}
-        causation_id: {type: string}
+        workflow_instance_id: {type: string, maxLength: 128}
+        causation_id: {type: string, maxLength: 128, description: 'Defaults to X-Causation-Id (400 CAUSATION_MISMATCH when both disagree). A follow-up names the decision it resolves.'}
         decided_at:
           type: string
           format: date-time
           description: Defaults to receipt time. At most 5 minutes ahead of the server clock and not before 2020-01-01.
+        title: {type: string, maxLength: 200}
+        summary: {type: string, maxLength: 2000}
+        domain: {type: string, maxLength: 32, description: 'decision_domains code (400 UNKNOWN_DOMAIN otherwise); classified from action_type when omitted.'}
+        priority: {type: string, enum: [LOW, MEDIUM, HIGH, CRITICAL]}
+        tags: {type: array, maxItems: 10, items: {type: string, maxLength: 32}}
+        related_obligation_id: {type: string, maxLength: 64}
     GovernanceDecision:
       type: object
-      required: [decision_id, tenant_id, legal_entity_id, actor_id, action_type, outcome, rule_basis, correlation_id, decided_at, recorded_at]
+      required: [decision_id, tenant_id, legal_entity_id, actor_id, action_type, outcome, rule_basis, correlation_id, decided_at, recorded_at, domain, chain_seq, prev_hash, curr_hash, status_category, display_ref, follow_up_count, retention_class, record_class]
       properties:
         decision_id: {type: string}
         tenant_id: {type: string}
@@ -430,7 +645,7 @@ components:
         action_type: {type: string}
         outcome: {type: string}
         rule_basis: {type: string}
-        jurisdiction_context: {type: string, description: 'Defaults to X-Jurisdiction-Context; when both are sent they must match (400 JURISDICTION_MISMATCH).'}
+        jurisdiction_context: {type: string}
         policy_version_id: {type: string}
         evaluation_context: {type: object, additionalProperties: true}
         correlation_id: {type: string}
@@ -440,6 +655,81 @@ components:
         action_subject_id: {type: string}
         decided_at: {type: string, format: date-time, description: When the decision was made upstream (caller's claim).}
         recorded_at: {type: string, format: date-time, description: When this service stored it (server-assigned).}
+        title: {type: string}
+        summary: {type: string}
+        domain: {type: string}
+        priority: {type: string}
+        tags: {type: array, items: {type: string}}
+        related_obligation_id: {type: string}
+        chain_seq: {type: integer, format: int64, description: 'Position in the tenant''s hash chain (1-based, storage order).'}
+        prev_hash: {type: string, description: Hex SHA-256.}
+        curr_hash: {type: string, description: 'Hex sha256(prev_hash || canonical form).'}
+        status_category: {type: string, enum: [APPROVED, PENDING, ESCALATED, DENIED, OTHER]}
+        display_ref: {type: string, description: 'GD-<year stored>-<chain_seq>'}
+        follow_up_count: {type: integer, description: Later decisions whose causation_id is this one.}
+        retention_class: {type: string, enum: [EV-REGULATED], description: 'Event Catalogue section 16 class (decision D2-2.F11). Set when read; not part of the hashed canonical form.'}
+        record_class: {type: string, enum: [COMPLIANCE_EVIDENCE], description: Record class retention-registry-svc resolves the retention duration for.}
+    DecisionPage:
+      type: object
+      required: [records, total_count, next_cursor, limit, offset]
+      properties:
+        records: {type: array, items: {$ref: '#/components/schemas/GovernanceDecision'}}
+        total_count: {type: integer, format: int64}
+        next_cursor: {type: string}
+        limit: {type: integer}
+        offset: {type: integer}
+    CategoryCounts:
+      type: object
+      properties:
+        total: {type: integer}
+        approved: {type: integer}
+        pending: {type: integer}
+        escalated: {type: integer}
+        denied: {type: integer}
+        other: {type: integer}
+    NamedCount:
+      type: object
+      properties:
+        key: {type: string}
+        label: {type: string}
+        count: {type: integer}
+    DecisionSummary:
+      type: object
+      properties:
+        from: {type: string, format: date-time}
+        to: {type: string, format: date-time}
+        previous_from: {type: string, format: date-time}
+        totals: {$ref: '#/components/schemas/CategoryCounts'}
+        previous_totals: {$ref: '#/components/schemas/CategoryCounts'}
+        open_pending: {type: integer, description: PENDING decisions no later decision follows up.}
+        open_escalated: {type: integer}
+        by_domain: {type: array, items: {$ref: '#/components/schemas/NamedCount'}}
+        by_jurisdiction: {type: array, items: {$ref: '#/components/schemas/NamedCount'}}
+        by_priority: {type: array, items: {$ref: '#/components/schemas/NamedCount'}}
+        top_sources: {type: array, items: {$ref: '#/components/schemas/NamedCount'}}
+        trend:
+          type: array
+          items:
+            allOf:
+              - {$ref: '#/components/schemas/CategoryCounts'}
+              - {type: object, properties: {date: {type: string, format: date}}}
+        replays: {type: object, properties: {total: {type: integer}, mismatches: {type: integer}}}
+        chain:
+          type: object
+          properties:
+            length: {type: integer}
+            head_hash: {type: string}
+            packages: {type: integer}
+            sealed_through: {type: integer}
+            last_sealed_at: {type: string, format: date-time}
+        outbox: {type: object, properties: {pending: {type: integer}, published: {type: integer}, oldest_pending_seconds: {type: number}}}
+        facets:
+          type: object
+          properties:
+            domains: {type: array, items: {type: object, properties: {code: {type: string}, label: {type: string}}}}
+            jurisdictions: {type: array, items: {type: string}}
+            priorities: {type: array, items: {type: string}}
+            categories: {type: array, items: {type: string}}
     ReplayManifest:
       type: object
       required: [replay_manifest_id, decision_id, policy_version_id, replayed_outcome, original_outcome, outcomes_match, replayed_at, replayed_by_principal_id, tenant_id]
@@ -454,52 +744,102 @@ components:
         replayed_at: {type: string, format: date-time}
         replayed_by_principal_id: {type: string, description: The authenticated caller who ran the replay.}
         tenant_id: {type: string}
+        decision_display_ref: {type: string, description: Only on GET /v1/replay-manifests.}
+        decision_title: {type: string}
+        decision_action_type: {type: string}
+    ChainBreak:
+      type: object
+      properties:
+        chain_seq: {type: integer, format: int64}
+        decision_id: {type: string}
+        reason: {type: string, enum: [SEQUENCE_GAP, PREV_HASH_MISMATCH, HASH_MISMATCH]}
+    PackageCheck:
+      type: object
+      required: [package_id, package_seq, to_seq, valid]
+      properties:
+        package_id: {type: string}
+        package_seq: {type: integer}
+        to_seq: {type: integer, format: int64}
+        valid: {type: boolean}
+        reason: {type: string, enum: [ROOT_MISMATCH, HEAD_MISMATCH, PACKAGE_CHAIN_MISMATCH, LEAVES_MISSING]}
+        recomputed_root: {type: string}
     ChainVerification:
       type: object
-      required: [valid, decisions_checked]
+      required: [valid, decisions_checked, head_seq, packages_checked, packages, verified_at]
       properties:
-        valid: {type: boolean, description: True when every prev_hash matches the previous curr_hash.}
-        decisions_checked: {type: integer, minimum: 0}
-        last_decision_id: {type: string, description: Empty when the tenant has no decisions.}
-    ChainExportRecord:
+        valid: {type: boolean, description: Every link and every package re-computes.}
+        decisions_checked: {type: integer, format: int64}
+        head_seq: {type: integer, format: int64}
+        head_hash: {type: string}
+        head_decision_id: {type: string}
+        first_break: {$ref: '#/components/schemas/ChainBreak'}
+        packages_checked: {type: integer}
+        packages: {type: array, items: {$ref: '#/components/schemas/PackageCheck'}}
+        verified_at: {type: string, format: date-time}
+    DecisionEvidence:
       type: object
-      required: [decision_id, tenant_id, legal_entity_id, actor_id, action_type, outcome, rule_basis, decided_at, prev_hash, curr_hash]
       properties:
         decision_id: {type: string}
+        display_ref: {type: string}
+        chain_seq: {type: integer, format: int64}
+        prev_hash: {type: string}
+        curr_hash: {type: string}
+        hash_valid: {type: boolean}
+        prev_link_valid: {type: boolean}
+        package: {$ref: '#/components/schemas/EvidencePackage'}
+        events:
+          type: array
+          items:
+            type: object
+            properties:
+              event_type: {type: string}
+              created_at: {type: string, format: date-time}
+              published_at: {type: string, format: date-time}
+              attempts: {type: integer}
+              last_error: {type: string}
+        events_note: {type: string}
+    EvidenceBundle:
+      type: object
+      properties:
+        format: {type: string}
         tenant_id: {type: string}
-        legal_entity_id: {type: string}
-        actor_id: {type: string}
-        action_type: {type: string}
-        outcome: {type: string}
-        rule_basis: {type: string}
-        decided_at: {type: string, format: date-time}
-        prev_hash: {type: string, description: Hex-encoded; empty or "00" for the first decision.}
-        curr_hash: {type: string, description: Hex-encoded.}
+        retention_class: {type: string, enum: [EV-REGULATED]}
+        record_class: {type: string, enum: [COMPLIANCE_EVIDENCE]}
+        exported_at: {type: string, format: date-time}
+        canonical_form: {type: string}
+        verification: {$ref: '#/components/schemas/ChainVerification'}
+        decisions:
+          type: array
+          items:
+            allOf:
+              - {$ref: '#/components/schemas/GovernanceDecision'}
+              - {type: object, properties: {canonical: {type: string}}}
+        packages: {type: array, items: {$ref: '#/components/schemas/EvidencePackage'}}
+        replay_manifests: {type: array, items: {$ref: '#/components/schemas/ReplayManifest'}}
     SealPackageRequest:
       type: object
-      required: [package_id, last_decision_id]
       properties:
-        package_id: {type: string, maxLength: 64}
-        last_decision_id: {type: string, maxLength: 64}
-    SealPackageResponse:
-      type: object
-      required: [package_id, merkle_root, sealed_at, sealed_by]
-      properties:
-        package_id: {type: string}
-        merkle_root: {type: string, description: Hex-encoded SHA-256 Merkle root.}
-        sealed_at: {type: string, format: date-time}
-        sealed_by: {type: string}
+        through_decision_id: {type: string, maxLength: 64, description: Seal through this decision; the head when omitted.}
+        label: {type: string, maxLength: 200}
+        reason: {type: string, maxLength: 500}
     EvidencePackage:
       type: object
-      required: [package_id, tenant_id, merkle_root, leaf_count, last_decision_id, sealed_at, sealed_by]
+      required: [package_id, tenant_id, package_seq, to_seq, leaf_count, merkle_root, head_hash, head_decision_id, prev_package_hash, package_hash, sealed_by, sealed_at]
       properties:
-        package_id: {type: string}
+        package_id: {type: string, format: uuid}
         tenant_id: {type: string}
-        merkle_root: {type: string, description: Hex-encoded SHA-256 Merkle root.}
-        leaf_count: {type: integer, format: int64, minimum: 0}
-        last_decision_id: {type: string}
-        sealed_at: {type: string, format: date-time}
+        package_seq: {type: integer}
+        to_seq: {type: integer, format: int64}
+        leaf_count: {type: integer, format: int64}
+        merkle_root: {type: string, description: Hex RFC 6962 Merkle Tree Hash over curr_hash of decisions 1..to_seq.}
+        head_hash: {type: string}
+        head_decision_id: {type: string}
+        prev_package_hash: {type: string}
+        package_hash: {type: string, description: 'sha256(prev_package_hash || merkle_root || head_hash || uint64be(to_seq))'}
+        label: {type: string}
+        reason: {type: string}
         sealed_by: {type: string}
+        sealed_at: {type: string, format: date-time}
     Problem:
       type: object
       required: [type, title, status, code]
@@ -539,12 +879,12 @@ components:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
     NotFound:
-      description: No such decision in the caller's tenant, or its policy version is gone.
+      description: No such decision or package in the caller's tenant, or a decision's policy version is gone.
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
     Conflict:
-      description: IDEMPOTENCY_MISMATCH or DECISION_ID_CONFLICT.
+      description: IDEMPOTENCY_MISMATCH, DECISION_ID_CONFLICT, NOTHING_TO_SEAL or CHAIN_BROKEN.
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}

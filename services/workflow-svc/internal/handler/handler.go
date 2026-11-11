@@ -45,7 +45,7 @@ type WorkflowStore interface {
 	VerifyRelease(ctx context.Context, params domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error)
 	EscalateToWorkflow(ctx context.Context, params domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error)
 	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
-	ListPendingApprovals(ctx context.Context, tenantID string, limit, offset int) ([]*domain.WorkflowInstance, error)
+	ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
 
 	// Workflow definitions (WFC-02) — see internal/store/pg_store.go.
@@ -123,7 +123,7 @@ type WorkflowStore interface {
 	RouteToDomain(ctx context.Context, params domain.RouteToDomainParams) (*domain.FormSubmissionRoute, error)
 	GetSubmissionVersion(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmissionVersionInfo, error)
 	GetValidationResult(ctx context.Context, tenantID, submissionID string) (*domain.ValidationResult, error)
-	ListPendingSubmissions(ctx context.Context, tenantID, formID string, limit, offset int) ([]*domain.FormSubmission, error)
+	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -2290,9 +2290,9 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type listResponse struct {
-		Records    []*domain.WorkflowInstance   `json:"records"`
-		NextCursor string                       `json:"next_cursor,omitempty"`
-		Watermark  string                       `json:"watermark,omitempty"`
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                     `json:"next_cursor,omitempty"`
+		Watermark  string                     `json:"watermark,omitempty"`
 	}
 
 	resp := listResponse{

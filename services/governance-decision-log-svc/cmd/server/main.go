@@ -41,6 +41,7 @@ import (
 	"zoiko.io/governance-decision-log-svc/internal/mtls"
 	"zoiko.io/governance-decision-log-svc/internal/outbox"
 	"zoiko.io/governance-decision-log-svc/internal/policyclient"
+	"zoiko.io/governance-decision-log-svc/internal/sealer"
 	"zoiko.io/governance-decision-log-svc/internal/store"
 	"zoiko.io/governance-decision-log-svc/internal/telemetry"
 )
@@ -154,16 +155,41 @@ func main() {
 
 	// Event publishing uses transactional outbox (see 4b above)
 
+	// Background work (certificate renewal, CRL refresh, scheduled sealing)
+	// stops with this context at shutdown.
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	defer bgCancel()
+
+	// Workload identity (X5): one certificate from mtls-management-svc, used
+	// for the inbound mTLS listener and for calls to authorization-svc. It is
+	// renewed at two thirds of its lifetime; both halves read it per handshake.
+	var workloadID *mtls.RotatingIdentity
+	if cfg.MTLSEnabled || cfg.AuthzMTLSEnabled {
+		provision := func(ctx context.Context) (*mtls.Identity, error) {
+			pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			return mtls.Provision(pctx, cfg.MTLSManagementServiceURL, "governance-decision-log-svc", platformScopeID,
+				mtls.LoadBootstrapToken(cfg.MTLSBootstrapTokenPath))
+		}
+		first, err := provision(context.Background())
+		if err != nil {
+			log.Fatal("mtls: failed to provision this service's workload identity", zap.Error(err))
+		}
+		workloadID, err = mtls.NewRotatingIdentity(first)
+		if err != nil {
+			log.Fatal("mtls: workload identity unusable", zap.Error(err))
+		}
+		go workloadID.Run(bgCtx, provision, log)
+		log.Info("mtls: workload identity provisioned", zap.Bool("listener", cfg.MTLSEnabled), zap.Bool("authz_client", cfg.AuthzMTLSEnabled),
+			zap.Time("not_after", workloadID.NotAfter()), zap.Time("renew_at", workloadID.RenewAt()))
+	}
+
 	// AuthZ client. Refuses to start in production/staging against a
 	// placeholder URL — no service may silently fall back to permit-all.
 	var authzClient authz.Client
 	if cfg.AuthzMTLSEnabled {
-		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "governance-decision-log-svc", platformScopeID)
-		if err != nil {
-			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
-		}
 		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
-		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, log, mtlsHTTPClient)
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, log, workloadID.HTTPClient()).WithWorkload("governance-decision-log-svc")
 	} else {
 		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
 		if err != nil {
@@ -177,7 +203,12 @@ func main() {
 	// identity-context-svc's signed envelope (JWKS) and that its session is still
 	// live (AU-01), and makes the verified claims the only source of those
 	// headers. IDENTITY_VERIFY: require (default outside local) | warn.
-	gate, gateSettings, err := idenv.NewGateFromEnv("governance-decision-log-svc", log, idenv.EnvOptions{})
+	// Peers: the workloads that may vouch for X-Principal-Id over verified mTLS
+	// — the two ledger writers whose relays act for no signed-in person.
+	// IDENTITY_PEERS overrides (e.g. to add the readers contract-lifecycle-svc,
+	// decision-support-svc and evidence-manifest-svc once they call over mTLS).
+	gate, gateSettings, err := idenv.NewGateFromEnv("governance-decision-log-svc", log,
+		idenv.EnvOptions{DefaultPeers: []string{"policy-svc", "workflow-svc"}})
 	if err != nil {
 		log.Fatal("identity gate configuration refused", zap.Error(err))
 	}
@@ -212,6 +243,16 @@ func main() {
 	}
 	handler.RegisterRoutes(r, h)
 
+	// Scheduled sealing (GOV-07): every tenant's unsealed decisions are sealed
+	// into an evidence package each interval, after re-verifying the chain.
+	if cfg.EvidenceSealInterval > 0 {
+		go sealer.New(pgStore, cfg.EvidenceSealPrincipalID, log, metrics).Run(bgCtx, cfg.EvidenceSealInterval)
+		log.Info("scheduled evidence sealing on", zap.Duration("interval", cfg.EvidenceSealInterval),
+			zap.String("sealed_by", cfg.EvidenceSealPrincipalID))
+	} else {
+		log.Warn("EVIDENCE_SEAL_INTERVAL=0: scheduled sealing off; packages are sealed only on request")
+	}
+
 	// ── 7. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
@@ -243,6 +284,42 @@ func main() {
 		}
 	}()
 
+	// The mTLS listener serves the same router: what changes is only that
+	// every connection presents a verified platform certificate, which the
+	// identity gate reads as the calling workload.
+	var mtlsSrv *http.Server
+	if cfg.MTLSEnabled {
+		// Revocation: a peer certificate on mtls-management-svc's CRL is
+		// refused at the handshake, and so is every client certificate while
+		// no current CRL is held (fail closed).
+		if cfg.MTLSRevocationCheck != "off" {
+			revocation := mtls.NewRevocationChecker(cfg.MTLSCRLURL, workloadID.CACertificates)
+			if err := revocation.Refresh(context.Background()); err != nil {
+				log.Warn("mtls: initial CRL fetch failed — :8450 refuses client certificates until one is fetched", zap.Error(err))
+			}
+			workloadID.SetPeerVerifier(revocation.VerifyConnection)
+			go revocation.Run(bgCtx, cfg.MTLSCRLRefresh, log)
+			log.Info("mtls: client certificate revocation check on", zap.String("crl_url", cfg.MTLSCRLURL), zap.Duration("refresh", cfg.MTLSCRLRefresh))
+		} else {
+			log.Warn("mtls: MTLS_REVOCATION_CHECK=off — a revoked peer certificate is admitted until it expires (ENV=local only)")
+		}
+		mtlsSrv = &http.Server{
+			Addr:              ":" + strconv.Itoa(cfg.MTLSPort),
+			Handler:           r,
+			TLSConfig:         workloadID.ServerTLSConfig(),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+		go func() {
+			log.Info("mTLS server listening", zap.String("addr", mtlsSrv.Addr))
+			if err := mtlsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- err
+			}
+		}()
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -256,6 +333,11 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	if mtlsSrv != nil {
+		if err := mtlsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Error("mTLS listener shutdown failed", zap.Error(err))
+		}
 	}
 	log.Info("server stopped")
 }

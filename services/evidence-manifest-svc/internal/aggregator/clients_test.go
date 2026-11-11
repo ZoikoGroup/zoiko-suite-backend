@@ -19,7 +19,7 @@ func TestGovernanceDecisionClient_ListByEntityAndDateRange_Success(t *testing.T)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "entity-1", r.URL.Query().Get("entity"))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"decision_id":"gd-1","outcome":"GRANTED"},{"decision_id":"gd-2","outcome":"DENIED"}]`))
+		_, _ = w.Write([]byte(`{"records":[{"decision_id":"gd-1","outcome":"GRANTED"},{"decision_id":"gd-2","outcome":"DENIED"}],"total_count":2,"next_cursor":""}`))
 	}))
 	defer srv.Close()
 

@@ -79,7 +79,7 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D1-12 | carta-svc :8142 | 🟡 | 8 | 0 | 2 | 1 | 0 | 4 | 1 | 0 | ✔ · ✔ · ✔ 2 pkgs | none (phase6 compose only) | shared, dead-wired · 2/3 | CA-0 |
 | D1-13 | key-management-svc :8143 | 🟡 | 11 | 0 | 1 | 0 | 0 | 9 | 1 | 0 | ✔ · ✔ · ✔ 3 pkgs | none (phase6 compose only) | shared, dead-wired · 5/5 | KM-0 |
 | D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 0 | 5 | 4 | 16 | 2 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs | none (no `progress.md`) | legacy · 12/148 | JR-0 |
-| D2-2 | governance-decision-log-svc :8083 | 🟡 | 13 | 0 | 4 | 4 | 0 | 4 | 0 | 1 | ✔ · ✔ · ✔ 6 pkgs | none | legacy · 2/4 | GDL-0 |
+| D2-2 | governance-decision-log-svc :8083 | ✅ | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 9 pkgs (+ store IT) | S0–S6 verified 11 Nov (9 rows with independence waived by the user); 🏁 after the commit (verifier step 1) | v2.0 · 14/14 | Commit (R3) |
 | D2-3 | policy-svc :8085 | 🟡 | 14 | 0 | 7 | 2 | 1 | 3 | 0 | 1 | ✔ · ✔ · ✔ 12 pkgs | none | legacy · 7/39 | POL-0 |
 | D2-4 | obligations-svc :8088 | 🟡 | 14 | 0 | 4 | 5 | 2 | 3 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | none | legacy · 7/24 | OB-0 |
 | D2-5 | authorization-svc :8089 | 🟡 | 23 | 0 | 13 | 4 | 1 | 4 | 0 | 1 | ✔ · ✔ · ✔ 14 pkgs | S0–S6 verified 2 Nov (main merged since); reconfirm | v2.0 · 64/80 | AZ-3 |
@@ -737,7 +737,7 @@ The page exists. What is missing:
 | D1-9.F10 | Federation role eligibility: `GET /v1/iam/federation/role-eligibility` | 🔵 | Routed; added with the federation work (3 Nov); not audited | AC-0 |
 | D1-9.F11 | Sessions end on role or assignment change; Idempotency-Key; outbox; refused-escalation evidence | 🟡 | Reconfirm (was ✅): Identity audit 9/9 | VC-1 |
 | D1-9.F12 | `resource.action` aliases for legacy names (S9-D1) | ❌ | Decided, not built | AC-1 |
-| D1-9.F13 | Production grants by migration (notification actions, workflow actions incl. `WORKFLOW_CANCEL/ESCALATE/INVALIDATE/ADMINISTER`, a template with `WORKFLOW_APPROVE`, `iam.workload.manage`; service identities `svc-access-control`, `svc-policy`, `GOVERNANCE_DECISION_RECORD` for ledger writers) | ❌ | Only `seed-demo-rbac.ps1` grants most of them | AC-2 |
+| D1-9.F13 | Production grants by migration (notification actions, workflow actions incl. `WORKFLOW_CANCEL/ESCALATE/INVALIDATE/ADMINISTER`, a template with `WORKFLOW_APPROVE`, `iam.workload.manage`; service identities `svc-access-control`, `svc-policy`, `GOVERNANCE_DECISION_RECORD` for ledger writers) | ❌ | Only `seed-demo-rbac.ps1` grants most of them; 11 Nov (late): decision-log READ readers (`svc-contract-lifecycle`, `svc-decision-support`) by authorization-svc 000042; 11 Nov: `svc-access-control`, `svc-policy`, `svc-workflow` (authorization-svc 000043), `iam.assignment.read` registered (access-control 000050), ledger-writer template (000051) | Notification and workflow action templates, `iam.workload.manage`: AC-2 |
 | D1-9.F14 | Refused-escalations read and console summary: `GET /v1/iam/refused-escalations`, `GET /v1/iam/summary` | ❌ | Not built | AC-3 |
 | D1-9.F15 | Cursor paging (API-4) on every list | ❌ | Offset lists | AC-3 |
 | D1-9.F16 | ETag/If-Match beyond roles and bundles (assignment requests, groups, members, campaigns, items, subject links, template instantiate/upgrade) | 🟡 | Roles and bundles only | AC-4 |
@@ -867,33 +867,33 @@ These services answer "is this allowed, under which rules, who must approve, and
 | Spec | Doc 03 §8.7; GOV-07 |
 | Latest score | 41 met / 6 partial / 0 failed of 47 (87.2%, 93.6% weighted) |
 | Stages | `progress.md` (no feature matrix in the S0 format) |
-| Console | `/admin/governance` legacy |
+| Console | `/admin/governance` v2.0 (11 Nov) |
 
 **Features**
 
 | ID | Feature | Status | Evidence | What is needed |
 |---|---|---|---|---|
-| D2-2.F01 | Append a decision: `POST /v1/decisions` (tenant-owned, immutable, idempotent on `(tenant_id, decision_id)`) | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-2.F02 | Query and get: `GET /v1/decisions`, `GET /v1/decisions/{id}` (ETag on reads) | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-2.F03 | Replay: `POST /v1/decisions/{id}/replay`; `GET …/{id}/replay-manifests` (tenant-scoped) | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-2.F04 | Outbox and relay for `governance.decision.recorded` / `.replayed` | 🟡 | Coded and retry-tested; not proven against a real broker | X3 |
-| D2-2.F05 | `jurisdiction_context` on decisions; column-width and size guards; RFC 9457 | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-2.F06 | Read authorization | 🟡 | Compose `DECISION_LOG_READ_AUTHZ: "warn"` (hard-coded) | GDL-1 |
-| D2-2.F07 | Callers forward the envelope and `X-Principal-Id` (contract-lifecycle, decision-support, evidence-manifest) (D-04) | 🟡 | Other teams' services | Cross-team |
-| D2-2.F08 | Identity verification through ForwardAuth and mTLS workload identity (D-05, X5) | 🟡 | `IDENTITY_VERIFY` default `warn` | X5 |
-| D2-2.F09 | GOV-07 evidence ledger and verification (hash chain, seal, verify, export) | ❌ | Not built | G-07 |
-| D2-2.F10 | workflow-svc ledger relay proven live (`WORKFLOW_LEDGER_PRINCIPAL_ID` granted `GOVERNANCE_DECISION_RECORD`) | ❌ | Coded 21 Oct; never run against a real decision log | GDL-2 |
-| D2-2.F11 | Open questions: "audit" query dimension; GOV-07 hash chain; `decision_id` = §16 `evidence_id`; retention class; which GOV section owns GovernanceDecision; `X-Purpose-Context` on reads or appends (D-06); event naming (D-07, C3) | 🧭 | Governance audit register | Decision |
-| D2-2.F12 | Cursor paging on `GET /v1/decisions` (API-4) | ❌ | — | GDL-1 |
-| D2-2.F13 | Dependency E2E and console v2.0 | ❌ | No `e2e-governance-decision-log-deps.py`; legacy page | GDL-3, GDL-FE-1…3 |
+| D2-2.F01 | Append a decision: `POST /v1/decisions` (tenant-owned, immutable, idempotent on `(tenant_id, decision_id)`) | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. TestCreateDecision_*, TestPgStore_RecordDecision_WritesKeyAndEventInOneTransaction; e2e "record:*" | — |
+| D2-2.F02 | Query and get: `GET /v1/decisions`, `GET /v1/decisions/{id}` (ETag on reads) | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. TestList_*, TestListDecisions_AuditDimensionIsTheCorrelationID; e2e list/summary/"F11: audit dimension" | — |
+| D2-2.F03 | Replay: `POST /v1/decisions/{id}/replay`; `GET …/{id}/replay-manifests` (tenant-scoped) | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. TestReplayDecision_*, TestPgStore_ReplayQueuesOneEvent; e2e "replay:*" against policy-svc | — |
+| D2-2.F04 | Outbox and relay for `governance.decision.recorded` / `.replayed` | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. TestC3_*, TestR9_*, TestOutbox_*; e2e "kafka:*", "C3/R9:*", "R9:*" (4 names registered, v1) | Production broker: X3 |
+| D2-2.F05 | `jurisdiction_context` on decisions; column-width and size guards; RFC 9457 | ✅ | VC-1 11 Nov (evening): suite 213/0/0 (store suite on Postgres, runtime role), dependency e2e 121/121 in require, audit.sh 43/0: TestCreateDecision_400_* (incl. register fields); e2e "invalid priority → 400", "unknown domain → 400" | — |
+| D2-2.F06 | Read authorization | ✅ | VC-1 11 Nov (evening): suite 213/0/0 (store suite on Postgres, runtime role), dependency e2e 121/121 in require, audit.sh 43/0: TestReadRoutes_401_403_503; e2e "read authz enforced … 403", "read without a principal → 401", "F07: … user WITHOUT READ → 403" | — |
+| D2-2.F07 | Callers forward the envelope and `X-Principal-Id` (contract-lifecycle, decision-support, evidence-manifest) (D-04) | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. client tests in the three readers; e2e "F07:*" + "F07 live:*"; grants by authorization-svc 000042 (TestAC2_*) | — |
+| D2-2.F08 | Identity verification through ForwardAuth and mTLS workload identity (D-05, X5) | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. TestRotation_*, TestRevocation_*, TestProvision_*; e2e identity (require) + "revocation:*" | — |
+| D2-2.F09 | GOV-07 evidence ledger and verification (hash chain, seal, verify, export) | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. TestLedger_*, TestSealer_*, TestRunOnce_*; e2e "offline:*" + scheduled seal | — |
+| D2-2.F10 | workflow-svc ledger relay proven live (`WORKFLOW_LEDGER_PRINCIPAL_ID` granted `GOVERNANCE_DECISION_RECORD`) | ✅ | VC-1 11 Nov (evening): suite 213/0/0 (store suite on Postgres, runtime role), dependency e2e 121/121 in require, audit.sh 43/0: e2e "workflow relay: *" (svc-workflow over mTLS, linked into the chain) | — |
+| D2-2.F11 | Open questions: "audit" query dimension; GOV-07 hash chain; `decision_id` = §16 `evidence_id`; retention class; which GOV section owns GovernanceDecision; `X-Purpose-Context` on reads or appends (D-06); event naming (D-07, C3) | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. decisions of 11 Nov built (F02/F04); e2e "F11:*" | — |
+| D2-2.F12 | Cursor paging on `GET /v1/decisions` (API-4) | ✅ | VC-1 11 Nov (evening): suite 213/0/0 (store suite on Postgres, runtime role), dependency e2e 121/121 in require, audit.sh 43/0: TestList_RegisterFacetsTotalsSearchAndCursor (cursor on every page, RFC3339Nano); e2e "cursor paging" | — |
+| D2-2.F13 | Dependency E2E and console v2.0 | ✅ | ✅ VC-1 11 Nov 2026 (late), independence waived by the user (the same session built and verified): golang:1.26 suites GDL 215/0/0 (DB, 0 skip), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow all ok; migrations up/down/up; 6 mutants killed; live e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live sections 40/40, governance.spec.ts 5/5, vitest 8/8. e2e-governance-decision-log-deps.py 128/128; governance.spec.ts 5/5; console trend axis + register width fixed 11 Nov | — |
 
 **Tasks**
 
-- [ ] **GDL-0 · Baseline (S0):** matrix in `progress.md`; suite with counts.
-- [ ] **GDL-1 · Read authorization enforce + API-4:** grant every reader `GOVERNANCE_DECISION_READ` by migration (AC-2); make compose read `DECISION_LOG_READ_AUTHZ` from an env default and set `enforce`; cursor paging. Tests: reader without the grant → 403 in enforce mode.
-- [ ] **G-07 · Evidence ledger** (IMPLEMENTATION-PLAN §6 G-07): per-tenant hash chain, sealed packages, verify, export; tamper test.
-- [ ] **GDL-2 · Live ledger relay:** set `WORKFLOW_LEDGER_PRINCIPAL_ID`, grant it, run workflow → decision log once on the stack, record the decision id.
-- [ ] **GDL-3 · Live:** rebuild; `scripts/audit.sh`; new `deployments/scripts/e2e-governance-decision-log-deps.py` (policy relay as `svc-policy`, workflow relay, authorization read checks, Kafka event).
+- [x] **GDL-0 · Baseline (S0):** matrix in `progress.md`; suite with counts.
+- [x] **GDL-1 · Read authorization enforce + API-4:** grant every reader `GOVERNANCE_DECISION_READ` by migration (AC-2); make compose read `DECISION_LOG_READ_AUTHZ` from an env default and set `enforce`; cursor paging. Tests: reader without the grant → 403 in enforce mode.
+- [x] **G-07 · Evidence ledger** (IMPLEMENTATION-PLAN §6 G-07): per-tenant hash chain, sealed packages, verify, export; tamper test.
+- [x] **GDL-2 · Live ledger relay:** set `WORKFLOW_LEDGER_PRINCIPAL_ID`, grant it, run workflow → decision log once on the stack, record the decision id.
+- [x] **GDL-3 · Live:** rebuild; `scripts/audit.sh`; new `deployments/scripts/e2e-governance-decision-log-deps.py` (policy relay as `svc-policy`, workflow relay, authorization read checks, Kafka event).
 
 **Console (frontend)** — `app/admin/governance` (legacy) · client `lib/api/governance.ts` calls 2 of 4 screen-relevant routes (Appendix B; the append is service-to-service). Rebuild in v2.0 following "Frontend rules for every console" below.
 
@@ -907,15 +907,15 @@ These services answer "is this allowed, under which rules, who must approve, and
 | Footer | Required controls: decisions are immutable · reads are authorized · every replay records a manifest |
 
 **Tasks**
-- [ ] **GDL-FE-1 · Summary route + API client** for every route in Appendix B D2-2 (and the G-07 routes once built).
-- [ ] **GDL-FE-2 · Page v2.0.**
-- [ ] **GDL-FE-3 · UI E2E** `tests/e2e/console/decision-log.spec.ts`. Cover:
+- [x] **GDL-FE-1 · Summary route + API client** for every route in Appendix B D2-2 (and the G-07 routes once built).
+- [x] **GDL-FE-2 · Page v2.0.**
+- [x] **GDL-FE-3 · UI E2E** `tests/e2e/console/decision-log.spec.ts`. Cover:
   - a decision written by policy-svc appears;
   - replay shows its manifest;
   - a reader without the grant is refused once enforce is on;
   - empty and unavailable states.
 
-**Blocked and decisions:** the open questions above; callers' envelope forwarding (D-04).
+**Blocked and decisions:** none open. F11's questions were decided on 11 Nov 2026 and D-04 (callers' envelope) is built (F07). All 13 rows ✅ (11 Nov); for the 9 rows built in the verifying session the user waived the independent pass.
 
 ---
 
@@ -938,7 +938,7 @@ These services answer "is this allowed, under which rules, who must approve, and
 | D2-3.F01 | Policies and versions: `GET/POST /v1/policies`, `GET …/{id}`, `GET/POST …/{id}/versions`, `GET /v1/policy-versions/{id}`, `GET …/transitions`, `GET /v1/policy-versions/compare` | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
 | D2-3.F02 | GOV-05 lifecycle: `POST …/versions/{v}/submit-review`, `…/approve` (maker-checker + own-object SoD), `…/activate`, `…/schedule`, `…/suspend`, `…/review-suspension` (suspender cannot review), `…/retire`; If-Match mandatory (428) | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
 | D2-3.F03 | Evaluate, resolve, explain, evidence: `POST /v1/policies/evaluate`, `GET /v1/policies/resolve`, `GET /v1/policies/explain`, `GET /v1/policy-evaluations/{id}` | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-3.F04 | Evidence relayed into governance-decision-log-svc as `svc-policy` (durable outbox) | 🟡 | Reconfirm (was ✅): Governance audit | Production grant: AC-2; VC-1 |
+| D2-3.F04 | Evidence relayed into governance-decision-log-svc as `svc-policy` (durable outbox) | 🟡 | Reconfirm (was ✅): Governance audit; 11 Nov: production grant by authorization-svc 000043; relay proven live (GDL e2e "policy relay: *") | VC-1 |
 | D2-3.F05 | 8 event types; `jurisdiction_context` and `residency_region` on events | 🟡 | Reconfirm (was ✅): Governance audit | Kafka proof: X3; VC-1 |
 | D2-3.F06 | Control tests and attestations: `POST /v1/control-test-definitions`, `GET …/{id}`, `GET/POST …/{id}/executions`, `GET /v1/controls/{ref}/effectiveness`, `POST /v1/attestations`, `GET …/{id}`, `POST …/{id}/revoke` | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
 | D2-3.F07 | Identity verification (JWKS envelope, or mTLS on `:8449`) | 🟡 | Compose `POLICY_IDENTITY_VERIFY` default `warn` (P-12); needs governance-decision-log to forward the envelope on replay | POL-3 |
@@ -1655,7 +1655,7 @@ Both teammate audits score only what each service's own documents promise. The s
 | API-4 | Cursor pagination on every list | 🟡 | Done in evidence-requirements and identity-context. Every other service has a task (TER-2, CFG-1, SV-1, SI-3, NT-1, DA-1, AC-3, JR-5, GDL-1, POL-1, OB-4, AZ-1, WF-5) | 14 services |
 | API-5 | Async operations | ❌ | Needed first by ORG-9 master imports | tenant-entity-registry |
 | API-6 | Deprecation / Sunset on renamed routes | ❌ | Needed by ST-3, NT-5, CFG-1, AZ-4 | 4 services |
-| R5 | Production grants by migration, not `seed-demo-rbac.ps1` | 🟡 | AC-2 (notification, workflow, `svc-access-control`, `svc-policy`, ledger writers, `GOVERNANCE_DECISION_READ` readers) | access-control, authorization |
+| R5 | Production grants by migration, not `seed-demo-rbac.ps1` | 🟡 | AC-2 (notification and workflow action templates, `iam.workload.manage`); service identities done 11 Nov 2026: decision-log readers (authorization-svc 000042), `svc-policy` / `svc-workflow` / `svc-access-control` (000043); `iam.assignment.read` registered and `GOVERNANCE_DECISION_RECORD` carried by a template (access-control 000050, 000051) | access-control, authorization |
 | G-07 | Evidence ledger and verification | ❌ | In governance-decision-log-svc | D2-2 |
 | G-08 | Schema registry lifecycle (schema-registry-svc) | ❌ | Then register IAM-10, EML-4, evidence-requirements schemas | schema-registry-svc |
 | G-09 / G-10 | Retention and disposition; legal hold (retention-registry-svc) | ❌ | G-10 first (IAM-3 and G-09 depend on it) | retention-registry-svc |
@@ -3162,6 +3162,20 @@ Every service runs these stages; the task lists below fill them in.
 - authorization-svc migration (next free, expected **000041_service_identity_grants**): platform
   role assignments for `svc-access-control` (at least `iam.assignment.revoke` for review REVOKE)
   and `svc-policy`, guarded and idempotent.
+  - Done 11 Nov (late) for the decision log's readers: **000042_decision_log_service_readers**. Roles are
+    tenant-owned, so a "platform" assignment cannot grant across tenants: the migration provisions
+    `SVC_DECISION_LOG_READER` (READ only, tenant-wide assignments for `svc-contract-lifecycle` and
+    `svc-decision-support`) in every existing tenant and, by an AFTER INSERT trigger on `roles`, in
+    each new tenant when its first role is created; once per tenant, so an administrator's
+    revocation stands. Tests `TestAC2_*`.
+  - Done 11 Nov for the other service identities: **000043_platform_service_identity_grants**
+    (`SVC_POLICY_LEDGER` / `SVC_WORKFLOW_LEDGER`: `GOVERNANCE_DECISION_RECORD`; `SVC_ACCESS_CONTROL`:
+    `iam.assignment.revoke`, `iam.assignment.read`), same per-tenant pattern, test
+    `TestAC2_PlatformServiceIdentitiesProvisionedWithATenantsFirstRole`. access-control **000050**
+    registers `iam.assignment.read` (IAM_ACCESS_ADMINISTRATOR v2) and **000051** adds template
+    GOVERNANCE_LEDGER_WRITER (`GOVERNANCE_DECISION_RECORD`, `GOVERNANCE_DECISION_READ`). The seed now
+    only verifies every service-identity grant. Still open in AC-2: the notification and workflow
+    action templates and `iam.workload.manage`.
 - **Tests:** store test per template; authorization IT `TestSvcAccessControlMayRevoke` → PERMIT.
 
 ##### AC-3 · Console read gaps + API-4 cursor paging
@@ -4393,6 +4407,8 @@ listed, run *Verify*, and re-score the row. Row ids are the ones used in this se
 | D-06 | A9 | `X-Purpose-Context` is required on every append. Its own rationale (`services/_contract/rollout.sh` SENSITIVE list: "governed sensitive access") means *reads*, and GCP §16 scopes purpose to privileged, destructive or emergency commands. Neither covers an evidence append | Should purpose be required on appends, on reads, or both? | Required on **reads**, not appends. This needs a `RequiredOnRead` level in **services/_contract** (the shared generator), and the readers (D-03/D-04) to send purpose first | Regenerate `internal/envelope/contract.go` with `rollout.sh` |
 | D-07 | V1 | Event names follow Doc 03 (`governance.decision.recorded` / `.replayed`), not the Event Catalogue pattern `com.zoikosuite.governance.decision.recorded` | **Group decision C3**: which naming is the wire contract | Keep Doc 03 (every service and workflow-history-svc use it) unless C3 says otherwise | Rename both event types in `internal/events` and in Doc 03 §8.7 |
 
+**11 Nov 2026:** D-03 and D-04 done (D2-2.F07: the three readers call :8450 with their own certificates, name a principal and send the full envelope with a purpose; compose `DECISION_LOG_READ_AUTHZ=enforce`, `IDENTITY_VERIFY=require`). D-06 decided as proposed (purpose on reads). D-07 decided by C3: both names (D2-2.F04). The five unscored rows below were decided by the user (D2-2.F11): E3 = correlation id; D10 = yes (built, 000016); D11 = yes; D13 = EV-REGULATED / COMPLIANCE_EVIDENCE; N4 = GOV-07.
+
 ##### C. Unscored (❓, carried from the 28 Sep audit)
 
 | Row | Question |
@@ -4966,6 +4982,9 @@ One dated entry per verifier pass that re-scores rows: service, rows re-scored (
 | Date | Service | Rows re-scored | New score | Evidence |
 |---|---|---|---|---|
 | 6 Nov 2026 | (all) | None: file built from the six sources | Latest scores are in D2 (Domain 1) and E2 (Domain 2; later passes in E9 and E11) | The `Source:` lines in this file |
+| 11 Nov 2026 (latest) | D2-2 governance-decision-log-svc | F01–F04, F07–F09, F11, F13 🔵 → ✅, **independence waived by the user** (built and verified in the same session); dashboard 13/13 ✅ | 13 ✅ of 13 | Uncommitted tree. Suites (golang:1.26): GDL 215/0/0 (DB), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow ok; authorization store 152/0/1, access-control 155/0/0 (all 51 migrations); authorization 000042/000043 and access-control 000050/000051 up/down/up; mutants 6/6 killed; R7 callers and R5 registrations checked; live: seed verification, e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live 40/40 (its 3 host-test sections blocked by Windows Application Control, run in the container instead), governance.spec.ts 5/5, tsc/eslint clean, vitest 8/8 |
+| 11 Nov 2026 (late) | D2-2 governance-decision-log-svc | No status change (implementer pass): F04, F07, F13 evidence extended — event schemas registered (R9), reader grants by migration (authorization-svc 000042, AC-2 in part), console spec re-run | 4 ✅ · 9 🔵 · 0 🟡 · 0 🧭 of 13 | GDL suite 215/0/0; authorization store suite 151/0/1 (the by-design skip); e2e 128/128; governance.spec.ts 5/5; schema registration run twice (idempotent, v1 each) |
+| 11 Nov 2026 | D2-2 governance-decision-log-svc | F05, F06, F10, F12 🔵 → ✅. F01–F04, F07–F09, F11, F13 stay 🔵 (code changed in this verifying session: F07 readers, F11 decisions, rotation/CRL, scheduled sealing). F11 🧭 → 🔵, F07 🟡 → 🔵 | 4 ✅ · 9 🔵 · 0 🟡 · 0 🧭 of 13 | Uncommitted working tree. golang:1.26 suites: GDL 213/0/0 (DB), identity-envelope, contract-lifecycle, decision-support, evidence-manifest ok; 000016/000017 and access-control 000049 up/down/up; mutants killed 4/4; live e2e-governance-decision-log-deps.py 121/121 (require), `--scheduled-seal` 4/4, audit.sh 43/0, promtool 85 rules |
 
 ---
 

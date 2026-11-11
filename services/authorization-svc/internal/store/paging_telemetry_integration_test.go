@@ -22,8 +22,10 @@ func TestAZ1IT_AssignmentKeysetTraversal(t *testing.T) {
 	var got []string
 	after := ""
 	for pages := 0; pages < 10; pages++ {
+		// Scoped to this test's role: since 000042 a tenant's first role
+		// also provisions the decision-log service readers' assignments.
 		page, err := f.s.QueryRoleAssignments(f.ctx, domain.AssignmentQuery{
-			TenantID: f.tenant, ActiveOnly: true, Limit: 3, Keyset: true, AfterID: after,
+			TenantID: f.tenant, RoleID: r.RoleID, ActiveOnly: true, Limit: 3, Keyset: true, AfterID: after,
 		})
 		if err != nil {
 			t.Fatal(err)

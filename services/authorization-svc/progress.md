@@ -2583,3 +2583,43 @@ p99 1376 ms, 0 errors (0.5 CPU, local); revocation 9–35 ms; projection lag 0.2
 
 **Deploy:** no migration in this service. Rebuild access-control-svc and authorization-svc
 together (If-Match is now required by one and sent by the other); apply access-control 000048.
+
+## 11 Nov (late): AC-2 in part — decision-log service readers granted by migration
+
+- **000042_decision_log_service_readers.** Roles are tenant-owned
+  (`FindGrantedActionsScoped` matches `r.tenant_id` to the request tenant), so
+  a service principal needs a grant in every tenant it acts in. The migration
+  creates `SVC_DECISION_LOG_READER` (bundle `LEDGER_READ` =
+  `["GOVERNANCE_DECISION_READ"]`, tenant-wide assignments for
+  `svc-contract-lifecycle` and `svc-decision-support`) in every existing tenant,
+  and an AFTER INSERT trigger on `roles` does the same for a new tenant when its
+  first role is created. Once per tenant: if the role already exists nothing is
+  added, so an administrator's later revocation stands. Rows are written under
+  their own tenant (FORCE RLS WITH CHECK holds for a non-superuser migration
+  role); history and `iam.assignment.granted` come from the existing triggers.
+  Down ends the assignments (`iam.assignment.revoked`), then removes the rows it
+  created, so up/down/up is symmetric (verified on a scratch DB).
+- Tests: `TestAC2_DecisionLogReadersProvisionedWithATenantsFirstRole`,
+  `TestAC2_AnEndedReaderAssignmentIsNotRegranted` (AUTHZ_IT_DSN, NOBYPASSRLS);
+  `TestAZ1IT_AssignmentKeysetTraversal` now scopes to its own role (a tenant's
+  first role also provisions the readers); the legacy setup list includes 000042.
+  Store suite 151 pass / 0 fail / 1 by-design skip. Applied live
+  (`migrate.py up --db authorization_svc`): 6 tenants provisioned or already held
+  the seed role.
+
+## 11 Nov (later): AC-2 — the platform's other service identities by migration
+
+- **000043_platform_service_identity_grants**, same pattern as 000042 (every
+  existing tenant now, each new tenant on its first role, once per role):
+  `SVC_POLICY_LEDGER` (svc-policy) and `SVC_WORKFLOW_LEDGER` (svc-workflow) with
+  `GOVERNANCE_DECISION_RECORD`; `SVC_ACCESS_CONTROL` (svc-access-control) with
+  `iam.assignment.revoke`, `iam.assignment.read`. A generic
+  `authz_provision_service_role` does the per-role work; the trigger skips roles
+  created by a migration. Role codes match the dev seed's, so the demo tenant is
+  untouched. Down ends the assignments, then removes the rows it created.
+- Test `TestAC2_PlatformServiceIdentitiesProvisionedWithATenantsFirstRole`
+  (exact action sets; a revoked writer is not re-granted). Store suite 152 pass
+  / 0 fail / 1 by-design skip; up/down/up on scratch; applied live (6 tenants).
+- `seed-demo-rbac.ps1` no longer grants any service identity; it verifies them
+  (svc-access-control from the store: /v1/authorize refuses the tenant id as a
+  legal entity, which is the scope the admin gate checks).

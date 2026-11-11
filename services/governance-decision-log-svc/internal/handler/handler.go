@@ -2,7 +2,6 @@ package handler
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -24,31 +23,18 @@ import (
 	svcenvelope "zoiko.io/governance-decision-log-svc/internal/envelope"
 	"zoiko.io/governance-decision-log-svc/internal/events"
 	svcmiddleware "zoiko.io/governance-decision-log-svc/internal/middleware"
-	apicontract "zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/governance-decision-log-svc/internal/policyclient"
 	"zoiko.io/governance-decision-log-svc/internal/store"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 )
 
-// DecisionStore is the narrow interface the handler depends on.
-// Allows the handler to be tested without a real database.
-type DecisionStore interface {
-	RecordDecision(ctx context.Context, rec store.DecisionRecord) (*domain.GovernanceDecision, bool, error)
-	FindByID(ctx context.Context, tenantID, decisionID string) (*domain.GovernanceDecision, error)
-	List(ctx context.Context, params store.ListParams) ([]*domain.GovernanceDecision, *domain.PaginationCursor, error)
+// DecisionStore is the interface the handler depends on: the store's whole
+// contract, so the handler can be tested without a real database.
+type DecisionStore = store.Store
 
-	// ── replay manifests (backlog item 34) ──────────────────────────────────
-	CreateReplayManifest(ctx context.Context, m *domain.ReplayManifest, event *store.ReplayEvent) (*domain.ReplayManifest, bool, error)
-	ListReplayManifestsByDecision(ctx context.Context, tenantID, decisionID string) ([]*domain.ReplayManifest, error)
-
-	// ── G-07 Evidence ledger ───────────────────────────────────────────────
-	VerifyChain(ctx context.Context, tenantID string) (valid bool, checked int, lastDecisionID string, err error)
-	ExportChain(ctx context.Context, tenantID string, encoder *json.Encoder) error
-	SealPackage(ctx context.Context, tenantID, principalID, packageID, lastDecisionID string) ([]byte, error)
-	GetPackage(ctx context.Context, tenantID, packageID string) (*domain.EvidencePackage, error)
-
-	// ── idempotency keys ──────────────────────────────────────────────────────
-	CheckIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (string, []byte, error)
-}
+// ActionSealEvidence is the authorization-svc action_type a caller must hold
+// (on the platform scope) to seal the evidence ledger into a package.
+const ActionSealEvidence = "GOVERNANCE_EVIDENCE_SEAL"
 
 // ActionRecordDecision is the authorization-svc action_type a caller must
 // hold to append to the governance ledger.
@@ -105,7 +91,7 @@ func tooLong(fields ...field) string {
 func writeTooLong(w http.ResponseWriter, r *http.Request, name string, fields []field) {
 	for _, f := range fields {
 		if f.name == name {
-			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: name+" exceeds "+strconv.Itoa(f.max)+" characters", Title: "Value Too Long"})
+			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: name + " exceeds " + strconv.Itoa(f.max) + " characters", Title: "Value Too Long"})
 			return
 		}
 	}
@@ -284,15 +270,21 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Use(svcmiddleware.TenantContext())
 	r.Post("/v1/decisions", h.CreateDecision)
 	r.Get("/v1/decisions", h.ListDecisions)
+	// Static before the {decision_id} pattern; chi prefers it either way.
+	r.Get("/v1/decisions/summary", h.DecisionSummary)
 	r.Get("/v1/decisions/{decision_id}", h.GetDecision)
+	r.Get("/v1/decisions/{decision_id}/evidence", h.GetDecisionEvidence)
 	r.Post("/v1/decisions/{decision_id}/replay", h.ReplayDecision)
 	r.Get("/v1/decisions/{decision_id}/replay-manifests", h.ListReplayManifests)
+	r.Get("/v1/replay-manifests", h.ListAllReplayManifests)
 
 	// G-07 Evidence ledger routes
 	r.Get("/v1/evidence/chain/verify", h.VerifyChain)
 	r.Get("/v1/evidence/chain/export", h.ExportChain)
+	r.Get("/v1/evidence/packages", h.ListPackages)
 	r.Post("/v1/evidence/packages/seal", h.SealPackage)
 	r.Get("/v1/evidence/packages/{package_id}", h.GetPackage)
+	r.Get("/v1/evidence/packages/{package_id}/verify", h.VerifyPackage)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -341,10 +333,83 @@ type createDecisionRequest struct {
 	EvaluationContext   json.RawMessage `json:"evaluation_context,omitempty"`
 	CorrelationID       string          `json:"correlation_id"`
 	// WorkflowInstanceID and CausationID are optional Event Linkage Keys
-	// (doctrine §3.3) — omit either when not known.
+	// (doctrine §3.3) — omit either when not known. CausationID defaults to
+	// the X-Causation-Id header; when both are sent they must agree. A
+	// follow-up decision (one resolving a PENDING or ESCALATED one) names the
+	// decision it follows up here.
 	WorkflowInstanceID *string    `json:"workflow_instance_id,omitempty"`
 	CausationID        *string    `json:"causation_id,omitempty"`
 	DecidedAt          *time.Time `json:"decided_at,omitempty"`
+
+	// Register fields (000016), all optional. Domain is a decision_domains
+	// code; when omitted the database classifies it from action_type.
+	Title               *string  `json:"title,omitempty"`
+	Summary             *string  `json:"summary,omitempty"`
+	Domain              *string  `json:"domain,omitempty"`
+	Priority            *string  `json:"priority,omitempty"`
+	Tags                []string `json:"tags,omitempty"`
+	RelatedObligationID *string  `json:"related_obligation_id,omitempty"`
+}
+
+// maxTags and maxTagLen bound the tag list (000016 chk_tags holds the count).
+const (
+	maxTags   = 10
+	maxTagLen = 32
+)
+
+// normaliseRegisterFields trims the register fields, upper-cases domain and
+// priority, and checks priority and tags. It answers the first problem, or "".
+func (req *createDecisionRequest) normaliseRegisterFields() string {
+	trim := func(p **string, upper bool) {
+		if *p == nil {
+			return
+		}
+		v := strings.TrimSpace(**p)
+		if upper {
+			v = strings.ToUpper(v)
+		}
+		if v == "" {
+			*p = nil
+			return
+		}
+		*p = &v
+	}
+	trim(&req.Title, false)
+	trim(&req.Summary, false)
+	trim(&req.Domain, true)
+	trim(&req.Priority, true)
+	trim(&req.RelatedObligationID, false)
+
+	if req.Priority != nil && !contains(domain.Priorities, *req.Priority) {
+		return "priority must be one of " + strings.Join(domain.Priorities, ", ")
+	}
+	seen := map[string]bool{}
+	tags := []string{}
+	for _, t := range req.Tags {
+		t = strings.TrimSpace(t)
+		if t == "" || seen[strings.ToLower(t)] {
+			continue
+		}
+		if len(t) > maxTagLen {
+			return "each tag must be at most " + strconv.Itoa(maxTagLen) + " characters"
+		}
+		seen[strings.ToLower(t)] = true
+		tags = append(tags, t)
+	}
+	if len(tags) > maxTags {
+		return "at most " + strconv.Itoa(maxTags) + " tags"
+	}
+	req.Tags = tags
+	return ""
+}
+
+func contains(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // missingField names the first required field that is empty. tenant_id is
@@ -460,8 +525,26 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Causation, by the same one-source rule: policy-svc's relay sends the
+	// causing decision as X-Causation-Id, the console in the body.
+	headerCausation := strings.TrimSpace(r.Header.Get("X-Causation-Id"))
+	switch {
+	case req.CausationID == nil || strings.TrimSpace(*req.CausationID) == "":
+		req.CausationID = nil
+		if headerCausation != "" {
+			req.CausationID = &headerCausation
+		}
+	case headerCausation != "" && *req.CausationID != headerCausation:
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "CAUSATION_MISMATCH", Detail: "body causation_id does not match the X-Causation-Id header", Title: "Causation Mismatch"})
+		return
+	}
+
 	if missing := req.missingField(); missing != "" {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "Field '"+missing+"' is required", Title: "Missing Required Field"})
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "Field '" + missing + "' is required", Title: "Missing Required Field"})
+		return
+	}
+	if problem := req.normaliseRegisterFields(); problem != "" {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: problem, Title: "Invalid Register Field"})
 		return
 	}
 
@@ -481,13 +564,19 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 		{"policy_version_id", ptr(req.PolicyVersionID), 64},
 		{"action_subject_type", ptr(req.ActionSubjectType), 64},
 		{"action_subject_id", ptr(req.ActionSubjectID), 64},
+		{"causation_id", ptr(req.CausationID), 128},
+		{"workflow_instance_id", ptr(req.WorkflowInstanceID), 128},
+		{"title", ptr(req.Title), 200},
+		{"summary", ptr(req.Summary), 2000},
+		{"domain", ptr(req.Domain), 32},
+		{"related_obligation_id", ptr(req.RelatedObligationID), 64},
 	}
 	if name := tooLong(limits...); name != "" {
 		writeTooLong(w, r, name, limits)
 		return
 	}
 	if !validLegalEntityID(req.LegalEntityID) {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "legal_entity_id must be a UUID or "+platformScopeSentinel, Title: "Invalid Legal Entity"})
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "legal_entity_id must be a UUID or " + platformScopeSentinel, Title: "Invalid Legal Entity"})
 		return
 	}
 
@@ -539,20 +628,32 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 		ActionSubjectType:   req.ActionSubjectType,
 		ActionSubjectID:     req.ActionSubjectID,
 		DecidedAt:           decidedAt,
-	}
-	event, err := events.DecisionRecorded(d)
-	if err != nil {
-		h.log.Error("CreateDecision: build event failed", zap.String("decision_id", d.DecisionID), zap.Error(err))
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusInternalServerError, Code: "INTERNAL", Detail: "could not build the decision event", Title: "Internal Error"})
-		return
+		Title:               req.Title,
+		Summary:             req.Summary,
+		Domain:              ptr(req.Domain),
+		Priority:            req.Priority,
+		Tags:                req.Tags,
+		RelatedObligationID: req.RelatedObligationID,
 	}
 
+	// The event is built from the STORED row, inside the write's transaction,
+	// so it carries the classified domain and the decision's chain link.
 	stored, created, err := h.store.RecordDecision(r.Context(), store.DecisionRecord{
 		Decision:       d,
 		IdempotencyKey: idempotencyKey,
 		BodyHash:       bodyHash,
-		Event:          event,
+		EventFor: func(s *domain.GovernanceDecision) ([]byte, error) {
+			return events.DecisionRecorded(*s)
+		},
 	})
+	if errors.Is(err, domain.ErrUnknownDomain) {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "UNKNOWN_DOMAIN", Detail: "domain is not a known decision domain code", Title: "Unknown Domain"})
+		return
+	}
+	if errors.Is(err, domain.ErrInvalidField) {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: err.Error(), Title: "Invalid Field"})
+		return
+	}
 	if errors.Is(err, domain.ErrIdempotencyKeyInUse) {
 		// A concurrent request with this key committed first; answer as its replay.
 		if !h.replayByIdempotencyKey(w, r, tenantID, idempotencyKey, bodyHash) {
@@ -570,7 +671,7 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !created && !sameDecision(d, stored, req.DecidedAt != nil) {
+	if !created && !sameDecision(d, stored, req.DecidedAt != nil, req.Domain != nil) {
 		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusConflict, Code: "DECISION_ID_CONFLICT", Detail: "decision_id is already recorded with different content", Title: "Decision ID Conflict"})
 		return
 	}
@@ -619,7 +720,17 @@ func (h *Handler) replayByIdempotencyKey(w http.ResponseWriter, r *http.Request,
 // sameDecision reports whether a repeat POST describes the decision already
 // stored. decided_at is compared only when the caller sent one: an omitted
 // decided_at defaults to receipt time, which differs on every retry.
-func sameDecision(req domain.GovernanceDecision, stored *domain.GovernanceDecision, decidedAtSupplied bool) bool {
+func sameDecision(req domain.GovernanceDecision, stored *domain.GovernanceDecision, decidedAtSupplied, domainSupplied bool) bool {
+	if domainSupplied && req.Domain != stored.Domain {
+		return false
+	}
+	if !sameOptional(req.Title, stored.Title) ||
+		!sameOptional(req.Summary, stored.Summary) ||
+		!sameOptional(req.Priority, stored.Priority) ||
+		!sameOptional(req.RelatedObligationID, stored.RelatedObligationID) ||
+		strings.Join(req.Tags, "\x00") != strings.Join(stored.Tags, "\x00") {
+		return false
+	}
 	if req.LegalEntityID != stored.LegalEntityID ||
 		req.ActorID != stored.ActorID ||
 		req.ActionType != stored.ActionType ||
@@ -857,7 +968,7 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if decision.ActionType != "APPROVAL_THRESHOLD" {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusNotImplemented, Code: "NOT_IMPLEMENTED", Detail: "Replay not implemented for action type: "+decision.ActionType, Title: "Replay Not Implemented"})
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusNotImplemented, Code: "NOT_IMPLEMENTED", Detail: "Replay not implemented for action type: " + decision.ActionType, Title: "Replay Not Implemented"})
 		return
 	}
 
@@ -870,7 +981,7 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 		policyVersionID = v
 	}
 	if policyVersionID == "" {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "Decision records no policy version to replay against (rule_basis: "+decision.RuleBasis+")", Title: "No Policy Version"})
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "Decision records no policy version to replay against (rule_basis: " + decision.RuleBasis + ")", Title: "No Policy Version"})
 		return
 	}
 
@@ -879,7 +990,7 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 	version, err := h.policyClient.GetPolicyVersion(r.Context(), tenantID, policyVersionID)
 	if err != nil {
 		if errors.Is(err, policyclient.ErrPolicyVersionNotFound) {
-			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusNotFound, Code: "NOT_FOUND", Detail: "Policy version no longer resolvable: "+policyVersionID, Title: "Policy Version Not Found"})
+			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusNotFound, Code: "NOT_FOUND", Detail: "Policy version no longer resolvable: " + policyVersionID, Title: "Policy Version Not Found"})
 			return
 		}
 		h.log.Error("ReplayDecision: policy-svc unavailable", zap.String("decision_id", decisionID), zap.String("correlation_id", correlationID), zap.Error(err))
@@ -959,10 +1070,22 @@ func replayApprovalThreshold(rulePayload, evaluationContext json.RawMessage) (st
 		return "", errors.New("policy version has invalid/missing threshold_amount")
 	}
 
+	// policy-svc's evidence relay records the whole evaluation, with the facts
+	// it was asked about under action_context; a caller writing its own record
+	// may put amount at the top. Both are the same fact.
 	var action struct {
-		Amount *float64 `json:"amount"`
+		Amount        *float64 `json:"amount"`
+		ActionContext *struct {
+			Amount *float64 `json:"amount"`
+		} `json:"action_context"`
 	}
-	if err := json.Unmarshal(evaluationContext, &action); err != nil || action.Amount == nil {
+	if err := json.Unmarshal(evaluationContext, &action); err != nil {
+		return "", errors.New("decision's evaluation_context is missing amount")
+	}
+	if action.Amount == nil && action.ActionContext != nil {
+		action.Amount = action.ActionContext.Amount
+	}
+	if action.Amount == nil {
 		return "", errors.New("decision's evaluation_context is missing amount")
 	}
 
@@ -1040,16 +1163,24 @@ func (h *Handler) ListReplayManifests(w http.ResponseWriter, r *http.Request) {
 //	rule_basis=policy-v3-sod     filter by rule_basis
 //	from=2024-01-01T00:00:00Z    decided_at lower bound (RFC3339, inclusive)
 //	to=2024-12-31T23:59:59Z      decided_at upper bound (RFC3339, inclusive)
+//	domain=FINANCE_TAX           filter by domain code
+//	status=APPROVED              APPROVED | PENDING | ESCALATED | DENIED | OTHER
+//	priority=HIGH                LOW | MEDIUM | HIGH | CRITICAL | UNSET
+//	jurisdiction=GB              filter by jurisdiction_context
+//	causation=<decision_id>      follow-ups of one decision
+//	workflow=<instance_id>       decisions of one workflow instance
+//	q=renewal                    free text, or a display reference GD-2026-0042
 //	limit=50                     page size, a positive integer (above 200 is capped to 200; default 50)
 //	offset=0                     zero-based page offset, a non-negative integer
+//	cursor=...                   keyset continuation (API-4); offset is then ignored
 //
 // Requires X-Tenant-Id and X-Principal-Id. Authorization is checked via
 // GOVERNANCE_DECISION_READ.
 //
 // Response:
 //
-//	200 → JSON array of decisions (may be empty), newest first
-//	400 → missing X-Tenant-Id, invalid from/to timestamp, invalid limit/offset
+//	200 → {records, total_count, next_cursor, limit, offset}, newest first
+//	400 → missing X-Tenant-Id, invalid from/to timestamp, invalid limit/offset/cursor, unknown status/priority
 //	401 → missing X-Principal-Id
 //	403 → not authorized to read decisions
 //	503 → store unavailable, authorization service unavailable
@@ -1073,11 +1204,35 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	params := store.ListParams{
-		TenantID:      tenantID,
-		ActorID:       q.Get("actor"),
-		LegalEntityID: q.Get("entity"),
-		ActionType:    q.Get("action"),
-		RuleBasis:     q.Get("rule_basis"),
+		TenantID:           tenantID,
+		ActorID:            q.Get("actor"),
+		LegalEntityID:      q.Get("entity"),
+		ActionType:         q.Get("action"),
+		RuleBasis:          q.Get("rule_basis"),
+		Domain:             strings.ToUpper(strings.TrimSpace(q.Get("domain"))),
+		Category:           strings.ToUpper(strings.TrimSpace(q.Get("status"))),
+		Priority:           strings.ToUpper(strings.TrimSpace(q.Get("priority"))),
+		Jurisdiction:       strings.TrimSpace(q.Get("jurisdiction")),
+		CausationID:        q.Get("causation"),
+		WorkflowInstanceID: q.Get("workflow"),
+		CorrelationID:      strings.TrimSpace(q.Get("correlation")),
+		Query:              q.Get("q"),
+	}
+	if params.Category != "" && !contains([]string{domain.CategoryApproved, domain.CategoryPending, domain.CategoryEscalated, domain.CategoryDenied, domain.CategoryOther}, params.Category) {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "status must be APPROVED, PENDING, ESCALATED, DENIED or OTHER", Title: "Invalid Status"})
+		return
+	}
+	if params.Priority != "" && params.Priority != "UNSET" && !contains(domain.Priorities, params.Priority) {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "priority must be LOW, MEDIUM, HIGH, CRITICAL or UNSET", Title: "Invalid Priority"})
+		return
+	}
+	if len(params.CorrelationID) > 64 {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "correlation exceeds 64 characters", Title: "Value Too Long"})
+		return
+	}
+	if len(params.Query) > 200 {
+		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "q exceeds 200 characters", Title: "Value Too Long"})
+		return
 	}
 	if v := q.Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
@@ -1109,13 +1264,15 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	// Cursor-based pagination (API-4): if cursor is provided, offset is ignored.
 	if v := q.Get("cursor"); v != "" {
 		c, err := domain.DecodePaginationCursor(v)
-		if err != nil {
+		if err == nil {
+			_, err = c.ParseDecidedAt()
+		}
+		if err != nil || c.DecisionID == "" {
 			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_CURSOR", Detail: "cursor is not valid", Title: "Invalid Cursor"})
 			return
 		}
 		params.Cursor = c
 	} else if v := q.Get("offset"); v != "" {
-		// Legacy offset-based pagination (deprecated, cursor preferred)
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
 			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "offset must be a non-negative integer", Title: "Invalid Offset"})
@@ -1124,7 +1281,7 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 		params.Offset = n
 	}
 
-	results, nextCursor, err := h.store.List(r.Context(), params)
+	res, err := h.store.List(r.Context(), params)
 	if err != nil {
 		h.log.Error("ListDecisions: store unavailable",
 			zap.String("correlation_id", correlationID),
@@ -1135,188 +1292,38 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Always return an array — never null.
-	if results == nil {
-		results = []*domain.GovernanceDecision{}
+	records := res.Records
+	if records == nil {
+		records = []*domain.GovernanceDecision{}
 	}
-
-	// Encode next cursor for the response
-	var nextCursorStr string
-	if nextCursor != nil {
-		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
-			nextCursorStr = encoded
+	nextCursor := ""
+	if res.NextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(res.NextCursor); err == nil {
+			nextCursor = encoded
 		}
 	}
 
 	type listResponse struct {
-		Records     []*domain.GovernanceDecision `json:"records"`
-		NextCursor  string                       `json:"next_cursor"`
-		TotalCount  int                          `json:"total_count"`
+		Records    []*domain.GovernanceDecision `json:"records"`
+		TotalCount int64                        `json:"total_count"`
+		NextCursor string                       `json:"next_cursor"`
+		Limit      int                          `json:"limit"`
+		Offset     int                          `json:"offset"`
 	}
 
-	resp := listResponse{
-		Records:    results,
-		NextCursor: nextCursorStr,
-		TotalCount: len(results),
+	// Decisions are immutable, so a page changes only when a decision is added:
+	// the count and the newest stored_at identify it.
+	etag := fmt.Sprintf(`"list-%d-%d"`, res.Total, len(records))
+	if len(records) > 0 {
+		etag = fmt.Sprintf(`"list-%d-%d-%s"`, res.Total, len(records), records[0].RecordedAt.UTC().Format(time.RFC3339Nano))
 	}
-
-	// List endpoint: ETag based on count and last item's stored_at for cache validation.
-	var etag string
-	if len(results) > 0 {
-		etag = fmt.Sprintf(`"list-%d-%s"`, len(results), results[0].RecordedAt.UTC().Format(time.RFC3339Nano))
-	} else {
-		etag = `"list-0"`
-	}
-	writeJSONWithETag(w, http.StatusOK, resp, etag)
-}
-
-// ── G-07 Evidence ledger handlers ────────────────────────────────────────
-
-// VerifyChain handles GET /v1/evidence/chain/verify.
-// Verifies the hash chain integrity for the caller's tenant.
-// Returns 200 with {valid: true, checked: N, last_decision_id: "..."}
-// or 503 if store unavailable.
-func (h *Handler) VerifyChain(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	if tenantID == "" {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "TENANT_SCOPE_MISSING", Detail: "X-Tenant-Id is required", Title: "Tenant Scope Missing"})
-		return
-	}
-	principalID, ok := h.readPrincipal(w, r)
-	if !ok {
-		return
-	}
-	// Authorization: need GOVERNANCE_DECISION_READ on platform scope
-	if !h.authorizeReadOf(w, r, principalID, "") {
-		return
-	}
-
-	valid, checked, lastID, err := h.store.VerifyChain(r.Context(), tenantID)
-	if err != nil {
-		h.log.Error("VerifyChain failed", zap.String("tenant_id", tenantID), zap.Error(err))
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Detail: "Store unavailable", Title: "Service Unavailable"})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"valid":            valid,
-		"decisions_checked": checked,
-		"last_decision_id": lastID,
-	})
-}
-
-// ExportChain handles GET /v1/evidence/chain/export.
-// Exports the hash chain for the caller's tenant as a JSON stream.
-// Each line is a decision with its prev_hash and curr_hash.
-// Authorization: GOVERNANCE_DECISION_READ on platform scope.
-func (h *Handler) ExportChain(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	if tenantID == "" {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "TENANT_SCOPE_MISSING", Detail: "X-Tenant-Id is required", Title: "Tenant Scope Missing"})
-		return
-	}
-	principalID, ok := h.readPrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorizeReadOf(w, r, principalID, "") {
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	encoder := json.NewEncoder(w)
-	err := h.store.ExportChain(r.Context(), tenantID, encoder)
-	if err != nil {
-		h.log.Error("ExportChain failed", zap.String("tenant_id", tenantID), zap.Error(err))
-		// Can't change status after writing header, just log
-		return
-	}
-}
-
-// SealPackage handles POST /v1/evidence/packages/seal.
-// Creates a sealed package (Merkle root snapshot) for the caller's tenant.
-// Requires WORKFLOW_LEDGER_PRINCIPAL_ID authorization.
-// Body: { "package_id": "...", "last_decision_id": "..." }
-// Authorization: WORKFLOW_LEDGER_PRINCIPAL_ID (checked via authz service)
-func (h *Handler) SealPackage(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	if tenantID == "" {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "TENANT_SCOPE_MISSING", Detail: "X-Tenant-Id is required", Title: "Tenant Scope Missing"})
-		return
-	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	// Check WORKFLOW_LEDGER_PRINCIPAL_ID authorization
-	if err := h.authz.CheckAllowed(r.Context(), principalID, h.authzPlatformScopeID, "WORKFLOW_LEDGER_PRINCIPAL_ID"); err != nil {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusForbidden, Code: "AUTHORIZATION_DENIED", Detail: "Principal not authorized to seal packages", Title: "Authorization Denied"})
-		return
-	}
-
-	var req struct {
-		PackageID       string `json:"package_id"`
-		LastDecisionID  string `json:"last_decision_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: err.Error(), Title: "Invalid JSON"})
-		return
-	}
-	if req.PackageID == "" || req.LastDecisionID == "" {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "INVALID_REQUEST", Detail: "package_id and last_decision_id are required", Title: "Invalid Request"})
-		return
-	}
-
-	merkleRoot, err := h.store.SealPackage(r.Context(), tenantID, principalID, req.PackageID, req.LastDecisionID)
-	if err != nil {
-		h.log.Error("SealPackage failed", zap.String("tenant_id", tenantID), zap.Error(err))
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Detail: "Store unavailable", Title: "Service Unavailable"})
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"package_id":  req.PackageID,
-		"merkle_root":  fmt.Sprintf("%x", merkleRoot),
-		"sealed_at":   time.Now().UTC().Format(time.RFC3339),
-		"sealed_by":   principalID,
-	})
-}
-
-// GetPackage handles GET /v1/evidence/packages/{package_id}.
-// Retrieves a sealed package by ID.
-// Authorization: GOVERNANCE_DECISION_READ on the package's tenant.
-func (h *Handler) GetPackage(w http.ResponseWriter, r *http.Request) {
-	packageID := chi.URLParam(r, "package_id")
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	if tenantID == "" {
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusBadRequest, Code: "TENANT_SCOPE_MISSING", Detail: "X-Tenant-Id is required", Title: "Tenant Scope Missing"})
-		return
-	}
-	principalID, ok := h.readPrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	// First get the package to know its tenant
-	pkg, err := h.store.GetPackage(r.Context(), tenantID, packageID)
-	if err != nil {
-		if errors.Is(err, domain.ErrPackageNotFound) {
-			apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusNotFound, Code: "NOT_FOUND", Detail: "Package not found", Title: "Package Not Found"})
-			return
-		}
-		h.log.Error("GetPackage failed", zap.String("package_id", packageID), zap.Error(err))
-		apicontract.WriteProblem(w, r, apicontract.Problem{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Detail: "Store unavailable", Title: "Service Unavailable"})
-		return
-	}
-
-	// Authorization: must be able to read the package's tenant
-	if !h.authorizeReadOf(w, r, principalID, pkg.TenantID) {
-		return
-	}
-
-	writeJSON(w, http.StatusOK, pkg)
+	writeJSONWithETag(w, http.StatusOK, listResponse{
+		Records:    records,
+		TotalCount: res.Total,
+		NextCursor: nextCursor,
+		Limit:      res.Limit,
+		Offset:     res.Offset,
+	}, etag)
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.
@@ -1331,7 +1338,6 @@ func writeJSONWithETag(w http.ResponseWriter, status int, v any, version string)
 	w.Header().Set("ETag", version)
 	writeJSON(w, status, v)
 }
-
 
 // maxRequestBytes caps a JSON request body. Reading until EOF with no cap lets
 // a single request make the service allocate whatever the client is willing to

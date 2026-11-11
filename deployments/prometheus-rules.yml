@@ -1219,3 +1219,83 @@ groups:
           description: >-
             Self-approval, own-object, cooling-window or static-conflict attempts above the usual rate (ZS-IAM-001 §26 SoD
             alerts). Read the access-decision log for decision_basis LIKE 'sod:%' to see who and what.
+
+  # ---------------------------------------------------------------------------
+  # D2-2 governance-decision-log-svc — the governance evidence ledger
+  # ---------------------------------------------------------------------------
+  # Every decision commits with its outbox event; a stopped relay is invisible
+  # from the request path (writes keep answering 201) while the evidence
+  # stream to the estate stops. These alert on that, and on the ledger being
+  # unable to accept evidence at all.
+  - name: governance-decision-log
+    rules:
+      - alert: GovernanceLedgerRelayStalled
+        # The oldest unpublished event is the relay's lag. A broker restart
+        # produces a short spike, which the outbox makes harmless.
+        expr: outbox_oldest_pending_seconds{service="governance-decision-log-svc"} > 300
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "governance-decision-log-svc: oldest unpublished decision event is {{ $value | humanizeDuration }} old"
+          description: >-
+            governance.decision.recorded / .replayed events are durable in the outbox but not reaching Kafka.
+            Check KAFKA_BROKERS and the relay's last_error (GET /v1/decisions/{id}/evidence shows it per decision).
+            Never delete outbox rows to clear it.
+
+      - alert: GovernanceLedgerOutboxBacklog
+        expr: outbox_pending_events{service="governance-decision-log-svc"} > 1000
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "governance-decision-log-svc: {{ $value }} decision events waiting in the outbox"
+          description: >-
+            The relay is behind. Evidence is not lost, but downstream consumers (audit, evidence manifest) are stale.
+
+      - alert: GovernanceLedgerNotReady
+        expr: readiness_up{service="governance-decision-log-svc"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "governance-decision-log-svc cannot reach its database"
+          description: >-
+            Callers (policy-svc, workflow-svc) keep their decisions in their own outboxes and retry, but no governance
+            evidence is being recorded or read.
+
+      - alert: GovernanceLedgerWriteErrors
+        expr: sum(rate(http_requests_total{service="governance-decision-log-svc", route="/v1/decisions", method="POST", status_code=~"5.."}[5m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "governance-decision-log-svc is refusing decision writes with 5xx"
+          description: >-
+            503 means the store or authorization-svc is unavailable (fail closed). Writers retry; check readiness
+            and authorization-svc.
+
+      - alert: GovernanceLedgerChainBroken
+        # The scheduled sealer re-verifies each tenant's hash chain before it
+        # seals and refuses a broken one: a stored decision was altered behind
+        # the append-only triggers. Never "fixed" by re-sealing.
+        expr: increase(gdl_evidence_seal_total{service="governance-decision-log-svc", outcome="chain_broken"}[1h]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "governance-decision-log-svc: a tenant's evidence chain does not verify; scheduled sealing refused"
+          description: >-
+            GET /v1/evidence/chain/verify names the first broken link. Treat as a security incident: preserve the
+            database, compare against the last sealed package and the exported bundles.
+
+      - alert: GovernanceLedgerSealingFailing
+        expr: increase(gdl_evidence_seal_total{service="governance-decision-log-svc", outcome="error"}[2h]) > 0
+          and increase(gdl_evidence_seal_total{service="governance-decision-log-svc", outcome="sealed"}[2h]) == 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "governance-decision-log-svc: scheduled evidence sealing has failed for two hours"
+          description: >-
+            Decisions keep recording but are not being sealed into GOV-07 packages (EVIDENCE_SEAL_INTERVAL).
+            Check the store and the service log ("scheduled seal failed").

@@ -51,6 +51,14 @@ type stubStore struct {
 	listManifestsErr       error
 	listManifestsGotTenant string
 
+	summaryGot   store.SummaryParams
+	summaryErr   error
+	verifyResult *domain.ChainVerification
+	sealGot      store.SealRequest
+	sealErr      error
+	sealed       *domain.EvidencePackage
+	seals        int
+
 	// idempotency keys
 	idempotencyKeys map[string]struct {
 		decisionID string
@@ -86,6 +94,19 @@ func (s *stubStore) RecordDecision(_ context.Context, rec store.DecisionRecord) 
 	}
 	stored := d
 	stored.RecordedAt = time.Now().UTC()
+	stored.ChainSeq = int64(s.inserts)
+	if stored.Domain == "" {
+		stored.Domain = "OTHER"
+	}
+	// The real store builds the event from the stored row inside the write's
+	// transaction; record what it would have queued.
+	if rec.EventFor != nil {
+		ev, err := rec.EventFor(&stored)
+		if err != nil {
+			return nil, false, err
+		}
+		s.gotRec.Event = ev
+	}
 	s.findByIDResult = &stored
 	return &stored, true, nil
 }
@@ -98,9 +119,20 @@ func (s *stubStore) FindByID(_ context.Context, tenantID, decisionID string) (*d
 	return s.findByIDResult, s.findByIDErr
 }
 
-func (s *stubStore) List(_ context.Context, params store.ListParams) ([]*domain.GovernanceDecision, *domain.PaginationCursor, error) {
+func (s *stubStore) List(_ context.Context, params store.ListParams) (*store.ListResult, error) {
 	s.listGotParams = params
-	return s.listResult, nil, s.listErr
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return &store.ListResult{Records: s.listResult, Total: int64(len(s.listResult)), Limit: 50}, nil
+}
+
+func (s *stubStore) Summary(_ context.Context, p store.SummaryParams) (*domain.DecisionSummary, error) {
+	s.summaryGot = p
+	if s.summaryErr != nil {
+		return nil, s.summaryErr
+	}
+	return &domain.DecisionSummary{From: p.From, To: p.To}, nil
 }
 
 // ── replay manifests ─────────────────────────────────────────────────────────
@@ -132,19 +164,57 @@ func (s *stubStore) CheckIdempotencyKey(_ context.Context, _, idempotencyKey str
 
 // ── G-07 Evidence ledger ───────────────────────────────────────────────────
 
-func (s *stubStore) VerifyChain(_ context.Context, _ string) (bool, int, string, error) {
-	return true, 0, "", nil
+func (s *stubStore) ListReplayManifests(_ context.Context, p store.ReplayListParams) ([]*domain.ReplayManifest, int64, error) {
+	return s.listManifestsResult, int64(len(s.listManifestsResult)), s.listManifestsErr
 }
 
-func (s *stubStore) ExportChain(_ context.Context, _ string, _ *json.Encoder) error {
-	return nil
+func (s *stubStore) DecisionEvidence(_ context.Context, _, decisionID string) (*domain.DecisionEvidence, error) {
+	return &domain.DecisionEvidence{DecisionID: decisionID, HashValid: true, PrevLinkValid: true, Events: []domain.OutboxEvent{}}, nil
 }
 
-func (s *stubStore) SealPackage(_ context.Context, _, _, _, _ string) ([]byte, error) {
-	return []byte{0x00}, nil
+func (s *stubStore) VerifyChain(_ context.Context, _ string) (*domain.ChainVerification, error) {
+	if s.verifyResult != nil {
+		return s.verifyResult, nil
+	}
+	return &domain.ChainVerification{Valid: true, Packages: []domain.PackageCheck{}}, nil
 }
 
-func (s *stubStore) GetPackage(_ context.Context, _, _ string) (*domain.EvidencePackage, error) {
+func (s *stubStore) ExportChain(_ context.Context, tenantID string) (*store.ChainExport, error) {
+	return &store.ChainExport{TenantID: tenantID, ExportedAt: time.Now().UTC(), Verification: &domain.ChainVerification{Valid: true}}, nil
+}
+
+func (s *stubStore) SealPackage(_ context.Context, req store.SealRequest) (*domain.EvidencePackage, bool, error) {
+	s.sealGot = req
+	s.seals++
+	if s.sealErr != nil {
+		return nil, false, s.sealErr
+	}
+	if s.sealed != nil && s.sealed.IdempotencyKey == req.IdempotencyKey {
+		return s.sealed, false, nil
+	}
+	s.sealed = &domain.EvidencePackage{PackageID: "11111111-2222-3333-4444-555555555555", TenantID: req.TenantID, PackageSeq: 1, ToSeq: 3,
+		SealedBy: req.PrincipalID, IdempotencyKey: req.IdempotencyKey, RequestHash: req.RequestHash}
+	return s.sealed, true, nil
+}
+
+func (s *stubStore) ListPackages(_ context.Context, _ string) ([]*domain.EvidencePackage, error) {
+	if s.sealed == nil {
+		return nil, nil
+	}
+	return []*domain.EvidencePackage{s.sealed}, nil
+}
+
+func (s *stubStore) GetPackage(_ context.Context, _, id string) (*domain.EvidencePackage, error) {
+	if s.sealed != nil && s.sealed.PackageID == id {
+		return s.sealed, nil
+	}
+	return nil, domain.ErrPackageNotFound
+}
+
+func (s *stubStore) VerifyPackage(_ context.Context, _, id string) (*domain.PackageCheck, error) {
+	if s.sealed != nil && s.sealed.PackageID == id {
+		return &domain.PackageCheck{PackageID: id, Valid: true}, nil
+	}
 	return nil, domain.ErrPackageNotFound
 }
 
@@ -467,8 +537,8 @@ func TestListDecisions_200_Empty(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	// New response format: {"records":[],"next_cursor":"","total_count":0}
-	expected := `{"records":[],"next_cursor":"","total_count":0}`
+	// New response format: {"records":[],"total_count":0,"next_cursor":"","limit":50,"offset":0}
+	expected := `{"records":[],"total_count":0,"next_cursor":"","limit":50,"offset":0}`
 	if strings.TrimSpace(rr.Body.String()) != expected {
 		t.Errorf("expected %s, got %q", expected, rr.Body.String())
 	}
@@ -920,6 +990,7 @@ var gatedRoutes = []struct {
 	body string
 }{
 	{name: "record decision", path: "/v1/decisions", body: `{"decision_id":"d-1","tenant_id":"` + testTenant + `","legal_entity_id":"55555555-5555-5555-5555-555555555555","actor_id":"a-1","action_type":"APPROVE","outcome":"GRANTED","rule_basis":"policy:APPROVAL_5K","correlation_id":"corr-1"}`},
+	{name: "seal evidence", path: "/v1/evidence/packages/seal", body: `{"label":"month end"}`},
 }
 
 // TestGatedRoutes_401_WithoutPrincipal — this service shipped with no gate of
@@ -1156,7 +1227,11 @@ func TestReplayDecision_MissingReplayedByPrincipal400(t *testing.T) {
 
 // ── read authorization (audit A7) ────────────────────────────────────────────
 
-var readRoutes = []string{"/v1/decisions", "/v1/decisions/dec-1", "/v1/decisions/dec-1/replay-manifests"}
+var readRoutes = []string{
+	"/v1/decisions", "/v1/decisions/dec-1", "/v1/decisions/dec-1/replay-manifests",
+	"/v1/decisions/summary", "/v1/decisions/dec-1/evidence", "/v1/replay-manifests",
+	"/v1/evidence/chain/verify", "/v1/evidence/chain/export", "/v1/evidence/packages",
+}
 
 // TestReadRoutes_401_403_503 — every GET used to gate on the tenant header only.
 func TestReadRoutes_401_403_503(t *testing.T) {

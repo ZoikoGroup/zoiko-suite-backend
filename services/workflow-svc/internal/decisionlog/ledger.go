@@ -54,6 +54,16 @@ func NewLedgerDeliverer(baseURL, principalID string) *LedgerDeliverer {
 	}
 }
 
+// NewLedgerDelivererWith is NewLedgerDeliverer over a caller-supplied client:
+// workflow-svc's mTLS workload identity (identity-envelope/mtlsclient), so the
+// relay reaches governance-decision-log-svc's peer listener as a verified
+// workload. The relay acts for no signed-in person and carries no envelope;
+// under that service's IDENTITY_VERIFY=require its certificate is the only
+// identity it has.
+func NewLedgerDelivererWith(baseURL, principalID string, client *http.Client) *LedgerDeliverer {
+	return &LedgerDeliverer{baseURL: strings.TrimRight(baseURL, "/"), principalID: principalID, http: client}
+}
+
 type ledgerRequest struct {
 	DecisionID          string          `json:"decision_id"`
 	LegalEntityID       string          `json:"legal_entity_id"`

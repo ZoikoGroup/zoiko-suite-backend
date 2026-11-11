@@ -7,30 +7,32 @@ CONTEXT.md for the spec/context).
 
 ## Current status
 
-**Phase:** Phase 1 (write path) merged to `main` (PR #14). Phase 2
-(query surface) and Phase 3 (close the loop — events, CI, Dockerfile,
-README) both built, verified, and pushed to `shashi-changes` (mirrors
-the Phase 1 flow — commits landed on the personal working branch
-rather than per-phase feature branches). A full line-by-line audit
-against `CONTEXT.md` found and fixed one real gap
-(`domain.ErrStoreUnavailable` now actually wired into `PgStore`) — the
-service is now fully spec-compliant. PR into `main` not yet opened (to
-be opened manually).
+**11 Nov 2026 (evening) — every open item closed and verified live
+(uncommitted).** The three decision-log readers call :8450 over mTLS (F07);
+the F11 decisions are recorded and built; the :8450 listener rotates its
+certificate and checks the CRL; sealing runs on a schedule. Suite 213 pass /
+0 fail / 0 skip (store suite on Postgres); dependency e2e 121/121 in
+`IDENTITY_VERIFY=require`; scheduled-seal e2e 4/4; `scripts/audit.sh` 43/0;
+4 mutants killed. Next: commit, then an independent VC-1 pass on the rows this
+session changed (see "Next steps").
 
 ## S0 Baseline Matrix
 
-| Feature Row | Route / Consumer | Test | Console Tab | Status |
-|-------------|------------------|------|-------------|--------|
-| D2-2.F01 | POST /v1/decisions | TestCreateDecision_* | Decisions | 🔵 Built |
-| D2-2.F02 | GET /v1/decisions, GET /v1/decisions/{id} | TestListDecisions_*, TestGetDecision_* | Decisions | 🟡 Partial (needs cursor paging) |
-| D2-2.F03 | POST /v1/decisions/{id}/replay, GET /v1/decisions/{id}/replay-manifests | TestReplayDecision_*, TestListReplayManifests_* | Replays | 🔵 Built |
-| D2-2.F04 | Outbox: governance.decision.recorded/.replayed | TestOutbox_* | — | 🔵 Built |
-| D2-2.F05 | jurisdiction_context, column guards, RFC 9457 | TestCreateDecision_* | — | 🔵 Built |
-| D2-2.F06 | Read authorization (GOVERNANCE_DECISION_READ) | TestAuthorizeRead_* | Decisions | 🟡 Partial (warn mode) |
-| D2-2.F09 | G-07 Evidence ledger | — | Evidence chain | ❌ Missing |
-| D2-2.F10 | Workflow ledger relay | — | Evidence chain | ❌ Missing |
-| D2-2.F12 | Cursor paging (API-4) on GET /v1/decisions | TestListDecisions_CursorPaging | Decisions | ❌ Missing |
-| D2-2.F13 | Dependency E2E, console v2.0 | e2e-governance-decision-log-deps.py | All | ❌ Missing |
+| Feature Row | Route / Consumer | Test | Console | Status |
+|-------------|------------------|------|---------|--------|
+| D2-2.F01 | POST /v1/decisions (+ register fields, X-Causation-Id) | TestCreateDecision_*, TestCreateDecision_RegisterFieldsNormalisedStoredAndEvented, e2e "record:*" | New Decision, Record Outcome | 🔵 Built + live |
+| D2-2.F02 | GET /v1/decisions (facets, q, total_count, offset+cursor), GET /v1/decisions/{id}, GET /v1/decisions/summary | TestListDecisions_*, TestList_RegisterFacetsTotalsSearchAndCursor, TestSummary_CountsWindowsAndFacets | KPIs, panels, register, drawer | 🔵 Built + live |
+| D2-2.F03 | POST …/{id}/replay, GET …/{id}/replay-manifests, GET /v1/replay-manifests | TestReplayDecision_*, TestReplayDecision_ReadsPolicySvcActionContext, TestListReplayManifests_TenantWideWithDecisionReference, e2e "replay:*" | Replays tab, drawer Evidence pane | 🔵 Built + live (policy-svc) |
+| D2-2.F04 | Outbox → Kafka `zoiko.governance.events` | TestOutbox*, e2e "kafka:*" | Audit Trail pane | 🔵 Proven against the local broker |
+| D2-2.F05 | jurisdiction_context, width guards, RFC 9457 | TestCreateDecision_400_* | — | 🔵 |
+| D2-2.F07 | Readers on mTLS: contract-lifecycle-svc (svc-contract-lifecycle), decision-support-svc (svc-decision-support), evidence-manifest-svc (signed-in user) | governancelog client tests (3 services), e2e "F07:*" + "F07 live:*" (contract approve/deny, recommendation from precedent, manifest snapshot) | — | 🔵 Built + live |
+| D2-2.F06 | Read authorization (GOVERNANCE_DECISION_READ), compose default enforce | TestReadRoutes_401_403_503, e2e "read authz enforced" | all reads | 🔵 enforce |
+| D2-2.F08 | Identity: compose `IDENTITY_VERIFY=require`; envelope (JWKS) or peer workload over mTLS :8450 (IDENTITY_PEERS); authz calls over mTLS; certificate rotation + CRL check | TestProvision_*, TestServerRequiresAVerifiedClientCertificate, TestRotation_*, TestRevocation_*, mtlsclient tests; e2e 121/121 in require (revoked peer refused) | console sends the envelope | 🔵 Built + live (require) |
+| D2-2.F09 | G-07: hash chain (DB trigger), verify, seal (RFC 6962 Merkle), package verify, export bundle; scheduled sealing (EVIDENCE_SEAL_INTERVAL) | ledger tests (RFC 6962 vectors), TestLedger_*, TestSealer_*, TestRunOnce_*, e2e "offline:*", --scheduled-seal 4/4 | Evidence chain tab | 🔵 Built + live |
+| D2-2.F10 | workflow-svc ledger relay over mTLS as svc-workflow | e2e "workflow relay: *" (live, require mode) | Register (workflow filter) | 🔵 Built + live |
+| D2-2.F11 | Decisions 11 Nov: EV-REGULATED / COMPLIANCE_EVIDENCE; `?correlation=` (audit); decision_id = evidence_id; GOV-07 owns; purpose on reads; C3 canonical names alongside | TestList_AuditDimensionIsTheCorrelationID, TestC3_*, TestOutbox_WireAndCanonicalNamesQueuedTogether, e2e "F11:*", "C3/R9:*" | — | 🔵 Built + live |
+| D2-2.F12 | Cursor paging (API-4) | TestList_RegisterFacetsTotalsSearchAndCursor | — | 🔵 |
+| D2-2.F13 | Dependency E2E + console v2.0 + UI E2E | deployments/scripts/e2e-governance-decision-log-deps.py (121/121, 11 Nov evening), tests/e2e/console/governance.spec.ts (5/5, 11 Nov), scripts/audit.sh (43/0) | /admin/governance | 🔵 |
 
 ## Roadmap — three phases, three branches, three PRs into `main`
 
@@ -255,23 +257,190 @@ on its own. Full technical detail for each phase is in CONTEXT.md
   new service in Phase 1 "Sovereign Spine" (see
   `docs/architecture/06-blueprint.md`).
 
+### 2026-11-11 — Gaps closed, local E2E complete
+
+What was wrong, and what replaced it:
+- **000016 (G-07) could not be applied anywhere**: it referenced a `tenants`
+  table this DB does not have, UPDATEd rows with the append-only trigger live,
+  concatenated bytea with text, and chained in caller-supplied `decided_at`
+  order. Rewritten (never recorded as applied anywhere): `chain_seq` /
+  `prev_hash` / `curr_hash` set by a BEFORE INSERT trigger under a per-tenant
+  advisory lock (no caller can supply hashes; concurrent appends serialise);
+  `curr_hash = sha256(prev || gdl_canonical(row))` where the canonical form is
+  the row's jsonb text; backfill in storage order; `evidence_packages`
+  (append-only, RLS forced) with an RFC 6962 Merkle root and a package hash
+  chaining packages. Also the register fields (title, summary, domain,
+  priority, tags, related_obligation_id) and the data-driven
+  `decision_domains` / `decision_domain_rules` / `decision_outcome_categories`.
+- **VerifyChain checked only hash lengths; SealPackage authorized on the string
+  "WORKFLOW_LEDGER_PRINCIPAL_ID" as an action, ignored the caller's package id,
+  hashed `prev || last_decision_id` (not a Merkle tree) and counted leaves by
+  string-comparing ids; GetPackage authorized on the tenant id as a legal
+  entity; ExportChain wrote 200 before reading.** All rebuilt: full link +
+  package re-computation, `GOVERNANCE_EVIDENCE_SEAL` on the platform scope,
+  idempotent seal (Idempotency-Key), chain verified before sealing (409
+  CHAIN_BROKEN), bundle built before the first byte.
+- **List**: `total_count` was the page length; the cursor dropped microseconds
+  (rows skipped/repeated) and was never issued on page one. Now a real count,
+  RFC3339Nano keyset cursor on every page, stable `decided_at, decision_id`
+  order, and facets (domain, status, priority, jurisdiction, causation,
+  workflow, q incl. `GD-<year>-<n>`).
+- **New routes**: `GET /v1/decisions/summary`, `GET /v1/decisions/{id}/evidence`,
+  `GET /v1/replay-manifests`, `GET /v1/evidence/packages`,
+  `GET /v1/evidence/packages/{id}/verify`.
+- **Found by the live e2e**: replay read `amount` only at the top level, but
+  policy-svc's relay nests it under `action_context` (every policy decision
+  answered 400); the replay-history column list split `COALESCE(x, '')`.
+  Both fixed with regression tests.
+- Compose `DECISION_LOG_READ_AUTHZ` now `${…:-enforce}`; seed grants READ,
+  REPLAY and GOVERNANCE_EVIDENCE_SEAL; four alert rules
+  (`governance-decision-log` group, promtool-checked); `scripts/audit.sh` and
+  the dependency e2e rewritten (both previously checked tables, metrics and
+  statuses that do not exist).
+
+Verified 11 Nov: unit + store suites (incl. tamper and full-rewrite detection
+as the runtime role) green in golang:1.26; `e2e-governance-decision-log-deps.py`
+64/64 (Kafka delivery, policy-svc relay as svc-policy, replay manifest,
+offline re-verification of every link and Merkle root in the bundle);
+`scripts/audit.sh` 40/0 (Prometheus scrape SKIPPED: not on the local stack);
+console UI e2e 5/5 plus a 24-step drive (record, follow-up, filters, drawer
+panes, verify, seal, package verify, both downloads, full record).
+
+### 2026-11-11 (later) — X5: identity gate ready for `require`
+
+- **mTLS listener** (`MTLS_ENABLED`, :8450): the platform CA client certificate
+  is required; the identity gate admits `IDENTITY_PEERS` (default
+  `policy-svc,workflow-svc`) as peer workloads vouching for X-Principal-Id.
+  One workload identity serves the listener and the calls to
+  authorization-svc's :8449 (`AUTHZ_MTLS_ENABLED`, now on in compose).
+- **Fixed**: provisioning sent no bootstrap token (register M-01), so
+  `AUTHZ_MTLS_ENABLED=true` could never start; and over mTLS the authz hop
+  forwarded the caller's `X-Workload-Id` (policy-svc) on this service's
+  certificate → `workload_identity_mismatch` 403 → 503 on every peer write
+  (hidden in warn mode by the 5 s decision cache). The hop now names this
+  service.
+- compose: bootstrap tokens for governance-decision-log-svc, policy-svc and
+  workflow-svc; port 8450; `IDENTITY_PEERS`.
+- Verified: e2e 73/73 (warn), `--require` 9/9 (headers alone 401, verified
+  envelope 200, tampered 401, no client cert refused at the handshake,
+  policy-svc peer 201 as svc-policy, non-peer certificate 401); audit.sh
+  41/0 with Prometheus scraping and the four rules healthy; console UI 5/5.
+- Under `require`, policy-svc's relay (plain HTTP, no envelope) is refused
+  401 and retries durably — it must call :8450 with its certificate first
+  (policy-svc's change). Compose stays `warn` until then.
+
+### 2026-11-11 (latest) — VC-1 closed (independence waived by the user)
+
+- All 13 rows ✅. The user waived the independent pass for the 9 rows built in
+  the verifying session. Re-run for it: suites 215/0/0 (+ readers, policy,
+  workflow, identity-envelope), migrations up/down/up, 6 mutants killed
+  (revocation lookup, seal-without-verify, correlation predicate, manifest
+  paging, canonical alias, reader principal), live e2e 128/128, scheduled seal
+  4/4, audit.sh live 40/40, governance.spec.ts 5/5.
+- Writers' production grants: authorization-svc 000043 (svc-policy,
+  svc-workflow; svc-access-control too); R5: access-control 000050/000051.
+- Console: Trend Over Time y-axis labels were clipped (negative left margin)
+  and the register's last column overflowed at 1536 px; both fixed.
+
+### 2026-11-11 (late) — event schemas registered, reader grants by migration, console re-run
+
+- **Schemas (R9).** `schemas/governance.decision.recorded.v1.json` and
+  `.replayed.v1.json` are the envelope contracts; TestR9_* holds them to what
+  the producer emits (both names, nulls included) and to the registry's shape
+  rules. `deployments/scripts/register-governance-decision-log-schemas.py`
+  registers all four names (wire + canonical) with fixed Idempotency-Keys and
+  reads each back; run twice on the stack: version 1 each, unchanged.
+- **Reader grants by migration (AC-2).** authorization-svc 000042 provisions
+  `SVC_DECISION_LOG_READER` (READ only) for `svc-contract-lifecycle` and
+  `svc-decision-support` in every tenant, and in each new tenant on its first
+  role (trigger), once; `seed-demo-rbac.ps1` now only verifies it.
+- **Console.** governance.spec.ts 5/5 against the built console on :3100
+  (OIDC sign-in; `deployments/identity/oidc-clients.local.json` now also
+  registers the :3100 callback the console tests use).
+- Verified: GDL suite 215/0/0 (DB); authorization store suite 151/0/1;
+  dependency e2e 128/128 (+ "R9:*" registry and live-event checks).
+
+### 2026-11-11 (evening) — F07 readers, F11 decisions, :8450 hardening, scheduled sealing
+
+- **F07 — the three readers.** Each now calls `https://governance-decision-log-svc:8450`
+  with its own certificate (`identity-envelope/mtlsclient`, own bootstrap
+  token; keygen loop and `IDENTITY_PEERS` extended) and the full read envelope
+  with a purpose. contract-lifecycle-svc and decision-support-svc read as
+  `svc-contract-lifecycle` / `svc-decision-support` (READ granted by
+  `seed-demo-rbac.ps1`, role SVC_DECISION_LOG_READER); evidence-manifest-svc
+  vouches for the signed-in user. Found while doing it: decision-support and
+  evidence-manifest decoded the list as a bare array, so every recommendation
+  silently degraded to NO_HISTORY and every range manifest failed; both now
+  decode the page, and evidence-manifest follows `next_cursor` (fails closed
+  past 100 pages). Their builds moved to the repository-root context (go.mod
+  replaces identity-envelope); phase5 compose updated too. No stack needs
+  `DECISION_LOG_IDENTITY_VERIFY=warn` any more.
+- **F11 — decisions (user, 11 Nov):** retention class EV-REGULATED + record
+  class COMPLIANCE_EVIDENCE (on decisions, events, bundle); the "audit"
+  dimension is `?correlation=` (000017 index); `decision_id` is the GOV-07
+  evidence id; GOV-07 owns GovernanceDecision (plan section 4, 23 Oct);
+  purpose on reads (already built); C3: both event names during the
+  deprecation window (`events.WithCanonicalAlias`, schema_version 1.3).
+- **Hardening.** `mtls.RotatingIdentity` (listener + authz client read the
+  certificate per handshake; renewal at 2/3 of lifetime) and
+  `mtls.RevocationChecker` (CRL from mtls-management-svc, fail closed,
+  `MTLS_REVOCATION_CHECK=off` only with ENV=local). `internal/sealer` seals
+  every tenant each `EVIDENCE_SEAL_INTERVAL` (1h) as
+  `svc-governance-decision-log` after re-verifying the chain; 000017 adds the
+  read-only `app.evidence_sealer` RLS marker. Alerts
+  GovernanceLedgerChainBroken / GovernanceLedgerSealingFailing (promtool: 85
+  rules OK).
+- Verified 11 Nov: suites in golang:1.26 — governance-decision-log-svc 213/0/0
+  (DB, runtime role; 4 consecutive clean runs; one earlier run had a one-off
+  failure of TestPgStore_List_FilterByAction/RuleBasis that did not
+  reproduce in 6 later runs), identity-envelope, contract-lifecycle-svc,
+  decision-support-svc, evidence-manifest-svc all ok; 000016 + 000017
+  up/down/up on a scratch DB, access-control 000049 up/down/up; mutants killed:
+  revocation lookup, seal-without-verify, correlation predicate, manifest
+  paging. Live (14 containers, require mode): dependency e2e **121/121** (incl.
+  contract approval refused on a DENIED decision and allowed on a GRANTED one,
+  a recommendation from 3+ precedents, a manifest snapshotting the entity's
+  decisions, a revoked peer refused at the :8450 handshake within the CRL
+  refresh while another peer keeps working, the canonical alias on Kafka);
+  `--scheduled-seal` 4/4 with a 20 s interval; `scripts/audit.sh` 43/0 with
+  Prometheus loading all 6 rules. Console UI spec not re-run (no console code
+  changed).
+
+### 2026-11-11 (final) — callers on mTLS, `require` on, workflow relay live
+
+- **identity-envelope/mtlsclient** (shared): a service's outbound workload
+  identity — certificate from mtls-management-svc with the service's own
+  bootstrap token, background provisioning with retry, renewal at 2/3 of the
+  lifetime, server verified against the platform CA and by hostname.
+- **policy-svc**: the evidence relay calls `GOVERNANCE_DECISION_LOG_MTLS_URL`
+  (https://governance-decision-log-svc:8450) with its certificate.
+- **workflow-svc**: the ledger relay does the same; its DB was 6 migrations
+  behind (000018/000019 were already present untracked — verified object by
+  object and recorded; 000008/12/17/20 applied).
+- **access-control-svc 000049**: `GOVERNANCE_EVIDENCE_SEAL` (HIGH) registered;
+  template GOVERNANCE_EVIDENCE_STEWARD v1 (READ, REPLAY, SEAL).
+- **Seed**: WORKFLOW_FULL bundle (none existed: no demo user could approve) and
+  svc-workflow's ledger grant.
+- **Compose**: governance-decision-log-svc `IDENTITY_VERIFY=require`.
+- Console: no change needed (it already sends the envelope); the three
+  overview governance panels now pass the full session identity too.
+- Verified: dependency e2e **79/79 in require** (policy relay + replay,
+  workflow relay → decision in the chain, envelope / peer / refusals, Kafka,
+  seal, offline bundle check); console UI 5/5; audit live sections green
+  (host test binaries blocked by App Control — suites green in golang:1.26:
+  identity-envelope, governance-decision-log-svc incl. DB, policy-svc,
+  workflow-svc, access-control-svc).
+
 ## Next steps
 
-- [x] Scaffold Phase 1 (write path).
-- [x] Verify Phase 1 against a real Postgres container (boot, POST,
-      confirm row, re-POST same `decision_id`, confirm no duplicate).
-- [x] Commit Phase 1 to `feat/governance-decision-log-svc-write-path` and open a PR into `main`. (PR #14, merged)
-- [x] Scaffold Phase 2 (query surface) on a fresh branch off updated `main`.
-- [x] Verify Phase 2 against a real Postgres container (single lookup,
-      unfiltered list, each filter individually, composed filters,
-      invalid timestamp rejection).
-- [x] Commit Phase 2 and push to `shashi-changes` (`2092b32`).
-- [x] Build Phase 3 (events, CI, Dockerfile, README).
-- [x] Verify Phase 3 via a real built Docker image against a real
-      Postgres container (health, POST with event emitted once, GET,
-      idempotent replay with no re-publish).
-- [x] Commit Phase 3 and push to `shashi-changes`.
-- [ ] Open a PR from `shashi-changes` into `main` covering Phase 2 + 3.
-- [ ] Before Authorization Service integration begins: revisit the
-      fail-closed-vs-async question and the read-API auth model
-      question, both currently deferred.
+- [ ] Commit and open the PR (nothing committed yet).
+- [x] GDL-2: workflow-svc's ledger relay live (e2e "workflow relay: *").
+- [x] contract-lifecycle-svc, decision-support-svc, evidence-manifest-svc on
+      :8450 with their own certificates (D2-2.F07, 11 Nov evening).
+- [x] Production hardening: rotation + CRL on :8450, GOVERNANCE_EVIDENCE_SEAL
+      in access-control's taxonomy (000049), scheduled sealing, retention class.
+- [x] VC-1 on F01-F04, F07-F09, F11, F13 (independence waived by the user).
+- [x] Production grants by migration for svc-contract-lifecycle and
+      svc-decision-support READ (authorization-svc 000042); writers
+      svc-policy / svc-workflow by 000043.
+- [x] Both event names registered in schema-registry-svc (R9).

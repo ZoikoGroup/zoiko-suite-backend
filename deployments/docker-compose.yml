@@ -340,7 +340,7 @@ services:
     command:
       - |
         set -e
-        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc; do
+        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc governance-decision-log-svc policy-svc workflow-svc contract-lifecycle-svc decision-support-svc evidence-manifest-svc; do
           mkdir -p "/bootstrap/$$svc"
           if [ ! -f "/bootstrap/$$svc/token" ]; then
             head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "/bootstrap/$$svc/token"
@@ -1097,6 +1097,7 @@ services:
     cpus: "0.5"
     ports:
       - "8083:8083"
+      - "8450:8450" # mTLS listener for peer workloads (X5) — see MTLS_ENABLED below
     environment:
       PORT: "8083"
       DB_HOST: postgres
@@ -1116,28 +1117,65 @@ services:
       # policy version a past decision used (doc7 backlog item 34) — never
       # for authorization.
       POLICY_SERVICE_URL: "http://policy-svc:8085"
-      # Reads are authorized on GOVERNANCE_DECISION_READ. warn logs a refusal
-      # instead of making it, because contract-lifecycle-svc (contract
-      # activation) and decision-support-svc still read with no X-Principal-Id.
-      # Set to enforce (the code default) once both forward the caller.
-      DECISION_LOG_READ_AUTHZ: "warn"
-      # Identity gate (A1 / D-05): a presented signed envelope is verified and
-      # its session checked; its claims replace X-Principal-Id / X-Tenant-Id.
-      # warn here because the out-of-domain readers above, and every ledger
-      # writer's async relay (no person behind it; a peer over mTLS in
-      # production), present no envelope yet. The code default outside local is
-      # require.
-      IDENTITY_VERIFY: "${DECISION_LOG_IDENTITY_VERIFY:-warn}"
+      # Reads are authorized on GOVERNANCE_DECISION_READ (GDL-1): enforce, the
+      # code default. Every reader names a principal (D2-2.F07, 11 Nov):
+      # contract-lifecycle-svc and decision-support-svc their own service
+      # principals, evidence-manifest-svc the signed-in user.
+      DECISION_LOG_READ_AUTHZ: "${DECISION_LOG_READ_AUTHZ:-enforce}"
+      # Identity gate (A1 / D-05, X5): require. A presented signed envelope is
+      # verified and its session checked (the console); a ledger writer's relay
+      # (policy-svc, workflow-svc: no person behind it) calls :8450 with its
+      # certificate and is admitted as an IDENTITY_PEERS workload. Headers alone
+      # are refused 401. The three readers (contract-lifecycle-svc,
+      # decision-support-svc, evidence-manifest-svc) call :8450 with their own
+      # certificates too (D2-2.F07), so no stack needs warn any more.
+      IDENTITY_VERIFY: "${DECISION_LOG_IDENTITY_VERIFY:-require}"
       IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
+      # Workload identity (X5). One certificate from mtls-management-svc,
+      # provisioned with this service's own bootstrap token (register M-01):
+      #  - MTLS_ENABLED opens :8450, where a client certificate is required and
+      #    the names in IDENTITY_PEERS are admitted as peer workloads vouching
+      #    for X-Principal-Id. policy-svc's and workflow-svc's ledger relays act
+      #    for no signed-in person, so this is how they stay admitted once
+      #    DECISION_LOG_IDENTITY_VERIFY=require (they must call :8450 first).
+      #  - AUTHZ_MTLS_ENABLED sends this service's authorization checks to
+      #    authorization-svc's mTLS listener.
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8450"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      IDENTITY_PEERS: "${DECISION_LOG_IDENTITY_PEERS:-policy-svc,workflow-svc,contract-lifecycle-svc,decision-support-svc,evidence-manifest-svc}"
+      # Production hardening (11 Nov): the workload certificate is renewed at
+      # two thirds of its lifetime, and :8450 refuses a client certificate on
+      # mtls-management-svc's CRL (and every one while no current CRL is
+      # held). MTLS_REVOCATION_CHECK=off is accepted only with ENV=local.
+      MTLS_REVOCATION_CHECK: "${DECISION_LOG_MTLS_REVOCATION_CHECK:-require}"
+      MTLS_CRL_REFRESH_SECONDS: "${DECISION_LOG_MTLS_CRL_REFRESH_SECONDS:-30}"
+      # Scheduled sealing (GOV-07): every tenant's unsealed decisions are sealed
+      # into an evidence package each interval, after the chain re-verifies.
+      EVIDENCE_SEAL_INTERVAL: "${DECISION_LOG_EVIDENCE_SEAL_INTERVAL:-1h}"
+      AUTHZ_MTLS_ENABLED: "true"
+      AUTHZ_MTLS_URL: "https://authorization-svc:8449"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "governance-decision-log-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.governance.events"
+    volumes:
+      # Only this service's own bootstrap token: the governance-decision-log-svc/
+      # sub-directory of the keygen volume.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: governance-decision-log-svc
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      mtls-management-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -1211,6 +1249,14 @@ services:
       DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      # The ledger relay calls governance-decision-log-svc's mTLS peer listener
+      # with this service's own certificate (X5): it acts for no signed-in
+      # person, so under that service's IDENTITY_VERIFY=require the
+      # certificate is its identity. Provisioned from mtls-management-svc
+      # with this service's own bootstrap token (register M-01).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${GOVERNANCE_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
       # The principal policy-svc writes evaluation evidence to the governance
       # ledger as (decision D-02). It needs GOVERNANCE_DECISION_RECORD; until
       # it has it, evaluations still succeed and their evidence waits, durable,
@@ -1248,7 +1294,17 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.policy.events"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: policy-svc
     depends_on:
+      mtls-management-svc:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       kafka:
@@ -1669,6 +1725,14 @@ services:
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
       DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-decision-log-svc:8083"
+      # The ledger relay calls governance-decision-log-svc's mTLS peer listener
+      # with this service's own certificate (X5): it acts for no signed-in
+      # person, so under that service's IDENTITY_VERIFY=require the
+      # certificate is its identity. Provisioned from mtls-management-svc
+      # with this service's own bootstrap token (register M-01).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${GOVERNANCE_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
       # The writer to the governance ledger (workflow decision evidence): a
       # service principal holding GOVERNANCE_DECISION_RECORD and nothing else
       # (GOVERNANCE_LEDGER_WRITER in deployments/supabase/seed-rbac.sql).
@@ -1692,7 +1756,17 @@ services:
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: workflow-svc
     depends_on:
+      mtls-management-svc:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       kafka:
@@ -1854,8 +1928,10 @@ services:
   # (WorkflowHistoryClient.ListByEntityAndDateRange).
   evidence-manifest-svc:
     build:
-      context: ../services/evidence-manifest-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module (shared mTLS client), so the build must see both.
+      context: ..
+      dockerfile: services/evidence-manifest-svc/Dockerfile
     container_name: evidence-manifest-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1872,9 +1948,23 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.evidence.events"
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      # Decision-log reads over mTLS (D2-2.F07): this service's certificate,
+      # vouching for the signed-in user (the manifest snapshots whole
+      # decisions, so the decision log authorizes that person).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${EVIDENCE_MANIFEST_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
       WORKFLOW_SERVICE_URL: "http://workflow-svc:8090"
       WORKFLOW_HISTORY_SERVICE_URL: "http://workflow-history-svc:8097"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: evidence-manifest-svc
     depends_on:
       postgres:
         condition: service_healthy
@@ -2891,8 +2981,10 @@ services:
   # error, since a recommendation is advisory only.
   decision-support-svc:
     build:
-      context: ../services/decision-support-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module (shared mTLS client), so the build must see both.
+      context: ..
+      dockerfile: services/decision-support-svc/Dockerfile
     container_name: decision-support-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2910,6 +3002,20 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.decision-support.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       GOVERNANCE_DECISION_LOG_URL: "http://governance-decision-log-svc:8083"
+      # Precedent reads over mTLS (D2-2.F07) as this service's own principal,
+      # which holds GOVERNANCE_DECISION_READ (seed-demo-rbac.ps1).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${DECISION_SUPPORT_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      GOVERNANCE_DECISION_LOG_PRINCIPAL_ID: "${DECISION_SUPPORT_LEDGER_PRINCIPAL_ID:-svc-decision-support}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: decision-support-svc
     depends_on:
       postgres:
         condition: service_healthy
@@ -4102,8 +4208,10 @@ services:
   # ── Phase 5 · contract-lifecycle-svc (Port: 8119) ────────────────────────────
   contract-lifecycle-svc:
     build:
-      context: ../services/contract-lifecycle-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module (shared mTLS client), so the build must see both.
+      context: ..
+      dockerfile: services/contract-lifecycle-svc/Dockerfile
     container_name: contract-lifecycle-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4117,6 +4225,20 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       GOVERNANCE_LOG_URL: "http://governance-svc:8083"
+      # Activation verifies its governance decision over mTLS (D2-2.F07) as
+      # this service's own principal, which holds GOVERNANCE_DECISION_READ.
+      GOVERNANCE_LOG_MTLS_URL: "${CONTRACT_LIFECYCLE_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      GOVERNANCE_LOG_PRINCIPAL_ID: "${CONTRACT_LIFECYCLE_LEDGER_PRINCIPAL_ID:-svc-contract-lifecycle}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: contract-lifecycle-svc
     depends_on:
       postgres:
         condition: service_healthy

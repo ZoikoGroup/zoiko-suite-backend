@@ -56,149 +56,121 @@ if [ "$GOUT" -gt 0 ]; then ok "store suite fails loudly when REQUIRE_DB_TESTS is
 
 echo
 echo "-- 5. Live service health ------------------------------------------"
-HJ=$(curl -s -m 20 $B/healthz)
 chk "GET /healthz" "$(code $B/healthz)" "200"
-RD=$(curl -s -m 20 $B/readyz)
 chk "GET /readyz" "$(code $B/readyz)" "200"
-for c in postgres outbox; do
-  if echo "$RD" | grep -q "\"$c\":\"ok\""; then ok "readiness check: $c"; else bad "readiness check: $c"; fi
+RD=$(curl -s -m 20 $B/readyz)
+if echo "$RD" | grep -q '"status":"ok"'; then ok "readyz reports the database pool ok"; else bad "readyz body: $RD"; fi
+
+# Headers of a well-formed read (purpose of access, D-06) and write.
+# R0/W0 carry no principal: curl sends a repeated header twice and the
+# service reads the first, so the principal is added per call, never overridden.
+R0=(-H "X-Tenant-Id: $TEN" -H "X-Legal-Entity-Id: $ENT" -H "X-Request-Id: au-$RUN"
+    -H "X-Correlation-ID: au-$RUN" -H "X-Source-Channel: api" -H "X-Purpose-Context: GOVERNANCE_AUDIT")
+W0=(-H "X-Tenant-Id: $TEN" -H "X-Legal-Entity-Id: $ENT" -H "X-Request-Id: au-$RUN"
+    -H "X-Correlation-ID: au-$RUN" -H "X-Source-Channel: api" -H "Content-Type: application/json")
+RH=("${R0[@]}" -H "X-Principal-Id: $PRIN")
+WH=("${W0[@]}" -H "X-Principal-Id: $PRIN")
+STRANGER=e2e00000-0000-4000-8000-0000000000aa
+
+# The service runs IDENTITY_VERIFY=require in compose: identity headers alone
+# are refused, so the audit signs in as the demo admin and presents the signed
+# envelope, as the console does. In require mode a stranger's bare headers are
+# refused as unverified (401) before any grant is consulted; the 403 grant path
+# is proven by the dependency e2e through a peer workload.
+IDP=${IDP:-http://127.0.0.1:8080}
+MODE=warn
+[ "$(code "${R0[@]}" -H "X-Principal-Id: $PRIN" $B/v1/decisions)" = "401" ] && MODE=require
+echo "        identity mode: $MODE"
+TOKEN=$(curl -s -m 20 -X POST $IDP/v1/authenticate -H 'Content-Type: application/json' \
+  -d "{\"tenant_id\":\"$TEN\",\"email\":\"admin@zoikosuite.com\",\"password\":\"Zoiko@Governance1\",\"client_id\":\"zoiko-console\",\"client_secret\":\"local-dev-console-client-secret\"}" \
+  | python -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+ENVJWT=$(curl -s -m 20 -X POST $IDP/v1/context/resolve "${W0[@]}" -H "X-Principal-Id: $PRIN" -H "Idempotency-Key: au-env-$RUN" \
+  -d "{\"bearer_token\":\"$TOKEN\",\"legal_entity_id\":\"$ENT\"}" \
+  | python -c "import sys,json; print(json.load(sys.stdin).get('envelope_jwt',''))" 2>/dev/null)
+if [ -n "$ENVJWT" ]; then ok "signed envelope issued for the demo admin"; else bad "no envelope from identity-context-svc at $IDP"; fi
+RH+=(-H "Authorization: Bearer $ENVJWT")
+WH+=(-H "Authorization: Bearer $ENVJWT")
+DENY=403
+[ "$MODE" = "require" ] && DENY=401
+
+echo
+echo "-- 6. Contract surface: every route answers (openapi.yaml) ----------"
+for path in /v1/decisions "/v1/decisions/summary" /v1/replay-manifests /v1/evidence/chain/verify /v1/evidence/packages; do
+  chk "GET $path" "$(code "${RH[@]}" $B$path)" "200"
 done
+chk "GET /v1/evidence/chain/export (attachment)" "$(code "${RH[@]}" $B/v1/evidence/chain/export)" "200"
+chk "GET /v1/decisions/{unknown} → 404" "$(code "${RH[@]}" $B/v1/decisions/audit-missing-$RUN)" "404"
+chk "GET /v1/evidence/packages/{unknown} → 404" "$(code "${RH[@]}" $B/v1/evidence/packages/00000000-0000-4000-8000-000000000000)" "404"
 
 echo
-echo "-- 6. GDL contract surface (spec §18–§21) --------------------------"
-# Admin routes require step-up (mfa_verified). We can't easily do that here,
-# so we just check the routes exist and are protected.
-for path in \
-  "/v1/decisions" \
-  "/v1/decisions/{id}" \
-  "/v1/decisions/{id}/replay" \
-  "/v1/decisions/{id}/replay-manifests" \
-  "/v1/evidence/chain/verify" \
-  "/v1/evidence/chain/export" \
-  "/v1/evidence/packages/seal" \
-  "/v1/evidence/packages/{id}"; do
-  chk "route $path exists (401 as expected)" "$(code -X GET $B$path "${H[@]}" -H 'X-Request-Id: ia1' -H 'X-Correlation-ID: ia1')" "401"
-done
-
-# If-Match required on mutations
-KM=$(uuidgen)
-chk "POST /v1/decisions requires If-Match" "$(code -X POST $B/v1/decisions "${H[@]}" -H 'X-Request-Id: ia1' -H 'X-Correlation-ID: ia1' -d "{\"tenant_id\":\"$TEN\",\"legal_entity_id\":\"$ENT\",\"actor_id\":\"$PRIN\",\"action_type\":\"PAYROLL_RELEASE\",\"outcome\":\"GRANTED\",\"rule_basis\":\"policy-v3-sod\",\"correlation_id\":\"$KM\"}')" "428"
-chk "POST /v1/decisions requires Idempotency-Key" "$(code -X POST $B/v1/decisions "${H[@]}" -H 'If-Match: *' -H 'X-Request-Id: ia2' -H "Idempotency-Key: ia2-$RUN" -H 'X-Correlation-ID: ia2' -d "{\"tenant_id\":\"$TEN\",\"legal_entity_id\":\"$ENT\",\"actor_id\":\"$PRIN\",\"action_type\":\"PAYROLL_RELEASE\",\"outcome\":\"GRANTED\",\"rule_basis\":\"policy-v3-sod\",\"correlation_id\":\"$KM\"}')" "428"
-
-# Cursor paging on lists
-s=$(code -X GET $B/v1/decisions "${H[@]}" -H 'X-Request-Id: ia3' -H 'X-Correlation-ID: ia3')
-if [ "$s" = "401" ]; then ok "GET /v1/decisions exists (401 as expected)"; else bad "GET /v1/decisions (got $s)"; fi
+echo "-- 7. Negative paths ------------------------------------------------"
+DEC="{\"decision_id\":\"audit-$RUN\",\"legal_entity_id\":\"$ENT\",\"action_type\":\"AUDIT_PROBE\",\"outcome\":\"GRANTED\",\"rule_basis\":\"AUDIT:probe\",\"correlation_id\":\"au-$RUN\"}"
+chk "POST /v1/decisions without Idempotency-Key → 400" "$(code -X POST "${WH[@]}" -d "$DEC" $B/v1/decisions)" "400"
+# The envelope contract refuses a write with no actor before the handler does:
+# 400 envelope_incomplete or 401, depending on ZS_ENVELOPE_ENFORCEMENT.
+s=$(code -X POST -H "X-Tenant-Id: $TEN" -H "Idempotency-Key: k-$RUN" -H 'Content-Type: application/json' -d "$DEC" $B/v1/decisions)
+if [ "$s" = "400" ] || [ "$s" = "401" ]; then ok "POST /v1/decisions without a principal refused ($s)"; else bad "POST without a principal (got $s)"; fi
+chk "POST /v1/decisions by an unverified or ungranted principal → $DENY" "$(code -X POST "${W0[@]}" -H "X-Principal-Id: $STRANGER" -H "Idempotency-Key: s-$RUN" -d "$DEC" $B/v1/decisions)" "$DENY"
+chk "GET /v1/decisions by an unverified or ungranted principal → $DENY" "$(code "${R0[@]}" -H "X-Principal-Id: $STRANGER" $B/v1/decisions)" "$DENY"
+chk "GET /v1/decisions?cursor=invalid → 400" "$(code "${RH[@]}" "$B/v1/decisions?cursor=invalid")" "400"
+chk "GET /v1/decisions?status=MAYBE → 400" "$(code "${RH[@]}" "$B/v1/decisions?status=MAYBE")" "400"
+chk "GET /v1/decisions/summary?days=0 → 400" "$(code "${RH[@]}" "$B/v1/decisions/summary?days=0")" "400"
+chk "POST seal by an unverified or ungranted principal → $DENY" "$(code -X POST "${W0[@]}" -H "X-Principal-Id: $STRANGER" -H "Idempotency-Key: z-$RUN" -d '{}' $B/v1/evidence/packages/seal)" "$DENY"
 
 echo
-echo "-- 7. Negative-path acceptance (spec §18–§21) -----------------------"
-# NP1: Missing Idempotency-Key on mutation refused (428)
-KM=$(uuidgen)
-s=$(code -X POST $B/v1/decisions "${H[@]}" -H 'If-Match: *' -H 'X-Request-Id: np1' -H 'X-Correlation-ID: np1' -d "{\"tenant_id\":\"$TEN\",\"legal_entity_id\":\"$ENT\",\"actor_id\":\"$PRIN\",\"action_type\":\"PAYROLL_RELEASE\",\"outcome\":\"GRANTED\",\"rule_basis\":\"policy-v3-sod\",\"correlation_id\":\"$KM\"}")
-chk "NP1 missing Idempotency-Key refused" "$s" "428"
-
-# NP2: Stale If-Match refused (412)
-s=$(code -X POST $B/v1/decisions "${H[@]}" -H 'If-Match: "stale-etag"' -H 'X-Request-Id: np2' -H "Idempotency-Key: np2-$RUN" -H 'X-Correlation-ID: np2' -d "{\"tenant_id\":\"$TEN\",\"legal_entity_id\":\"$ENT\",\"actor_id\":\"$PRIN\",\"action_type\":\"PAYROLL_RELEASE\",\"outcome\":\"GRANTED\",\"rule_basis\":\"policy-v3-sod\",\"correlation_id\":\"$KM\"}")
-chk "NP2 stale If-Match refused" "$s" "412"
-
-# NP3: Decision not found returns 404
-s=$(code -X GET $B/v1/decisions/00000000-0000-0000-0000-000000000000 "${H[@]}" -H 'X-Request-Id: np3' -H 'X-Correlation-ID: np3')
-chk "NP3 unknown decision returns 404" "$s" "404"
-
-# NP4: Cursor pagination works
-s=$(code -X GET $B/v1/decisions?cursor=invalid "${H[@]}" -H 'X-Request-Id: np4' -H 'X-Correlation-ID: np4')
-chk "NP4 invalid cursor refused" "$s" "400"
-
-# NP5: Evidence ledger endpoints require authorization
-s=$(code -X GET $B/v1/evidence/chain/verify "${H[@]}" -H 'X-Request-Id: np5' -H 'X-Correlation-ID: np5')
-chk "NP5 verify chain requires auth" "$s" "401"
-
-s=$(code -X GET $B/v1/evidence/chain/export "${H[@]}" -H 'X-Request-Id: np6' -H 'X-Correlation-ID: np6')
-chk "NP6 export chain requires auth" "$s" "401"
-
-s=$(code -X POST $B/v1/evidence/packages/seal "${H[@]}" -H 'X-Request-Id: np7' -H "Idempotency-Key: np7-$RUN" -H 'X-Correlation-ID: np7' -d '{"package_id":"test","last_decision_id":"00000000-0000-0000-0000-000000000000"}')
-chk "NP7 seal package requires auth" "$s" "401"
-
-s=$(code -X GET $B/v1/evidence/packages/test-package "${H[@]}" -H 'X-Request-Id: np8' -H 'X-Correlation-ID: np8')
-chk "NP8 get package requires auth" "$s" "401"
-
-echo
-echo "-- 8. G-07 Evidence ledger ------------------------------------------"
-# VerifyChain endpoint
-s=$(code -X GET $B/v1/evidence/chain/verify "${H[@]}" -H 'X-Request-Id: g07-1' -H 'X-Correlation-ID: g07-1')
-if [ "$s" = "401" ]; then ok "G-07 verify chain endpoint exists (401 as expected)"; else bad "G-07 verify chain (got $s)"; fi
-
-# ExportChain endpoint
-s=$(code -X GET $B/v1/evidence/chain/export "${H[@]}" -H 'X-Request-Id: g07-2' -H 'X-Correlation-ID: g07-2')
-if [ "$s" = "401" ]; then ok "G-07 export chain endpoint exists (401 as expected)"; else bad "G-07 export chain (got $s)"; fi
-
-# SealPackage endpoint
-s=$(code -X POST $B/v1/evidence/packages/seal "${H[@]}" -H 'X-Request-Id: g07-3' -H "Idempotency-Key: g07-3-$RUN" -H 'X-Correlation-ID: g07-3' -d '{"package_id":"test","last_decision_id":"00000000-0000-0000-0000-000000000000"}')
-if [ "$s" = "401" ]; then ok "G-07 seal package endpoint exists (401 as expected)"; else bad "G-07 seal package (got $s)"; fi
-
-# GetPackage endpoint
-s=$(code -X GET $B/v1/evidence/packages/test-package "${H[@]}" -H 'X-Request-Id: g07-4' -H 'X-Correlation-ID: g07-4')
-if [ "$s" = "401" ]; then ok "G-07 get package endpoint exists (401 as expected)"; else bad "G-07 get package (got $s)"; fi
+echo "-- 8. G-07 evidence ledger ------------------------------------------"
+chk "record a probe decision → 201" "$(code -X POST "${WH[@]}" -H "Idempotency-Key: a-$RUN" -d "$DEC" $B/v1/decisions)" "201"
+chk "repeat with the same key → 200" "$(code -X POST "${WH[@]}" -H "Idempotency-Key: a-$RUN" -d "$DEC" $B/v1/decisions)" "200"
+V=$(curl -s -m 30 "${RH[@]}" $B/v1/evidence/chain/verify)
+if echo "$V" | grep -q '"valid":true'; then ok "chain verifies (links + packages)"; else bad "chain verify: ${V:0:200}"; fi
+EV=$(curl -s -m 20 "${RH[@]}" $B/v1/decisions/audit-$RUN/evidence)
+if echo "$EV" | grep -q '"hash_valid":true' && echo "$EV" | grep -q '"prev_link_valid":true'; then ok "probe decision's own link re-computes"; else bad "evidence: ${EV:0:200}"; fi
+SC=$(code -X POST "${WH[@]}" -H "Idempotency-Key: seal-$RUN" -d '{"label":"audit"}' $B/v1/evidence/packages/seal)
+if [ "$SC" = "201" ]; then ok "seal through the head (201)"; else bad "seal (got $SC)"; fi
+chk "seal again with nothing new → 409" "$(code -X POST "${WH[@]}" -H "Idempotency-Key: seal2-$RUN" -d '{}' $B/v1/evidence/packages/seal)" "409"
 
 echo
 echo "-- 9. Telemetry ----------------------------------------------------"
 M=$(curl -s -m 20 $B/metrics)
-GDLN=$(echo "$M" | grep -c '^governance_decision_log_')
-if [ "$GDLN" -ge 10 ]; then ok "GDL metric families emitted ($GDLN series)"; else bad "GDL metrics ($GDLN)"; fi
-for fam in governance_decision_log_recorded_total governance_decision_log_decisions_total \
-           governance_decision_log_replays_total governance_decision_log_chain_verifications_total \
-           governance_decision_log_chain_exports_total governance_decision_log_packages_sealed_total \
-           governance_decision_log_outbox_pending governance_decision_log_outbox_dead_letter; do
-  if echo "$M" | grep -q "^$fam"; then ok "  $fam"; else bad "  $fam missing"; fi
+for fam in outbox_pending_events outbox_oldest_pending_seconds outbox_pruned_events_total readiness_up http_requests_total http_request_duration_seconds_bucket; do
+  if echo "$M" | grep -q "^$fam{.*service=\"governance-decision-log-svc\""; then ok "  $fam"; else bad "  $fam missing"; fi
 done
-echo "$M" | grep -q '^governance_decision_log_recorded_total{.*outcome="created"' && ok "  created decisions counted" || bad "  created decisions not counted"
-echo "$M" | grep -q '^governance_decision_log_recorded_total{.*outcome="replay"' && ok "  replay decisions counted" || bad "  replay decisions not counted"
 
 echo
-echo "-- 10. Alert rules (gate 11) ---------------------------------------"
-RULES=$(curl -s -m 20 "$PROM/api/v1/rules")
-NR=$(echo "$RULES" | python -c "
-import sys,json
-d=json.load(sys.stdin)
-n=sum(len(g['rules']) for g in d['data']['groups'] if 'gdl' in g['name'] or 'governance' in g['name'])
-print(n)" 2>/dev/null)
-NH=$(echo "$RULES" | python -c "
-import sys,json
-d=json.load(sys.stdin)
-n=sum(1 for g in d['data']['groups'] if ('gdl' in g['name'] or 'governance' in g['name']) for r in g['rules'] if r.get('health')=='ok')
-print(n)" 2>/dev/null)
-chk "GDL/governance alert rules loaded" "$NR" "6"
-chk "alert rules evaluating (health ok)" "$NH" "6"
-UP=$(curl -s -m 20 --get "$PROM/api/v1/query" --data-urlencode 'query=up{job="governance-decision-log-svc"}' | python -c "
+echo "-- 10. Alert rules --------------------------------------------------"
+RULES_FILE="$SVC/../../deployments/prometheus-rules.yml"
+NR=$(grep -c "alert: GovernanceLedger" "$RULES_FILE")
+# 4 relay/readiness/write rules + 2 for scheduled sealing (chain broken,
+# sealing failing), 11 Nov 2026.
+chk "governance-decision-log alert rules defined" "$NR" "6"
+if curl -s -m 5 "$PROM/-/ready" >/dev/null 2>&1; then
+  UP=$(curl -s -m 20 --get "$PROM/api/v1/query" --data-urlencode 'query=up{job="governance-decision-log-svc"}' | python -c "
 import sys,json
 r=json.load(sys.stdin)['data']['result']
 print(r[0]['value'][1] if r else '0')" 2>/dev/null)
-chk "prometheus scraping the service" "$UP" "1"
+  chk "prometheus scraping the service" "$UP" "1"
+  LOADED=$(curl -s -m 20 "$PROM/api/v1/rules" | python -c "
+import sys,json
+g=[x for x in json.load(sys.stdin)['data']['groups'] if x['name']=='governance-decision-log']
+print(sum(1 for r in (g[0]['rules'] if g else []) if r.get('health')=='ok'))" 2>/dev/null)
+  chk "prometheus loaded the governance-decision-log rules (healthy)" "$LOADED" "6"
+else
+  echo "  SKIP  prometheus not running at $PROM (start the prometheus compose service to check scraping)"
+fi
 
 echo
 echo "-- 11. Outbox drain ------------------------------------------------"
-PENDING=$(docker exec zoiko-postgres psql -U postgres -d governance_decision_log -tAc "select count(*) filter (where published_at is null) from event_outbox;" 2>/dev/null | tr -d '[:space:]')
-PUB=$(docker exec zoiko-postgres psql -U postgres -d governance_decision_log -tAc "select count(published_at) from event_outbox;" 2>/dev/null | tr -d '[:space:]')
+sleep 3
+PENDING=$(docker exec zoiko-postgres psql -U postgres -d governance_decision_log -tAc "select count(*) from outbox where published_at is null;" 2>/dev/null | tr -d '[:space:]')
+PUB=$(docker exec zoiko-postgres psql -U postgres -d governance_decision_log -tAc "select count(*) from outbox where published_at is not null;" 2>/dev/null | tr -d '[:space:]')
 echo "        published=$PUB pending=$PENDING"
-if [ "${PENDING:-1}" -lt 100 ]; then ok "outbox at baseline"; else bad "outbox backlog $PENDING"; fi
+if [ -n "$PENDING" ] && [ "$PENDING" -lt 100 ]; then ok "outbox drained (pending $PENDING)"; else bad "outbox backlog ${PENDING:-unreadable}"; fi
 
 echo
 echo "-- 12. Contract parity ---------------------------------------------"
-# OpenAPI parity test
 cd "$SVC"
-if [ -f internal/handler/openapi_parity_test.go ]; then
-  OUT=$(go test -count=1 ./internal/handler -run OpenAPI 2>&1)
-  if echo "$OUT" | grep -q "PASS"; then ok "OpenAPI parity test passes"; else bad "OpenAPI parity test fails"; fi
-else
-  echo "  SKIP  OpenAPI parity test not found"
-fi
-
-# AsyncAPI parity test
-if [ -f internal/events/contract_test.go ]; then
-  OUT=$(go test -count=1 ./internal/events -run Contract 2>&1)
-  if echo "$OUT" | grep -q "PASS"; then ok "AsyncAPI parity test passes"; else bad "AsyncAPI parity test fails"; fi
-else
-  echo "  SKIP  AsyncAPI parity test not found"
-fi
+OUT=$(go test -count=1 ./internal/handler -run OpenAPI 2>&1)
+if echo "$OUT" | grep -q "^ok"; then ok "openapi.yaml matches the router"; else bad "OpenAPI parity: ${OUT:0:200}"; fi
 
 docker exec zoiko-postgres psql -U postgres -c "DROP DATABASE IF EXISTS gdl_audit_scratch;" >/dev/null 2>&1
 

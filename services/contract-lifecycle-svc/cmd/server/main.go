@@ -14,6 +14,7 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/contract-lifecycle-svc/internal/authz"
 	"zoiko.io/contract-lifecycle-svc/internal/config"
@@ -74,7 +75,25 @@ func main() {
 	} else {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
-	governanceLogClient := governancelog.NewClient(cfg.GovernanceLogURL)
+	// Decision-log reads (D2-2.F07): over mTLS as this service's workload,
+	// reading as its own principal, when GOVERNANCE_LOG_MTLS_URL is set. The
+	// certificate is provisioned in the background and renewed; until it is,
+	// a verification fails closed (activation refused, retryable).
+	var governanceLogClient *governancelog.Client
+	if cfg.GovernanceLogMTLSURL != "" {
+		identity := mtlsclient.Start(context.Background(), mtlsclient.Options{
+			ServiceName:        "contract-lifecycle-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, logger)
+		governanceLogClient = governancelog.NewClientWithHTTPClient(cfg.GovernanceLogMTLSURL, identity.HTTPClient(5*time.Second), cfg.GovernanceLogPrincipalID)
+		logger.Info("governance decision log reads over mTLS",
+			zap.String("url", cfg.GovernanceLogMTLSURL), zap.String("principal", cfg.GovernanceLogPrincipalID))
+	} else {
+		governanceLogClient = governancelog.NewClient(cfg.GovernanceLogURL)
+		logger.Warn("GOVERNANCE_LOG_MTLS_URL unset: decision-log reads use plain HTTP, which a decision log running IDENTITY_VERIFY=require refuses",
+			zap.String("url", cfg.GovernanceLogURL))
+	}
 
 	h := handler.New(pgStore, publisher, authzClient, governanceLogClient, logger)
 

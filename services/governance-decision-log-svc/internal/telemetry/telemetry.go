@@ -62,6 +62,11 @@ type Metrics struct {
 	OutboxPending              prometheus.Gauge
 	OutboxOldestPendingSeconds prometheus.Gauge
 	OutboxPrunedTotal          prometheus.Counter
+
+	// Scheduled sealing (GOV-07): runs by outcome (sealed, nothing, chain_broken,
+	// error). Alert on chain_broken: the sealer re-verifies every tenant's
+	// chain before it seals, and refuses to certify a broken one.
+	EvidenceSealRunsTotal *prometheus.CounterVec
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -98,9 +103,19 @@ func NewMetrics(serviceName string) *Metrics {
 		Help:        "Published outbox rows removed by retention.",
 		ConstLabels: prometheus.Labels{"service": serviceName},
 	})
+	m.EvidenceSealRunsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        "gdl_evidence_seal_total",
+		Help:        "Scheduled evidence seals per tenant attempt, by outcome (sealed, chain_broken, error).",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"outcome"})
 	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp,
-		m.OutboxPending, m.OutboxOldestPendingSeconds, m.OutboxPrunedTotal)
+		m.OutboxPending, m.OutboxOldestPendingSeconds, m.OutboxPrunedTotal, m.EvidenceSealRunsTotal)
 	return m
+}
+
+// ObserveSeal implements sealer.Observer.
+func (m *Metrics) ObserveSeal(outcome string) {
+	m.EvidenceSealRunsTotal.WithLabelValues(outcome).Inc()
 }
 
 // ObserveOutboxBacklog implements outbox.Observer.

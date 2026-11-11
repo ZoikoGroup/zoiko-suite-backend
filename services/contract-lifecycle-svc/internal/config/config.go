@@ -21,6 +21,16 @@ type Config struct {
 	AuthzMTLSEnabled         bool
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
+
+	// GovernanceLogMTLSURL, when set, is governance-decision-log-svc's mTLS
+	// listener (https://governance-decision-log-svc:8450). Decision reads then
+	// present this service's workload certificate, provisioned with its own
+	// bootstrap token (MTLS_BOOTSTRAP_TOKEN_PATH), and read as
+	// GovernanceLogPrincipalID (D2-2.F07). Empty keeps the plain
+	// GovernanceLogURL, which a decision log in IDENTITY_VERIFY=require refuses.
+	GovernanceLogMTLSURL     string
+	GovernanceLogPrincipalID string
+	MTLSBootstrapTokenPath   string
 }
 
 func Load() (*Config, error) {
@@ -44,6 +54,10 @@ func Load() (*Config, error) {
 		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnvOrDefault("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: getEnvOrDefault("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+
+		GovernanceLogMTLSURL:     os.Getenv("GOVERNANCE_LOG_MTLS_URL"),
+		GovernanceLogPrincipalID: getEnvOrDefault("GOVERNANCE_LOG_PRINCIPAL_ID", "svc-contract-lifecycle"),
+		MTLSBootstrapTokenPath:   os.Getenv("MTLS_BOOTSTRAP_TOKEN_PATH"),
 	}, nil
 }
 

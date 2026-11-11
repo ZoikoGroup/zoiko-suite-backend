@@ -1,0 +1,12 @@
+# Used by BuildKit for builds with -f services/decision-support-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/decision-support-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/decision-support-svc/**/*.exe
+services/decision-support-svc/**/*_test.go
+services/decision-support-svc/deployments/
+services/identity-envelope/**/*_test.go

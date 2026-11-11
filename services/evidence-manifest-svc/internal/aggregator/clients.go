@@ -10,12 +10,16 @@ package aggregator
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -64,19 +68,78 @@ func forwardTenant(ctx context.Context, req *http.Request) {
 
 // ── governance-decision-log-svc ──────────────────────────────────────────────
 
+// GovernanceDecisionClient reads governance-decision-log-svc.
+//
+// D2-2.F07 (11 Nov 2026). The decision log runs IDENTITY_VERIFY=require and
+// enforces read authorization, and answers its list as a page
+// ({"records": [...], "next_cursor": ...}). This client decoded a bare array
+// (so every list failed) and sent only the tenant and principal. It now:
+//   - presents this service's workload certificate to the decision log's
+//     :8450 listener (GOVERNANCE_DECISION_LOG_MTLS_URL), where the identity
+//     gate admits it as a peer workload (IDENTITY_PEERS);
+//   - vouches for the SIGNED-IN USER (X-Principal-Id forwarded, never this
+//     service's own principal): a manifest snapshots whole decisions, so the
+//     decision log authorizes the person the manifest is assembled for;
+//   - sends the full input envelope with a read purpose (register D-04, D-06);
+//   - follows next_cursor to the end of the range, failing closed rather
+//     than snapshotting the first page as if it were the whole range.
 type GovernanceDecisionClient struct {
 	baseURL string
 	http    *http.Client
 	log     *zap.Logger
 }
 
+// GovernancePurpose is the purpose sent on every decision-log read.
+const GovernancePurpose = "evidence_manifest_assembly"
+
+// governancePageSize and governanceMaxPages bound one range read: a range
+// larger than this fails the manifest instead of truncating it.
+const (
+	governancePageSize = 200
+	governanceMaxPages = 100
+)
+
 func NewGovernanceDecisionClient(baseURL string, log *zap.Logger) *GovernanceDecisionClient {
-	return &GovernanceDecisionClient{baseURL: baseURL, log: log, http: &http.Client{Timeout: 5 * time.Second}}
+	return NewGovernanceDecisionClientWithHTTPClient(baseURL, &http.Client{Timeout: 5 * time.Second}, log)
+}
+
+// NewGovernanceDecisionClientWithHTTPClient uses httpClient, the mTLS client
+// presenting this service's workload certificate.
+func NewGovernanceDecisionClientWithHTTPClient(baseURL string, httpClient *http.Client, log *zap.Logger) *GovernanceDecisionClient {
+	return &GovernanceDecisionClient{baseURL: strings.TrimRight(baseURL, "/"), log: log, http: httpClient}
+}
+
+func randomID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// governanceEnvelope adds what the decision log's input contract requires on
+// a read, beyond the tenant, principal and correlation forwardTenant copies.
+func governanceEnvelope(ctx context.Context, req *http.Request) {
+	forwardTenant(ctx, req)
+	h := req.Header
+	env, hasEnv := svcenvelope.FromContext(ctx)
+	if hasEnv && env.RequestID != "" {
+		h.Set("X-Request-Id", env.RequestID)
+	} else {
+		h.Set("X-Request-Id", randomID())
+	}
+	if h.Get("X-Correlation-ID") == "" {
+		h.Set("X-Correlation-ID", randomID())
+	}
+	if hasEnv && env.SourceChannel != "" {
+		h.Set("X-Source-Channel", string(env.SourceChannel))
+	} else {
+		h.Set("X-Source-Channel", "system")
+	}
+	h.Set("X-Purpose-Context", GovernancePurpose)
 }
 
 // ListByEntityAndDateRange calls governance-decision-log-svc's REAL list
 // endpoint (GET /v1/decisions?entity=...&from=...&to=...) — the only source
-// in this service with genuine discovery.
+// in this service with genuine discovery — and follows every page.
 func (c *GovernanceDecisionClient) ListByEntityAndDateRange(ctx context.Context, legalEntityID string, from, to *time.Time) ([]SourceRecord, error) {
 	q := url.Values{}
 	q.Set("entity", legalEntityID)
@@ -86,57 +149,76 @@ func (c *GovernanceDecisionClient) ListByEntityAndDateRange(ctx context.Context,
 	if to != nil {
 		q.Set("to", to.UTC().Format(time.RFC3339))
 	}
+	q.Set("limit", strconv.Itoa(governancePageSize))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/decisions?"+q.Encode(), nil)
+	out := []SourceRecord{}
+	cursor := ""
+	for page := 0; ; page++ {
+		if page == governanceMaxPages {
+			c.log.Error("governance decision range exceeds the page bound — failing closed rather than truncating",
+				zap.Int("pages", page), zap.Int("page_size", governancePageSize))
+			return nil, ErrSourceUnavailable
+		}
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/decisions?"+q.Encode(), nil)
+		if err != nil {
+			return nil, ErrSourceUnavailable
+		}
+		governanceEnvelope(ctx, req)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			c.log.Error("governance-decision-log-svc unreachable — failing closed", zap.Error(err))
+			return nil, ErrSourceUnavailable
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			c.log.Error("governance-decision-log-svc unexpected status", zap.Int("status", resp.StatusCode))
+			return nil, ErrSourceUnavailable
+		}
+		if readErr != nil {
+			return nil, ErrSourceUnavailable
+		}
+
+		var pageBody struct {
+			Records    *[]json.RawMessage `json:"records"`
+			NextCursor string             `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(body, &pageBody); err != nil || pageBody.Records == nil {
+			return nil, fmt.Errorf("aggregator: decode governance decisions page: %w", errOrMissing(err))
+		}
+		// Each element is kept as its own JSON so each ManifestRecord
+		// snapshot is exactly one decision, not the whole page.
+		for _, raw := range *pageBody.Records {
+			var d struct {
+				DecisionID string `json:"decision_id"`
+			}
+			if err := json.Unmarshal(raw, &d); err != nil || d.DecisionID == "" {
+				return nil, fmt.Errorf("aggregator: decode governance decision: %w", errOrMissing(err))
+			}
+			out = append(out, SourceRecord{SourceType: domain.SourceGovernanceDecision, SourceRecordID: d.DecisionID, RawJSON: raw})
+		}
+		if pageBody.NextCursor == "" || len(*pageBody.Records) == 0 {
+			return out, nil
+		}
+		cursor = pageBody.NextCursor
+	}
+}
+
+func errOrMissing(err error) error {
 	if err != nil {
-		return nil, ErrSourceUnavailable
+		return err
 	}
-	forwardTenant(ctx, req)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		c.log.Error("governance-decision-log-svc unreachable — failing closed", zap.Error(err))
-		return nil, ErrSourceUnavailable
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		c.log.Error("governance-decision-log-svc unexpected status", zap.Int("status", resp.StatusCode))
-		return nil, ErrSourceUnavailable
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, ErrSourceUnavailable
-	}
-	var decisions []struct {
-		DecisionID string `json:"decision_id"`
-	}
-	if err := json.Unmarshal(body, &decisions); err != nil {
-		return nil, fmt.Errorf("aggregator: decode governance decisions list: %w", err)
-	}
-
-	// Re-marshal each element individually so each ManifestRecord snapshot is
-	// exactly one decision's JSON, not the whole array.
-	var raw []json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("aggregator: decode governance decisions list: %w", err)
-	}
-
-	out := make([]SourceRecord, 0, len(decisions))
-	for i, d := range decisions {
-		out = append(out, SourceRecord{
-			SourceType:     domain.SourceGovernanceDecision,
-			SourceRecordID: d.DecisionID,
-			RawJSON:        raw[i],
-		})
-	}
-	return out, nil
+	return errors.New("missing records or decision_id")
 }
 
 // GetByID fetches one governance decision by ID (used when the caller
 // supplies explicit governance_decision_ids rather than a date range).
 func (c *GovernanceDecisionClient) GetByID(ctx context.Context, decisionID string) (*SourceRecord, error) {
-	return getByID(ctx, c.http, c.log, fmt.Sprintf("%s/v1/decisions/%s", c.baseURL, decisionID),
-		domain.SourceGovernanceDecision, decisionID)
+	return getByID(ctx, c.http, c.log, fmt.Sprintf("%s/v1/decisions/%s", c.baseURL, url.PathEscape(decisionID)),
+		domain.SourceGovernanceDecision, decisionID, governanceEnvelope)
 }
 
 // ── authorization-svc ─────────────────────────────────────────────────────────
@@ -316,12 +398,15 @@ func (c *WorkflowHistoryClient) ListByEntityAndDateRange(ctx context.Context, le
 
 // ── shared helper ────────────────────────────────────────────────────────────
 
-func getByID(ctx context.Context, client *http.Client, log *zap.Logger, url string, sourceType domain.SourceType, id string) (*SourceRecord, error) {
+func getByID(ctx context.Context, client *http.Client, log *zap.Logger, url string, sourceType domain.SourceType, id string, decorate ...func(context.Context, *http.Request)) (*SourceRecord, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, ErrSourceUnavailable
 	}
 	forwardTenant(ctx, req)
+	for _, d := range decorate {
+		d(ctx, req)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Error("source service unreachable — failing closed", zap.String("url", url), zap.Error(err))

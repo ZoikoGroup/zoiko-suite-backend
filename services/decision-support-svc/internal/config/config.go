@@ -17,6 +17,17 @@ type Config struct {
 	AuthZServiceURL          string
 	GovernanceDecisionLogURL string
 
+	// GovernanceDecisionLogMTLSURL, when set, is the decision log's mTLS
+	// listener (https://governance-decision-log-svc:8450): precedent reads then
+	// present this service's workload certificate, provisioned from
+	// MTLSManagementServiceURL with its own bootstrap token, and read as
+	// GovernanceDecisionLogPrincipalID (D2-2.F07). Empty keeps the plain URL,
+	// which a decision log in IDENTITY_VERIFY=require refuses.
+	GovernanceDecisionLogMTLSURL     string
+	GovernanceDecisionLogPrincipalID string
+	MTLSManagementServiceURL         string
+	MTLSBootstrapTokenPath           string
+
 	OTELExporterEndpoint string
 }
 
@@ -66,6 +77,11 @@ func Load() (*Config, error) {
 		},
 		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		GovernanceDecisionLogURL: env("GOVERNANCE_DECISION_LOG_URL", "http://governance-decision-log-svc:8083"),
+
+		GovernanceDecisionLogMTLSURL:     os.Getenv("GOVERNANCE_DECISION_LOG_MTLS_URL"),
+		GovernanceDecisionLogPrincipalID: env("GOVERNANCE_DECISION_LOG_PRINCIPAL_ID", "svc-decision-support"),
+		MTLSManagementServiceURL:         env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		MTLSBootstrapTokenPath:           os.Getenv("MTLS_BOOTSTRAP_TOKEN_PATH"),
 
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil

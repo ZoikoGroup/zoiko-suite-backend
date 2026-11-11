@@ -93,7 +93,6 @@ $SEED_ADMIN_ROLE_ID = "5eed0000-0000-4000-8000-00000000a002"
 # iam.assignment.revoke and iam.assignment.read and nothing else: it can read
 # and remove access, never grant it.
 $ACS_SERVICE_ID      = "svc-access-control"
-$ACS_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a003"
 
 # policy-svc's own identity (POLICY_LEDGER_PRINCIPAL_ID). Its evidence relay
 # writes every policy evaluation to governance-decision-log-svc as this
@@ -101,7 +100,21 @@ $ACS_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a003"
 # else: on the platform scope (evaluations no entity scopes) and on the legal
 # entity (evaluations scoped to it).
 $POLICY_SERVICE_ID      = "svc-policy"
-$POLICY_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a004"
+
+# workflow-svc's own identity (WORKFLOW_LEDGER_PRINCIPAL_ID). Its ledger relay
+# writes every workflow decision to governance-decision-log-svc as this
+# principal, so it holds GOVERNANCE_DECISION_RECORD and nothing else.
+$WORKFLOW_SERVICE_ID      = "svc-workflow"
+
+# The decision log's two service READERS (D2-2.F07). contract-lifecycle-svc
+# verifies a contract's approving decision, and decision-support-svc samples
+# precedent, as their own principals over mTLS, so each holds
+# GOVERNANCE_DECISION_READ and nothing else. The grant is PRODUCTION data now:
+# authorization-svc migration 000042 provisions it in every tenant (AC-2), so
+# this script only verifies it. evidence-manifest-svc reads as the signed-in
+# user, so it needs no grant.
+$CONTRACT_LIFECYCLE_SERVICE_ID = "svc-contract-lifecycle"
+$DECISION_SUPPORT_SERVICE_ID   = "svc-decision-support"
 
 $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 
@@ -432,13 +445,16 @@ $BUNDLES = @(
         Actions = @("VENDOR_DD_INITIATE", "VENDOR_DD_VIEW")
     },
     @{
-        # governance-decision-log-svc authorizes every decision write against
-        # authzPlatformScopeID -- decisions are platform records, not
-        # entity-scoped ones -- so this grant is checked on the platform scope
-        # below, never on the legal entity or tenant.
+        # governance-decision-log-svc authorizes a write on the decision's legal
+        # entity, and a tenant-wide read (an unfiltered register, the summary,
+        # the evidence chain) and a seal on authzPlatformScopeID, so this grant
+        # is checked on the platform scope below. READ is the Governance Log
+        # console's register; REPLAY its replay command; GOVERNANCE_EVIDENCE_SEAL
+        # its "Seal package" (G-07).
         Code    = "GOVERNANCE_FULL"
         Service = "governance-decision-log-svc"
-        Actions = @("GOVERNANCE_DECISION_RECORD")
+        Actions = @("GOVERNANCE_DECISION_RECORD", "GOVERNANCE_DECISION_READ", "GOVERNANCE_DECISION_REPLAY",
+                    "GOVERNANCE_EVIDENCE_SEAL")
     },
     @{
         # policy-svc checks its actions against the legal entity when the
@@ -449,6 +465,19 @@ $BUNDLES = @(
         # principals hold this role; policy-svc itself refuses the author
         # approving or activating, and the suspender reviewing, so the
         # maker-checker paths stay testable with $PRINCIPAL_ID and $APPROVER_ID.
+        # workflow-svc: instances, approvals and definitions. WORKFLOW_APPROVE is
+        # checked on the instance's legal entity (with the workflow type and
+        # approver role as ABAC attributes); definitions, cancel/escalate and
+        # the tenant-wide pending list on the platform scope. Both demo
+        # principals hold this role; authorization-svc's own-object SoD still
+        # refuses the initiator approving their own instance.
+        Code    = "WORKFLOW_FULL"
+        Service = "workflow-svc"
+        Actions = @("WORKFLOW_APPROVE", "WORKFLOW_READ", "WORKFLOW_CANCEL", "WORKFLOW_ESCALATE",
+                    "WORKFLOW_ESCALATE_TO", "WORKFLOW_INVALIDATE", "WORKFLOW_ADMINISTER", "WORKFLOW_DEFINE",
+                    "WORKFLOW_REQUEST_CHANGES")
+    },
+    @{
         Code    = "POLICY_FULL"
         Service = "policy-svc"
         Actions = @("POLICY_CREATE", "POLICY_CREATE_GLOBAL", "POLICY_READ", "POLICY_EVALUATE",
@@ -947,7 +976,7 @@ $ALL_ACTIONS = $BUNDLES | ForEach-Object { $_.Actions } | Sort-Object -Unique
 # missing, and the run would skip the bundles entirely -- never granting the
 # platform scope. It then reported success and had granted nothing.
 $PLATFORM_SCOPED_ACTION_CODES = @(
-    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL", "CONTROL_TESTS_FULL",
+    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL", "CONTROL_TESTS_FULL", "WORKFLOW_FULL",
     "SCHEMA_FULL", "JURISDICTION_FULL", "JURISDICTION_PACK_REGISTRY_FULL", "JURISDICTION_RESOLVER_CALLER",
     # retention-registry-svc falls back to the platform scope when a hold or
     # policy names no tenant -- the console offers that as a "platform-wide"
@@ -1119,9 +1148,7 @@ if ($missing.Count -eq 0) {
     if ((Get-Decision -Action "iam.role.manage" -Scope $TENANT_ID).decision_outcome -ne "GRANTED" -or
         (Get-Decision -Action "iam.assignment.grant" -Scope $TENANT_ID -Principal $APPROVER_ID).decision_outcome -ne "GRANTED" -or
         (Get-Decision -Action "iam.permission_bundle.manage" -Scope $TENANT_ID -Principal $SEED_ADMIN_ID).decision_outcome -ne "GRANTED" -or
-        (Get-Decision -Action "iam.assignment.grant" -Scope $PLATFORM_SCOPE -Principal $SEED_ADMIN_ID).decision_outcome -ne "GRANTED" -or
-        (Get-Decision -Action "iam.assignment.revoke" -Scope $TENANT_ID -Principal $ACS_SERVICE_ID).decision_outcome -ne "GRANTED" -or
-        (Get-Decision -Action "iam.assignment.read" -Scope $TENANT_ID -Principal $ACS_SERVICE_ID).decision_outcome -ne "GRANTED") {
+        (Get-Decision -Action "iam.assignment.grant" -Scope $PLATFORM_SCOPE -Principal $SEED_ADMIN_ID).decision_outcome -ne "GRANTED") {
         Write-Host "0  bootstrap the IAM admin grant directly (the admin API refuses everyone until one exists)" -NoNewline
         $iamActions = ($BUNDLES | Where-Object { $_.Code -eq "IAM_ADMIN_FULL" }).Actions | ConvertTo-Json -Compress
         $sql = @"
@@ -1155,16 +1182,6 @@ INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, 
 SELECT '$SEED_ADMIN_ID', '$SEED_ADMIN_ROLE_ID', '$PLATFORM_SCOPE', now() - interval '1 minute', 'seed-bootstrap'
 WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
                   WHERE principal_id = '$SEED_ADMIN_ID' AND role_id = '$SEED_ADMIN_ROLE_ID' AND legal_entity_id = '$PLATFORM_SCOPE');
-INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
-VALUES ('$ACS_SERVICE_ROLE_ID', '$TENANT_ID', 'SVC_ACCESS_CONTROL', 'access-control-svc review executor', 'LEGAL_ENTITY', true, 'seed-bootstrap')
-ON CONFLICT DO NOTHING;
-INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
-VALUES ('$ACS_SERVICE_ROLE_ID', 'REVIEW_REVOKE', '["iam.assignment.revoke", "iam.assignment.read"]'::jsonb, true)
-ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
-INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
-SELECT '$ACS_SERVICE_ID', '$ACS_SERVICE_ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
-WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
-                  WHERE principal_id = '$ACS_SERVICE_ID' AND role_id = '$ACS_SERVICE_ROLE_ID' AND legal_entity_id = '$TENANT_ID');
 "@
         $sql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -v ON_ERROR_STOP=1 -q | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "IAM bootstrap into authorization_svc failed (container $PgContainer)" }
@@ -1288,32 +1305,56 @@ try {
     }
 }
 
-# -- policy-svc's ledger writer -----------------------------------------------------
+# -- the platform's service identities (AC-2) -----------------------------------------
 #
-# Runs on every invocation, like the SoD approver above: it is one role with one
-# bundle and two assignments, written idempotently. Direct SQL, as for the other
-# service identities in the bootstrap block -- DEVELOPMENT ONLY.
-if ((Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $PLATFORM_SCOPE -Principal $POLICY_SERVICE_ID).decision_outcome -ne "GRANTED" -or
-    (Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $LEGAL_ENTITY -Principal $POLICY_SERVICE_ID).decision_outcome -ne "GRANTED") {
-    Write-Host "grant $POLICY_SERVICE_ID GOVERNANCE_DECISION_RECORD (policy evidence relay)" -NoNewline
-    $sql = @"
-INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
-VALUES ('$POLICY_SERVICE_ROLE_ID', '$TENANT_ID', 'SVC_POLICY_LEDGER', 'policy-svc evidence relay', 'LEGAL_ENTITY', true, 'seed-bootstrap')
-ON CONFLICT DO NOTHING;
-INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
-VALUES ('$POLICY_SERVICE_ROLE_ID', 'LEDGER_WRITE', '["GOVERNANCE_DECISION_RECORD"]'::jsonb, true)
-ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
-INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
-SELECT '$POLICY_SERVICE_ID', '$POLICY_SERVICE_ROLE_ID', scope, now() - interval '1 minute', 'seed-bootstrap'
-FROM (VALUES ('$PLATFORM_SCOPE'::uuid), ('$LEGAL_ENTITY'::uuid)) AS s(scope)
-WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
-                  WHERE principal_id = '$POLICY_SERVICE_ID' AND role_id = '$POLICY_SERVICE_ROLE_ID' AND legal_entity_id = s.scope);
-"@
-    $sql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -v ON_ERROR_STOP=1 -q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "policy-svc ledger grant into authorization_svc failed (container $PgContainer)" }
-    Start-Sleep -Seconds 6
-    Write-Host "  -> done" -ForegroundColor Green
+# Verified, not granted: authorization-svc migration 000043 provisions, in every
+# tenant from its first role on, GOVERNANCE_DECISION_RECORD for policy-svc's and
+# workflow-svc's ledger relays and iam.assignment.revoke / .read for
+# access-control-svc's review executor. A missing grant means the migration has
+# not run.
+foreach ($check in @(
+        @{ Principal = $POLICY_SERVICE_ID;   Action = "GOVERNANCE_DECISION_RECORD" },
+        @{ Principal = $WORKFLOW_SERVICE_ID; Action = "GOVERNANCE_DECISION_RECORD" })) {
+    foreach ($scope in @($PLATFORM_SCOPE, $LEGAL_ENTITY)) {
+        if ((Get-Decision -Action $check.Action -Scope $scope -Principal $check.Principal).decision_outcome -ne "GRANTED") {
+            throw "$($check.Principal) does not hold $($check.Action) on $scope : run deployments/migrate.py up --db authorization_svc (migration 000043_platform_service_identity_grants)"
+        }
+    }
 }
+# svc-access-control's actions are checked by authorization-svc's own admin
+# gate on the TENANT as the scope, which /v1/authorize refuses to evaluate
+# (tenant_scope_mismatch: a tenant is not one of its legal entities), so the
+# grant is read from the store: an active, approved assignment in this tenant
+# whose bundle carries both actions.
+$acsSql = @"
+SELECT count(*) FROM principal_role_assignments a
+JOIN roles r ON r.role_id = a.role_id AND r.active_flag
+JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
+WHERE a.principal_id = '$ACS_SERVICE_ID' AND r.tenant_id = '$TENANT_ID'
+  AND a.approval_status = 'APPROVED' AND a.suspended_at IS NULL
+  AND (a.legal_entity_id IS NULL OR a.legal_entity_id = '$TENANT_ID')
+  AND a.effective_from <= now() AND (a.effective_to IS NULL OR a.effective_to > now())
+  AND pb.permitted_actions ? 'iam.assignment.revoke' AND pb.permitted_actions ? 'iam.assignment.read';
+"@
+$acsHeld = ($acsSql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -tA -q)
+if ($LASTEXITCODE -ne 0 -or [int]("$acsHeld".Trim()) -lt 1) {
+    throw "$ACS_SERVICE_ID does not hold iam.assignment.revoke + iam.assignment.read in $TENANT_ID : run deployments/migrate.py up --db authorization_svc (migration 000043_platform_service_identity_grants)"
+}
+Write-Host "service identities hold their grants (authorization-svc 000043)" -ForegroundColor DarkGray
+
+# -- the decision log's service readers (D2-2.F07) -----------------------------------
+#
+# Verified, not granted: authorization-svc migration 000042 provisions
+# GOVERNANCE_DECISION_READ for both principals in every tenant, from the
+# tenant's first role on (AC-2). A missing grant means the migration has not run.
+foreach ($reader in @($CONTRACT_LIFECYCLE_SERVICE_ID, $DECISION_SUPPORT_SERVICE_ID)) {
+    foreach ($scope in @($PLATFORM_SCOPE, $LEGAL_ENTITY)) {
+        if ((Get-Decision -Action "GOVERNANCE_DECISION_READ" -Scope $scope -Principal $reader).decision_outcome -ne "GRANTED") {
+            throw "$reader does not hold GOVERNANCE_DECISION_READ on $scope : run deployments/migrate.py up --db authorization_svc (migration 000042_decision_log_service_readers)"
+        }
+    }
+}
+Write-Host "decision-log readers hold GOVERNANCE_DECISION_READ (authorization-svc 000042)" -ForegroundColor DarkGray
 
 # -- REF-04 / REF-05 maker-checker roles -------------------------------------------
 #

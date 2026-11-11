@@ -32,6 +32,16 @@ type Config struct {
 	AuthorizationServiceURL  string
 	WorkflowServiceURL       string
 	WorkflowHistoryURL       string
+
+	// GovernanceDecisionLogMTLSURL, when set, is the decision log's mTLS
+	// listener (https://governance-decision-log-svc:8450): reads then present
+	// this service's workload certificate, provisioned from
+	// MTLSManagementServiceURL with its own bootstrap token, vouching for the
+	// signed-in user (D2-2.F07). Empty keeps the plain URL, which a decision
+	// log in IDENTITY_VERIFY=require refuses.
+	GovernanceDecisionLogMTLSURL string
+	MTLSManagementServiceURL     string
+	MTLSBootstrapTokenPath       string
 }
 
 func Load() (*Config, error) {
@@ -62,6 +72,10 @@ func Load() (*Config, error) {
 		AuthorizationServiceURL:  strEnv("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
 		WorkflowServiceURL:       strEnv("WORKFLOW_SERVICE_URL", "http://workflow-svc:8090"),
 		WorkflowHistoryURL:       strEnv("WORKFLOW_HISTORY_SERVICE_URL", "http://workflow-history-svc:8097"),
+
+		GovernanceDecisionLogMTLSURL: os.Getenv("GOVERNANCE_DECISION_LOG_MTLS_URL"),
+		MTLSManagementServiceURL:     strEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		MTLSBootstrapTokenPath:       os.Getenv("MTLS_BOOTSTRAP_TOKEN_PATH"),
 	}, nil
 }
 

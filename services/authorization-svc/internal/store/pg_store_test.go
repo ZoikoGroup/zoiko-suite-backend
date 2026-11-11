@@ -146,6 +146,10 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000040_quantity_authority_limits.up.sql",
 		// 000041: one authz_assignment_events() whichever of 000037 / 000038 ran last.
 		"000041_assignment_events_reconciled.up.sql",
+		// 000042: the decision log's service readers, provisioned per tenant.
+		"000042_decision_log_service_readers.up.sql",
+		// 000043: svc-policy / svc-workflow ledger writers and svc-access-control, per tenant.
+		"000043_platform_service_identity_grants.up.sql",
 	}
 	// Three migrations have now been missed from this list. Refuse to run
 	// against a schema the list does not fully describe.

@@ -81,6 +81,15 @@ func NewHTTPClient(baseURL string) *HTTPClient {
 	}
 }
 
+// NewHTTPClientWith is NewHTTPClient over a caller-supplied client — policy-svc's
+// mTLS workload identity (identity-envelope/mtlsclient), so the relay reaches
+// governance-decision-log-svc's peer listener as a verified workload. The
+// relay acts for no signed-in person and carries no envelope; under that
+// service's IDENTITY_VERIFY=require its certificate is the only identity it has.
+func NewHTTPClientWith(baseURL string, client *http.Client) *HTTPClient {
+	return &HTTPClient{baseURL: strings.TrimRight(baseURL, "/"), http: client}
+}
+
 // createDecisionRequest mirrors governance-decision-log-svc's
 // createDecisionRequest. tenant_id is deliberately omitted: that service
 // files the decision under the verified X-Tenant-Id and refuses a body that

@@ -58,8 +58,13 @@ func TestPgStore_RecordDecision_WritesKeyAndEventInOneTransaction(t *testing.T) 
 		if n := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM idempotency_keys WHERE idempotency_key = 'k-atomic'`); n != 1 {
 			t.Errorf("expected 1 idempotency key, got %d", n)
 		}
-		if n := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox WHERE aggregate_id = 'dec-atomic' AND published_at IS NULL`); n != 1 {
-			t.Errorf("expected 1 pending outbox event keyed by the decision, got %d", n)
+		// The wire event and its canonical-name alias (C3/R9), both in the
+		// decision's own transaction.
+		if n := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox WHERE aggregate_id = 'dec-atomic' AND published_at IS NULL`); n != 2 {
+			t.Errorf("expected 2 pending outbox events keyed by the decision (wire + canonical), got %d", n)
+		}
+		if n := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox WHERE aggregate_id = 'dec-atomic' AND event_type = 'com.zoikosuite.governance.decision.recorded'`); n != 1 {
+			t.Errorf("expected exactly one canonical-name alias, got %d", n)
 		}
 	})
 }
@@ -102,7 +107,7 @@ func TestPgStore_RecordDecision_RepeatReturnsStoredRow(t *testing.T) {
 	}
 	changed := d
 	changed.Outcome = "GRANTED"
-	stored, created, err := s.RecordDecision(ctx, store.DecisionRecord{Decision: changed, Event: []byte(`{}`)})
+	stored, created, err := s.RecordDecision(ctx, store.DecisionRecord{Decision: changed, Event: []byte(`{"event_type":"governance.decision.recorded"}`)})
 	if err != nil || created {
 		t.Fatalf("expected created=false, got %v / %v", created, err)
 	}
@@ -202,11 +207,11 @@ func TestPgStore_ReplayManifestIdempotentOnKey(t *testing.T) {
 			ReplayedByPrincipalID: "auditor", TenantID: "tenant-1", IdempotencyKey: "same", RequestHash: []byte{1},
 		}
 	}
-	first, created, err := s.CreateReplayManifest(ctx, mk("33333333-3333-3333-3333-333333333333"), &store.ReplayEvent{Envelope: []byte(`{}`), LegalEntityID: "entity-1", CorrelationID: "c"})
+	first, created, err := s.CreateReplayManifest(ctx, mk("33333333-3333-3333-3333-333333333333"), &store.ReplayEvent{Envelope: []byte(`{"event_type":"governance.decision.replayed"}`), LegalEntityID: "entity-1", CorrelationID: "c"})
 	if err != nil || !created {
 		t.Fatalf("first: %v %v", created, err)
 	}
-	second, created, err := s.CreateReplayManifest(ctx, mk("44444444-4444-4444-4444-444444444444"), &store.ReplayEvent{Envelope: []byte(`{}`), LegalEntityID: "entity-1", CorrelationID: "c"})
+	second, created, err := s.CreateReplayManifest(ctx, mk("44444444-4444-4444-4444-444444444444"), &store.ReplayEvent{Envelope: []byte(`{"event_type":"governance.decision.replayed"}`), LegalEntityID: "entity-1", CorrelationID: "c"})
 	if err != nil || created {
 		t.Fatalf("retry must not create: created=%v err=%v", created, err)
 	}
@@ -278,7 +283,8 @@ func TestOutboxRelay_DrainsEveryTenantAsRuntimeRole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("relay: %v", err)
 	}
-	if n != 2 || len(w.msgs) != 2 {
+	// Two tenants, each event under its wire and its canonical name (C3/R9).
+	if n != 4 || len(w.msgs) != 4 {
 		t.Fatalf("expected both tenants' events published, got %d (%d messages)", n, len(w.msgs))
 	}
 	for _, m := range w.msgs {
@@ -379,7 +385,8 @@ func TestOutbox_BacklogAndRetention(t *testing.T) {
 	w := outbox.NewWorker(pool, &capturingWriter{}, zap.NewNop())
 
 	pending, oldest, err := w.Backlog(ctx)
-	if err != nil || pending != 3 || oldest < 0 {
+	// Three decisions, each a wire event plus its canonical alias (C3/R9).
+	if err != nil || pending != 6 || oldest < 0 {
 		t.Fatalf("backlog before relay: pending=%d oldest=%s err=%v", pending, oldest, err)
 	}
 
@@ -405,19 +412,19 @@ func TestOutbox_BacklogAndRetention(t *testing.T) {
 	scopedRelay(`UPDATE outbox SET created_at = now() - interval '2 hours' WHERE aggregate_id = 'dec-pending'`)
 
 	pending, oldest, err = w.Backlog(ctx)
-	if err != nil || pending != 1 || oldest < time.Hour {
-		t.Fatalf("backlog: pending=%d oldest=%s err=%v, want 1 pending at least 1h old", pending, oldest, err)
+	if err != nil || pending != 2 || oldest < time.Hour {
+		t.Fatalf("backlog: pending=%d oldest=%s err=%v, want 2 pending (one event, two names) at least 1h old", pending, oldest, err)
 	}
 
 	n, err := w.Prune(ctx, 7*24*time.Hour)
-	if err != nil || n != 1 {
-		t.Fatalf("prune removed %d (err %v), want only the 30-day-old published row", n, err)
+	if err != nil || n != 2 {
+		t.Fatalf("prune removed %d (err %v), want only the 30-day-old published rows (both names)", n, err)
 	}
 	scoped(t, pool, "tenant-1", func(tx pgx.Tx) {
-		if c := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox`); c != 2 {
+		if c := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox`); c != 4 {
 			t.Errorf("expected the recent published row and the pending row kept, got %d rows", c)
 		}
-		if c := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox WHERE aggregate_id = 'dec-pending'`); c != 1 {
+		if c := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox WHERE aggregate_id = 'dec-pending'`); c != 2 {
 			t.Error("retention removed an unpublished event")
 		}
 	})
@@ -453,7 +460,7 @@ func TestOutbox_StopCancelsABlockedRelay(t *testing.T) {
 		t.Fatal("Stop did not return while the relay was blocked on the broker")
 	}
 	scoped(t, pool, "tenant-1", func(tx pgx.Tx) {
-		if c := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox WHERE published_at IS NULL`); c != 1 {
+		if c := countScoped(t, ctx, tx, `SELECT COUNT(*) FROM outbox WHERE published_at IS NULL`); c != 2 {
 			t.Errorf("the interrupted event must stay pending for the next relay, got %d pending", c)
 		}
 	})

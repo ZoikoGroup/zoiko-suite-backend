@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -33,9 +34,39 @@ type Config struct {
 	// AuthzMTLSURL is authorization-svc's mTLS listener, used only when
 	// AuthzMTLSEnabled is true.
 	AuthzMTLSURL string
-	// MTLSManagementServiceURL is where this service provisions its own
-	// client-side mTLS identity, used only when AuthzMTLSEnabled is true.
+	// MTLSManagementServiceURL is where this service provisions its mTLS
+	// identity (used when AuthzMTLSEnabled or MTLSEnabled is true).
 	MTLSManagementServiceURL string
+
+	// MTLSEnabled opens the inbound mTLS listener on MTLSPort (X5): service
+	// callers (policy-svc's and workflow-svc's ledger relays) present a
+	// platform client certificate, and the identity gate admits the names in
+	// IDENTITY_PEERS as peer workloads. Required before IDENTITY_VERIFY=require,
+	// because those relays act for no signed-in person and carry no envelope.
+	MTLSEnabled bool
+	MTLSPort    int
+	// MTLSBootstrapTokenPath is this service's own provisioning token file
+	// (register M-01), mounted from the mtls_bootstrap_token volume.
+	MTLSBootstrapTokenPath string
+	// MTLSRevocationCheck is "require" (default) or "off": whether the :8450
+	// listener refuses client certificates on mtls-management-svc's CRL, and
+	// refuses every client certificate while it holds no current CRL. "off"
+	// is accepted only with ENV=local.
+	MTLSRevocationCheck string
+	// MTLSCRLURL is where the CRL is fetched (default: the management
+	// service's /v1/mtls/crl); MTLSCRLRefresh how often.
+	MTLSCRLURL     string
+	MTLSCRLRefresh time.Duration
+
+	// EvidenceSealInterval is how often the scheduled sealer seals every
+	// tenant's unsealed decisions into an evidence package (GOV-07
+	// SealEvidencePackage on a schedule; EVIDENCE_SEAL_INTERVAL, a Go
+	// duration; default 1h; 0 turns the schedule off). The sealer also
+	// re-verifies each tenant's chain before sealing, so a broken chain is
+	// reported within one interval.
+	EvidenceSealInterval time.Duration
+	// EvidenceSealPrincipalID is recorded as sealed_by on scheduled packages.
+	EvidenceSealPrincipalID string
 
 	// PolicyServiceURL is the base URL of policy-svc. Used only by
 	// ReplayDecision to fetch the EXACT policy version a past decision
@@ -160,9 +191,26 @@ func quoteDSNValue(v string) string {
 	return b.String()
 }
 
+// Validate refuses settings that would weaken a control outside local runs.
+func (c *Config) Validate() error {
+	switch c.MTLSRevocationCheck {
+	case "require":
+	case "off":
+		if !strings.EqualFold(c.Env, "local") {
+			return fmt.Errorf("MTLS_REVOCATION_CHECK=off is only allowed with ENV=local: a revoked peer certificate would keep writing decisions until it expires")
+		}
+	default:
+		return fmt.Errorf("MTLS_REVOCATION_CHECK must be \"require\" or \"off\", got %q", c.MTLSRevocationCheck)
+	}
+	if c.MTLSCRLRefresh <= 0 {
+		return fmt.Errorf("MTLS_CRL_REFRESH_SECONDS must be positive")
+	}
+	return nil
+}
+
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
-	return &Config{
+	c := &Config{
 		Env:                      env("ENV", "local"),
 		Port:                     envInt("PORT", 8083),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
@@ -171,6 +219,14 @@ func Load() (*Config, error) {
 		AuthzMTLSEnabled:         os.Getenv("AUTHZ_MTLS_ENABLED") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		MTLSEnabled:              os.Getenv("MTLS_ENABLED") == "true",
+		MTLSPort:                 envInt("MTLS_PORT", 8450),
+		MTLSBootstrapTokenPath:   env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
+		MTLSRevocationCheck:      strings.ToLower(env("MTLS_REVOCATION_CHECK", "require")),
+		MTLSCRLURL:               env("MTLS_CRL_URL", strings.TrimRight(env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"), "/")+"/v1/mtls/crl"),
+		MTLSCRLRefresh:           time.Duration(envInt("MTLS_CRL_REFRESH_SECONDS", 30)) * time.Second,
+		EvidenceSealInterval:     envDuration("EVIDENCE_SEAL_INTERVAL", time.Hour),
+		EvidenceSealPrincipalID:  env("EVIDENCE_SEAL_PRINCIPAL_ID", "svc-governance-decision-log"),
 		PolicyServiceURL:         env("POLICY_SERVICE_URL", "http://policy-svc:8085"),
 		ReadAuthzMode:            env("DECISION_LOG_READ_AUTHZ", "enforce"),
 		OutboxRetention:          envDuration("OUTBOX_RETENTION", 168*time.Hour),
@@ -195,7 +251,11 @@ func Load() (*Config, error) {
 			// "default_query_exec_mode=exec statement_cache_capacity=0".
 			Options: env("DB_OPTIONS", ""),
 		},
-	}, nil
+	}
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func env(key, def string) string {

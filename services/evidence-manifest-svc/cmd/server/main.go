@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/evidence-manifest-svc/internal/aggregator"
 	"zoiko.io/evidence-manifest-svc/internal/authz"
@@ -93,7 +94,23 @@ func main() {
 	go relay.Start(relayCtx)
 
 	pgStore := store.New(pool, log)
-	governanceClient := aggregator.NewGovernanceDecisionClient(cfg.GovernanceDecisionLogURL, log)
+	// Decision-log reads (D2-2.F07): over mTLS as this service's workload,
+	// vouching for the signed-in user, when GOVERNANCE_DECISION_LOG_MTLS_URL is
+	// set. Until the certificate is provisioned a read fails and the manifest
+	// generation fails closed, as for any source outage.
+	var governanceClient *aggregator.GovernanceDecisionClient
+	if cfg.GovernanceDecisionLogMTLSURL != "" {
+		identity := mtlsclient.Start(relayCtx, mtlsclient.Options{
+			ServiceName:        "evidence-manifest-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		governanceClient = aggregator.NewGovernanceDecisionClientWithHTTPClient(cfg.GovernanceDecisionLogMTLSURL, identity.HTTPClient(5*time.Second), log)
+		log.Info("governance decision log reads over mTLS", zap.String("url", cfg.GovernanceDecisionLogMTLSURL))
+	} else {
+		governanceClient = aggregator.NewGovernanceDecisionClient(cfg.GovernanceDecisionLogURL, log)
+		log.Warn("GOVERNANCE_DECISION_LOG_MTLS_URL unset: decision-log reads use plain HTTP, which a decision log running IDENTITY_VERIFY=require refuses")
+	}
 	accessClient := aggregator.NewAccessDecisionClient(cfg.AuthorizationServiceURL, log)
 	workflowClient := aggregator.NewWorkflowClient(cfg.WorkflowServiceURL, log)
 	workflowHistoryClient := aggregator.NewWorkflowHistoryClient(cfg.WorkflowHistoryURL, log)

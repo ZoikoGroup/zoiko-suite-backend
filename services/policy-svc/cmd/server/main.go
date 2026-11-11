@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/cache"
@@ -144,7 +145,20 @@ func main() {
 	if cfg.LedgerPrincipalID == "" {
 		log.Error("POLICY_LEDGER_PRINCIPAL_ID is not set: evaluations will be stored but stay PENDING for the governance ledger")
 	}
-	evidenceRelay := evidence.NewRelay(pgStore, decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL),
+	// Over mTLS when configured: the relay presents policy-svc's workload
+	// certificate to governance-decision-log-svc's peer listener, which admits
+	// it as a registered peer vouching for the ledger principal (X5).
+	ledgerClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL)
+	if cfg.GovernanceDecisionLogMTLSURL != "" {
+		ledgerIdentity := mtlsclient.Start(context.Background(), mtlsclient.Options{
+			ServiceName:        "policy-svc",
+			ManagementURL:      cfg.MTLSManagementURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		ledgerClient = decisionlog.NewHTTPClientWith(cfg.GovernanceDecisionLogMTLSURL, ledgerIdentity.HTTPClient(5*time.Second))
+		log.Info("evidence relay: governance ledger over mTLS", zap.String("url", cfg.GovernanceDecisionLogMTLSURL))
+	}
+	evidenceRelay := evidence.NewRelay(pgStore, ledgerClient,
 		cfg.LedgerPrincipalID, cfg.EvidenceRelayInterval, log)
 	evidenceRelay.Start()
 	defer evidenceRelay.Stop()
