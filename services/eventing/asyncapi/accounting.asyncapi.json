@@ -1,0 +1,1836 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "accounting-event": {
+      "address": "zoikosuite.accounting.accounting-event.v1",
+      "messages": {
+        "accepted": {
+          "$ref": "#/components/messages/accounting-event.accepted"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/accounting-event.rejected"
+        }
+      }
+    },
+    "allocation": {
+      "address": "zoikosuite.accounting.allocation.v1",
+      "messages": {
+        "posted": {
+          "$ref": "#/components/messages/allocation.posted"
+        }
+      }
+    },
+    "balance-snapshot": {
+      "address": "zoikosuite.accounting.balance-snapshot.v1",
+      "messages": {
+        "signed": {
+          "$ref": "#/components/messages/balance-snapshot.signed"
+        }
+      }
+    },
+    "consolidation-adjustment": {
+      "address": "zoikosuite.accounting.consolidation-adjustment.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/consolidation-adjustment.approved"
+        },
+        "created": {
+          "$ref": "#/components/messages/consolidation-adjustment.created"
+        },
+        "posted": {
+          "$ref": "#/components/messages/consolidation-adjustment.posted"
+        },
+        "reversed": {
+          "$ref": "#/components/messages/consolidation-adjustment.reversed"
+        }
+      }
+    },
+    "consolidation-run": {
+      "address": "zoikosuite.accounting.consolidation-run.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/consolidation-run.completed"
+        },
+        "exception-detected": {
+          "$ref": "#/components/messages/consolidation-run.exception-detected"
+        },
+        "started": {
+          "$ref": "#/components/messages/consolidation-run.started"
+        }
+      }
+    },
+    "financial-snapshot": {
+      "address": "zoikosuite.accounting.financial-snapshot.v1",
+      "messages": {
+        "integrity-failed": {
+          "$ref": "#/components/messages/financial-snapshot.integrity-failed"
+        }
+      }
+    },
+    "fx-revaluation": {
+      "address": "zoikosuite.accounting.fx-revaluation.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/fx-revaluation.completed"
+        }
+      }
+    },
+    "intercompany-entry": {
+      "address": "zoikosuite.accounting.intercompany-entry.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/intercompany-entry.created"
+        },
+        "dispute-raised": {
+          "$ref": "#/components/messages/intercompany-entry.dispute-raised"
+        },
+        "dispute-resolved": {
+          "$ref": "#/components/messages/intercompany-entry.dispute-resolved"
+        },
+        "matched": {
+          "$ref": "#/components/messages/intercompany-entry.matched"
+        },
+        "mismatch-detected": {
+          "$ref": "#/components/messages/intercompany-entry.mismatch-detected"
+        }
+      }
+    },
+    "intercompany-mismatch": {
+      "address": "zoikosuite.accounting.intercompany-mismatch.v1",
+      "messages": {
+        "detected": {
+          "$ref": "#/components/messages/intercompany-mismatch.detected"
+        }
+      }
+    },
+    "journal": {
+      "address": "zoikosuite.accounting.journal.v1",
+      "messages": {
+        "adjusted": {
+          "$ref": "#/components/messages/journal.adjusted"
+        },
+        "approved": {
+          "$ref": "#/components/messages/journal.approved"
+        },
+        "created": {
+          "$ref": "#/components/messages/journal.created"
+        },
+        "posted": {
+          "$ref": "#/components/messages/journal.posted"
+        },
+        "proposed": {
+          "$ref": "#/components/messages/journal.proposed"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/journal.rejected"
+        },
+        "reversed": {
+          "$ref": "#/components/messages/journal.reversed"
+        },
+        "validated": {
+          "$ref": "#/components/messages/journal.validated"
+        },
+        "withdrawn": {
+          "$ref": "#/components/messages/journal.withdrawn"
+        }
+      }
+    },
+    "kernel": {
+      "address": "zoikosuite.accounting.kernel.v1",
+      "messages": {
+        "account.scope-changed": {
+          "$ref": "#/components/messages/kernel.account.scope-changed"
+        },
+        "allocation-rule.activated": {
+          "$ref": "#/components/messages/kernel.allocation-rule.activated"
+        },
+        "allocation-rule.created": {
+          "$ref": "#/components/messages/kernel.allocation-rule.created"
+        },
+        "allocation-rule.retired": {
+          "$ref": "#/components/messages/kernel.allocation-rule.retired"
+        },
+        "allocation-run.posted": {
+          "$ref": "#/components/messages/kernel.allocation-run.posted"
+        },
+        "allocation-run.reversed": {
+          "$ref": "#/components/messages/kernel.allocation-run.reversed"
+        },
+        "balance-snapshot.signed": {
+          "$ref": "#/components/messages/kernel.balance-snapshot.signed"
+        },
+        "book.created": {
+          "$ref": "#/components/messages/kernel.book.created"
+        },
+        "book.status-changed": {
+          "$ref": "#/components/messages/kernel.book.status-changed"
+        },
+        "consolidation-adjustment.approved": {
+          "$ref": "#/components/messages/kernel.consolidation-adjustment.approved"
+        },
+        "consolidation-adjustment.proposed": {
+          "$ref": "#/components/messages/kernel.consolidation-adjustment.proposed"
+        },
+        "consolidation-adjustment.withdrawn": {
+          "$ref": "#/components/messages/kernel.consolidation-adjustment.withdrawn"
+        },
+        "consolidation-group.created": {
+          "$ref": "#/components/messages/kernel.consolidation-group.created"
+        },
+        "consolidation-mapping.versioned": {
+          "$ref": "#/components/messages/kernel.consolidation-mapping.versioned"
+        },
+        "consolidation-member.added": {
+          "$ref": "#/components/messages/kernel.consolidation-member.added"
+        },
+        "consolidation-member.ended": {
+          "$ref": "#/components/messages/kernel.consolidation-member.ended"
+        },
+        "consolidation-run.certified": {
+          "$ref": "#/components/messages/kernel.consolidation-run.certified"
+        },
+        "consolidation-run.completed": {
+          "$ref": "#/components/messages/kernel.consolidation-run.completed"
+        },
+        "consolidation-run.superseded": {
+          "$ref": "#/components/messages/kernel.consolidation-run.superseded"
+        },
+        "event.registered": {
+          "$ref": "#/components/messages/kernel.event.registered"
+        },
+        "event.rejected": {
+          "$ref": "#/components/messages/kernel.event.rejected"
+        },
+        "fx.override-approved": {
+          "$ref": "#/components/messages/kernel.fx.override-approved"
+        },
+        "fx.override-rejected": {
+          "$ref": "#/components/messages/kernel.fx.override-rejected"
+        },
+        "fx.override-requested": {
+          "$ref": "#/components/messages/kernel.fx.override-requested"
+        },
+        "fx.rate-ingested": {
+          "$ref": "#/components/messages/kernel.fx.rate-ingested"
+        },
+        "migration-batch.approved": {
+          "$ref": "#/components/messages/kernel.migration-batch.approved"
+        },
+        "migration-batch.cancelled": {
+          "$ref": "#/components/messages/kernel.migration-batch.cancelled"
+        },
+        "migration-batch.posted": {
+          "$ref": "#/components/messages/kernel.migration-batch.posted"
+        },
+        "migration-batch.reconciled": {
+          "$ref": "#/components/messages/kernel.migration-batch.reconciled"
+        },
+        "migration-batch.staged": {
+          "$ref": "#/components/messages/kernel.migration-batch.staged"
+        },
+        "migration-batch.validated": {
+          "$ref": "#/components/messages/kernel.migration-batch.validated"
+        },
+        "period.reopened": {
+          "$ref": "#/components/messages/kernel.period.reopened"
+        },
+        "period.resealed": {
+          "$ref": "#/components/messages/kernel.period.resealed"
+        },
+        "period.sealed": {
+          "$ref": "#/components/messages/kernel.period.sealed"
+        },
+        "posting.exception-raised": {
+          "$ref": "#/components/messages/kernel.posting.exception-raised"
+        },
+        "reconciliation.break-raised": {
+          "$ref": "#/components/messages/kernel.reconciliation.break-raised"
+        },
+        "reconciliation.exception-accepted": {
+          "$ref": "#/components/messages/kernel.reconciliation.exception-accepted"
+        },
+        "reconciliation.resolved": {
+          "$ref": "#/components/messages/kernel.reconciliation.resolved"
+        },
+        "reconciliation.tolerance-set": {
+          "$ref": "#/components/messages/kernel.reconciliation.tolerance-set"
+        },
+        "revaluation.completed": {
+          "$ref": "#/components/messages/kernel.revaluation.completed"
+        },
+        "rule-set.activated": {
+          "$ref": "#/components/messages/kernel.rule-set.activated"
+        },
+        "rule-set.approved": {
+          "$ref": "#/components/messages/kernel.rule-set.approved"
+        },
+        "rule-set.created": {
+          "$ref": "#/components/messages/kernel.rule-set.created"
+        },
+        "rule-set.tested": {
+          "$ref": "#/components/messages/kernel.rule-set.tested"
+        }
+      }
+    },
+    "period": {
+      "address": "zoikosuite.accounting.period.v1",
+      "messages": {
+        "close-review-started": {
+          "$ref": "#/components/messages/period.close-review-started"
+        },
+        "closed": {
+          "$ref": "#/components/messages/period.closed"
+        },
+        "command-rejected": {
+          "$ref": "#/components/messages/period.command-rejected"
+        },
+        "hard-closed": {
+          "$ref": "#/components/messages/period.hard-closed"
+        },
+        "opened": {
+          "$ref": "#/components/messages/period.opened"
+        },
+        "reclosed": {
+          "$ref": "#/components/messages/period.reclosed"
+        },
+        "reopen-requested": {
+          "$ref": "#/components/messages/period.reopen-requested"
+        },
+        "reopened": {
+          "$ref": "#/components/messages/period.reopened"
+        },
+        "soft-closed": {
+          "$ref": "#/components/messages/period.soft-closed"
+        },
+        "subledger-control-exception": {
+          "$ref": "#/components/messages/period.subledger-control-exception"
+        }
+      }
+    },
+    "reconciliation-break": {
+      "address": "zoikosuite.accounting.reconciliation-break.v1",
+      "messages": {
+        "detected": {
+          "$ref": "#/components/messages/reconciliation-break.detected"
+        },
+        "resolved": {
+          "$ref": "#/components/messages/reconciliation-break.resolved"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "accounting-event.accepted": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Posting engine/evidence. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.accounting-event.accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Accounting event: accepted.",
+        "title": "accounting-event accepted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.accounting-event.accepted",
+        "x-zoiko-origin": "spec"
+      },
+      "accounting-event.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Source domain exception queue. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.accounting-event.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Accounting event: rejected.",
+        "title": "accounting-event rejected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.accounting-event.rejected",
+        "x-zoiko-origin": "spec"
+      },
+      "allocation.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: GL/reporting. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.allocation.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Allocation run: posted.",
+        "title": "allocation posted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.allocation.posted",
+        "x-zoiko-origin": "spec"
+      },
+      "balance-snapshot.signed": {
+        "contentType": "application/json",
+        "description": "Producer: Trial Balance Service. Primary consumers / intent: Reporting/audit/consolidation. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.balance-snapshot.signed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Balance snapshot: signed.",
+        "title": "balance-snapshot signed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.balance-snapshot.signed",
+        "x-zoiko-origin": "spec"
+      },
+      "consolidation-adjustment.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Consolidation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.consolidation-adjustment.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Adjustment: approved.",
+        "title": "consolidation-adjustment approved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.consolidation-adjustment.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "consolidation-adjustment.created": {
+        "contentType": "application/json",
+        "description": "Producer: Consolidation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.consolidation-adjustment.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Adjustment: created.",
+        "title": "consolidation-adjustment created",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.consolidation-adjustment.created",
+        "x-zoiko-origin": "extension"
+      },
+      "consolidation-adjustment.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Consolidation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.consolidation-adjustment.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Adjustment: posted.",
+        "title": "consolidation-adjustment posted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.consolidation-adjustment.posted",
+        "x-zoiko-origin": "extension"
+      },
+      "consolidation-adjustment.reversed": {
+        "contentType": "application/json",
+        "description": "Producer: Consolidation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.consolidation-adjustment.reversed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Adjustment: reversed.",
+        "title": "consolidation-adjustment reversed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.consolidation-adjustment.reversed",
+        "x-zoiko-origin": "extension"
+      },
+      "consolidation-run.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Consolidation Service. Primary consumers / intent: Group reporting/evidence. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.consolidation-run.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation run: completed.",
+        "title": "consolidation-run completed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.consolidation-run.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "consolidation-run.exception-detected": {
+        "contentType": "application/json",
+        "description": "Producer: Consolidation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.consolidation-run.exception-detected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Run: exception-detected.",
+        "title": "consolidation-run exception-detected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.consolidation-run.exception-detected",
+        "x-zoiko-origin": "extension"
+      },
+      "consolidation-run.started": {
+        "contentType": "application/json",
+        "description": "Producer: Consolidation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.consolidation-run.started",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Run: started.",
+        "title": "consolidation-run started",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.consolidation-run.started",
+        "x-zoiko-origin": "extension"
+      },
+      "financial-snapshot.integrity-failed": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Accounting close workflow. Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.financial-snapshot.integrity-failed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Financial Snapshot: integrity-failed.",
+        "title": "financial-snapshot integrity-failed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.financial-snapshot.integrity-failed",
+        "x-zoiko-origin": "extension"
+      },
+      "fx-revaluation.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: GL/reporting. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.fx-revaluation.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Revaluation run: completed.",
+        "title": "fx-revaluation completed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.fx-revaluation.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "intercompany-entry.created": {
+        "contentType": "application/json",
+        "description": "Producer: Intercompany Accounting Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.intercompany-entry.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Intercompany Entry: created.",
+        "title": "intercompany-entry created",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.intercompany-entry.created",
+        "x-zoiko-origin": "extension"
+      },
+      "intercompany-entry.dispute-raised": {
+        "contentType": "application/json",
+        "description": "Producer: Intercompany Accounting Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.intercompany-entry.dispute-raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Intercompany Entry: dispute-raised.",
+        "title": "intercompany-entry dispute-raised",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.intercompany-entry.dispute-raised",
+        "x-zoiko-origin": "extension"
+      },
+      "intercompany-entry.dispute-resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Intercompany Accounting Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.intercompany-entry.dispute-resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Intercompany Entry: dispute-resolved.",
+        "title": "intercompany-entry dispute-resolved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.intercompany-entry.dispute-resolved",
+        "x-zoiko-origin": "extension"
+      },
+      "intercompany-entry.matched": {
+        "contentType": "application/json",
+        "description": "Producer: Intercompany Accounting Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.intercompany-entry.matched",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Intercompany Entry: matched.",
+        "title": "intercompany-entry matched",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.intercompany-entry.matched",
+        "x-zoiko-origin": "extension"
+      },
+      "intercompany-entry.mismatch-detected": {
+        "contentType": "application/json",
+        "description": "Producer: Intercompany Accounting Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.intercompany-entry.mismatch-detected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Intercompany Entry: mismatch-detected.",
+        "title": "intercompany-entry mismatch-detected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.intercompany-entry.mismatch-detected",
+        "x-zoiko-origin": "extension"
+      },
+      "intercompany-mismatch.detected": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine. Primary consumers / intent: Close workflow. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.intercompany-mismatch.detected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Intercompany pair: detected.",
+        "title": "intercompany-mismatch detected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.intercompany-mismatch.detected",
+        "x-zoiko-origin": "spec"
+      },
+      "journal.adjusted": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: GL/reconciliation/reporting. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.journal.adjusted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: adjusted.",
+        "title": "journal adjusted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.adjusted",
+        "x-zoiko-origin": "spec"
+      },
+      "journal.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Posting engine. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.journal.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: approved.",
+        "title": "journal approved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "journal.created": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Approval workflow, journal read models. Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.journal.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: created.",
+        "title": "journal created",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.created",
+        "x-zoiko-origin": "extension"
+      },
+      "journal.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: GL/reconciliation/reporting/consolidation. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.journal.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: posted.",
+        "title": "journal posted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.posted",
+        "x-zoiko-origin": "spec"
+      },
+      "journal.proposed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Approval/workflow. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.journal.proposed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: proposed.",
+        "title": "journal proposed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.proposed",
+        "x-zoiko-origin": "spec"
+      },
+      "journal.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Preparer, exception workflow. Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.journal.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: rejected.",
+        "title": "journal rejected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.rejected",
+        "x-zoiko-origin": "extension"
+      },
+      "journal.reversed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: GL/reconciliation/reporting. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.journal.reversed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: reversed.",
+        "title": "journal reversed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.reversed",
+        "x-zoiko-origin": "spec"
+      },
+      "journal.validated": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Posting engine, reporting. Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.journal.validated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: validated.",
+        "title": "journal validated",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.validated",
+        "x-zoiko-origin": "extension"
+      },
+      "journal.withdrawn": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Review queues, reporting. Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.journal.withdrawn",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Journal: withdrawn.",
+        "title": "journal withdrawn",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.journal.withdrawn",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.account.scope-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.account.scope-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Account: scope-changed.",
+        "title": "kernel account scope-changed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.account.scope-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.allocation-rule.activated": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.allocation-rule.activated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Allocation Rule: activated.",
+        "title": "kernel allocation-rule activated",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.allocation-rule.activated",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.allocation-rule.created": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.allocation-rule.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Allocation Rule: created.",
+        "title": "kernel allocation-rule created",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.allocation-rule.created",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.allocation-rule.retired": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.allocation-rule.retired",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Allocation Rule: retired.",
+        "title": "kernel allocation-rule retired",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.allocation-rule.retired",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.allocation-run.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.allocation-run.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Allocation Run: posted.",
+        "title": "kernel allocation-run posted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.allocation-run.posted",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.allocation-run.reversed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.allocation-run.reversed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Allocation Run: reversed.",
+        "title": "kernel allocation-run reversed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.allocation-run.reversed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.balance-snapshot.signed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.balance-snapshot.signed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Balance Snapshot: signed.",
+        "title": "kernel balance-snapshot signed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.balance-snapshot.signed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.book.created": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.book.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Book: created.",
+        "title": "kernel book created",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.book.created",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.book.status-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.book.status-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Book: status-changed.",
+        "title": "kernel book status-changed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.book.status-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-adjustment.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-adjustment.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Adjustment: approved.",
+        "title": "kernel consolidation-adjustment approved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-adjustment.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-adjustment.proposed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-adjustment.proposed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Adjustment: proposed.",
+        "title": "kernel consolidation-adjustment proposed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-adjustment.proposed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-adjustment.withdrawn": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-adjustment.withdrawn",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Adjustment: withdrawn.",
+        "title": "kernel consolidation-adjustment withdrawn",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-adjustment.withdrawn",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-group.created": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-group.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Group: created.",
+        "title": "kernel consolidation-group created",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-group.created",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-mapping.versioned": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-mapping.versioned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Mapping: versioned.",
+        "title": "kernel consolidation-mapping versioned",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-mapping.versioned",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-member.added": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-member.added",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Member: added.",
+        "title": "kernel consolidation-member added",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-member.added",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-member.ended": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-member.ended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Member: ended.",
+        "title": "kernel consolidation-member ended",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-member.ended",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-run.certified": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-run.certified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Run: certified.",
+        "title": "kernel consolidation-run certified",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-run.certified",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-run.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-run.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Run: completed.",
+        "title": "kernel consolidation-run completed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-run.completed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.consolidation-run.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.consolidation-run.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Consolidation Run: superseded.",
+        "title": "kernel consolidation-run superseded",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.consolidation-run.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.event.registered": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.event.registered",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Event: registered.",
+        "title": "kernel event registered",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.event.registered",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.event.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.event.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Event: rejected.",
+        "title": "kernel event rejected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.event.rejected",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.fx.override-approved": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.fx.override-approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Fx: override-approved.",
+        "title": "kernel fx override-approved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.fx.override-approved",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.fx.override-rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.fx.override-rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Fx: override-rejected.",
+        "title": "kernel fx override-rejected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.fx.override-rejected",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.fx.override-requested": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.fx.override-requested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Fx: override-requested.",
+        "title": "kernel fx override-requested",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.fx.override-requested",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.fx.rate-ingested": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.fx.rate-ingested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Fx: rate-ingested.",
+        "title": "kernel fx rate-ingested",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.fx.rate-ingested",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.migration-batch.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.migration-batch.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Migration Batch: approved.",
+        "title": "kernel migration-batch approved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.migration-batch.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.migration-batch.cancelled": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.migration-batch.cancelled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Migration Batch: cancelled.",
+        "title": "kernel migration-batch cancelled",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.migration-batch.cancelled",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.migration-batch.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.migration-batch.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Migration Batch: posted.",
+        "title": "kernel migration-batch posted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.migration-batch.posted",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.migration-batch.reconciled": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.migration-batch.reconciled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Migration Batch: reconciled.",
+        "title": "kernel migration-batch reconciled",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.migration-batch.reconciled",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.migration-batch.staged": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.migration-batch.staged",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Migration Batch: staged.",
+        "title": "kernel migration-batch staged",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.migration-batch.staged",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.migration-batch.validated": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.migration-batch.validated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Migration Batch: validated.",
+        "title": "kernel migration-batch validated",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.migration-batch.validated",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.period.reopened": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.period.reopened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: reopened.",
+        "title": "kernel period reopened",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.period.reopened",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.period.resealed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.period.resealed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: resealed.",
+        "title": "kernel period resealed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.period.resealed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.period.sealed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.period.sealed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: sealed.",
+        "title": "kernel period sealed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.period.sealed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.posting.exception-raised": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.posting.exception-raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Posting: exception-raised.",
+        "title": "kernel posting exception-raised",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.posting.exception-raised",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.reconciliation.break-raised": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.reconciliation.break-raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: break-raised.",
+        "title": "kernel reconciliation break-raised",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.reconciliation.break-raised",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.reconciliation.exception-accepted": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.reconciliation.exception-accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: exception-accepted.",
+        "title": "kernel reconciliation exception-accepted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.reconciliation.exception-accepted",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.reconciliation.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.reconciliation.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: resolved.",
+        "title": "kernel reconciliation resolved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.reconciliation.resolved",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.reconciliation.tolerance-set": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.reconciliation.tolerance-set",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: tolerance-set.",
+        "title": "kernel reconciliation tolerance-set",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.reconciliation.tolerance-set",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.revaluation.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.revaluation.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Revaluation: completed.",
+        "title": "kernel revaluation completed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.revaluation.completed",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.rule-set.activated": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.rule-set.activated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Rule Set: activated.",
+        "title": "kernel rule-set activated",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.rule-set.activated",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.rule-set.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.rule-set.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Rule Set: approved.",
+        "title": "kernel rule-set approved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.rule-set.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.rule-set.created": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.rule-set.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Rule Set: created.",
+        "title": "kernel rule-set created",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.rule-set.created",
+        "x-zoiko-origin": "extension"
+      },
+      "kernel.rule-set.tested": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.kernel.rule-set.tested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Rule Set: tested.",
+        "title": "kernel rule-set tested",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.kernel.rule-set.tested",
+        "x-zoiko-origin": "extension"
+      },
+      "period.close-review-started": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.close-review-started",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: close-review-started.",
+        "title": "period close-review-started",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.close-review-started",
+        "x-zoiko-origin": "extension"
+      },
+      "period.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: closed.",
+        "title": "period closed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.closed",
+        "x-zoiko-origin": "extension"
+      },
+      "period.command-rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Period Service. Primary consumers / intent: Security and control monitoring (a refused period command; carries no state change). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.command-rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Accounting period: command-rejected.",
+        "title": "period command-rejected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.command-rejected",
+        "x-zoiko-origin": "extension"
+      },
+      "period.hard-closed": {
+        "contentType": "application/json",
+        "description": "Producer: Period Service. Primary consumers / intent: All posting domains/reporting. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.period.hard-closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Accounting period: hard-closed.",
+        "title": "period hard-closed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.hard-closed",
+        "x-zoiko-origin": "spec"
+      },
+      "period.opened": {
+        "contentType": "application/json",
+        "description": "Producer: Period Service. Primary consumers / intent: Posting guards, close workflow, reporting. Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.opened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Accounting period: opened.",
+        "title": "period opened",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.opened",
+        "x-zoiko-origin": "extension"
+      },
+      "period.reclosed": {
+        "contentType": "application/json",
+        "description": "Producer: Period Service. Primary consumers / intent: Posting guards, close workflow, reporting. Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.reclosed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Accounting period: reclosed.",
+        "title": "period reclosed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.reclosed",
+        "x-zoiko-origin": "extension"
+      },
+      "period.reopen-requested": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.reopen-requested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: reopen-requested.",
+        "title": "period reopen-requested",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.reopen-requested",
+        "x-zoiko-origin": "extension"
+      },
+      "period.reopened": {
+        "contentType": "application/json",
+        "description": "Producer: Period Service. Primary consumers / intent: Posting domains/audit. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.period.reopened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Accounting period: reopened.",
+        "title": "period reopened",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.reopened",
+        "x-zoiko-origin": "spec"
+      },
+      "period.soft-closed": {
+        "contentType": "application/json",
+        "description": "Producer: Period Service. Primary consumers / intent: Posting guards/close workflow. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.period.soft-closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Accounting period: soft-closed.",
+        "title": "period soft-closed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.soft-closed",
+        "x-zoiko-origin": "spec"
+      },
+      "period.subledger-control-exception": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.subledger-control-exception",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: subledger-control-exception.",
+        "title": "period subledger-control-exception",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.subledger-control-exception",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-break.detected": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine. Primary consumers / intent: Ops/close workflow. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.reconciliation-break.detected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: detected.",
+        "title": "reconciliation-break detected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-break.detected",
+        "x-zoiko-origin": "spec"
+      },
+      "reconciliation-break.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine. Primary consumers / intent: Ops/close workflow. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.accounting.reconciliation-break.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: resolved.",
+        "title": "reconciliation-break resolved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-break.resolved",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite accounting domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.accounting-event": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/accounting-event"
+      },
+      "description": "Producer(s): Accounting Kernel. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/accounting-event/messages/accepted"
+        },
+        {
+          "$ref": "#/channels/accounting-event/messages/rejected"
+        }
+      ],
+      "summary": "Publish accounting-event facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.allocation": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/allocation"
+      },
+      "description": "Producer(s): Accounting Kernel. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/allocation/messages/posted"
+        }
+      ],
+      "summary": "Publish allocation facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.balance-snapshot": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/balance-snapshot"
+      },
+      "description": "Producer(s): Trial Balance Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/balance-snapshot/messages/signed"
+        }
+      ],
+      "summary": "Publish balance-snapshot facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.consolidation-adjustment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/consolidation-adjustment"
+      },
+      "description": "Producer(s): Consolidation Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/consolidation-adjustment/messages/approved"
+        },
+        {
+          "$ref": "#/channels/consolidation-adjustment/messages/created"
+        },
+        {
+          "$ref": "#/channels/consolidation-adjustment/messages/posted"
+        },
+        {
+          "$ref": "#/channels/consolidation-adjustment/messages/reversed"
+        }
+      ],
+      "summary": "Publish consolidation-adjustment facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.consolidation-run": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/consolidation-run"
+      },
+      "description": "Producer(s): Consolidation Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/consolidation-run/messages/completed"
+        },
+        {
+          "$ref": "#/channels/consolidation-run/messages/exception-detected"
+        },
+        {
+          "$ref": "#/channels/consolidation-run/messages/started"
+        }
+      ],
+      "summary": "Publish consolidation-run facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.financial-snapshot": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/financial-snapshot"
+      },
+      "description": "Producer(s): Financial Close Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/financial-snapshot/messages/integrity-failed"
+        }
+      ],
+      "summary": "Publish financial-snapshot facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.fx-revaluation": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/fx-revaluation"
+      },
+      "description": "Producer(s): Accounting Kernel. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/fx-revaluation/messages/completed"
+        }
+      ],
+      "summary": "Publish fx-revaluation facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.intercompany-entry": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/intercompany-entry"
+      },
+      "description": "Producer(s): Intercompany Accounting Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/intercompany-entry/messages/created"
+        },
+        {
+          "$ref": "#/channels/intercompany-entry/messages/dispute-raised"
+        },
+        {
+          "$ref": "#/channels/intercompany-entry/messages/dispute-resolved"
+        },
+        {
+          "$ref": "#/channels/intercompany-entry/messages/matched"
+        },
+        {
+          "$ref": "#/channels/intercompany-entry/messages/mismatch-detected"
+        }
+      ],
+      "summary": "Publish intercompany-entry facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.intercompany-mismatch": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/intercompany-mismatch"
+      },
+      "description": "Producer(s): Reconciliation Engine. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/intercompany-mismatch/messages/detected"
+        }
+      ],
+      "summary": "Publish intercompany-mismatch facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.journal": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/journal"
+      },
+      "description": "Producer(s): Accounting Kernel. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/journal/messages/adjusted"
+        },
+        {
+          "$ref": "#/channels/journal/messages/approved"
+        },
+        {
+          "$ref": "#/channels/journal/messages/created"
+        },
+        {
+          "$ref": "#/channels/journal/messages/posted"
+        },
+        {
+          "$ref": "#/channels/journal/messages/proposed"
+        },
+        {
+          "$ref": "#/channels/journal/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/journal/messages/reversed"
+        },
+        {
+          "$ref": "#/channels/journal/messages/validated"
+        },
+        {
+          "$ref": "#/channels/journal/messages/withdrawn"
+        }
+      ],
+      "summary": "Publish journal facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.kernel": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/kernel"
+      },
+      "description": "Producer(s): Accounting Kernel. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/kernel/messages/account.scope-changed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/allocation-rule.activated"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/allocation-rule.created"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/allocation-rule.retired"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/allocation-run.posted"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/allocation-run.reversed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/balance-snapshot.signed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/book.created"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/book.status-changed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-adjustment.approved"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-adjustment.proposed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-adjustment.withdrawn"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-group.created"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-mapping.versioned"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-member.added"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-member.ended"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-run.certified"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-run.completed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/consolidation-run.superseded"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/event.registered"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/event.rejected"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/fx.override-approved"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/fx.override-rejected"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/fx.override-requested"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/fx.rate-ingested"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/migration-batch.approved"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/migration-batch.cancelled"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/migration-batch.posted"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/migration-batch.reconciled"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/migration-batch.staged"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/migration-batch.validated"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/period.reopened"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/period.resealed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/period.sealed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/posting.exception-raised"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/reconciliation.break-raised"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/reconciliation.exception-accepted"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/reconciliation.resolved"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/reconciliation.tolerance-set"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/revaluation.completed"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/rule-set.activated"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/rule-set.approved"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/rule-set.created"
+        },
+        {
+          "$ref": "#/channels/kernel/messages/rule-set.tested"
+        }
+      ],
+      "summary": "Publish kernel facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.period": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/period"
+      },
+      "description": "Producer(s): Financial Close Service, Period Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/period/messages/close-review-started"
+        },
+        {
+          "$ref": "#/channels/period/messages/closed"
+        },
+        {
+          "$ref": "#/channels/period/messages/command-rejected"
+        },
+        {
+          "$ref": "#/channels/period/messages/hard-closed"
+        },
+        {
+          "$ref": "#/channels/period/messages/opened"
+        },
+        {
+          "$ref": "#/channels/period/messages/reclosed"
+        },
+        {
+          "$ref": "#/channels/period/messages/reopen-requested"
+        },
+        {
+          "$ref": "#/channels/period/messages/reopened"
+        },
+        {
+          "$ref": "#/channels/period/messages/soft-closed"
+        },
+        {
+          "$ref": "#/channels/period/messages/subledger-control-exception"
+        }
+      ],
+      "summary": "Publish period facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.reconciliation-break": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/reconciliation-break"
+      },
+      "description": "Producer(s): Reconciliation Engine. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/reconciliation-break/messages/detected"
+        },
+        {
+          "$ref": "#/channels/reconciliation-break/messages/resolved"
+        }
+      ],
+      "summary": "Publish reconciliation-break facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

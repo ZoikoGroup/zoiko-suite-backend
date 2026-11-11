@@ -137,6 +137,9 @@ type Message struct {
 	PayloadHash      string
 	// Region is the event's residency region from its envelope; empty for a legacy envelope that names none.
 	Region string
+	// Classification is the event's classification from its envelope (public/internal/confidential/restricted);
+	// empty when the envelope names none, which the residency gate treats as restricted.
+	Classification string
 	// ReplayRunID is set by the consumer's replay-channel reader, never read from the payload: a payload cannot
 	// declare itself live. Empty means the live path (ZS-EVENT-001 section 10, inbox replay_run_id).
 	ReplayRunID string
@@ -150,6 +153,7 @@ type wire struct {
 	AggregateVersion *int64          `json:"aggregateversion"`
 	PayloadHash      string          `json:"payloadhash"`
 	Region           string          `json:"residencyregion"`
+	Classification   string          `json:"classification"`
 	LegacyID         string          `json:"event_id"`
 	LegacyType       string          `json:"event_type"`
 	LegacyTenant     string          `json:"tenant_id"`
@@ -174,6 +178,7 @@ func Parse(raw []byte) (Message, error) {
 		AggregateVersion: w.AggregateVersion,
 		PayloadHash:      w.PayloadHash,
 		Region:           w.Region,
+		Classification:   w.Classification,
 	}
 	if m.PayloadHash == "" {
 		body := w.Data
@@ -311,6 +316,8 @@ type Inbox struct {
 	cfg      Config
 	region   string
 	allowReplay bool
+	delivery    *deliveryGate
+	observer    Observer
 }
 
 // ErrRegionMismatch means a repair would act on an event whose residency region is not this inbox's (or is unknown).
@@ -347,11 +354,21 @@ func (h handlerFailure) Unwrap() error { return h.err }
 // INT-IDEM-005 and changes nothing: it is not the same fact and must not be
 // treated as a harmless duplicate.
 func (i *Inbox) Process(ctx context.Context, msg Message, fn Handler) (Result, error) {
+	res, err := i.admit(ctx, msg, fn)
+	i.observe(msg, res, err)
+	return res, err
+}
+
+// admit applies the delivery controls (identity, residency, replay) and then processes.
+func (i *Inbox) admit(ctx context.Context, msg Message, fn Handler) (Result, error) {
 	if err := msg.validate(); err != nil {
 		return Result{}, err
 	}
 	if fn == nil {
 		return Result{}, errors.New("inbox: handler is required")
+	}
+	if err := i.checkDelivery(msg); err != nil {
+		return Result{Outcome: Rejected}, err
 	}
 	if msg.ReplayRunID != "" {
 		// Replay is an authorized operating mode, not a retry (E-17). The check

@@ -233,6 +233,11 @@ func New(s Spec) (*Envelope, error) {
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, invalid("data must be a JSON object")
 	}
+	// E-15 / EV-T09: secret material never leaves in an event. The error names
+	// the JSON paths, never the values.
+	if hits := ScanSecrets(data); len(hits) > 0 {
+		return nil, invalid("data holds prohibited secret material at %s (E-15, section 13); remove it or send a reference", strings.Join(hits, ", "))
+	}
 
 	id, err := uuid.NewV7()
 	if err != nil {

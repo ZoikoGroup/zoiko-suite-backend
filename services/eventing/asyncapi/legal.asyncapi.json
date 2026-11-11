@@ -1,0 +1,489 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "contract": {
+      "address": "zoikosuite.legal.contract.v1",
+      "messages": {
+        "amended": {
+          "$ref": "#/components/messages/contract.amended"
+        },
+        "approved": {
+          "$ref": "#/components/messages/contract.approved"
+        },
+        "drafted": {
+          "$ref": "#/components/messages/contract.drafted"
+        },
+        "executed": {
+          "$ref": "#/components/messages/contract.executed"
+        },
+        "renewed": {
+          "$ref": "#/components/messages/contract.renewed"
+        },
+        "terminated": {
+          "$ref": "#/components/messages/contract.terminated"
+        }
+      }
+    },
+    "corporate-resolution": {
+      "address": "zoikosuite.legal.corporate-resolution.v1",
+      "messages": {
+        "adopted": {
+          "$ref": "#/components/messages/corporate-resolution.adopted"
+        }
+      }
+    },
+    "ip-registration": {
+      "address": "zoikosuite.legal.ip-registration.v1",
+      "messages": {
+        "renewed": {
+          "$ref": "#/components/messages/ip-registration.renewed"
+        }
+      }
+    },
+    "license": {
+      "address": "zoikosuite.legal.license.v1",
+      "messages": {
+        "expiring": {
+          "$ref": "#/components/messages/license.expiring"
+        }
+      }
+    },
+    "matter": {
+      "address": "zoikosuite.legal.matter.v1",
+      "messages": {
+        "closed": {
+          "$ref": "#/components/messages/matter.closed"
+        },
+        "opened": {
+          "$ref": "#/components/messages/matter.opened"
+        }
+      }
+    },
+    "obligation": {
+      "address": "zoikosuite.legal.obligation.v1",
+      "messages": {
+        "breached": {
+          "$ref": "#/components/messages/obligation.breached"
+        },
+        "created": {
+          "$ref": "#/components/messages/obligation.created"
+        },
+        "due": {
+          "$ref": "#/components/messages/obligation.due"
+        },
+        "satisfied": {
+          "$ref": "#/components/messages/obligation.satisfied"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "contract.amended": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Obligations/evidence. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.contract.amended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract: amended.",
+        "title": "contract amended",
+        "x-zoiko-event-type": "com.zoikosuite.legal.contract.amended",
+        "x-zoiko-origin": "spec"
+      },
+      "contract.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Signature workflow. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.contract.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract: approved.",
+        "title": "contract approved",
+        "x-zoiko-event-type": "com.zoikosuite.legal.contract.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "contract.drafted": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Approval/review. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.contract.drafted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract: drafted.",
+        "title": "contract drafted",
+        "x-zoiko-event-type": "com.zoikosuite.legal.contract.drafted",
+        "x-zoiko-origin": "spec"
+      },
+      "contract.executed": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Obligations/evidence/business domains. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.contract.executed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract: executed.",
+        "title": "contract executed",
+        "x-zoiko-event-type": "com.zoikosuite.legal.contract.executed",
+        "x-zoiko-origin": "spec"
+      },
+      "contract.renewed": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Obligations/calendar. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.contract.renewed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract: renewed.",
+        "title": "contract renewed",
+        "x-zoiko-event-type": "com.zoikosuite.legal.contract.renewed",
+        "x-zoiko-origin": "spec"
+      },
+      "contract.terminated": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Obligations/business domains. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.contract.terminated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract: terminated.",
+        "title": "contract terminated",
+        "x-zoiko-event-type": "com.zoikosuite.legal.contract.terminated",
+        "x-zoiko-origin": "spec"
+      },
+      "corporate-resolution.adopted": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Corporate records/evidence. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.corporate-resolution.adopted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Resolution: adopted.",
+        "title": "corporate-resolution adopted",
+        "x-zoiko-event-type": "com.zoikosuite.legal.corporate-resolution.adopted",
+        "x-zoiko-origin": "spec"
+      },
+      "ip-registration.renewed": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Calendar/evidence. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.ip-registration.renewed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "IP registration: renewed.",
+        "title": "ip-registration renewed",
+        "x-zoiko-event-type": "com.zoikosuite.legal.ip-registration.renewed",
+        "x-zoiko-origin": "spec"
+      },
+      "license.expiring": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Deadline/task. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.license.expiring",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "License: expiring.",
+        "title": "license expiring",
+        "x-zoiko-event-type": "com.zoikosuite.legal.license.expiring",
+        "x-zoiko-origin": "spec"
+      },
+      "matter.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Retention/evidence. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.matter.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Legal matter: closed.",
+        "title": "matter closed",
+        "x-zoiko-event-type": "com.zoikosuite.legal.matter.closed",
+        "x-zoiko-origin": "spec"
+      },
+      "matter.opened": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Task/document/evidence. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.matter.opened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Legal matter: opened.",
+        "title": "matter opened",
+        "x-zoiko-event-type": "com.zoikosuite.legal.matter.opened",
+        "x-zoiko-origin": "spec"
+      },
+      "obligation.breached": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Matter/case workflow. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.obligation.breached",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract obligation: breached.",
+        "title": "obligation breached",
+        "x-zoiko-event-type": "com.zoikosuite.legal.obligation.breached",
+        "x-zoiko-origin": "spec"
+      },
+      "obligation.created": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Task/calendar. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.obligation.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract obligation: created.",
+        "title": "obligation created",
+        "x-zoiko-event-type": "com.zoikosuite.legal.obligation.created",
+        "x-zoiko-origin": "spec"
+      },
+      "obligation.due": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Task/escalation. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.obligation.due",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract obligation: due.",
+        "title": "obligation due",
+        "x-zoiko-event-type": "com.zoikosuite.legal.obligation.due",
+        "x-zoiko-origin": "spec"
+      },
+      "obligation.satisfied": {
+        "contentType": "application/json",
+        "description": "Producer: Legal. Primary consumers / intent: Evidence. Family: Legal & Corporate Governance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.legal.obligation.satisfied",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Contract obligation: satisfied.",
+        "title": "obligation satisfied",
+        "x-zoiko-event-type": "com.zoikosuite.legal.obligation.satisfied",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite legal domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.contract": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/contract"
+      },
+      "description": "Producer(s): Legal. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/contract/messages/amended"
+        },
+        {
+          "$ref": "#/channels/contract/messages/approved"
+        },
+        {
+          "$ref": "#/channels/contract/messages/drafted"
+        },
+        {
+          "$ref": "#/channels/contract/messages/executed"
+        },
+        {
+          "$ref": "#/channels/contract/messages/renewed"
+        },
+        {
+          "$ref": "#/channels/contract/messages/terminated"
+        }
+      ],
+      "summary": "Publish contract facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.corporate-resolution": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/corporate-resolution"
+      },
+      "description": "Producer(s): Legal. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/corporate-resolution/messages/adopted"
+        }
+      ],
+      "summary": "Publish corporate-resolution facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.ip-registration": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/ip-registration"
+      },
+      "description": "Producer(s): Legal. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/ip-registration/messages/renewed"
+        }
+      ],
+      "summary": "Publish ip-registration facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.license": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/license"
+      },
+      "description": "Producer(s): Legal. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/license/messages/expiring"
+        }
+      ],
+      "summary": "Publish license facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.matter": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/matter"
+      },
+      "description": "Producer(s): Legal. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/matter/messages/closed"
+        },
+        {
+          "$ref": "#/channels/matter/messages/opened"
+        }
+      ],
+      "summary": "Publish matter facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.obligation": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/obligation"
+      },
+      "description": "Producer(s): Legal. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/obligation/messages/breached"
+        },
+        {
+          "$ref": "#/channels/obligation/messages/created"
+        },
+        {
+          "$ref": "#/channels/obligation/messages/due"
+        },
+        {
+          "$ref": "#/channels/obligation/messages/satisfied"
+        }
+      ],
+      "summary": "Publish obligation facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

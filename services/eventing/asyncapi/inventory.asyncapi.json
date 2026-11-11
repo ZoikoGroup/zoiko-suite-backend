@@ -1,0 +1,282 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "stock": {
+      "address": "zoikosuite.inventory.stock.v1",
+      "messages": {
+        "adjusted": {
+          "$ref": "#/components/messages/stock.adjusted"
+        },
+        "issued": {
+          "$ref": "#/components/messages/stock.issued"
+        },
+        "received": {
+          "$ref": "#/components/messages/stock.received"
+        },
+        "transferred": {
+          "$ref": "#/components/messages/stock.transferred"
+        }
+      }
+    },
+    "stock-count": {
+      "address": "zoikosuite.inventory.stock-count.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/stock-count.completed"
+        }
+      }
+    },
+    "valuation": {
+      "address": "zoikosuite.inventory.valuation.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/valuation.completed"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "stock-count.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory. Primary consumers / intent: Adjustment workflow. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.inventory.stock-count.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Stock count: completed.",
+        "title": "stock-count completed",
+        "x-zoiko-event-type": "com.zoikosuite.inventory.stock-count.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "stock.adjusted": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory. Primary consumers / intent: Accounting/reconciliation. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.inventory.stock.adjusted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Inventory adjustment: adjusted.",
+        "title": "stock adjusted",
+        "x-zoiko-event-type": "com.zoikosuite.inventory.stock.adjusted",
+        "x-zoiko-origin": "spec"
+      },
+      "stock.issued": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory. Primary consumers / intent: Valuation/accounting. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.inventory.stock.issued",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Inventory movement: issued.",
+        "title": "stock issued",
+        "x-zoiko-event-type": "com.zoikosuite.inventory.stock.issued",
+        "x-zoiko-origin": "spec"
+      },
+      "stock.received": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory. Primary consumers / intent: Valuation/accounting. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.inventory.stock.received",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Inventory movement: received.",
+        "title": "stock received",
+        "x-zoiko-event-type": "com.zoikosuite.inventory.stock.received",
+        "x-zoiko-origin": "spec"
+      },
+      "stock.transferred": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory. Primary consumers / intent: Location read models. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.inventory.stock.transferred",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Inventory movement: transferred.",
+        "title": "stock transferred",
+        "x-zoiko-event-type": "com.zoikosuite.inventory.stock.transferred",
+        "x-zoiko-origin": "spec"
+      },
+      "valuation.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory. Primary consumers / intent: Accounting/reporting. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.inventory.valuation.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Valuation run: completed.",
+        "title": "valuation completed",
+        "x-zoiko-event-type": "com.zoikosuite.inventory.valuation.completed",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite inventory domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.stock": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/stock"
+      },
+      "description": "Producer(s): Inventory. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/stock/messages/adjusted"
+        },
+        {
+          "$ref": "#/channels/stock/messages/issued"
+        },
+        {
+          "$ref": "#/channels/stock/messages/received"
+        },
+        {
+          "$ref": "#/channels/stock/messages/transferred"
+        }
+      ],
+      "summary": "Publish stock facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.stock-count": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/stock-count"
+      },
+      "description": "Producer(s): Inventory. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/stock-count/messages/completed"
+        }
+      ],
+      "summary": "Publish stock-count facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.valuation": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/valuation"
+      },
+      "description": "Producer(s): Inventory. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/valuation/messages/completed"
+        }
+      ],
+      "summary": "Publish valuation facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

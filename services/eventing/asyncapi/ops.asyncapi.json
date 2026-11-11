@@ -1,0 +1,264 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "deployment": {
+      "address": "zoikosuite.ops.deployment.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/deployment.completed"
+        }
+      }
+    },
+    "incident": {
+      "address": "zoikosuite.ops.incident.v1",
+      "messages": {
+        "declared": {
+          "$ref": "#/components/messages/incident.declared"
+        },
+        "resolved": {
+          "$ref": "#/components/messages/incident.resolved"
+        }
+      }
+    },
+    "recovery": {
+      "address": "zoikosuite.ops.recovery.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/recovery.completed"
+        },
+        "started": {
+          "$ref": "#/components/messages/recovery.started"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "deployment.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Release Service. Primary consumers / intent: Ops/observability. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ops.deployment.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deployment: completed.",
+        "title": "deployment completed",
+        "x-zoiko-event-type": "com.zoikosuite.ops.deployment.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "incident.declared": {
+        "contentType": "application/json",
+        "description": "Producer: Operations. Primary consumers / intent: Status/response workflows. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ops.incident.declared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Incident: declared.",
+        "title": "incident declared",
+        "x-zoiko-event-type": "com.zoikosuite.ops.incident.declared",
+        "x-zoiko-origin": "spec"
+      },
+      "incident.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Operations. Primary consumers / intent: Post-incident/evidence. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ops.incident.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Incident: resolved.",
+        "title": "incident resolved",
+        "x-zoiko-event-type": "com.zoikosuite.ops.incident.resolved",
+        "x-zoiko-origin": "spec"
+      },
+      "recovery.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Operations. Primary consumers / intent: Ops/audit. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ops.recovery.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Recovery run: completed.",
+        "title": "recovery completed",
+        "x-zoiko-event-type": "com.zoikosuite.ops.recovery.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "recovery.started": {
+        "contentType": "application/json",
+        "description": "Producer: Operations. Primary consumers / intent: Ops/audit. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ops.recovery.started",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Recovery run: started.",
+        "title": "recovery started",
+        "x-zoiko-event-type": "com.zoikosuite.ops.recovery.started",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite ops domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.deployment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/deployment"
+      },
+      "description": "Producer(s): Release Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/deployment/messages/completed"
+        }
+      ],
+      "summary": "Publish deployment facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.incident": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/incident"
+      },
+      "description": "Producer(s): Operations. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/incident/messages/declared"
+        },
+        {
+          "$ref": "#/channels/incident/messages/resolved"
+        }
+      ],
+      "summary": "Publish incident facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.recovery": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/recovery"
+      },
+      "description": "Producer(s): Operations. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/recovery/messages/completed"
+        },
+        {
+          "$ref": "#/channels/recovery/messages/started"
+        }
+      ],
+      "summary": "Publish recovery facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

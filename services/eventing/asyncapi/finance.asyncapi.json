@@ -1,0 +1,261 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "budget": {
+      "address": "zoikosuite.finance.budget.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/budget.published"
+        }
+      }
+    },
+    "forecast": {
+      "address": "zoikosuite.finance.forecast.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/forecast.published"
+        }
+      }
+    },
+    "scenario": {
+      "address": "zoikosuite.finance.scenario.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/scenario.published"
+        }
+      }
+    },
+    "variance": {
+      "address": "zoikosuite.finance.variance.v1",
+      "messages": {
+        "material-threshold-breached": {
+          "$ref": "#/components/messages/variance.material-threshold-breached"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "budget.published": {
+        "contentType": "application/json",
+        "description": "Producer: FP&A. Primary consumers / intent: Reporting/variance. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.finance.budget.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Budget version: published.",
+        "title": "budget published",
+        "x-zoiko-event-type": "com.zoikosuite.finance.budget.published",
+        "x-zoiko-origin": "spec"
+      },
+      "forecast.published": {
+        "contentType": "application/json",
+        "description": "Producer: FP&A. Primary consumers / intent: Reporting/variance. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.finance.forecast.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Forecast version: published.",
+        "title": "forecast published",
+        "x-zoiko-event-type": "com.zoikosuite.finance.forecast.published",
+        "x-zoiko-origin": "spec"
+      },
+      "scenario.published": {
+        "contentType": "application/json",
+        "description": "Producer: FP&A. Primary consumers / intent: Management reporting. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.finance.scenario.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Scenario: published.",
+        "title": "scenario published",
+        "x-zoiko-event-type": "com.zoikosuite.finance.scenario.published",
+        "x-zoiko-origin": "spec"
+      },
+      "variance.material-threshold-breached": {
+        "contentType": "application/json",
+        "description": "Producer: FP&A. Primary consumers / intent: Task/management review. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.finance.variance.material-threshold-breached",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Variance: material-threshold-breached.",
+        "title": "variance material-threshold-breached",
+        "x-zoiko-event-type": "com.zoikosuite.finance.variance.material-threshold-breached",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite finance domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.budget": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/budget"
+      },
+      "description": "Producer(s): FP&A. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/budget/messages/published"
+        }
+      ],
+      "summary": "Publish budget facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.forecast": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/forecast"
+      },
+      "description": "Producer(s): FP&A. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/forecast/messages/published"
+        }
+      ],
+      "summary": "Publish forecast facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.scenario": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/scenario"
+      },
+      "description": "Producer(s): FP&A. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/scenario/messages/published"
+        }
+      ],
+      "summary": "Publish scenario facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.variance": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/variance"
+      },
+      "description": "Producer(s): FP&A. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/variance/messages/material-threshold-breached"
+        }
+      ],
+      "summary": "Publish variance facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

@@ -1,0 +1,549 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "bank-account": {
+      "address": "zoikosuite.treasury.bank-account.v1",
+      "messages": {
+        "closed": {
+          "$ref": "#/components/messages/bank-account.closed"
+        },
+        "created": {
+          "$ref": "#/components/messages/bank-account.created"
+        },
+        "metadata-amended": {
+          "$ref": "#/components/messages/bank-account.metadata-amended"
+        },
+        "ownership-verified": {
+          "$ref": "#/components/messages/bank-account.ownership-verified"
+        },
+        "reactivated": {
+          "$ref": "#/components/messages/bank-account.reactivated"
+        },
+        "suspended": {
+          "$ref": "#/components/messages/bank-account.suspended"
+        },
+        "token-rotated": {
+          "$ref": "#/components/messages/bank-account.token-rotated"
+        }
+      }
+    },
+    "cash-position": {
+      "address": "zoikosuite.treasury.cash-position.v1",
+      "messages": {
+        "became-stale": {
+          "$ref": "#/components/messages/cash-position.became-stale"
+        },
+        "calculated": {
+          "$ref": "#/components/messages/cash-position.calculated"
+        },
+        "published": {
+          "$ref": "#/components/messages/cash-position.published"
+        }
+      }
+    },
+    "fx-exposure": {
+      "address": "zoikosuite.treasury.fx-exposure.v1",
+      "messages": {
+        "became-stale": {
+          "$ref": "#/components/messages/fx-exposure.became-stale"
+        },
+        "calculated": {
+          "$ref": "#/components/messages/fx-exposure.calculated"
+        },
+        "published": {
+          "$ref": "#/components/messages/fx-exposure.published"
+        }
+      }
+    },
+    "treasury-transfer": {
+      "address": "zoikosuite.treasury.treasury-transfer.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/treasury-transfer.approved"
+        },
+        "authorized": {
+          "$ref": "#/components/messages/treasury-transfer.authorized"
+        },
+        "cancelled": {
+          "$ref": "#/components/messages/treasury-transfer.cancelled"
+        },
+        "created": {
+          "$ref": "#/components/messages/treasury-transfer.created"
+        },
+        "returned": {
+          "$ref": "#/components/messages/treasury-transfer.returned"
+        },
+        "settled": {
+          "$ref": "#/components/messages/treasury-transfer.settled"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/treasury-transfer.submitted"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "bank-account.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.bank-account.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Account: closed.",
+        "title": "bank-account closed",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.bank-account.closed",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-account.created": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.bank-account.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Account: created.",
+        "title": "bank-account created",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.bank-account.created",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-account.metadata-amended": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.bank-account.metadata-amended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Account: metadata-amended.",
+        "title": "bank-account metadata-amended",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.bank-account.metadata-amended",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-account.ownership-verified": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.bank-account.ownership-verified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Account: ownership-verified.",
+        "title": "bank-account ownership-verified",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.bank-account.ownership-verified",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-account.reactivated": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.bank-account.reactivated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Account: reactivated.",
+        "title": "bank-account reactivated",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.bank-account.reactivated",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-account.suspended": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.bank-account.suspended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Account: suspended.",
+        "title": "bank-account suspended",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.bank-account.suspended",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-account.token-rotated": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.bank-account.token-rotated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Account: token-rotated.",
+        "title": "bank-account token-rotated",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.bank-account.token-rotated",
+        "x-zoiko-origin": "extension"
+      },
+      "cash-position.became-stale": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.cash-position.became-stale",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Cash Position: became-stale.",
+        "title": "cash-position became-stale",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.cash-position.became-stale",
+        "x-zoiko-origin": "extension"
+      },
+      "cash-position.calculated": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.cash-position.calculated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Cash Position: calculated.",
+        "title": "cash-position calculated",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.cash-position.calculated",
+        "x-zoiko-origin": "extension"
+      },
+      "cash-position.published": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.cash-position.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Cash Position: published.",
+        "title": "cash-position published",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.cash-position.published",
+        "x-zoiko-origin": "extension"
+      },
+      "fx-exposure.became-stale": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.fx-exposure.became-stale",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Fx Exposure: became-stale.",
+        "title": "fx-exposure became-stale",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.fx-exposure.became-stale",
+        "x-zoiko-origin": "extension"
+      },
+      "fx-exposure.calculated": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.fx-exposure.calculated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Fx Exposure: calculated.",
+        "title": "fx-exposure calculated",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.fx-exposure.calculated",
+        "x-zoiko-origin": "extension"
+      },
+      "fx-exposure.published": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.fx-exposure.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Fx Exposure: published.",
+        "title": "fx-exposure published",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.fx-exposure.published",
+        "x-zoiko-origin": "extension"
+      },
+      "treasury-transfer.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.treasury-transfer.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Treasury Transfer: approved.",
+        "title": "treasury-transfer approved",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.treasury-transfer.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "treasury-transfer.authorized": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.treasury-transfer.authorized",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Treasury Transfer: authorized.",
+        "title": "treasury-transfer authorized",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.treasury-transfer.authorized",
+        "x-zoiko-origin": "extension"
+      },
+      "treasury-transfer.cancelled": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.treasury-transfer.cancelled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Treasury Transfer: cancelled.",
+        "title": "treasury-transfer cancelled",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.treasury-transfer.cancelled",
+        "x-zoiko-origin": "extension"
+      },
+      "treasury-transfer.created": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.treasury-transfer.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Treasury Transfer: created.",
+        "title": "treasury-transfer created",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.treasury-transfer.created",
+        "x-zoiko-origin": "extension"
+      },
+      "treasury-transfer.returned": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.treasury-transfer.returned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Treasury Transfer: returned.",
+        "title": "treasury-transfer returned",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.treasury-transfer.returned",
+        "x-zoiko-origin": "extension"
+      },
+      "treasury-transfer.settled": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.treasury-transfer.settled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Treasury Transfer: settled.",
+        "title": "treasury-transfer settled",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.treasury-transfer.settled",
+        "x-zoiko-origin": "extension"
+      },
+      "treasury-transfer.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Treasury (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.treasury.treasury-transfer.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Treasury Transfer: submitted.",
+        "title": "treasury-transfer submitted",
+        "x-zoiko-event-type": "com.zoikosuite.treasury.treasury-transfer.submitted",
+        "x-zoiko-origin": "extension"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite treasury domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.bank-account": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/bank-account"
+      },
+      "description": "Producer(s): Treasury Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/bank-account/messages/closed"
+        },
+        {
+          "$ref": "#/channels/bank-account/messages/created"
+        },
+        {
+          "$ref": "#/channels/bank-account/messages/metadata-amended"
+        },
+        {
+          "$ref": "#/channels/bank-account/messages/ownership-verified"
+        },
+        {
+          "$ref": "#/channels/bank-account/messages/reactivated"
+        },
+        {
+          "$ref": "#/channels/bank-account/messages/suspended"
+        },
+        {
+          "$ref": "#/channels/bank-account/messages/token-rotated"
+        }
+      ],
+      "summary": "Publish bank-account facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.cash-position": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/cash-position"
+      },
+      "description": "Producer(s): Treasury Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/cash-position/messages/became-stale"
+        },
+        {
+          "$ref": "#/channels/cash-position/messages/calculated"
+        },
+        {
+          "$ref": "#/channels/cash-position/messages/published"
+        }
+      ],
+      "summary": "Publish cash-position facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.fx-exposure": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/fx-exposure"
+      },
+      "description": "Producer(s): Treasury Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/fx-exposure/messages/became-stale"
+        },
+        {
+          "$ref": "#/channels/fx-exposure/messages/calculated"
+        },
+        {
+          "$ref": "#/channels/fx-exposure/messages/published"
+        }
+      ],
+      "summary": "Publish fx-exposure facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.treasury-transfer": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/treasury-transfer"
+      },
+      "description": "Producer(s): Treasury Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/treasury-transfer/messages/approved"
+        },
+        {
+          "$ref": "#/channels/treasury-transfer/messages/authorized"
+        },
+        {
+          "$ref": "#/channels/treasury-transfer/messages/cancelled"
+        },
+        {
+          "$ref": "#/channels/treasury-transfer/messages/created"
+        },
+        {
+          "$ref": "#/channels/treasury-transfer/messages/returned"
+        },
+        {
+          "$ref": "#/channels/treasury-transfer/messages/settled"
+        },
+        {
+          "$ref": "#/channels/treasury-transfer/messages/submitted"
+        }
+      ],
+      "summary": "Publish treasury-transfer facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

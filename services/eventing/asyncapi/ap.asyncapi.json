@@ -1,0 +1,537 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "expense-claim": {
+      "address": "zoikosuite.ap.expense-claim.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/expense-claim.approved"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/expense-claim.rejected"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/expense-claim.submitted"
+        }
+      }
+    },
+    "goods-receipt": {
+      "address": "zoikosuite.ap.goods-receipt.v1",
+      "messages": {
+        "recorded": {
+          "$ref": "#/components/messages/goods-receipt.recorded"
+        }
+      }
+    },
+    "payment-proposal": {
+      "address": "zoikosuite.ap.payment-proposal.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/payment-proposal.approved"
+        },
+        "created": {
+          "$ref": "#/components/messages/payment-proposal.created"
+        }
+      }
+    },
+    "purchase-order": {
+      "address": "zoikosuite.ap.purchase-order.v1",
+      "messages": {
+        "issued": {
+          "$ref": "#/components/messages/purchase-order.issued"
+        }
+      }
+    },
+    "purchase-requisition": {
+      "address": "zoikosuite.ap.purchase-requisition.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/purchase-requisition.approved"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/purchase-requisition.submitted"
+        }
+      }
+    },
+    "service-receipt": {
+      "address": "zoikosuite.ap.service-receipt.v1",
+      "messages": {
+        "recorded": {
+          "$ref": "#/components/messages/service-receipt.recorded"
+        }
+      }
+    },
+    "supplier-credit": {
+      "address": "zoikosuite.ap.supplier-credit.v1",
+      "messages": {
+        "applied": {
+          "$ref": "#/components/messages/supplier-credit.applied"
+        }
+      }
+    },
+    "supplier-invoice": {
+      "address": "zoikosuite.ap.supplier-invoice.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/supplier-invoice.approved"
+        },
+        "captured": {
+          "$ref": "#/components/messages/supplier-invoice.captured"
+        },
+        "matched": {
+          "$ref": "#/components/messages/supplier-invoice.matched"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/supplier-invoice.rejected"
+        },
+        "validated": {
+          "$ref": "#/components/messages/supplier-invoice.validated"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "expense-claim.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Expense Service. Primary consumers / intent: Accounting/reimbursement. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.expense-claim.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Expense claim: approved.",
+        "title": "expense-claim approved",
+        "x-zoiko-event-type": "com.zoikosuite.ap.expense-claim.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "expense-claim.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Expense Service. Primary consumers / intent: Claimant/workflow. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.expense-claim.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Expense claim: rejected.",
+        "title": "expense-claim rejected",
+        "x-zoiko-event-type": "com.zoikosuite.ap.expense-claim.rejected",
+        "x-zoiko-origin": "spec"
+      },
+      "expense-claim.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Expense Service. Primary consumers / intent: Approval. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.expense-claim.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Expense claim: submitted.",
+        "title": "expense-claim submitted",
+        "x-zoiko-event-type": "com.zoikosuite.ap.expense-claim.submitted",
+        "x-zoiko-origin": "spec"
+      },
+      "goods-receipt.recorded": {
+        "contentType": "application/json",
+        "description": "Producer: Procurement. Primary consumers / intent: AP/inventory/accounting. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.goods-receipt.recorded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Goods receipt: recorded.",
+        "title": "goods-receipt recorded",
+        "x-zoiko-event-type": "com.zoikosuite.ap.goods-receipt.recorded",
+        "x-zoiko-origin": "spec"
+      },
+      "payment-proposal.approved": {
+        "contentType": "application/json",
+        "description": "Producer: AP. Primary consumers / intent: Payment orchestration. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.payment-proposal.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment proposal: approved.",
+        "title": "payment-proposal approved",
+        "x-zoiko-event-type": "com.zoikosuite.ap.payment-proposal.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "payment-proposal.created": {
+        "contentType": "application/json",
+        "description": "Producer: AP. Primary consumers / intent: Approval. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.payment-proposal.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment proposal: created.",
+        "title": "payment-proposal created",
+        "x-zoiko-event-type": "com.zoikosuite.ap.payment-proposal.created",
+        "x-zoiko-origin": "spec"
+      },
+      "purchase-order.issued": {
+        "contentType": "application/json",
+        "description": "Producer: Procurement. Primary consumers / intent: Supplier/receipt workflow. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.purchase-order.issued",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Purchase order: issued.",
+        "title": "purchase-order issued",
+        "x-zoiko-event-type": "com.zoikosuite.ap.purchase-order.issued",
+        "x-zoiko-origin": "spec"
+      },
+      "purchase-requisition.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Procurement. Primary consumers / intent: PO creation. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.purchase-requisition.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Purchase requisition: approved.",
+        "title": "purchase-requisition approved",
+        "x-zoiko-event-type": "com.zoikosuite.ap.purchase-requisition.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "purchase-requisition.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Procurement. Primary consumers / intent: Approval workflow. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.purchase-requisition.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Purchase requisition: submitted.",
+        "title": "purchase-requisition submitted",
+        "x-zoiko-event-type": "com.zoikosuite.ap.purchase-requisition.submitted",
+        "x-zoiko-origin": "spec"
+      },
+      "service-receipt.recorded": {
+        "contentType": "application/json",
+        "description": "Producer: Procurement. Primary consumers / intent: AP/accounting. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.service-receipt.recorded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Service receipt: recorded.",
+        "title": "service-receipt recorded",
+        "x-zoiko-event-type": "com.zoikosuite.ap.service-receipt.recorded",
+        "x-zoiko-origin": "spec"
+      },
+      "supplier-credit.applied": {
+        "contentType": "application/json",
+        "description": "Producer: AP. Primary consumers / intent: Accounting/payables. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.supplier-credit.applied",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Supplier credit: applied.",
+        "title": "supplier-credit applied",
+        "x-zoiko-event-type": "com.zoikosuite.ap.supplier-credit.applied",
+        "x-zoiko-origin": "spec"
+      },
+      "supplier-invoice.approved": {
+        "contentType": "application/json",
+        "description": "Producer: AP. Primary consumers / intent: Accounting/payment proposal. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.supplier-invoice.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Supplier invoice: approved.",
+        "title": "supplier-invoice approved",
+        "x-zoiko-event-type": "com.zoikosuite.ap.supplier-invoice.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "supplier-invoice.captured": {
+        "contentType": "application/json",
+        "description": "Producer: AP. Primary consumers / intent: Validation/matching. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.supplier-invoice.captured",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Supplier invoice: captured.",
+        "title": "supplier-invoice captured",
+        "x-zoiko-event-type": "com.zoikosuite.ap.supplier-invoice.captured",
+        "x-zoiko-origin": "spec"
+      },
+      "supplier-invoice.matched": {
+        "contentType": "application/json",
+        "description": "Producer: AP. Primary consumers / intent: Approval. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.supplier-invoice.matched",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Supplier invoice: matched.",
+        "title": "supplier-invoice matched",
+        "x-zoiko-event-type": "com.zoikosuite.ap.supplier-invoice.matched",
+        "x-zoiko-origin": "spec"
+      },
+      "supplier-invoice.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: AP. Primary consumers / intent: Exception workflow. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.supplier-invoice.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Supplier invoice: rejected.",
+        "title": "supplier-invoice rejected",
+        "x-zoiko-event-type": "com.zoikosuite.ap.supplier-invoice.rejected",
+        "x-zoiko-origin": "spec"
+      },
+      "supplier-invoice.validated": {
+        "contentType": "application/json",
+        "description": "Producer: AP. Primary consumers / intent: Matching/approval. Family: Procurement & Accounts Payable. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ap.supplier-invoice.validated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Supplier invoice: validated.",
+        "title": "supplier-invoice validated",
+        "x-zoiko-event-type": "com.zoikosuite.ap.supplier-invoice.validated",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite ap domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.expense-claim": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/expense-claim"
+      },
+      "description": "Producer(s): Expense Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/expense-claim/messages/approved"
+        },
+        {
+          "$ref": "#/channels/expense-claim/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/expense-claim/messages/submitted"
+        }
+      ],
+      "summary": "Publish expense-claim facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.goods-receipt": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/goods-receipt"
+      },
+      "description": "Producer(s): Procurement. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/goods-receipt/messages/recorded"
+        }
+      ],
+      "summary": "Publish goods-receipt facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payment-proposal": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payment-proposal"
+      },
+      "description": "Producer(s): AP. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payment-proposal/messages/approved"
+        },
+        {
+          "$ref": "#/channels/payment-proposal/messages/created"
+        }
+      ],
+      "summary": "Publish payment-proposal facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.purchase-order": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/purchase-order"
+      },
+      "description": "Producer(s): Procurement. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/purchase-order/messages/issued"
+        }
+      ],
+      "summary": "Publish purchase-order facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.purchase-requisition": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/purchase-requisition"
+      },
+      "description": "Producer(s): Procurement. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/purchase-requisition/messages/approved"
+        },
+        {
+          "$ref": "#/channels/purchase-requisition/messages/submitted"
+        }
+      ],
+      "summary": "Publish purchase-requisition facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.service-receipt": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/service-receipt"
+      },
+      "description": "Producer(s): Procurement. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/service-receipt/messages/recorded"
+        }
+      ],
+      "summary": "Publish service-receipt facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.supplier-credit": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/supplier-credit"
+      },
+      "description": "Producer(s): AP. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/supplier-credit/messages/applied"
+        }
+      ],
+      "summary": "Publish supplier-credit facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.supplier-invoice": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/supplier-invoice"
+      },
+      "description": "Producer(s): AP. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/supplier-invoice/messages/approved"
+        },
+        {
+          "$ref": "#/channels/supplier-invoice/messages/captured"
+        },
+        {
+          "$ref": "#/channels/supplier-invoice/messages/matched"
+        },
+        {
+          "$ref": "#/channels/supplier-invoice/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/supplier-invoice/messages/validated"
+        }
+      ],
+      "summary": "Publish supplier-invoice facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

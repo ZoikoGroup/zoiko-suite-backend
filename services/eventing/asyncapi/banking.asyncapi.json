@@ -1,0 +1,1359 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "bank-account": {
+      "address": "zoikosuite.banking.bank-account.v1",
+      "messages": {
+        "connected": {
+          "$ref": "#/components/messages/bank-account.connected"
+        }
+      }
+    },
+    "bank-connection": {
+      "address": "zoikosuite.banking.bank-connection.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/bank-connection.created"
+        },
+        "degraded": {
+          "$ref": "#/components/messages/bank-connection.degraded"
+        },
+        "requested": {
+          "$ref": "#/components/messages/bank-connection.requested"
+        }
+      }
+    },
+    "bank-reconciliation": {
+      "address": "zoikosuite.banking.bank-reconciliation.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/bank-reconciliation.completed"
+        }
+      }
+    },
+    "bank-statement": {
+      "address": "zoikosuite.banking.bank-statement.v1",
+      "messages": {
+        "imported": {
+          "$ref": "#/components/messages/bank-statement.imported"
+        },
+        "ingested": {
+          "$ref": "#/components/messages/bank-statement.ingested"
+        }
+      }
+    },
+    "bank-transaction": {
+      "address": "zoikosuite.banking.bank-transaction.v1",
+      "messages": {
+        "normalized": {
+          "$ref": "#/components/messages/bank-transaction.normalized"
+        }
+      }
+    },
+    "canonical-transaction": {
+      "address": "zoikosuite.banking.canonical-transaction.v1",
+      "messages": {
+        "normalized": {
+          "$ref": "#/components/messages/canonical-transaction.normalized"
+        },
+        "renormalized": {
+          "$ref": "#/components/messages/canonical-transaction.renormalized"
+        }
+      }
+    },
+    "cash-position": {
+      "address": "zoikosuite.banking.cash-position.v1",
+      "messages": {
+        "calculated": {
+          "$ref": "#/components/messages/cash-position.calculated"
+        }
+      }
+    },
+    "mapping-exception": {
+      "address": "zoikosuite.banking.mapping-exception.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/mapping-exception.approved"
+        },
+        "raised": {
+          "$ref": "#/components/messages/mapping-exception.raised"
+        }
+      }
+    },
+    "payee-destination": {
+      "address": "zoikosuite.banking.payee-destination.v1",
+      "messages": {
+        "activated": {
+          "$ref": "#/components/messages/payee-destination.activated"
+        },
+        "approved": {
+          "$ref": "#/components/messages/payee-destination.approved"
+        },
+        "proposed": {
+          "$ref": "#/components/messages/payee-destination.proposed"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/payee-destination.superseded"
+        },
+        "suspended": {
+          "$ref": "#/components/messages/payee-destination.suspended"
+        }
+      }
+    },
+    "payment": {
+      "address": "zoikosuite.banking.payment.v1",
+      "messages": {
+        "accepted": {
+          "$ref": "#/components/messages/payment.accepted"
+        },
+        "cancelled": {
+          "$ref": "#/components/messages/payment.cancelled"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/payment.rejected"
+        },
+        "returned": {
+          "$ref": "#/components/messages/payment.returned"
+        },
+        "settled": {
+          "$ref": "#/components/messages/payment.settled"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/payment.submitted"
+        }
+      }
+    },
+    "payment-execution-state": {
+      "address": "zoikosuite.banking.payment-execution-state.v1",
+      "messages": {
+        "accepted": {
+          "$ref": "#/components/messages/payment-execution-state.accepted"
+        },
+        "cancelled": {
+          "$ref": "#/components/messages/payment-execution-state.cancelled"
+        },
+        "conflict-raised": {
+          "$ref": "#/components/messages/payment-execution-state.conflict-raised"
+        },
+        "conflict-resolved": {
+          "$ref": "#/components/messages/payment-execution-state.conflict-resolved"
+        },
+        "pending": {
+          "$ref": "#/components/messages/payment-execution-state.pending"
+        },
+        "pending-unknown": {
+          "$ref": "#/components/messages/payment-execution-state.pending-unknown"
+        },
+        "recorded": {
+          "$ref": "#/components/messages/payment-execution-state.recorded"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/payment-execution-state.rejected"
+        },
+        "returned": {
+          "$ref": "#/components/messages/payment-execution-state.returned"
+        },
+        "settled": {
+          "$ref": "#/components/messages/payment-execution-state.settled"
+        },
+        "status-updated": {
+          "$ref": "#/components/messages/payment-execution-state.status-updated"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/payment-execution-state.submitted"
+        }
+      }
+    },
+    "payment-initiation-attempt": {
+      "address": "zoikosuite.banking.payment-initiation-attempt.v1",
+      "messages": {
+        "ambiguous": {
+          "$ref": "#/components/messages/payment-initiation-attempt.ambiguous"
+        },
+        "prepared": {
+          "$ref": "#/components/messages/payment-initiation-attempt.prepared"
+        },
+        "quarantined": {
+          "$ref": "#/components/messages/payment-initiation-attempt.quarantined"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/payment-initiation-attempt.rejected"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/payment-initiation-attempt.submitted"
+        }
+      }
+    },
+    "payment-instruction": {
+      "address": "zoikosuite.banking.payment-instruction.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/payment-instruction.approved"
+        },
+        "created": {
+          "$ref": "#/components/messages/payment-instruction.created"
+        }
+      }
+    },
+    "provider-callback": {
+      "address": "zoikosuite.banking.provider-callback.v1",
+      "messages": {
+        "quarantined": {
+          "$ref": "#/components/messages/provider-callback.quarantined"
+        }
+      }
+    },
+    "reconciliation": {
+      "address": "zoikosuite.banking.reconciliation.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/reconciliation.completed"
+        },
+        "evidence-conflict.raised": {
+          "$ref": "#/components/messages/reconciliation.evidence-conflict.raised"
+        },
+        "evidence-conflict.resolved": {
+          "$ref": "#/components/messages/reconciliation.evidence-conflict.resolved"
+        },
+        "exception.raised": {
+          "$ref": "#/components/messages/reconciliation.exception.raised"
+        },
+        "ingested": {
+          "$ref": "#/components/messages/reconciliation.ingested"
+        },
+        "matched": {
+          "$ref": "#/components/messages/reconciliation.matched"
+        },
+        "run.certified": {
+          "$ref": "#/components/messages/reconciliation.run.certified"
+        },
+        "run.reperformed": {
+          "$ref": "#/components/messages/reconciliation.run.reperformed"
+        },
+        "run.started": {
+          "$ref": "#/components/messages/reconciliation.run.started"
+        },
+        "run.superseded": {
+          "$ref": "#/components/messages/reconciliation.run.superseded"
+        }
+      }
+    },
+    "treasury-transfer": {
+      "address": "zoikosuite.banking.treasury-transfer.v1",
+      "messages": {
+        "settled": {
+          "$ref": "#/components/messages/treasury-transfer.settled"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "bank-account.connected": {
+        "contentType": "application/json",
+        "description": "Producer: Banking. Primary consumers / intent: Statement ingestion/ops. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.bank-account.connected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank account connection: connected.",
+        "title": "bank-account connected",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-account.connected",
+        "x-zoiko-origin": "spec"
+      },
+      "bank-connection.created": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.bank-connection.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Connection: created.",
+        "title": "bank-connection created",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-connection.created",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-connection.degraded": {
+        "contentType": "application/json",
+        "description": "Producer: Banking. Primary consumers / intent: Ops/alerts. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.bank-connection.degraded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank connection: degraded.",
+        "title": "bank-connection degraded",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-connection.degraded",
+        "x-zoiko-origin": "spec"
+      },
+      "bank-connection.requested": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.bank-connection.requested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Connection: requested.",
+        "title": "bank-connection requested",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-connection.requested",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-reconciliation.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Banking. Primary consumers / intent: Accounting/close. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.bank-reconciliation.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank reconciliation: completed.",
+        "title": "bank-reconciliation completed",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-reconciliation.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "bank-statement.imported": {
+        "contentType": "application/json",
+        "description": "Producer: Banking. Primary consumers / intent: Normalization/reconciliation. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.bank-statement.imported",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank statement: imported.",
+        "title": "bank-statement imported",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-statement.imported",
+        "x-zoiko-origin": "spec"
+      },
+      "bank-statement.ingested": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.bank-statement.ingested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Statement: ingested.",
+        "title": "bank-statement ingested",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-statement.ingested",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-transaction.normalized": {
+        "contentType": "application/json",
+        "description": "Producer: Banking. Primary consumers / intent: Matching/cash application. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.bank-transaction.normalized",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank transaction: normalized.",
+        "title": "bank-transaction normalized",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-transaction.normalized",
+        "x-zoiko-origin": "spec"
+      },
+      "canonical-transaction.normalized": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.canonical-transaction.normalized",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Canonical Transaction: normalized.",
+        "title": "canonical-transaction normalized",
+        "x-zoiko-event-type": "com.zoikosuite.banking.canonical-transaction.normalized",
+        "x-zoiko-origin": "extension"
+      },
+      "canonical-transaction.renormalized": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.canonical-transaction.renormalized",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Canonical Transaction: renormalized.",
+        "title": "canonical-transaction renormalized",
+        "x-zoiko-event-type": "com.zoikosuite.banking.canonical-transaction.renormalized",
+        "x-zoiko-origin": "extension"
+      },
+      "cash-position.calculated": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury. Primary consumers / intent: Treasury/reporting. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.cash-position.calculated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Cash position: calculated.",
+        "title": "cash-position calculated",
+        "x-zoiko-event-type": "com.zoikosuite.banking.cash-position.calculated",
+        "x-zoiko-origin": "spec"
+      },
+      "mapping-exception.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.mapping-exception.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Mapping Exception: approved.",
+        "title": "mapping-exception approved",
+        "x-zoiko-event-type": "com.zoikosuite.banking.mapping-exception.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "mapping-exception.raised": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.mapping-exception.raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Mapping Exception: raised.",
+        "title": "mapping-exception raised",
+        "x-zoiko-event-type": "com.zoikosuite.banking.mapping-exception.raised",
+        "x-zoiko-origin": "extension"
+      },
+      "payee-destination.activated": {
+        "contentType": "application/json",
+        "description": "Producer: Payee Banking Identity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payee-destination.activated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payee Destination: activated.",
+        "title": "payee-destination activated",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payee-destination.activated",
+        "x-zoiko-origin": "extension"
+      },
+      "payee-destination.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Payee Banking Identity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payee-destination.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payee Destination: approved.",
+        "title": "payee-destination approved",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payee-destination.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "payee-destination.proposed": {
+        "contentType": "application/json",
+        "description": "Producer: Payee Banking Identity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payee-destination.proposed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payee Destination: proposed.",
+        "title": "payee-destination proposed",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payee-destination.proposed",
+        "x-zoiko-origin": "extension"
+      },
+      "payee-destination.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Payee Banking Identity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payee-destination.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payee Destination: superseded.",
+        "title": "payee-destination superseded",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payee-destination.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "payee-destination.suspended": {
+        "contentType": "application/json",
+        "description": "Producer: Payee Banking Identity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payee-destination.suspended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payee Destination: suspended.",
+        "title": "payee-destination suspended",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payee-destination.suspended",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.accepted": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: accepted.",
+        "title": "payment-execution-state accepted",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.accepted",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.cancelled": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.cancelled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: cancelled.",
+        "title": "payment-execution-state cancelled",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.cancelled",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.conflict-raised": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.conflict-raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: conflict-raised.",
+        "title": "payment-execution-state conflict-raised",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.conflict-raised",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.conflict-resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.conflict-resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: conflict-resolved.",
+        "title": "payment-execution-state conflict-resolved",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.conflict-resolved",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.pending": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.pending",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: pending.",
+        "title": "payment-execution-state pending",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.pending",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.pending-unknown": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.pending-unknown",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: pending-unknown.",
+        "title": "payment-execution-state pending-unknown",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.pending-unknown",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.recorded": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.recorded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: recorded.",
+        "title": "payment-execution-state recorded",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.recorded",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: rejected.",
+        "title": "payment-execution-state rejected",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.rejected",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.returned": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.returned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: returned.",
+        "title": "payment-execution-state returned",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.returned",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.settled": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.settled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: settled.",
+        "title": "payment-execution-state settled",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.settled",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.status-updated": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.status-updated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: status-updated.",
+        "title": "payment-execution-state status-updated",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.status-updated",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-execution-state.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-execution-state.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Execution State: submitted.",
+        "title": "payment-execution-state submitted",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-execution-state.submitted",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-initiation-attempt.ambiguous": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Initiation Adapter. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-initiation-attempt.ambiguous",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Initiation Attempt: ambiguous.",
+        "title": "payment-initiation-attempt ambiguous",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-initiation-attempt.ambiguous",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-initiation-attempt.prepared": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Initiation Adapter. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-initiation-attempt.prepared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Initiation Attempt: prepared.",
+        "title": "payment-initiation-attempt prepared",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-initiation-attempt.prepared",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-initiation-attempt.quarantined": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Initiation Adapter. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-initiation-attempt.quarantined",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Initiation Attempt: quarantined.",
+        "title": "payment-initiation-attempt quarantined",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-initiation-attempt.quarantined",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-initiation-attempt.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Initiation Adapter. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-initiation-attempt.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Initiation Attempt: rejected.",
+        "title": "payment-initiation-attempt rejected",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-initiation-attempt.rejected",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-initiation-attempt.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Initiation Adapter. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.payment-initiation-attempt.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment Initiation Attempt: submitted.",
+        "title": "payment-initiation-attempt submitted",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-initiation-attempt.submitted",
+        "x-zoiko-origin": "extension"
+      },
+      "payment-instruction.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Payments. Primary consumers / intent: Provider attempt. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.payment-instruction.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment instruction: approved.",
+        "title": "payment-instruction approved",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-instruction.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "payment-instruction.created": {
+        "contentType": "application/json",
+        "description": "Producer: Payments. Primary consumers / intent: Approval workflow. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.payment-instruction.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment instruction: created.",
+        "title": "payment-instruction created",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment-instruction.created",
+        "x-zoiko-origin": "spec"
+      },
+      "payment.accepted": {
+        "contentType": "application/json",
+        "description": "Producer: Payments. Primary consumers / intent: Ops/status. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.payment.accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment: accepted.",
+        "title": "payment accepted",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment.accepted",
+        "x-zoiko-origin": "spec"
+      },
+      "payment.cancelled": {
+        "contentType": "application/json",
+        "description": "Producer: Payments. Primary consumers / intent: AP/AR. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.payment.cancelled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment: cancelled.",
+        "title": "payment cancelled",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment.cancelled",
+        "x-zoiko-origin": "spec"
+      },
+      "payment.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Payments. Primary consumers / intent: AP/AR/ops. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.payment.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment: rejected.",
+        "title": "payment rejected",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment.rejected",
+        "x-zoiko-origin": "spec"
+      },
+      "payment.returned": {
+        "contentType": "application/json",
+        "description": "Producer: Payments. Primary consumers / intent: Accounting/AP/AR. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.payment.returned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment: returned.",
+        "title": "payment returned",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment.returned",
+        "x-zoiko-origin": "spec"
+      },
+      "payment.settled": {
+        "contentType": "application/json",
+        "description": "Producer: Payments. Primary consumers / intent: Accounting/cash application/reconciliation. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.payment.settled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment: settled.",
+        "title": "payment settled",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment.settled",
+        "x-zoiko-origin": "spec"
+      },
+      "payment.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Payments. Primary consumers / intent: AP/AR/ops. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.payment.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payment: submitted.",
+        "title": "payment submitted",
+        "x-zoiko-event-type": "com.zoikosuite.banking.payment.submitted",
+        "x-zoiko-origin": "spec"
+      },
+      "provider-callback.quarantined": {
+        "contentType": "application/json",
+        "description": "Producer: Payment Status Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.provider-callback.quarantined",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Provider Callback: quarantined.",
+        "title": "provider-callback quarantined",
+        "x-zoiko-event-type": "com.zoikosuite.banking.provider-callback.quarantined",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: completed.",
+        "title": "reconciliation completed",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.completed",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.evidence-conflict.raised": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.evidence-conflict.raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: raised.",
+        "title": "reconciliation evidence-conflict raised",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.evidence-conflict.raised",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.evidence-conflict.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.evidence-conflict.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: resolved.",
+        "title": "reconciliation evidence-conflict resolved",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.evidence-conflict.resolved",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.exception.raised": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.exception.raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: raised.",
+        "title": "reconciliation exception raised",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.exception.raised",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.ingested": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.ingested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: ingested.",
+        "title": "reconciliation ingested",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.ingested",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.matched": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.matched",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: matched.",
+        "title": "reconciliation matched",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.matched",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.run.certified": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.run.certified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: certified.",
+        "title": "reconciliation run certified",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.run.certified",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.run.reperformed": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.run.reperformed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: reperformed.",
+        "title": "reconciliation run reperformed",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.run.reperformed",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.run.started": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.run.started",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: started.",
+        "title": "reconciliation run started",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.run.started",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation.run.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Bank Reconciliation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.reconciliation.run.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation: superseded.",
+        "title": "reconciliation run superseded",
+        "x-zoiko-event-type": "com.zoikosuite.banking.reconciliation.run.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "treasury-transfer.settled": {
+        "contentType": "application/json",
+        "description": "Producer: Treasury. Primary consumers / intent: Accounting/cash position. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.banking.treasury-transfer.settled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Transfer: settled.",
+        "title": "treasury-transfer settled",
+        "x-zoiko-event-type": "com.zoikosuite.banking.treasury-transfer.settled",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite banking domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.bank-account": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/bank-account"
+      },
+      "description": "Producer(s): Banking. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/bank-account/messages/connected"
+        }
+      ],
+      "summary": "Publish bank-account facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.bank-connection": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/bank-connection"
+      },
+      "description": "Producer(s): Banking, Banking Connector Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/bank-connection/messages/created"
+        },
+        {
+          "$ref": "#/channels/bank-connection/messages/degraded"
+        },
+        {
+          "$ref": "#/channels/bank-connection/messages/requested"
+        }
+      ],
+      "summary": "Publish bank-connection facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.bank-reconciliation": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/bank-reconciliation"
+      },
+      "description": "Producer(s): Banking. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/bank-reconciliation/messages/completed"
+        }
+      ],
+      "summary": "Publish bank-reconciliation facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.bank-statement": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/bank-statement"
+      },
+      "description": "Producer(s): Banking, Banking Connector Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/bank-statement/messages/imported"
+        },
+        {
+          "$ref": "#/channels/bank-statement/messages/ingested"
+        }
+      ],
+      "summary": "Publish bank-statement facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.bank-transaction": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/bank-transaction"
+      },
+      "description": "Producer(s): Banking. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/bank-transaction/messages/normalized"
+        }
+      ],
+      "summary": "Publish bank-transaction facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.canonical-transaction": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/canonical-transaction"
+      },
+      "description": "Producer(s): Banking Connector Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/canonical-transaction/messages/normalized"
+        },
+        {
+          "$ref": "#/channels/canonical-transaction/messages/renormalized"
+        }
+      ],
+      "summary": "Publish canonical-transaction facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.cash-position": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/cash-position"
+      },
+      "description": "Producer(s): Treasury. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/cash-position/messages/calculated"
+        }
+      ],
+      "summary": "Publish cash-position facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.mapping-exception": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/mapping-exception"
+      },
+      "description": "Producer(s): Banking Connector Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/mapping-exception/messages/approved"
+        },
+        {
+          "$ref": "#/channels/mapping-exception/messages/raised"
+        }
+      ],
+      "summary": "Publish mapping-exception facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payee-destination": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payee-destination"
+      },
+      "description": "Producer(s): Payee Banking Identity Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payee-destination/messages/activated"
+        },
+        {
+          "$ref": "#/channels/payee-destination/messages/approved"
+        },
+        {
+          "$ref": "#/channels/payee-destination/messages/proposed"
+        },
+        {
+          "$ref": "#/channels/payee-destination/messages/superseded"
+        },
+        {
+          "$ref": "#/channels/payee-destination/messages/suspended"
+        }
+      ],
+      "summary": "Publish payee-destination facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payment"
+      },
+      "description": "Producer(s): Payments. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payment/messages/accepted"
+        },
+        {
+          "$ref": "#/channels/payment/messages/cancelled"
+        },
+        {
+          "$ref": "#/channels/payment/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/payment/messages/returned"
+        },
+        {
+          "$ref": "#/channels/payment/messages/settled"
+        },
+        {
+          "$ref": "#/channels/payment/messages/submitted"
+        }
+      ],
+      "summary": "Publish payment facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payment-execution-state": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payment-execution-state"
+      },
+      "description": "Producer(s): Payment Status Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payment-execution-state/messages/accepted"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/cancelled"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/conflict-raised"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/conflict-resolved"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/pending"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/pending-unknown"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/recorded"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/returned"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/settled"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/status-updated"
+        },
+        {
+          "$ref": "#/channels/payment-execution-state/messages/submitted"
+        }
+      ],
+      "summary": "Publish payment-execution-state facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payment-initiation-attempt": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payment-initiation-attempt"
+      },
+      "description": "Producer(s): Payment Initiation Adapter. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payment-initiation-attempt/messages/ambiguous"
+        },
+        {
+          "$ref": "#/channels/payment-initiation-attempt/messages/prepared"
+        },
+        {
+          "$ref": "#/channels/payment-initiation-attempt/messages/quarantined"
+        },
+        {
+          "$ref": "#/channels/payment-initiation-attempt/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/payment-initiation-attempt/messages/submitted"
+        }
+      ],
+      "summary": "Publish payment-initiation-attempt facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payment-instruction": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payment-instruction"
+      },
+      "description": "Producer(s): Payments. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payment-instruction/messages/approved"
+        },
+        {
+          "$ref": "#/channels/payment-instruction/messages/created"
+        }
+      ],
+      "summary": "Publish payment-instruction facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.provider-callback": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/provider-callback"
+      },
+      "description": "Producer(s): Payment Status Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/provider-callback/messages/quarantined"
+        }
+      ],
+      "summary": "Publish provider-callback facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.reconciliation": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/reconciliation"
+      },
+      "description": "Producer(s): Bank Reconciliation Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/reconciliation/messages/completed"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/evidence-conflict.raised"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/evidence-conflict.resolved"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/exception.raised"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/ingested"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/matched"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/run.certified"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/run.reperformed"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/run.started"
+        },
+        {
+          "$ref": "#/channels/reconciliation/messages/run.superseded"
+        }
+      ],
+      "summary": "Publish reconciliation facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.treasury-transfer": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/treasury-transfer"
+      },
+      "description": "Producer(s): Treasury. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/treasury-transfer/messages/settled"
+        }
+      ],
+      "summary": "Publish treasury-transfer facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

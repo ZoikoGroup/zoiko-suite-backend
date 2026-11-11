@@ -41,6 +41,10 @@ type Entry struct {
 	Subject string `json:"subject"`
 	// Consumers is the catalogue's primary-consumer / intent column.
 	Consumers string `json:"consumers"`
+	// Origin is empty for a type listed in ZS-EVENT-001 section 19, and "extension" for a type a service already emits
+	// that section 19 does not list. Extensions are real, owned facts recorded so they are governed; they still
+	// need their consumers registered (section 23) before they count as Ready.
+	Origin string `json:"origin,omitempty"`
 }
 
 // Domain is the first segment after the prefix (accounting, ar, tax, ...).
@@ -66,6 +70,13 @@ var Domains = []string{
 	"inventory", "projects", "finance", "reporting", "audit", "legal",
 	"business", "workforce", "data", "ai", "commercial", "security", "ops",
 }
+
+// ExtensionDomains are domain prefixes services already emit under that section 19
+// does not define. Only an origin=extension entry may use one, so a spec entry can
+// never drift into them. Each is an open architecture question (section 19's
+// "Data, AI & Integrations" family uses the data.* domain for connector and import
+// facts): adopt the domain into section 19, or migrate the producer to an existing one.
+var ExtensionDomains = []string{"integration", "connectivity", "treasury", "reconciliation", "einvoice"}
 
 var (
 	once    sync.Once
@@ -113,16 +124,19 @@ func Lookup(eventType string) (Entry, bool) {
 // pastTense reports whether a fact segment reads as a past-tense fact.
 // It is a heuristic on purpose (§21: "Past-tense name"); legitimate
 // exceptions are listed in nonPastTense with the reason they are accepted.
-var pastTense = regexp.MustCompile(`(ed|en|off|paid|made|sent|held|built|run|given|known|taken|shown)$`)
+var pastTense = regexp.MustCompile(`((ed|en|wn|set|off|paid|made|sent|held|built|run|given|taken|bound|back)|^became-.+)$`)
 
 // nonPastTense are catalogue entries the standard itself lists whose last
 // segment is not a past participle. They are accepted explicitly so that a
 // new one has to be a conscious decision, not a lint gap.
 var nonPastTense = map[string]string{
-	"com.zoikosuite.tax.tax-payment.due":    "§19 lists it as a state-reached signal: the payment became due",
-	"com.zoikosuite.legal.obligation.due":   "§19 lists it as a state-reached signal: the obligation became due",
-	"com.zoikosuite.business.deadline.due":  "§19 lists it as a state-reached signal: the deadline became due",
-	"com.zoikosuite.legal.license.expiring": "§19 lists it as a lead-time signal ahead of expiry",
+	"com.zoikosuite.tax.tax-payment.due":                             "§19 lists it as a state-reached signal: the payment became due",
+	"com.zoikosuite.legal.obligation.due":                            "§19 lists it as a state-reached signal: the obligation became due",
+	"com.zoikosuite.business.deadline.due":                           "§19 lists it as a state-reached signal: the deadline became due",
+	"com.zoikosuite.legal.license.expiring":                          "§19 lists it as a lead-time signal ahead of expiry",
+	"com.zoikosuite.banking.payment-execution-state.pending":         "extension: provider state fact, the payment is pending",
+	"com.zoikosuite.banking.payment-execution-state.pending-unknown": "extension: provider result cannot be proven yet (section 15 status.unknown)",
+	"com.zoikosuite.banking.payment-initiation-attempt.ambiguous":    "extension: provider outcome is ambiguous (section 15 status.unknown)",
 }
 
 var typeShape = regexp.MustCompile(`^com\.zoikosuite\.[a-z0-9-]+\.[a-z0-9-]+(\.[a-z0-9-]+)+$`)
@@ -145,11 +159,18 @@ func Lint(e Entry) []string {
 			known = true
 		}
 	}
+	if !known && e.Origin == "extension" {
+		for _, d := range ExtensionDomains {
+			if e.Domain() == d {
+				known = true
+			}
+		}
+	}
 	if !known {
 		v = append(v, fmt.Sprintf("domain %q is not a §19 domain", e.Domain()))
 	}
 	if !pastTense.MatchString(e.Fact()) {
-		if _, ok := nonPastTense[e.Type]; !ok {
+		if _, ok := nonPastTense[e.Type]; !ok && !(e.Origin == "extension" && extensionNamingDebt[e.Type]) {
 			v = append(v, fmt.Sprintf("fact %q is not past tense (§5.1, E-01) and has no recorded exemption", e.Fact()))
 		}
 	}
@@ -181,4 +202,35 @@ var genericAllowed = map[string]string{
 	"com.zoikosuite.workforce.worker-financial-profile.changed": "listed in §19 (payroll dimensions)",
 	"com.zoikosuite.security.key-policy.changed":                "listed in §19 (encryption services)",
 	"com.zoikosuite.governance.residency-policy.changed":        "listed in §19 (routing, data platform)",
+}
+
+// Spec returns the entries listed in ZS-EVENT-001 section 19 (not extensions).
+func Spec() ([]Entry, error) {
+	all, err := All()
+	if err != nil {
+		return nil, err
+	}
+	var out []Entry
+	for _, e := range all {
+		if e.Origin == "" {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// FactPath is the part of the type that identifies the message within its
+// domain. Most types are domain.aggregate.fact; some have a sub-aggregate
+// (accounting.kernel.migration-batch.approved), and keying by the last segment
+// alone would make "kernel.approved" collide across them.
+//
+// withAggregate=true returns "aggregate.<path>", unique within the domain (a
+// component key); false returns just the path below the aggregate (the message
+// name within its channel).
+func (e Entry) FactPath(withAggregate bool) string {
+	s := segments(e.Type)
+	if withAggregate {
+		return strings.Join(s[1:], ".")
+	}
+	return strings.Join(s[2:], ".")
 }

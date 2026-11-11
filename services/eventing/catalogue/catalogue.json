@@ -1,1374 +1,446 @@
 [
-    {
-        "type":  "com.zoikosuite.governance.tenant.created",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Tenant Service",
-        "subject":  "Tenant",
-        "consumers":  "GTRM, entitlement, observability"
-    },
-    {
-        "type":  "com.zoikosuite.governance.tenant.status-changed",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Tenant Service",
-        "subject":  "Tenant",
-        "consumers":  "Gateway, commercial, operations"
-    },
-    {
-        "type":  "com.zoikosuite.governance.residency-policy.changed",
-        "family":  "Governance \u0026 Control",
-        "producer":  "GTRM/Policy",
-        "subject":  "Tenant residency policy",
-        "consumers":  "Routing, data platform, integrations"
-    },
-    {
-        "type":  "com.zoikosuite.governance.authorization-policy.published",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Authorization Service",
-        "subject":  "Policy",
-        "consumers":  "Gateway/domain services"
-    },
-    {
-        "type":  "com.zoikosuite.governance.delegation.granted",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Role \u0026 Delegation",
-        "subject":  "Delegation",
-        "consumers":  "Workflow/approvals"
-    },
-    {
-        "type":  "com.zoikosuite.governance.delegation.revoked",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Role \u0026 Delegation",
-        "subject":  "Delegation",
-        "consumers":  "Workflow/approvals"
-    },
-    {
-        "type":  "com.zoikosuite.governance.sod-policy.published",
-        "family":  "Governance \u0026 Control",
-        "producer":  "SoD Service",
-        "subject":  "SoD policy",
-        "consumers":  "Approval engines"
-    },
-    {
-        "type":  "com.zoikosuite.governance.workflow-definition.published",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Workflow Service",
-        "subject":  "Workflow definition",
-        "consumers":  "Workflow runtime"
-    },
-    {
-        "type":  "com.zoikosuite.governance.retention-policy.published",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Retention Service",
-        "subject":  "Retention policy",
-        "consumers":  "Domain stores/archive"
-    },
-    {
-        "type":  "com.zoikosuite.governance.legal-hold.placed",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Legal Hold Service",
-        "subject":  "Legal hold",
-        "consumers":  "Disposition/document/archive"
-    },
-    {
-        "type":  "com.zoikosuite.governance.legal-hold.released",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Legal Hold Service",
-        "subject":  "Legal hold",
-        "consumers":  "Disposition/document/archive"
-    },
-    {
-        "type":  "com.zoikosuite.governance.schema.published",
-        "family":  "Governance \u0026 Control",
-        "producer":  "Schema Registry",
-        "subject":  "Schema",
-        "consumers":  "Producers/consumers/CI"
-    },
-    {
-        "type":  "com.zoikosuite.org.legal-entity.created",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Legal Entity Service",
-        "subject":  "Legal entity",
-        "consumers":  "Accounting, tax, legal, reporting"
-    },
-    {
-        "type":  "com.zoikosuite.org.legal-entity.updated",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Legal Entity Service",
-        "subject":  "Legal entity",
-        "consumers":  "Dependent domain read models"
-    },
-    {
-        "type":  "com.zoikosuite.org.legal-entity.status-changed",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Legal Entity Service",
-        "subject":  "Legal entity",
-        "consumers":  "Accounting/tax posting guards"
-    },
-    {
-        "type":  "com.zoikosuite.org.establishment.registered",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Establishment Service",
-        "subject":  "Establishment",
-        "consumers":  "Tax, invoicing, legal"
-    },
-    {
-        "type":  "com.zoikosuite.org.establishment.changed",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Establishment Service",
-        "subject":  "Establishment",
-        "consumers":  "Tax, reporting"
-    },
-    {
-        "type":  "com.zoikosuite.org.party.created",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Party Service",
-        "subject":  "Party",
-        "consumers":  "AR/AP/Legal/CRM"
-    },
-    {
-        "type":  "com.zoikosuite.org.party-role.granted",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Party Service",
-        "subject":  "Party role",
-        "consumers":  "AR/AP/workforce"
-    },
-    {
-        "type":  "com.zoikosuite.org.party-role.revoked",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Party Service",
-        "subject":  "Party role",
-        "consumers":  "AR/AP/workforce"
-    },
-    {
-        "type":  "com.zoikosuite.org.registration.added",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Registration Service",
-        "subject":  "Registration",
-        "consumers":  "Tax/legal/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.org.registration.expired",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Registration Service",
-        "subject":  "Registration",
-        "consumers":  "Tax/legal workflows"
-    },
-    {
-        "type":  "com.zoikosuite.org.ownership.changed",
-        "family":  "Organization \u0026 Master Data",
-        "producer":  "Ownership Service",
-        "subject":  "Ownership relationship",
-        "consumers":  "Consolidation/legal/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.accounting-event.accepted",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Accounting event",
-        "consumers":  "Posting engine/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.accounting-event.rejected",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Accounting event",
-        "consumers":  "Source domain exception queue"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.journal.proposed",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Journal",
-        "consumers":  "Approval/workflow"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.journal.approved",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Journal",
-        "consumers":  "Posting engine"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.journal.posted",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Journal",
-        "consumers":  "GL/reconciliation/reporting/consolidation"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.journal.reversed",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Journal",
-        "consumers":  "GL/reconciliation/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.journal.adjusted",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Journal",
-        "consumers":  "GL/reconciliation/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.period.soft-closed",
-        "family":  "Accounting Kernel",
-        "producer":  "Period Service",
-        "subject":  "Accounting period",
-        "consumers":  "Posting guards/close workflow"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.period.hard-closed",
-        "family":  "Accounting Kernel",
-        "producer":  "Period Service",
-        "subject":  "Accounting period",
-        "consumers":  "All posting domains/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.period.reopened",
-        "family":  "Accounting Kernel",
-        "producer":  "Period Service",
-        "subject":  "Accounting period",
-        "consumers":  "Posting domains/audit"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.fx-revaluation.completed",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Revaluation run",
-        "consumers":  "GL/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.allocation.posted",
-        "family":  "Accounting Kernel",
-        "producer":  "Accounting Kernel",
-        "subject":  "Allocation run",
-        "consumers":  "GL/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.intercompany-mismatch.detected",
-        "family":  "Accounting Kernel",
-        "producer":  "Reconciliation Engine",
-        "subject":  "Intercompany pair",
-        "consumers":  "Close workflow"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.consolidation-run.completed",
-        "family":  "Accounting Kernel",
-        "producer":  "Consolidation Service",
-        "subject":  "Consolidation run",
-        "consumers":  "Group reporting/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.balance-snapshot.signed",
-        "family":  "Accounting Kernel",
-        "producer":  "Trial Balance Service",
-        "subject":  "Balance snapshot",
-        "consumers":  "Reporting/audit/consolidation"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.reconciliation-break.detected",
-        "family":  "Accounting Kernel",
-        "producer":  "Reconciliation Engine",
-        "subject":  "Reconciliation",
-        "consumers":  "Ops/close workflow"
-    },
-    {
-        "type":  "com.zoikosuite.accounting.reconciliation-break.resolved",
-        "family":  "Accounting Kernel",
-        "producer":  "Reconciliation Engine",
-        "subject":  "Reconciliation",
-        "consumers":  "Ops/close workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ar.quote.accepted",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Quote",
-        "consumers":  "Sales order/workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ar.sales-order.confirmed",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Sales order",
-        "consumers":  "Fulfillment/invoicing"
-    },
-    {
-        "type":  "com.zoikosuite.ar.customer-invoice.validated",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Customer invoice",
-        "consumers":  "Issue workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ar.customer-invoice.issued",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Customer invoice",
-        "consumers":  "Accounting/receivables/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.ar.customer-invoice.disputed",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Customer invoice",
-        "consumers":  "Collections/case management"
-    },
-    {
-        "type":  "com.zoikosuite.ar.customer-invoice.partially-paid",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Customer invoice",
-        "consumers":  "Receivables/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.ar.customer-invoice.paid",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Customer invoice",
-        "consumers":  "Receivables/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.ar.credit-note.issued",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Credit note",
-        "consumers":  "Accounting/receivables/tax"
-    },
-    {
-        "type":  "com.zoikosuite.ar.debit-note.issued",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Debit note",
-        "consumers":  "Accounting/receivables/tax"
-    },
-    {
-        "type":  "com.zoikosuite.ar.receivable.written-off",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Receivable",
-        "consumers":  "Accounting/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.ar.refund.authorized",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "AR",
-        "subject":  "Refund",
-        "consumers":  "Payments/accounting"
-    },
-    {
-        "type":  "com.zoikosuite.ar.collection-case.opened",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "Collections",
-        "subject":  "Collection case",
-        "consumers":  "Task/case workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ar.collection-case.closed",
-        "family":  "Accounts Receivable \u0026 Revenue",
-        "producer":  "Collections",
-        "subject":  "Collection case",
-        "consumers":  "Reporting"
-    },
-    {
-        "type":  "com.zoikosuite.ap.purchase-requisition.submitted",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "Procurement",
-        "subject":  "Purchase requisition",
-        "consumers":  "Approval workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ap.purchase-requisition.approved",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "Procurement",
-        "subject":  "Purchase requisition",
-        "consumers":  "PO creation"
-    },
-    {
-        "type":  "com.zoikosuite.ap.purchase-order.issued",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "Procurement",
-        "subject":  "Purchase order",
-        "consumers":  "Supplier/receipt workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ap.goods-receipt.recorded",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "Procurement",
-        "subject":  "Goods receipt",
-        "consumers":  "AP/inventory/accounting"
-    },
-    {
-        "type":  "com.zoikosuite.ap.service-receipt.recorded",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "Procurement",
-        "subject":  "Service receipt",
-        "consumers":  "AP/accounting"
-    },
-    {
-        "type":  "com.zoikosuite.ap.supplier-invoice.captured",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "AP",
-        "subject":  "Supplier invoice",
-        "consumers":  "Validation/matching"
-    },
-    {
-        "type":  "com.zoikosuite.ap.supplier-invoice.validated",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "AP",
-        "subject":  "Supplier invoice",
-        "consumers":  "Matching/approval"
-    },
-    {
-        "type":  "com.zoikosuite.ap.supplier-invoice.matched",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "AP",
-        "subject":  "Supplier invoice",
-        "consumers":  "Approval"
-    },
-    {
-        "type":  "com.zoikosuite.ap.supplier-invoice.approved",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "AP",
-        "subject":  "Supplier invoice",
-        "consumers":  "Accounting/payment proposal"
-    },
-    {
-        "type":  "com.zoikosuite.ap.supplier-invoice.rejected",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "AP",
-        "subject":  "Supplier invoice",
-        "consumers":  "Exception workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ap.supplier-credit.applied",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "AP",
-        "subject":  "Supplier credit",
-        "consumers":  "Accounting/payables"
-    },
-    {
-        "type":  "com.zoikosuite.ap.expense-claim.submitted",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "Expense Service",
-        "subject":  "Expense claim",
-        "consumers":  "Approval"
-    },
-    {
-        "type":  "com.zoikosuite.ap.expense-claim.approved",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "Expense Service",
-        "subject":  "Expense claim",
-        "consumers":  "Accounting/reimbursement"
-    },
-    {
-        "type":  "com.zoikosuite.ap.expense-claim.rejected",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "Expense Service",
-        "subject":  "Expense claim",
-        "consumers":  "Claimant/workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ap.payment-proposal.created",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "AP",
-        "subject":  "Payment proposal",
-        "consumers":  "Approval"
-    },
-    {
-        "type":  "com.zoikosuite.ap.payment-proposal.approved",
-        "family":  "Procurement \u0026 Accounts Payable",
-        "producer":  "AP",
-        "subject":  "Payment proposal",
-        "consumers":  "Payment orchestration"
-    },
-    {
-        "type":  "com.zoikosuite.banking.bank-account.connected",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Banking",
-        "subject":  "Bank account connection",
-        "consumers":  "Statement ingestion/ops"
-    },
-    {
-        "type":  "com.zoikosuite.banking.bank-connection.degraded",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Banking",
-        "subject":  "Bank connection",
-        "consumers":  "Ops/alerts"
-    },
-    {
-        "type":  "com.zoikosuite.banking.bank-statement.imported",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Banking",
-        "subject":  "Bank statement",
-        "consumers":  "Normalization/reconciliation"
-    },
-    {
-        "type":  "com.zoikosuite.banking.bank-transaction.normalized",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Banking",
-        "subject":  "Bank transaction",
-        "consumers":  "Matching/cash application"
-    },
-    {
-        "type":  "com.zoikosuite.banking.bank-reconciliation.completed",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Banking",
-        "subject":  "Bank reconciliation",
-        "consumers":  "Accounting/close"
-    },
-    {
-        "type":  "com.zoikosuite.banking.payment-instruction.created",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Payments",
-        "subject":  "Payment instruction",
-        "consumers":  "Approval workflow"
-    },
-    {
-        "type":  "com.zoikosuite.banking.payment-instruction.approved",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Payments",
-        "subject":  "Payment instruction",
-        "consumers":  "Provider attempt"
-    },
-    {
-        "type":  "com.zoikosuite.banking.payment.submitted",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Payments",
-        "subject":  "Payment",
-        "consumers":  "AP/AR/ops"
-    },
-    {
-        "type":  "com.zoikosuite.banking.payment.accepted",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Payments",
-        "subject":  "Payment",
-        "consumers":  "Ops/status"
-    },
-    {
-        "type":  "com.zoikosuite.banking.payment.rejected",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Payments",
-        "subject":  "Payment",
-        "consumers":  "AP/AR/ops"
-    },
-    {
-        "type":  "com.zoikosuite.banking.payment.settled",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Payments",
-        "subject":  "Payment",
-        "consumers":  "Accounting/cash application/reconciliation"
-    },
-    {
-        "type":  "com.zoikosuite.banking.payment.returned",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Payments",
-        "subject":  "Payment",
-        "consumers":  "Accounting/AP/AR"
-    },
-    {
-        "type":  "com.zoikosuite.banking.payment.cancelled",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Payments",
-        "subject":  "Payment",
-        "consumers":  "AP/AR"
-    },
-    {
-        "type":  "com.zoikosuite.banking.cash-position.calculated",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Treasury",
-        "subject":  "Cash position",
-        "consumers":  "Treasury/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.banking.treasury-transfer.settled",
-        "family":  "Banking, Cash \u0026 Payments",
-        "producer":  "Treasury",
-        "subject":  "Transfer",
-        "consumers":  "Accounting/cash position"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-determination.completed",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax Engine",
-        "subject":  "Tax determination",
-        "consumers":  "AR/AP/accounting"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-determination.overridden",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax Engine",
-        "subject":  "Tax determination",
-        "consumers":  "Evidence/accounting"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-liability.recognized",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax liability",
-        "consumers":  "Accounting/obligation calendar"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-return.prepared",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax return",
-        "consumers":  "Approval"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-return.approved",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax return",
-        "consumers":  "Submission"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-return.submitted",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax return",
-        "consumers":  "Ops/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-return.accepted",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax return",
-        "consumers":  "Ledger/obligations/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-return.rejected",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax return",
-        "consumers":  "Exception workflow"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-return.amended",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax return",
-        "consumers":  "Ledger/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-payment.due",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax obligation",
-        "consumers":  "AP/treasury/calendar"
-    },
-    {
-        "type":  "com.zoikosuite.tax.tax-payment.recorded",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "Tax payment",
-        "consumers":  "Tax ledger/reconciliation"
-    },
-    {
-        "type":  "com.zoikosuite.tax.e-invoice.submitted",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax/E-Invoice",
-        "subject":  "E-invoice submission",
-        "consumers":  "AR/ops"
-    },
-    {
-        "type":  "com.zoikosuite.tax.e-invoice.cleared",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax/E-Invoice",
-        "subject":  "E-invoice submission",
-        "consumers":  "AR/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.tax.e-invoice.rejected",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax/E-Invoice",
-        "subject":  "E-invoice submission",
-        "consumers":  "AR/exception"
-    },
-    {
-        "type":  "com.zoikosuite.tax.saft-export.generated",
-        "family":  "Tax \u0026 Electronic Invoicing",
-        "producer":  "Tax",
-        "subject":  "SAF-T export",
-        "consumers":  "Audit/filing evidence"
-    },
-    {
-        "type":  "com.zoikosuite.assets.fixed-asset.capitalized",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Fixed Assets",
-        "subject":  "Asset",
-        "consumers":  "Accounting/depreciation"
-    },
-    {
-        "type":  "com.zoikosuite.assets.depreciation.posted",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Fixed Assets",
-        "subject":  "Depreciation run",
-        "consumers":  "Accounting/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.assets.asset.impaired",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Fixed Assets",
-        "subject":  "Asset",
-        "consumers":  "Accounting/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.assets.asset.revalued",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Fixed Assets",
-        "subject":  "Asset",
-        "consumers":  "Accounting/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.assets.asset.disposed",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Fixed Assets",
-        "subject":  "Asset",
-        "consumers":  "Accounting/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.inventory.stock.received",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Inventory",
-        "subject":  "Inventory movement",
-        "consumers":  "Valuation/accounting"
-    },
-    {
-        "type":  "com.zoikosuite.inventory.stock.issued",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Inventory",
-        "subject":  "Inventory movement",
-        "consumers":  "Valuation/accounting"
-    },
-    {
-        "type":  "com.zoikosuite.inventory.stock.transferred",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Inventory",
-        "subject":  "Inventory movement",
-        "consumers":  "Location read models"
-    },
-    {
-        "type":  "com.zoikosuite.inventory.stock.adjusted",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Inventory",
-        "subject":  "Inventory adjustment",
-        "consumers":  "Accounting/reconciliation"
-    },
-    {
-        "type":  "com.zoikosuite.inventory.stock-count.completed",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Inventory",
-        "subject":  "Stock count",
-        "consumers":  "Adjustment workflow"
-    },
-    {
-        "type":  "com.zoikosuite.inventory.valuation.completed",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Inventory",
-        "subject":  "Valuation run",
-        "consumers":  "Accounting/reporting"
-    },
-    {
-        "type":  "com.zoikosuite.projects.project.created",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Projects",
-        "subject":  "Project",
-        "consumers":  "Costing/time/billing"
-    },
-    {
-        "type":  "com.zoikosuite.projects.project-cost.posted",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Projects",
-        "subject":  "Project cost",
-        "consumers":  "Accounting/profitability"
-    },
-    {
-        "type":  "com.zoikosuite.projects.billing-milestone.reached",
-        "family":  "Assets, Inventory \u0026 Projects",
-        "producer":  "Projects",
-        "subject":  "Billing milestone",
-        "consumers":  "AR/invoicing"
-    },
-    {
-        "type":  "com.zoikosuite.finance.budget.published",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "FP\u0026A",
-        "subject":  "Budget version",
-        "consumers":  "Reporting/variance"
-    },
-    {
-        "type":  "com.zoikosuite.finance.forecast.published",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "FP\u0026A",
-        "subject":  "Forecast version",
-        "consumers":  "Reporting/variance"
-    },
-    {
-        "type":  "com.zoikosuite.finance.scenario.published",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "FP\u0026A",
-        "subject":  "Scenario",
-        "consumers":  "Management reporting"
-    },
-    {
-        "type":  "com.zoikosuite.finance.variance.material-threshold-breached",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "FP\u0026A",
-        "subject":  "Variance",
-        "consumers":  "Task/management review"
-    },
-    {
-        "type":  "com.zoikosuite.reporting.management-pack.generated",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "Reporting",
-        "subject":  "Report package",
-        "consumers":  "Board/report distribution"
-    },
-    {
-        "type":  "com.zoikosuite.reporting.financial-statements.generated",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "Reporting",
-        "subject":  "Financial statement set",
-        "consumers":  "Review/statutory reporting"
-    },
-    {
-        "type":  "com.zoikosuite.reporting.statutory-package.generated",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "Reporting",
-        "subject":  "Statutory package",
-        "consumers":  "Filing workflow"
-    },
-    {
-        "type":  "com.zoikosuite.reporting.xbrl-package.generated",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "Reporting",
-        "subject":  "XBRL package",
-        "consumers":  "Validation/submission"
-    },
-    {
-        "type":  "com.zoikosuite.reporting.regulatory-submission.submitted",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "Reporting",
-        "subject":  "Regulatory submission",
-        "consumers":  "Ops/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.reporting.regulatory-submission.accepted",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "Reporting",
-        "subject":  "Regulatory submission",
-        "consumers":  "Evidence/obligation"
-    },
-    {
-        "type":  "com.zoikosuite.reporting.regulatory-submission.rejected",
-        "family":  "FP\u0026A \u0026 Reporting",
-        "producer":  "Reporting",
-        "subject":  "Regulatory submission",
-        "consumers":  "Exception workflow"
-    },
-    {
-        "type":  "com.zoikosuite.audit.engagement.created",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Engagement",
-        "consumers":  "Planning/workflow"
-    },
-    {
-        "type":  "com.zoikosuite.audit.audit-population.frozen",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Audit population",
-        "consumers":  "Sampling/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.audit.sample.selected",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Sample",
-        "consumers":  "Workpaper/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.audit.evidence.received",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Evidence item",
-        "consumers":  "Workpaper/review"
-    },
-    {
-        "type":  "com.zoikosuite.audit.workpaper.prepared",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Workpaper",
-        "consumers":  "Review queue"
-    },
-    {
-        "type":  "com.zoikosuite.audit.workpaper.reviewed",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Workpaper",
-        "consumers":  "Sign-off"
-    },
-    {
-        "type":  "com.zoikosuite.audit.workpaper.signed-off",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Workpaper",
-        "consumers":  "Engagement completion/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.audit.finding.raised",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Finding",
-        "consumers":  "Management response/task"
-    },
-    {
-        "type":  "com.zoikosuite.audit.finding.resolved",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Finding",
-        "consumers":  "Engagement completion"
-    },
-    {
-        "type":  "com.zoikosuite.audit.engagement.closed",
-        "family":  "Audit \u0026 Assurance",
-        "producer":  "Audit",
-        "subject":  "Engagement",
-        "consumers":  "Evidence/retention"
-    },
-    {
-        "type":  "com.zoikosuite.legal.contract.drafted",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract",
-        "consumers":  "Approval/review"
-    },
-    {
-        "type":  "com.zoikosuite.legal.contract.approved",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract",
-        "consumers":  "Signature workflow"
-    },
-    {
-        "type":  "com.zoikosuite.legal.contract.executed",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract",
-        "consumers":  "Obligations/evidence/business domains"
-    },
-    {
-        "type":  "com.zoikosuite.legal.contract.amended",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract",
-        "consumers":  "Obligations/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.legal.contract.renewed",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract",
-        "consumers":  "Obligations/calendar"
-    },
-    {
-        "type":  "com.zoikosuite.legal.contract.terminated",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract",
-        "consumers":  "Obligations/business domains"
-    },
-    {
-        "type":  "com.zoikosuite.legal.obligation.created",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract obligation",
-        "consumers":  "Task/calendar"
-    },
-    {
-        "type":  "com.zoikosuite.legal.obligation.due",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract obligation",
-        "consumers":  "Task/escalation"
-    },
-    {
-        "type":  "com.zoikosuite.legal.obligation.satisfied",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract obligation",
-        "consumers":  "Evidence"
-    },
-    {
-        "type":  "com.zoikosuite.legal.obligation.breached",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Contract obligation",
-        "consumers":  "Matter/case workflow"
-    },
-    {
-        "type":  "com.zoikosuite.legal.matter.opened",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Legal matter",
-        "consumers":  "Task/document/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.legal.matter.closed",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Legal matter",
-        "consumers":  "Retention/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.legal.corporate-resolution.adopted",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "Resolution",
-        "consumers":  "Corporate records/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.legal.license.expiring",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "License",
-        "consumers":  "Deadline/task"
-    },
-    {
-        "type":  "com.zoikosuite.legal.ip-registration.renewed",
-        "family":  "Legal \u0026 Corporate Governance",
-        "producer":  "Legal",
-        "subject":  "IP registration",
-        "consumers":  "Calendar/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.business.document.stored",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Document Service",
-        "subject":  "Document",
-        "consumers":  "Linked domain/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.business.document.versioned",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Document Service",
-        "subject":  "Document",
-        "consumers":  "Linked domain/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.business.document.classification-changed",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Document Service",
-        "subject":  "Document",
-        "consumers":  "Access/retention"
-    },
-    {
-        "type":  "com.zoikosuite.business.task.created",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Task Service",
-        "subject":  "Task",
-        "consumers":  "Work queues"
-    },
-    {
-        "type":  "com.zoikosuite.business.task.completed",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Task Service",
-        "subject":  "Task",
-        "consumers":  "Workflow/metrics"
-    },
-    {
-        "type":  "com.zoikosuite.business.case.opened",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Case Service",
-        "subject":  "Case",
-        "consumers":  "Task/workflow"
-    },
-    {
-        "type":  "com.zoikosuite.business.case.closed",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Case Service",
-        "subject":  "Case",
-        "consumers":  "Reporting/retention"
-    },
-    {
-        "type":  "com.zoikosuite.business.deadline.due",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Deadline Service",
-        "subject":  "Obligation/deadline",
-        "consumers":  "Task/escalation"
-    },
-    {
-        "type":  "com.zoikosuite.business.template.published",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Template Service",
-        "subject":  "Template",
-        "consumers":  "Form/document generation"
-    },
-    {
-        "type":  "com.zoikosuite.business.form.submitted",
-        "family":  "Business Operations \u0026 Documents",
-        "producer":  "Form Service",
-        "subject":  "Form submission",
-        "consumers":  "Owning domain/workflow"
-    },
-    {
-        "type":  "com.zoikosuite.workforce.worker-financial-profile.changed",
-        "family":  "Workforce \u0026 Payroll Interfaces",
-        "producer":  "Workforce Interface",
-        "subject":  "Worker financial profile",
-        "consumers":  "Payroll/accounting dimensions"
-    },
-    {
-        "type":  "com.zoikosuite.workforce.time-financial-input.approved",
-        "family":  "Workforce \u0026 Payroll Interfaces",
-        "producer":  "Workforce Interface",
-        "subject":  "Time financial input",
-        "consumers":  "Payroll/project costing"
-    },
-    {
-        "type":  "com.zoikosuite.workforce.payroll-result.imported",
-        "family":  "Workforce \u0026 Payroll Interfaces",
-        "producer":  "Payroll Interface",
-        "subject":  "Payroll result",
-        "consumers":  "Validation"
-    },
-    {
-        "type":  "com.zoikosuite.workforce.payroll-result.validated",
-        "family":  "Workforce \u0026 Payroll Interfaces",
-        "producer":  "Payroll Interface",
-        "subject":  "Payroll result",
-        "consumers":  "Accounting/liabilities/payments"
-    },
-    {
-        "type":  "com.zoikosuite.workforce.payroll-journal.posted",
-        "family":  "Workforce \u0026 Payroll Interfaces",
-        "producer":  "Payroll Interface",
-        "subject":  "Payroll journal",
-        "consumers":  "GL/reconciliation"
-    },
-    {
-        "type":  "com.zoikosuite.workforce.payroll-liability.recognized",
-        "family":  "Workforce \u0026 Payroll Interfaces",
-        "producer":  "Payroll Interface",
-        "subject":  "Payroll liability",
-        "consumers":  "Tax/AP/treasury"
-    },
-    {
-        "type":  "com.zoikosuite.workforce.payroll-payment.settled",
-        "family":  "Workforce \u0026 Payroll Interfaces",
-        "producer":  "Payroll Interface",
-        "subject":  "Payroll payment",
-        "consumers":  "Payroll/reconciliation"
-    },
-    {
-        "type":  "com.zoikosuite.data.import.validated",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Import Service",
-        "subject":  "Import job",
-        "consumers":  "Approval/preview"
-    },
-    {
-        "type":  "com.zoikosuite.data.import.committed",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Import Service",
-        "subject":  "Import job",
-        "consumers":  "Owning domains/reconciliation"
-    },
-    {
-        "type":  "com.zoikosuite.data.import.failed",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Import Service",
-        "subject":  "Import job",
-        "consumers":  "Ops/exception"
-    },
-    {
-        "type":  "com.zoikosuite.data.connector-sync.started",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Connector Service",
-        "subject":  "Sync run",
-        "consumers":  "Ops"
-    },
-    {
-        "type":  "com.zoikosuite.data.connector-sync.completed",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Connector Service",
-        "subject":  "Sync run",
-        "consumers":  "Ops/reconciliation"
-    },
-    {
-        "type":  "com.zoikosuite.data.connector-sync.failed",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Connector Service",
-        "subject":  "Sync run",
-        "consumers":  "Ops/exception"
-    },
-    {
-        "type":  "com.zoikosuite.data.data-quality-issue.detected",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Data Quality",
-        "subject":  "DQ issue",
-        "consumers":  "Owner/task"
-    },
-    {
-        "type":  "com.zoikosuite.data.data-quality-issue.resolved",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Data Quality",
-        "subject":  "DQ issue",
-        "consumers":  "Owner/metrics"
-    },
-    {
-        "type":  "com.zoikosuite.data.external-record.linked",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "Integration Service",
-        "subject":  "External link",
-        "consumers":  "Owning domain/read model"
-    },
-    {
-        "type":  "com.zoikosuite.ai.document-extraction.completed",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "AI Extraction",
-        "subject":  "Extraction result",
-        "consumers":  "Human validation/owning workflow"
-    },
-    {
-        "type":  "com.zoikosuite.ai.classification.suggested",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "AI Classification",
-        "subject":  "Suggestion",
-        "consumers":  "Human/deterministic validation"
-    },
-    {
-        "type":  "com.zoikosuite.ai.anomaly.detected",
-        "family":  "Data, AI \u0026 Integrations",
-        "producer":  "AI/Rules",
-        "subject":  "Anomaly signal",
-        "consumers":  "Investigation queue"
-    },
-    {
-        "type":  "com.zoikosuite.commercial.subscription.started",
-        "family":  "Commercial Platform",
-        "producer":  "Commercial",
-        "subject":  "Subscription",
-        "consumers":  "Entitlement/billing"
-    },
-    {
-        "type":  "com.zoikosuite.commercial.subscription.changed",
-        "family":  "Commercial Platform",
-        "producer":  "Commercial",
-        "subject":  "Subscription",
-        "consumers":  "Entitlement/billing"
-    },
-    {
-        "type":  "com.zoikosuite.commercial.subscription.cancelled",
-        "family":  "Commercial Platform",
-        "producer":  "Commercial",
-        "subject":  "Subscription",
-        "consumers":  "Entitlement/billing"
-    },
-    {
-        "type":  "com.zoikosuite.commercial.entitlement.granted",
-        "family":  "Commercial Platform",
-        "producer":  "Commercial",
-        "subject":  "Entitlement",
-        "consumers":  "Gateway/product"
-    },
-    {
-        "type":  "com.zoikosuite.commercial.entitlement.revoked",
-        "family":  "Commercial Platform",
-        "producer":  "Commercial",
-        "subject":  "Entitlement",
-        "consumers":  "Gateway/product"
-    },
-    {
-        "type":  "com.zoikosuite.commercial.usage.measured",
-        "family":  "Commercial Platform",
-        "producer":  "Commercial",
-        "subject":  "Usage meter",
-        "consumers":  "Commercial billing"
-    },
-    {
-        "type":  "com.zoikosuite.commercial.platform-invoice.issued",
-        "family":  "Commercial Platform",
-        "producer":  "Commercial Billing",
-        "subject":  "Platform invoice",
-        "consumers":  "Collections/commercial accounting plane"
-    },
-    {
-        "type":  "com.zoikosuite.commercial.platform-payment.settled",
-        "family":  "Commercial Platform",
-        "producer":  "Commercial Billing",
-        "subject":  "Platform payment",
-        "consumers":  "Commercial receivables"
-    },
-    {
-        "type":  "com.zoikosuite.security.privileged-session.started",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Security",
-        "subject":  "Privileged session",
-        "consumers":  "SIEM/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.security.privileged-session.ended",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Security",
-        "subject":  "Privileged session",
-        "consumers":  "SIEM/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.security.secret.rotated",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Security",
-        "subject":  "Secret/key",
-        "consumers":  "Dependent workloads/ops"
-    },
-    {
-        "type":  "com.zoikosuite.security.key-policy.changed",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Security",
-        "subject":  "Key policy",
-        "consumers":  "Encryption services"
-    },
-    {
-        "type":  "com.zoikosuite.security.security-event.raised",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Security",
-        "subject":  "Security event",
-        "consumers":  "SIEM/incident response"
-    },
-    {
-        "type":  "com.zoikosuite.ops.incident.declared",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Operations",
-        "subject":  "Incident",
-        "consumers":  "Status/response workflows"
-    },
-    {
-        "type":  "com.zoikosuite.ops.incident.resolved",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Operations",
-        "subject":  "Incident",
-        "consumers":  "Post-incident/evidence"
-    },
-    {
-        "type":  "com.zoikosuite.ops.recovery.started",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Operations",
-        "subject":  "Recovery run",
-        "consumers":  "Ops/audit"
-    },
-    {
-        "type":  "com.zoikosuite.ops.recovery.completed",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Operations",
-        "subject":  "Recovery run",
-        "consumers":  "Ops/audit"
-    },
-    {
-        "type":  "com.zoikosuite.ops.deployment.completed",
-        "family":  "Security \u0026 Platform Operations",
-        "producer":  "Release Service",
-        "subject":  "Deployment",
-        "consumers":  "Ops/observability"
-    }
+  {"type":"com.zoikosuite.governance.tenant.created","family":"Governance & Control","producer":"Tenant Service","subject":"Tenant","consumers":"GTRM, entitlement, observability"},
+  {"type":"com.zoikosuite.governance.tenant.status-changed","family":"Governance & Control","producer":"Tenant Service","subject":"Tenant","consumers":"Gateway, commercial, operations"},
+  {"type":"com.zoikosuite.governance.residency-policy.changed","family":"Governance & Control","producer":"GTRM/Policy","subject":"Tenant residency policy","consumers":"Routing, data platform, integrations"},
+  {"type":"com.zoikosuite.governance.authorization-policy.published","family":"Governance & Control","producer":"Authorization Service","subject":"Policy","consumers":"Gateway/domain services"},
+  {"type":"com.zoikosuite.governance.delegation.granted","family":"Governance & Control","producer":"Role & Delegation","subject":"Delegation","consumers":"Workflow/approvals"},
+  {"type":"com.zoikosuite.governance.delegation.revoked","family":"Governance & Control","producer":"Role & Delegation","subject":"Delegation","consumers":"Workflow/approvals"},
+  {"type":"com.zoikosuite.governance.sod-policy.published","family":"Governance & Control","producer":"SoD Service","subject":"SoD policy","consumers":"Approval engines"},
+  {"type":"com.zoikosuite.governance.workflow-definition.published","family":"Governance & Control","producer":"Workflow Service","subject":"Workflow definition","consumers":"Workflow runtime"},
+  {"type":"com.zoikosuite.governance.retention-policy.published","family":"Governance & Control","producer":"Retention Service","subject":"Retention policy","consumers":"Domain stores/archive"},
+  {"type":"com.zoikosuite.governance.legal-hold.placed","family":"Governance & Control","producer":"Legal Hold Service","subject":"Legal hold","consumers":"Disposition/document/archive"},
+  {"type":"com.zoikosuite.governance.legal-hold.released","family":"Governance & Control","producer":"Legal Hold Service","subject":"Legal hold","consumers":"Disposition/document/archive"},
+  {"type":"com.zoikosuite.governance.schema.published","family":"Governance & Control","producer":"Schema Registry","subject":"Schema","consumers":"Producers/consumers/CI"},
+  {"type":"com.zoikosuite.org.legal-entity.created","family":"Organization & Master Data","producer":"Legal Entity Service","subject":"Legal entity","consumers":"Accounting, tax, legal, reporting"},
+  {"type":"com.zoikosuite.org.legal-entity.updated","family":"Organization & Master Data","producer":"Legal Entity Service","subject":"Legal entity","consumers":"Dependent domain read models"},
+  {"type":"com.zoikosuite.org.legal-entity.status-changed","family":"Organization & Master Data","producer":"Legal Entity Service","subject":"Legal entity","consumers":"Accounting/tax posting guards"},
+  {"type":"com.zoikosuite.org.establishment.registered","family":"Organization & Master Data","producer":"Establishment Service","subject":"Establishment","consumers":"Tax, invoicing, legal"},
+  {"type":"com.zoikosuite.org.establishment.changed","family":"Organization & Master Data","producer":"Establishment Service","subject":"Establishment","consumers":"Tax, reporting"},
+  {"type":"com.zoikosuite.org.party.created","family":"Organization & Master Data","producer":"Party Service","subject":"Party","consumers":"AR/AP/Legal/CRM"},
+  {"type":"com.zoikosuite.org.party-role.granted","family":"Organization & Master Data","producer":"Party Service","subject":"Party role","consumers":"AR/AP/workforce"},
+  {"type":"com.zoikosuite.org.party-role.revoked","family":"Organization & Master Data","producer":"Party Service","subject":"Party role","consumers":"AR/AP/workforce"},
+  {"type":"com.zoikosuite.org.registration.added","family":"Organization & Master Data","producer":"Registration Service","subject":"Registration","consumers":"Tax/legal/reporting"},
+  {"type":"com.zoikosuite.org.registration.expired","family":"Organization & Master Data","producer":"Registration Service","subject":"Registration","consumers":"Tax/legal workflows"},
+  {"type":"com.zoikosuite.org.ownership.changed","family":"Organization & Master Data","producer":"Ownership Service","subject":"Ownership relationship","consumers":"Consolidation/legal/reporting"},
+  {"type":"com.zoikosuite.accounting.accounting-event.accepted","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Accounting event","consumers":"Posting engine/evidence"},
+  {"type":"com.zoikosuite.accounting.accounting-event.rejected","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Accounting event","consumers":"Source domain exception queue"},
+  {"type":"com.zoikosuite.accounting.journal.proposed","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Journal","consumers":"Approval/workflow"},
+  {"type":"com.zoikosuite.accounting.journal.approved","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Journal","consumers":"Posting engine"},
+  {"type":"com.zoikosuite.accounting.journal.posted","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Journal","consumers":"GL/reconciliation/reporting/consolidation"},
+  {"type":"com.zoikosuite.accounting.journal.reversed","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Journal","consumers":"GL/reconciliation/reporting"},
+  {"type":"com.zoikosuite.accounting.journal.adjusted","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Journal","consumers":"GL/reconciliation/reporting"},
+  {"type":"com.zoikosuite.accounting.period.soft-closed","family":"Accounting Kernel","producer":"Period Service","subject":"Accounting period","consumers":"Posting guards/close workflow"},
+  {"type":"com.zoikosuite.accounting.period.hard-closed","family":"Accounting Kernel","producer":"Period Service","subject":"Accounting period","consumers":"All posting domains/reporting"},
+  {"type":"com.zoikosuite.accounting.period.reopened","family":"Accounting Kernel","producer":"Period Service","subject":"Accounting period","consumers":"Posting domains/audit"},
+  {"type":"com.zoikosuite.accounting.fx-revaluation.completed","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Revaluation run","consumers":"GL/reporting"},
+  {"type":"com.zoikosuite.accounting.allocation.posted","family":"Accounting Kernel","producer":"Accounting Kernel","subject":"Allocation run","consumers":"GL/reporting"},
+  {"type":"com.zoikosuite.accounting.intercompany-mismatch.detected","family":"Accounting Kernel","producer":"Reconciliation Engine","subject":"Intercompany pair","consumers":"Close workflow"},
+  {"type":"com.zoikosuite.accounting.consolidation-run.completed","family":"Accounting Kernel","producer":"Consolidation Service","subject":"Consolidation run","consumers":"Group reporting/evidence"},
+  {"type":"com.zoikosuite.accounting.balance-snapshot.signed","family":"Accounting Kernel","producer":"Trial Balance Service","subject":"Balance snapshot","consumers":"Reporting/audit/consolidation"},
+  {"type":"com.zoikosuite.accounting.reconciliation-break.detected","family":"Accounting Kernel","producer":"Reconciliation Engine","subject":"Reconciliation","consumers":"Ops/close workflow"},
+  {"type":"com.zoikosuite.accounting.reconciliation-break.resolved","family":"Accounting Kernel","producer":"Reconciliation Engine","subject":"Reconciliation","consumers":"Ops/close workflow"},
+  {"type":"com.zoikosuite.ar.quote.accepted","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Quote","consumers":"Sales order/workflow"},
+  {"type":"com.zoikosuite.ar.sales-order.confirmed","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Sales order","consumers":"Fulfillment/invoicing"},
+  {"type":"com.zoikosuite.ar.customer-invoice.validated","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Customer invoice","consumers":"Issue workflow"},
+  {"type":"com.zoikosuite.ar.customer-invoice.issued","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Customer invoice","consumers":"Accounting/receivables/reporting"},
+  {"type":"com.zoikosuite.ar.customer-invoice.disputed","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Customer invoice","consumers":"Collections/case management"},
+  {"type":"com.zoikosuite.ar.customer-invoice.partially-paid","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Customer invoice","consumers":"Receivables/reporting"},
+  {"type":"com.zoikosuite.ar.customer-invoice.paid","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Customer invoice","consumers":"Receivables/reporting"},
+  {"type":"com.zoikosuite.ar.credit-note.issued","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Credit note","consumers":"Accounting/receivables/tax"},
+  {"type":"com.zoikosuite.ar.debit-note.issued","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Debit note","consumers":"Accounting/receivables/tax"},
+  {"type":"com.zoikosuite.ar.receivable.written-off","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Receivable","consumers":"Accounting/reporting"},
+  {"type":"com.zoikosuite.ar.refund.authorized","family":"Accounts Receivable & Revenue","producer":"AR","subject":"Refund","consumers":"Payments/accounting"},
+  {"type":"com.zoikosuite.ar.collection-case.opened","family":"Accounts Receivable & Revenue","producer":"Collections","subject":"Collection case","consumers":"Task/case workflow"},
+  {"type":"com.zoikosuite.ar.collection-case.closed","family":"Accounts Receivable & Revenue","producer":"Collections","subject":"Collection case","consumers":"Reporting"},
+  {"type":"com.zoikosuite.ap.purchase-requisition.submitted","family":"Procurement & Accounts Payable","producer":"Procurement","subject":"Purchase requisition","consumers":"Approval workflow"},
+  {"type":"com.zoikosuite.ap.purchase-requisition.approved","family":"Procurement & Accounts Payable","producer":"Procurement","subject":"Purchase requisition","consumers":"PO creation"},
+  {"type":"com.zoikosuite.ap.purchase-order.issued","family":"Procurement & Accounts Payable","producer":"Procurement","subject":"Purchase order","consumers":"Supplier/receipt workflow"},
+  {"type":"com.zoikosuite.ap.goods-receipt.recorded","family":"Procurement & Accounts Payable","producer":"Procurement","subject":"Goods receipt","consumers":"AP/inventory/accounting"},
+  {"type":"com.zoikosuite.ap.service-receipt.recorded","family":"Procurement & Accounts Payable","producer":"Procurement","subject":"Service receipt","consumers":"AP/accounting"},
+  {"type":"com.zoikosuite.ap.supplier-invoice.captured","family":"Procurement & Accounts Payable","producer":"AP","subject":"Supplier invoice","consumers":"Validation/matching"},
+  {"type":"com.zoikosuite.ap.supplier-invoice.validated","family":"Procurement & Accounts Payable","producer":"AP","subject":"Supplier invoice","consumers":"Matching/approval"},
+  {"type":"com.zoikosuite.ap.supplier-invoice.matched","family":"Procurement & Accounts Payable","producer":"AP","subject":"Supplier invoice","consumers":"Approval"},
+  {"type":"com.zoikosuite.ap.supplier-invoice.approved","family":"Procurement & Accounts Payable","producer":"AP","subject":"Supplier invoice","consumers":"Accounting/payment proposal"},
+  {"type":"com.zoikosuite.ap.supplier-invoice.rejected","family":"Procurement & Accounts Payable","producer":"AP","subject":"Supplier invoice","consumers":"Exception workflow"},
+  {"type":"com.zoikosuite.ap.supplier-credit.applied","family":"Procurement & Accounts Payable","producer":"AP","subject":"Supplier credit","consumers":"Accounting/payables"},
+  {"type":"com.zoikosuite.ap.expense-claim.submitted","family":"Procurement & Accounts Payable","producer":"Expense Service","subject":"Expense claim","consumers":"Approval"},
+  {"type":"com.zoikosuite.ap.expense-claim.approved","family":"Procurement & Accounts Payable","producer":"Expense Service","subject":"Expense claim","consumers":"Accounting/reimbursement"},
+  {"type":"com.zoikosuite.ap.expense-claim.rejected","family":"Procurement & Accounts Payable","producer":"Expense Service","subject":"Expense claim","consumers":"Claimant/workflow"},
+  {"type":"com.zoikosuite.ap.payment-proposal.created","family":"Procurement & Accounts Payable","producer":"AP","subject":"Payment proposal","consumers":"Approval"},
+  {"type":"com.zoikosuite.ap.payment-proposal.approved","family":"Procurement & Accounts Payable","producer":"AP","subject":"Payment proposal","consumers":"Payment orchestration"},
+  {"type":"com.zoikosuite.banking.bank-account.connected","family":"Banking, Cash & Payments","producer":"Banking","subject":"Bank account connection","consumers":"Statement ingestion/ops"},
+  {"type":"com.zoikosuite.banking.bank-connection.degraded","family":"Banking, Cash & Payments","producer":"Banking","subject":"Bank connection","consumers":"Ops/alerts"},
+  {"type":"com.zoikosuite.banking.bank-statement.imported","family":"Banking, Cash & Payments","producer":"Banking","subject":"Bank statement","consumers":"Normalization/reconciliation"},
+  {"type":"com.zoikosuite.banking.bank-transaction.normalized","family":"Banking, Cash & Payments","producer":"Banking","subject":"Bank transaction","consumers":"Matching/cash application"},
+  {"type":"com.zoikosuite.banking.bank-reconciliation.completed","family":"Banking, Cash & Payments","producer":"Banking","subject":"Bank reconciliation","consumers":"Accounting/close"},
+  {"type":"com.zoikosuite.banking.payment-instruction.created","family":"Banking, Cash & Payments","producer":"Payments","subject":"Payment instruction","consumers":"Approval workflow"},
+  {"type":"com.zoikosuite.banking.payment-instruction.approved","family":"Banking, Cash & Payments","producer":"Payments","subject":"Payment instruction","consumers":"Provider attempt"},
+  {"type":"com.zoikosuite.banking.payment.submitted","family":"Banking, Cash & Payments","producer":"Payments","subject":"Payment","consumers":"AP/AR/ops"},
+  {"type":"com.zoikosuite.banking.payment.accepted","family":"Banking, Cash & Payments","producer":"Payments","subject":"Payment","consumers":"Ops/status"},
+  {"type":"com.zoikosuite.banking.payment.rejected","family":"Banking, Cash & Payments","producer":"Payments","subject":"Payment","consumers":"AP/AR/ops"},
+  {"type":"com.zoikosuite.banking.payment.settled","family":"Banking, Cash & Payments","producer":"Payments","subject":"Payment","consumers":"Accounting/cash application/reconciliation"},
+  {"type":"com.zoikosuite.banking.payment.returned","family":"Banking, Cash & Payments","producer":"Payments","subject":"Payment","consumers":"Accounting/AP/AR"},
+  {"type":"com.zoikosuite.banking.payment.cancelled","family":"Banking, Cash & Payments","producer":"Payments","subject":"Payment","consumers":"AP/AR"},
+  {"type":"com.zoikosuite.banking.cash-position.calculated","family":"Banking, Cash & Payments","producer":"Treasury","subject":"Cash position","consumers":"Treasury/reporting"},
+  {"type":"com.zoikosuite.banking.treasury-transfer.settled","family":"Banking, Cash & Payments","producer":"Treasury","subject":"Transfer","consumers":"Accounting/cash position"},
+  {"type":"com.zoikosuite.tax.tax-determination.completed","family":"Tax & Electronic Invoicing","producer":"Tax Engine","subject":"Tax determination","consumers":"AR/AP/accounting"},
+  {"type":"com.zoikosuite.tax.tax-determination.overridden","family":"Tax & Electronic Invoicing","producer":"Tax Engine","subject":"Tax determination","consumers":"Evidence/accounting"},
+  {"type":"com.zoikosuite.tax.tax-liability.recognized","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax liability","consumers":"Accounting/obligation calendar"},
+  {"type":"com.zoikosuite.tax.tax-return.prepared","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax return","consumers":"Approval"},
+  {"type":"com.zoikosuite.tax.tax-return.approved","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax return","consumers":"Submission"},
+  {"type":"com.zoikosuite.tax.tax-return.submitted","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax return","consumers":"Ops/evidence"},
+  {"type":"com.zoikosuite.tax.tax-return.accepted","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax return","consumers":"Ledger/obligations/evidence"},
+  {"type":"com.zoikosuite.tax.tax-return.rejected","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax return","consumers":"Exception workflow"},
+  {"type":"com.zoikosuite.tax.tax-return.amended","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax return","consumers":"Ledger/evidence"},
+  {"type":"com.zoikosuite.tax.tax-payment.due","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax obligation","consumers":"AP/treasury/calendar"},
+  {"type":"com.zoikosuite.tax.tax-payment.recorded","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"Tax payment","consumers":"Tax ledger/reconciliation"},
+  {"type":"com.zoikosuite.tax.e-invoice.submitted","family":"Tax & Electronic Invoicing","producer":"Tax/E-Invoice","subject":"E-invoice submission","consumers":"AR/ops"},
+  {"type":"com.zoikosuite.tax.e-invoice.cleared","family":"Tax & Electronic Invoicing","producer":"Tax/E-Invoice","subject":"E-invoice submission","consumers":"AR/evidence"},
+  {"type":"com.zoikosuite.tax.e-invoice.rejected","family":"Tax & Electronic Invoicing","producer":"Tax/E-Invoice","subject":"E-invoice submission","consumers":"AR/exception"},
+  {"type":"com.zoikosuite.tax.saft-export.generated","family":"Tax & Electronic Invoicing","producer":"Tax","subject":"SAF-T export","consumers":"Audit/filing evidence"},
+  {"type":"com.zoikosuite.assets.fixed-asset.capitalized","family":"Assets, Inventory & Projects","producer":"Fixed Assets","subject":"Asset","consumers":"Accounting/depreciation"},
+  {"type":"com.zoikosuite.assets.depreciation.posted","family":"Assets, Inventory & Projects","producer":"Fixed Assets","subject":"Depreciation run","consumers":"Accounting/reporting"},
+  {"type":"com.zoikosuite.assets.asset.impaired","family":"Assets, Inventory & Projects","producer":"Fixed Assets","subject":"Asset","consumers":"Accounting/reporting"},
+  {"type":"com.zoikosuite.assets.asset.revalued","family":"Assets, Inventory & Projects","producer":"Fixed Assets","subject":"Asset","consumers":"Accounting/reporting"},
+  {"type":"com.zoikosuite.assets.asset.disposed","family":"Assets, Inventory & Projects","producer":"Fixed Assets","subject":"Asset","consumers":"Accounting/reporting"},
+  {"type":"com.zoikosuite.inventory.stock.received","family":"Assets, Inventory & Projects","producer":"Inventory","subject":"Inventory movement","consumers":"Valuation/accounting"},
+  {"type":"com.zoikosuite.inventory.stock.issued","family":"Assets, Inventory & Projects","producer":"Inventory","subject":"Inventory movement","consumers":"Valuation/accounting"},
+  {"type":"com.zoikosuite.inventory.stock.transferred","family":"Assets, Inventory & Projects","producer":"Inventory","subject":"Inventory movement","consumers":"Location read models"},
+  {"type":"com.zoikosuite.inventory.stock.adjusted","family":"Assets, Inventory & Projects","producer":"Inventory","subject":"Inventory adjustment","consumers":"Accounting/reconciliation"},
+  {"type":"com.zoikosuite.inventory.stock-count.completed","family":"Assets, Inventory & Projects","producer":"Inventory","subject":"Stock count","consumers":"Adjustment workflow"},
+  {"type":"com.zoikosuite.inventory.valuation.completed","family":"Assets, Inventory & Projects","producer":"Inventory","subject":"Valuation run","consumers":"Accounting/reporting"},
+  {"type":"com.zoikosuite.projects.project.created","family":"Assets, Inventory & Projects","producer":"Projects","subject":"Project","consumers":"Costing/time/billing"},
+  {"type":"com.zoikosuite.projects.project-cost.posted","family":"Assets, Inventory & Projects","producer":"Projects","subject":"Project cost","consumers":"Accounting/profitability"},
+  {"type":"com.zoikosuite.projects.billing-milestone.reached","family":"Assets, Inventory & Projects","producer":"Projects","subject":"Billing milestone","consumers":"AR/invoicing"},
+  {"type":"com.zoikosuite.finance.budget.published","family":"FP&A & Reporting","producer":"FP&A","subject":"Budget version","consumers":"Reporting/variance"},
+  {"type":"com.zoikosuite.finance.forecast.published","family":"FP&A & Reporting","producer":"FP&A","subject":"Forecast version","consumers":"Reporting/variance"},
+  {"type":"com.zoikosuite.finance.scenario.published","family":"FP&A & Reporting","producer":"FP&A","subject":"Scenario","consumers":"Management reporting"},
+  {"type":"com.zoikosuite.finance.variance.material-threshold-breached","family":"FP&A & Reporting","producer":"FP&A","subject":"Variance","consumers":"Task/management review"},
+  {"type":"com.zoikosuite.reporting.management-pack.generated","family":"FP&A & Reporting","producer":"Reporting","subject":"Report package","consumers":"Board/report distribution"},
+  {"type":"com.zoikosuite.reporting.financial-statements.generated","family":"FP&A & Reporting","producer":"Reporting","subject":"Financial statement set","consumers":"Review/statutory reporting"},
+  {"type":"com.zoikosuite.reporting.statutory-package.generated","family":"FP&A & Reporting","producer":"Reporting","subject":"Statutory package","consumers":"Filing workflow"},
+  {"type":"com.zoikosuite.reporting.xbrl-package.generated","family":"FP&A & Reporting","producer":"Reporting","subject":"XBRL package","consumers":"Validation/submission"},
+  {"type":"com.zoikosuite.reporting.regulatory-submission.submitted","family":"FP&A & Reporting","producer":"Reporting","subject":"Regulatory submission","consumers":"Ops/evidence"},
+  {"type":"com.zoikosuite.reporting.regulatory-submission.accepted","family":"FP&A & Reporting","producer":"Reporting","subject":"Regulatory submission","consumers":"Evidence/obligation"},
+  {"type":"com.zoikosuite.reporting.regulatory-submission.rejected","family":"FP&A & Reporting","producer":"Reporting","subject":"Regulatory submission","consumers":"Exception workflow"},
+  {"type":"com.zoikosuite.audit.engagement.created","family":"Audit & Assurance","producer":"Audit","subject":"Engagement","consumers":"Planning/workflow"},
+  {"type":"com.zoikosuite.audit.audit-population.frozen","family":"Audit & Assurance","producer":"Audit","subject":"Audit population","consumers":"Sampling/evidence"},
+  {"type":"com.zoikosuite.audit.sample.selected","family":"Audit & Assurance","producer":"Audit","subject":"Sample","consumers":"Workpaper/evidence"},
+  {"type":"com.zoikosuite.audit.evidence.received","family":"Audit & Assurance","producer":"Audit","subject":"Evidence item","consumers":"Workpaper/review"},
+  {"type":"com.zoikosuite.audit.workpaper.prepared","family":"Audit & Assurance","producer":"Audit","subject":"Workpaper","consumers":"Review queue"},
+  {"type":"com.zoikosuite.audit.workpaper.reviewed","family":"Audit & Assurance","producer":"Audit","subject":"Workpaper","consumers":"Sign-off"},
+  {"type":"com.zoikosuite.audit.workpaper.signed-off","family":"Audit & Assurance","producer":"Audit","subject":"Workpaper","consumers":"Engagement completion/evidence"},
+  {"type":"com.zoikosuite.audit.finding.raised","family":"Audit & Assurance","producer":"Audit","subject":"Finding","consumers":"Management response/task"},
+  {"type":"com.zoikosuite.audit.finding.resolved","family":"Audit & Assurance","producer":"Audit","subject":"Finding","consumers":"Engagement completion"},
+  {"type":"com.zoikosuite.audit.engagement.closed","family":"Audit & Assurance","producer":"Audit","subject":"Engagement","consumers":"Evidence/retention"},
+  {"type":"com.zoikosuite.legal.contract.drafted","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract","consumers":"Approval/review"},
+  {"type":"com.zoikosuite.legal.contract.approved","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract","consumers":"Signature workflow"},
+  {"type":"com.zoikosuite.legal.contract.executed","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract","consumers":"Obligations/evidence/business domains"},
+  {"type":"com.zoikosuite.legal.contract.amended","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract","consumers":"Obligations/evidence"},
+  {"type":"com.zoikosuite.legal.contract.renewed","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract","consumers":"Obligations/calendar"},
+  {"type":"com.zoikosuite.legal.contract.terminated","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract","consumers":"Obligations/business domains"},
+  {"type":"com.zoikosuite.legal.obligation.created","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract obligation","consumers":"Task/calendar"},
+  {"type":"com.zoikosuite.legal.obligation.due","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract obligation","consumers":"Task/escalation"},
+  {"type":"com.zoikosuite.legal.obligation.satisfied","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract obligation","consumers":"Evidence"},
+  {"type":"com.zoikosuite.legal.obligation.breached","family":"Legal & Corporate Governance","producer":"Legal","subject":"Contract obligation","consumers":"Matter/case workflow"},
+  {"type":"com.zoikosuite.legal.matter.opened","family":"Legal & Corporate Governance","producer":"Legal","subject":"Legal matter","consumers":"Task/document/evidence"},
+  {"type":"com.zoikosuite.legal.matter.closed","family":"Legal & Corporate Governance","producer":"Legal","subject":"Legal matter","consumers":"Retention/evidence"},
+  {"type":"com.zoikosuite.legal.corporate-resolution.adopted","family":"Legal & Corporate Governance","producer":"Legal","subject":"Resolution","consumers":"Corporate records/evidence"},
+  {"type":"com.zoikosuite.legal.license.expiring","family":"Legal & Corporate Governance","producer":"Legal","subject":"License","consumers":"Deadline/task"},
+  {"type":"com.zoikosuite.legal.ip-registration.renewed","family":"Legal & Corporate Governance","producer":"Legal","subject":"IP registration","consumers":"Calendar/evidence"},
+  {"type":"com.zoikosuite.business.document.stored","family":"Business Operations & Documents","producer":"Document Service","subject":"Document","consumers":"Linked domain/evidence"},
+  {"type":"com.zoikosuite.business.document.versioned","family":"Business Operations & Documents","producer":"Document Service","subject":"Document","consumers":"Linked domain/evidence"},
+  {"type":"com.zoikosuite.business.document.classification-changed","family":"Business Operations & Documents","producer":"Document Service","subject":"Document","consumers":"Access/retention"},
+  {"type":"com.zoikosuite.business.task.created","family":"Business Operations & Documents","producer":"Task Service","subject":"Task","consumers":"Work queues"},
+  {"type":"com.zoikosuite.business.task.completed","family":"Business Operations & Documents","producer":"Task Service","subject":"Task","consumers":"Workflow/metrics"},
+  {"type":"com.zoikosuite.business.case.opened","family":"Business Operations & Documents","producer":"Case Service","subject":"Case","consumers":"Task/workflow"},
+  {"type":"com.zoikosuite.business.case.closed","family":"Business Operations & Documents","producer":"Case Service","subject":"Case","consumers":"Reporting/retention"},
+  {"type":"com.zoikosuite.business.deadline.due","family":"Business Operations & Documents","producer":"Deadline Service","subject":"Obligation/deadline","consumers":"Task/escalation"},
+  {"type":"com.zoikosuite.business.template.published","family":"Business Operations & Documents","producer":"Template Service","subject":"Template","consumers":"Form/document generation"},
+  {"type":"com.zoikosuite.business.form.submitted","family":"Business Operations & Documents","producer":"Form Service","subject":"Form submission","consumers":"Owning domain/workflow"},
+  {"type":"com.zoikosuite.workforce.worker-financial-profile.changed","family":"Workforce & Payroll Interfaces","producer":"Workforce Interface","subject":"Worker financial profile","consumers":"Payroll/accounting dimensions"},
+  {"type":"com.zoikosuite.workforce.time-financial-input.approved","family":"Workforce & Payroll Interfaces","producer":"Workforce Interface","subject":"Time financial input","consumers":"Payroll/project costing"},
+  {"type":"com.zoikosuite.workforce.payroll-result.imported","family":"Workforce & Payroll Interfaces","producer":"Payroll Interface","subject":"Payroll result","consumers":"Validation"},
+  {"type":"com.zoikosuite.workforce.payroll-result.validated","family":"Workforce & Payroll Interfaces","producer":"Payroll Interface","subject":"Payroll result","consumers":"Accounting/liabilities/payments"},
+  {"type":"com.zoikosuite.workforce.payroll-journal.posted","family":"Workforce & Payroll Interfaces","producer":"Payroll Interface","subject":"Payroll journal","consumers":"GL/reconciliation"},
+  {"type":"com.zoikosuite.workforce.payroll-liability.recognized","family":"Workforce & Payroll Interfaces","producer":"Payroll Interface","subject":"Payroll liability","consumers":"Tax/AP/treasury"},
+  {"type":"com.zoikosuite.workforce.payroll-payment.settled","family":"Workforce & Payroll Interfaces","producer":"Payroll Interface","subject":"Payroll payment","consumers":"Payroll/reconciliation"},
+  {"type":"com.zoikosuite.data.import.validated","family":"Data, AI & Integrations","producer":"Import Service","subject":"Import job","consumers":"Approval/preview"},
+  {"type":"com.zoikosuite.data.import.committed","family":"Data, AI & Integrations","producer":"Import Service","subject":"Import job","consumers":"Owning domains/reconciliation"},
+  {"type":"com.zoikosuite.data.import.failed","family":"Data, AI & Integrations","producer":"Import Service","subject":"Import job","consumers":"Ops/exception"},
+  {"type":"com.zoikosuite.data.connector-sync.started","family":"Data, AI & Integrations","producer":"Connector Service","subject":"Sync run","consumers":"Ops"},
+  {"type":"com.zoikosuite.data.connector-sync.completed","family":"Data, AI & Integrations","producer":"Connector Service","subject":"Sync run","consumers":"Ops/reconciliation"},
+  {"type":"com.zoikosuite.data.connector-sync.failed","family":"Data, AI & Integrations","producer":"Connector Service","subject":"Sync run","consumers":"Ops/exception"},
+  {"type":"com.zoikosuite.data.data-quality-issue.detected","family":"Data, AI & Integrations","producer":"Data Quality","subject":"DQ issue","consumers":"Owner/task"},
+  {"type":"com.zoikosuite.data.data-quality-issue.resolved","family":"Data, AI & Integrations","producer":"Data Quality","subject":"DQ issue","consumers":"Owner/metrics"},
+  {"type":"com.zoikosuite.data.external-record.linked","family":"Data, AI & Integrations","producer":"Integration Service","subject":"External link","consumers":"Owning domain/read model"},
+  {"type":"com.zoikosuite.ai.document-extraction.completed","family":"Data, AI & Integrations","producer":"AI Extraction","subject":"Extraction result","consumers":"Human validation/owning workflow"},
+  {"type":"com.zoikosuite.ai.classification.suggested","family":"Data, AI & Integrations","producer":"AI Classification","subject":"Suggestion","consumers":"Human/deterministic validation"},
+  {"type":"com.zoikosuite.ai.anomaly.detected","family":"Data, AI & Integrations","producer":"AI/Rules","subject":"Anomaly signal","consumers":"Investigation queue"},
+  {"type":"com.zoikosuite.commercial.subscription.started","family":"Commercial Platform","producer":"Commercial","subject":"Subscription","consumers":"Entitlement/billing"},
+  {"type":"com.zoikosuite.commercial.subscription.changed","family":"Commercial Platform","producer":"Commercial","subject":"Subscription","consumers":"Entitlement/billing"},
+  {"type":"com.zoikosuite.commercial.subscription.cancelled","family":"Commercial Platform","producer":"Commercial","subject":"Subscription","consumers":"Entitlement/billing"},
+  {"type":"com.zoikosuite.commercial.entitlement.granted","family":"Commercial Platform","producer":"Commercial","subject":"Entitlement","consumers":"Gateway/product"},
+  {"type":"com.zoikosuite.commercial.entitlement.revoked","family":"Commercial Platform","producer":"Commercial","subject":"Entitlement","consumers":"Gateway/product"},
+  {"type":"com.zoikosuite.commercial.usage.measured","family":"Commercial Platform","producer":"Commercial","subject":"Usage meter","consumers":"Commercial billing"},
+  {"type":"com.zoikosuite.commercial.platform-invoice.issued","family":"Commercial Platform","producer":"Commercial Billing","subject":"Platform invoice","consumers":"Collections/commercial accounting plane"},
+  {"type":"com.zoikosuite.commercial.platform-payment.settled","family":"Commercial Platform","producer":"Commercial Billing","subject":"Platform payment","consumers":"Commercial receivables"},
+  {"type":"com.zoikosuite.security.privileged-session.started","family":"Security & Platform Operations","producer":"Security","subject":"Privileged session","consumers":"SIEM/evidence"},
+  {"type":"com.zoikosuite.security.privileged-session.ended","family":"Security & Platform Operations","producer":"Security","subject":"Privileged session","consumers":"SIEM/evidence"},
+  {"type":"com.zoikosuite.security.secret.rotated","family":"Security & Platform Operations","producer":"Security","subject":"Secret/key","consumers":"Dependent workloads/ops"},
+  {"type":"com.zoikosuite.security.key-policy.changed","family":"Security & Platform Operations","producer":"Security","subject":"Key policy","consumers":"Encryption services"},
+  {"type":"com.zoikosuite.security.security-event.raised","family":"Security & Platform Operations","producer":"Security","subject":"Security event","consumers":"SIEM/incident response"},
+  {"type":"com.zoikosuite.ops.incident.declared","family":"Security & Platform Operations","producer":"Operations","subject":"Incident","consumers":"Status/response workflows"},
+  {"type":"com.zoikosuite.ops.incident.resolved","family":"Security & Platform Operations","producer":"Operations","subject":"Incident","consumers":"Post-incident/evidence"},
+  {"type":"com.zoikosuite.ops.recovery.started","family":"Security & Platform Operations","producer":"Operations","subject":"Recovery run","consumers":"Ops/audit"},
+  {"type":"com.zoikosuite.ops.recovery.completed","family":"Security & Platform Operations","producer":"Operations","subject":"Recovery run","consumers":"Ops/audit"},
+  {"type":"com.zoikosuite.ops.deployment.completed","family":"Security & Platform Operations","producer":"Release Service","subject":"Deployment","consumers":"Ops/observability"},
+  {"type":"com.zoikosuite.accounting.financial-snapshot.integrity-failed","family":"Accounting Kernel (extension)","producer":"Financial Close Service","subject":"Financial Snapshot","consumers":"Accounting close workflow","origin":"extension"},
+  {"type":"com.zoikosuite.banking.bank-connection.created","family":"Banking, Cash & Payments (extension)","producer":"Banking Connector Service","subject":"Bank Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.bank-connection.requested","family":"Banking, Cash & Payments (extension)","producer":"Banking Connector Service","subject":"Bank Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.bank-statement.ingested","family":"Banking, Cash & Payments (extension)","producer":"Banking Connector Service","subject":"Bank Statement","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.canonical-transaction.normalized","family":"Banking, Cash & Payments (extension)","producer":"Banking Connector Service","subject":"Canonical Transaction","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.canonical-transaction.renormalized","family":"Banking, Cash & Payments (extension)","producer":"Banking Connector Service","subject":"Canonical Transaction","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.mapping-exception.approved","family":"Banking, Cash & Payments (extension)","producer":"Banking Connector Service","subject":"Mapping Exception","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.mapping-exception.raised","family":"Banking, Cash & Payments (extension)","producer":"Banking Connector Service","subject":"Mapping Exception","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payee-destination.activated","family":"Banking, Cash & Payments (extension)","producer":"Payee Banking Identity Service","subject":"Payee Destination","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payee-destination.approved","family":"Banking, Cash & Payments (extension)","producer":"Payee Banking Identity Service","subject":"Payee Destination","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payee-destination.proposed","family":"Banking, Cash & Payments (extension)","producer":"Payee Banking Identity Service","subject":"Payee Destination","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payee-destination.superseded","family":"Banking, Cash & Payments (extension)","producer":"Payee Banking Identity Service","subject":"Payee Destination","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payee-destination.suspended","family":"Banking, Cash & Payments (extension)","producer":"Payee Banking Identity Service","subject":"Payee Destination","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.accepted","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.cancelled","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.conflict-raised","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.conflict-resolved","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.pending","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.pending-unknown","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.recorded","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.rejected","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.returned","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.settled","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.status-updated","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-execution-state.submitted","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Payment Execution State","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-initiation-attempt.ambiguous","family":"Banking, Cash & Payments (extension)","producer":"Payment Initiation Adapter","subject":"Payment Initiation Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-initiation-attempt.prepared","family":"Banking, Cash & Payments (extension)","producer":"Payment Initiation Adapter","subject":"Payment Initiation Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-initiation-attempt.quarantined","family":"Banking, Cash & Payments (extension)","producer":"Payment Initiation Adapter","subject":"Payment Initiation Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-initiation-attempt.rejected","family":"Banking, Cash & Payments (extension)","producer":"Payment Initiation Adapter","subject":"Payment Initiation Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.payment-initiation-attempt.submitted","family":"Banking, Cash & Payments (extension)","producer":"Payment Initiation Adapter","subject":"Payment Initiation Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.provider-callback.quarantined","family":"Banking, Cash & Payments (extension)","producer":"Payment Status Service","subject":"Provider Callback","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-callback.quarantined","family":"Tax & Electronic Invoicing (extension)","producer":"Tax Authority Interface Service","subject":"Authority Callback","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.period.opened","family":"Accounting Kernel (extension)","producer":"Period Service","subject":"Accounting period","consumers":"Posting guards, close workflow, reporting","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.period.reclosed","family":"Accounting Kernel (extension)","producer":"Period Service","subject":"Accounting period","consumers":"Posting guards, close workflow, reporting","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.period.command-rejected","family":"Accounting Kernel (extension)","producer":"Period Service","subject":"Accounting period","consumers":"Security and control monitoring (a refused period command; carries no state change)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.journal.created","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Journal","consumers":"Approval workflow, journal read models","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.journal.validated","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Journal","consumers":"Posting engine, reporting","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.journal.rejected","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Journal","consumers":"Preparer, exception workflow","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.journal.withdrawn","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Journal","consumers":"Review queues, reporting","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.account.scope-changed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Account","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.allocation-rule.activated","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Allocation Rule","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.allocation-rule.created","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Allocation Rule","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.allocation-rule.retired","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Allocation Rule","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.allocation-run.posted","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Allocation Run","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.allocation-run.reversed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Allocation Run","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.balance-snapshot.signed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Balance Snapshot","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.book.created","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Book","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.book.status-changed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Book","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-adjustment.approved","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Adjustment","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-adjustment.proposed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Adjustment","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-adjustment.withdrawn","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Adjustment","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-group.created","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Group","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-mapping.versioned","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Mapping","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-member.added","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Member","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-member.ended","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Member","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-run.certified","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Run","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-run.completed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Run","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.consolidation-run.superseded","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Consolidation Run","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.event.registered","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Event","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.event.rejected","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Event","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.fx.override-approved","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Fx","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.fx.override-rejected","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Fx","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.fx.override-requested","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Fx","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.fx.rate-ingested","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Fx","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.migration-batch.approved","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Migration Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.migration-batch.cancelled","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Migration Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.migration-batch.posted","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Migration Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.migration-batch.reconciled","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Migration Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.migration-batch.staged","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Migration Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.migration-batch.validated","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Migration Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.period.reopened","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Period","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.period.resealed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Period","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.period.sealed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Period","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.posting.exception-raised","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Posting","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.reconciliation.break-raised","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.reconciliation.exception-accepted","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.reconciliation.resolved","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.reconciliation.tolerance-set","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.revaluation.completed","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Revaluation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.rule-set.activated","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Rule Set","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.rule-set.approved","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Rule Set","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.rule-set.created","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Rule Set","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.kernel.rule-set.tested","family":"Accounting Kernel (extension)","producer":"Accounting Kernel","subject":"Rule Set","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.consolidation-adjustment.approved","family":"Accounting (extension)","producer":"Consolidation Service","subject":"Consolidation Adjustment","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.consolidation-adjustment.created","family":"Accounting (extension)","producer":"Consolidation Service","subject":"Consolidation Adjustment","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.consolidation-adjustment.posted","family":"Accounting (extension)","producer":"Consolidation Service","subject":"Consolidation Adjustment","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.consolidation-adjustment.reversed","family":"Accounting (extension)","producer":"Consolidation Service","subject":"Consolidation Adjustment","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.consolidation-run.exception-detected","family":"Accounting (extension)","producer":"Consolidation Service","subject":"Consolidation Run","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.consolidation-run.started","family":"Accounting (extension)","producer":"Consolidation Service","subject":"Consolidation Run","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.intercompany-entry.created","family":"Accounting (extension)","producer":"Intercompany Accounting Service","subject":"Intercompany Entry","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.intercompany-entry.dispute-raised","family":"Accounting (extension)","producer":"Intercompany Accounting Service","subject":"Intercompany Entry","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.intercompany-entry.dispute-resolved","family":"Accounting (extension)","producer":"Intercompany Accounting Service","subject":"Intercompany Entry","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.intercompany-entry.matched","family":"Accounting (extension)","producer":"Intercompany Accounting Service","subject":"Intercompany Entry","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.intercompany-entry.mismatch-detected","family":"Accounting (extension)","producer":"Intercompany Accounting Service","subject":"Intercompany Entry","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.period.close-review-started","family":"Accounting (extension)","producer":"Financial Close Service","subject":"Period","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.period.closed","family":"Accounting (extension)","producer":"Financial Close Service","subject":"Period","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.period.reopen-requested","family":"Accounting (extension)","producer":"Financial Close Service","subject":"Period","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.accounting.period.subledger-control-exception","family":"Accounting (extension)","producer":"Financial Close Service","subject":"Period","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.completed","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.evidence-conflict.raised","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.evidence-conflict.resolved","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.exception.raised","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.ingested","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.matched","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.run.certified","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.run.reperformed","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.run.started","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.banking.reconciliation.run.superseded","family":"Banking (extension)","producer":"Bank Reconciliation Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.bridge.created","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Bridge","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.bridge.ingested","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Bridge","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.connector.activated","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Connector","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.connector.approval-requested","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Connector","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.connector.approved","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Connector","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.connector.config-changed","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Connector","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.connector.degraded","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Connector","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.connector.scope-changed","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Connector","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.external-profile.certified","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"External Profile","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.external-profile.deprecated","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"External Profile","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.external-profile.published","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"External Profile","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.external-profile.unsupported","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"External Profile","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.sync.checkpoint-advanced","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Sync","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.sync.checkpoint-reset-applied","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Sync","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.connectivity.sync.checkpoint-reset-requested","family":"Connectivity (extension)","producer":"Connectivity Api Bridge Service","subject":"Sync","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.einvoice.network-attempt.accepted","family":"Einvoice (extension)","producer":"Tax Authority Interface Service","subject":"Network Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.einvoice.network-attempt.delivered","family":"Einvoice (extension)","producer":"Tax Authority Interface Service","subject":"Network Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.einvoice.network-attempt.prepared","family":"Einvoice (extension)","producer":"Tax Authority Interface Service","subject":"Network Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.einvoice.network-attempt.submitted","family":"Einvoice (extension)","producer":"Tax Authority Interface Service","subject":"Network Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.batch.accepted","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.batch.conflict","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.batch.duplicate","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.batch.partial","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.batch.received","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.batch.reconciled","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.batch.rejected","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Batch","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.callback.applied","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Callback","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.callback.duplicate","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Callback","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.callback.inconsistent","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Callback","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.callback.invalid","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Callback","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.certification.passed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Certification","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.activated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.authorizing","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.break-glass-denied","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.break-glass-requested","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.created","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.credential-bound","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.credential-expired","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.credential-expiring","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.credential-rotated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.migrated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.migration-requested","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.probed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.resumed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.revoked","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.scopes-changed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.suspended","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.validated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connection.validation-failed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connection","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connector.created","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connector","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.connector.deprecated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Connector","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.blocked","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.draft-created","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.draft-updated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.gate-attested","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.published","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.submitted","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.superseded","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.validated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.contract.validation-failed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Contract","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.handoff-target.activated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Handoff Target","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.handoff-target.created","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Handoff Target","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.handoff-target.suspended","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Handoff Target","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.accepted","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.duplicate","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.handed-off","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.handoff-stalled","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.handoff-unknown","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.quarantine-dismissed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.quarantine-released","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.quarantined","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.rejected","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.inbound.replayed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Inbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.legacy.cutover","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Legacy","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.legacy.cutover-requested","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Legacy","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.legacy.cutover-reverted","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Legacy","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.legacy.discovered","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Legacy","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.legacy.mapped","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Legacy","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.legacy.parity-run","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Legacy","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.legacy.shadow-started","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Legacy","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.outbound.cancelled","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Outbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.outbound.pending","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Outbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.outbound.reserved","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Outbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.outbound.resolved","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Outbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.outbound.submitted","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Outbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.outbound.unknown","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Outbound","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.reconciliation.closed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.reconciliation.completed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.reconciliation.escalated","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.reconciliation.requested","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.reconciliation.variance","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.reconciliation.variance-resolved","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Reconciliation","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.replay.approved","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Replay","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.replay.completed","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Replay","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.replay.requested","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Replay","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.replay.started","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Replay","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.rollout.advance-requested","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Rollout","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.rollout.advanced","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Rollout","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.rollout.planned","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Rollout","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.rollout.rolled-back","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Rollout","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.security.batch-content-unsafe","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Security","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.security.cross-tenant-credential","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Security","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.security.handoff-egress-blocked","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Security","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.security.handoff-region-blocked","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Security","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.security.inbound-account-claim-mismatch","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Security","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.security.inbound-tenant-claim-mismatch","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Security","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.integration.security.tenant-scope-mismatch","family":"Integration (extension)","producer":"Connectivity Api Bridge Service","subject":"Security","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.reconciliation.job.analyzed","family":"Reconciliation (extension)","producer":"Reconciliation Intelligence Service","subject":"Job","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.reconciliation.job.resolution-recommended","family":"Reconciliation (extension)","producer":"Reconciliation Intelligence Service","subject":"Job","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.reconciliation.job.unmatched-flagged","family":"Reconciliation (extension)","producer":"Reconciliation Intelligence Service","subject":"Job","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-attempt.blocked","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-attempt.deadline-at-risk","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-attempt.prepared","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-attempt.response-received","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-attempt.submitted","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-attempt.unknown-outcome","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Attempt","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-profile.certified","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Profile","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-profile.deprecated","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Profile","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-profile.published","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Profile","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.tax.authority-profile.withdrawn","family":"Tax (extension)","producer":"Tax Authority Interface Service","subject":"Authority Profile","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.bank-account.closed","family":"Treasury (extension)","producer":"Treasury Service","subject":"Bank Account","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.bank-account.created","family":"Treasury (extension)","producer":"Treasury Service","subject":"Bank Account","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.bank-account.metadata-amended","family":"Treasury (extension)","producer":"Treasury Service","subject":"Bank Account","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.bank-account.ownership-verified","family":"Treasury (extension)","producer":"Treasury Service","subject":"Bank Account","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.bank-account.reactivated","family":"Treasury (extension)","producer":"Treasury Service","subject":"Bank Account","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.bank-account.suspended","family":"Treasury (extension)","producer":"Treasury Service","subject":"Bank Account","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.bank-account.token-rotated","family":"Treasury (extension)","producer":"Treasury Service","subject":"Bank Account","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.cash-position.became-stale","family":"Treasury (extension)","producer":"Treasury Service","subject":"Cash Position","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.cash-position.calculated","family":"Treasury (extension)","producer":"Treasury Service","subject":"Cash Position","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.cash-position.published","family":"Treasury (extension)","producer":"Treasury Service","subject":"Cash Position","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.fx-exposure.became-stale","family":"Treasury (extension)","producer":"Treasury Service","subject":"Fx Exposure","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.fx-exposure.calculated","family":"Treasury (extension)","producer":"Treasury Service","subject":"Fx Exposure","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.fx-exposure.published","family":"Treasury (extension)","producer":"Treasury Service","subject":"Fx Exposure","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.treasury-transfer.approved","family":"Treasury (extension)","producer":"Treasury Service","subject":"Treasury Transfer","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.treasury-transfer.authorized","family":"Treasury (extension)","producer":"Treasury Service","subject":"Treasury Transfer","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.treasury-transfer.cancelled","family":"Treasury (extension)","producer":"Treasury Service","subject":"Treasury Transfer","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.treasury-transfer.created","family":"Treasury (extension)","producer":"Treasury Service","subject":"Treasury Transfer","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.treasury-transfer.returned","family":"Treasury (extension)","producer":"Treasury Service","subject":"Treasury Transfer","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.treasury-transfer.settled","family":"Treasury (extension)","producer":"Treasury Service","subject":"Treasury Transfer","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"},
+  {"type":"com.zoikosuite.treasury.treasury-transfer.submitted","family":"Treasury (extension)","producer":"Treasury Service","subject":"Treasury Transfer","consumers":"Not yet declared (extension observed in the producer; register consumers per section 23)","origin":"extension"}
 ]

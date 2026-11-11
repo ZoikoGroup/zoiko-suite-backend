@@ -19,7 +19,7 @@ changed yet. Items marked "verify" were inferred from file names/greps, not test
 | §10 Replay / repair | `eventing/inbox`, `eventing/repair` | **Wave 1 done (consumer side):** replay rejected by default, `AllowReplay()` opt-in, isolated per-run namespace (EV-T11). Producer-side replay-run tooling still open. |
 | §11 Quarantine | `eventing/inbox` (`CaseSQL`) | **Wave 1 done:** case record with owner, priority, SLA, failure class, disposition, evidence; `UnownedQuarantined` signal. |
 | §12 Schema registry & compatibility | `services/schema-registry-svc` | **Wave 2 done:** enum, bounds, pattern, format and additionalProperties now compared (enum growth refused unless NONE); sticky producer ownership (E-02, EV-T23); kebab-case canonical names registrable. `$ref`/`allOf`/`anyOf` still not compared. |
-| §12.1 / §21 AsyncAPI | `asyncapi.yaml` | Only 12 of ~127 services have one. |
+| §12.1 / §21 AsyncAPI | `services/eventing/asyncapi` | **Generated** from the catalogue: 21 AsyncAPI 3.1.0 documents, drift-tested. Per-service `asyncapi.yaml` files (12) are separate and not yet reconciled; event `data` schemas still to be registered. |
 | §17 Observability | `outbox.ReadStats`, `busops` (lag, partition health) | Partial: producer + lag signals exist; consumer dedupe rate, unknown-type, replay, residency-denied counters not confirmed. |
 | §14 Residency / ACLs | `integration/gate*`, inbox `SetRegion` | Partial (verify): consumer region check exists; producer-ownership ACL (EV-T23) not found. |
 | §15 External provider effects | `eventing/integration`, payment/tax adapter services | Partial (verify): attempt-record pattern appears in adapters; not audited against EV-T12/T13. |
@@ -101,3 +101,121 @@ Recommended resolution per row: either add the type to `catalogue.json` with own
 consumers (when the fact is real and distinct), or rename with dual-emit through
 `LegacyType` (when it is the same fact under a different name). Each removal from the
 baseline is then a visible, reviewable step.
+
+## Decisions taken (owner answers) and what followed
+
+1. **Catalogue gaps resolved by adding, not renaming.** The 32 types the Wave 3 audit
+   found are in `catalogue.json` with `origin: "extension"` (producer = the emitting
+   service, consumers "not yet declared" until registered per §23). The uncatalogued
+   baseline is empty, so any new unlisted type fails CI. Spec entries are 196; total 231
+   with the three period events below.
+2. **accounting-period-svc migrated to `eventing`.** It is the real "Period Service" of
+   §19. Events now go to `eventing_outbox` (migration 000005, `outbox.SchemaSQL` + the
+   relay-aware RLS policy) through the shared envelope and relay (RequireAll acks). Its
+   PascalCase names (`PeriodHardClosed`) stay on the wire as the legacy `event_type`
+   (expand/contract); canonical types are `com.zoikosuite.accounting.period.{opened,
+   soft-closed, hard-closed, reopened, reclosed, command-rejected}`. The legacy
+   `accounting_period_outbox` is no longer written; the legacy relay keeps draining
+   what it holds (tested). Needs `EVENT_RESIDENCY_REGION`. Dockerfile and compose now
+   build from `services/`.
+   - Not preserved: the legacy envelope's `event_version` ("1.0") member, and event ids
+     are UUIDv7 instead of `evt-<uuid>`. Neither is read by any consumer found in the repo,
+     but verify before production.
+   - `asyncapi.yaml` of the service still documents the legacy names; regenerate it from
+     the catalogue (AsyncAPI wave).
+3. **Wave 2 platform controls added to `eventing`:** `policy.ProducerACL` (E-02, EV-T23),
+   `policy.Residency` + `Inbox.SetDeliveryPolicy` (EV-T10, with audit evidence),
+   `Inbox.SetObserver` (§17 consumer signals).
+
+## Finding: two producers emit the same period facts (E-02 violation)
+
+`financial-close-svc` builds `com.zoikosuite.accounting.period.<fact>` at runtime and
+emits `soft-closed` and `reopened`, the same facts accounting-period-svc now emits under
+the same canonical names. By E-02 / EV-T23 exactly one service may own each. Until the
+owners decide which, `policy.ProducerACL` cannot be enabled for the `accounting.period.*`
+family (it refuses overlapping grants by design). Suggested split: accounting-period-svc
+owns the lifecycle facts (`opened`, `soft-closed`, `hard-closed`, `reopened`, `reclosed`,
+`command-rejected`); financial-close-svc keeps close-evidence facts (`closed`,
+`close-review-started`, `reopen-requested`, `reopen-rejected`) and stops emitting the
+lifecycle ones. That is a Finance-owner decision.
+
+## Still open
+
+- Wire `ProducerACL` into producers (blocked on the finding above for the period family).
+- Producer-side replay-run tooling (consumer side done).
+- PII/secret gate: `envelope.New` now refuses secret material in `data` (EV-T09). A broader PII scan (names, emails, tax ids in free text) is not attempted: it needs the payload schemas and data classification.
+- Payload schemas: published for the six period events and the eight `general-ledger-svc` journal facts (`contracts/events/`, each verified against real emissions on Postgres, including the kernel's richer `journal.posted`). Journal `created`, `validated`, `rejected` and `withdrawn` were emitted but uncatalogued (the audit cannot see types built at runtime); they are now catalogue extensions. Original note on the period events (`accounting-period-svc/contracts/events/*.schema.json`, derived from the real producer and verified by a test that validates every emitted event against them). The other ~217 catalogue types have none yet; derive each from its producer the same way. Registering the files in schema-registry-svc is a deploy step not done here (they pass the registry's own shape validation).
+- AsyncAPI: documents are now generated from the catalogue (21 domains, drift-tested). Still open: registering per-event payload schemas so `data` stops being an open object, golden payloads, PII/secret scan (§21 gates).
+- Waves 4-7 of §25 (operating finance, compliance, data/integrations, hardening).
+
+## Blind spot of the emitted-type audit
+
+`ScanServices` only sees complete string literals; most producers build the type from a
+prefix plus a fact, so their types are invisible to the ratchet. Wave work on
+general-ledger-svc found four emitted-but-uncatalogued journal facts that way. Each
+producer migrated to a schema-verified family (period, journal) closes its own blind
+spot; the other dynamic families (`kernel.*`, `account-mapping.*`, consolidation,
+intercompany, treasury, banking reconciliation, statement sets) still need the same pass.
+
+## general-ledger-svc kernel events: schemas from captured payloads
+
+44 `accounting.kernel.*` facts are now catalogued (extensions) and have schemas in
+`general-ledger-svc/contracts/events/`. Rather than hand-derive 44 shapes, the whole GL
+test suite was run once against a Postgres with a capture trigger (about 5,700 emitted
+events) and `eventing/schemainfer` inferred an observed contract per type. Checks:
+- the 365 captured journal events all satisfy the hand-written journal schemas (0 failures);
+- all 51 schemas pass schema-registry-svc's own shape validation;
+- every kernel integration test now validates the events it emitted against these schemas
+  (a deliberately broken schema made it fail, so the check can fail);
+- a test requires a schema file for every literal `OutEvent` fact in the source. It found
+  `allocation-rule.retired`, which no test emits; its schema was derived from the code.
+
+Limits: four types had a single sample, so they state no required fields; `required` for
+the others reflects what the suite exercises, not necessarily what a rarely-hit code path
+omits. No `account-mapping.*` events were captured (no suite path emitted them): they remain
+without schemas. Fixed along the way: the AsyncAPI generator collided messages for
+sub-aggregate types (`kernel.migration-batch.approved` vs `kernel.approved`).
+
+## Capture across 12 more services (196 schemas, 165 more catalogue extensions)
+
+The capture method (trigger on `eventing_outbox`, run the service's integration suite with
+`-tags=integration -count=1`, infer with `eventing/schemainfer`) was applied to every
+service that uses `eventing`. Lessons: many suites hide their event tests behind
+`-tags=integration`; Go's test cache returns `ok (cached)` without running anything; a few
+suites `DROP SCHEMA public CASCADE`, so the capture objects live in their own schema; one
+database per service avoids cross-talk.
+
+Result: `contracts/events/` schemas in banking-connector, connectivity-api-bridge (103),
+consolidation, financial-close, intercompany-accounting, payee-banking-identity,
+payment-initiation-adapter, payment-status, reconciliation-intelligence,
+tax-authority-interface, treasury, bank-reconciliation. 254 schema files in total, all
+passing schema-registry-svc's validation. 165 more emitted types are catalogued as
+extensions (catalogue 444 = 196 spec + 248 extensions). Not captured (no events written
+to the database by their tests): data-ingestion, financial-statements, identity-context,
+migration-integrity, notification.
+
+New guard tests: no schema without a catalogue entry; one service per schema.
+
+### Findings that need an owner decision
+
+1. **Two services emit the same period facts with incompatible payloads.**
+   `accounting.period.reopened` and `soft-closed`: accounting-period-svc sends about 30
+   fields keyed by `period_key`; financial-close-svc sends 7 fields keyed by
+   `fiscal_period_id`. A consumer of `type` cannot know which shape it gets. Frozen in
+   `knownSchemaConflicts`; resolve by choosing the owner (see earlier finding).
+2. **Two domains the spec does not define.** connectivity-api-bridge emits ~110 types under
+   `integration.*` and `connectivity.*` (section 19 puts connector facts under `data.*`),
+   treasury under `treasury.*`, others under `reconciliation.*` and `einvoice.*`. They are
+   catalogued as extensions via `ExtensionDomains`; decide whether to adopt the domains into
+   section 19 or migrate the producers.
+3. **19 emitted names break the past-tense rule** (`batch.duplicate`, `outbound.pending`,
+   `security.tenant-scope-mismatch`, ...). Recorded in `extensionNamingDebt`; shrink-only.
+4. **financial-statements-svc store writes a column no migration creates**
+   (`statement_facts.source_accounts`); its integration tests fail on a fresh database.
+   Pre-existing and unrelated to this work, found because the capture ran those tests.
+
+### Not yet enforced
+
+Only general-ledger-svc validates what its tests emit against its schemas. The other 12
+services' schemas are inferred and registrable but nothing in their own suites fails if the
+producer drifts. Next step: the same cleanup hook in each service's test environment.

@@ -1,0 +1,399 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "case": {
+      "address": "zoikosuite.business.case.v1",
+      "messages": {
+        "closed": {
+          "$ref": "#/components/messages/case.closed"
+        },
+        "opened": {
+          "$ref": "#/components/messages/case.opened"
+        }
+      }
+    },
+    "deadline": {
+      "address": "zoikosuite.business.deadline.v1",
+      "messages": {
+        "due": {
+          "$ref": "#/components/messages/deadline.due"
+        }
+      }
+    },
+    "document": {
+      "address": "zoikosuite.business.document.v1",
+      "messages": {
+        "classification-changed": {
+          "$ref": "#/components/messages/document.classification-changed"
+        },
+        "stored": {
+          "$ref": "#/components/messages/document.stored"
+        },
+        "versioned": {
+          "$ref": "#/components/messages/document.versioned"
+        }
+      }
+    },
+    "form": {
+      "address": "zoikosuite.business.form.v1",
+      "messages": {
+        "submitted": {
+          "$ref": "#/components/messages/form.submitted"
+        }
+      }
+    },
+    "task": {
+      "address": "zoikosuite.business.task.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/task.completed"
+        },
+        "created": {
+          "$ref": "#/components/messages/task.created"
+        }
+      }
+    },
+    "template": {
+      "address": "zoikosuite.business.template.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/template.published"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "case.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Case Service. Primary consumers / intent: Reporting/retention. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.case.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Case: closed.",
+        "title": "case closed",
+        "x-zoiko-event-type": "com.zoikosuite.business.case.closed",
+        "x-zoiko-origin": "spec"
+      },
+      "case.opened": {
+        "contentType": "application/json",
+        "description": "Producer: Case Service. Primary consumers / intent: Task/workflow. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.case.opened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Case: opened.",
+        "title": "case opened",
+        "x-zoiko-event-type": "com.zoikosuite.business.case.opened",
+        "x-zoiko-origin": "spec"
+      },
+      "deadline.due": {
+        "contentType": "application/json",
+        "description": "Producer: Deadline Service. Primary consumers / intent: Task/escalation. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.deadline.due",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Obligation/deadline: due.",
+        "title": "deadline due",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.due",
+        "x-zoiko-origin": "spec"
+      },
+      "document.classification-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Document Service. Primary consumers / intent: Access/retention. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.document.classification-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: classification-changed.",
+        "title": "document classification-changed",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.classification-changed",
+        "x-zoiko-origin": "spec"
+      },
+      "document.stored": {
+        "contentType": "application/json",
+        "description": "Producer: Document Service. Primary consumers / intent: Linked domain/evidence. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.document.stored",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: stored.",
+        "title": "document stored",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.stored",
+        "x-zoiko-origin": "spec"
+      },
+      "document.versioned": {
+        "contentType": "application/json",
+        "description": "Producer: Document Service. Primary consumers / intent: Linked domain/evidence. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.document.versioned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: versioned.",
+        "title": "document versioned",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.versioned",
+        "x-zoiko-origin": "spec"
+      },
+      "form.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Form Service. Primary consumers / intent: Owning domain/workflow. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.form.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Form submission: submitted.",
+        "title": "form submitted",
+        "x-zoiko-event-type": "com.zoikosuite.business.form.submitted",
+        "x-zoiko-origin": "spec"
+      },
+      "task.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Task Service. Primary consumers / intent: Workflow/metrics. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.task.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: completed.",
+        "title": "task completed",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "task.created": {
+        "contentType": "application/json",
+        "description": "Producer: Task Service. Primary consumers / intent: Work queues. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.task.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: created.",
+        "title": "task created",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.created",
+        "x-zoiko-origin": "spec"
+      },
+      "template.published": {
+        "contentType": "application/json",
+        "description": "Producer: Template Service. Primary consumers / intent: Form/document generation. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.template.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Template: published.",
+        "title": "template published",
+        "x-zoiko-event-type": "com.zoikosuite.business.template.published",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite business domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.case": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/case"
+      },
+      "description": "Producer(s): Case Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/case/messages/closed"
+        },
+        {
+          "$ref": "#/channels/case/messages/opened"
+        }
+      ],
+      "summary": "Publish case facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.deadline": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/deadline"
+      },
+      "description": "Producer(s): Deadline Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/deadline/messages/due"
+        }
+      ],
+      "summary": "Publish deadline facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.document": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/document"
+      },
+      "description": "Producer(s): Document Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/document/messages/classification-changed"
+        },
+        {
+          "$ref": "#/channels/document/messages/stored"
+        },
+        {
+          "$ref": "#/channels/document/messages/versioned"
+        }
+      ],
+      "summary": "Publish document facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.form": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/form"
+      },
+      "description": "Producer(s): Form Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/form/messages/submitted"
+        }
+      ],
+      "summary": "Publish form facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.task": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/task"
+      },
+      "description": "Producer(s): Task Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/task/messages/completed"
+        },
+        {
+          "$ref": "#/channels/task/messages/created"
+        }
+      ],
+      "summary": "Publish task facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.template": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/template"
+      },
+      "description": "Producer(s): Template Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/template/messages/published"
+        }
+      ],
+      "summary": "Publish template facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

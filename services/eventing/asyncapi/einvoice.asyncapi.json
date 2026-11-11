@@ -1,0 +1,216 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "network-attempt": {
+      "address": "zoikosuite.einvoice.network-attempt.v1",
+      "messages": {
+        "accepted": {
+          "$ref": "#/components/messages/network-attempt.accepted"
+        },
+        "delivered": {
+          "$ref": "#/components/messages/network-attempt.delivered"
+        },
+        "prepared": {
+          "$ref": "#/components/messages/network-attempt.prepared"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/network-attempt.submitted"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "network-attempt.accepted": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Einvoice (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.einvoice.network-attempt.accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Network Attempt: accepted.",
+        "title": "network-attempt accepted",
+        "x-zoiko-event-type": "com.zoikosuite.einvoice.network-attempt.accepted",
+        "x-zoiko-origin": "extension"
+      },
+      "network-attempt.delivered": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Einvoice (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.einvoice.network-attempt.delivered",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Network Attempt: delivered.",
+        "title": "network-attempt delivered",
+        "x-zoiko-event-type": "com.zoikosuite.einvoice.network-attempt.delivered",
+        "x-zoiko-origin": "extension"
+      },
+      "network-attempt.prepared": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Einvoice (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.einvoice.network-attempt.prepared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Network Attempt: prepared.",
+        "title": "network-attempt prepared",
+        "x-zoiko-event-type": "com.zoikosuite.einvoice.network-attempt.prepared",
+        "x-zoiko-origin": "extension"
+      },
+      "network-attempt.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Einvoice (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.einvoice.network-attempt.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Network Attempt: submitted.",
+        "title": "network-attempt submitted",
+        "x-zoiko-event-type": "com.zoikosuite.einvoice.network-attempt.submitted",
+        "x-zoiko-origin": "extension"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite einvoice domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.network-attempt": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/network-attempt"
+      },
+      "description": "Producer(s): Tax Authority Interface Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/network-attempt/messages/accepted"
+        },
+        {
+          "$ref": "#/channels/network-attempt/messages/delivered"
+        },
+        {
+          "$ref": "#/channels/network-attempt/messages/prepared"
+        },
+        {
+          "$ref": "#/channels/network-attempt/messages/submitted"
+        }
+      ],
+      "summary": "Publish network-attempt facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

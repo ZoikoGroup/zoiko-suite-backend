@@ -1,0 +1,345 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "payroll-journal": {
+      "address": "zoikosuite.workforce.payroll-journal.v1",
+      "messages": {
+        "posted": {
+          "$ref": "#/components/messages/payroll-journal.posted"
+        }
+      }
+    },
+    "payroll-liability": {
+      "address": "zoikosuite.workforce.payroll-liability.v1",
+      "messages": {
+        "recognized": {
+          "$ref": "#/components/messages/payroll-liability.recognized"
+        }
+      }
+    },
+    "payroll-payment": {
+      "address": "zoikosuite.workforce.payroll-payment.v1",
+      "messages": {
+        "settled": {
+          "$ref": "#/components/messages/payroll-payment.settled"
+        }
+      }
+    },
+    "payroll-result": {
+      "address": "zoikosuite.workforce.payroll-result.v1",
+      "messages": {
+        "imported": {
+          "$ref": "#/components/messages/payroll-result.imported"
+        },
+        "validated": {
+          "$ref": "#/components/messages/payroll-result.validated"
+        }
+      }
+    },
+    "time-financial-input": {
+      "address": "zoikosuite.workforce.time-financial-input.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/time-financial-input.approved"
+        }
+      }
+    },
+    "worker-financial-profile": {
+      "address": "zoikosuite.workforce.worker-financial-profile.v1",
+      "messages": {
+        "changed": {
+          "$ref": "#/components/messages/worker-financial-profile.changed"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "payroll-journal.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Payroll Interface. Primary consumers / intent: GL/reconciliation. Family: Workforce & Payroll Interfaces. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.workforce.payroll-journal.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payroll journal: posted.",
+        "title": "payroll-journal posted",
+        "x-zoiko-event-type": "com.zoikosuite.workforce.payroll-journal.posted",
+        "x-zoiko-origin": "spec"
+      },
+      "payroll-liability.recognized": {
+        "contentType": "application/json",
+        "description": "Producer: Payroll Interface. Primary consumers / intent: Tax/AP/treasury. Family: Workforce & Payroll Interfaces. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.workforce.payroll-liability.recognized",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payroll liability: recognized.",
+        "title": "payroll-liability recognized",
+        "x-zoiko-event-type": "com.zoikosuite.workforce.payroll-liability.recognized",
+        "x-zoiko-origin": "spec"
+      },
+      "payroll-payment.settled": {
+        "contentType": "application/json",
+        "description": "Producer: Payroll Interface. Primary consumers / intent: Payroll/reconciliation. Family: Workforce & Payroll Interfaces. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.workforce.payroll-payment.settled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payroll payment: settled.",
+        "title": "payroll-payment settled",
+        "x-zoiko-event-type": "com.zoikosuite.workforce.payroll-payment.settled",
+        "x-zoiko-origin": "spec"
+      },
+      "payroll-result.imported": {
+        "contentType": "application/json",
+        "description": "Producer: Payroll Interface. Primary consumers / intent: Validation. Family: Workforce & Payroll Interfaces. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.workforce.payroll-result.imported",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payroll result: imported.",
+        "title": "payroll-result imported",
+        "x-zoiko-event-type": "com.zoikosuite.workforce.payroll-result.imported",
+        "x-zoiko-origin": "spec"
+      },
+      "payroll-result.validated": {
+        "contentType": "application/json",
+        "description": "Producer: Payroll Interface. Primary consumers / intent: Accounting/liabilities/payments. Family: Workforce & Payroll Interfaces. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.workforce.payroll-result.validated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Payroll result: validated.",
+        "title": "payroll-result validated",
+        "x-zoiko-event-type": "com.zoikosuite.workforce.payroll-result.validated",
+        "x-zoiko-origin": "spec"
+      },
+      "time-financial-input.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Workforce Interface. Primary consumers / intent: Payroll/project costing. Family: Workforce & Payroll Interfaces. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.workforce.time-financial-input.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Time financial input: approved.",
+        "title": "time-financial-input approved",
+        "x-zoiko-event-type": "com.zoikosuite.workforce.time-financial-input.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "worker-financial-profile.changed": {
+        "contentType": "application/json",
+        "description": "Producer: Workforce Interface. Primary consumers / intent: Payroll/accounting dimensions. Family: Workforce & Payroll Interfaces. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.workforce.worker-financial-profile.changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Worker financial profile: changed.",
+        "title": "worker-financial-profile changed",
+        "x-zoiko-event-type": "com.zoikosuite.workforce.worker-financial-profile.changed",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite workforce domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.payroll-journal": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payroll-journal"
+      },
+      "description": "Producer(s): Payroll Interface. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payroll-journal/messages/posted"
+        }
+      ],
+      "summary": "Publish payroll-journal facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payroll-liability": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payroll-liability"
+      },
+      "description": "Producer(s): Payroll Interface. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payroll-liability/messages/recognized"
+        }
+      ],
+      "summary": "Publish payroll-liability facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payroll-payment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payroll-payment"
+      },
+      "description": "Producer(s): Payroll Interface. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payroll-payment/messages/settled"
+        }
+      ],
+      "summary": "Publish payroll-payment facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.payroll-result": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/payroll-result"
+      },
+      "description": "Producer(s): Payroll Interface. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/payroll-result/messages/imported"
+        },
+        {
+          "$ref": "#/channels/payroll-result/messages/validated"
+        }
+      ],
+      "summary": "Publish payroll-result facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.time-financial-input": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/time-financial-input"
+      },
+      "description": "Producer(s): Workforce Interface. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/time-financial-input/messages/approved"
+        }
+      ],
+      "summary": "Publish time-financial-input facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.worker-financial-profile": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/worker-financial-profile"
+      },
+      "description": "Producer(s): Workforce Interface. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/worker-financial-profile/messages/changed"
+        }
+      ],
+      "summary": "Publish worker-financial-profile facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

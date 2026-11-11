@@ -9,7 +9,7 @@ import (
 
 // The §19 inventory has 16 family tables and 196 event types.
 func TestCatalogueIsComplete(t *testing.T) {
-	all, err := All()
+	all, err := Spec()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,5 +74,36 @@ func TestLookup(t *testing.T) {
 	}
 	if _, ok := Lookup("com.zoikosuite.accounting.journal.edited"); ok {
 		t.Fatal("uncatalogued type must not resolve")
+	}
+}
+
+// Extensions are real services' facts; they must lint like any other entry and
+// be distinguishable from the section 19 inventory.
+func TestExtensionsAreMarkedAndOwned(t *testing.T) {
+	all, _ := All()
+	spec, _ := Spec()
+	ext := len(all) - len(spec)
+	if ext != 248 {
+		t.Fatalf("expected 248 extension entries, got %d", ext)
+	}
+	for _, e := range all {
+		if e.Origin != "" && e.Origin != "extension" {
+			t.Errorf("%s: unknown origin %q", e.Type, e.Origin)
+		}
+	}
+}
+
+// The naming-debt list may only shrink: every entry must still be catalogued as an
+// extension and still fail the past-tense rule. Fix the name, then delete the line.
+func TestNamingDebtIsReal(t *testing.T) {
+	for typ := range extensionNamingDebt {
+		e, ok := Lookup(typ)
+		if !ok || e.Origin != "extension" {
+			t.Errorf("%s is in extensionNamingDebt but is not a catalogued extension: remove it", typ)
+			continue
+		}
+		if pastTense.MatchString(e.Fact()) {
+			t.Errorf("%s now conforms to the past-tense rule: remove it from extensionNamingDebt", typ)
+		}
 	}
 }

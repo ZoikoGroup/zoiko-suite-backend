@@ -1,0 +1,351 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "connector-sync": {
+      "address": "zoikosuite.data.connector-sync.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/connector-sync.completed"
+        },
+        "failed": {
+          "$ref": "#/components/messages/connector-sync.failed"
+        },
+        "started": {
+          "$ref": "#/components/messages/connector-sync.started"
+        }
+      }
+    },
+    "data-quality-issue": {
+      "address": "zoikosuite.data.data-quality-issue.v1",
+      "messages": {
+        "detected": {
+          "$ref": "#/components/messages/data-quality-issue.detected"
+        },
+        "resolved": {
+          "$ref": "#/components/messages/data-quality-issue.resolved"
+        }
+      }
+    },
+    "external-record": {
+      "address": "zoikosuite.data.external-record.v1",
+      "messages": {
+        "linked": {
+          "$ref": "#/components/messages/external-record.linked"
+        }
+      }
+    },
+    "import": {
+      "address": "zoikosuite.data.import.v1",
+      "messages": {
+        "committed": {
+          "$ref": "#/components/messages/import.committed"
+        },
+        "failed": {
+          "$ref": "#/components/messages/import.failed"
+        },
+        "validated": {
+          "$ref": "#/components/messages/import.validated"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "connector-sync.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Connector Service. Primary consumers / intent: Ops/reconciliation. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.connector-sync.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Sync run: completed.",
+        "title": "connector-sync completed",
+        "x-zoiko-event-type": "com.zoikosuite.data.connector-sync.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "connector-sync.failed": {
+        "contentType": "application/json",
+        "description": "Producer: Connector Service. Primary consumers / intent: Ops/exception. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.connector-sync.failed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Sync run: failed.",
+        "title": "connector-sync failed",
+        "x-zoiko-event-type": "com.zoikosuite.data.connector-sync.failed",
+        "x-zoiko-origin": "spec"
+      },
+      "connector-sync.started": {
+        "contentType": "application/json",
+        "description": "Producer: Connector Service. Primary consumers / intent: Ops. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.connector-sync.started",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Sync run: started.",
+        "title": "connector-sync started",
+        "x-zoiko-event-type": "com.zoikosuite.data.connector-sync.started",
+        "x-zoiko-origin": "spec"
+      },
+      "data-quality-issue.detected": {
+        "contentType": "application/json",
+        "description": "Producer: Data Quality. Primary consumers / intent: Owner/task. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.data-quality-issue.detected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "DQ issue: detected.",
+        "title": "data-quality-issue detected",
+        "x-zoiko-event-type": "com.zoikosuite.data.data-quality-issue.detected",
+        "x-zoiko-origin": "spec"
+      },
+      "data-quality-issue.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Data Quality. Primary consumers / intent: Owner/metrics. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.data-quality-issue.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "DQ issue: resolved.",
+        "title": "data-quality-issue resolved",
+        "x-zoiko-event-type": "com.zoikosuite.data.data-quality-issue.resolved",
+        "x-zoiko-origin": "spec"
+      },
+      "external-record.linked": {
+        "contentType": "application/json",
+        "description": "Producer: Integration Service. Primary consumers / intent: Owning domain/read model. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.external-record.linked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "External link: linked.",
+        "title": "external-record linked",
+        "x-zoiko-event-type": "com.zoikosuite.data.external-record.linked",
+        "x-zoiko-origin": "spec"
+      },
+      "import.committed": {
+        "contentType": "application/json",
+        "description": "Producer: Import Service. Primary consumers / intent: Owning domains/reconciliation. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.import.committed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Import job: committed.",
+        "title": "import committed",
+        "x-zoiko-event-type": "com.zoikosuite.data.import.committed",
+        "x-zoiko-origin": "spec"
+      },
+      "import.failed": {
+        "contentType": "application/json",
+        "description": "Producer: Import Service. Primary consumers / intent: Ops/exception. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.import.failed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Import job: failed.",
+        "title": "import failed",
+        "x-zoiko-event-type": "com.zoikosuite.data.import.failed",
+        "x-zoiko-origin": "spec"
+      },
+      "import.validated": {
+        "contentType": "application/json",
+        "description": "Producer: Import Service. Primary consumers / intent: Approval/preview. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.data.import.validated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Import job: validated.",
+        "title": "import validated",
+        "x-zoiko-event-type": "com.zoikosuite.data.import.validated",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite data domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.connector-sync": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/connector-sync"
+      },
+      "description": "Producer(s): Connector Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/connector-sync/messages/completed"
+        },
+        {
+          "$ref": "#/channels/connector-sync/messages/failed"
+        },
+        {
+          "$ref": "#/channels/connector-sync/messages/started"
+        }
+      ],
+      "summary": "Publish connector-sync facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.data-quality-issue": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/data-quality-issue"
+      },
+      "description": "Producer(s): Data Quality. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/data-quality-issue/messages/detected"
+        },
+        {
+          "$ref": "#/channels/data-quality-issue/messages/resolved"
+        }
+      ],
+      "summary": "Publish data-quality-issue facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.external-record": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/external-record"
+      },
+      "description": "Producer(s): Integration Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/external-record/messages/linked"
+        }
+      ],
+      "summary": "Publish external-record facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.import": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/import"
+      },
+      "description": "Producer(s): Import Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/import/messages/committed"
+        },
+        {
+          "$ref": "#/channels/import/messages/failed"
+        },
+        {
+          "$ref": "#/channels/import/messages/validated"
+        }
+      ],
+      "summary": "Publish import facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

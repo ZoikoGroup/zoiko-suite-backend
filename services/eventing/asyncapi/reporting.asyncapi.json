@@ -1,0 +1,330 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "financial-statements": {
+      "address": "zoikosuite.reporting.financial-statements.v1",
+      "messages": {
+        "generated": {
+          "$ref": "#/components/messages/financial-statements.generated"
+        }
+      }
+    },
+    "management-pack": {
+      "address": "zoikosuite.reporting.management-pack.v1",
+      "messages": {
+        "generated": {
+          "$ref": "#/components/messages/management-pack.generated"
+        }
+      }
+    },
+    "regulatory-submission": {
+      "address": "zoikosuite.reporting.regulatory-submission.v1",
+      "messages": {
+        "accepted": {
+          "$ref": "#/components/messages/regulatory-submission.accepted"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/regulatory-submission.rejected"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/regulatory-submission.submitted"
+        }
+      }
+    },
+    "statutory-package": {
+      "address": "zoikosuite.reporting.statutory-package.v1",
+      "messages": {
+        "generated": {
+          "$ref": "#/components/messages/statutory-package.generated"
+        }
+      }
+    },
+    "xbrl-package": {
+      "address": "zoikosuite.reporting.xbrl-package.v1",
+      "messages": {
+        "generated": {
+          "$ref": "#/components/messages/xbrl-package.generated"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "financial-statements.generated": {
+        "contentType": "application/json",
+        "description": "Producer: Reporting. Primary consumers / intent: Review/statutory reporting. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.reporting.financial-statements.generated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Financial statement set: generated.",
+        "title": "financial-statements generated",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.financial-statements.generated",
+        "x-zoiko-origin": "spec"
+      },
+      "management-pack.generated": {
+        "contentType": "application/json",
+        "description": "Producer: Reporting. Primary consumers / intent: Board/report distribution. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.reporting.management-pack.generated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Report package: generated.",
+        "title": "management-pack generated",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.management-pack.generated",
+        "x-zoiko-origin": "spec"
+      },
+      "regulatory-submission.accepted": {
+        "contentType": "application/json",
+        "description": "Producer: Reporting. Primary consumers / intent: Evidence/obligation. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.reporting.regulatory-submission.accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Regulatory submission: accepted.",
+        "title": "regulatory-submission accepted",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.regulatory-submission.accepted",
+        "x-zoiko-origin": "spec"
+      },
+      "regulatory-submission.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Reporting. Primary consumers / intent: Exception workflow. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.reporting.regulatory-submission.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Regulatory submission: rejected.",
+        "title": "regulatory-submission rejected",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.regulatory-submission.rejected",
+        "x-zoiko-origin": "spec"
+      },
+      "regulatory-submission.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Reporting. Primary consumers / intent: Ops/evidence. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.reporting.regulatory-submission.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Regulatory submission: submitted.",
+        "title": "regulatory-submission submitted",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.regulatory-submission.submitted",
+        "x-zoiko-origin": "spec"
+      },
+      "statutory-package.generated": {
+        "contentType": "application/json",
+        "description": "Producer: Reporting. Primary consumers / intent: Filing workflow. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.reporting.statutory-package.generated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statutory package: generated.",
+        "title": "statutory-package generated",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statutory-package.generated",
+        "x-zoiko-origin": "spec"
+      },
+      "xbrl-package.generated": {
+        "contentType": "application/json",
+        "description": "Producer: Reporting. Primary consumers / intent: Validation/submission. Family: FP&A & Reporting. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.reporting.xbrl-package.generated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "XBRL package: generated.",
+        "title": "xbrl-package generated",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.xbrl-package.generated",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite reporting domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.financial-statements": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/financial-statements"
+      },
+      "description": "Producer(s): Reporting. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/financial-statements/messages/generated"
+        }
+      ],
+      "summary": "Publish financial-statements facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.management-pack": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/management-pack"
+      },
+      "description": "Producer(s): Reporting. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/management-pack/messages/generated"
+        }
+      ],
+      "summary": "Publish management-pack facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.regulatory-submission": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/regulatory-submission"
+      },
+      "description": "Producer(s): Reporting. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/regulatory-submission/messages/accepted"
+        },
+        {
+          "$ref": "#/channels/regulatory-submission/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/regulatory-submission/messages/submitted"
+        }
+      ],
+      "summary": "Publish regulatory-submission facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.statutory-package": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/statutory-package"
+      },
+      "description": "Producer(s): Reporting. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/statutory-package/messages/generated"
+        }
+      ],
+      "summary": "Publish statutory-package facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.xbrl-package": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/xbrl-package"
+      },
+      "description": "Producer(s): Reporting. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/xbrl-package/messages/generated"
+        }
+      ],
+      "summary": "Publish xbrl-package facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

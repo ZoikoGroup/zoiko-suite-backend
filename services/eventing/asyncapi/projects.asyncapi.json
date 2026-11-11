@@ -1,0 +1,228 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "billing-milestone": {
+      "address": "zoikosuite.projects.billing-milestone.v1",
+      "messages": {
+        "reached": {
+          "$ref": "#/components/messages/billing-milestone.reached"
+        }
+      }
+    },
+    "project": {
+      "address": "zoikosuite.projects.project.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/project.created"
+        }
+      }
+    },
+    "project-cost": {
+      "address": "zoikosuite.projects.project-cost.v1",
+      "messages": {
+        "posted": {
+          "$ref": "#/components/messages/project-cost.posted"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "billing-milestone.reached": {
+        "contentType": "application/json",
+        "description": "Producer: Projects. Primary consumers / intent: AR/invoicing. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.projects.billing-milestone.reached",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Billing milestone: reached.",
+        "title": "billing-milestone reached",
+        "x-zoiko-event-type": "com.zoikosuite.projects.billing-milestone.reached",
+        "x-zoiko-origin": "spec"
+      },
+      "project-cost.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Projects. Primary consumers / intent: Accounting/profitability. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.projects.project-cost.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Project cost: posted.",
+        "title": "project-cost posted",
+        "x-zoiko-event-type": "com.zoikosuite.projects.project-cost.posted",
+        "x-zoiko-origin": "spec"
+      },
+      "project.created": {
+        "contentType": "application/json",
+        "description": "Producer: Projects. Primary consumers / intent: Costing/time/billing. Family: Assets, Inventory & Projects. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.projects.project.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Project: created.",
+        "title": "project created",
+        "x-zoiko-event-type": "com.zoikosuite.projects.project.created",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite projects domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.billing-milestone": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/billing-milestone"
+      },
+      "description": "Producer(s): Projects. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/billing-milestone/messages/reached"
+        }
+      ],
+      "summary": "Publish billing-milestone facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.project": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/project"
+      },
+      "description": "Producer(s): Projects. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/project/messages/created"
+        }
+      ],
+      "summary": "Publish project facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.project-cost": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/project-cost"
+      },
+      "description": "Producer(s): Projects. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/project-cost/messages/posted"
+        }
+      ],
+      "summary": "Publish project-cost facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

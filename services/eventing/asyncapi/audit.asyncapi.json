@@ -1,0 +1,399 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "audit-population": {
+      "address": "zoikosuite.audit.audit-population.v1",
+      "messages": {
+        "frozen": {
+          "$ref": "#/components/messages/audit-population.frozen"
+        }
+      }
+    },
+    "engagement": {
+      "address": "zoikosuite.audit.engagement.v1",
+      "messages": {
+        "closed": {
+          "$ref": "#/components/messages/engagement.closed"
+        },
+        "created": {
+          "$ref": "#/components/messages/engagement.created"
+        }
+      }
+    },
+    "evidence": {
+      "address": "zoikosuite.audit.evidence.v1",
+      "messages": {
+        "received": {
+          "$ref": "#/components/messages/evidence.received"
+        }
+      }
+    },
+    "finding": {
+      "address": "zoikosuite.audit.finding.v1",
+      "messages": {
+        "raised": {
+          "$ref": "#/components/messages/finding.raised"
+        },
+        "resolved": {
+          "$ref": "#/components/messages/finding.resolved"
+        }
+      }
+    },
+    "sample": {
+      "address": "zoikosuite.audit.sample.v1",
+      "messages": {
+        "selected": {
+          "$ref": "#/components/messages/sample.selected"
+        }
+      }
+    },
+    "workpaper": {
+      "address": "zoikosuite.audit.workpaper.v1",
+      "messages": {
+        "prepared": {
+          "$ref": "#/components/messages/workpaper.prepared"
+        },
+        "reviewed": {
+          "$ref": "#/components/messages/workpaper.reviewed"
+        },
+        "signed-off": {
+          "$ref": "#/components/messages/workpaper.signed-off"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "audit-population.frozen": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Sampling/evidence. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.audit-population.frozen",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Audit population: frozen.",
+        "title": "audit-population frozen",
+        "x-zoiko-event-type": "com.zoikosuite.audit.audit-population.frozen",
+        "x-zoiko-origin": "spec"
+      },
+      "engagement.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Evidence/retention. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.engagement.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Engagement: closed.",
+        "title": "engagement closed",
+        "x-zoiko-event-type": "com.zoikosuite.audit.engagement.closed",
+        "x-zoiko-origin": "spec"
+      },
+      "engagement.created": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Planning/workflow. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.engagement.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Engagement: created.",
+        "title": "engagement created",
+        "x-zoiko-event-type": "com.zoikosuite.audit.engagement.created",
+        "x-zoiko-origin": "spec"
+      },
+      "evidence.received": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Workpaper/review. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.evidence.received",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Evidence item: received.",
+        "title": "evidence received",
+        "x-zoiko-event-type": "com.zoikosuite.audit.evidence.received",
+        "x-zoiko-origin": "spec"
+      },
+      "finding.raised": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Management response/task. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.finding.raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Finding: raised.",
+        "title": "finding raised",
+        "x-zoiko-event-type": "com.zoikosuite.audit.finding.raised",
+        "x-zoiko-origin": "spec"
+      },
+      "finding.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Engagement completion. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.finding.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Finding: resolved.",
+        "title": "finding resolved",
+        "x-zoiko-event-type": "com.zoikosuite.audit.finding.resolved",
+        "x-zoiko-origin": "spec"
+      },
+      "sample.selected": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Workpaper/evidence. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.sample.selected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Sample: selected.",
+        "title": "sample selected",
+        "x-zoiko-event-type": "com.zoikosuite.audit.sample.selected",
+        "x-zoiko-origin": "spec"
+      },
+      "workpaper.prepared": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Review queue. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.workpaper.prepared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Workpaper: prepared.",
+        "title": "workpaper prepared",
+        "x-zoiko-event-type": "com.zoikosuite.audit.workpaper.prepared",
+        "x-zoiko-origin": "spec"
+      },
+      "workpaper.reviewed": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Sign-off. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.workpaper.reviewed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Workpaper: reviewed.",
+        "title": "workpaper reviewed",
+        "x-zoiko-event-type": "com.zoikosuite.audit.workpaper.reviewed",
+        "x-zoiko-origin": "spec"
+      },
+      "workpaper.signed-off": {
+        "contentType": "application/json",
+        "description": "Producer: Audit. Primary consumers / intent: Engagement completion/evidence. Family: Audit & Assurance. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.audit.workpaper.signed-off",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Workpaper: signed-off.",
+        "title": "workpaper signed-off",
+        "x-zoiko-event-type": "com.zoikosuite.audit.workpaper.signed-off",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite audit domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.audit-population": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/audit-population"
+      },
+      "description": "Producer(s): Audit. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/audit-population/messages/frozen"
+        }
+      ],
+      "summary": "Publish audit-population facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.engagement": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/engagement"
+      },
+      "description": "Producer(s): Audit. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/engagement/messages/closed"
+        },
+        {
+          "$ref": "#/channels/engagement/messages/created"
+        }
+      ],
+      "summary": "Publish engagement facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.evidence": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/evidence"
+      },
+      "description": "Producer(s): Audit. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/evidence/messages/received"
+        }
+      ],
+      "summary": "Publish evidence facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.finding": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/finding"
+      },
+      "description": "Producer(s): Audit. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/finding/messages/raised"
+        },
+        {
+          "$ref": "#/channels/finding/messages/resolved"
+        }
+      ],
+      "summary": "Publish finding facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.sample": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/sample"
+      },
+      "description": "Producer(s): Audit. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/sample/messages/selected"
+        }
+      ],
+      "summary": "Publish sample facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.workpaper": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/workpaper"
+      },
+      "description": "Producer(s): Audit. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/workpaper/messages/prepared"
+        },
+        {
+          "$ref": "#/channels/workpaper/messages/reviewed"
+        },
+        {
+          "$ref": "#/channels/workpaper/messages/signed-off"
+        }
+      ],
+      "summary": "Publish workpaper facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

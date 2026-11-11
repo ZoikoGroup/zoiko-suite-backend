@@ -1,0 +1,348 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "entitlement": {
+      "address": "zoikosuite.commercial.entitlement.v1",
+      "messages": {
+        "granted": {
+          "$ref": "#/components/messages/entitlement.granted"
+        },
+        "revoked": {
+          "$ref": "#/components/messages/entitlement.revoked"
+        }
+      }
+    },
+    "platform-invoice": {
+      "address": "zoikosuite.commercial.platform-invoice.v1",
+      "messages": {
+        "issued": {
+          "$ref": "#/components/messages/platform-invoice.issued"
+        }
+      }
+    },
+    "platform-payment": {
+      "address": "zoikosuite.commercial.platform-payment.v1",
+      "messages": {
+        "settled": {
+          "$ref": "#/components/messages/platform-payment.settled"
+        }
+      }
+    },
+    "subscription": {
+      "address": "zoikosuite.commercial.subscription.v1",
+      "messages": {
+        "cancelled": {
+          "$ref": "#/components/messages/subscription.cancelled"
+        },
+        "changed": {
+          "$ref": "#/components/messages/subscription.changed"
+        },
+        "started": {
+          "$ref": "#/components/messages/subscription.started"
+        }
+      }
+    },
+    "usage": {
+      "address": "zoikosuite.commercial.usage.v1",
+      "messages": {
+        "measured": {
+          "$ref": "#/components/messages/usage.measured"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "entitlement.granted": {
+        "contentType": "application/json",
+        "description": "Producer: Commercial. Primary consumers / intent: Gateway/product. Family: Commercial Platform. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.commercial.entitlement.granted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Entitlement: granted.",
+        "title": "entitlement granted",
+        "x-zoiko-event-type": "com.zoikosuite.commercial.entitlement.granted",
+        "x-zoiko-origin": "spec"
+      },
+      "entitlement.revoked": {
+        "contentType": "application/json",
+        "description": "Producer: Commercial. Primary consumers / intent: Gateway/product. Family: Commercial Platform. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.commercial.entitlement.revoked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Entitlement: revoked.",
+        "title": "entitlement revoked",
+        "x-zoiko-event-type": "com.zoikosuite.commercial.entitlement.revoked",
+        "x-zoiko-origin": "spec"
+      },
+      "platform-invoice.issued": {
+        "contentType": "application/json",
+        "description": "Producer: Commercial Billing. Primary consumers / intent: Collections/commercial accounting plane. Family: Commercial Platform. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.commercial.platform-invoice.issued",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Platform invoice: issued.",
+        "title": "platform-invoice issued",
+        "x-zoiko-event-type": "com.zoikosuite.commercial.platform-invoice.issued",
+        "x-zoiko-origin": "spec"
+      },
+      "platform-payment.settled": {
+        "contentType": "application/json",
+        "description": "Producer: Commercial Billing. Primary consumers / intent: Commercial receivables. Family: Commercial Platform. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.commercial.platform-payment.settled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Platform payment: settled.",
+        "title": "platform-payment settled",
+        "x-zoiko-event-type": "com.zoikosuite.commercial.platform-payment.settled",
+        "x-zoiko-origin": "spec"
+      },
+      "subscription.cancelled": {
+        "contentType": "application/json",
+        "description": "Producer: Commercial. Primary consumers / intent: Entitlement/billing. Family: Commercial Platform. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.commercial.subscription.cancelled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Subscription: cancelled.",
+        "title": "subscription cancelled",
+        "x-zoiko-event-type": "com.zoikosuite.commercial.subscription.cancelled",
+        "x-zoiko-origin": "spec"
+      },
+      "subscription.changed": {
+        "contentType": "application/json",
+        "description": "Producer: Commercial. Primary consumers / intent: Entitlement/billing. Family: Commercial Platform. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.commercial.subscription.changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Subscription: changed.",
+        "title": "subscription changed",
+        "x-zoiko-event-type": "com.zoikosuite.commercial.subscription.changed",
+        "x-zoiko-origin": "spec"
+      },
+      "subscription.started": {
+        "contentType": "application/json",
+        "description": "Producer: Commercial. Primary consumers / intent: Entitlement/billing. Family: Commercial Platform. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.commercial.subscription.started",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Subscription: started.",
+        "title": "subscription started",
+        "x-zoiko-event-type": "com.zoikosuite.commercial.subscription.started",
+        "x-zoiko-origin": "spec"
+      },
+      "usage.measured": {
+        "contentType": "application/json",
+        "description": "Producer: Commercial. Primary consumers / intent: Commercial billing. Family: Commercial Platform. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.commercial.usage.measured",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Usage meter: measured.",
+        "title": "usage measured",
+        "x-zoiko-event-type": "com.zoikosuite.commercial.usage.measured",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite commercial domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.entitlement": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/entitlement"
+      },
+      "description": "Producer(s): Commercial. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/entitlement/messages/granted"
+        },
+        {
+          "$ref": "#/channels/entitlement/messages/revoked"
+        }
+      ],
+      "summary": "Publish entitlement facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.platform-invoice": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/platform-invoice"
+      },
+      "description": "Producer(s): Commercial Billing. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/platform-invoice/messages/issued"
+        }
+      ],
+      "summary": "Publish platform-invoice facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.platform-payment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/platform-payment"
+      },
+      "description": "Producer(s): Commercial Billing. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/platform-payment/messages/settled"
+        }
+      ],
+      "summary": "Publish platform-payment facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.subscription": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/subscription"
+      },
+      "description": "Producer(s): Commercial. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/subscription/messages/cancelled"
+        },
+        {
+          "$ref": "#/channels/subscription/messages/changed"
+        },
+        {
+          "$ref": "#/channels/subscription/messages/started"
+        }
+      ],
+      "summary": "Publish subscription facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.usage": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/usage"
+      },
+      "description": "Producer(s): Commercial. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/usage/messages/measured"
+        }
+      ],
+      "summary": "Publish usage facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}
