@@ -1,210 +1,203 @@
-# jurisdiction-rules-svc Progress Matrix
+# jurisdiction-rules-svc · progress (D2-1, Jurisdictions & Rules)
 
-**Section**: D2-1
-**Service**: jurisdiction-rules-svc (:8082, DB `jurisdiction_rules`)
-**Scope**: All features (JR-0 through JR-7, JR-FE-1 through JR-FE-3)
+Service: jurisdiction-rules-svc · port 8082 · DB `jurisdiction_rules` · compose service `jurisdiction-svc`
+(container `jurisdiction-rules-svc`). Console page (later): `/admin/jurisdictions`.
 
-## Feature Matrix
+This file replaces the 11 Nov version, whose matrix was not checked against the code: it claimed RLS + FORCE
+on every table (there is none), a negative-path suite that never sent a request body or asserted a result,
+and cursor paging that does not exist. Every status below was re-derived from the code on 12 Nov 2026.
 
-| Feature ID | Route / Consumer | Test | Console Tab | Status |
-|------------|------------------|------|-------------|--------|
-| D2-1.F01 | GET /v1/jurisdictions, GET /v1/jurisdictions/{id}, GET /v1/jurisdictions/{id}/ancestors, POST /v1/admin/jurisdictions, POST /v1/admin/jurisdictions/{id}/deactivate | TestListJurisdictions_*, TestGetJurisdiction_*, TestGetAncestors_*, TestCreateJurisdiction_*, TestDeactivateJurisdiction_* | Jurisdictions | 🟡 Reconfirm |
-| D2-1.F02 | GET /v1/jurisdictions/{id}/rules, GET /v1/rules/{id}, GET /v1/rules/{id}/status-history, POST /v1/admin/jurisdictions/{id}/rules, POST /v1/admin/rules/{id}/transition | TestFindRules_*, TestGetRule_*, TestGetRuleStatusHistory_*, TestCreateRule_*, TestTransitionRuleStatus_* | Rules | 🟡 Reconfirm |
-| D2-1.F03 | GET /v1/jurisdictions/{id}/rule-pack | TestGetRulePack_* | Rule packs | 🟡 Reconfirm |
-| D2-1.F04 | POST /v1/admin/rules/{id}/drift, GET /v1/rules/{id}/drift-events | TestRecordDrift_*, TestGetDriftEvents_* | Rules | 🟡 Reconfirm |
-| D2-1.F05 | Automatic drift from regulatory feed | — | Rules | ⛔ Blocked (external-data-feed-svc) |
-| D2-1.F06 | Activation approval reference resolved against workflow-svc | TestActivation_ConfirmsTheApproval, TestActivation_RefusesAnInvalidApproval, TestActivation_FailsClosedWhenWorkflowIsDown | Rules | 🔵 Built (not audited) |
-| D2-1.F07 | REF-01 registry commands: GET /v1/jurisdictions/{id}/as-of, /hierarchy, aliases, imports (maker-checker) | TestAsOf_*, TestHierarchy_*, TestListAliases, TestAmendAlias_*, TestEndAlias, TestImport_* | Jurisdictions, Imports | 🔵 Built (REF-01 waves 1–3) |
-| D2-1.F08 | REF-10 business calendars: GET/POST /v1/calendars, /{code}, /versions, /is-business-day, /add-business-days, admin routes | TestBusinessCalendar_* | Calendars | 🔵 Built (REF-3 wave 1) |
-| D2-1.F09 | REF-10 payment terms: GET/POST /v1/payment-terms, /{code}, /versions, /due-date, /explain-due-date, admin routes | TestPaymentTerm_* | Payment terms | 🔵 Built (REF-3 wave 2) |
-| D2-1.F10 | Obligation rules: GET/POST /v1/obligation-rules, PUT /provenance, /publish, POST /v1/obligation-calculations:calculate | TestObligationRule_* | Obligation rules | 🔵 Built (not audited) |
-| D2-1.F11 | Rule resolution: POST /v1/rule-resolutions:resolve, GET /v1/rule-decisions/{id}, GET /v1/pack-coverage, POST /v1/admin/resolver-cache:invalidate | TestResolve_*, TestPackCoverage_* | Resolve & validate | 🔵 Built (RESOLVER_ENABLED=true) |
-| D2-1.F12 | Action validation: POST /v1/validate-action | TestValidateAction_* | Resolve & validate | 🔵 Built (not audited) |
-| D2-1.F13 | JUR-1 determination: POST /v1/jurisdiction-decisions:resolve | TestDetermination_* | Resolve & validate | 🔵 Built (needs ORG-6/ORG-7) |
-| D2-1.F14 | Jurisdiction packs, regimes, sources, interpretations, provenance, parameters | TestPack_*, TestRegime_*, TestSource_*, TestInterpretation_*, TestProvenance_*, TestParameters_* | Rule packs, Sources & notices | 🔵 Built (pack waves 0–4) |
-| D2-1.F15 | Pack compile, sign, verify, artifact, signing keys | TestCompile_*, TestSign_*, TestVerify_*, TestArtifact_*, TestSigningKey_* | Rule packs | 🔵 Built (not audited) |
-| D2-1.F16 | Pack certification: test-bundle, test-runs, reviews, certify | TestCertification_* | Rule packs | 🔵 Built (wave 5) |
-| D2-1.F17 | Pack operations: publish, deploy, rollback, supersede, withdraw, block, unblock, hotfix, deployment rings/regions, source-change notices, ops metrics | TestOperations_* | Rule packs, Rollouts | 🔵 Built (waves 6–7) |
-| D2-1.F18 | Rollouts: GET/POST /v1/admin/rollouts, attestations, expert-approvals, transition, owner, packs, seed-portfolio, checklists, jurisdiction-support | TestRollout_* | Rollouts | 🔵 Built (wave 8) |
-| D2-1.F19 | Remediation cases: GET/POST /v1/admin/remediation-cases, close, decisions, dispositions | TestRemediation_* | Remediation | 🔵 Built (wave 7) |
-| D2-1.F20 | Applicability & determination APIs: POST /v1/licences:evaluate, /v1/registration-obligations:resolve, /v1/registration-identifiers:validate, /v1/scheme-elections:evaluate, /v1/threshold-monitors:evaluate, /v1/submission-profiles:resolve, /v1/payroll-statutory-parameters:resolve, /v1/retention-rules:resolve, /v1/accounting-mappings:resolve, /v1/regulatory-calculations:execute | TestApplicability_* | Resolve & validate | 🔵 Built (waves 2–4) |
-| D2-1.F21 | Regulatory submissions: POST /v1/regulatory-submissions, GET /{id}, POST /{id}/events | TestSubmission_* | Submissions | 🔵 Built (not audited) |
-| D2-1.F22 | Entity-jurisdiction projection: GET /v1/entities/{id}/jurisdictions | TestGetEntityJurisdictions_TenantScoped | Jurisdictions | 🟡 Partial (J-10 backfill needed) |
-| D2-1.F23 | Outbox hygiene: registry events in transaction, aggregate_version, FOR UPDATE SKIP LOCKED, replay tool | — | — | 🟡 Partial (J-11, J-12, J-15, J-16) |
-| D2-1.F24 | Identity verification, remove published port 8082:8082 | — | — | 🟡 Partial (compose publishes 8082:8082, IDENTITY_VERIFY=warn) |
-| D2-1.F25 | Bitemporal replay, idempotency keys, ETag/If-Match, append-only triggers, RFC 9457 | TestIfMatch_*, Test*_Idempotent*, Test*_ETag* | All | 🟡 Reconfirm |
-| D2-1.F26 | Decisions: owner of entity applicability (C8, J-05), precedence model (J-08), public reads/event naming (J-09) | — | — | 🧭 Decision (CL-2) |
-| D2-1.F27 | Cursor paging (API-4) on list routes | — | All | ❌ Missing |
-| D2-1.F28 | Contract parity: openapi has 148 paths; no route-parity test | TestOpenAPIDocumentIsValid | — | 🟡 Partial (parity test missing) |
-| D2-1.F29 | Console v2.0 | — | All | ❌ Missing |
+Status legend (tracker): ✅ verified · 🔵 built, not verified · 🟡 partial · ❌ missing · ⛔ blocked on a named
+external dependency · 🧭 waits on a named decision. The implementer never sets ✅.
 
-## Task Tracking
+## 1. Specification context (what binds this service)
 
-### JR-0 · Baseline (S0)
-- [ ] Create `progress.md` with matrix (this file)
-- [ ] Full suite on scratch Postgres (0 skip) - requires TEST_DATABASE_URL
-- [ ] Apply missing local migrations with `deployments/migrate.py up --db jurisdiction_rules`
+| Source | What it gives this service |
+|---|---|
+| Doc 03 §8.2 (`docs/architecture/03-microservices.md`) | Owns jurisdiction profiles, rule libraries, effective-dated rule sets, entity-jurisdiction applicability, compliance calendar logic, external rule references, legal drift indicators. APIs: resolve jurisdiction set, fetch runtime rule pack, get effective rule by date, validate action. Events out: `jurisdiction.rule.updated`, `.rule.activated`, `.calendar.changed`, `legal.drift.detected`, `jurisdiction.created`, `.deactivated`. Events in: `entity.created`, `entity.jurisdiction.changed`, external regulatory feed changes. Evidence: rule basis of every governed action; historical rule state for replay. |
+| ZS-JUR-001 (Global Jurisdiction Pack & Regulatory Rule Architecture Standard) | §3 15 invariants; §4 hierarchy; §5–6 pack manifest and components; §7 rule identity and temporal fields; §8 source register; §9 determination; §10 precedence/conflicts; §11–19 rule families (registration, tax, e-invoice, filing, calendar, payroll, retention, accounting mapping); §20 authoring workflow; §21 compiler/registry; §22 certification harness; §23 release states and rings; §24 hotfix; §25 runtime APIs; §26 canonical events; §27 persistence; §28 privilege separation; §29 observability; §31 change management; §34 JUR-NEG-01…30; §37 waves 0–8. |
+| ZS-SVC-V-001 PDC-02 (Jurisdiction, Scope & Applicability Resolution) | Outcomes RESOLVED / AMBIGUOUS / INSUFFICIENT / CONFLICTED / NOT_APPLICABLE with evidence; no guessed jurisdiction; explicit precedence; NP-11…NP-20. |
+| ZS-SVC-I/U-001 REF-01 (Jurisdiction Registry) | Commands ImportJurisdictionUpdate, AddInternalJurisdiction, AmendJurisdictionAlias, RetireJurisdiction; queries ResolveJurisdiction, GetHierarchy, GetJurisdictionAsOf, MapExternalJurisdictionCode; lifecycle Proposed → Active → Retired/Superseded; maker-checker on source imports; events JurisdictionAdded/Updated/Retired/HierarchyChanged; negative paths #22, #23. |
+| REF-10 (Business Calendar & Payment Terms) | Commands ImportHolidayCalendar, CreateBusinessCalendar, ApprovePaymentTerm, SupersedePaymentTerm, RetirePaymentTerm; queries IsBusinessDay, AddBusinessDays, CalculateDueDate, GetPaymentTerm, ExplainDueDate; events BusinessCalendarUpdated, HolidayOccurrenceChanged, PaymentTermActivated, PaymentTermSuperseded; negative paths #40, #41. |
+| Tracker D2-1 (`docs/audit_files/DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md`) | Feature rows F01–F29, tasks JR-0…JR-7 and JR-FE-1…3, open register J-01…J-17, rules R1–R15 (R4 migrations, R5 registrations, R6 route controls, R7 wiring, R10 tests, R14 no stubs). |
+| Design notes | `docs/architecture/jurisdiction-pack-wave0…8*.md`, `jurisdiction-pack-decision-rule-parameters.md`. |
 
-### JR-1 · Audit and finish unaudited surface (F06–F21)
-- [x] Authorization at the object (verified: TestAdminRoutes_AuthorizationIsChecked, TestAdminRoutes_403_DeniedNeverReachesStore, TestCheckAuthz_NamesTheRouteResource)
-- [x] Maker-checker where a version is approved (verified: TestTransitionRuleStatus_ActivationIsMakerChecker)
-- [x] Idempotency-Key on mutations (verified: TestCreateJurisdiction_200_IdempotentReplay, TestCreateRule_200_ReplayDoesNotPublish, TestDeactivateJurisdiction_200_IdempotentReplayDoesNotPublish, TestRecordDrift_ReplayDoesNotPublish, TestTransitionRuleStatus_ReplayDoesNotPublish, TestImport_ProposeIsAsTheVerifiedCallerAndReplayIs200)
-- [x] If-Match/ETag (verified: TestIfMatch_TransitionAndDrift, TestGetRule_ReturnsETag, TestRetire_IfMatchIsTheExpectedVersion)
-- [x] Outbox in the same transaction (verified: event emission tests)
-- [x] RLS + FORCE (verified: store integration tests pass)
-- [x] R5 registrations (verified: migrations 000023, 000024, 000025, 000026, 000027, 000028, 000037, 000038, 000041 in access-control-svc)
-- [x] openapi entry (verified: TestOpenAPIMatchesTheRouter, TestOpenAPIDocumentIsValid)
-- [ ] Add negative-path tests (TestJUR_*, TestREF01_*, TestREF10_*) - written in negative_paths_test.go, blocked by Windows Application Control
+## 2. Feature inventory (every feature and operation)
 
-### JR-2 · J-10 backfill job
-- [ ] Implement backfill job for entities whose events left Kafka retention
-- [ ] Test: entity with no event gets its projection
+### 2.1 Jurisdiction registry (REF-01, Doc 03 §8.2, ZS-JUR §4)
 
-### JR-3 · Outbox hygiene
-- [ ] J-11: registry events written inside transaction
-- [ ] J-12: aggregate_version on registry events
-- [ ] J-15: FOR UPDATE SKIP LOCKED in worker (two-worker test)
-- [ ] J-16: parked-event replay command with authorization and evidence
+| ID | Operation | Route / consumer | Status |
+|---|---|---|---|
+| F01 | List / get (fail-closed) / ancestors | `GET /v1/jurisdictions`, `GET …/{id}`, `GET …/{id}/ancestors` | 🟡 reconfirm |
+| F01 | AddInternalJurisdiction | `POST /v1/admin/jurisdictions` (Idempotency-Key, event `jurisdiction.created`) | 🟡 reconfirm |
+| F01 | RetireJurisdiction | `POST /v1/admin/jurisdictions/{id}/deactivate` (If-Match, reason + evidence, `jurisdiction.deactivated`) | 🟡 reconfirm (J-13 If-Match built) |
+| F07 | GetJurisdictionAsOf · GetHierarchy | `GET …/{id}/as-of`, `GET …/{id}/hierarchy` | 🔵 |
+| F07 | AmendJurisdictionAlias · end alias · list aliases | `POST/GET …/{id}/aliases`, `POST …/aliases/{alias_id}/end` | 🔵 |
+| F07 | ResolveJurisdiction · MapExternalJurisdictionCode | `GET /v1/jurisdiction-resolutions`, `GET /v1/jurisdiction-code-mappings` | 🔵 |
+| F07 | ImportJurisdictionUpdate (maker-checker) | `POST/GET /v1/admin/jurisdiction-imports`, `GET …/{batch}`, `POST …/approve`, `…/reject` | 🔵 |
+| F07 | Events JurisdictionAdded/Updated/Retired/HierarchyChanged | `jurisdiction.created`, `.updated`, `.deactivated`, `.hierarchy.changed` | 🔵 |
 
-### JR-4 · J-01 Identity verification
-- [ ] Remove published `8082:8082` port from compose
-- [ ] Verify envelope (IDENTITY_VERIFY=require once callers send it)
+### 2.2 Effective-dated rules (Doc 03 §8.2)
 
-### JR-5 · API-4 and contract parity
-- [x] Add router ↔ openapi parity test (pattern: `evidence-requirements-svc/internal/handler/openapi_parity_test.go`)
-- [ ] Cursor paging on list routes
-- [ ] Extend Postman collection
+| ID | Operation | Route | Status |
+|---|---|---|---|
+| F02 | Rules of a jurisdiction (as of, known_at) · get rule (ETag) · status history | `GET …/{id}/rules`, `GET /v1/rules/{id}`, `GET …/status-history` | 🟡 reconfirm |
+| F02 | Create rule (DRAFT) · transition (creator ≠ activator) | `POST /v1/admin/jurisdictions/{id}/rules`, `POST /v1/admin/rules/{id}/transition` | 🟡 reconfirm |
+| F06 | Activation approval confirmed with workflow-svc (J-02) | `X-Approval-Reference` → `internal/approval` | 🔵 |
+| F03 | Runtime rule pack with `pack_digest` | `GET …/{id}/rule-pack` | 🟡 reconfirm |
+| F04 | Manual legal drift · drift history | `POST /v1/admin/rules/{id}/drift`, `GET …/drift-events`, `legal.drift.detected` | 🟡 reconfirm |
+| F05 | Automatic drift from a regulatory feed (J-03/J-04) | consumer of a regulatory source-change event | ❌ consumer · ⛔ producer (external-data-feed-svc) |
+| F12 | Validate action (J-06) | `POST /v1/validate-action` | 🔵 |
 
-### JR-6 · Drift consumer (J-03, J-04)
-- [ ] Once external-data-feed-svc publishes regulatory-change event: move matching rules to UNDER_REVIEW and record drift
+### 2.3 Entity applicability (Doc 03 §8.2 "entity-jurisdiction applicability mappings")
 
-### JR-7 · Live
-- [ ] Rebuild
-- [ ] scripts/audit.sh
-- [ ] New deployments/scripts/e2e-jurisdiction-rules-deps.py
+| ID | Operation | Route / consumer | Status |
+|---|---|---|---|
+| F22 | Projection from `entity.created` / `entity.jurisdiction.changed` | Kafka consumer (`internal/consumer/entity.go`) | 🔵 |
+| F22 | Read | `GET /v1/entities/{legal_entity_id}/jurisdictions` | 🔵 |
+| F22 | J-10 backfill from tenant-entity-registry for events past Kafka retention | — | ❌ |
+| F22 | Tenant isolation at the database (RLS + FORCE) | — | ❌ |
 
-### JR-FE-1 · Summary route + API client
-- [ ] Summary route GET /v1/jurisdiction-summary (backend, authorized, tested, in openapi)
-- [ ] API client for every route in Appendix B D2-1 (lib/api/jurisdictions/*.ts if >800 lines)
+### 2.4 Pack registries, compiler, certification (ZS-JUR waves 0, 1, 3)
 
-### JR-FE-2 · Page v2.0
-- [ ] Build page in v2.0 layout per console table (header, 5 KPIs, 3 panels, tabs, drawer commands, footer)
-- [ ] Use kit only, live data only, URL state, reason dialogs, step-up retry, If-Match, 412 reload, maker/checker button visibility
+| ID | Operation | Route | Status |
+|---|---|---|---|
+| F14 | Regimes | `GET /v1/regimes`, `GET …/{regime}`, `POST /v1/admin/regimes` | 🔵 |
+| F14 | Source register (capture, independent review, supersede) | `GET /v1/sources`, `GET …/{id}`, `POST /v1/admin/sources`, `…/review`, `…/supersede` | 🔵 |
+| F14 | Interpretation records (approver ≠ author) | `GET /v1/interpretations/{id}`, `POST /v1/admin/interpretations`, `…/approve` | 🔵 |
+| F14 | Packs and versions; submit for review | `GET /v1/packs`, `…/{ref}`, `…/versions`, `…/versions/{v}`; `POST /v1/admin/packs`, `…/versions`, `…/submit-review` | 🔵 |
+| F14 | Rule provenance and typed parameters | `GET/PUT …/rules/{id}/provenance`, `GET/PUT …/rules/{id}/parameters` | 🔵 |
+| F15 | Compile · sign · verify · artifact | `POST …/compile`, `…/sign`, `POST /v1/packs/{ref}/versions/{v}/verify`, `GET …/artifact` | 🔵 |
+| F15 | Signing keys register / retire / revoke | `GET /v1/pack-signing-keys`, `POST /v1/admin/pack-signing-keys`, `…/retire`, `…/revoke` | 🔵 |
+| F16 | Certification harness: test bundle, test runs, reviews, certify | `POST/GET …/test-bundle`, `…/test-runs`, `…/reviews`, `…/certify`, `GET …/certification` | 🔵 |
+| — | API-5 async operations for compile and test runs (EST-5) | `Prefer: respond-async` → 202 + `/v1/operations/{id}` | ❌ |
 
-### JR-FE-3 · UI E2E
-- [ ] tests/e2e/console/jurisdictions.spec.ts covering:
-  - Rule created by one user, activated by another
-  - Import approved by second user
-  - Business-day arithmetic from published calendar
-  - Payment-term due date with explain
-  - Pack sign → verify → publish
-  - Validate-action diagnostic
-  - Empty and unavailable states
+### 2.5 Runtime resolution (ZS-JUR waves 2, 4–6; PDC-02)
 
-## Test Suite Baseline (2026-11-11)
+| ID | Operation | Route | Status |
+|---|---|---|---|
+| F11 | Rule resolution with decision evidence · decision read · coverage · cache invalidate | `POST /v1/rule-resolutions:resolve`, `GET /v1/rule-decisions/{id}`, `GET /v1/pack-coverage`, `POST /v1/admin/resolver-cache:invalidate` | 🔵 |
+| F13 | Jurisdiction determination (JUR-1) | `POST /v1/jurisdiction-decisions:resolve` | 🔵 (ORG-6/ORG-7 inputs pending) |
+| F10 | Obligation rules + due-date calculation | `GET /v1/obligation-rules`, `…/{id}`, `POST /v1/admin/obligation-rules`, `PUT …/provenance`, `POST …/publish`, `POST /v1/obligation-calculations:calculate` | 🔵 |
+| F20 | Registrations, licences, schemes, thresholds | `POST /v1/registration-obligations:resolve`, `/v1/registration-identifiers:validate`, `/v1/licences:evaluate`, `/v1/scheme-elections:evaluate`, `/v1/threshold-monitors:evaluate` | 🔵 |
+| F20 | Tax calculation | `POST /v1/regulatory-calculations:execute` | 🔵 · events `regulatory-calculation.completed/.failed` ❌ |
+| F20 | Payroll parameters · retention · accounting mappings · submission profiles | `POST /v1/payroll-statutory-parameters:resolve`, `/v1/retention-rules:resolve`, `/v1/accounting-mappings:resolve`, `/v1/submission-profiles:resolve` | 🔵 |
+| F21 | Regulatory submissions lifecycle | `POST /v1/regulatory-submissions`, `GET …/{id}`, `POST …/{id}/events` | 🔵 · tenant isolation ❌ |
+| — | Decision evidence tenant isolation | `rule_decision_evidence` | ❌ |
 
-| Package | Tests | Pass | Fail | Skip |
-|---------|-------|------|------|------|
-| internal/approval | 4 | 4 | 0 | 0 |
-| internal/authz | — | — | — | — (blocked by App Control) |
-| internal/config | 3 | 3 | 0 | 0 |
-| internal/consumer | 2 | 2 | 0 | 0 |
-| internal/domain | 5 | 5 | 0 | 0 |
-| internal/envelope | 3 | 3 | 0 | 0 |
-| internal/events | — | — | — | — (blocked by App Control) |
-| internal/handler | 113 | 113 | 0 | 0 (includes new parity test) |
-| internal/resolver | 8 | 8 | 0 | 0 |
-| internal/store | 90 | 90 | 0 | 0 (integration with TEST_DATABASE_URL) |
-| internal/telemetry | 3 | 3 | 0 | 0 |
+### 2.6 Calendars and payment terms (REF-10, ZS-JUR §15)
 
-**Notes**: 
-- internal/authz and internal/events tests blocked by Windows Application Control policy
-- Integration tests in internal/store now pass (90 tests) with TEST_DATABASE_URL
-- New TestOpenAPIMatchesTheRouter added and passing
-- Negative path tests written in negative_paths_test.go (blocked by App Control)
-- Run with Docker golang:1.26-alpine for blocked packages if needed
+| ID | Operation | Route | Status |
+|---|---|---|---|
+| F08 | Calendars and versions (maker-checker publish), sources, holiday import, observed holidays | `GET /v1/calendars`, `…/{code}`, `…/versions`, `…/versions/{v}`; `POST /v1/admin/calendars`, `…/versions`, `…/publish`, `PUT …/sources`, `POST …/imports` | 🔵 |
+| F08 | IsBusinessDay · AddBusinessDays | `GET …/is-business-day`, `GET …/add-business-days` | 🔵 |
+| F09 | Payment terms: create, version, approve, supersede, retire | `POST /v1/admin/payment-terms`, `…/versions`, `…/approve`, `…/supersede`, `…/retire` | 🔵 |
+| F09 | GetPaymentTerm · CalculateDueDate · ExplainDueDate | `GET /v1/payment-terms/{code}`, `…/versions`, `…/versions/{v}`, `…/due-date`, `…/explain-due-date` | 🔵 |
 
-## Migrations Applied (dev DB)
-- [ ] 000001_initial_schema
-- [ ] 000002_add_audit_columns
-- [ ] 000003_add_data_classification
-- [ ] 000004_add_rule_code_index
-- [ ] 000005_add_outbox
-- [ ] 000005_jurisdiction_pack_registries
-- [ ] 000006_add_exclusion_constraint
-- [ ] 000006_pack_artifacts_and_signing_keys
-- [ ] 000007_add_bitemporal_replay
-- [ ] 000007_pack_certification
-- [ ] 000008_add_precedence_metadata
-- [ ] 000008_rule_decision_evidence
-- [ ] 000009_enforce_drift_append_only
-- [ ] 000009_pack_release_operations
-- [ ] 000010_calendars_and_obligations
-- [ ] 000011_rule_parameters
-- [ ] 000012_payroll_parameter_evidence
-- [ ] 000013_records_evidence
-- [ ] 000014_regulatory_submissions
-- [ ] 000015_jurisdiction_rollout
-- [ ] 000016_fix_rule_status_history_trigger
-- [ ] 000017_append_only_rbac
-- [ ] 000018_idempotency_keys
-- [ ] 000019_entity_jurisdiction_applicability
-- [ ] 000020_row_version_and_rule_immutability
-- [ ] 000021_registration_evidence
-- [ ] 000022_jurisdiction_decision_evidence
-- [ ] 000023_applicability_evidence
-- [ ] 000024_pack_supersede_event
-- [ ] 000025_resolver_change_notify
-- [ ] 000026_remediation_cases
-- [ ] 000027_jurisdiction_versions
-- [ ] 000028_jurisdiction_aliases
-- [ ] 000029_jurisdiction_imports
-- [ ] 000030_business_calendar
-- [ ] 000031_payment_terms
+### 2.7 Release operations, rollouts, remediation (ZS-JUR waves 7, 8; §23, §24, §29, §31)
 
-## Commits (this session)
+| ID | Operation | Route | Status |
+|---|---|---|---|
+| F17 | Publish · deploy (rings/regions) · rollback · supersede · withdraw · block · unblock | `POST /v1/admin/packs/{ref}/versions/{v}/publish|deploy|rollback|supersede|withdraw|block|unblock`, `GET …/deployments` | 🔵 |
+| F17 | Emergency hotfix + retrospective | `POST …/hotfix`, `…/hotfix/retrospective`, `GET …/hotfix` | 🔵 |
+| F17 | Rings and regions | `GET/POST /v1/deployment-rings`, `/v1/deployment-regions` | 🔵 |
+| F17 | Source-change notices (intake, review, close) | `GET /v1/source-change-notices`, `…/{id}`, `POST /v1/admin/source-change-notices`, `…/review`, `…/close` | 🔵 |
+| F17 | §29 operations metrics | `GET /v1/ops/metrics` | 🔵 |
+| F18 | Rollout governance | `GET/POST /v1/admin/rollouts`, `GET …/{id}`, `…/attestations`, `…/expert-approvals`, `…/transition`, `PUT …/owner`, `PUT …/packs`, `POST /v1/admin/rollouts:seed-portfolio`, `GET /v1/rollout-checklists`, `GET /v1/jurisdiction-support/{code}` | 🔵 |
+| F19 | Remediation cases | `GET/POST /v1/admin/remediation-cases`, `GET …/{id}`, `POST …/close`, `GET …/decisions`, `POST …/dispositions` | 🔵 |
+| — | §26 rule lifecycle events `regulatory-rule.versioned/.effective/.expired` | effectivity watcher | ❌ |
 
-| Commit | Task | Files |
-|--------|------|-------|
-| — | JR-0 Baseline | progress.md |
+### 2.8 Cross-cutting controls
 
-## Blockers & Decisions
+| ID | Control | Status |
+|---|---|---|
+| F23 / J-11 | Registry events written in the same transaction as the write | ❌ (written after commit, through the pool) |
+| F23 / J-12 | `aggregate_version` on registry events | ❌ |
+| F23 / J-15 | Outbox claim with `FOR UPDATE SKIP LOCKED` | ❌ |
+| F23 / J-16 | Parked outbox events: list + requeue (authorized, evidenced) | ❌ |
+| F24 / J-01 | No published service port; signed identity required | 🟡 (gate mounted, `IDENTITY_VERIFY=warn`, `8082:8082` published) |
+| F25 | Idempotency-Key replay, ETag/If-Match, bitemporal replay, append-only triggers, RFC 9457 | 🟡 reconfirm; If-Match covers only jurisdictions and rules |
+| F27 | API-4 cursor paging on list routes | ❌ |
+| F28 | Router ↔ openapi parity + kin-openapi validity | 🔵 (`TestOpenAPIMatchesTheRouter`, `TestOpenAPIDocumentIsValid`) |
+| R4 | RLS + FORCE on tenant data | ❌ (no table has RLS; three hold tenant data) |
+| R5 | Every checked action registered in access-control | 🔵 (83 actions, all registered; template coverage to confirm) |
+| R10 | Negative paths named after their spec id | ❌ (ids in comments only; JUR-NEG-16, 17, 21, 29, 30 untested; 11 Nov suite hollow) |
+| JR-FE-1 | Console summary route `GET /v1/jurisdiction-summary` | ❌ |
+| S2 | asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, scripts/audit.sh, Postman | ❌ (only openapi.yaml, SPEC_DEVIATIONS.md) |
+| S4 | `deployments/scripts/e2e-jurisdiction-rules-deps.py` | ❌ |
 
-| Item | Status | Details |
-|------|--------|---------|
-| D2-1.F05 (automatic drift) | ⛔ Blocked | external-data-feed-svc publishes no regulatory-change event |
-| D2-1.F26 (C8/J-05, J-08, J-09) | 🧭 Decision | Listed in Governance audit register, goes to CL-2 |
-| internal/authz tests | ⚠️ Blocked | Windows Application Control blocks test binary |
-| internal/events tests | ⚠️ Blocked | Windows Application Control blocks test binary |
-| Integration tests | ⏭️ Skipped | Require TEST_DATABASE_URL (scratch Postgres) |
+### 2.9 Decisions and blocked items (not buildable here)
 
-## Next Steps (JR-1)
-1. Run full test suite on scratch Postgres (set TEST_DATABASE_URL)
-2. Audit each route group for: authorization at object, maker-checker, Idempotency-Key, If-Match/ETag, outbox, RLS+FORCE, R5, openapi
-3. Add negative-path tests with TestJUR_*, TestREF01_*, TestREF10_* naming
-4. Fix any failures
+| Item | Owner | Status |
+|---|---|---|
+| F26 · J-05 / C8: who owns entity applicability (projection vs owner) | Architecture, with tenant-entity-registry and obligations owners | 🧭 (built as a projection) |
+| F26 · J-08: one precedence model (`precedence_level` vs registry `precedence`) | Architecture / Tax Engineering | 🧭 |
+| F26 · J-09: public reads tier, `rule_payload` content, event naming, inherited rules of deactivated ancestors | Product / architecture | 🧭 |
+| F05 producer: regulatory source-change event from external-data-feed-svc | external-data-feed-svc owner (teammate) | ⛔ |
+| Production pack signing key, `RESOLVER_RING` / `RESOLVER_REGION` | Platform ops (SEC-1 key custody) | ⛔ |
+| Tax families beyond flat/banded rates (place of supply, reverse charge, exemptions …) | Tax Engineering (wave docs) | 🧭 |
+| Country rule content | Local expert certification (ZS-JUR §32) | 🧭 |
 
-## Commits (this session)
+## 3. Ordered completion steps (backend)
 
-| Commit | Task | Files |
-|--------|------|-------|
-| (uncommitted) | JR-0 Baseline | progress.md |
-| (uncommitted) | JR-1 Audit | — (verification only) |
-| (uncommitted) | JR-5 Parity | internal/handler/openapi_parity_test.go |
-| (uncommitted) | JR-1 Negative paths | internal/handler/negative_paths_test.go |
+1. **JR-0 baseline.** Make the registry integration suite runnable against an external scratch Postgres
+   (`JUR_IT_DSN`), rewrite the hollow negative-path suite, run build · vet · unit · store · registryit with
+   0 skips and record counts; check the dev DB migrations.
+2. **Unit of work (J-11, R4).** One database transaction per request: every store call and every outbox row
+   of a request commit together or not at all; the response is released only after the commit. The same
+   transaction carries the caller's tenant (`app.tenant_id`) for RLS.
+3. **Tenant isolation (R4).** RLS + FORCE on `entity_jurisdiction_applicability`; `tenant_id` + RLS + FORCE on
+   `regulatory_submissions`, `regulatory_submission_events`, `rule_decision_evidence` (platform-scope read for
+   remediation operators only).
+4. **Outbox hygiene (JR-3).** `aggregate_version` on registry events (J-12); `FOR UPDATE SKIP LOCKED` claim and a
+   two-worker test (J-15); parked-event list and requeue routes with authorization and evidence (J-16).
+5. **Concurrency (F25, R6).** `row_version` on every mutable aggregate, `ETag` on its reads, `If-Match` (412) on
+   its commands, checked under a row lock inside the request transaction.
+6. **API-4 (JR-5).** Cursor paging on every list route (`page_size`, `cursor`, `filter[...]`; signed cursors
+   bound to tenant, route and filters), keeping the bare-array answer for callers that send no paging
+   parameter.
+7. **Events (§26).** `regulatory-calculation.completed/.failed`; `regulatory-rule.versioned/.effective/.expired`
+   (effectivity watcher with a durable watermark).
+8. **J-10 backfill (JR-2).** Page tenant-entity-registry's entities and jurisdiction assignments and upsert the
+   projection with synthetic event ids, version-guarded; admin route + test.
+9. **Negative paths (R10).** One test named after each of JUR-NEG-01…30, REF-01 #22/#23, REF-10 #40/#41, and the
+   PDC-02 NP-11…NP-20 cases that apply.
+10. **Console summary (JR-FE-1 backend part).** `GET /v1/jurisdiction-summary` with the five KPIs, the pack
+    pipeline counts and the coverage bars, all live.
+11. **API-5 (EST-5).** Async compile and test runs: `Prefer: respond-async` → 202 + `Location`, operation
+    polling and cancel.
+12. **Drift consumer (JR-6).** Consumer for a regulatory source-change event (contract documented in
+    asyncapi.yaml); matching ACTIVE rules move to `UNDER_REVIEW` with drift evidence; producer ⛔.
+13. **J-01 (JR-4).** Loopback-bind the published port; admin mutations require a verified identity
+    (`IDENTITY_VERIFY_ADMIN=require`); reads stay `warn` until the out-of-domain readers forward the envelope.
+14. **S2 contract and docs.** openapi for every new route; asyncapi.yaml; RUNBOOK.md; RELEASE_CERTIFICATE.md;
+    SPEC_DEVIATIONS.md; scripts/audit.sh; Postman collection.
+15. **S3/S4 live.** Migrate the dev DB, rebuild the image, run audit.sh live, write and pass
+    `deployments/scripts/e2e-jurisdiction-rules-deps.py`.
+16. **S6.** Evidence blocks, mutation check (break two guards, a test fails for each), tracker rows → 🔵.
 
-## Feature Rows Changed
+## 4. Negative-path matrix (R10)
 
-| Feature ID | Old Status | New Status | Evidence |
-|------------|------------|------------|----------|
-| D2-1.F25 | 🟡 Reconfirm | 🔵 Built (not audited) | TestIfMatch_*, Test*_Idempotent*, Test*_ETag* |
-| D2-1.F28 | 🟡 Partial | 🔵 Built | TestOpenAPIMatchesTheRouter |
-| D2-1.F27 | ❌ Missing | 🔵 Built | Cursor paging tests needed (API-4) |
+Filled in by step 9. Each row: spec id → test name → status.
 
-## Migrations Applied (dev DB)
-- [x] All 31 migrations applied successfully via `deployments/migrate.py up --db jurisdiction_rules`
+## 5. Test baseline
 
-## Live Status
-- [x] Image built: `deployments-jurisdiction-svc:latest`
-- [x] Container running: `jurisdiction-rules-svc` (healthy)
-- [x] Health checks passing: /healthz, /readyz, /v1/jurisdictions
+**12 Nov 2026, JR-0 (before any change).** Host Go 1.26.7, `GOTMPDIR` on D: (Application Control blocked a test
+binary once; the rerun passed). Store and registry suites ran against scratch databases `jur_store_it` and
+`jur_reg_it` on the dev Postgres (`registryit` now takes `JUR_IT_DSN`; embedded Postgres stays the default).
+
+| Suite | Command | Pass | Fail | Skip |
+|---|---|---|---|---|
+| build + vet | `go build ./... && go vet ./...` | ✔ | — | — |
+| unit (all packages) | `go test -count=1 ./...` | 504 | 7 | 81 (the store DB tests, run below) |
+| store | `TEST_DATABASE_URL=… REQUIRE_DB_TESTS=1 go test -p 1 ./internal/store/` | 88 | 0 | 0 |
+| registryit | `JUR_IT_DSN=… go test -tags=integration ./internal/registryit/` | 115 | 0 | 0 |
+
+The 7 failures were the 11 Nov `TestJUR_ValidateAction_NegativePaths`, written against field names the
+route does not have and never run. The suite is rewritten (`internal/handler/negative_paths_test.go`): every
+case sends a real body and asserts status, `application/problem+json` and the problem code; 4 tests,
+21 cases, all pass. Dev DB: `migrate.py status --db jurisdiction_rules` → 36/36 applied.
+
+## 6. Evidence log
+
+One block per step, appended as each step lands.

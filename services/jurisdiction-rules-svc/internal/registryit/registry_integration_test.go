@@ -68,17 +68,28 @@ func applyAll(ctx context.Context, files []string) error {
 	return nil
 }
 
+// TestMain runs the suite against embedded Postgres, or, when JUR_IT_DSN is
+// set, against that database instead. The external database must be empty:
+// every migration is applied to it. JUR_IT_DSN exists for hosts where the
+// embedded server cannot run (it refuses to initdb as root in a container,
+// and Windows Application Control blocks its binaries).
 func TestMain(m *testing.M) {
-	port := uint32(17101 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Version(embeddedpostgres.V16).Port(port).Database("jur_test").Username("postgres").Password("postgres"))
-	if err := pg.Start(); err != nil {
-		fmt.Printf("embedded postgres: %v\n", err)
-		os.Exit(1)
-	}
 	ctx := context.Background()
 	var err error
-	pool, err = pgxpool.New(ctx, fmt.Sprintf("host=localhost port=%d dbname=jur_test user=postgres password=postgres sslmode=disable", port))
+	stop := func() error { return nil }
+	dsn := os.Getenv("JUR_IT_DSN")
+	if dsn == "" {
+		port := uint32(17101 + uint32(os.Getpid()%499))
+		pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
+			Version(embeddedpostgres.V16).Port(port).Database("jur_test").Username("postgres").Password("postgres"))
+		if err := pg.Start(); err != nil {
+			fmt.Printf("embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+		stop = pg.Stop
+		dsn = fmt.Sprintf("host=localhost port=%d dbname=jur_test user=postgres password=postgres sslmode=disable", port)
+	}
+	pool, err = pgxpool.New(ctx, dsn)
 	if err == nil {
 		for i := 0; i < 75; i++ {
 			if err = pool.Ping(ctx); err == nil {
@@ -94,7 +105,7 @@ func TestMain(m *testing.M) {
 	}
 	if err != nil {
 		fmt.Printf("setup: %v\n", err)
-		_ = pg.Stop()
+		_ = stop()
 		os.Exit(1)
 	}
 	log := zap.NewNop()
@@ -104,7 +115,7 @@ func TestMain(m *testing.M) {
 	st = store.New(pool, log)
 	code := m.Run()
 	pool.Close()
-	_ = pg.Stop()
+	_ = stop()
 	os.Exit(code)
 }
 
