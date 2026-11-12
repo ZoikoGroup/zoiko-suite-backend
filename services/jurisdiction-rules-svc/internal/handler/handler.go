@@ -110,6 +110,9 @@ type Handler struct {
 
 	// versions reads aggregate versions for ETag and If-Match (WithAggregateVersions).
 	versions VersionStore
+
+	// backfill rebuilds the entity projection from the registry (J-10, WithEntityBackfill).
+	backfill *entityBackfill
 }
 
 // New constructs a Handler.
@@ -282,6 +285,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	}
 	if h.outbox != nil {
 		registerOutboxRoutes(r, h)
+	}
+	if h.backfill != nil {
+		r.Post(backfillPath, h.BackfillEntityApplicability)
 	}
 }
 

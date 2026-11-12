@@ -39,6 +39,7 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
 	"zoiko.io/jurisdiction-rules-svc/internal/consumer"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	"zoiko.io/jurisdiction-rules-svc/internal/entityregistry"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
@@ -240,6 +241,13 @@ func main() {
 		log.Warn("pack signing disabled: PACK_SIGNING_KEY_REF/PACK_SIGNING_KEY_FILE are not set; the sign command will answer 503")
 	}
 	h.WithEntityApplicability(pgStore)
+	// J-10: the entity projection can be rebuilt from the registry for
+	// entities whose events left Kafka retention.
+	if cfg.TenantRegistryURL != "" {
+		h.WithEntityBackfill(entityregistry.New(cfg.TenantRegistryURL), pgStore)
+	} else {
+		log.Warn("TENANT_REGISTRY_URL unset: the entity applicability backfill route is not mounted")
+	}
 	// J-16: parked outbox events can be listed and requeued by an operator.
 	h.WithOutboxRecovery(pgStore)
 	// API-3: ETag on every aggregate read, If-Match on its commands.

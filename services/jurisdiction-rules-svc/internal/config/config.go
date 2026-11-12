@@ -23,6 +23,11 @@ type Config struct {
 	// No service self-authorizes (doctrine).
 	AuthZServiceURL string
 
+	// TenantRegistryURL is tenant-entity-registry-svc, read by the J-10
+	// backfill of the entity-jurisdiction projection. Empty disables the
+	// backfill route.
+	TenantRegistryURL string
+
 	// WorkflowServiceURL is workflow-svc, which confirms the approval a rule
 	// activation cites (J-02). Required outside local/dev.
 	WorkflowServiceURL string
@@ -156,6 +161,8 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8082),
+
+		TenantRegistryURL: env("TENANT_REGISTRY_URL", ""),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),
