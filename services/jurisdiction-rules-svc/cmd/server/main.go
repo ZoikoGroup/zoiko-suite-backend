@@ -182,6 +182,12 @@ func main() {
 	// guarantees the key is present).
 	r.Use(handler.IdempotencyMiddleware(pgStore, log))
 
+	// One database transaction per write request (J-11): its changes and the
+	// outbox rows announcing them commit together, and the response is sent
+	// only after the commit. Inside the idempotency middleware, so a replay is
+	// always of a committed response.
+	r.Use(handler.UnitOfWork(pgStore, log))
+
 	h := handler.New(pgStore, authzClient, publisher, cfg.AuthZPlatformScopeID, log)
 	var registryPub events.RegistryPublisher
 	if rp, ok := publisher.(events.RegistryPublisher); ok {

@@ -29,7 +29,7 @@ const idempotencyRetention = "24 hours"
 // the existing record when the key is already held — the caller compares
 // request hashes and replays or refuses.
 func (s *PgStore) ClaimIdempotencyKey(ctx context.Context, principalID, key, method, path, requestHash string) (*IdempotencyRecord, error) {
-	tag, err := s.pool.Exec(ctx, `
+	tag, err := s.db(ctx).Exec(ctx, `
 		INSERT INTO idempotency_keys (principal_id, idempotency_key, method, path, request_hash)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (principal_id, idempotency_key, method, path) DO UPDATE
@@ -48,7 +48,7 @@ func (s *PgStore) ClaimIdempotencyKey(ctx context.Context, principalID, key, met
 	var rec IdempotencyRecord
 	var status *int
 	var contentType *string
-	err = s.pool.QueryRow(ctx, `
+	err = s.db(ctx).QueryRow(ctx, `
 		SELECT request_hash, response_status, content_type, response_body
 		FROM idempotency_keys
 		WHERE principal_id = $1 AND idempotency_key = $2 AND method = $3 AND path = $4`,
@@ -72,7 +72,7 @@ func (s *PgStore) ClaimIdempotencyKey(ctx context.Context, principalID, key, met
 
 // CompleteIdempotencyKey stores the response of the request that owns the key.
 func (s *PgStore) CompleteIdempotencyKey(ctx context.Context, principalID, key, method, path string, status int, contentType string, body []byte) error {
-	_, err := s.pool.Exec(ctx, `
+	_, err := s.db(ctx).Exec(ctx, `
 		UPDATE idempotency_keys
 		SET response_status = $5, content_type = $6, response_body = $7
 		WHERE principal_id = $1 AND idempotency_key = $2 AND method = $3 AND path = $4`,
@@ -87,7 +87,7 @@ func (s *PgStore) CompleteIdempotencyKey(ctx context.Context, principalID, key, 
 // ReleaseIdempotencyKey forgets the key, so a request that failed in a way
 // worth retrying (5xx) can be retried under the same key.
 func (s *PgStore) ReleaseIdempotencyKey(ctx context.Context, principalID, key, method, path string) error {
-	_, err := s.pool.Exec(ctx, `
+	_, err := s.db(ctx).Exec(ctx, `
 		DELETE FROM idempotency_keys
 		WHERE principal_id = $1 AND idempotency_key = $2 AND method = $3 AND path = $4`,
 		principalID, key, method, path)

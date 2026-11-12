@@ -68,7 +68,7 @@ func (s *PgStore) crossPackReasons(ctx context.Context, ref, version string) ([]
 }
 
 func (s *PgStore) activeDeployments(ctx context.Context, versionID string) ([]domain.RingRegion, error) {
-	rows, err := s.pool.Query(ctx, `SELECT ring_code, region_code FROM pack_deployments WHERE pack_version_id::text=$1 AND status='ACTIVE'`, versionID)
+	rows, err := s.db(ctx).Query(ctx, `SELECT ring_code, region_code FROM pack_deployments WHERE pack_version_id::text=$1 AND status='ACTIVE'`, versionID)
 	if err != nil {
 		return nil, s.registryFail("activeDeployments", err, nil)
 	}

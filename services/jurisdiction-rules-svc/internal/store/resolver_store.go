@@ -28,7 +28,7 @@ func scanEligible(r pgx.Row) (domain.EligiblePack, error) {
 
 // ListEligiblePacks returns the pack versions whose status is in statuses.
 func (s *PgStore) ListEligiblePacks(ctx context.Context, statuses []string, ring, region string) ([]domain.EligiblePack, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+eligibleCols+` FROM jurisdiction_pack_versions v
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+eligibleCols+` FROM jurisdiction_pack_versions v
 		JOIN jurisdiction_packs p USING (pack_id) WHERE v.status = ANY($1)
 		  AND ($2 = '' OR $3 = '' OR EXISTS (SELECT 1 FROM pack_deployments d WHERE d.pack_version_id = v.pack_version_id
 		        AND d.ring_code = $2 AND d.region_code = $3 AND d.status = 'ACTIVE'))
@@ -50,7 +50,7 @@ func (s *PgStore) ListEligiblePacks(ctx context.Context, statuses []string, ring
 
 // FindPackVersion returns one pack version at any status (pinned replay).
 func (s *PgStore) FindPackVersion(ctx context.Context, ref, version string) (*domain.EligiblePack, error) {
-	p, err := scanEligible(s.pool.QueryRow(ctx, `SELECT `+eligibleCols+` FROM jurisdiction_pack_versions v
+	p, err := scanEligible(s.db(ctx).QueryRow(ctx, `SELECT `+eligibleCols+` FROM jurisdiction_pack_versions v
 		JOIN jurisdiction_packs p USING (pack_id) WHERE p.pack_ref=$1 AND v.version=$2`, ref, version))
 	if err != nil {
 		return nil, s.registryFail("FindPackVersion", err, domain.ErrPackVersionNotFound)
@@ -65,7 +65,7 @@ func (s *PgStore) FindPackVersion(ctx context.Context, ref, version string) (*do
 func (s *PgStore) LoadPack(ctx context.Context, packVersionID string) (*domain.LoadedPack, error) {
 	lp := &domain.LoadedPack{PackVersionID: packVersionID}
 	var vdigest *string
-	err := s.pool.QueryRow(ctx, `SELECT a.artifact, a.artifact_digest, v.artifact_digest, a.signature, a.signature_key_ref
+	err := s.db(ctx).QueryRow(ctx, `SELECT a.artifact, a.artifact_digest, v.artifact_digest, a.signature, a.signature_key_ref
 		FROM pack_artifacts a JOIN jurisdiction_pack_versions v USING (pack_version_id)
 		WHERE a.pack_version_id::text=$1`, packVersionID).
 		Scan(&lp.ArtifactJSON, &lp.ArtifactDigest, &vdigest, &lp.Signature, &lp.KeyRef)
@@ -88,7 +88,7 @@ func (s *PgStore) LoadPack(ctx context.Context, packVersionID string) (*domain.L
 		}
 	}
 	var c domain.LoadedCertification
-	err = s.pool.QueryRow(ctx, `SELECT certification_id::text, artifact_digest, report::text, report_digest, signature, signature_key_ref
+	err = s.db(ctx).QueryRow(ctx, `SELECT certification_id::text, artifact_digest, report::text, report_digest, signature, signature_key_ref
 		FROM pack_certifications WHERE pack_version_id::text=$1`, packVersionID).
 		Scan(&c.CertificationID, &c.ArtifactDigest, &c.ReportJSON, &c.ReportDigest, &c.Signature, &c.KeyRef)
 	switch {
@@ -165,7 +165,7 @@ func scanDecision(r pgx.Row) (*StoredDecision, error) {
 // (replayed=true); the same key with a different request is
 // ErrIdempotencyConflict.
 func (s *PgStore) RecordDecision(ctx context.Context, rec DecisionRecord) (*StoredDecision, bool, error) {
-	d, err := scanDecision(s.pool.QueryRow(ctx, `INSERT INTO rule_decision_evidence
+	d, err := scanDecision(s.db(ctx).QueryRow(ctx, `INSERT INTO rule_decision_evidence
 		(requested_by, correlation_id, idempotency_key, request_digest, request, effective_at, outcome, pack_ref, pack_version,
 		 pack_version_id, artifact_digest, certification_id, rule_id, rule_content_digest, basis, response, resolver_ring, resolver_region, decision_kind)
 		VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10::uuid,$11,$12::uuid,$13::uuid,$14,$15,$16::jsonb,$17,$18,$19)
@@ -180,7 +180,7 @@ func (s *PgStore) RecordDecision(ctx context.Context, rec DecisionRecord) (*Stor
 	if !errors.Is(err, pgx.ErrNoRows) || rec.IdempotencyKey == nil {
 		return nil, false, s.registryFail("RecordDecision", err, nil)
 	}
-	existing, err := scanDecision(s.pool.QueryRow(ctx, `SELECT `+decisionCols+` FROM rule_decision_evidence
+	existing, err := scanDecision(s.db(ctx).QueryRow(ctx, `SELECT `+decisionCols+` FROM rule_decision_evidence
 		WHERE requested_by=$1 AND idempotency_key=$2`, rec.RequestedBy, *rec.IdempotencyKey))
 	if err != nil {
 		return nil, false, s.registryFail("RecordDecision lookup", err, nil)
@@ -200,7 +200,7 @@ func nullIfEmpty(s string) *string {
 
 // GetDecision reads one stored decision.
 func (s *PgStore) GetDecision(ctx context.Context, id string) (*StoredDecision, error) {
-	d, err := scanDecision(s.pool.QueryRow(ctx, `SELECT `+decisionCols+` FROM rule_decision_evidence WHERE decision_id::text=$1`, id))
+	d, err := scanDecision(s.db(ctx).QueryRow(ctx, `SELECT `+decisionCols+` FROM rule_decision_evidence WHERE decision_id::text=$1`, id))
 	if err != nil {
 		return nil, s.registryFail("GetDecision", err, domain.ErrDecisionNotFound)
 	}

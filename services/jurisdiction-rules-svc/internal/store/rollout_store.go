@@ -90,7 +90,7 @@ type CreateRolloutParams struct {
 
 // CreateRollout adds a portfolio entry in PLANNED.
 func (s *PgStore) CreateRollout(ctx context.Context, p CreateRolloutParams) (*RolloutRecord, error) {
-	r, err := scanRollout(s.pool.QueryRow(ctx, `INSERT INTO jurisdiction_rollouts
+	r, err := scanRollout(s.db(ctx).QueryRow(ctx, `INSERT INTO jurisdiction_rollouts
 		(family_ref, display_name, layer, jurisdiction_code, scope_note, owner, support_owner, created_by)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+rolloutCols,
 		p.FamilyRef, p.DisplayName, p.Layer, p.JurisdictionCode, p.ScopeNote, p.Owner, p.SupportOwner, p.CreatedBy))
@@ -109,7 +109,7 @@ func (s *PgStore) SeedPortfolio(ctx context.Context, actor string) (created, exi
 			c := e.JurisdictionCode
 			code = &c
 		}
-		tag, err := s.pool.Exec(ctx, `INSERT INTO jurisdiction_rollouts (family_ref, display_name, layer, jurisdiction_code, scope_note, owner, created_by)
+		tag, err := s.db(ctx).Exec(ctx, `INSERT INTO jurisdiction_rollouts (family_ref, display_name, layer, jurisdiction_code, scope_note, owner, created_by)
 			VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (family_ref) DO NOTHING`, e.FamilyRef, e.DisplayName, e.Layer, code, e.Note, domain.UnassignedOwner, actor)
 		if err != nil {
 			return created, existing, s.registryFail("SeedPortfolio", err, nil)
@@ -128,7 +128,7 @@ func (s *PgStore) ListRollouts(ctx context.Context, status string, limit, offset
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+rolloutCols+` FROM jurisdiction_rollouts WHERE ($1 = '' OR status = $1) ORDER BY family_ref LIMIT $2 OFFSET $3`, status, limit, offset)
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+rolloutCols+` FROM jurisdiction_rollouts WHERE ($1 = '' OR status = $1) ORDER BY family_ref LIMIT $2 OFFSET $3`, status, limit, offset)
 	if err != nil {
 		return nil, s.registryFail("ListRollouts", err, nil)
 	}
@@ -201,14 +201,14 @@ func (s *PgStore) snapshot(ctx context.Context, q rowQuerier, id string, lock bo
 
 // GetRollout returns a rollout with its checklist state, expert decisions, packs, history and blockers.
 func (s *PgStore) GetRollout(ctx context.Context, id string) (*RolloutDetail, error) {
-	rec, snap, err := s.snapshot(ctx, s.pool, id, false)
+	rec, snap, err := s.snapshot(ctx, s.db(ctx), id, false)
 	if err != nil {
 		return nil, err
 	}
 	d := &RolloutDetail{Rollout: rec, Checklist: []ChecklistState{}, Approvals: []*ExpertApprovalRecord{}, Packs: []string{}, Events: []*RolloutEventRecord{}, Blockers: map[string][]string{}}
 
 	latest := map[string]ChecklistState{}
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT ON (item_code) item_code, met, evidence_ref, attested_by, attested_at FROM rollout_attestations
+	rows, err := s.db(ctx).Query(ctx, `SELECT DISTINCT ON (item_code) item_code, met, evidence_ref, attested_by, attested_at FROM rollout_attestations
 		WHERE rollout_id=$1::uuid ORDER BY item_code, attested_at DESC, attestation_id DESC`, rec.RolloutID)
 	if err != nil {
 		return nil, s.registryFail("GetRollout attestations", err, nil)
@@ -232,7 +232,7 @@ func (s *PgStore) GetRollout(ctx context.Context, id string) (*RolloutDetail, er
 		}
 	}
 
-	arows, err := s.pool.Query(ctx, `SELECT expert, qualification, scope, decision, notes, decided_at FROM rollout_expert_approvals WHERE rollout_id=$1::uuid ORDER BY decided_at, approval_id`, rec.RolloutID)
+	arows, err := s.db(ctx).Query(ctx, `SELECT expert, qualification, scope, decision, notes, decided_at FROM rollout_expert_approvals WHERE rollout_id=$1::uuid ORDER BY decided_at, approval_id`, rec.RolloutID)
 	if err != nil {
 		return nil, s.registryFail("GetRollout approvals", err, nil)
 	}
@@ -246,7 +246,7 @@ func (s *PgStore) GetRollout(ctx context.Context, id string) (*RolloutDetail, er
 	}
 	arows.Close()
 
-	prows, err := s.pool.Query(ctx, `SELECT p.pack_ref FROM rollout_packs rp JOIN jurisdiction_packs p USING (pack_id) WHERE rp.rollout_id=$1::uuid ORDER BY p.pack_ref`, rec.RolloutID)
+	prows, err := s.db(ctx).Query(ctx, `SELECT p.pack_ref FROM rollout_packs rp JOIN jurisdiction_packs p USING (pack_id) WHERE rp.rollout_id=$1::uuid ORDER BY p.pack_ref`, rec.RolloutID)
 	if err != nil {
 		return nil, s.registryFail("GetRollout packs", err, nil)
 	}
@@ -260,7 +260,7 @@ func (s *PgStore) GetRollout(ctx context.Context, id string) (*RolloutDetail, er
 	}
 	prows.Close()
 
-	erows, err := s.pool.Query(ctx, `SELECT from_status, to_status, actor, reason, occurred_at FROM rollout_events WHERE rollout_id=$1::uuid ORDER BY occurred_at, event_id`, rec.RolloutID)
+	erows, err := s.db(ctx).Query(ctx, `SELECT from_status, to_status, actor, reason, occurred_at FROM rollout_events WHERE rollout_id=$1::uuid ORDER BY occurred_at, event_id`, rec.RolloutID)
 	if err != nil {
 		return nil, s.registryFail("GetRollout events", err, nil)
 	}
@@ -287,7 +287,7 @@ func (s *PgStore) GetRollout(ctx context.Context, id string) (*RolloutDetail, er
 // SetRolloutOwner assigns the accountable owner and support owner. The new owner must not already have
 // attested to or approved this rollout (they would be marking their own work).
 func (s *PgStore) SetRolloutOwner(ctx context.Context, id, owner string, supportOwner *string) (*RolloutRecord, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.db(ctx).Begin(ctx)
 	if err != nil {
 		return nil, s.registryFail("SetRolloutOwner begin", err, nil)
 	}
@@ -320,18 +320,18 @@ func (s *PgStore) SetRolloutOwner(ctx context.Context, id, owner string, support
 
 // LinkRolloutPacks links packs (by pack_ref) to the rollout. Linking is additive and idempotent.
 func (s *PgStore) LinkRolloutPacks(ctx context.Context, id string, packRefs []string, actor string) error {
-	if _, err := scanRollout(s.pool.QueryRow(ctx, `SELECT `+rolloutCols+` FROM jurisdiction_rollouts WHERE rollout_id::text=$1`, id)); err != nil {
+	if _, err := scanRollout(s.db(ctx).QueryRow(ctx, `SELECT `+rolloutCols+` FROM jurisdiction_rollouts WHERE rollout_id::text=$1`, id)); err != nil {
 		return s.registryFail("LinkRolloutPacks", err, domain.ErrRolloutNotFound)
 	}
 	for _, ref := range packRefs {
-		tag, err := s.pool.Exec(ctx, `INSERT INTO rollout_packs (rollout_id, pack_id, linked_by)
+		tag, err := s.db(ctx).Exec(ctx, `INSERT INTO rollout_packs (rollout_id, pack_id, linked_by)
 			SELECT $1::uuid, pack_id, $3 FROM jurisdiction_packs WHERE pack_ref=$2 ON CONFLICT DO NOTHING`, id, ref, actor)
 		if err != nil {
 			return s.registryFail("LinkRolloutPacks insert", err, nil)
 		}
 		if tag.RowsAffected() == 0 {
 			var n int
-			if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM jurisdiction_packs WHERE pack_ref=$1`, ref).Scan(&n); err != nil {
+			if err := s.db(ctx).QueryRow(ctx, `SELECT COUNT(*) FROM jurisdiction_packs WHERE pack_ref=$1`, ref).Scan(&n); err != nil {
 				return s.registryFail("LinkRolloutPacks check", err, nil)
 			}
 			if n == 0 {
@@ -344,20 +344,20 @@ func (s *PgStore) LinkRolloutPacks(ctx context.Context, id string, packRefs []st
 
 // AddAttestation records one Definition of Ready or Done answer. The latest answer for an item is current.
 func (s *PgStore) AddAttestation(ctx context.Context, id, checklist, item string, met bool, evidence, actor string) error {
-	if _, err := scanRollout(s.pool.QueryRow(ctx, `SELECT `+rolloutCols+` FROM jurisdiction_rollouts WHERE rollout_id::text=$1`, id)); err != nil {
+	if _, err := scanRollout(s.db(ctx).QueryRow(ctx, `SELECT `+rolloutCols+` FROM jurisdiction_rollouts WHERE rollout_id::text=$1`, id)); err != nil {
 		return s.registryFail("AddAttestation", err, domain.ErrRolloutNotFound)
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO rollout_attestations (rollout_id, checklist, item_code, met, evidence_ref, attested_by) VALUES ($1::uuid,$2,$3,$4,$5,$6)`,
+	_, err := s.db(ctx).Exec(ctx, `INSERT INTO rollout_attestations (rollout_id, checklist, item_code, met, evidence_ref, attested_by) VALUES ($1::uuid,$2,$3,$4,$5,$6)`,
 		id, checklist, item, met, evidence, actor)
 	return s.registryFail("AddAttestation insert", err, nil)
 }
 
 // AddExpertApproval records a qualified expert decision.
 func (s *PgStore) AddExpertApproval(ctx context.Context, id, expert, qualification, scope, decision, notes string) error {
-	if _, err := scanRollout(s.pool.QueryRow(ctx, `SELECT `+rolloutCols+` FROM jurisdiction_rollouts WHERE rollout_id::text=$1`, id)); err != nil {
+	if _, err := scanRollout(s.db(ctx).QueryRow(ctx, `SELECT `+rolloutCols+` FROM jurisdiction_rollouts WHERE rollout_id::text=$1`, id)); err != nil {
 		return s.registryFail("AddExpertApproval", err, domain.ErrRolloutNotFound)
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO rollout_expert_approvals (rollout_id, expert, qualification, scope, decision, notes) VALUES ($1::uuid,$2,$3,$4,$5,$6)`,
+	_, err := s.db(ctx).Exec(ctx, `INSERT INTO rollout_expert_approvals (rollout_id, expert, qualification, scope, decision, notes) VALUES ($1::uuid,$2,$3,$4,$5,$6)`,
 		id, expert, qualification, scope, decision, notes)
 	return s.registryFail("AddExpertApproval insert", err, nil)
 }
@@ -365,7 +365,7 @@ func (s *PgStore) AddExpertApproval(ctx context.Context, id, expert, qualificati
 // TransitionRollout moves a rollout, refusing with the full list of blockers when a gate is not met.
 // The database enforces the same gates as a second line of defence.
 func (s *PgStore) TransitionRollout(ctx context.Context, id, to, actor, reason string) (*RolloutRecord, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.db(ctx).Begin(ctx)
 	if err != nil {
 		return nil, s.registryFail("TransitionRollout begin", err, nil)
 	}
@@ -409,7 +409,7 @@ type SupportItem struct {
 // JurisdictionSupport reports production support for a jurisdiction code: it is supported only when a
 // LAUNCHED rollout names it AND one of that rollout's packs has a RELEASED version that covers it.
 func (s *PgStore) JurisdictionSupport(ctx context.Context, code string) (*SupportView, error) {
-	rows, err := s.pool.Query(ctx, `SELECT rollout_id::text, family_ref, status FROM jurisdiction_rollouts
+	rows, err := s.db(ctx).Query(ctx, `SELECT rollout_id::text, family_ref, status FROM jurisdiction_rollouts
 		WHERE jurisdiction_code=$1 AND status <> 'RETIRED' ORDER BY family_ref`, code)
 	if err != nil {
 		return nil, s.registryFail("JurisdictionSupport", err, nil)
@@ -436,7 +436,7 @@ func (s *PgStore) JurisdictionSupport(ctx context.Context, code string) (*Suppor
 	case len(launched) > 0:
 		covered := false
 		for _, id := range launched {
-			if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM rollout_packs rp
+			if err := s.db(ctx).QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM rollout_packs rp
 				JOIN jurisdiction_pack_versions v ON v.pack_id = rp.pack_id AND v.status = 'RELEASED'
 				JOIN pack_version_jurisdictions pj ON pj.pack_version_id = v.pack_version_id
 				JOIN jurisdictions j ON j.jurisdiction_id = pj.jurisdiction_id

@@ -195,11 +195,11 @@ func (s *PgStore) remediationProgress(ctx context.Context, q querier, caseID str
 
 // GetRemediationCase reads one case with its progress.
 func (s *PgStore) GetRemediationCase(ctx context.Context, id string) (*RemediationCase, error) {
-	c, err := scanRemediation(s.pool.QueryRow(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE c.case_id::text=$1`, id))
+	c, err := scanRemediation(s.db(ctx).QueryRow(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE c.case_id::text=$1`, id))
 	if err != nil {
 		return nil, s.registryFail("GetRemediationCase", err, domain.ErrRemediationNotFound)
 	}
-	if c.Progress, err = s.remediationProgress(ctx, s.pool, id); err != nil {
+	if c.Progress, err = s.remediationProgress(ctx, s.db(ctx), id); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -208,7 +208,7 @@ func (s *PgStore) GetRemediationCase(ctx context.Context, id string) (*Remediati
 // ListRemediationCases lists cases, newest first, optionally by status (OPEN or CLOSED).
 func (s *PgStore) ListRemediationCases(ctx context.Context, status string, limit, offset int) ([]*RemediationCase, error) {
 	limit = pageLimit(limit, 50, 200)
-	rows, err := s.pool.Query(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE ($1='' OR c.status=$1) ORDER BY c.opened_at DESC, c.case_id LIMIT $2 OFFSET $3`, status, limit, offset)
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE ($1='' OR c.status=$1) ORDER BY c.opened_at DESC, c.case_id LIMIT $2 OFFSET $3`, status, limit, offset)
 	if err != nil {
 		return nil, s.registryFail("ListRemediationCases", err, nil)
 	}
@@ -230,7 +230,7 @@ func (s *PgStore) ListRemediationDecisions(ctx context.Context, caseID string, p
 	if _, err := s.GetRemediationCase(ctx, caseID); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT e.decision_id::text, e.decision_kind, e.outcome, e.effective_at, e.created_at, e.requested_by, COALESCE(e.resolver_ring,''), COALESCE(e.resolver_region,''),
+	rows, err := s.db(ctx).Query(ctx, `SELECT e.decision_id::text, e.decision_kind, e.outcome, e.effective_at, e.created_at, e.requested_by, COALESCE(e.resolver_ring,''), COALESCE(e.resolver_region,''),
 			x.disposition, x.evidence_ref, x.note, x.new_decision_id::text, x.recorded_by, x.recorded_at
 		FROM remediation_case_decisions d JOIN rule_decision_evidence e ON e.decision_id = d.decision_id
 		LEFT JOIN remediation_dispositions x ON x.case_id = d.case_id AND x.decision_id = d.decision_id

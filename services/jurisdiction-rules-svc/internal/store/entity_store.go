@@ -25,7 +25,7 @@ const applicabilityColumns = `applicability_id, tenant_id, legal_entity_id, juri
 // event (an out-of-order delivery — an ASSIGNED arriving after its END_DATED
 // must not reopen the assignment).
 func (s *PgStore) ApplyEntityApplicability(ctx context.Context, eventID, eventType string, a domain.EntityJurisdictionApplicability) (bool, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.db(ctx).Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
@@ -70,7 +70,7 @@ func (s *PgStore) ApplyEntityApplicability(ctx context.Context, eventID, eventTy
 			// forever. The failed statement aborted the transaction (a commit
 			// now would silently roll back), so the record is its own write.
 			_ = tx.Rollback(ctx)
-			if _, derr := s.pool.Exec(ctx, `
+			if _, derr := s.db(ctx).Exec(ctx, `
 				INSERT INTO consumed_events (event_id, event_type) VALUES ($1, $2)
 				ON CONFLICT (event_id) DO NOTHING`, eventID, eventType); derr != nil {
 				return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, derr)
@@ -95,7 +95,7 @@ func (s *PgStore) ListEntityJurisdictions(ctx context.Context, tenantID, legalEn
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db(ctx).Query(ctx, `
 		SELECT `+applicabilityColumns+`
 		FROM entity_jurisdiction_applicability
 		WHERE tenant_id = $1 AND legal_entity_id = $2

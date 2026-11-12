@@ -83,7 +83,7 @@ func scanSubmission(r pgx.Row) (*SubmissionRecord, error) {
 // the same caller with the same request returns the stored submission
 // (replayed=true); the same key with a different request is ErrIdempotencyConflict.
 func (s *PgStore) CreateSubmission(ctx context.Context, p CreateSubmissionParams) (*SubmissionRecord, bool, error) {
-	rec, err := scanSubmission(s.pool.QueryRow(ctx, `INSERT INTO regulatory_submissions
+	rec, err := scanSubmission(s.db(ctx).QueryRow(ctx, `INSERT INTO regulatory_submissions
 		(submission_kind, jurisdiction_code, profile_code, subject_ref, payload_hash, status, effective_at, pack_version_id, artifact_digest,
 		 rule_id, rule_content_digest, profile_snapshot, dependencies_used, approvals, submitted_by, idempotency_key, request_digest)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8::uuid,$9,$10::uuid,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16,$17)
@@ -97,7 +97,7 @@ func (s *PgStore) CreateSubmission(ctx context.Context, p CreateSubmissionParams
 	if !errors.Is(err, pgx.ErrNoRows) || p.IdempotencyKey == nil {
 		return nil, false, s.registryFail("CreateSubmission", err, nil)
 	}
-	existing, err := scanSubmission(s.pool.QueryRow(ctx, `SELECT `+submissionCols+` FROM regulatory_submissions
+	existing, err := scanSubmission(s.db(ctx).QueryRow(ctx, `SELECT `+submissionCols+` FROM regulatory_submissions
 		WHERE submitted_by=$1 AND idempotency_key=$2`, p.SubmittedBy, *p.IdempotencyKey))
 	if err != nil {
 		return nil, false, s.registryFail("CreateSubmission lookup", err, nil)
@@ -122,7 +122,7 @@ func scanEvent(r pgx.Row) (*SubmissionEventRecord, error) {
 }
 
 func (s *PgStore) listSubmissionEvents(ctx context.Context, id string) ([]*SubmissionEventRecord, error) {
-	rows, err := s.pool.Query(ctx, eventSelect+` WHERE submission_id=$1::uuid ORDER BY received_at, event_row_id`, id)
+	rows, err := s.db(ctx).Query(ctx, eventSelect+` WHERE submission_id=$1::uuid ORDER BY received_at, event_row_id`, id)
 	if err != nil {
 		return nil, s.registryFail("listSubmissionEvents", err, nil)
 	}
@@ -140,7 +140,7 @@ func (s *PgStore) listSubmissionEvents(ctx context.Context, id string) ([]*Submi
 
 // GetSubmission reads a submission with its status reports in arrival order.
 func (s *PgStore) GetSubmission(ctx context.Context, id string) (*SubmissionRecord, []*SubmissionEventRecord, error) {
-	rec, err := scanSubmission(s.pool.QueryRow(ctx, `SELECT `+submissionCols+` FROM regulatory_submissions WHERE submission_id::text=$1`, id))
+	rec, err := scanSubmission(s.db(ctx).QueryRow(ctx, `SELECT `+submissionCols+` FROM regulatory_submissions WHERE submission_id::text=$1`, id))
 	if err != nil {
 		return nil, nil, s.registryFail("GetSubmission", err, domain.ErrSubmissionNotFound)
 	}
@@ -173,7 +173,7 @@ type SubmissionEventResult struct {
 // late after a final outcome, illegal, or missing a required receipt are stored
 // with their disposition and never change the status (JUR-NEG-09, 10, 11).
 func (s *PgStore) RecordSubmissionEvent(ctx context.Context, id string, p SubmissionEventParams) (*SubmissionEventResult, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.db(ctx).Begin(ctx)
 	if err != nil {
 		return nil, s.registryFail("RecordSubmissionEvent begin", err, nil)
 	}

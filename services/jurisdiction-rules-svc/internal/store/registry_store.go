@@ -66,7 +66,7 @@ func (s *PgStore) registryFail(op string, err error, notFound error) error {
 }
 
 func (s *PgStore) begin(ctx context.Context, op string) (pgx.Tx, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.db(ctx).Begin(ctx)
 	if err != nil {
 		s.log.Error("pg "+op+": begin failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -122,7 +122,7 @@ func scanPackVersion(r pgx.Row) (*domain.PackVersion, error) {
 // CreateRegime inserts a regime idempotently by code. A replay with a
 // different name is a conflict, not a silent rename.
 func (s *PgStore) CreateRegime(ctx context.Context, p domain.CreateRegimeParams) (*domain.Regime, bool, error) {
-	row := s.pool.QueryRow(ctx, `
+	row := s.db(ctx).QueryRow(ctx, `
 		INSERT INTO regulatory_regimes (regime_code, regime_name, description, created_by_principal_id)
 		VALUES ($1,$2,$3,$4)
 		ON CONFLICT (regime_code) DO NOTHING
@@ -134,7 +134,7 @@ func (s *PgStore) CreateRegime(ctx context.Context, p domain.CreateRegimeParams)
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, s.registryFail("CreateRegime", err, nil)
 	}
-	x, err = scanRegime(s.pool.QueryRow(ctx, `SELECT `+regimeCols+` FROM regulatory_regimes WHERE regime_code=$1`, p.RegimeCode))
+	x, err = scanRegime(s.db(ctx).QueryRow(ctx, `SELECT `+regimeCols+` FROM regulatory_regimes WHERE regime_code=$1`, p.RegimeCode))
 	if err != nil {
 		return nil, false, s.registryFail("CreateRegime lookup", err, nil)
 	}
@@ -145,7 +145,7 @@ func (s *PgStore) CreateRegime(ctx context.Context, p domain.CreateRegimeParams)
 }
 
 func (s *PgStore) GetRegime(ctx context.Context, id string) (*domain.Regime, error) {
-	x, err := scanRegime(s.pool.QueryRow(ctx, `SELECT `+regimeCols+` FROM regulatory_regimes WHERE regime_id::text=$1 OR regime_code=$1`, id))
+	x, err := scanRegime(s.db(ctx).QueryRow(ctx, `SELECT `+regimeCols+` FROM regulatory_regimes WHERE regime_id::text=$1 OR regime_code=$1`, id))
 	if err != nil {
 		return nil, s.registryFail("GetRegime", err, domain.ErrRegimeNotFound)
 	}
@@ -153,7 +153,7 @@ func (s *PgStore) GetRegime(ctx context.Context, id string) (*domain.Regime, err
 }
 
 func (s *PgStore) ListRegimes(ctx context.Context) ([]*domain.Regime, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+regimeCols+` FROM regulatory_regimes ORDER BY regime_code`)
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+regimeCols+` FROM regulatory_regimes ORDER BY regime_code`)
 	if err != nil {
 		return nil, s.registryFail("ListRegimes", err, nil)
 	}
@@ -181,7 +181,7 @@ func (s *PgStore) CreateSource(ctx context.Context, p domain.CreateSourceParams)
 	if p.Language == "" {
 		p.Language = "en"
 	}
-	row := s.pool.QueryRow(ctx, `
+	row := s.db(ctx).QueryRow(ctx, `
 		INSERT INTO regulatory_sources (jurisdiction_id, authority, source_type, authority_level, title,
 			official_identifier, published_on, effective_on, location, snapshot_hash, snapshot_ref, language,
 			translation_ref, interpretation_notes, created_by_principal_id)
@@ -198,7 +198,7 @@ func (s *PgStore) CreateSource(ctx context.Context, p domain.CreateSourceParams)
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, s.registryFail("CreateSource", err, nil)
 	}
-	x, err = scanSource(s.pool.QueryRow(ctx, `SELECT `+sourceCols+` FROM regulatory_sources
+	x, err = scanSource(s.db(ctx).QueryRow(ctx, `SELECT `+sourceCols+` FROM regulatory_sources
 		WHERE jurisdiction_id=$1 AND authority=$2 AND snapshot_hash=$3`, p.JurisdictionID, p.Authority, p.SnapshotHash))
 	if err != nil {
 		return nil, false, s.registryFail("CreateSource lookup", err, nil)
@@ -210,7 +210,7 @@ func (s *PgStore) CreateSource(ctx context.Context, p domain.CreateSourceParams)
 }
 
 func (s *PgStore) GetSource(ctx context.Context, id string) (*domain.RegulatorySource, error) {
-	x, err := scanSource(s.pool.QueryRow(ctx, `SELECT `+sourceCols+` FROM regulatory_sources WHERE source_id::text=$1`, id))
+	x, err := scanSource(s.db(ctx).QueryRow(ctx, `SELECT `+sourceCols+` FROM regulatory_sources WHERE source_id::text=$1`, id))
 	if err != nil {
 		return nil, s.registryFail("GetSource", err, domain.ErrSourceNotFound)
 	}
@@ -219,7 +219,7 @@ func (s *PgStore) GetSource(ctx context.Context, id string) (*domain.RegulatoryS
 
 // ListSources lists sources, newest first, optionally filtered.
 func (s *PgStore) ListSources(ctx context.Context, jurisdictionID, authority string, limit, offset int) ([]*domain.RegulatorySource, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+sourceCols+` FROM regulatory_sources
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+sourceCols+` FROM regulatory_sources
 		WHERE ($1 = '' OR jurisdiction_id::text = $1) AND ($2 = '' OR authority = $2)
 		ORDER BY created_at DESC, source_id LIMIT $3 OFFSET $4`,
 		jurisdictionID, authority, clampLimit(limit, 50, 200), offset)
@@ -254,7 +254,7 @@ func (s *PgStore) ReviewSource(ctx context.Context, id, reviewer string) (*domai
 		}
 		return nil, false, domain.ErrAlreadyDecided
 	}
-	x, err := scanSource(s.pool.QueryRow(ctx, `UPDATE regulatory_sources
+	x, err := scanSource(s.db(ctx).QueryRow(ctx, `UPDATE regulatory_sources
 		SET reviewed_by_principal_id=$2, reviewed_at=NOW()
 		WHERE source_id::text=$1 AND reviewed_by_principal_id IS NULL
 		RETURNING `+sourceCols, id, reviewer))
@@ -289,7 +289,7 @@ func (s *PgStore) SupersedeSource(ctx context.Context, id, replacementID string)
 		}
 		return nil, false, err
 	}
-	x, err := scanSource(s.pool.QueryRow(ctx, `UPDATE regulatory_sources
+	x, err := scanSource(s.db(ctx).QueryRow(ctx, `UPDATE regulatory_sources
 		SET superseded_by_source_id=$2, superseded_at=NOW()
 		WHERE source_id::text=$1 AND superseded_by_source_id IS NULL
 		RETURNING `+sourceCols, id, replacementID))
@@ -369,11 +369,11 @@ func (s *PgStore) CreateInterpretation(ctx context.Context, p domain.CreateInter
 }
 
 func (s *PgStore) GetInterpretation(ctx context.Context, id string) (*domain.InterpretationRecord, error) {
-	x, err := scanInterp(s.pool.QueryRow(ctx, `SELECT `+interpCols+` FROM interpretation_records WHERE interpretation_id::text=$1`, id))
+	x, err := scanInterp(s.db(ctx).QueryRow(ctx, `SELECT `+interpCols+` FROM interpretation_records WHERE interpretation_id::text=$1`, id))
 	if err != nil {
 		return nil, s.registryFail("GetInterpretation", err, domain.ErrInterpretationNotFound)
 	}
-	x.SourceIDs, err = s.interpretationSources(ctx, s.pool, x.InterpretationID)
+	x.SourceIDs, err = s.interpretationSources(ctx, s.db(ctx), x.InterpretationID)
 	return x, err
 }
 
@@ -395,7 +395,7 @@ func (s *PgStore) ApproveInterpretation(ctx context.Context, id, approver string
 		return nil, false, domain.ErrNotIndependent
 	}
 	var unready int
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM regulatory_sources rs
+	if err := s.db(ctx).QueryRow(ctx, `SELECT COUNT(*) FROM regulatory_sources rs
 		JOIN interpretation_sources i ON i.source_id = rs.source_id
 		WHERE i.interpretation_id::text=$1 AND (rs.reviewed_by_principal_id IS NULL OR rs.superseded_by_source_id IS NOT NULL)`,
 		id).Scan(&unready); err != nil {
@@ -404,7 +404,7 @@ func (s *PgStore) ApproveInterpretation(ctx context.Context, id, approver string
 	if unready > 0 {
 		return nil, false, domain.ErrSourceNotReady
 	}
-	x, err := scanInterp(s.pool.QueryRow(ctx, `UPDATE interpretation_records
+	x, err := scanInterp(s.db(ctx).QueryRow(ctx, `UPDATE interpretation_records
 		SET status='APPROVED', approved_by_principal_id=$2, approved_at=NOW()
 		WHERE interpretation_id::text=$1 AND status='PENDING' RETURNING `+interpCols, id, approver))
 	if err != nil {
@@ -420,7 +420,7 @@ func (s *PgStore) ApproveInterpretation(ctx context.Context, id, approver string
 // ── packs ───────────────────────────────────────────────────────────────────
 
 func (s *PgStore) CreatePack(ctx context.Context, p domain.CreatePackParams) (*domain.Pack, bool, error) {
-	x, err := scanPack(s.pool.QueryRow(ctx, `INSERT INTO jurisdiction_packs (pack_ref, pack_name, owner, support_owner, created_by_principal_id)
+	x, err := scanPack(s.db(ctx).QueryRow(ctx, `INSERT INTO jurisdiction_packs (pack_ref, pack_name, owner, support_owner, created_by_principal_id)
 		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (pack_ref) DO NOTHING RETURNING `+packCols,
 		p.PackRef, p.PackName, p.Owner, p.SupportOwner, p.CreatedBy))
 	if err == nil {
@@ -429,7 +429,7 @@ func (s *PgStore) CreatePack(ctx context.Context, p domain.CreatePackParams) (*d
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, s.registryFail("CreatePack", err, nil)
 	}
-	x, err = scanPack(s.pool.QueryRow(ctx, `SELECT `+packCols+` FROM jurisdiction_packs WHERE pack_ref=$1`, p.PackRef))
+	x, err = scanPack(s.db(ctx).QueryRow(ctx, `SELECT `+packCols+` FROM jurisdiction_packs WHERE pack_ref=$1`, p.PackRef))
 	if err != nil {
 		return nil, false, s.registryFail("CreatePack lookup", err, nil)
 	}
@@ -440,7 +440,7 @@ func (s *PgStore) CreatePack(ctx context.Context, p domain.CreatePackParams) (*d
 }
 
 func (s *PgStore) GetPack(ctx context.Context, ref string) (*domain.Pack, error) {
-	x, err := scanPack(s.pool.QueryRow(ctx, `SELECT `+packCols+` FROM jurisdiction_packs WHERE pack_ref=$1`, ref))
+	x, err := scanPack(s.db(ctx).QueryRow(ctx, `SELECT `+packCols+` FROM jurisdiction_packs WHERE pack_ref=$1`, ref))
 	if err != nil {
 		return nil, s.registryFail("GetPack", err, domain.ErrPackNotFound)
 	}
@@ -448,7 +448,7 @@ func (s *PgStore) GetPack(ctx context.Context, ref string) (*domain.Pack, error)
 }
 
 func (s *PgStore) ListPacks(ctx context.Context, limit, offset int) ([]*domain.Pack, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+packCols+` FROM jurisdiction_packs ORDER BY pack_ref LIMIT $1 OFFSET $2`,
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+packCols+` FROM jurisdiction_packs ORDER BY pack_ref LIMIT $1 OFFSET $2`,
 		clampLimit(limit, 50, 200), offset)
 	if err != nil {
 		return nil, s.registryFail("ListPacks", err, nil)
@@ -637,7 +637,7 @@ func (s *PgStore) resolveCodes(ctx context.Context, q querier, query string, cod
 }
 
 func (s *PgStore) GetPackVersion(ctx context.Context, ref, version string) (*domain.PackVersion, error) {
-	v, err := scanPackVersion(s.pool.QueryRow(ctx, `SELECT `+packVersionCols+` FROM jurisdiction_pack_versions v
+	v, err := scanPackVersion(s.db(ctx).QueryRow(ctx, `SELECT `+packVersionCols+` FROM jurisdiction_pack_versions v
 		JOIN jurisdiction_packs p USING (pack_id) WHERE p.pack_ref=$1 AND v.version=$2`, ref, version))
 	if err != nil {
 		return nil, s.registryFail("GetPackVersion", err, domain.ErrPackVersionNotFound)
@@ -649,7 +649,7 @@ func (s *PgStore) ListPackVersions(ctx context.Context, ref string) ([]*domain.P
 	if _, err := s.GetPack(ctx, ref); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+packVersionCols+` FROM jurisdiction_pack_versions v
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+packVersionCols+` FROM jurisdiction_pack_versions v
 		JOIN jurisdiction_packs p USING (pack_id) WHERE p.pack_ref=$1 ORDER BY v.created_at DESC, v.version DESC`, ref)
 	if err != nil {
 		return nil, s.registryFail("ListPackVersions", err, nil)
@@ -680,7 +680,7 @@ func (s *PgStore) SubmitPackVersionForReview(ctx context.Context, ref, version, 
 	if cur.Status != "DRAFT" {
 		return nil, false, domain.ErrNotDraft
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE jurisdiction_pack_versions SET status='REVIEW', updated_at=NOW(), updated_by_principal_id=$2
+	tag, err := s.db(ctx).Exec(ctx, `UPDATE jurisdiction_pack_versions SET status='REVIEW', updated_at=NOW(), updated_by_principal_id=$2
 		WHERE pack_version_id::text=$1 AND status='DRAFT'`, cur.PackVersionID, actor)
 	if err != nil {
 		return nil, false, s.registryFail("SubmitPackVersionForReview", err, nil)
@@ -791,7 +791,7 @@ func (s *PgStore) SetRuleProvenance(ctx context.Context, p domain.SetRuleProvena
 }
 
 func (s *PgStore) GetRuleProvenance(ctx context.Context, ruleID string) (*domain.RuleProvenance, error) {
-	return s.ruleProvenance(ctx, s.pool, ruleID)
+	return s.ruleProvenance(ctx, s.db(ctx), ruleID)
 }
 
 func (s *PgStore) ruleProvenance(ctx context.Context, q querier, ruleID string) (*domain.RuleProvenance, error) {
@@ -893,5 +893,5 @@ func (s *PgStore) getRuleParametersTx(ctx context.Context, q querier, ruleID str
 
 // GetRuleParameters returns a rule's parameters (nil when it has none).
 func (s *PgStore) GetRuleParameters(ctx context.Context, ruleID string) (json.RawMessage, error) {
-	return s.getRuleParametersTx(ctx, s.pool, ruleID)
+	return s.getRuleParametersTx(ctx, s.db(ctx), ruleID)
 }

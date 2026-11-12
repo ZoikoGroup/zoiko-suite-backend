@@ -197,6 +197,9 @@ func newEnvWithSigner(signer domain.Signer) *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
 	r := chi.NewRouter()
+	// As main.go mounts it: every write request runs in one transaction, so
+	// the whole suite exercises the unit of work's statement semantics.
+	r.Use(handler.UnitOfWork(st, zap.NewNop()))
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub)
 	if signer != nil {
 		h.WithSigner(signer)

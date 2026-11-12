@@ -6,8 +6,9 @@ import (
 	"go.uber.org/zap"
 )
 
-// ZS-JUR-001 s26 registry event families. Published as facts after the
-// write commits, in the same envelope as every other event of this service.
+// ZS-JUR-001 s26 registry event families, in the same envelope as every other
+// event of this service. Written to the outbox inside the request's unit of
+// work, so an event exists exactly when the write it announces committed.
 const (
 	EventRegimeCreated          = "regulatory-regime.created"
 	EventSourceCaptured         = "regulatory-source.captured"
@@ -30,7 +31,9 @@ type RegistryPublisher interface {
 // PublishRegistryEvent implements RegistryPublisher. The event goes to the
 // transactional outbox (the OutboxWorker relays it to Kafka), so a broker
 // outage cannot lose it. aggregate_id keys the partition so all events about
-// one record stay ordered.
+// one record stay ordered. Inside a request's unit of work the outbox row is
+// written in the same transaction as the change it announces (J-11): the two
+// commit together or neither does.
 func (p *OutboxPublisher) PublishRegistryEvent(ctx context.Context, eventType, aggregateID, actorID, correlationID string, payload map[string]any) error {
 	body := make(map[string]any, len(payload)+1)
 	for k, v := range payload {
@@ -38,7 +41,7 @@ func (p *OutboxPublisher) PublishRegistryEvent(ctx context.Context, eventType, a
 	}
 	body["aggregate_id"] = aggregateID
 	jurisdictionID, _ := payload["jurisdiction_id"].(string)
-	return p.emitToOutbox(ctx, p.store.Pool(), eventType, correlationID, jurisdictionID, actorID, body)
+	return p.emitToOutbox(ctx, p.store.DB(ctx), eventType, correlationID, jurisdictionID, actorID, body)
 }
 
 // PublishRegistryEvent implements RegistryPublisher by dropping the event.

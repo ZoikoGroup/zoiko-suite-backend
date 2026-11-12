@@ -155,11 +155,11 @@ func (s *PgStore) ResolveCalendarVersion(ctx context.Context, code, on string, k
 	var id string
 	var err error
 	if pin != nil {
-		err = s.pool.QueryRow(ctx, `
+		err = s.db(ctx).QueryRow(ctx, `
 			SELECT v.calendar_version_id::text FROM regulatory_calendar_versions v JOIN regulatory_calendars c USING (calendar_id)
 			WHERE c.calendar_code=$1 AND v.version=$2 AND v.status='PUBLISHED' AND v.published_at <= $3`, code, *pin, known).Scan(&id)
 	} else {
-		err = s.pool.QueryRow(ctx, `
+		err = s.db(ctx).QueryRow(ctx, `
 			SELECT v.calendar_version_id::text FROM regulatory_calendar_versions v JOIN regulatory_calendars c USING (calendar_id)
 			WHERE c.calendar_code=$1 AND v.status='PUBLISHED' AND v.effective_from <= $2::date AND v.published_at <= $3
 			ORDER BY v.version DESC LIMIT 1`, code, on, known).Scan(&id)
@@ -170,7 +170,7 @@ func (s *PgStore) ResolveCalendarVersion(ctx context.Context, code, on string, k
 	if err != nil {
 		return nil, false, s.registryFail("ResolveCalendarVersion", err, nil)
 	}
-	rec, err := s.loadCalendarVersion(ctx, s.pool, `v.calendar_version_id::text=$1`, id)
+	rec, err := s.loadCalendarVersion(ctx, s.db(ctx), `v.calendar_version_id::text=$1`, id)
 	if err != nil {
 		return nil, false, s.registryFail("ResolveCalendarVersion read", err, nil)
 	}
@@ -186,12 +186,12 @@ func (s *PgStore) CalendarHolidayChanges(ctx context.Context, code string, versi
 	}
 	var prev []domain.Holiday
 	var prevID string
-	err = s.pool.QueryRow(ctx, `
+	err = s.db(ctx).QueryRow(ctx, `
 		SELECT v.calendar_version_id::text FROM regulatory_calendar_versions v JOIN regulatory_calendars c USING (calendar_id)
 		WHERE c.calendar_code=$1 AND v.version < $2 AND v.status='PUBLISHED' ORDER BY v.version DESC LIMIT 1`, code, version).Scan(&prevID)
 	switch {
 	case err == nil:
-		rec, err := s.loadCalendarVersion(ctx, s.pool, `v.calendar_version_id::text=$1`, prevID)
+		rec, err := s.loadCalendarVersion(ctx, s.db(ctx), `v.calendar_version_id::text=$1`, prevID)
 		if err != nil {
 			return nil, s.registryFail("CalendarHolidayChanges read", err, nil)
 		}

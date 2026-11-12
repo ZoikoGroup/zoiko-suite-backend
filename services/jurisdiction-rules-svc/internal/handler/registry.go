@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -204,7 +205,14 @@ func (h *Handler) emitRegistry(r *http.Request, eventType, aggregateID, actor st
 	}
 	corr := r.Header.Get("X-Correlation-ID")
 	h.publish(eventType, corr, func() error {
-		return h.registryPub.PublishRegistryEvent(r.Context(), eventType, aggregateID, actor, corr, payload)
+		err := h.registryPub.PublishRegistryEvent(r.Context(), eventType, aggregateID, actor, corr, payload)
+		if err != nil {
+			// J-11: the change and its event commit together or not at all.
+			// Inside the request's unit of work this rolls the change back and
+			// the caller gets 503; it can retry with the same Idempotency-Key.
+			store.AbortUnit(r.Context(), fmt.Errorf("event %s not written: %w", eventType, err))
+		}
+		return err
 	})
 }
 

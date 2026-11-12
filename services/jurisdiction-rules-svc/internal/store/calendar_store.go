@@ -107,7 +107,7 @@ func (s *PgStore) CreateCalendar(ctx context.Context, code, jurisdictionID, auth
 		err := r.Scan(&c.CalendarID, &c.CalendarCode, &c.JurisdictionID, &c.Authority, &c.Description, &c.CreatedAt, &c.CreatedBy)
 		return &c, err
 	}
-	c, err := scan(s.pool.QueryRow(ctx, `INSERT INTO regulatory_calendars (calendar_code, jurisdiction_id, authority, description, created_by_principal_id)
+	c, err := scan(s.db(ctx).QueryRow(ctx, `INSERT INTO regulatory_calendars (calendar_code, jurisdiction_id, authority, description, created_by_principal_id)
 		VALUES ($1,$2::uuid,$3,$4,$5) ON CONFLICT (calendar_code) DO NOTHING RETURNING `+cols, code, jurisdictionID, authority, description, actor))
 	if err == nil {
 		return c, true, nil
@@ -115,7 +115,7 @@ func (s *PgStore) CreateCalendar(ctx context.Context, code, jurisdictionID, auth
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, s.registryFail("CreateCalendar", err, nil)
 	}
-	c, err = scan(s.pool.QueryRow(ctx, `SELECT `+cols+` FROM regulatory_calendars WHERE calendar_code=$1`, code))
+	c, err = scan(s.db(ctx).QueryRow(ctx, `SELECT `+cols+` FROM regulatory_calendars WHERE calendar_code=$1`, code))
 	if err != nil {
 		return nil, false, s.registryFail("CreateCalendar lookup", err, nil)
 	}
@@ -127,7 +127,7 @@ func (s *PgStore) CreateCalendar(ctx context.Context, code, jurisdictionID, auth
 
 func (s *PgStore) GetCalendar(ctx context.Context, code string) (*Calendar, error) {
 	var c Calendar
-	err := s.pool.QueryRow(ctx, `SELECT calendar_id::text, calendar_code, jurisdiction_id::text, authority, description, created_at, created_by_principal_id
+	err := s.db(ctx).QueryRow(ctx, `SELECT calendar_id::text, calendar_code, jurisdiction_id::text, authority, description, created_at, created_by_principal_id
 		FROM regulatory_calendars WHERE calendar_code=$1`, code).Scan(&c.CalendarID, &c.CalendarCode, &c.JurisdictionID, &c.Authority, &c.Description, &c.CreatedAt, &c.CreatedBy)
 	if err != nil {
 		return nil, s.registryFail("GetCalendar", err, domain.ErrCalendarNotFound)
@@ -136,7 +136,7 @@ func (s *PgStore) GetCalendar(ctx context.Context, code string) (*Calendar, erro
 }
 
 func (s *PgStore) ListCalendars(ctx context.Context) ([]*Calendar, error) {
-	rows, err := s.pool.Query(ctx, `SELECT calendar_id::text, calendar_code, jurisdiction_id::text, authority, description, created_at, created_by_principal_id
+	rows, err := s.db(ctx).Query(ctx, `SELECT calendar_id::text, calendar_code, jurisdiction_id::text, authority, description, created_at, created_by_principal_id
 		FROM regulatory_calendars ORDER BY calendar_code`)
 	if err != nil {
 		return nil, s.registryFail("ListCalendars", err, nil)
@@ -248,7 +248,7 @@ func (s *PgStore) CreateCalendarVersion(ctx context.Context, code, effectiveFrom
 }
 
 func (s *PgStore) GetCalendarVersion(ctx context.Context, code string, version int) (*CalendarVersionRecord, error) {
-	r, err := s.loadCalendarVersion(ctx, s.pool, `c.calendar_code=$1 AND v.version=$2`, code, version)
+	r, err := s.loadCalendarVersion(ctx, s.db(ctx), `c.calendar_code=$1 AND v.version=$2`, code, version)
 	if err != nil {
 		return nil, s.registryFail("GetCalendarVersion", err, domain.ErrCalendarNotFound)
 	}
@@ -259,7 +259,7 @@ func (s *PgStore) ListCalendarVersions(ctx context.Context, code string) ([]*Cal
 	if _, err := s.GetCalendar(ctx, code); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT v.version FROM regulatory_calendar_versions v JOIN regulatory_calendars c USING (calendar_id) WHERE c.calendar_code=$1 ORDER BY v.version`, code)
+	rows, err := s.db(ctx).Query(ctx, `SELECT v.version FROM regulatory_calendar_versions v JOIN regulatory_calendars c USING (calendar_id) WHERE c.calendar_code=$1 ORDER BY v.version`, code)
 	if err != nil {
 		return nil, s.registryFail("ListCalendarVersions", err, nil)
 	}
@@ -351,12 +351,12 @@ func (s *PgStore) PublishCalendarVersion(ctx context.Context, code string, versi
 	if len(cur.SourceIDs) == 0 {
 		return nil, false, domain.ErrSourceNotReady
 	}
-	if n, err := s.unreadySources(ctx, s.pool, "calendar_version_sources", "calendar_version_id", cur.CalendarVersionID); err != nil {
+	if n, err := s.unreadySources(ctx, s.db(ctx), "calendar_version_sources", "calendar_version_id", cur.CalendarVersionID); err != nil {
 		return nil, false, s.registryFail("PublishCalendarVersion sources", err, nil)
 	} else if n > 0 {
 		return nil, false, domain.ErrSourceNotReady
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE regulatory_calendar_versions SET status='PUBLISHED', published_at=NOW(), published_by=$2
+	if _, err := s.db(ctx).Exec(ctx, `UPDATE regulatory_calendar_versions SET status='PUBLISHED', published_at=NOW(), published_by=$2
 		WHERE calendar_version_id::text=$1 AND status='DRAFT'`, cur.CalendarVersionID, actor); err != nil {
 		return nil, false, s.registryFail("PublishCalendarVersion", err, nil)
 	}
@@ -454,7 +454,7 @@ func (s *PgStore) CreateObligationRule(ctx context.Context, p CreateObligationPa
 }
 
 func (s *PgStore) GetObligationRule(ctx context.Context, id string) (*ObligationRuleRecord, error) {
-	r, err := s.loadObligation(ctx, s.pool, `o.obligation_rule_id::text=$1`, id)
+	r, err := s.loadObligation(ctx, s.db(ctx), `o.obligation_rule_id::text=$1`, id)
 	if err != nil {
 		return nil, s.registryFail("GetObligationRule", err, domain.ErrObligationRuleNotFound)
 	}
@@ -462,7 +462,7 @@ func (s *PgStore) GetObligationRule(ctx context.Context, id string) (*Obligation
 }
 
 func (s *PgStore) ListObligationRules(ctx context.Context, jurisdictionID, code string, limit, offset int) ([]*ObligationRuleRecord, error) {
-	rows, err := s.pool.Query(ctx, `SELECT obligation_rule_id::text FROM obligation_rules WHERE ($1='' OR jurisdiction_id::text=$1) AND ($2='' OR obligation_code=$2)
+	rows, err := s.db(ctx).Query(ctx, `SELECT obligation_rule_id::text FROM obligation_rules WHERE ($1='' OR jurisdiction_id::text=$1) AND ($2='' OR obligation_code=$2)
 		ORDER BY obligation_code, rule_version, obligation_rule_id LIMIT $3 OFFSET $4`, jurisdictionID, code, clampLimit(limit, 50, 200), offset)
 	if err != nil {
 		return nil, s.registryFail("ListObligationRules", err, nil)
@@ -571,21 +571,21 @@ func (s *PgStore) PublishObligationRule(ctx context.Context, id, actor string) (
 		return nil, false, domain.ErrSourceNotReady
 	}
 	var istatus string
-	if err := s.pool.QueryRow(ctx, `SELECT status FROM interpretation_records WHERE interpretation_id::text=$1`, *cur.InterpretationID).Scan(&istatus); err != nil || istatus != "APPROVED" {
+	if err := s.db(ctx).QueryRow(ctx, `SELECT status FROM interpretation_records WHERE interpretation_id::text=$1`, *cur.InterpretationID).Scan(&istatus); err != nil || istatus != "APPROVED" {
 		return nil, false, domain.ErrUnapprovedInterpretation
 	}
-	if n, err := s.unreadySources(ctx, s.pool, "obligation_rule_sources", "obligation_rule_id", id); err != nil {
+	if n, err := s.unreadySources(ctx, s.db(ctx), "obligation_rule_sources", "obligation_rule_id", id); err != nil {
 		return nil, false, s.registryFail("PublishObligationRule sources", err, nil)
 	} else if n > 0 {
 		return nil, false, domain.ErrSourceNotReady
 	}
 	if cur.CalendarCode != nil {
 		var n int
-		if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM regulatory_calendars WHERE calendar_code=$1`, *cur.CalendarCode).Scan(&n); err != nil || n == 0 {
+		if err := s.db(ctx).QueryRow(ctx, `SELECT COUNT(*) FROM regulatory_calendars WHERE calendar_code=$1`, *cur.CalendarCode).Scan(&n); err != nil || n == 0 {
 			return nil, false, domain.ErrInvalidReference
 		}
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE obligation_rules SET status='PUBLISHED', published_at=NOW(), published_by=$2
+	if _, err := s.db(ctx).Exec(ctx, `UPDATE obligation_rules SET status='PUBLISHED', published_at=NOW(), published_by=$2
 		WHERE obligation_rule_id::text=$1 AND status='DRAFT'`, id, actor); err != nil {
 		return nil, false, s.registryFail("PublishObligationRule", err, nil)
 	}

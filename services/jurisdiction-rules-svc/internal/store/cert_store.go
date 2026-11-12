@@ -143,7 +143,7 @@ func (s *PgStore) GetLatestTestBundle(ctx context.Context, ref, version string) 
 	if err != nil {
 		return nil, err
 	}
-	x, err := scanBundle(s.pool.QueryRow(ctx, bundleSelect+` WHERE pack_version_id::text=$1 ORDER BY revision DESC LIMIT 1`, v.PackVersionID))
+	x, err := scanBundle(s.db(ctx).QueryRow(ctx, bundleSelect+` WHERE pack_version_id::text=$1 ORDER BY revision DESC LIMIT 1`, v.PackVersionID))
 	if err != nil {
 		return nil, s.registryFail("GetLatestTestBundle", err, domain.ErrNoTestBundle)
 	}
@@ -221,7 +221,7 @@ func (s *PgStore) ListTestRuns(ctx context.Context, ref, version string, limit i
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, runSelect+` WHERE pack_version_id::text=$1 ORDER BY executed_at DESC, run_id LIMIT $2`, v.PackVersionID, clampLimit(limit, 20, 100))
+	rows, err := s.db(ctx).Query(ctx, runSelect+` WHERE pack_version_id::text=$1 ORDER BY executed_at DESC, run_id LIMIT $2`, v.PackVersionID, clampLimit(limit, 20, 100))
 	if err != nil {
 		return nil, s.registryFail("ListTestRuns", err, nil)
 	}
@@ -302,7 +302,7 @@ func (s *PgStore) ListReviews(ctx context.Context, ref, version string) ([]*Revi
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT review_id::text, artifact_digest, reviewer, role, decision, findings, created_at
+	rows, err := s.db(ctx).Query(ctx, `SELECT review_id::text, artifact_digest, reviewer, role, decision, findings, created_at
 		FROM pack_reviews WHERE pack_version_id::text=$1 ORDER BY created_at, review_id`, v.PackVersionID)
 	if err != nil {
 		return nil, s.registryFail("ListReviews", err, nil)
@@ -544,7 +544,7 @@ func (s *PgStore) GetCertification(ctx context.Context, ref, version string) (*C
 	if _, err := s.GetPackVersion(ctx, ref, version); err != nil {
 		return nil, domain.VerificationResult{}, err
 	}
-	c, err := scanCert(s.pool.QueryRow(ctx, certSelect+` WHERE p.pack_ref=$1 AND v.version=$2`, ref, version))
+	c, err := scanCert(s.db(ctx).QueryRow(ctx, certSelect+` WHERE p.pack_ref=$1 AND v.version=$2`, ref, version))
 	if err != nil {
 		return nil, domain.VerificationResult{}, s.registryFail("GetCertification", err, domain.ErrNotCertified)
 	}

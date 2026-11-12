@@ -57,7 +57,7 @@ func scanNotice(r pgx.Row) (*SourceChangeNotice, error) {
 }
 
 func (s *PgStore) CreateNotice(ctx context.Context, p CreateNoticeParams) (*SourceChangeNotice, error) {
-	n, err := scanNotice(s.pool.QueryRow(ctx, `INSERT INTO source_change_notices (jurisdiction_id, authority, change_type, title, location,
+	n, err := scanNotice(s.db(ctx).QueryRow(ctx, `INSERT INTO source_change_notices (jurisdiction_id, authority, change_type, title, location,
 			observed_hash, affected_source_id, detail, created_by_principal_id) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7::uuid,$8,$9)
 		RETURNING `+noticeCols, p.JurisdictionID, p.Authority, p.ChangeType, p.Title, p.Location, p.ObservedHash, p.AffectedSourceID, p.Detail, p.CreatedBy))
 	if err != nil {
@@ -67,7 +67,7 @@ func (s *PgStore) CreateNotice(ctx context.Context, p CreateNoticeParams) (*Sour
 }
 
 func (s *PgStore) GetNotice(ctx context.Context, id string) (*SourceChangeNotice, error) {
-	n, err := scanNotice(s.pool.QueryRow(ctx, `SELECT `+noticeCols+` FROM source_change_notices WHERE notice_id::text=$1`, id))
+	n, err := scanNotice(s.db(ctx).QueryRow(ctx, `SELECT `+noticeCols+` FROM source_change_notices WHERE notice_id::text=$1`, id))
 	if err != nil {
 		return nil, s.registryFail("GetNotice", err, domain.ErrNoticeNotFound)
 	}
@@ -75,7 +75,7 @@ func (s *PgStore) GetNotice(ctx context.Context, id string) (*SourceChangeNotice
 }
 
 func (s *PgStore) ListNotices(ctx context.Context, status string, limit, offset int) ([]*SourceChangeNotice, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+noticeCols+` FROM source_change_notices WHERE ($1='' OR status=$1)
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+noticeCols+` FROM source_change_notices WHERE ($1='' OR status=$1)
 		ORDER BY created_at DESC, notice_id LIMIT $2 OFFSET $3`, status, clampLimit(limit, 50, 200), offset)
 	if err != nil {
 		return nil, s.registryFail("ListNotices", err, nil)
@@ -107,7 +107,7 @@ func (s *PgStore) StartNoticeReview(ctx context.Context, id, reviewer string) (*
 	if cur.Status != "OPEN" {
 		return nil, false, domain.ErrAlreadyDecided
 	}
-	n, err := scanNotice(s.pool.QueryRow(ctx, `UPDATE source_change_notices SET status='UNDER_REVIEW', reviewer=$2, review_started_at=NOW()
+	n, err := scanNotice(s.db(ctx).QueryRow(ctx, `UPDATE source_change_notices SET status='UNDER_REVIEW', reviewer=$2, review_started_at=NOW()
 		WHERE notice_id::text=$1 AND status='OPEN' RETURNING `+noticeCols, id, reviewer))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -140,11 +140,11 @@ func (s *PgStore) CloseNotice(ctx context.Context, id, closer, outcome, note str
 			return nil, false, domain.ErrInvalidReference
 		}
 		var st string
-		if err := s.pool.QueryRow(ctx, `SELECT status FROM interpretation_records WHERE interpretation_id::text=$1`, *linkedInterpretation).Scan(&st); err != nil || st != "APPROVED" {
+		if err := s.db(ctx).QueryRow(ctx, `SELECT status FROM interpretation_records WHERE interpretation_id::text=$1`, *linkedInterpretation).Scan(&st); err != nil || st != "APPROVED" {
 			return nil, false, domain.ErrUnapprovedInterpretation
 		}
 	}
-	n, err := scanNotice(s.pool.QueryRow(ctx, `UPDATE source_change_notices SET status='CLOSED', closed_at=NOW(), closed_by=$2, outcome=$3,
+	n, err := scanNotice(s.db(ctx).QueryRow(ctx, `UPDATE source_change_notices SET status='CLOSED', closed_at=NOW(), closed_by=$2, outcome=$3,
 			outcome_note=$4, linked_interpretation_id=$5::uuid WHERE notice_id::text=$1 AND status='UNDER_REVIEW' RETURNING `+noticeCols,
 		id, closer, outcome, note, linkedInterpretation))
 	if err != nil {
@@ -226,12 +226,12 @@ func (s *PgStore) Metrics(ctx context.Context, windowHours, certAgeWarnDays, upc
 			"deadline calculation exceptions (no regulatory calendar exists)",
 			"pack deployment skew between services (resolvers do not report the version they run); skew shown is between regions in the deployment registry",
 		}}
-	if err := s.pool.QueryRow(ctx, `SELECT NOW()`).Scan(&m.GeneratedAt); err != nil {
+	if err := s.db(ctx).QueryRow(ctx, `SELECT NOW()`).Scan(&m.GeneratedAt); err != nil {
 		return nil, s.registryFail("Metrics now", err, nil)
 	}
 
 	collect := func(query string, args []any, each func(pgx.Rows) error) error {
-		rows, err := s.pool.Query(ctx, query, args...)
+		rows, err := s.db(ctx).Query(ctx, query, args...)
 		if err != nil {
 			return s.registryFail("Metrics query", err, nil)
 		}
@@ -362,7 +362,7 @@ func (s *PgStore) Metrics(ctx context.Context, windowHours, certAgeWarnDays, upc
 	}); err != nil {
 		return nil, err
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FILTER (WHERE status='OPEN'), COUNT(*) FILTER (WHERE status='UNDER_REVIEW'),
+	if err := s.db(ctx).QueryRow(ctx, `SELECT COUNT(*) FILTER (WHERE status='OPEN'), COUNT(*) FILTER (WHERE status='UNDER_REVIEW'),
 			MAX(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600) FILTER (WHERE status <> 'CLOSED') FROM source_change_notices`).
 		Scan(&m.OpenSourceChanges, &m.SourceChangesInReview, &m.OldestOpenChangeHours); err != nil {
 		return nil, s.registryFail("Metrics notices", err, nil)
