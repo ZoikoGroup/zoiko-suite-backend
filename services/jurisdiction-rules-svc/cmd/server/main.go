@@ -327,6 +327,23 @@ func main() {
 		log.Info("entity consumer wired", zap.String("topic", cfg.Kafka.EntityTopic), zap.String("group_id", cfg.Kafka.GroupID))
 	}
 
+	// Automatic legal drift (J-03/J-04): regulatory.source.changed moves the
+	// ACTIVE rules citing the changed external_feed_reference to UNDER_REVIEW.
+	if len(cfg.Kafka.Brokers) > 0 && cfg.Kafka.RegulatoryFeedTopic != "" && writer != nil {
+		feedReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: cfg.Kafka.Brokers, GroupID: cfg.Kafka.GroupID + "-regulatory-feed", Topic: cfg.Kafka.RegulatoryFeedTopic,
+			MinBytes: 1, MaxBytes: 10e6, MaxWait: 500 * time.Millisecond, StartOffset: kafka.FirstOffset,
+			ErrorLogger: kafka.LoggerFunc(func(msg string, args ...any) {
+				log.Error("kafka consumer error", zap.String("topic", cfg.Kafka.RegulatoryFeedTopic), zap.String("detail", fmt.Sprintf(msg, args...)))
+			}),
+			WatchPartitionChanges: true, PartitionWatchInterval: 30 * time.Second,
+		})
+		go consumer.NewFeedConsumer(log, pgStore, publisher).Run(consumerCtx, feedReader)
+		log.Info("regulatory feed consumer wired", zap.String("topic", cfg.Kafka.RegulatoryFeedTopic))
+	} else {
+		log.Info("regulatory feed consumer off (KAFKA_REGULATORY_FEED_TOPIC unset): legal drift is recorded by hand only")
+	}
+
 	// ── 7. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)

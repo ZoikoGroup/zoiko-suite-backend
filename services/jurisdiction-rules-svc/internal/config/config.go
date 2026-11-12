@@ -134,6 +134,11 @@ type KafkaConfig struct {
 	// entity.created and entity.jurisdiction.changed (Doc 03 §8.2). Empty
 	// disables the consumer.
 	EntityTopic string
+
+	// RegulatoryFeedTopic carries regulatory.source.changed (automatic legal
+	// drift, J-03/J-04). Empty disables the consumer; its producer,
+	// external-data-feed-svc, does not publish the event yet.
+	RegulatoryFeedTopic string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -176,6 +181,8 @@ func Load() (*Config, error) {
 			GroupID:     env("KAFKA_GROUP_ID", "jurisdiction-rules-svc"),
 			Topic:       env("KAFKA_EVENTS_TOPIC", "zoiko.jurisdiction.events"),
 			EntityTopic: env("KAFKA_ENTITY_TOPIC", "zoiko.entity.events"),
+
+			RegulatoryFeedTopic: env("KAFKA_REGULATORY_FEED_TOPIC", ""),
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		WorkflowServiceURL:   env("WORKFLOW_SERVICE_URL", ""),
