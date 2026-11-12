@@ -271,6 +271,15 @@ func TestTaxCalculation_FromAReleasedPack_IsExactExplainedAndRecorded(t *testing
 	r = s.execute(t, map[string]any{"effective_at": time.Now().Add(-90 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)}, 200)
 	assert.Equal(t, "NO_RULE", calcBody(r)["outcome"], "before the rule is effective nothing is invented")
 
+	// s26 runtime decisions: each calculation is announced, completed or failed.
+	assert.Equal(t, 3, s.e.pub.count("regulatory-calculation.completed"), "three exact amounts")
+	assert.Equal(t, 4, s.e.pub.count("regulatory-calculation.failed"), "two invalid facts, one unsupported, one with no rule in force")
+	for _, p := range s.e.pub.payloadsOf("regulatory-calculation.completed") {
+		_, hasAmount := p["taxable_amount"]
+		assert.False(t, hasAmount, "events carry identifiers and digests, not financial values")
+		assert.NotEmpty(t, p["artifact_digest"])
+	}
+
 	// Request hygiene.
 	code, _ = s.e.do("POST", "/v1/regulatory-calculations:execute", "tax-engine", map[string]any{"jurisdiction": "GB"})
 	assert.Equal(t, 400, code)

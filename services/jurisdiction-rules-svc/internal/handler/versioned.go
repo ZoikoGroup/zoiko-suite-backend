@@ -126,6 +126,7 @@ var createRoutes = map[string]bool{
 	"/v1/admin/rollouts": true, "/v1/admin/remediation-cases": true, "/v1/admin/source-change-notices": true,
 	"/v1/admin/deployment-rings": true, "/v1/admin/deployment-regions": true, "/v1/admin/jurisdiction-imports": true,
 	"/v1/admin/jurisdictions/{jurisdiction_id}/aliases": true, "/v1/regulatory-submissions": true,
+	"/v1/admin/jurisdictions/{jurisdiction_id}/rules": true,
 }
 
 // VersionStore reads aggregate versions (store.PgStore).

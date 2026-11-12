@@ -263,6 +263,15 @@ func main() {
 	}
 	handler.RegisterRoutes(r, h)
 
+	// s26 rule lifecycle: rules reaching the start or end of their effective
+	// interval are announced when the instant passes.
+	if registryPub != nil && writer != nil {
+		watcher := events.NewEffectivityWatcher(log, pgStore, registryPub, time.Duration(cfg.RuleEffectivityIntervalSeconds)*time.Second)
+		watcher.Start()
+		defer watcher.Stop()
+		log.Info("rule effectivity watcher started", zap.Int("interval_seconds", cfg.RuleEffectivityIntervalSeconds))
+	}
+
 	// Entity consumer (Doc 03 §8.2 consumed events): projects entity.created and
 	// entity.jurisdiction.changed from tenant-entity-registry-svc.
 	consumerCtx, stopConsumers := context.WithCancel(context.Background())

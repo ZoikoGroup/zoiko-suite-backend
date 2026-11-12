@@ -164,6 +164,26 @@ func SubmissionRegisteredEventType(kind string) string {
 // ZS-JUR-001 s26 "Runtime decisions" family: a jurisdiction determination was made (s9).
 const EventJurisdictionDecisionResolved = "jurisdiction-decision.resolved"
 
+// ZS-JUR-001 s26 "Runtime decisions": a regulatory calculation completed (an
+// exact amount from a released rule) or failed (refused; the reason is in the
+// recorded decision). The taxable amount and the result stay in the decision
+// evidence: events carry identifiers and digests, not financial values.
+const (
+	EventCalculationCompleted = "regulatory-calculation.completed"
+	EventCalculationFailed    = "regulatory-calculation.failed"
+)
+
+// ZS-JUR-001 s26 "Rule lifecycle": a rule version was recorded; a rule in force
+// reached the start (effective) or the end (expired) of its effective interval.
+// effective and expired are announced by the effectivity watcher when the
+// instant passes, not when the rule is written: a future-dated rule announces
+// itself on the day it starts to apply (s31, JUR-NEG-21).
+const (
+	EventRuleVersioned = "regulatory-rule.versioned"
+	EventRuleEffective = "regulatory-rule.effective"
+	EventRuleExpired   = "regulatory-rule.expired"
+)
+
 // ZS-JUR-001 s23: a RELEASED version was marked SUPERSEDED by a newer one (historical resolution stays permitted).
 const EventPackSuperseded = "jurisdiction-pack.superseded"
 

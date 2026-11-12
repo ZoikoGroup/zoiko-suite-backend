@@ -109,6 +109,11 @@ type Config struct {
 	// where a per-process random key would break every cursor on a restart or
 	// on another replica.
 	CursorSigningKey []byte
+
+	// RuleEffectivityIntervalSeconds is how often the effectivity watcher
+	// announces rules reaching the start or end of their interval
+	// (regulatory-rule.effective / .expired). Default 60, 5 to 3600.
+	RuleEffectivityIntervalSeconds int
 }
 
 // KafkaConfig holds event-backbone connection parameters. Per
@@ -188,6 +193,8 @@ func Load() (*Config, error) {
 		ResolverRegion:           env("RESOLVER_REGION", ""),
 		HotfixRetroSLAHours:      envInt("HOTFIX_RETRO_SLA_HOURS", 120),
 		PackCertAgeWarnDays:      envInt("PACK_CERT_AGE_WARN_DAYS", 180),
+
+		RuleEffectivityIntervalSeconds: envInt("RULE_EFFECTIVITY_INTERVAL_SECONDS", 60),
 	}
 	key, err := cursorKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), localEnv(cfg.Env))
 	if err != nil {
@@ -273,6 +280,9 @@ func (c *Config) validate() error {
 		}
 	}
 
+	if c.RuleEffectivityIntervalSeconds < 5 || c.RuleEffectivityIntervalSeconds > 3600 {
+		return fmt.Errorf("RULE_EFFECTIVITY_INTERVAL_SECONDS must be between 5 and 3600, got %d", c.RuleEffectivityIntervalSeconds)
+	}
 	if c.HotfixRetroSLAHours < 1 || c.PackCertAgeWarnDays < 1 {
 		return fmt.Errorf("HOTFIX_RETRO_SLA_HOURS and PACK_CERT_AGE_WARN_DAYS must be at least 1")
 	}

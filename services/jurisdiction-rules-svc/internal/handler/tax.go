@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
@@ -221,6 +222,24 @@ func (h *Handler) ExecuteCalculation(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusUnprocessableEntity
 	case domain.OutcomeAmbiguous:
 		status = http.StatusConflict
+	}
+	if !replayed {
+		// s26 "Runtime decisions": a calculation either completed (an exact
+		// amount from a released rule) or failed (refused, with its reason in
+		// the recorded decision). A replay announces nothing new.
+		eventType := events.EventCalculationFailed
+		if stored.Outcome == domain.CalcCalculated {
+			eventType = events.EventCalculationCompleted
+		}
+		payload := map[string]any{"decision_id": stored.DecisionID, "outcome": stored.Outcome, "jurisdiction": req.Jurisdiction,
+			"rule_domain": req.RuleDomain, "rule_code": req.RuleCode, "effective_at": at.UTC(), "currency": req.Currency}
+		if d.Pack != nil {
+			payload["pack_ref"], payload["pack_version"], payload["artifact_digest"] = d.Pack.PackRef, d.Pack.Version, d.Pack.ArtifactDigest
+		}
+		if d.Rule != nil {
+			payload["rule_id"], payload["rule_content_digest"] = d.Rule.RuleID, d.Rule.ContentDigest
+		}
+		h.emitRegistry(r, eventType, stored.DecisionID, actor, payload)
 	}
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, "calculation": json.RawMessage(stored.Response)})
 }

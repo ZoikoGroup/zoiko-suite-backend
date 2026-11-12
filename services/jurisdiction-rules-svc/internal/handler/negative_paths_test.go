@@ -80,7 +80,7 @@ func TestJUR_ValidateAction_NegativePaths(t *testing.T) {
 	const p = "/v1/validate-action"
 	runNegCases(t, []negCase{
 		{name: "no caller identity", method: http.MethodPost, path: p, noIdentity: true,
-			body: `{"action_type":"TAX.STD","jurisdiction_id":"j-1","entity_type":"INVOICE"}`,
+			body:       `{"action_type":"TAX.STD","jurisdiction_id":"j-1","entity_type":"INVOICE"}`,
 			wantStatus: http.StatusUnauthorized, wantCode: "missing_principal"},
 		{name: "malformed JSON", method: http.MethodPost, path: p, body: `{not json}`,
 			wantStatus: http.StatusBadRequest, wantCode: "invalid_json"},

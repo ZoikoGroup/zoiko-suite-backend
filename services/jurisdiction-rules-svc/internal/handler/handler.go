@@ -949,6 +949,15 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
+	if created {
+		// ZS-JUR-001 s26 rule lifecycle: a rule version was recorded.
+		h.emitRegistry(r, events.EventRuleVersioned, rule.JurisdictionRuleID, principalID, map[string]any{
+			"jurisdiction_rule_id": rule.JurisdictionRuleID, "jurisdiction_id": rule.JurisdictionID,
+			"rule_domain": rule.RuleDomain, "rule_code": rule.RuleCode, "rule_version": rule.RuleVersion,
+			"supersedes_rule_id": rule.SupersedesRuleID, "rule_status": rule.RuleStatus,
+			"effective_from": rule.EffectiveFrom, "effective_to": rule.EffectiveTo,
+		})
+	}
 
 	status := http.StatusOK
 	if created {
