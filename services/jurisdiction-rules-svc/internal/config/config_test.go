@@ -20,7 +20,7 @@ func withEnv(t *testing.T, vars map[string]string) {
 	// KAFKA_BROKERS distinguishes the two: explicitly empty means "no event
 	// backbone", absent means "use the default".
 	for _, k := range []string{
-		"ENV", "PORT", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_SSLMODE",
+		"ENV", "PORT", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_SSLMODE", "CURSOR_SIGNING_KEY_HEX",
 		"KAFKA_BROKERS", "KAFKA_GROUP_ID", "KAFKA_EVENTS_TOPIC", "KAFKA_ENTITY_TOPIC",
 		"AUTHZ_SERVICE_URL", "AUTHZ_PLATFORM_SCOPE_ID", "AUTHZ_ALLOW_STUB", "OTEL_EXPORTER_OTLP_ENDPOINT",
 		"PACK_SIGNING_KEY_REF", "PACK_SIGNING_KEY_FILE", "PACK_CERT_MIN_REVIEWS",
@@ -127,6 +127,7 @@ func TestLoad_ProductionGuards(t *testing.T) {
 		"DB_PASSWORD":             "s3cret",
 		"DB_SSLMODE":              "require",
 		"AUTHZ_PLATFORM_SCOPE_ID": "00000000-0000-0000-0000-0000000000ff",
+		"CURSOR_SIGNING_KEY_HEX":  testCursorKey,
 	}
 
 	cases := []struct {
@@ -156,6 +157,18 @@ func TestLoad_ProductionGuards(t *testing.T) {
 			name:      "invalid port",
 			mutate:    func(m map[string]string) { m["PORT"] = "0" },
 			wantError: "PORT",
+		},
+		{
+			// API-4: a per-process cursor key breaks every next_cursor on a
+			// restart and on every other replica.
+			name:      "missing cursor signing key",
+			mutate:    func(m map[string]string) { delete(m, "CURSOR_SIGNING_KEY_HEX") },
+			wantError: "CURSOR_SIGNING_KEY_HEX",
+		},
+		{
+			name:      "short cursor signing key",
+			mutate:    func(m map[string]string) { m["CURSOR_SIGNING_KEY_HEX"] = "abcd" },
+			wantError: "CURSOR_SIGNING_KEY_HEX",
 		},
 	}
 
@@ -282,7 +295,7 @@ func TestLoad_ResolverEligibilityIsProductionSafe(t *testing.T) {
 // Existing production deployments must keep starting after an upgrade, so the
 // resolver is opt-in; enabling it in production then demands a ring and region.
 func TestLoad_ResolverIsOptInAndNeedsARolloutScopeInProduction(t *testing.T) {
-	prod := map[string]string{"ENV": "production", "DB_PASSWORD": "x", "DB_SSLMODE": "require", "AUTHZ_PLATFORM_SCOPE_ID": "scope"}
+	prod := map[string]string{"ENV": "production", "DB_PASSWORD": "x", "DB_SSLMODE": "require", "AUTHZ_PLATFORM_SCOPE_ID": "scope", "CURSOR_SIGNING_KEY_HEX": testCursorKey}
 	with := func(extra map[string]string) map[string]string {
 		m := map[string]string{}
 		for k, v := range prod {
@@ -358,3 +371,6 @@ func TestLoad_AuthZAllowStubIsLocalOnly(t *testing.T) {
 		t.Fatal("the stub must be off unless AUTHZ_ALLOW_STUB=true is set")
 	}
 }
+
+// testCursorKey is a 32-byte hex cursor signing key for the non-local cases.
+const testCursorKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"

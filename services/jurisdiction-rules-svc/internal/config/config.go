@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -100,6 +102,13 @@ type Config struct {
 	HotfixRetroSLAHours int
 	// PackCertAgeWarnDays marks a certification stale in the metrics (default 180).
 	PackCertAgeWarnDays int
+
+	// CursorSigningKey signs every list's next_cursor (API-4), binding it to
+	// the tenant, route and filters that produced it.
+	// CURSOR_SIGNING_KEY_HEX, at least 32 bytes; required outside local/dev,
+	// where a per-process random key would break every cursor on a restart or
+	// on another replica.
+	CursorSigningKey []byte
 }
 
 // KafkaConfig holds event-backbone connection parameters. Per
@@ -180,11 +189,54 @@ func Load() (*Config, error) {
 		HotfixRetroSLAHours:      envInt("HOTFIX_RETRO_SLA_HOURS", 120),
 		PackCertAgeWarnDays:      envInt("PACK_CERT_AGE_WARN_DAYS", 180),
 	}
+	key, err := cursorKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), localEnv(cfg.Env))
+	if err != nil {
+		return nil, err
+	}
+	cfg.CursorSigningKey = key
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	// Last, so the other guards report first: outside local/dev a cursor key
+	// that differs per process would break every next_cursor on a restart.
+	if len(cfg.CursorSigningKey) == 0 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is required outside local/dev")
+	}
 	return cfg, nil
+}
+
+// localEnv reports whether env names a developer tier.
+func localEnv(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "local", "dev", "development", "test":
+		return true
+	}
+	return false
+}
+
+// cursorKey decodes CURSOR_SIGNING_KEY_HEX. Unset gives a random key per
+// process in local/dev and no key elsewhere (Load then refuses to start).
+func cursorKey(raw string, local bool) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if !local {
+			return nil, nil
+		}
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("generate cursor signing key: %w", err)
+		}
+		return key, nil
+	}
+	key, err := hex.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is not hex: %w", err)
+	}
+	if len(key) < 32 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be at least 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }
 
 // validate rejects configurations that would start the service in an unsafe

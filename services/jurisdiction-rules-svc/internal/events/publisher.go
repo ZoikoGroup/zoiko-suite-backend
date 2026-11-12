@@ -334,11 +334,16 @@ func (p *OutboxPublisher) marshalDrift(r domain.JurisdictionRule, e domain.Drift
 	return data
 }
 
+// MessageWriter is what the relay writes to: a *kafka.Writer in production.
+type MessageWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+}
+
 // OutboxWorker publishes events from the outbox to Kafka.
 type OutboxWorker struct {
 	log       *zap.Logger
 	store     *store.PgStore
-	producer  *kafka.Writer
+	producer  MessageWriter
 	topic     string
 	metrics   *telemetry.Metrics
 	interval  time.Duration
@@ -347,7 +352,7 @@ type OutboxWorker struct {
 	wg        sync.WaitGroup
 }
 
-func NewOutboxWorker(log *zap.Logger, store *store.PgStore, producer *kafka.Writer, topic string, metrics *telemetry.Metrics) *OutboxWorker {
+func NewOutboxWorker(log *zap.Logger, store *store.PgStore, producer MessageWriter, topic string, metrics *telemetry.Metrics) *OutboxWorker {
 	return &OutboxWorker{
 		log:       log,
 		store:     store,
@@ -387,15 +392,41 @@ func (w *OutboxWorker) run() {
 	}
 }
 
-func (w *OutboxWorker) processBatch() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// RelayOnce publishes one batch now (the ticker's work; tests call it directly).
+func (w *OutboxWorker) RelayOnce() { w.processBatch() }
 
-	events, err := w.store.GetPendingOutboxEvents(ctx, w.batchSize)
+// processBatch relays one batch inside one transaction (J-15): the rows are
+// claimed with FOR UPDATE SKIP LOCKED, published, and marked published or
+// failed in the same transaction, so another replica's relay never sees a
+// claimed row and no event is published twice by two relays. A transaction
+// advisory lock lets one relay run at a time, which keeps the events of an
+// aggregate in the order they were written. If the commit fails after a
+// publish, the rows are published again next tick: delivery stays
+// at-least-once, and consumers dedupe on event_id.
+func (w *OutboxWorker) processBatch() {
+	bg, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ctx, unit := w.store.BeginUnit(bg, "")
+	defer unit.Rollback(ctx)
+
+	locked, err := w.store.TryLockOutboxRelay(ctx)
 	if err != nil {
-		w.log.Error("outbox: failed to fetch pending events", zap.Error(err))
+		w.log.Error("outbox: relay lock failed", zap.Error(err))
 		return
 	}
+	if !locked {
+		return // another replica's relay is publishing
+	}
+	events, err := w.store.ClaimOutboxEvents(ctx, w.batchSize)
+	if err != nil {
+		w.log.Error("outbox: failed to claim pending events", zap.Error(err))
+		return
+	}
+	defer func() {
+		if err := unit.Finish(ctx); err != nil {
+			w.log.Error("outbox: relay transaction not committed; the batch is retried", zap.Error(err))
+		}
+	}()
 	if w.metrics != nil {
 		w.metrics.OutboxPendingEvents.Set(float64(len(events)))
 	}
@@ -427,7 +458,7 @@ func (w *OutboxWorker) processBatch() {
 			if markErr := w.store.MarkOutboxEventFailed(ctx, e.OutboxID, err.Error()); markErr != nil {
 				w.log.Error("outbox: failed to mark event failed", zap.Error(markErr))
 			} else if e.PublishAttempts+1 >= store.MaxOutboxAttempts {
-				// GetPendingOutboxEvents skips it from now on, so the events
+				// ClaimOutboxEvents skips it from now on, so the events
 				// behind it flow again; it stays in event_outbox for a person.
 				w.log.Error("outbox: event parked after repeated publish failures",
 					zap.String("outbox_id", e.OutboxID), zap.String("event_type", e.EventType),

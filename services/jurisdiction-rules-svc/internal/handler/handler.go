@@ -101,6 +101,12 @@ type Handler struct {
 	// approvals confirms the X-Approval-Reference an activation cites (see
 	// WithApprovalVerifier, J-02). Nil only in local/dev.
 	approvals approval.Verifier
+
+	// cursors signs the next_cursor of every paged list (API-4, WithCursors).
+	cursors *apicontract.CursorSigner
+
+	// outbox is the parked-event recovery store (J-16, WithOutboxRecovery).
+	outbox OutboxRecoveryStore
 }
 
 // New constructs a Handler.
@@ -111,6 +117,7 @@ func New(store JurisdictionStore, authzClient authz.AuthorizationClient, publish
 		publisher:    publisher,
 		authzScopeID: authzScopeID,
 		log:          log,
+		cursors:      randomCursorSigner(),
 	}
 }
 
@@ -266,6 +273,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 	if h.registry != nil {
 		registerRegistryRoutes(r, h)
+	}
+	if h.outbox != nil {
+		registerOutboxRoutes(r, h)
 	}
 }
 

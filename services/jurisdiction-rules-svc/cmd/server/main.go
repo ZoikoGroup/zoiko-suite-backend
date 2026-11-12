@@ -240,6 +240,15 @@ func main() {
 		log.Warn("pack signing disabled: PACK_SIGNING_KEY_REF/PACK_SIGNING_KEY_FILE are not set; the sign command will answer 503")
 	}
 	h.WithEntityApplicability(pgStore)
+	// J-16: parked outbox events can be listed and requeued by an operator.
+	h.WithOutboxRecovery(pgStore)
+	// API-4: next_cursor tokens are signed with the configured key, so they
+	// survive a restart and work on every replica.
+	cursors, err := apicontract.NewCursorSigner(cfg.CursorSigningKey)
+	if err != nil {
+		log.Fatal("cursor signing key refused", zap.Error(err))
+	}
+	h.WithCursors(cursors)
 
 	// J-02: activation confirms its X-Approval-Reference with workflow-svc.
 	switch {
