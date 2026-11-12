@@ -382,25 +382,32 @@ tenant scoping are closed in this pass.
   - *Off by default.* Unset or `false`, behaviour is unchanged and the
     tokenizer is never called. That is a regression test. The flag is parsed
     strictly: a typo refuses to start rather than reading as off.
-  - *PROPOSED contract, not verified with key-management-svc's owner.* That
-    service has no tokenize or detokenize endpoint today.
-    `internal/tokenization/client.go` is the one place to change.
+  - *Contract — proposed 2026-11-11, implemented by key-management-svc
+    2026-11-12.* `internal/tokenization/client.go` matches the server
+    (key-management-svc `internal/handler/tokenization.go`):
 
     ```
-    POST /v1/tokenize    headers X-Tenant-Id (required), X-Principal-Id, X-Correlation-ID
-                         {"value", "classification": "S3_RESTRICTED"} -> 200 {"token"}
-    POST /v1/detokenize  headers X-Tenant-Id (required), X-Principal-Id (required), X-Correlation-ID
-                         {"token"} -> 200 {"value"}; 403 = denied (SEC-T15 / SEC-T29)
+    POST /v1/tokenize    headers X-Tenant-Id, X-Principal-Id, X-Legal-Entity-Id (required), X-Correlation-ID
+                         + §4 envelope (X-Request-Id, X-Source-Channel, X-Purpose-Context, Idempotency-Key)
+                         {"value", "classification": "S3_RESTRICTED"} -> 200 {"token": "<uuid>"}
+    POST /v1/detokenize  headers as tokenize
+                         {"token"} -> 200 {"value"}; 403 = denied (SEC-T15 / SEC-T29; unknown token too)
     ```
 
-    The tenant and principal headers are added beyond a body-only contract
-    because SEC-T29 requires tenant binding and SEC-INV-15 requires
-    detokenization evidence.
+    Paths, bodies, the tenant/principal/correlation headers and the 403 are
+    as proposed. Changed on this side: the client now sends the full §4
+    envelope (without it key-management-svc's write-strict envelope refuses
+    the POST with 400), `Scope` carries the request's legal entity (the vault
+    authorizes `TOKEN_CREATE` at it and `TOKEN_DETOKENIZE` at the stored
+    one), and tokenize requires a principal.
   - *A migration state with an end.* `TOKENIZATION_ENFORCED` stays `false`
-    (compose) until key-management-svc implements the endpoints, the same
-    shape as authorization-svc's `ZS_ENVELOPE_ENFORCEMENT` rollout. Before
-    it is turned on:
-    1. The contract is confirmed, or this client is changed to match.
+    (compose). key-management-svc implementing the endpoints removes only
+    the first prerequisite. Same shape as authorization-svc's
+    `ZS_ENVELOPE_ENFORCEMENT` rollout. Before it is turned on:
+    1. Proposing principals hold `TOKEN_CREATE` in authorization-svc at
+       their legal entity, or every enforced proposal is refused (fail
+       closed); `TOKEN_DETOKENIZE` goes only to readers that need the raw
+       identifier (SEC-T15).
     2. The `PayeeMasterPrivilegedRead` path, which today returns the full
        identifier, is wired to detokenize under the separate elevated
        authorization SEC-T15 requires. As built, it would return the token.

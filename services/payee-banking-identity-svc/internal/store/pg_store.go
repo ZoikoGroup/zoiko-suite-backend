@@ -317,7 +317,7 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 	// TOKENIZATION_ENFORCED is on (refusing the whole write if tokenization
 	// fails), the raw identifier otherwise — exactly as before.
 	storedIdentifier, err := s.protectAccountIdentifier(ctx,
-		tokenization.Scope{TenantID: tenantID, PrincipalID: principalID, CorrelationID: correlationID}, req.AccountIdentifier)
+		tokenization.Scope{TenantID: tenantID, PrincipalID: principalID, LegalEntityID: req.LegalEntityID, CorrelationID: correlationID}, req.AccountIdentifier)
 	if err != nil {
 		return nil, false, err
 	}

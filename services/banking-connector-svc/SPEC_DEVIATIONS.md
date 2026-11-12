@@ -930,43 +930,58 @@ serializes `account_number`.
   to start. `AUTHZ_MTLS_ENABLED`-style `== "true"` parsing would read a typo
   as "off", which for a protection flag is fail-open.
 
-### G3. The endpoint contract is a PROPOSAL, not verified
+### G3. The endpoint contract — proposed 2026-11-11, implemented 2026-11-12
 
-key-management-svc, owned by another developer, has no tokenize or detokenize
-endpoint; it manages key metadata only. The contract below is what this
-service *assumes*. It has not been agreed with key-management-svc's owner, and
-`internal/tokenization/client.go` is the one place to change if the real one
-differs.
+This contract was first written as a proposal, before key-management-svc had
+a vault. key-management-svc now implements it (its
+`internal/handler/tokenization.go`, migration 000001, and its own
+SPEC_DEVIATIONS.md), and `internal/tokenization/client.go` matches:
 
 ```
 POST /v1/tokenize
-  headers: X-Tenant-Id (required), X-Principal-Id, X-Correlation-ID
+  headers: X-Tenant-Id, X-Principal-Id, X-Legal-Entity-Id (required),
+           X-Correlation-ID, + the §4 envelope (X-Request-Id,
+           X-Source-Channel, X-Purpose-Context, Idempotency-Key)
   body:    {"value": "<raw>", "classification": "S3_RESTRICTED"}
-  200:     {"token": "<opaque>"}
+  200:     {"token": "<uuid>"}
 
 POST /v1/detokenize
-  headers: X-Tenant-Id (required), X-Principal-Id (required), X-Correlation-ID
-  body:    {"token": "<opaque>"}
+  headers: as tokenize
+  body:    {"token": "<uuid>"}
   200:     {"value": "<raw>"}
-  403:     elevated authorization missing (SEC-T15) or token not bound to
-           this tenant/context (SEC-T29)
+  403:     no TOKEN_DETOKENIZE grant (SEC-T15), or not this tenant's token
+           (SEC-T29); a token that does not exist is the same 403
 ```
 
-The tenant and principal headers go beyond a body-only
-`{value, classification}` contract. SEC-T29 requires the service to bind a
-token to its tenant and deny cross-tenant detokenization, and SEC-INV-15
-requires detokenization evidence. Without a tenant and an actor on the call it
-can do neither. The `S3_RESTRICTED` spelling is also part of the proposal.
+Paths, bodies, the tenant/principal/correlation headers and the meaning of a
+detokenize 403 are unchanged from the proposal. Three things changed on this
+side when the server was built:
+
+- **The §4 envelope.** key-management-svc refuses a POST without it in its
+  default write-strict mode, so the proposal's three headers alone would have
+  been refused with 400. The client now sends the full envelope, as
+  `internal/authz` and other service-to-service clients do.
+- **Legal entity.** The vault authorizes `TOKEN_CREATE` at the caller's legal
+  entity and `TOKEN_DETOKENIZE` at the one stored with the token, so `Scope`
+  carries `LegalEntityID` (the connection's) and a request without one is
+  refused before calling.
+- **Principal on tokenize.** Required by the vault on both routes; the client
+  now refuses a tokenize with no principal rather than sending it optionally.
 
 ### G4. A migration state with an end, not a permanent toggle
 
 `TOKENIZATION_ENFORCED` stays `false` (compose:
-`docker-compose.phase7.yml`) until key-management-svc implements the two
-endpoints. This has the same shape as authorization-svc's
-`ZS_ENVELOPE_ENFORCEMENT` rollout. Before it is turned on:
+`docker-compose.phase7.yml`). key-management-svc now implements the two
+endpoints, but that removes only the first prerequisite. This has the same
+shape as authorization-svc's `ZS_ENVELOPE_ENFORCEMENT` rollout. Before it is
+turned on:
 
-1. **The contract (G3).** key-management-svc's owner confirms it, or this
-   client is changed to match.
+1. **Grants.** The principals that create connections need `TOKEN_CREATE` in
+   authorization-svc at their legal entity, or every enforced write is
+   refused (fail closed). `TOKEN_DETOKENIZE` goes only to the readers that
+   genuinely need the raw number (SEC-T15). Tenants must be UUIDs: the vault
+   refuses any other tenant, and this service's tests still use string
+   tenants against the Fake.
 2. **Readers.** They return the stored token, so the read surfaces must be
    revisited.
    - `maskSensitiveFields` masks the token's characters, not account digits.

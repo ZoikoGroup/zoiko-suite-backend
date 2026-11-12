@@ -3,7 +3,9 @@ info:
   title: key-management-svc
   version: 1.0.0
   description: |
-    Customer key metadata registry for BYOK/HYOK key management.
+    Customer key metadata registry for BYOK/HYOK key management, and the
+    platform token vault (`/v1/tokenize`, `/v1/detokenize`) for S2/S3 values
+    such as bank account numbers.
 
     ## Authentication & Authorization
 
@@ -14,8 +16,9 @@ info:
     the legal entity scope (see per-route descriptions).
 
     Unlike siem-integration-svc or carta-svc, ALL routes in this service
-    require a verified principal. Verified: no service-to-service callers
-    exist for this service's routes, so no exemptions are needed.
+    require a verified principal. The vault routes are called service to
+    service (banking-connector-svc, payee-banking-identity-svc), and those
+    callers propagate the acting principal, so no exemptions are needed.
 
     ## Error responses (RFC 9457)
 
@@ -228,8 +231,133 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  /v1/tokenize:
+    post:
+      summary: Tokenize a sensitive value
+      description: |
+        Encrypts `value` (AES-256-GCM) into the caller's tenant and returns an
+        opaque token. Authorized on `TOKEN_CREATE` at `X-Legal-Entity-Id`,
+        which is stored with the token and is the scope its detokenization is
+        later authorized against. Idempotent on `Idempotency-Key`: the same
+        key and request returns the same token; the same key with a different
+        request is 409. Accepts S2_CONFIDENTIAL and S3_RESTRICTED only.
+      operationId: Tokenize
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TokenizeRequest' }
+      responses:
+        '200':
+          description: Token for the value (new, or the original on a replay)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenizeResponse' }
+        '400':
+          description: Missing or invalid value, classification, legal entity or idempotency key
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized (TOKEN_CREATE)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: Idempotency-Key reused for a different request
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: Failed to tokenize
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: Authorization service or vault unavailable
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/detokenize:
+    post:
+      summary: Detokenize a token
+      description: |
+        Returns the raw value behind a token. Authorized on the separate,
+        elevated `TOKEN_DETOKENIZE` grant (SEC-T15) at the legal entity
+        stored with the token, never one the caller supplies. A token from
+        another tenant is refused with 403 (SEC-T29), and so is a token that
+        does not exist, so the response never reveals whether another tenant
+        holds a token. Every attempt, refused or not, emits a
+        `token.detokenized` SIEM event (SEC-INV-15).
+      operationId: Detokenize
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DetokenizeRequest' }
+      responses:
+        '200':
+          description: The raw value
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DetokenizeResponse' }
+        '400':
+          description: Missing token
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Token not available to this tenant, or not authorized (TOKEN_DETOKENIZE)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: Failed to detokenize
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: Authorization service or vault unavailable
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
 components:
   schemas:
+    TokenizeRequest:
+      type: object
+      required: [value, classification]
+      properties:
+        value: { type: string, maxLength: 1024 }
+        classification: { type: string, enum: [S2_CONFIDENTIAL, S3_RESTRICTED] }
+
+    TokenizeResponse:
+      type: object
+      properties:
+        token: { type: string, format: uuid }
+
+    DetokenizeRequest:
+      type: object
+      required: [token]
+      properties:
+        token: { type: string }
+
+    DetokenizeResponse:
+      type: object
+      properties:
+        value: { type: string }
+
     Problem:
       type: object
       required: [type, title, status, code]

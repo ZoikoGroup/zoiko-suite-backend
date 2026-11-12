@@ -115,7 +115,7 @@ func (p *PgStore) CreateConnection(ctx context.Context, c *domain.BankConnection
 	// written, when TOKENIZATION_ENFORCED is on; otherwise it is unchanged.
 	// c carries the stored value from here on, so the event payload and the
 	// returned connection never hold a raw number the database does not.
-	stored, err := p.protectAccountNumber(ctx, tokenization.Scope{TenantID: tenantID, PrincipalID: actorID, CorrelationID: correlationID},
+	stored, err := p.protectAccountNumber(ctx, tokenization.Scope{TenantID: tenantID, PrincipalID: actorID, LegalEntityID: c.LegalEntityID, CorrelationID: correlationID},
 		c.AccountNumber)
 	if err != nil {
 		return err

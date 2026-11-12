@@ -90,11 +90,11 @@ func TestTokenization_EnforcedStoresTheTokenNotTheRawValue(t *testing.T) {
 	if ev, n := eventAccountNumber(t, admin, c.ConnectionID); n != 1 || ev != stored {
 		t.Fatalf("event carries %q (%d events), want the token", ev, n)
 	}
-	scope := tokenization.Scope{TenantID: "tenant-tok-a", PrincipalID: "auditor"}
+	scope := tokenization.Scope{TenantID: "tenant-tok-a", PrincipalID: "auditor", LegalEntityID: "le-tok"}
 	if v, err := fake.Detokenize(context.Background(), scope, stored); err != nil || v != rawAccountNumber {
 		t.Fatalf("stored token detokenizes to %q, %v", v, err)
 	}
-	other := tokenization.Scope{TenantID: "tenant-tok-b", PrincipalID: "auditor"}
+	other := tokenization.Scope{TenantID: "tenant-tok-b", PrincipalID: "auditor", LegalEntityID: "le-tok"}
 	if _, err := fake.Detokenize(context.Background(), other, stored); !errors.Is(err, tokenization.ErrDetokenizationDenied) {
 		t.Fatalf("another tenant detokenized the stored token: %v", err)
 	}
