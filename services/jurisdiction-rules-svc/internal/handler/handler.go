@@ -116,6 +116,10 @@ type Handler struct {
 
 	// summary serves the console summary counts (JR-FE-1, WithSummary).
 	summary SummaryStore
+
+	// operations and units run API-5 asynchronous commands (WithAsyncOperations).
+	operations apicontract.OperationStore
+	units      UnitStore
 }
 
 // New constructs a Handler.
@@ -294,6 +298,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	}
 	if h.summary != nil {
 		r.Get("/v1/jurisdiction-summary", h.JurisdictionSummary)
+	}
+	if h.operations != nil {
+		registerOperationRoutes(r, h)
 	}
 }
 

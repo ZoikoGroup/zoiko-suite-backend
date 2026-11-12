@@ -178,7 +178,7 @@ func (vr versionedRouter) Get(pattern string, fn http.HandlerFunc) {
 	vr.Router.Get(pattern, vr.h.versioned(pattern, fn))
 }
 func (vr versionedRouter) Post(pattern string, fn http.HandlerFunc) {
-	vr.Router.Post(pattern, vr.h.versioned(pattern, fn))
+	vr.Router.Post(pattern, vr.h.asyncCapable(pattern, vr.h.versioned(pattern, fn)))
 }
 func (vr versionedRouter) Put(pattern string, fn http.HandlerFunc) {
 	vr.Router.Put(pattern, vr.h.versioned(pattern, fn))

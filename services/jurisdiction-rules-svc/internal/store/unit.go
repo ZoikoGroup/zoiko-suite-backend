@@ -368,3 +368,10 @@ func (s *PgStore) AggregateVersion(ctx context.Context, table, where string, loc
 }
 
 var errNoAggregate = errors.New("store: no such aggregate")
+
+// WithoutUnit returns ctx with no unit of work: statements under it use the
+// pool, each committing on its own. For work that must outlive or precede the
+// request's transaction (an API-5 operation record, a background run).
+func WithoutUnit(ctx context.Context) context.Context {
+	return context.WithValue(ctx, unitKey{}, (*Unit)(nil))
+}

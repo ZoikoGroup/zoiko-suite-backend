@@ -33,6 +33,7 @@ import (
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/apicontract/asyncpgx"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
@@ -252,6 +253,8 @@ func main() {
 	h.WithOutboxRecovery(pgStore)
 	// JR-FE-1: the console summary counts.
 	h.WithSummary(pgStore)
+	// API-5: pack compile and test runs can run as asynchronous operations.
+	h.WithAsyncOperations(asyncpgx.New(pgStore.OperationsDB()), pgStore)
 	// API-3: ETag on every aggregate read, If-Match on its commands.
 	h.WithAggregateVersions(pgStore)
 	// API-4: next_cursor tokens are signed with the configured key, so they
