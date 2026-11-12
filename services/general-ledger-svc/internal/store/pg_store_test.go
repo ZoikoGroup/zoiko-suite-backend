@@ -39,6 +39,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	t.Cleanup(func() { assertEventsMatchSchemas(t, pool, "com.zoikosuite.accounting.account-mapping.") })
 
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)

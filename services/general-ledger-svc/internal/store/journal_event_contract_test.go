@@ -166,3 +166,16 @@ func TestEveryKernelEventFactHasAPublishedSchema(t *testing.T) {
 		assert.True(t, have[n], "kernel fact %s is emitted but has no contracts/events/%s.schema.json", n, n)
 	}
 }
+
+// Every account-mapping fact the store emits has a published schema, and the
+// four facts are the complete set (ZS-EVENT-001 12.1). Emitted payloads are
+// validated against these files at cleanup of every test that opens a pool.
+func TestAccountMappingSchemaFilesAreTheEmittedFacts(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join(journalSchemaDir(), "accounting.account-mapping.*.schema.json"))
+	require.NoError(t, err)
+	var got []string
+	for _, f := range files {
+		got = append(got, strings.TrimSuffix(strings.TrimPrefix(filepath.Base(f), "accounting.account-mapping."), ".schema.json"))
+	}
+	assert.ElementsMatch(t, []string{"created", "activated", "superseded", "ambiguity-detected"}, got)
+}

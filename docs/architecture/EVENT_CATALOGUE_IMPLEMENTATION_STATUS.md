@@ -226,3 +226,23 @@ the suite and fail if the suite emitted nothing (payment-status, payment-initiat
 treasury, bank-reconciliation). A deliberately broken schema failed the consolidation suite.
 Found along the way: general-ledger-svc `insertAccountVersion` had 19 placeholders for 18
 columns (every account create failed); fixed.
+
+### Producer ownership (E-02, EV-T23) checked in the same place
+
+`catalogue.ServiceName()` turns a catalogue producer written "<Name> Service" (plus Accounting
+Kernel and Payment Initiation Adapter) into a deployed service; roles (AR, Legal, ...) and
+capabilities several services emit (Period Service, Party Service, ...) stay unowned.
+`policy.CatalogueACL()` is the lenient ACL that results, and `contracttest.CheckOutbox` now also
+fails any event whose publisher (taken from `source`, `urn:zoikosuite:service:<service>`) is not
+the type's owner, or that names no publisher. All 12 adopter suites pass with it. Still not
+enforced at runtime in the producers: this is a test-time gate; wiring the ACL into each
+service's `main` is open, and blocked for `accounting.period.*` until the owner decision.
+
+### account-mapping.* now catalogued and schema'd
+
+The four `accounting.account-mapping.*` facts general-ledger-svc emits through `enqueueMappingEvent`
+(`created`, `activated`, `superseded`, `ambiguity-detected`) were invisible to the type audit
+(the type is assembled at runtime) and had no capture. They are now catalogue extensions
+(catalogue 448 = 196 spec + 252 extensions) with schemas in `general-ledger-svc/contracts/events/`,
+validated against real emissions by every GL store test at cleanup. `ambiguity-detected` is not
+emitted by any current test, so its schema is derived from the code only.

@@ -77,8 +77,16 @@ func CheckOutbox(ctx context.Context, pool *pgxpool.Pool, schemaDir string) (pro
 		checked++
 		var who struct {
 			Service string `json:"source_service"`
+			Source  string `json:"source"`
 		}
-		if json.Unmarshal(payload, &who) == nil && who.Service != "" {
+		if json.Unmarshal(payload, &who) == nil {
+			if who.Service == "" {
+				who.Service = strings.TrimPrefix(who.Source, "urn:zoikosuite:service:")
+			}
+		}
+		if who.Service == "" {
+			note(typ, "event names no publishing service (no source), so ownership cannot be checked")
+		} else {
 			if err := acl.Check(who.Service, typ); err != nil {
 				note(typ, err.Error())
 			}

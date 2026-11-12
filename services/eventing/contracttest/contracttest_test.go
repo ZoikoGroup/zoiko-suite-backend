@@ -74,7 +74,7 @@ const itemSchema = `{"type":"object","required":["id"],"properties":{"id":{"type
 
 func TestConformingEventsPass(t *testing.T) {
 	pool := outboxWith(t, map[string][]string{
-		"com.zoikosuite.ar.item.created": {`{"data":{"id":"a","qty":1}}`, `{"data":{"id":"b"}}`},
+		"com.zoikosuite.ar.item.created": {`{"source":"urn:zoikosuite:service:t-svc","data":{"id":"a","qty":1}}`, `{"source":"urn:zoikosuite:service:t-svc","data":{"id":"b"}}`},
 	})
 	dir := schemaDir(t, map[string]string{"ar.item.created.schema.json": itemSchema})
 	problems, checked, err := CheckOutbox(context.Background(), pool, dir)
@@ -85,9 +85,9 @@ func TestConformingEventsPass(t *testing.T) {
 
 func TestDriftMissingSchemaAndNoDataAreReported(t *testing.T) {
 	pool := outboxWith(t, map[string][]string{
-		"com.zoikosuite.ar.item.created": {`{"data":{"qty":"many"}}`, `{"other":1}`},
-		"com.zoikosuite.ar.item.removed": {`{"data":{"id":"x"}}`},
-		"LegacyEvent":                    {`{"data":{}}`},
+		"com.zoikosuite.ar.item.created": {`{"source":"urn:zoikosuite:service:t-svc","data":{"qty":"many"}}`, `{"source":"urn:zoikosuite:service:t-svc","other":1}`},
+		"com.zoikosuite.ar.item.removed": {`{"source":"urn:zoikosuite:service:t-svc","data":{"id":"x"}}`},
+		"LegacyEvent":                    {`{"source":"urn:zoikosuite:service:t-svc","data":{}}`},
 	})
 	dir := schemaDir(t, map[string]string{"ar.item.created.schema.json": itemSchema})
 	problems, checked, err := CheckOutbox(context.Background(), pool, dir)
@@ -111,7 +111,7 @@ func TestDriftMissingSchemaAndNoDataAreReported(t *testing.T) {
 func TestViolationsOfOneTypeAreCapped(t *testing.T) {
 	var bad []string
 	for i := 0; i < 10; i++ {
-		bad = append(bad, `{"data":{"qty":"x"}}`)
+		bad = append(bad, `{"source":"urn:zoikosuite:service:t-svc","data":{"qty":"x"}}`)
 	}
 	pool := outboxWith(t, map[string][]string{"com.zoikosuite.ar.item.created": bad})
 	dir := schemaDir(t, map[string]string{"ar.item.created.schema.json": itemSchema})
@@ -124,7 +124,7 @@ func TestViolationsOfOneTypeAreCapped(t *testing.T) {
 func TestEventFromANonOwningServiceIsReported(t *testing.T) {
 	const typ = "com.zoikosuite.treasury.bank-account.closed"
 	pool := outboxWith(t, map[string][]string{
-		typ: {`{"source_service":"payment-status-svc","data":{"id":"a"}}`, `{"source_service":"treasury-svc","data":{"id":"b"}}`},
+		typ: {`{"source":"urn:zoikosuite:service:payment-status-svc","data":{"id":"a"}}`, `{"source_service":"treasury-svc","data":{"id":"b"}}`},
 	})
 	dir := schemaDir(t, map[string]string{"treasury.bank-account.closed.schema.json": itemSchema})
 	problems, _, err := CheckOutbox(context.Background(), pool, dir)
@@ -133,5 +133,14 @@ func TestEventFromANonOwningServiceIsReported(t *testing.T) {
 	}
 	if len(problems) != 1 || !strings.Contains(problems[0], "owned by treasury-svc, not payment-status-svc") {
 		t.Fatalf("want exactly the non-owner reported, got %v", problems)
+	}
+}
+
+func TestEventWithNoPublisherIsReported(t *testing.T) {
+	pool := outboxWith(t, map[string][]string{"com.zoikosuite.ar.item.created": {`{"data":{"id":"a"}}`}})
+	dir := schemaDir(t, map[string]string{"ar.item.created.schema.json": itemSchema})
+	problems, _, _ := CheckOutbox(context.Background(), pool, dir)
+	if len(problems) != 1 || !strings.Contains(problems[0], "names no publishing service") {
+		t.Fatalf("got %v", problems)
 	}
 }

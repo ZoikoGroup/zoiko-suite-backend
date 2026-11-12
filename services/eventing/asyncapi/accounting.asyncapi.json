@@ -1,6 +1,23 @@
 {
   "asyncapi": "3.1.0",
   "channels": {
+    "account-mapping": {
+      "address": "zoikosuite.accounting.account-mapping.v1",
+      "messages": {
+        "activated": {
+          "$ref": "#/components/messages/account-mapping.activated"
+        },
+        "ambiguity-detected": {
+          "$ref": "#/components/messages/account-mapping.ambiguity-detected"
+        },
+        "created": {
+          "$ref": "#/components/messages/account-mapping.created"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/account-mapping.superseded"
+        }
+      }
+    },
     "accounting-event": {
       "address": "zoikosuite.accounting.accounting-event.v1",
       "messages": {
@@ -321,6 +338,54 @@
   },
   "components": {
     "messages": {
+      "account-mapping.activated": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.account-mapping.activated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Account Mapping: activated.",
+        "title": "account-mapping activated",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.account-mapping.activated",
+        "x-zoiko-origin": "extension"
+      },
+      "account-mapping.ambiguity-detected": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.account-mapping.ambiguity-detected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Account Mapping: ambiguity-detected.",
+        "title": "account-mapping ambiguity-detected",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.account-mapping.ambiguity-detected",
+        "x-zoiko-origin": "extension"
+      },
+      "account-mapping.created": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.account-mapping.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Account Mapping: created.",
+        "title": "account-mapping created",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.account-mapping.created",
+        "x-zoiko-origin": "extension"
+      },
+      "account-mapping.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Accounting Kernel. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.account-mapping.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Account Mapping: superseded.",
+        "title": "account-mapping superseded",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.account-mapping.superseded",
+        "x-zoiko-origin": "extension"
+      },
       "accounting-event.accepted": {
         "contentType": "application/json",
         "description": "Producer: Accounting Kernel. Primary consumers / intent: Posting engine/evidence. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
@@ -1450,6 +1515,28 @@
     "version": "1.0.0"
   },
   "operations": {
+    "publish.account-mapping": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/account-mapping"
+      },
+      "description": "Producer(s): Accounting Kernel. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/account-mapping/messages/activated"
+        },
+        {
+          "$ref": "#/channels/account-mapping/messages/ambiguity-detected"
+        },
+        {
+          "$ref": "#/channels/account-mapping/messages/created"
+        },
+        {
+          "$ref": "#/channels/account-mapping/messages/superseded"
+        }
+      ],
+      "summary": "Publish account-mapping facts after the authoritative commit (transactional outbox)."
+    },
     "publish.accounting-event": {
       "action": "send",
       "channel": {
