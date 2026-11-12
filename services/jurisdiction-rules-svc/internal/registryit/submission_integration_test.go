@@ -65,7 +65,7 @@ func subID(r map[string]any) string {
 	return r["submission"].(map[string]any)["submission_id"].(string)
 }
 
-func TestSubmissionProfiles_AreResolvedFromTheVerifiedPackWithDependencyChecks(t *testing.T) {
+func TestJURNEG08_27_SubmissionProfiles_AreResolvedFromTheVerifiedPackWithDependencyChecks(t *testing.T) {
 	s := newSubmissionScenario(t)
 	s.release(t)
 	resolve := func(body map[string]any, want int) map[string]any {
@@ -108,7 +108,7 @@ func TestSubmissionProfiles_AreResolvedFromTheVerifiedPackWithDependencyChecks(t
 	assert.Equal(t, "VAT_RETURN", r["profile"].(map[string]any)["profile"].(map[string]any)["obligation_code"])
 }
 
-func TestSubmissions_RegisterRefuseAndLifecycle(t *testing.T) {
+func TestJURNEG10_Submissions_RegisterRefuseAndLifecycle(t *testing.T) {
 	s := newSubmissionScenario(t)
 	s.release(t)
 

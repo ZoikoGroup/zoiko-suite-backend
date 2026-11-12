@@ -375,7 +375,7 @@ func TestEvidenceIsImmutableAtTheDatabase(t *testing.T) {
 	require.Error(t, err, "an approved interpretation is immutable")
 }
 
-func TestSupersedingASourcePreservesIt(t *testing.T) {
+func TestJURNEG06_SupersedingASourcePreservesIt(t *testing.T) {
 	e := newEnv()
 	j := seedJurisdiction(t, "FR")
 	_, old := e.do("POST", "/v1/admin/sources", "author", sourceBody(j.JurisdictionID))

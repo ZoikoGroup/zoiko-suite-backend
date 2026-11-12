@@ -320,7 +320,7 @@ func TestCompile_RejectsBrokenPacksAndStoresNothing(t *testing.T) {
 	assert.Equal(t, 404, code)
 }
 
-func TestCompile_ChangedInputsUnderSameVersionAreRefused(t *testing.T) {
+func TestJURNEG20_Compile_ChangedInputsUnderSameVersionAreRefused(t *testing.T) {
 	e := newEnv()
 	f := newFixture(t, e)
 	f.review(t, e, "2026.08.1", f.ruleID)

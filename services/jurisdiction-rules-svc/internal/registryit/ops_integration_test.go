@@ -125,7 +125,7 @@ func resolveOutcome(t *testing.T, c *certFixture) (string, map[string]any) {
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
 
-func TestRelease_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
+func TestJURNEG28_Release_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
 	c := opsPack(t, "", "")
 	e := c.e
 
@@ -173,7 +173,7 @@ func TestRelease_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
 	require.Error(t, err, "release history is append-only")
 }
 
-func TestRelease_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing.T) {
+func TestJURNEG15_Release_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing.T) {
 	a := opsPack(t, "", "")
 	a.certifyVersion(t, a.version) // pack A: CERTIFIED
 
@@ -294,7 +294,7 @@ func TestDeployment_RingOrderSoakAndHealthGates(t *testing.T) {
 	mustStatus(t, 400, code, r)
 }
 
-func TestResolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
+func TestJURNEG29_Resolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU) // this resolver instance serves canary / eu-west
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -331,7 +331,7 @@ func TestResolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
 
 // ── rollback ────────────────────────────────────────────────────────────────
 
-func TestRollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T) {
+func TestJURNEG19_Rollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -395,7 +395,7 @@ func TestRollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T)
 
 // ── emergency hotfix ────────────────────────────────────────────────────────
 
-func TestHotfix_EnhancedReviewRingExceptionAndRetrospective(t *testing.T) {
+func TestJURNEG14_Hotfix_EnhancedReviewRingExceptionAndRetrospective(t *testing.T) {
 	c := opsPack(t, ringEarly, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -570,7 +570,7 @@ func TestSourceChangeIntake_OpensReviewButNeverTouchesRules(t *testing.T) {
 
 // ── metrics ─────────────────────────────────────────────────────────────────
 
-func TestOpsMetrics_ReportsSkewAgeUpcomingAndWhatItDoesNotMeasure(t *testing.T) {
+func TestJURNEG29_OpsMetrics_ReportsSkewAgeUpcomingAndWhatItDoesNotMeasure(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)

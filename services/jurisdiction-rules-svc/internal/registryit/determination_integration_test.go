@@ -192,7 +192,7 @@ func TestJurisdictionDecision_EvidenceHoldsNoTenantOrEntityIdsAndReplaysAreIdemp
 	mustStatus(t, 409, code, c)
 }
 
-func TestJurisdictionDecision_RequestValidationAndRouteWiring(t *testing.T) {
+func TestPDC02NP11_JurisdictionDecision_RequestValidationAndRouteWiring(t *testing.T) {
 	e := newEnvDetermination()
 	ok := map[string]any{"legal_entity_id": "e1", "purpose": "TAX", "effective_at": time.Now().UTC().Format(time.RFC3339)}
 	with := func(k string, v any) map[string]any {

@@ -178,7 +178,58 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 
 ## 4. Negative-path matrix (R10)
 
-Filled in by step 9. Each row: spec id → test name → status.
+Every spec negative path has a test named after its id. Pure-logic proofs run in `internal/domain`,
+`internal/resolver` and `internal/store` (`negative_paths_index_test.go`); end-to-end proofs in
+`internal/registryit` carry the id in their own name, so each runs once.
+
+| Id | Scenario (short) | Test | Status |
+|---|---|---|---|
+| JUR-NEG-01 | Old rate before new effective date | `TestJURNEG01_TransactionBeforeANewRateUsesTheOldRule` (domain) | 🔵 |
+| JUR-NEG-02 | Overlap without precedence | `TestJURNEG02_OverlapWithoutPrecedenceIsRefused` (domain) | 🔵 |
+| JUR-NEG-03 | Digest mismatch | `TestJURNEG03_DigestMismatchIsRefused` (domain), `TestJURNEG04_RuntimeRefusesAnUntrustworthyPack` (resolver) | 🔵 |
+| JUR-NEG-04 | Unsigned pack | `TestJURNEG04_UnsignedPackFailsClosed` (domain), `TestJURNEG04_RuntimeRefusesAnUntrustworthyPack` (resolver) | 🔵 |
+| JUR-NEG-05 | Client jurisdiction not authoritative | `TestJURNEG05_AClientClaimIsNotAuthoritative` (domain) | 🔵 |
+| JUR-NEG-06 | Source URL changes after release | `TestJURNEG06_SupersedingASourcePreservesIt` (registryit) | 🔵 |
+| JUR-NEG-07 | Past return recalculated | `TestJURNEG07_HistoricalRecalculationUsesTheHistoricalVersion` (resolver) | 🔵 |
+| JUR-NEG-08 | Schema invalid after cutoff | `TestJURNEG08_27_SubmissionProfiles_AreResolvedFromTheVerifiedPackWithDependencyChecks` (registryit) | 🔵 |
+| JUR-NEG-09 | E-invoice rejected | `TestJURNEG09_RejectedEInvoiceIsNotAccepted` (domain) | 🔵 |
+| JUR-NEG-10 | Duplicate filing callback | `TestJURNEG10_Submissions_RegisterRefuseAndLifecycle` (registryit) | 🔵 |
+| JUR-NEG-11 | Late/out-of-order callback | `TestJURNEG11_LateCallbackCannotRegress` (domain) | 🔵 |
+| JUR-NEG-12 | Tenant shortens retention | `TestJURNEG12_Retention_IsAnsweredFromTheVerifiedPackAndNeverShortenedByATenant` (registryit) | 🔵 |
+| JUR-NEG-13 | Holiday calendar amended | `TestJURNEG13_HolidayAmendmentIsANewVersion` (domain) | 🔵 |
+| JUR-NEG-14 | Hotfix lacks second approver | `TestJURNEG14_Hotfix_EnhancedReviewRingExceptionAndRetrospective` (registryit) | 🔵 |
+| JUR-NEG-15 | Dependency unavailable in a region | `TestJURNEG15_Release_DependenciesMustBeReleased_AndDeployedInTheSameScope` (registryit) | 🔵 |
+| JUR-NEG-16 | Subdivision rule vs national rule | `TestJURNEG16_SubdivisionRuleCollidingWithItsCountryIsRefused` (registryit, new) | 🔵 |
+| JUR-NEG-17 | Exemption without registration evidence | — | 🧭 no exemption rule family exists; the wave docs leave exemptions (with reverse charge, place of supply) to a Tax Engineering decision (`jurisdiction-pack-wave7-consistency.md`). Licence and scheme answers already name their `evidence_required`. |
+| JUR-NEG-18 | AI change without certification | `TestJURNEG18_UnapprovedChangeCannotBeReleased` (domain) | 🔵 |
+| JUR-NEG-19 | Rollback after processing | `TestJURNEG19_Rollback_…`, `TestJURNEG19_Remediation_…` (registryit) | 🔵 |
+| JUR-NEG-20 | Same version, different content | `TestJURNEG20_Compile_ChangedInputsUnderSameVersionAreRefused` (registryit) | 🔵 |
+| JUR-NEG-21 | Future-dated rule deployed early | `TestJURNEG21_FutureDatedRuleAppliesOnlyFromItsEffectiveDate` (domain, new) | 🔵 |
+| JUR-NEG-22 | Unsupported jurisdiction | `TestJURNEG22_UnsupportedJurisdictionIsExplicit` (domain) | 🔵 |
+| JUR-NEG-23 | Guidance claims mandatory effect | `TestJURNEG23_GuidanceNeedsAnApprovedInterpretation` (domain) | 🔵 |
+| JUR-NEG-24 | Two regimes for one transaction | `TestJURNEG24_CrossPackAmbiguityIsBlocked` (resolver) | 🔵 |
+| JUR-NEG-25 | Float arithmetic | `TestJURNEG25_FloatArithmeticIsRefused` (domain) | 🔵 |
+| JUR-NEG-26 | Due date on a holiday | `TestJURNEG26_DueDateOnAHolidayIsAdjusted` (domain) | 🔵 |
+| JUR-NEG-27 | New code list mid-cycle | `TestJURNEG08_27_SubmissionProfiles_…` (registryit) | 🔵 |
+| JUR-NEG-28 | Pack withdrawn | `TestJURNEG28_Release_PublishWithdrawBlock_AreRecordedAndGuarded` (registryit) | 🔵 |
+| JUR-NEG-29 | Service runs a stale pack | `TestJURNEG29_OpsMetrics_…`, `TestJURNEG29_Resolver_UsesOnlyWhatIsDeployedToItsRingAndRegion` (registryit) | 🟡 skew is reported and each resolver serves only its ring and region; blocking a regulated action on skew needs a consistency policy nobody has defined (wave 7 "Not built": services do not report the version they run) |
+| JUR-NEG-30 | Retroactive legislation | `TestJURNEG30_Remediation_ManualCaseAndNothingToRemediate` (registryit) + pinned replay (JUR-NEG-07) | 🔵 |
+| REF-01 #22 | Unknown code | `TestREF01NP22_UnknownCodeIsRefusedNotGuessed` (store), `TestJUR_ValidateAction_UnknownJurisdictionIs404` (handler) | 🔵 |
+| REF-01 #23 | Retired/renamed code | `TestREF01NP23_RetiredCodeKeepsItsHistory` (store) | 🔵 |
+| REF-10 #40 | Holiday added after invoice | `TestREF10NP40_PaymentTerm_…`, `TestREF10NP40_BusinessCalendar_…` (registryit) | 🔵 |
+| REF-10 #41 | Basis date unresolvable | `TestREF10NP41_UnresolvableBasisDateIsRefused` (domain), `TestREF10NP41_PaymentTerm_DueDateInputRefusals` (registryit) | 🔵 |
+| PDC-02 NP-11 | Missing legal_entity_id | `TestPDC02NP11_JurisdictionDecision_RequestValidationAndRouteWiring` (registryit) | 🔵 |
+| PDC-02 NP-12 | Two plausible jurisdictions | `TestPDC02NP12_TwoPlausibleJurisdictionsNeedReview` (domain) | 🔵 |
+| PDC-02 NP-13 | UI locale ≠ legal jurisdiction | `TestPDC02NP13_LocaleOrClaimIsNotALegalFact` (domain) | 🔵 |
+| PDC-02 NP-14 | Current hierarchy for a past period | `TestPDC02NP14_HistoricalPeriodUsesTheAsOfHierarchy` (store) | 🔵 |
+| PDC-02 NP-15 | Branch mistaken for an entity | — | n/a here: legal personality is tenant-entity-registry's fact (MDM); this service reads assignments only |
+| PDC-02 NP-16 | Tenant overrides a mandatory rule | — | n/a by construction: no tenant override path exists (s28 elections not built), so nothing can override a pack rule |
+| PDC-02 NP-17 | Same-rank incompatible mandates | `TestPDC02NP17_SameRankIncompatibleMandatesAreConflicted` (resolver), `TestValidateAction_ConflictedIsNotPermitted` (handler) | 🔵 |
+| PDC-02 NP-18 | No match for a mandatory family | `TestPDC02NP18_NoMatchNeverFallsBack` (domain), `TestValidateAction_NoRuleIsInsufficient` (handler) | 🔵 |
+| PDC-02 NP-19 | Fixed UTC offset for a DST cutoff | `TestPDC02NP19_DeadlinesUseTheAuthorityTimeZone` (domain) | 🔵 |
+| PDC-02 NP-20 | Retroactive source received late | `TestPDC02NP20_KnownAtReplaysWhatWasKnown` (store) | 🔵 |
+
+PDC-02 NP-01…NP-10 are PDC-01 (policy package registry) scenarios, owned by policy-svc.
 
 ## 5. Test baseline
 

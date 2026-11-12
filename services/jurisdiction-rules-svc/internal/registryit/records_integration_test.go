@@ -60,7 +60,7 @@ func (s *payrollScenario) mapping(t *testing.T, body map[string]any, want int) m
 	return r
 }
 
-func TestRetention_IsAnsweredFromTheVerifiedPackAndNeverShortenedByATenant(t *testing.T) {
+func TestJURNEG12_Retention_IsAnsweredFromTheVerifiedPackAndNeverShortenedByATenant(t *testing.T) {
 	s := newRecordsScenario(t)
 	s.release(t)
 
