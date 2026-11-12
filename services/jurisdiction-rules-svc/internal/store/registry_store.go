@@ -222,7 +222,7 @@ func (s *PgStore) ListSources(ctx context.Context, jurisdictionID, authority str
 	rows, err := s.db(ctx).Query(ctx, `SELECT `+sourceCols+` FROM regulatory_sources
 		WHERE ($1 = '' OR jurisdiction_id::text = $1) AND ($2 = '' OR authority = $2)
 		ORDER BY created_at DESC, source_id LIMIT $3 OFFSET $4`,
-		jurisdictionID, authority, clampLimit(limit, 50, 200), offset)
+		jurisdictionID, authority, clampLimit(limit, 50, maxPage), offset)
 	if err != nil {
 		return nil, s.registryFail("ListSources", err, nil)
 	}
@@ -449,7 +449,7 @@ func (s *PgStore) GetPack(ctx context.Context, ref string) (*domain.Pack, error)
 
 func (s *PgStore) ListPacks(ctx context.Context, limit, offset int) ([]*domain.Pack, error) {
 	rows, err := s.db(ctx).Query(ctx, `SELECT `+packCols+` FROM jurisdiction_packs ORDER BY pack_ref LIMIT $1 OFFSET $2`,
-		clampLimit(limit, 50, 200), offset)
+		clampLimit(limit, 50, maxPage), offset)
 	if err != nil {
 		return nil, s.registryFail("ListPacks", err, nil)
 	}

@@ -137,7 +137,7 @@ func (s *PgStore) getImport(ctx context.Context, q Querier, batchID string, lock
 // ListJurisdictionImports lists batches, newest first, optionally of one status.
 // Rows are not included: read one batch for them.
 func (s *PgStore) ListJurisdictionImports(ctx context.Context, status string, limit int) ([]*domain.ImportBatch, error) {
-	if limit <= 0 || limit > 200 {
+	if limit <= 0 || limit > maxPage {
 		limit = 50
 	}
 	rows, err := s.db(ctx).Query(ctx, `SELECT `+importBatchColumns+` FROM jurisdiction_import_batches

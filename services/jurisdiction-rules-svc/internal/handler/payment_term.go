@@ -184,12 +184,16 @@ func (h *Handler) ListPaymentTermVersions(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	vs, err := s.ListPaymentTermVersions(r.Context(), chi.URLParam(r, "term_code"))
 	if err != nil {
 		h.writePaymentTermError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"versions": vs})
+	finishListAs(h, w, r, p, "versions", pageOf(p, vs))
 }
 
 func (h *Handler) GetPaymentTermVersion(w http.ResponseWriter, r *http.Request) {

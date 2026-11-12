@@ -311,12 +311,16 @@ func (h *Handler) GetRegime(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListRegimes(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	xs, err := h.registry.ListRegimes(r.Context())
 	if err != nil {
 		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"regimes": xs})
+	finishListAs(h, w, r, p, "regimes", pageOf(p, xs))
 }
 
 // ── source register ─────────────────────────────────────────────────────────
@@ -383,17 +387,17 @@ func (h *Handler) GetSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListSources(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	limit, offset, ok := h.parsePaging(w, r, q)
+	p, ok := h.beginList(w, r, []string{"jurisdiction_id", "authority"},
+		map[string]string{"jurisdiction_id": "jurisdiction_id", "authority": "authority"})
 	if !ok {
 		return
 	}
-	xs, err := h.registry.ListSources(r.Context(), q.Get("jurisdiction_id"), q.Get("authority"), limit, offset)
+	xs, err := h.registry.ListSources(r.Context(), p.filter("jurisdiction_id"), p.filter("authority"), p.fetch(), p.offset)
 	if err != nil {
 		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sources": xs})
+	finishListAs(h, w, r, p, "sources", xs)
 }
 
 // ReviewSource records the independent source review (s8 "reviewed_by").
@@ -563,16 +567,16 @@ func (h *Handler) GetPack(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPacks(w http.ResponseWriter, r *http.Request) {
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, nil, nil)
 	if !ok {
 		return
 	}
-	xs, err := h.registry.ListPacks(r.Context(), limit, offset)
+	xs, err := h.registry.ListPacks(r.Context(), p.fetch(), p.offset)
 	if err != nil {
 		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"packs": xs})
+	finishListAs(h, w, r, p, "packs", xs)
 }
 
 // CreatePackVersion drafts a version from a manifest sent as the request body.
@@ -634,12 +638,16 @@ func (h *Handler) GetPackVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPackVersions(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	vs, err := h.registry.ListPackVersions(r.Context(), chi.URLParam(r, "pack_ref"))
 	if err != nil {
 		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"versions": vs})
+	finishListAs(h, w, r, p, "versions", pageOf(p, vs))
 }
 
 func (h *Handler) SubmitPackVersionForReview(w http.ResponseWriter, r *http.Request) {

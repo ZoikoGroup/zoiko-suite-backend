@@ -207,12 +207,16 @@ func (h *Handler) RegisterSigningKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListSigningKeys(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	ks, err := h.registry.ListSigningKeys(r.Context())
 	if err != nil {
 		h.writeCompileError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": ks})
+	finishListAs(h, w, r, p, "keys", pageOf(p, ks))
 }
 
 type KeyStatusRequest struct {

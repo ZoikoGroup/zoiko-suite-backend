@@ -127,16 +127,23 @@ func (h *Handler) RunTests(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListTestRuns(w http.ResponseWriter, r *http.Request) {
-	limit, _, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, nil, nil)
 	if !ok {
 		return
+	}
+	limit := p.fetch()
+	if p.paged {
+		limit = p.offset + p.fetch() // the store reads the newest first from the start
 	}
 	rs, err := h.registry.ListTestRuns(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"), limit)
 	if err != nil {
 		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"runs": rs})
+	if p.paged {
+		rs = pageOf(p, rs)
+	}
+	finishListAs(h, w, r, p, "runs", rs)
 }
 
 type AddReviewRequest struct {
@@ -183,12 +190,16 @@ func (h *Handler) AddReview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListReviews(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	rs, err := h.registry.ListReviews(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"))
 	if err != nil {
 		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"reviews": rs})
+	finishListAs(h, w, r, p, "reviews", pageOf(p, rs))
 }
 
 // CertifyPackVersion certifies a pack version. 201 on success, 200 for a

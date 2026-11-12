@@ -176,3 +176,16 @@ func pageOf[T any](p *pageReq, all []T) []T {
 	}
 	return rest
 }
+
+// finishListAs is finishList for a route whose legacy answer wraps the list
+// in an object under key (e.g. {"sources": [...]}).
+func finishListAs[T any](h *Handler, w http.ResponseWriter, r *http.Request, p *pageReq, key string, items []T) {
+	if !p.paged {
+		if items == nil {
+			items = []T{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{key: items})
+		return
+	}
+	finishList(h, w, r, p, items)
+}

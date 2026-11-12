@@ -367,18 +367,17 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 //	503 → store unavailable
 func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
-	q := r.URL.Query()
 
-	limit, offset, ok := h.parsePaging(w, r, q)
+	p, ok := h.beginList(w, r, []string{"type", "active"}, map[string]string{"type": "type", "active": "active"})
 	if !ok {
 		return
 	}
 
 	params := store.ListParams{
-		JurisdictionType: q.Get("type"),
-		ActiveOnly:       q.Get("active") == "true",
-		Limit:            limit,
-		Offset:           offset,
+		JurisdictionType: p.filter("type"),
+		ActiveOnly:       p.filter("active") == "true",
+		Limit:            p.fetch(),
+		Offset:           p.offset,
 	}
 
 	results, err := h.store.List(r.Context(), params)
@@ -391,15 +390,11 @@ func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Always return an array — never null.
-	if results == nil {
-		results = []*domain.Jurisdiction{}
-	}
 	h.log.Debug("ListJurisdictions",
 		zap.Int("count", len(results)),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, results)
+	finishList(h, w, r, p, results)
 }
 
 // GetAncestors handles GET /v1/jurisdictions/{jurisdiction_id}/ancestors.
@@ -462,33 +457,29 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, r, q)
+	p, ok := h.beginList(w, r, []string{"domain"}, map[string]string{"domain": "domain"})
 	if !ok {
 		return
 	}
 
 	results, err := h.store.FindRules(r.Context(), store.FindRulesParams{
 		JurisdictionID: jurisdictionID,
-		Domain:         q.Get("domain"), // empty string means all domains
+		Domain:         p.filter("domain"), // empty string means all domains
 		EffectiveAt:    effectiveAt,
-		Limit:          limit,
-		Offset:         offset,
+		Limit:          p.fetch(),
+		Offset:         p.offset,
 	})
 	if err != nil {
 		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
-	// Always return an array — never null.
-	if results == nil {
-		results = []*domain.JurisdictionRule{}
-	}
 	h.log.Debug("GetRules",
 		zap.String("jurisdiction_id", jurisdictionID),
 		zap.Int("count", len(results)),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, results)
+	finishList(h, w, r, p, results)
 }
 
 // GetRulePack handles GET /v1/jurisdictions/{jurisdiction_id}/rule-pack —
@@ -598,20 +589,17 @@ func (h *Handler) GetDriftEvents(w http.ResponseWriter, r *http.Request) {
 	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, nil, nil)
 	if !ok {
 		return
 	}
 
-	history, err := h.store.FindDriftEvents(r.Context(), ruleID, limit, offset)
+	history, err := h.store.FindDriftEvents(r.Context(), ruleID, p.fetch(), p.offset)
 	if err != nil {
 		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
-	if history == nil {
-		history = []*domain.DriftEvent{}
-	}
-	writeJSON(w, http.StatusOK, history)
+	finishList(h, w, r, p, history)
 }
 
 // GetRuleStatusHistory handles GET /v1/rules/{jurisdiction_rule_id}/status-history.
@@ -630,20 +618,17 @@ func (h *Handler) GetRuleStatusHistory(w http.ResponseWriter, r *http.Request) {
 	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, nil, nil)
 	if !ok {
 		return
 	}
 
-	history, err := h.store.FindRuleStatusHistory(r.Context(), ruleID, limit, offset)
+	history, err := h.store.FindRuleStatusHistory(r.Context(), ruleID, p.fetch(), p.offset)
 	if err != nil {
 		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
-	if history == nil {
-		history = []*domain.RuleStatusHistory{}
-	}
-	writeJSON(w, http.StatusOK, history)
+	finishList(h, w, r, p, history)
 }
 
 // ── Admin mutations ──────────────────────────────────────────────────────────

@@ -699,3 +699,13 @@ func TestMigration000023_DownThenUp(t *testing.T) {
 	assert.Contains(t, kinds(), "APPLICABILITY")
 	require.NoError(t, insert("APPLICABILITY"))
 }
+
+// doRaw returns the status and the raw body of a GET (for routes answering a JSON array).
+func (e *env) doRaw(method, path string) (int, string) {
+	req := httptest.NewRequest(method, path, nil)
+	req.Header.Set("X-Principal-Id", "reader")
+	req.Header.Set("X-Tenant-Id", itTenant)
+	rr := httptest.NewRecorder()
+	e.srv.ServeHTTP(rr, req)
+	return rr.Code, rr.Body.String()
+}

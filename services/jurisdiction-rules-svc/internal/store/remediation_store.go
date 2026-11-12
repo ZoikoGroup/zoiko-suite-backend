@@ -214,7 +214,7 @@ func (s *PgStore) GetRemediationCase(ctx context.Context, id string) (*Remediati
 
 // ListRemediationCases lists cases, newest first, optionally by status (OPEN or CLOSED).
 func (s *PgStore) ListRemediationCases(ctx context.Context, status string, limit, offset int) ([]*RemediationCase, error) {
-	limit = pageLimit(limit, 50, 200)
+	limit = pageLimit(limit, 50, maxPage)
 	rows, err := s.db(ctx).Query(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE ($1='' OR c.status=$1) ORDER BY c.opened_at DESC, c.case_id LIMIT $2 OFFSET $3`, status, limit, offset)
 	if err != nil {
 		return nil, s.registryFail("ListRemediationCases", err, nil)

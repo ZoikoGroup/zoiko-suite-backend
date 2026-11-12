@@ -107,12 +107,16 @@ func (h *Handler) CreateCalendar(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListCalendars(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	cs, err := h.registry.ListCalendars(r.Context())
 	if err != nil {
 		h.writeCalendarError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"calendars": cs})
+	finishListAs(h, w, r, p, "calendars", pageOf(p, cs))
 }
 
 func (h *Handler) GetCalendar(w http.ResponseWriter, r *http.Request) {
@@ -182,12 +186,16 @@ func (h *Handler) GetCalendarVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListCalendarVersions(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	vs, err := h.registry.ListCalendarVersions(r.Context(), chi.URLParam(r, "calendar_code"))
 	if err != nil {
 		h.writeCalendarError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"versions": vs})
+	finishListAs(h, w, r, p, "versions", pageOf(p, vs))
 }
 
 type SourceIDsRequest struct {
@@ -308,17 +316,17 @@ func (h *Handler) GetObligationRule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListObligationRules(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	limit, offset, ok := h.parsePaging(w, r, q)
+	p, ok := h.beginList(w, r, []string{"jurisdiction_id", "obligation_code"},
+		map[string]string{"jurisdiction_id": "jurisdiction_id", "obligation_code": "obligation_code"})
 	if !ok {
 		return
 	}
-	rs, err := h.registry.ListObligationRules(r.Context(), q.Get("jurisdiction_id"), q.Get("obligation_code"), limit, offset)
+	rs, err := h.registry.ListObligationRules(r.Context(), p.filter("jurisdiction_id"), p.filter("obligation_code"), p.fetch(), p.offset)
 	if err != nil {
 		h.writeCalendarError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"obligation_rules": rs})
+	finishListAs(h, w, r, p, "obligation_rules", rs)
 }
 
 type ObligationProvenanceRequest struct {

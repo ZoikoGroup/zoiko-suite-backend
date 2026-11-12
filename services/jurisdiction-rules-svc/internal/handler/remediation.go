@@ -94,21 +94,21 @@ func (h *Handler) ListRemediationCases(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.admin(w, r, "remediation_case", "view"); !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, []string{"status"}, map[string]string{"status": "status"})
 	if !ok {
 		return
 	}
-	status := strings.ToUpper(r.URL.Query().Get("status"))
+	status := strings.ToUpper(p.filter("status"))
 	if status != "" && status != "OPEN" && status != "CLOSED" {
 		writeError(w, r, http.StatusBadRequest, "invalid_status", "status must be OPEN or CLOSED")
 		return
 	}
-	out, err := h.registry.ListRemediationCases(r.Context(), status, limit, offset)
+	out, err := h.registry.ListRemediationCases(r.Context(), status, p.fetch(), p.offset)
 	if err != nil {
 		h.writeRemediationError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"cases": out})
+	finishListAs(h, w, r, p, "cases", out)
 }
 
 func (h *Handler) GetRemediationCase(w http.ResponseWriter, r *http.Request) {
@@ -128,17 +128,17 @@ func (h *Handler) ListRemediationDecisions(w http.ResponseWriter, r *http.Reques
 	if _, ok := h.admin(w, r, "remediation_case", "view"); !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, []string{"pending"}, map[string]string{"pending": "pending"})
 	if !ok {
 		return
 	}
-	pending := r.URL.Query().Get("pending") == "true"
-	out, err := h.registry.ListRemediationDecisions(r.Context(), chi.URLParam(r, "case_id"), pending, limit, offset)
+	pending := p.filter("pending") == "true"
+	out, err := h.registry.ListRemediationDecisions(r.Context(), chi.URLParam(r, "case_id"), pending, p.fetch(), p.offset)
 	if err != nil {
 		h.writeRemediationError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"decisions": out})
+	finishListAs(h, w, r, p, "decisions", out)
 }
 
 type RecordDispositionsRequest struct {

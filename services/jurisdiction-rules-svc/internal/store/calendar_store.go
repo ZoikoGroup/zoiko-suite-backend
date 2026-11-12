@@ -463,7 +463,7 @@ func (s *PgStore) GetObligationRule(ctx context.Context, id string) (*Obligation
 
 func (s *PgStore) ListObligationRules(ctx context.Context, jurisdictionID, code string, limit, offset int) ([]*ObligationRuleRecord, error) {
 	rows, err := s.db(ctx).Query(ctx, `SELECT obligation_rule_id::text FROM obligation_rules WHERE ($1='' OR jurisdiction_id::text=$1) AND ($2='' OR obligation_code=$2)
-		ORDER BY obligation_code, rule_version, obligation_rule_id LIMIT $3 OFFSET $4`, jurisdictionID, code, clampLimit(limit, 50, 200), offset)
+		ORDER BY obligation_code, rule_version, obligation_rule_id LIMIT $3 OFFSET $4`, jurisdictionID, code, clampLimit(limit, 50, maxPage), offset)
 	if err != nil {
 		return nil, s.registryFail("ListObligationRules", err, nil)
 	}

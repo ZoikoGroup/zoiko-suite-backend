@@ -543,7 +543,7 @@ func (s *PgStore) FindByIDAny(ctx context.Context, jurisdictionID string) (*doma
 
 // List returns a paginated, optionally-filtered slice of jurisdictions.
 func (s *PgStore) List(ctx context.Context, params ListParams) ([]*domain.Jurisdiction, error) {
-	limit := clampLimit(params.Limit, 50, 200)
+	limit := clampLimit(params.Limit, 50, maxPage)
 	offset := params.Offset
 	if offset < 0 {
 		offset = 0
@@ -879,7 +879,7 @@ func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*dom
 		at = time.Now().UTC()
 	}
 
-	limit := clampLimit(params.Limit, 50, 100)
+	limit := clampLimit(params.Limit, 50, maxPage)
 	offset := params.Offset
 	if offset < 0 {
 		offset = 0
@@ -1609,7 +1609,7 @@ func (s *PgStore) FindDriftEvents(ctx context.Context, ruleID string, limit, off
 		return nil, err
 	}
 
-	limit = clampLimit(limit, 50, 200)
+	limit = clampLimit(limit, 50, maxPage)
 	if offset < 0 {
 		offset = 0
 	}
@@ -1652,7 +1652,7 @@ func (s *PgStore) FindRuleStatusHistory(ctx context.Context, ruleID string, limi
 		return nil, err
 	}
 
-	limit = clampLimit(limit, 50, 200)
+	limit = clampLimit(limit, 50, maxPage)
 	if offset < 0 {
 		offset = 0
 	}
@@ -1751,6 +1751,10 @@ func jsonEquivalent(a, b []byte) bool {
 	}
 	return reflect.DeepEqual(av, bv)
 }
+
+// maxPage is the most rows a list reads: the API-4 maximum page (200) plus
+// the one look-ahead row that tells a paged list another page exists.
+const maxPage = 201
 
 func clampLimit(limit, def, max int) int {
 	if limit <= 0 {

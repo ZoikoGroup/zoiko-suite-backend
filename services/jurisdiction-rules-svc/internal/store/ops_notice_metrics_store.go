@@ -76,7 +76,7 @@ func (s *PgStore) GetNotice(ctx context.Context, id string) (*SourceChangeNotice
 
 func (s *PgStore) ListNotices(ctx context.Context, status string, limit, offset int) ([]*SourceChangeNotice, error) {
 	rows, err := s.db(ctx).Query(ctx, `SELECT `+noticeCols+` FROM source_change_notices WHERE ($1='' OR status=$1)
-		ORDER BY created_at DESC, notice_id LIMIT $2 OFFSET $3`, status, clampLimit(limit, 50, 200), offset)
+		ORDER BY created_at DESC, notice_id LIMIT $2 OFFSET $3`, status, clampLimit(limit, 50, maxPage), offset)
 	if err != nil {
 		return nil, s.registryFail("ListNotices", err, nil)
 	}

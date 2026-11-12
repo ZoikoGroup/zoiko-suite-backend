@@ -221,7 +221,7 @@ func (s *PgStore) ListTestRuns(ctx context.Context, ref, version string, limit i
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db(ctx).Query(ctx, runSelect+` WHERE pack_version_id::text=$1 ORDER BY executed_at DESC, run_id LIMIT $2`, v.PackVersionID, clampLimit(limit, 20, 100))
+	rows, err := s.db(ctx).Query(ctx, runSelect+` WHERE pack_version_id::text=$1 ORDER BY executed_at DESC, run_id LIMIT $2`, v.PackVersionID, clampLimit(limit, 20, maxPage))
 	if err != nil {
 		return nil, s.registryFail("ListTestRuns", err, nil)
 	}

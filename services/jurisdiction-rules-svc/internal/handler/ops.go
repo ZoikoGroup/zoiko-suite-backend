@@ -146,12 +146,16 @@ func (h *Handler) CreateRegion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListRegions(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	xs, err := h.registry.ListRegions(r.Context())
 	if err != nil {
 		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"regions": xs})
+	finishListAs(h, w, r, p, "regions", pageOf(p, xs))
 }
 
 type CreateRingRequest struct {
@@ -191,12 +195,16 @@ func (h *Handler) CreateRing(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListRings(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	xs, err := h.registry.ListRings(r.Context())
 	if err != nil {
 		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"rings": xs})
+	finishListAs(h, w, r, p, "rings", pageOf(p, xs))
 }
 
 // ── release lifecycle ───────────────────────────────────────────────────────
@@ -347,13 +355,17 @@ func (h *Handler) RollbackDeployment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListDeployments(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	ref, version := pathRefVersion(r)
 	ds, err := h.registry.ListDeployments(r.Context(), ref, version)
 	if err != nil {
 		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deployments": ds})
+	finishListAs(h, w, r, p, "deployments", pageOf(p, ds))
 }
 
 // ── emergency hotfix ────────────────────────────────────────────────────────
@@ -511,16 +523,16 @@ func (h *Handler) GetNotice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListNotices(w http.ResponseWriter, r *http.Request) {
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, []string{"status"}, map[string]string{"status": "status"})
 	if !ok {
 		return
 	}
-	ns, err := h.registry.ListNotices(r.Context(), strings.ToUpper(r.URL.Query().Get("status")), limit, offset)
+	ns, err := h.registry.ListNotices(r.Context(), strings.ToUpper(p.filter("status")), p.fetch(), p.offset)
 	if err != nil {
 		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"notices": ns})
+	finishListAs(h, w, r, p, "notices", ns)
 }
 
 // StartNoticeReview assigns the caller as independent reviewer (not the intake author).
