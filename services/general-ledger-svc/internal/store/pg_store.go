@@ -1242,7 +1242,7 @@ func insertAccountVersion(ctx context.Context, tx pgx.Tx, v *domain.AccountVersi
 			account_name, account_type, parent_account_id, is_control_account,
 			direct_posting_restricted, status, effective_from, effective_to,
 			change_kind, change_reason, evidence_refs, created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 	`, v.AccountVersionID, v.TenantID, v.AccountID, v.AccountCode, v.Version,
 		v.AccountName, string(v.AccountType), v.ParentAccountID, v.IsControlAccount,
 		v.DirectPostingRestricted, v.Status, v.EffectiveFrom, v.EffectiveTo,
