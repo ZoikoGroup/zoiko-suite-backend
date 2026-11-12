@@ -120,3 +120,18 @@ func TestViolationsOfOneTypeAreCapped(t *testing.T) {
 		t.Fatalf("expected a cap note, got %v", problems)
 	}
 }
+
+func TestEventFromANonOwningServiceIsReported(t *testing.T) {
+	const typ = "com.zoikosuite.treasury.bank-account.closed"
+	pool := outboxWith(t, map[string][]string{
+		typ: {`{"source_service":"payment-status-svc","data":{"id":"a"}}`, `{"source_service":"treasury-svc","data":{"id":"b"}}`},
+	})
+	dir := schemaDir(t, map[string]string{"treasury.bank-account.closed.schema.json": itemSchema})
+	problems, _, err := CheckOutbox(context.Background(), pool, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) != 1 || !strings.Contains(problems[0], "owned by treasury-svc, not payment-status-svc") {
+		t.Fatalf("want exactly the non-owner reported, got %v", problems)
+	}
+}

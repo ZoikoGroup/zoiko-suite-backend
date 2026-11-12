@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/eventing/integration"
+	"zoiko.io/eventing/policy"
 )
 
 const typePrefix = "com.zoikosuite."
@@ -50,6 +51,10 @@ func CheckOutbox(ctx context.Context, pool *pgxpool.Pool, schemaDir string) (pro
 	}
 	defer rows.Close()
 
+	acl, err := policy.CatalogueACL()
+	if err != nil {
+		return nil, 0, fmt.Errorf("contracttest: producer ACL: %w", err)
+	}
 	schemas := map[string][]byte{}
 	missing := map[string]bool{}
 	shown := map[string]int{}
@@ -70,6 +75,14 @@ func CheckOutbox(ctx context.Context, pool *pgxpool.Pool, schemaDir string) (pro
 			continue
 		}
 		checked++
+		var who struct {
+			Service string `json:"source_service"`
+		}
+		if json.Unmarshal(payload, &who) == nil && who.Service != "" {
+			if err := acl.Check(who.Service, typ); err != nil {
+				note(typ, err.Error())
+			}
+		}
 		if missing[typ] {
 			continue
 		}
@@ -122,4 +135,32 @@ func Verify(t testing.TB, pool *pgxpool.Pool, schemaDir string) {
 	for _, p := range problems {
 		t.Errorf("event contract violation: %s", p)
 	}
+}
+
+// FinishSuite is for a TestMain whose tests share one pool and never clear the
+// outbox: call it as `code := contracttest.FinishSuite(pool, "../../contracts/events", m.Run())`
+// before closing the pool. It checks everything the suite emitted, prints each
+// problem, and returns a non-zero code if the suite was green but an event broke
+// its contract, or if it emitted nothing at all (a pass that verified nothing).
+func FinishSuite(pool *pgxpool.Pool, schemaDir string, suiteCode int) int {
+	problems, checked, err := CheckOutbox(context.Background(), pool, schemaDir)
+	if err != nil {
+		fmt.Printf("event contract check: %v\n", err)
+		return 1
+	}
+	for _, p := range problems {
+		fmt.Printf("EVENT CONTRACT VIOLATION: %s\n", p)
+	}
+	fmt.Printf("event contract check: %d event(s) validated, %d problem(s)\n", checked, len(problems))
+	if suiteCode != 0 {
+		return suiteCode
+	}
+	if checked == 0 {
+		fmt.Println("event contract check: the suite emitted no events, so nothing was verified")
+		return 1
+	}
+	if len(problems) > 0 {
+		return 1
+	}
+	return 0
 }

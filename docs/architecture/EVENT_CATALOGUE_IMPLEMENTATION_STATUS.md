@@ -214,8 +214,15 @@ New guard tests: no schema without a catalogue entry; one service per schema.
    (`statement_facts.source_accounts`); its integration tests fail on a fresh database.
    Pre-existing and unrelated to this work, found because the capture ran those tests.
 
-### Not yet enforced
+### Enforced in each producer's own suite
 
-Only general-ledger-svc validates what its tests emit against its schemas. The other 12
-services' schemas are inferred and registrable but nothing in their own suites fails if the
-producer drifts. Next step: the same cleanup hook in each service's test environment.
+Every one of the 12 adopter services now validates what its tests emit against its published
+`contracts/events` schemas, as general-ledger-svc already did. The shared check is
+`eventing/contracttest` (`CheckOutbox`, `Verify` per test, `FinishSuite` per suite). Services
+that drop the outbox between tests call it at cleanup (consolidation, financial-close,
+intercompany-accounting, reconciliation-intelligence, payee-banking-identity, banking-connector,
+connectivity-api-bridge, tax-authority-interface); services that share one pool call it after
+the suite and fail if the suite emitted nothing (payment-status, payment-initiation-adapter,
+treasury, bank-reconciliation). A deliberately broken schema failed the consolidation suite.
+Found along the way: general-ledger-svc `insertAccountVersion` had 19 placeholders for 18
+columns (every account create failed); fixed.
