@@ -113,6 +113,9 @@ type Handler struct {
 
 	// backfill rebuilds the entity projection from the registry (J-10, WithEntityBackfill).
 	backfill *entityBackfill
+
+	// summary serves the console summary counts (JR-FE-1, WithSummary).
+	summary SummaryStore
 }
 
 // New constructs a Handler.
@@ -288,6 +291,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	}
 	if h.backfill != nil {
 		r.Post(backfillPath, h.BackfillEntityApplicability)
+	}
+	if h.summary != nil {
+		r.Get("/v1/jurisdiction-summary", h.JurisdictionSummary)
 	}
 }
 
