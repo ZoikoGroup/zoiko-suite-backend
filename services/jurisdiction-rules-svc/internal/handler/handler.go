@@ -107,6 +107,9 @@ type Handler struct {
 
 	// outbox is the parked-event recovery store (J-16, WithOutboxRecovery).
 	outbox OutboxRecoveryStore
+
+	// versions reads aggregate versions for ETag and If-Match (WithAggregateVersions).
+	versions VersionStore
 }
 
 // New constructs a Handler.
@@ -228,6 +231,9 @@ type RecordDriftRequest struct {
 // carries an X-Correlation-ID regardless of path — this makes the behaviour
 // testable in unit tests that build their own router via this function.
 func RegisterRoutes(r chi.Router, h *Handler) {
+	// Every registration below goes through the decorator, which attaches
+	// ETag and If-Match to the aggregate routes (versioned.go).
+	r = versionedRouter{Router: r, h: h}
 	r.Use(correlationIDMiddleware)
 
 	// ── Public read (no AuthZ required) ──────────────────────────────────────

@@ -22,6 +22,11 @@ const (
 	EventRuleProvenanceSet      = "regulatory-rule.provenance-set"
 )
 
+// AggregateVersionKey is the payload key a publisher of a registry event sets
+// to the aggregate's version (row_version after the change, 1 for a create);
+// it is moved into the envelope's aggregate_version (Governance audit J-12).
+const AggregateVersionKey = "aggregate_version"
+
 // RegistryPublisher emits the registry events. It is a separate interface so
 // the original Publisher contract (and its test doubles) is untouched.
 type RegistryPublisher interface {
@@ -40,8 +45,14 @@ func (p *OutboxPublisher) PublishRegistryEvent(ctx context.Context, eventType, a
 		body[k] = v
 	}
 	body["aggregate_id"] = aggregateID
+	// J-12: the aggregate's version travels in the envelope, not the payload.
+	var aggregateVersion int64
+	if v, ok := body[AggregateVersionKey].(int64); ok {
+		aggregateVersion = v
+		delete(body, AggregateVersionKey)
+	}
 	jurisdictionID, _ := payload["jurisdiction_id"].(string)
-	return p.emitToOutbox(ctx, p.store.DB(ctx), eventType, correlationID, jurisdictionID, actorID, body)
+	return p.emitToOutbox(ctx, p.store.DB(ctx), eventType, correlationID, jurisdictionID, actorID, aggregateVersion, body)
 }
 
 // PublishRegistryEvent implements RegistryPublisher by dropping the event.

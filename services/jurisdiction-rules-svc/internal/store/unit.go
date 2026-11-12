@@ -336,3 +336,35 @@ func (r *unitRows) Next() bool {
 	r.Close()
 	return false
 }
+
+// AggregateVersion reads the row_version (000020, 000034) of the row `where`
+// selects in `table`. table and where are code constants, never request input;
+// args bind the request's keys. With lock the row is read FOR UPDATE, so a
+// command that checked If-Match holds it until its unit of work commits and no
+// other request can change it in between. found is false when no row matches
+// (or a key is malformed). Scoped to the request's tenant, so a tenant table's
+// row of another tenant is not found.
+func (s *PgStore) AggregateVersion(ctx context.Context, table, where string, lock bool, args ...any) (int64, bool, error) {
+	q := `SELECT row_version FROM ` + table + ` WHERE ` + where
+	if lock {
+		q += ` FOR UPDATE`
+	}
+	var v int64
+	err := s.scoped(ctx, TenantFrom(ctx), false, func(tx Querier) error {
+		err := tx.QueryRow(ctx, q, args...).Scan(&v)
+		if errors.Is(err, pgx.ErrNoRows) || isInvalidTextRepresentation(err) {
+			// Rolls the scoped savepoint back: a malformed key aborted it.
+			return errNoAggregate
+		}
+		return err
+	})
+	if errors.Is(err, errNoAggregate) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("%w: aggregate version: %v", domain.ErrStoreUnavailable, err)
+	}
+	return v, true, nil
+}
+
+var errNoAggregate = errors.New("store: no such aggregate")

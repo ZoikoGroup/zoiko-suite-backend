@@ -204,6 +204,14 @@ func (h *Handler) emitRegistry(r *http.Request, eventType, aggregateID, actor st
 		return
 	}
 	corr := r.Header.Get("X-Correlation-ID")
+	if v := h.eventAggregateVersion(r.Context()); v > 0 {
+		withVersion := make(map[string]any, len(payload)+1)
+		for k, x := range payload {
+			withVersion[k] = x
+		}
+		withVersion[events.AggregateVersionKey] = v
+		payload = withVersion
+	}
 	h.publish(eventType, corr, func() error {
 		err := h.registryPub.PublishRegistryEvent(r.Context(), eventType, aggregateID, actor, corr, payload)
 		if err != nil {

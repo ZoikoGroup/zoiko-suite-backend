@@ -211,7 +211,7 @@ func newEnvWithSigner(signer domain.Signer) *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
 	r := newRouter()
-	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub)
+	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithAggregateVersions(st)
 	if signer != nil {
 		h.WithSigner(signer)
 	}
@@ -224,6 +224,12 @@ func (e *env) do(method, path, principal string, body any) (int, map[string]any)
 }
 
 func (e *env) doWithHeaders(method, path, principal string, body any, headers map[string]string) (int, map[string]any) {
+	code, out, _ := e.doFull(method, path, principal, body, headers)
+	return code, out
+}
+
+// doFull is doWithHeaders that also returns the response headers.
+func (e *env) doFull(method, path, principal string, body any, headers map[string]string) (int, map[string]any, http.Header) {
 	var buf bytes.Buffer
 	switch b := body.(type) {
 	case nil:
@@ -247,7 +253,7 @@ func (e *env) doWithHeaders(method, path, principal string, body any, headers ma
 	e.srv.ServeHTTP(rr, req)
 	var out map[string]any
 	_ = json.Unmarshal(rr.Body.Bytes(), &out)
-	return rr.Code, out
+	return rr.Code, out, rr.Header()
 }
 
 var ctx = context.Background()
@@ -606,7 +612,7 @@ func TestMigrations000005To000032_DownThenUp(t *testing.T) {
 	// Each migration depends on the earlier ones: down newest-first, up oldest-first.
 	names := []string{"000005_jurisdiction_pack_registries", "000006_pack_artifacts_and_signing_keys", "000007_pack_certification", "000008_rule_decision_evidence",
 		"000009_pack_release_operations", "000010_calendars_and_obligations", "000011_rule_parameters", "000012_payroll_parameter_evidence", "000013_records_evidence", "000014_regulatory_submissions", "000015_jurisdiction_rollout", "000021_registration_evidence", "000022_jurisdiction_decision_evidence", "000023_applicability_evidence", "000024_pack_supersede_event", "000025_resolver_change_notify", "000026_remediation_cases",
-		"000032_tenant_row_security"}
+		"000032_tenant_row_security", "000034_aggregate_row_versions"}
 	var downs, ups []string
 	for i := len(names) - 1; i >= 0; i-- {
 		downs = append(downs, migrations(t, names[i]+".down.sql")...)

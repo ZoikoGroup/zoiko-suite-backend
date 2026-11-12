@@ -29,7 +29,7 @@ func outboxEnv() *env {
 	auth := &recordingAuthz{}
 	r := chi.NewRouter()
 	r.Use(handler.UnitOfWork(st, zap.NewNop()))
-	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub)
+	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithAggregateVersions(st)
 	handler.RegisterRoutes(r, h)
 	return &env{srv: r, auth: auth}
 }

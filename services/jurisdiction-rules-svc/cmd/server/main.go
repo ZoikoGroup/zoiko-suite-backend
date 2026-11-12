@@ -242,6 +242,8 @@ func main() {
 	h.WithEntityApplicability(pgStore)
 	// J-16: parked outbox events can be listed and requeued by an operator.
 	h.WithOutboxRecovery(pgStore)
+	// API-3: ETag on every aggregate read, If-Match on its commands.
+	h.WithAggregateVersions(pgStore)
 	// API-4: next_cursor tokens are signed with the configured key, so they
 	// survive a restart and work on every replica.
 	cursors, err := apicontract.NewCursorSigner(cfg.CursorSigningKey)

@@ -209,7 +209,7 @@ func buildEnvelope(ctx context.Context, eventType, jurisdictionID, actorID, corr
 	return data, nil
 }
 
-func (p *OutboxPublisher) emitToOutbox(ctx context.Context, q store.Querier, eventType, correlationID, jurisdictionID, actorID string, payload map[string]any) error {
+func (p *OutboxPublisher) emitToOutbox(ctx context.Context, q store.Querier, eventType, correlationID, jurisdictionID, actorID string, aggregateVersion int64, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
@@ -218,7 +218,7 @@ func (p *OutboxPublisher) emitToOutbox(ctx context.Context, q store.Querier, eve
 	if classification == "" {
 		classification = "INTERNAL"
 	}
-	data, err := buildEnvelope(ctx, eventType, jurisdictionID, actorID, correlationID, classification, 0, raw)
+	data, err := buildEnvelope(ctx, eventType, jurisdictionID, actorID, correlationID, classification, aggregateVersion, raw)
 	if err != nil {
 		return err
 	}
