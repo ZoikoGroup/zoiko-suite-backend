@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -65,7 +64,7 @@ func newEnvOps(signer domain.Signer, ring, region string) *env {
 	if err != nil {
 		panic(err)
 	}
-	r := chi.NewRouter()
+	r := newRouter()
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithCertificationPolicy(1).
 		WithResolver(res).WithOperations(handler.OpsPolicy{HotfixRetroSLA: 72 * time.Hour})
 	if signer != nil {

@@ -193,13 +193,24 @@ type env struct {
 
 func newEnv() *env { return newEnvWithSigner(nil) }
 
+// itTenant is the tenant every suite request acts for unless it names another:
+// the input envelope makes one mandatory on every write, as in production.
+const itTenant = "11111111-2222-4333-8444-555555555555"
+
+// newRouter is the production middleware stack around the routes that the
+// suite exercises: every write request runs in one transaction (J-11) that
+// carries the request's tenant for row-level security (000032), so the whole
+// suite runs on the unit of work's statement semantics.
+func newRouter() chi.Router {
+	r := chi.NewRouter()
+	r.Use(handler.UnitOfWork(st, zap.NewNop()))
+	return r
+}
+
 func newEnvWithSigner(signer domain.Signer) *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
-	r := chi.NewRouter()
-	// As main.go mounts it: every write request runs in one transaction, so
-	// the whole suite exercises the unit of work's statement semantics.
-	r.Use(handler.UnitOfWork(st, zap.NewNop()))
+	r := newRouter()
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub)
 	if signer != nil {
 		h.WithSigner(signer)
@@ -225,6 +236,9 @@ func (e *env) doWithHeaders(method, path, principal string, body any, headers ma
 	req.Header.Set("Content-Type", "application/json")
 	if principal != "" {
 		req.Header.Set("X-Principal-Id", principal)
+	}
+	if _, named := headers["X-Tenant-Id"]; !named { // name it "" to send none
+		req.Header.Set("X-Tenant-Id", itTenant)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -579,7 +593,7 @@ func TestExistingEndpointsAreUnaffected(t *testing.T) {
 }
 
 func TestRegistryRoutesAbsentWithoutRegistry(t *testing.T) {
-	r := chi.NewRouter()
+	r := newRouter()
 	handler.RegisterRoutes(r, handler.New(st, authz.NewStubAuthZClient(zap.NewNop()), events.NewNoopPublisher(zap.NewNop()), "s", zap.NewNop()))
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, httptest.NewRequest("GET", "/v1/regimes", nil))
@@ -588,10 +602,11 @@ func TestRegistryRoutesAbsentWithoutRegistry(t *testing.T) {
 
 // ── migration round trip ────────────────────────────────────────────────────
 
-func TestMigrations000005To000026_DownThenUp(t *testing.T) {
+func TestMigrations000005To000032_DownThenUp(t *testing.T) {
 	// Each migration depends on the earlier ones: down newest-first, up oldest-first.
 	names := []string{"000005_jurisdiction_pack_registries", "000006_pack_artifacts_and_signing_keys", "000007_pack_certification", "000008_rule_decision_evidence",
-		"000009_pack_release_operations", "000010_calendars_and_obligations", "000011_rule_parameters", "000012_payroll_parameter_evidence", "000013_records_evidence", "000014_regulatory_submissions", "000015_jurisdiction_rollout", "000021_registration_evidence", "000022_jurisdiction_decision_evidence", "000023_applicability_evidence", "000024_pack_supersede_event", "000025_resolver_change_notify", "000026_remediation_cases"}
+		"000009_pack_release_operations", "000010_calendars_and_obligations", "000011_rule_parameters", "000012_payroll_parameter_evidence", "000013_records_evidence", "000014_regulatory_submissions", "000015_jurisdiction_rollout", "000021_registration_evidence", "000022_jurisdiction_decision_evidence", "000023_applicability_evidence", "000024_pack_supersede_event", "000025_resolver_change_notify", "000026_remediation_cases",
+		"000032_tenant_row_security"}
 	var downs, ups []string
 	for i := len(names) - 1; i >= 0; i-- {
 		downs = append(downs, migrations(t, names[i]+".down.sql")...)
@@ -617,6 +632,9 @@ func TestMigrations000005To000026_DownThenUp(t *testing.T) {
 	var actionDef string
 	require.NoError(t, pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_release_action'`).Scan(&actionDef))
 	assert.Contains(t, actionDef, "SUPERSEDE", "000024 up again allows the supersede release event")
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM pg_class WHERE relname IN ('regulatory_submissions','regulatory_submission_events','rule_decision_evidence')
+		AND relrowsecurity AND relforcerowsecurity`).Scan(&n))
+	assert.Equal(t, 3, n, "000032 up again restores the tenant row-level security")
 }
 
 // The original lifecycle (activate, drift, supersede) must keep working with
@@ -650,7 +668,7 @@ func TestOriginalRuleLifecycleUnaffectedByProvenanceTriggers(t *testing.T) {
 // 000023 on its own (the newest evidence-kind migration): reverting it refuses the APPLICABILITY kind for new rows but keeps every earlier kind, and
 // applying it again restores it. (An older evidence migration cannot be reverted and re-applied alone once newer-kind evidence exists: that evidence is
 // append-only and the older, narrower constraint could not validate it. The migrations are reverted and applied as a chain, which
-// TestMigrations000005To000026_DownThenUp covers.)
+// TestMigrations000005To000032_DownThenUp covers.)
 func TestMigration000023_DownThenUp(t *testing.T) {
 	kinds := func() string {
 		var def string

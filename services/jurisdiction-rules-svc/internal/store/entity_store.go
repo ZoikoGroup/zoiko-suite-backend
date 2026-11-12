@@ -30,6 +30,11 @@ func (s *PgStore) ApplyEntityApplicability(ctx context.Context, eventID, eventTy
 		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Row-level security (000032): the projection row is written as the
+	// event's tenant, the only tenant it may belong to.
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, a.TenantID); err != nil {
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
 
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO consumed_events (event_id, event_type) VALUES ($1, $2)
@@ -95,29 +100,36 @@ func (s *PgStore) ListEntityJurisdictions(ctx context.Context, tenantID, legalEn
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	rows, err := s.db(ctx).Query(ctx, `
-		SELECT `+applicabilityColumns+`
-		FROM entity_jurisdiction_applicability
-		WHERE tenant_id = $1 AND legal_entity_id = $2
-		  AND effective_from <= $3 AND (effective_to IS NULL OR effective_to > $3)
-		ORDER BY effective_from ASC, applicability_id ASC`, tenantID, legalEntityID, at)
-	if err != nil {
-		s.log.Error("pg ListEntityJurisdictions failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
 	out := []*domain.EntityJurisdictionApplicability{}
-	for rows.Next() {
-		a, err := scanApplicability(rows)
+	// Scoped to the tenant (000032): another tenant's rows are not readable,
+	// whatever the WHERE clause says.
+	err := s.scoped(ctx, tenantID, false, func(q Querier) error {
+		rows, err := q.Query(ctx, `
+			SELECT `+applicabilityColumns+`
+			FROM entity_jurisdiction_applicability
+			WHERE tenant_id = $1 AND legal_entity_id = $2
+			  AND effective_from <= $3 AND (effective_to IS NULL OR effective_to > $3)
+			ORDER BY effective_from ASC, applicability_id ASC`, tenantID, legalEntityID, at)
 		if err != nil {
-			s.log.Error("pg ListEntityJurisdictions scan failed", zap.Error(err))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			s.log.Error("pg ListEntityJurisdictions failed", zap.Error(err))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		out = append(out, a)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		defer rows.Close()
+		for rows.Next() {
+			a, err := scanApplicability(rows)
+			if err != nil {
+				s.log.Error("pg ListEntityJurisdictions scan failed", zap.Error(err))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			}
+			out = append(out, a)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

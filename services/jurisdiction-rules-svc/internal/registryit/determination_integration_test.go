@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,7 +28,7 @@ const decisionPath = "/v1/jurisdiction-decisions:resolve"
 func newEnvDetermination() *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
-	r := chi.NewRouter()
+	r := newRouter()
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithEntityApplicability(st)
 	handler.RegisterRoutes(r, h)
 	return &env{srv: r, pub: pub, auth: auth}
@@ -208,7 +207,7 @@ func TestJurisdictionDecision_RequestValidationAndRouteWiring(t *testing.T) {
 		}
 		return m
 	}
-	code, r := e.do("POST", decisionPath, "tax-ops", ok)
+	code, r := e.doWithHeaders("POST", decisionPath, "tax-ops", ok, map[string]string{"X-Tenant-Id": ""})
 	assert.Equal(t, 401, code, "X-Tenant-Id is required: %v", r)
 	decide(t, e, "t1", with("legal_entity_id", nil), 400)
 	decide(t, e, "t1", with("purpose", "PAYROLL"), 400)
@@ -237,7 +236,7 @@ func newEnvGated() *env {
 	if err != nil {
 		panic(err)
 	}
-	r := chi.NewRouter()
+	r := newRouter()
 	handler.RegisterRoutes(r, handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithCertificationPolicy(1).WithResolver(res))
 	return &env{srv: r, pub: pub, auth: auth}
 }

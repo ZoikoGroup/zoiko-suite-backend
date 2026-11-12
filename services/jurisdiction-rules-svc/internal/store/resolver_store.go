@@ -198,11 +198,20 @@ func nullIfEmpty(s string) *string {
 	return &s
 }
 
-// GetDecision reads one stored decision.
+// GetDecision reads one stored decision, scoped to the caller's tenant
+// (000032): a decision made for another tenant is not found.
 func (s *PgStore) GetDecision(ctx context.Context, id string) (*StoredDecision, error) {
-	d, err := scanDecision(s.db(ctx).QueryRow(ctx, `SELECT `+decisionCols+` FROM rule_decision_evidence WHERE decision_id::text=$1`, id))
+	var d *StoredDecision
+	err := s.scoped(ctx, TenantFrom(ctx), false, func(q Querier) error {
+		var err error
+		d, err = scanDecision(q.QueryRow(ctx, `SELECT `+decisionCols+` FROM rule_decision_evidence WHERE decision_id::text=$1`, id))
+		if err != nil {
+			return s.registryFail("GetDecision", err, domain.ErrDecisionNotFound)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, s.registryFail("GetDecision", err, domain.ErrDecisionNotFound)
+		return nil, err
 	}
 	return d, nil
 }

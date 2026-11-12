@@ -122,7 +122,11 @@ func scanEvent(r pgx.Row) (*SubmissionEventRecord, error) {
 }
 
 func (s *PgStore) listSubmissionEvents(ctx context.Context, id string) ([]*SubmissionEventRecord, error) {
-	rows, err := s.db(ctx).Query(ctx, eventSelect+` WHERE submission_id=$1::uuid ORDER BY received_at, event_row_id`, id)
+	return s.listSubmissionEventsOn(ctx, s.db(ctx), id)
+}
+
+func (s *PgStore) listSubmissionEventsOn(ctx context.Context, q Querier, id string) ([]*SubmissionEventRecord, error) {
+	rows, err := q.Query(ctx, eventSelect+` WHERE submission_id=$1::uuid ORDER BY received_at, event_row_id`, id)
 	if err != nil {
 		return nil, s.registryFail("listSubmissionEvents", err, nil)
 	}
@@ -139,13 +143,24 @@ func (s *PgStore) listSubmissionEvents(ctx context.Context, id string) ([]*Submi
 }
 
 // GetSubmission reads a submission with its status reports in arrival order.
+// Scoped to the caller's tenant (000032): another tenant's submission is not
+// found.
 func (s *PgStore) GetSubmission(ctx context.Context, id string) (*SubmissionRecord, []*SubmissionEventRecord, error) {
-	rec, err := scanSubmission(s.db(ctx).QueryRow(ctx, `SELECT `+submissionCols+` FROM regulatory_submissions WHERE submission_id::text=$1`, id))
+	var rec *SubmissionRecord
+	var events []*SubmissionEventRecord
+	err := s.scoped(ctx, TenantFrom(ctx), false, func(q Querier) error {
+		var err error
+		rec, err = scanSubmission(q.QueryRow(ctx, `SELECT `+submissionCols+` FROM regulatory_submissions WHERE submission_id::text=$1`, id))
+		if err != nil {
+			return s.registryFail("GetSubmission", err, domain.ErrSubmissionNotFound)
+		}
+		events, err = s.listSubmissionEventsOn(ctx, q, id)
+		return err
+	})
 	if err != nil {
-		return nil, nil, s.registryFail("GetSubmission", err, domain.ErrSubmissionNotFound)
+		return nil, nil, err
 	}
-	events, err := s.listSubmissionEvents(ctx, id)
-	return rec, events, err
+	return rec, events, nil
 }
 
 // SubmissionEventParams is one status report from an authority or provider.

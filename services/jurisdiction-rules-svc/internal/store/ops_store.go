@@ -699,10 +699,18 @@ func (s *PgStore) RollbackDeployment(ctx context.Context, ref, version, ring, re
 		return nil, &OpsBlocked{Reasons: reasons}
 	}
 
+	// The rollback reports how many decisions, of every tenant, the version
+	// made in this ring and region: an operator's count across tenants (000032).
 	var decisions int
+	if err := setCrossTenant(ctx, tx, true); err != nil {
+		return nil, s.registryFail("RollbackDeployment scope", err, nil)
+	}
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM rule_decision_evidence WHERE pack_version_id::text=$1 AND resolver_ring=$2 AND resolver_region=$3
 		AND created_at >= $4`, v.id, ring, region, cur.DeployedAt).Scan(&decisions); err != nil {
 		return nil, s.registryFail("RollbackDeployment decisions", err, nil)
+	}
+	if err := setCrossTenant(ctx, tx, false); err != nil {
+		return nil, s.registryFail("RollbackDeployment scope", err, nil)
 	}
 
 	if _, err := tx.Exec(ctx, `UPDATE pack_deployments SET status='ROLLED_BACK', rolled_back_at=NOW(), rolled_back_by=$2, rollback_reason=$3

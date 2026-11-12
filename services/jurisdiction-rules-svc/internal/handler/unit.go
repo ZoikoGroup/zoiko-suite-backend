@@ -20,7 +20,9 @@ type UnitStore interface {
 
 // UnitOfWork runs every write request (any method but GET, HEAD and OPTIONS)
 // in one database transaction (Governance audit J-11): the request's changes
-// and the outbox rows announcing them commit together or not at all.
+// and the outbox rows announcing them commit together or not at all. The
+// transaction carries the request's tenant for row-level security; a read
+// carries it in its context.
 //
 // The handler's response is held until the transaction is decided, so a
 // client is never told 2xx about a change that then failed to commit:
@@ -39,7 +41,9 @@ func UnitOfWork(st UnitStore, log *zap.Logger) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
 			case http.MethodGet, http.MethodHead, http.MethodOptions:
-				next.ServeHTTP(w, r)
+				// Reads need no transaction, only the tenant their scoped
+				// reads of tenant tables run as (row-level security, 000032).
+				next.ServeHTTP(w, r.WithContext(store.WithTenant(r.Context(), requestTenant(r))))
 				return
 			}
 			ctx, unit := st.BeginUnit(r.Context(), requestTenant(r))

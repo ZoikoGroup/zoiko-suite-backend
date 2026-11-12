@@ -230,8 +230,8 @@ func (s *PgStore) Metrics(ctx context.Context, windowHours, certAgeWarnDays, upc
 		return nil, s.registryFail("Metrics now", err, nil)
 	}
 
-	collect := func(query string, args []any, each func(pgx.Rows) error) error {
-		rows, err := s.db(ctx).Query(ctx, query, args...)
+	collectOn := func(q Querier, query string, args []any, each func(pgx.Rows) error) error {
+		rows, err := q.Query(ctx, query, args...)
 		if err != nil {
 			return s.registryFail("Metrics query", err, nil)
 		}
@@ -243,9 +243,18 @@ func (s *PgStore) Metrics(ctx context.Context, windowHours, certAgeWarnDays, upc
 		}
 		return s.registryFail("Metrics rows", rows.Err(), nil)
 	}
+	collect := func(query string, args []any, each func(pgx.Rows) error) error {
+		return collectOn(s.db(ctx), query, args, each)
+	}
+	// Resolution counts cover every tenant's decisions (s29 is a platform
+	// signal): an operator's read across tenants (000032), authorized as
+	// pack_ops_metrics.view by the handler.
+	collectAllTenants := func(query string, args []any, each func(pgx.Rows) error) error {
+		return s.scoped(ctx, TenantFrom(ctx), true, func(q Querier) error { return collectOn(q, query, args, each) })
+	}
 	win := time.Duration(windowHours) * time.Hour
 
-	if err := collect(`SELECT outcome, COUNT(*) FROM rule_decision_evidence WHERE created_at >= NOW() - make_interval(secs => $1) GROUP BY outcome`,
+	if err := collectAllTenants(`SELECT outcome, COUNT(*) FROM rule_decision_evidence WHERE created_at >= NOW() - make_interval(secs => $1) GROUP BY outcome`,
 		[]any{win.Seconds()}, func(r pgx.Rows) error {
 			var o string
 			var n int
@@ -257,7 +266,7 @@ func (s *PgStore) Metrics(ctx context.Context, windowHours, certAgeWarnDays, upc
 		}); err != nil {
 		return nil, err
 	}
-	if err := collect(`SELECT pack_ref, pack_version, COUNT(*) FROM rule_decision_evidence WHERE outcome='RESOLVED' AND created_at >= NOW() - make_interval(secs => $1)
+	if err := collectAllTenants(`SELECT pack_ref, pack_version, COUNT(*) FROM rule_decision_evidence WHERE outcome='RESOLVED' AND created_at >= NOW() - make_interval(secs => $1)
 		GROUP BY pack_ref, pack_version ORDER BY pack_ref, pack_version`, []any{win.Seconds()}, func(r pgx.Rows) error {
 		var x MetricPackVersion
 		if err := r.Scan(&x.PackRef, &x.Version, &x.Count); err != nil {

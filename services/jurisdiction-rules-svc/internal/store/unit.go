@@ -171,6 +171,71 @@ func (s *PgStore) db(ctx context.Context) dbtx {
 // through it, so they join the request's transaction).
 func (s *PgStore) DB(ctx context.Context) Querier { return s.db(ctx) }
 
+// ── row-level security scope (R4, migration 000032) ────────────────────────
+
+type tenantKey struct{}
+
+// WithTenant records the tenant a request without a unit (a read) acts for,
+// so the store's reads of tenant tables are scoped to it.
+func WithTenant(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, tenantKey{}, tenantID)
+}
+
+// TenantFrom is the tenant ctx acts for: its unit's, else WithTenant's, else "".
+func TenantFrom(ctx context.Context) string {
+	if u := unitFrom(ctx); u != nil {
+		return u.tenantID
+	}
+	t, _ := ctx.Value(tenantKey{}).(string)
+	return t
+}
+
+// setCrossTenant switches the transaction's cross-tenant read of decision
+// evidence on or off. Only operator paths that the handler has authorized use
+// it, and they switch it off again before their transaction is released into
+// the request's unit, so it never outlives the statements that need it.
+func setCrossTenant(ctx context.Context, q Querier, on bool) error {
+	v := "off"
+	if on {
+		v = "on"
+	}
+	_, err := q.Exec(ctx, `SELECT set_config('app.cross_tenant', $1, true)`, v)
+	return err
+}
+
+// scoped runs fn in a transaction whose row-level security scope is tenantID
+// ("" = no tenant) and, with cross, every tenant's decision evidence. Reads of
+// the tenant tables go through it: on the pool a statement has no tenant, and
+// would see nothing. Inside a unit it is a savepoint, and the unit's own scope
+// is restored before the savepoint is released.
+func (s *PgStore) scoped(ctx context.Context, tenantID string, cross bool, fn func(q Querier) error) error {
+	tx, err := s.db(ctx).Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: begin scoped read: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantID); err != nil {
+		return fmt.Errorf("%w: set tenant: %v", domain.ErrStoreUnavailable, err)
+	}
+	if cross {
+		if err := setCrossTenant(ctx, tx, true); err != nil {
+			return fmt.Errorf("%w: set cross-tenant: %v", domain.ErrStoreUnavailable, err)
+		}
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if u := unitFrom(ctx); u != nil {
+		if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true), set_config('app.cross_tenant', 'off', true)`, u.tenantID); err != nil {
+			return fmt.Errorf("%w: restore scope: %v", domain.ErrStoreUnavailable, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("%w: commit scoped read: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
 // isTx reports whether q is already a transaction the caller manages.
 func isTx(q Querier) bool {
 	_, ok := q.(pgx.Tx)

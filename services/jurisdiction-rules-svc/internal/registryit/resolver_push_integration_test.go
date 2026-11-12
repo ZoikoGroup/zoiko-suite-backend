@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -43,7 +42,7 @@ func newEnvListening(t *testing.T, signer domain.Signer, ttl time.Duration) *lis
 		}
 		res.Invalidate()
 	})
-	r := chi.NewRouter()
+	r := newRouter()
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithCertificationPolicy(1).WithResolver(res)
 	if signer != nil {
 		h.WithSigner(signer)
