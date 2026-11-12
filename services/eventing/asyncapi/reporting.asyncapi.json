@@ -31,6 +31,41 @@
         }
       }
     },
+    "statement-set": {
+      "address": "zoikosuite.reporting.statement-set.v1",
+      "messages": {
+        "approved": {
+          "$ref": "#/components/messages/statement-set.approved"
+        },
+        "certified": {
+          "$ref": "#/components/messages/statement-set.certified"
+        },
+        "changes-requested": {
+          "$ref": "#/components/messages/statement-set.changes-requested"
+        },
+        "created": {
+          "$ref": "#/components/messages/statement-set.created"
+        },
+        "disclosure-added": {
+          "$ref": "#/components/messages/statement-set.disclosure-added"
+        },
+        "draft-refreshed": {
+          "$ref": "#/components/messages/statement-set.draft-refreshed"
+        },
+        "published": {
+          "$ref": "#/components/messages/statement-set.published"
+        },
+        "submitted-for-review": {
+          "$ref": "#/components/messages/statement-set.submitted-for-review"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/statement-set.superseded"
+        },
+        "validated": {
+          "$ref": "#/components/messages/statement-set.validated"
+        }
+      }
+    },
     "statutory-package": {
       "address": "zoikosuite.reporting.statutory-package.v1",
       "messages": {
@@ -109,6 +144,126 @@
         "title": "regulatory-submission submitted",
         "x-zoiko-event-type": "com.zoikosuite.reporting.regulatory-submission.submitted",
         "x-zoiko-origin": "spec"
+      },
+      "statement-set.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: approved.",
+        "title": "statement-set approved",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.certified": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.certified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: certified.",
+        "title": "statement-set certified",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.certified",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.changes-requested": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.changes-requested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: changes-requested.",
+        "title": "statement-set changes-requested",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.changes-requested",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.created": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: created.",
+        "title": "statement-set created",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.created",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.disclosure-added": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.disclosure-added",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: disclosure-added.",
+        "title": "statement-set disclosure-added",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.disclosure-added",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.draft-refreshed": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.draft-refreshed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: draft-refreshed.",
+        "title": "statement-set draft-refreshed",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.draft-refreshed",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.published": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: published.",
+        "title": "statement-set published",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.published",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.submitted-for-review": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.submitted-for-review",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: submitted-for-review.",
+        "title": "statement-set submitted-for-review",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.submitted-for-review",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: superseded.",
+        "title": "statement-set superseded",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "statement-set.validated": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Statements Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reporting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reporting.statement-set.validated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Statement Set: validated.",
+        "title": "statement-set validated",
+        "x-zoiko-event-type": "com.zoikosuite.reporting.statement-set.validated",
+        "x-zoiko-origin": "extension"
       },
       "statutory-package.generated": {
         "contentType": "application/json",
@@ -299,6 +454,46 @@
         }
       ],
       "summary": "Publish regulatory-submission facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.statement-set": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/statement-set"
+      },
+      "description": "Producer(s): Financial Statements Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/statement-set/messages/approved"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/certified"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/changes-requested"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/created"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/disclosure-added"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/draft-refreshed"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/published"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/submitted-for-review"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/superseded"
+        },
+        {
+          "$ref": "#/channels/statement-set/messages/validated"
+        }
+      ],
+      "summary": "Publish statement-set facts after the authoritative commit (transactional outbox)."
     },
     "publish.statutory-package": {
       "action": "send",

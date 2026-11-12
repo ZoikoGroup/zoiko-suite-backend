@@ -246,3 +246,20 @@ The four `accounting.account-mapping.*` facts general-ledger-svc emits through `
 (catalogue 448 = 196 spec + 252 extensions) with schemas in `general-ledger-svc/contracts/events/`,
 validated against real emissions by every GL store test at cleanup. `ambiguity-detected` is not
 emitted by any current test, so its schema is derived from the code only.
+
+### The five "no samples" services, resolved
+
+- **financial-statements-svc**: the earlier "writes a column no migration creates" finding was wrong.
+  Migration 000003 adds `source_accounts`; the test harness only applied 000001 and 000002 (now all
+  four). Ten `reporting.statement-set.*` facts are catalogued (extensions) with schemas in
+  `contracts/events/`, validated per test.
+- **migration-integrity-svc**: four `migration.*` facts (`job.integrity-validated`,
+  `job.integrity-violations-detected`, `job.archived`, `audit-entry.remediated`) catalogued with
+  schemas, validated after the whole suite (which fails if it emits nothing). `migration` is a new
+  extension domain, one more open question next to `integration`, `connectivity`, etc.
+- **data-ingestion-svc** emits no events.
+- **identity-context-svc** and **notification-svc** write to their own outboxes, not `eventing`.
+  Giving them canonical envelopes and schemas is a migration (as accounting-period-svc was), not a
+  schema task; still open.
+
+Catalogue is now 462 entries = 196 spec + 266 extensions.

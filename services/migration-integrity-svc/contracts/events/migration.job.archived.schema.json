@@ -1,0 +1,1 @@
+{"type":"object","description":"ZS-EVENT-001 payload of com.zoikosuite.migration.job.archived (migration-integrity-svc, schema 1.0.0): a migration job was archived.","properties":{"job_id":{"type":"string"}},"required":["job_id"]}

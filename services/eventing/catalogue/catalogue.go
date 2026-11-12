@@ -76,7 +76,7 @@ var Domains = []string{
 // never drift into them. Each is an open architecture question (section 19's
 // "Data, AI & Integrations" family uses the data.* domain for connector and import
 // facts): adopt the domain into section 19, or migrate the producer to an existing one.
-var ExtensionDomains = []string{"integration", "connectivity", "treasury", "reconciliation", "einvoice"}
+var ExtensionDomains = []string{"integration", "connectivity", "treasury", "reconciliation", "einvoice", "migration"}
 
 var (
 	once    sync.Once
@@ -124,7 +124,7 @@ func Lookup(eventType string) (Entry, bool) {
 // pastTense reports whether a fact segment reads as a past-tense fact.
 // It is a heuristic on purpose (§21: "Past-tense name"); legitimate
 // exceptions are listed in nonPastTense with the reason they are accepted.
-var pastTense = regexp.MustCompile(`((ed|en|wn|set|off|paid|made|sent|held|built|run|given|taken|bound|back)|^became-.+)$`)
+var pastTense = regexp.MustCompile(`((ed|en|wn|set|off|paid|made|sent|held|built|run|given|taken|bound|back)|^became-.+|^submitted-for-.+)$`)
 
 // nonPastTense are catalogue entries the standard itself lists whose last
 // segment is not a past participle. They are accepted explicitly so that a
