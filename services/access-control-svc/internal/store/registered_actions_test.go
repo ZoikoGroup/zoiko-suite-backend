@@ -71,7 +71,19 @@ var registeredActionMigrations = []struct {
 		"EVIDENCE_MANIFEST_GENERATE": "STANDARD",
 		"EVIDENCE_MANIFEST_READ":     "STANDARD",
 	}},
+	{"000052_jurisdiction_rules_templates", "jurisdiction-rules-svc", map[string]string{
+		"JURISDICTION_OUTBOX_EVENT_VIEW":    "STANDARD",
+		"JURISDICTION_OUTBOX_EVENT_REQUEUE": "HIGH",
+		"JURISDICTION_SUMMARY_VIEW":         "STANDARD",
+		"JURISDICTION_ENTITY_BACKFILL":      "HIGH",
+		"JURISDICTION_OPERATION_VIEW":       "STANDARD",
+		"JURISDICTION_OPERATION_CANCEL":     "HIGH",
+	}},
 }
+
+// templatePublishers are the migrations, in this list, that publish role
+// templates carrying actions earlier migrations registered (rule R5).
+var templatePublishers = []string{"000052_jurisdiction_rules_templates"}
 
 // permCatalog is the permission catalogue used by alias tests.
 var permCatalog = store.NewPermissionCatalogue(testStore)
@@ -106,11 +118,26 @@ func TestRegisteredPermissionDownRefusesWhileGrantedAndOtherwiseRemovesOwnAction
 		}
 
 		// Unused: the down migration succeeds and removes its actions only.
+		// Migrations are reverted newest first, so a later migration that
+		// publishes templates carrying these actions is reverted before it.
 		tx, err := ownerPool.Begin(ctx)
 		require.NoError(t, err)
+		reverted := map[string]bool{}
+		for _, later := range templatePublishers {
+			if later > m.migration {
+				laterDown, err := os.ReadFile("../../deployments/migrations/" + later + ".down.sql")
+				require.NoError(t, err)
+				_, err = tx.Exec(ctx, string(laterDown))
+				require.NoError(t, err, "%s down, before %s down", later, m.migration)
+				reverted[later] = true
+			}
+		}
 		_, err = tx.Exec(ctx, string(down))
 		require.NoError(t, err, "%s down with nothing granted", m.migration)
 		for _, other := range registeredActionMigrations {
+			if reverted[other.migration] {
+				continue
+			}
 			for action := range other.risk {
 				var n int
 				require.NoError(t, tx.QueryRow(ctx, `SELECT count(*) FROM permission_definitions WHERE action_name = $1`, action).Scan(&n))
@@ -198,7 +225,7 @@ func TestS9D1_AliasCannotPointAtUnregisteredAction(t *testing.T) {
 		`SELECT alias_for FROM permission_definitions WHERE action_name = 'PAYMENT_RELEASE'`).Scan(&aliasFor)
 	require.NoError(t, err)
 	require.Equal(t, "payment.release", aliasFor, "PAYMENT_RELEASE must alias to payment.release")
-	
+
 	// The FK constraint prevents creating an alias to a non-existent action
 	// This is tested implicitly by the migration - if the constraint didn't
 	// exist, the migration would have failed or allowed invalid aliases.
