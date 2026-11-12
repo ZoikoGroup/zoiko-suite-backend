@@ -241,9 +241,13 @@ func TestWave2_ProviderSettlement_PaymentsPairWithBankDebitsAndEveryOtherItemIsD
 	}
 
 	// The entity approves a 3-day settlement lag for this control; later runs pin it.
-	_, err = testStore.CreateTolerancePolicy(ctx, w.tenant, "maker", domain.CreateTolerancePolicyRequest{
+	// Created pending and approved by a second principal (A4: approval is no
+	// longer a caller-declared field).
+	pol, err := testStore.CreateTolerancePolicy(ctx, w.tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: w.entity, Metric: "FIN-CTRL-004", AbsoluteTolerance: "0", Currency: "USD", DateToleranceDays: 3,
-		Rationale: "bank booking lag", EffectiveFrom: "2026-01-01", ApprovedBy: "treasurer"})
+		Rationale: "bank booking lag", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	_, err = testStore.ApproveTolerancePolicy(ctx, w.tenant, w.entity, pol.ToleranceID, "treasurer")
 	require.NoError(t, err)
 
 	tied()

@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/financial-control-svc/internal/domain"
-	"zoiko.io/financial-control-svc/internal/events"
 )
 
 // CertifyRun records a certifier's decision on a READY_TO_CERTIFY run, atomically
@@ -95,7 +94,7 @@ func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, actor, correl
 		}
 		p.ToCert = &cert
 		var err error
-		out, err = advanceTx(ctx, tx, tenantID, runID, p)
+		out, err = s.advanceTx(ctx, tx, tenantID, runID, p)
 		if err != nil || req.Decision != domain.DecisionCertify {
 			return err
 		}
@@ -374,7 +373,7 @@ func (s *PgStore) RevokeCertification(ctx context.Context, tenantID, runID, acto
 			VALUES ($1,$2,$3,$4)`, tenantID, idempotencyKey, revokeCommand, runID); err != nil {
 			return err
 		}
-		if err := emit(ctx, tx, r, events.RunCertificationRevoked, actor, correlationID, map[string]any{
+		if err := s.emit(ctx, tx, r, RunCertificationRevoked, actor, correlationID, map[string]any{
 			"run_id": r.RunID, "control_definition_id": r.ControlDefinitionID, "period_id": r.PeriodID,
 			"lifecycle_state": r.LifecycleState, "result_state": r.ResultState,
 			"prior_certification_state": domain.CertCertified, "certification_state": r.CertificationState,

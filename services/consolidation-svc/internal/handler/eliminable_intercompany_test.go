@@ -59,10 +59,19 @@ func TestStartRun_EliminatesClosedIntercompanyEntry(t *testing.T) {
 func TestCreateEliminationProposal_MatchedBalanceSummedExactly(t *testing.T) {
 	s := newStubStore()
 	s.groupHasRun["group-1"] = true
-	cl := &stubClients{intercompanyEntries: []clients.IntercompanyEntry{
-		{IntercompanyEntryID: "ic-1", Amount: "0.7", MatchStatus: "MATCHED"},
-		{IntercompanyEntryID: "ic-2", Amount: "0.1", MatchStatus: "CLOSED"},
-	}}
+	cl := &stubClients{
+		intercompanyEntries: []clients.IntercompanyEntry{
+			{IntercompanyEntryID: "ic-1", Amount: "0.7", MatchStatus: "MATCHED"},
+			{IntercompanyEntryID: "ic-2", Amount: "0.1", MatchStatus: "CLOSED"},
+		},
+		reciprocalBalances: &domain.ReciprocalBalances{
+			EntityA: "entity-a", EntityB: "entity-b", FiscalPeriod: "2026-07",
+			ByMatchStatus: []domain.ReciprocalStatusBalances{
+				{MatchStatus: "MATCHED", Net: []domain.ReciprocalCurrencyTotal{{CurrencyCode: "USD", Amount: "0.7"}}},
+				{MatchStatus: "CLOSED", Net: []domain.ReciprocalCurrencyTotal{{CurrencyCode: "USD", Amount: "0.1"}}},
+			},
+		},
+	}
 	req := validAdjustmentReq(domain.AdjustmentTypeElimination)
 	req["lines"] = []map[string]any{
 		{"account_code": "9000", "debit_amount": 0.4},
@@ -81,5 +90,64 @@ func TestCreateEliminationProposal_MatchedBalanceSummedExactly(t *testing.T) {
 	resp = doReq(newRouter(s, &stubAuthZ{}, cl), http.MethodPost, "/v1/consolidation/adjustments", req, "preparer-1")
 	if resp.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 for a proposal over the matched balance, got %d: %s", resp.Code, resp.Body.String())
+	}
+}
+
+// TestCreateEliminationProposal_BoundIsScopedToTheNamedPair_NotTenantWide
+// proves A5 is actually closed: a proposal for one entity pair is bounded
+// by THAT pair's reciprocal balance, forwarded by entity/period to
+// FetchReciprocalBalances — not by summing every eliminable balance
+// anywhere in the tenant, which would let an unrelated pair's large
+// balance validate a proposal that pair has nothing to do with.
+func TestCreateEliminationProposal_BoundIsScopedToTheNamedPair_NotTenantWide(t *testing.T) {
+	s := newStubStore()
+	s.groupHasRun["group-1"] = true
+	// This pair's own matched balance is small (50); only reachable via
+	// FetchReciprocalBalances for entity-a/entity-b, not the old tenant-wide
+	// entries fetch (which a stale implementation might still answer from
+	// intercompanyEntries, set here deliberately large to catch that regression).
+	cl := &stubClients{
+		intercompanyEntries: []clients.IntercompanyEntry{
+			{IntercompanyEntryID: "ic-unrelated", Amount: "999999", MatchStatus: "MATCHED"},
+		},
+		reciprocalBalances: &domain.ReciprocalBalances{
+			EntityA: "entity-a", EntityB: "entity-b", FiscalPeriod: "2026-07",
+			ByMatchStatus: []domain.ReciprocalStatusBalances{
+				{MatchStatus: "MATCHED", Net: []domain.ReciprocalCurrencyTotal{{CurrencyCode: "USD", Amount: "50"}}},
+			},
+		},
+	}
+	req := validAdjustmentReq(domain.AdjustmentTypeElimination)
+	req["lines"] = []map[string]any{
+		{"account_code": "9000", "debit_amount": 100},
+		{"account_code": "9100", "credit_amount": 100},
+	}
+	resp := doReq(newRouter(s, &stubAuthZ{}, cl), http.MethodPost, "/v1/consolidation/adjustments", req, "preparer-1")
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422: 100 exceeds this pair's own matched balance of 50, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if cl.reciprocalEntityA != "entity-a" || cl.reciprocalEntityB != "entity-b" || cl.reciprocalPeriod != "2026-07" {
+		t.Fatalf("expected the request's named pair/period to reach FetchReciprocalBalances, got entityA=%q entityB=%q period=%q",
+			cl.reciprocalEntityA, cl.reciprocalEntityB, cl.reciprocalPeriod)
+	}
+}
+
+// TestCreateEliminationProposal_MissingPair_Returns400 proves A5's own
+// required-field guard: an ELIMINATION proposal naming no pair is refused
+// before any intercompany call is made.
+func TestCreateEliminationProposal_MissingPair_Returns400(t *testing.T) {
+	s := newStubStore()
+	s.groupHasRun["group-1"] = true
+	req := map[string]any{
+		"group_legal_entity_id": "group-1", "fiscal_period": "2026-07",
+		"adjustment_type": domain.AdjustmentTypeElimination, "description": "no pair named",
+		"lines": []map[string]any{
+			{"account_code": "9000", "debit_amount": 10},
+			{"account_code": "9100", "credit_amount": 10},
+		},
+	}
+	resp := doReq(newRouter(s, &stubAuthZ{}, &stubClients{}), http.MethodPost, "/v1/consolidation/adjustments", req, "preparer-1")
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 missing_fields, got %d: %s", resp.Code, resp.Body.String())
 	}
 }

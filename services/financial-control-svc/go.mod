@@ -10,13 +10,14 @@ require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/riandyrn/otelchi v0.12.3
-	github.com/segmentio/kafka-go v0.4.51
 	github.com/stretchr/testify v1.11.1
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.uber.org/zap v1.27.0
 )
+
+require github.com/segmentio/kafka-go v0.4.51 // indirect
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -55,4 +56,7 @@ require (
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	zoiko.io/eventing v0.0.0-00010101000000-000000000000
 )
+
+replace zoiko.io/eventing => ../eventing

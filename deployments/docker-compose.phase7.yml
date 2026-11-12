@@ -110,6 +110,12 @@ services:
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.banking.connector.events"
       AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+      # Account-number tokenization (Security Standard §14). Off: account
+      # numbers are stored exactly as before. Stays "false" until
+      # key-management-svc (docker-compose.phase6.yml, published on 8143)
+      # implements the proposed /v1/tokenize and /v1/detokenize.
+      TOKENIZATION_SERVICE_URL: "http://host.docker.internal:8143"
+      TOKENIZATION_ENFORCED: "${TOKENIZATION_ENFORCED:-false}"
     ports:
       - "8145:8145"
     healthcheck:

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,6 +85,11 @@ type stubStore struct {
 	createExecErr     error
 	markCommittedErr  error
 	markFailedErr     error
+
+	// accountChanges mirrors account_change_approvals, by change_id — ACC-01's
+	// maker-checker gate (SPEC_DEVIATIONS A4/B16): a reparent or amendment
+	// touching a control account lands here instead of being applied.
+	accountChanges map[string]*domain.AccountChangeApproval
 }
 
 // commandIdempotencyEntry is one claimed Idempotency-Key: the command that
@@ -114,6 +120,7 @@ func newStubStore() *stubStore {
 		bySourceEvent:      map[string]string{},
 		claimedAt:          map[string]time.Time{},
 		commandIdempotency: map[string]commandIdempotencyEntry{},
+		accountChanges:     map[string]*domain.AccountChangeApproval{},
 	}
 	// ACC-02 is the only way a posting names an account, so every posting
 	// test starts with the two mappings validPostEventReq uses. Individual
@@ -345,30 +352,29 @@ func (s *stubStore) claimCommand(tenantID, idempotencyKey, command, accountCode 
 // version is enforced, a new version is appended, and the head row advances.
 // An Idempotency-Key already claimed by this command and account replays the
 // account instead of appending a second version.
-func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidence []string, principalID string) (*domain.Account, bool, error) {
+func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidence []string, sourcePolicyRef string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
 	if s.amendAccountErr != nil {
-		return nil, false, s.amendAccountErr
+		return nil, nil, false, s.amendAccountErr
 	}
 	if replay, acct, ok, err := s.replayCommand(tenantID, idempotencyKey, commandStubAmendAccount, accountCode); err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	} else if ok {
-		return acct, replay, nil
+		return acct, nil, replay, nil
 	}
 	key := tenantID + "|" + accountCode
 	cur, ok := s.accountsByCode[key]
 	if !ok {
-		return nil, false, domain.ErrAccountNotFound
+		return nil, nil, false, domain.ErrAccountNotFound
 	}
 	if expectedVersion > 0 && cur.Version != expectedVersion {
-		return nil, false, domain.ErrAccountVersionConflict
+		return nil, nil, false, domain.ErrAccountVersionConflict
 	}
 	versions := s.accountVersions[key]
 	if len(versions) > 0 {
 		prev := versions[len(versions)-1]
 		if effectiveFrom.Before(prev.EffectiveFrom) {
-			return nil, false, domain.ErrAccountEffectiveDate
+			return nil, nil, false, domain.ErrAccountEffectiveDate
 		}
-		prev.EffectiveTo = &effectiveFrom
 	}
 	updated := *cur
 	updated.AccountName = a.AccountName
@@ -377,6 +383,28 @@ func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode
 	updated.IsControlAccount = a.IsControlAccount
 	updated.DirectPostingRestricted = a.DirectPostingRestricted
 	updated.Status = a.Status
+
+	// SPEC_DEVIATIONS A4/B16: a control account on either side of the
+	// amendment is recorded pending, not applied, mirroring the real store.
+	if cur.IsControlAccount || updated.IsControlAccount {
+		if strings.TrimSpace(reason) == "" {
+			return nil, nil, false, domain.ErrAccountChangeReasonRequired
+		}
+		change := &domain.AccountChangeApproval{
+			ChangeID: "change-" + fmt.Sprint(len(s.accountChanges)+1), TenantID: tenantID,
+			AccountID: cur.AccountID, AccountCode: accountCode, ChangeKind: domain.AccountChangeKindAmended,
+			ExpectedVersion: cur.Version, Amendment: &updated, EffectiveFrom: effectiveFrom,
+			Reason: reason, EvidenceRefs: evidence, SourcePolicyRef: sourcePolicyRef, Status: domain.AccountChangeStatusPending,
+			ProposedAt: time.Now().UTC(), ProposedByPrincipalID: principalID,
+		}
+		s.accountChanges[change.ChangeID] = change
+		s.claimCommand(tenantID, idempotencyKey, commandStubAmendAccount, accountCode)
+		return cur, change, false, nil
+	}
+
+	if len(versions) > 0 {
+		versions[len(versions)-1].EffectiveTo = &effectiveFrom
+	}
 	updated.Version = cur.Version + 1
 	*cur = updated
 	s.accountVersions[key] = append(versions, &domain.AccountVersion{
@@ -389,7 +417,7 @@ func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode
 		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	})
 	s.claimCommand(tenantID, idempotencyKey, commandStubAmendAccount, accountCode)
-	return cur, false, nil
+	return cur, nil, false, nil
 }
 
 func (s *stubStore) GetAccountByCode(_ context.Context, tenantID, accountCode string) (*domain.Account, error) {
@@ -436,32 +464,34 @@ func (s *stubStore) GetAccountAsOf(_ context.Context, tenantID, accountCode stri
 // date is refused before any version is written. An Idempotency-Key already
 // claimed by this command and account replays the account instead of
 // appending a second version.
-func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, bool, error) {
+func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, sourcePolicyRef string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
 	if replay, acct, ok, err := s.replayCommand(tenantID, idempotencyKey, commandStubReparentAccount, accountCode); err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	} else if ok {
-		return acct, replay, nil
+		return acct, nil, replay, nil
 	}
 	key := tenantID + "|" + accountCode
 	a, ok := s.accountsByCode[key]
 	if !ok {
-		return nil, false, domain.ErrAccountNotFound
+		return nil, nil, false, domain.ErrAccountNotFound
 	}
 	if expectedVersion > 0 && a.Version != expectedVersion {
-		return nil, false, domain.ErrAccountVersionConflict
+		return nil, nil, false, domain.ErrAccountVersionConflict
 	}
+	parentIsControl := false
 	if parentAccountID != nil {
 		if *parentAccountID == a.AccountID {
-			return nil, false, domain.ErrAccountHierarchyCycle
+			return nil, nil, false, domain.ErrAccountHierarchyCycle
 		}
 		ancestor, ok := s.accounts[*parentAccountID]
 		if !ok {
-			return nil, false, domain.ErrParentAccountNotFound
+			return nil, nil, false, domain.ErrParentAccountNotFound
 		}
+		parentIsControl = ancestor.IsControlAccount
 		seen := map[string]bool{}
 		for ancestor != nil {
 			if ancestor.AccountID == a.AccountID {
-				return nil, false, domain.ErrAccountHierarchyCycle
+				return nil, nil, false, domain.ErrAccountHierarchyCycle
 			}
 			if seen[ancestor.AccountID] {
 				break
@@ -476,22 +506,43 @@ func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, id
 	sameParent := (a.ParentAccountID == nil && parentAccountID == nil) ||
 		(a.ParentAccountID != nil && parentAccountID != nil && *a.ParentAccountID == *parentAccountID)
 	if sameParent {
-		return a, false, nil
+		return a, nil, false, nil
 	}
 	effective := effectiveFrom
 	if effective.IsZero() {
 		effective = time.Now().UTC()
 	}
 	if effective.Before(time.Now().UTC().Truncate(24 * time.Hour)) {
-		return nil, false, domain.ErrAccountHierarchyBackdated
+		return nil, nil, false, domain.ErrAccountHierarchyBackdated
 	}
 	versions := s.accountVersions[key]
 	if len(versions) > 0 {
 		prev := versions[len(versions)-1]
 		if effective.Before(prev.EffectiveFrom) {
-			return nil, false, domain.ErrAccountEffectiveDate
+			return nil, nil, false, domain.ErrAccountEffectiveDate
 		}
-		prev.EffectiveTo = &effective
+	}
+
+	// SPEC_DEVIATIONS A4/B16: moving a control account, or moving an
+	// ordinary account under one, is recorded pending, not applied.
+	if a.IsControlAccount || parentIsControl {
+		if strings.TrimSpace(reason) == "" {
+			return nil, nil, false, domain.ErrAccountChangeReasonRequired
+		}
+		change := &domain.AccountChangeApproval{
+			ChangeID: "change-" + fmt.Sprint(len(s.accountChanges)+1), TenantID: tenantID,
+			AccountID: a.AccountID, AccountCode: accountCode, ChangeKind: domain.AccountChangeKindReparented,
+			ExpectedVersion: a.Version, NewParentAccountID: parentAccountID, EffectiveFrom: effective,
+			Reason: reason, EvidenceRefs: evidence, SourcePolicyRef: sourcePolicyRef, Status: domain.AccountChangeStatusPending,
+			ProposedAt: time.Now().UTC(), ProposedByPrincipalID: principalID,
+		}
+		s.accountChanges[change.ChangeID] = change
+		s.claimCommand(tenantID, idempotencyKey, commandStubReparentAccount, accountCode)
+		return a, change, false, nil
+	}
+
+	if len(versions) > 0 {
+		versions[len(versions)-1].EffectiveTo = &effective
 	}
 	a.ParentAccountID = parentAccountID
 	a.Version++
@@ -505,7 +556,7 @@ func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, id
 		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	})
 	s.claimCommand(tenantID, idempotencyKey, commandStubReparentAccount, accountCode)
-	return a, false, nil
+	return a, nil, false, nil
 }
 
 func (s *stubStore) ActivateAccount(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
@@ -514,6 +565,72 @@ func (s *stubStore) ActivateAccount(_ context.Context, tenantID, accountCode str
 
 func (s *stubStore) DeactivateAccount(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
 	return s.changeAccountStatus(tenantID, accountCode, "INACTIVE", "DEACTIVATED", expectedVersion, effectiveFrom, reason, evidence, principalID)
+}
+
+func (s *stubStore) GetAccountChangeApproval(_ context.Context, tenantID, changeID string) (*domain.AccountChangeApproval, error) {
+	c, ok := s.accountChanges[changeID]
+	if !ok || c.TenantID != tenantID {
+		return nil, domain.ErrAccountChangeNotFound
+	}
+	return c, nil
+}
+
+// ApproveAccountChange mirrors the real store's second half of a gated
+// reparent/amendment: it refuses a self-approval, then applies exactly the
+// same version-append-and-advance-head logic AmendAccountVersion/
+// ReparentAccount use for an ungated change.
+func (s *stubStore) ApproveAccountChange(_ context.Context, tenantID, changeID, principalID, idempotencyKey string) (*domain.Account, bool, error) {
+	c, ok := s.accountChanges[changeID]
+	if !ok || c.TenantID != tenantID {
+		return nil, false, domain.ErrAccountChangeNotFound
+	}
+	if c.Status != domain.AccountChangeStatusPending {
+		return nil, false, domain.ErrAccountChangeNotPending
+	}
+	if c.ProposedByPrincipalID == principalID {
+		return nil, false, domain.ErrAccountChangeSelfApproval
+	}
+	key := tenantID + "|" + c.AccountCode
+	cur, ok := s.accountsByCode[key]
+	if !ok {
+		return nil, false, domain.ErrAccountNotFound
+	}
+	if cur.Version != c.ExpectedVersion {
+		return nil, false, domain.ErrAccountVersionConflict
+	}
+
+	updated := *cur
+	switch c.ChangeKind {
+	case domain.AccountChangeKindReparented:
+		updated.ParentAccountID = c.NewParentAccountID
+	case domain.AccountChangeKindAmended:
+		updated.AccountName = c.Amendment.AccountName
+		updated.AccountType = c.Amendment.AccountType
+		updated.ParentAccountID = c.Amendment.ParentAccountID
+		updated.IsControlAccount = c.Amendment.IsControlAccount
+		updated.DirectPostingRestricted = c.Amendment.DirectPostingRestricted
+		updated.Status = c.Amendment.Status
+	}
+	versions := s.accountVersions[key]
+	if len(versions) > 0 {
+		versions[len(versions)-1].EffectiveTo = &c.EffectiveFrom
+	}
+	updated.Version = cur.Version + 1
+	*cur = updated
+	s.accountVersions[key] = append(versions, &domain.AccountVersion{
+		AccountVersionID: "v" + fmt.Sprint(updated.Version) + "-" + key,
+		AccountID:        updated.AccountID, TenantID: updated.TenantID, AccountCode: updated.AccountCode,
+		Version: updated.Version, AccountName: updated.AccountName, AccountType: updated.AccountType,
+		ParentAccountID: updated.ParentAccountID, IsControlAccount: updated.IsControlAccount,
+		DirectPostingRestricted: updated.DirectPostingRestricted, Status: updated.Status,
+		EffectiveFrom: c.EffectiveFrom, ChangeKind: c.ChangeKind, ChangeReason: c.Reason,
+		EvidenceRefs: c.EvidenceRefs, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: c.ProposedByPrincipalID,
+	})
+	now := time.Now().UTC()
+	c.Status = domain.AccountChangeStatusApproved
+	c.ApprovedAt = &now
+	c.ApprovedByPrincipalID = &principalID
+	return cur, false, nil
 }
 
 // changeAccountStatus mirrors the real store's transition invariants: idempotent

@@ -202,4 +202,12 @@ const (
 	ErrReopenSelfApproval      = errorString("a reopen must be approved by someone other than the person who requested it")
 	ErrReopenWindowInvalid     = errorString("reopen_until must be in the future and no more than 30 days away")
 	ErrReopenRetired           = errorString("a closed period is reopened by request and independent approval: POST /v1/close/periods/{id}/reopen-requests, then /v1/close/reopen-requests/{request_id}/approve")
+	// ErrCertifierNotIndependent: ACC-14 (SPEC_DEVIATIONS A6) — the close
+	// certifier (whoever hard-closes or recloses) must differ from the
+	// preparer, the principal who most recently brought the period into the
+	// state being closed from (CLOSE_REVIEW for a hard close,
+	// AUTHORIZED_REOPEN for a reclose). Applied unconditionally rather than
+	// behind a materiality switch, the same interpretation B1 already made
+	// for every other maker-checker gate in this service.
+	ErrCertifierNotIndependent = errorString("the close certifier must be someone other than the principal who prepared the period for close")
 )

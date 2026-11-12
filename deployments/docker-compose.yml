@@ -3294,8 +3294,9 @@ services:
   # authorization-svc, fail-closed. Postgres RLS + explicit tenant_id filters.
   financial-control-svc:
     build:
-      context: ../services/financial-control-svc
-      dockerfile: Dockerfile
+      # Context is services/ so the go.mod replace ../eventing resolves.
+      context: ../services
+      dockerfile: financial-control-svc/Dockerfile
     container_name: financial-control-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -3312,6 +3313,9 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.financial-control.events"
       KAFKA_GROUP_ID: "financial-control-svc"
+      # Required ZS-EVENT-001 envelope attributes (no default; startup refuses without them).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      EVENT_CLASSIFICATION: "${EVENT_CLASSIFICATION_FINANCIAL_CONTROL:-confidential}"
       # Registered source systems for control populations (name=base-url). A run can select a
       # registered system by name but can never supply a URL. Each source must implement
       # docs/architecture/control-population-contract.md; until then, runs against it end
@@ -4280,6 +4284,12 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.payee-banking-identity.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       COUNTERPARTY_SERVICE_URL: "http://counterparty-management-svc:8124"
+      # Account-identifier tokenization (Security Standard §14). Off: identifiers
+      # are stored exactly as before. Stays "false" until key-management-svc
+      # (docker-compose.phase6.yml, port 8143) implements the proposed
+      # /v1/tokenize and /v1/detokenize.
+      TOKENIZATION_SERVICE_URL: "http://key-management-svc:8143"
+      TOKENIZATION_ENFORCED: "${TOKENIZATION_ENFORCED:-false}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4441,8 +4451,9 @@ services:
   # Plane 2 tenant/workspace/legal_entity data.
   commercial-account-svc:
     build:
-      context: ../services/commercial-account-svc
-      dockerfile: Dockerfile
+      # Context is services/ so the go.mod replace ../eventing resolves.
+      context: ../services
+      dockerfile: commercial-account-svc/Dockerfile
     container_name: commercial-account-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4462,6 +4473,9 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/commercial_account?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
+      # Required ZS-EVENT-001 envelope attributes (no default; startup refuses without them).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      EVENT_CLASSIFICATION: "${EVENT_CLASSIFICATION_COMMERCIAL_ACCOUNT:-confidential}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
@@ -4485,8 +4499,9 @@ services:
   # separate objects — never compressed into one feature flag.
   capability-registry-svc:
     build:
-      context: ../services/capability-registry-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: capability-registry-svc/Dockerfile
     container_name: capability-registry-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4509,6 +4524,9 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/capability_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
+      # Required: stamped on every event (ZS-EVENT-001 §4); the service
+      # refuses to start without it. Same default as the other adopters.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:

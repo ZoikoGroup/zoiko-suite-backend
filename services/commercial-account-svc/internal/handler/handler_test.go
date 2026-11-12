@@ -14,7 +14,6 @@ import (
 
 	"zoiko.io/commercial-account-svc/internal/authz"
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/events"
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 )
 
@@ -103,14 +102,6 @@ func (s *stubStore) DeactivateMembership(_ context.Context, id, organizationID s
 	return nil
 }
 
-type stubPublisher struct{}
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
-
 // stubAuthz is a test double for AuthzChecker. By default it grants every
 // request; tests that need to exercise the deny/unavailable paths can flip
 // err to authz.ErrAuthorizationDenied or authz.ErrAuthzServiceUnavailable.
@@ -126,7 +117,7 @@ var _ AuthzChecker = (*stubAuthz)(nil)
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
+	return New(newStubStore(), &stubAuthz{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -183,7 +174,7 @@ func TestCreateCommercialAccount_MissingPrincipalHeader(t *testing.T) {
 
 func TestCreateCommercialAccount_AuthzDenied(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{err: authz.ErrAuthorizationDenied}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authz.ErrAuthorizationDenied}, logger)
 	body := domain.CreateCommercialAccountRequest{
 		OrganizationID:      "org-test-01",
 		LegalCustomerName:   "Verify Co",
@@ -301,7 +292,7 @@ func TestReadEndpoints_AuthzDenied_Refused(t *testing.T) {
 	}
 	deniedAuthz := &stubAuthz{err: authz.ErrAuthorizationDenied}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, deniedAuthz, logger)
+	h := New(store, deniedAuthz, logger)
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	RegisterRoutes(r, h)
@@ -337,7 +328,7 @@ func TestReadEndpoints_MissingPrincipal_Refused(t *testing.T) {
 		Status:         domain.MembershipStatusActive,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthz{}, logger)
+	h := New(store, &stubAuthz{}, logger)
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	RegisterRoutes(r, h)
@@ -360,4 +351,3 @@ func TestReadEndpoints_MissingPrincipal_Refused(t *testing.T) {
 		})
 	}
 }
-

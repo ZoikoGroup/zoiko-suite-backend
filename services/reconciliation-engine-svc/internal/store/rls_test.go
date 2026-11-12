@@ -32,6 +32,14 @@ const (
 
 func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	return openAdminPoolThrough(t, func(string) bool { return true })
+}
+
+// openAdminPoolThrough resets the schema and applies only the up migrations
+// include accepts, so a test can stop before a migration and seed the state it
+// runs against (applyMigrations then applies the rest).
+func openAdminPoolThrough(t *testing.T, include func(name string) bool) *pgxpool.Pool {
+	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
@@ -45,6 +53,8 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS eventing_outbox CASCADE;
+		DROP FUNCTION IF EXISTS eventing_outbox_payload_immutable() CASCADE;
 		DROP TABLE IF EXISTS reconciliation_certification_revocations CASCADE;
 		DROP TABLE IF EXISTS reconciliation_rule_versions CASCADE;
 		DROP TABLE IF EXISTS reconciliation_exception_transitions CASCADE;
@@ -68,6 +78,13 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP FUNCTION IF EXISTS enforce_revocation_revokes() CASCADE;
 		DROP FUNCTION IF EXISTS reconciliation_refs_nonblank(TEXT[]) CASCADE;`)
 
+	applyMigrations(t, pool, include)
+	return pool
+}
+
+func applyMigrations(t *testing.T, pool *pgxpool.Pool, include func(name string) bool) {
+	t.Helper()
+	ctx := context.Background()
 	_, thisFile, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(thisFile), "../../deployments/migrations")
 	entries, err := os.ReadDir(migDir)
@@ -76,7 +93,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	var migs []string
 	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".up.sql") {
+		if strings.HasSuffix(e.Name(), ".up.sql") && include(e.Name()) {
 			migs = append(migs, e.Name())
 		}
 	}
@@ -93,7 +110,6 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 			t.Fatalf("apply migration %s: %v", name, err)
 		}
 	}
-	return pool
 }
 
 func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
@@ -147,7 +163,8 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	admin := openAdminPool(t)
 	app := appRolePool(t, admin)
-	return &fixture{t: t, ctx: context.Background(), admin: admin, app: app, s: store.NewPgStore(app)}
+	return &fixture{t: t, ctx: context.Background(), admin: admin, app: app,
+		s: store.NewPgStore(app, store.WithEventRegion(testEventRegion))}
 }
 
 func (f *fixture) claim(op, resource string) domain.IdempotencyClaim {
@@ -159,6 +176,7 @@ func (f *fixture) claim(op, resource string) domain.IdempotencyClaim {
 	return domain.IdempotencyClaim{
 		OwnerScope: domain.SellerScope, PrincipalID: "test-operator", Key: fmt.Sprintf("key-%d", n),
 		Operation: op, RequestSHA256: hex.EncodeToString(sum[:]), ResourceID: resource,
+		CorrelationID: fmt.Sprintf("corr-%d", n),
 	}
 }
 

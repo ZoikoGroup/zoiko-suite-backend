@@ -50,6 +50,10 @@ type Store interface {
 	ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, *domain.FiscalPeriod, error)
 	RejectReopenRequest(ctx context.Context, requestID, deciderID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, error)
 	GetCloseHistory(ctx context.Context, fiscalPeriodID string) (*domain.CloseHistory, error)
+	// GetLatestTransitionPrincipal answers who most recently moved a period
+	// into toState (SPEC_DEVIATIONS A6: the close certifier must differ from
+	// this preparer).
+	GetLatestTransitionPrincipal(ctx context.Context, fiscalPeriodID, toState string) (string, error)
 	CreateCloseEvidence(ctx context.Context, evidence *domain.CloseEvidence, correlationID, actorID string, periodName, legalEntityID string) error
 	ListCloseEvidence(ctx context.Context, fiscalPeriodID string) ([]domain.CloseEvidence, error)
 	// CreateControlRun persists one ACC-06 subledger-to-GL reconciliation
@@ -57,6 +61,21 @@ type Store interface {
 	// If the run's status is EXCEPTION, enqueues a period.subledger_control_exception event.
 	CreateControlRun(ctx context.Context, run *domain.SubledgerControlRun, correlationID, actorID string) error
 	ListControlRuns(ctx context.Context, legalEntityID, fiscalPeriod string) ([]domain.SubledgerControlRun, error)
+
+	// ACC-06 governance (migration 000025, SPEC_DEVIATIONS A1): the
+	// resolution workflow for a run that lands EXCEPTION, and
+	// certification of a control's latest run.
+	GetControlRun(ctx context.Context, controlRunID string) (*domain.SubledgerControlRun, error)
+	GetLatestControlRun(ctx context.Context, legalEntityID, fiscalPeriod, subledger, bookID string) (*domain.SubledgerControlRun, error)
+	GetControlException(ctx context.Context, controlExceptionID string) (*domain.ControlException, error)
+	GetControlExceptionByRun(ctx context.Context, controlRunID string) (*domain.ControlException, error)
+	AssignException(ctx context.Context, controlExceptionID, assignedToPrincipalID, actorID, correlationID string) (*domain.ControlException, error)
+	RecordResolution(ctx context.Context, controlExceptionID, resolutionNote, actorID, correlationID string) (*domain.ControlException, error)
+	ListOpenExceptions(ctx context.Context, legalEntityID string) ([]domain.ControlException, error)
+	// HasUnresolvedException answers whether the given control (by its
+	// latest run) carries an OPEN or ASSIGNED exception right now.
+	HasUnresolvedException(ctx context.Context, legalEntityID, subledger, bookID string) (bool, error)
+	CertifyControlRun(ctx context.Context, controlRunID, certificationStatus, note, principalID, actorID, correlationID string) (*domain.SubledgerControlRun, error)
 
 	// ACC-07 (Accruals) — see internal/domain's AccrualSchedule doc comment
 	// for the authority boundary these methods implement.
@@ -117,7 +136,9 @@ type Store interface {
 	GetAllocationRunByRuleAndPeriod(ctx context.Context, ruleID, fiscalPeriod string) (*domain.AllocationRun, error)
 	GetAllocationRun(ctx context.Context, runID string) (*domain.AllocationRun, error)
 	MarkAllocationRunCalculated(ctx context.Context, runID string, sourceAmount float64, at time.Time) error
-	MarkAllocationRunPosted(ctx context.Context, runID, journalID string, at time.Time) error
+	// MarkAllocationRunPosted also enqueues ACC-09's AllocationPosted event
+	// (SPEC_DEVIATIONS A12) in the same transaction.
+	MarkAllocationRunPosted(ctx context.Context, run *domain.AllocationRun, journalID string, at time.Time, correlationID, actorID string) error
 	MarkAllocationRunFailed(ctx context.Context, runID, reason string) error
 	CreateAllocationResultLines(ctx context.Context, runID string, lines []domain.AllocationResultLine) error
 	ListAllocationExceptions(ctx context.Context, legalEntityID string) ([]domain.AllocationRun, error)
@@ -134,7 +155,9 @@ type Store interface {
 	// (SPEC_DEVIATIONS A11); PostRevaluation's own already-POSTED check
 	// (not a claim) covers Post, as the doc comment there explains.
 	ApproveFXRevaluationRun(ctx context.Context, run *domain.FXRevaluationRun, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
-	MarkFXRevaluationPosted(ctx context.Context, runID, journalID, principalID string, at time.Time) error
+	// MarkFXRevaluationPosted also enqueues ACC-10's RevaluationPosted event
+	// (SPEC_DEVIATIONS A12) in the same transaction.
+	MarkFXRevaluationPosted(ctx context.Context, runID, legalEntityID, journalID, principalID string, at time.Time, correlationID string) error
 
 	// ACC-17 (Opening Balance & Migration) — see domain.MigrationBatch's
 	// doc comment for the authority boundary these implement.
@@ -290,6 +313,14 @@ const (
 	// work to a wider group than period-lock itself.
 	actionSubledgerControlRun  = "SUBLEDGER_CONTROL_RUN"
 	actionSubledgerControlView = "SUBLEDGER_CONTROL_VIEW"
+	// ACC-06 governance actions (migration 000025). actionSubledgerControlResolve
+	// covers AssignException and RecordResolution — both are the same
+	// "work this exception" authority. actionSubledgerControlCertify is
+	// separate and more sensitive (maker-checker, ErrControlSelfCertification),
+	// covering both CertifyControl and RejectControl — the two ways a
+	// certifier can close out a period's control.
+	actionSubledgerControlResolve = "SUBLEDGER_CONTROL_RESOLVE"
+	actionSubledgerControlCertify = "SUBLEDGER_CONTROL_CERTIFY"
 
 	// ACC-07 (Accruals) actions. Create/Submit are one authority (the
 	// preparer); Approve is deliberately separate (segregation of duties —
@@ -535,9 +566,20 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}/available-actions", h.GetAvailableCloseActions)
 		r.Post("/{id}:mirror-to-period-service", h.MirrorPeriodToPeriodService)
 	})
+	r.Get("/v1/subledger-control/blocking", h.GetCloseBlockingControls)
 	r.Route("/v1/subledger-control/runs", func(r chi.Router) {
 		r.Post("/", h.RunSubledgerControl)
 		r.Get("/", h.ListSubledgerControlRuns)
+		r.Get("/{id}", h.GetControlRun)
+		r.Get("/{id}/variance", h.ExplainVariance)
+		r.Post("/{id}/certify", h.CertifyControl)
+		r.Post("/{id}/reject", h.RejectControl)
+	})
+	r.Route("/v1/subledger-control/exceptions", func(r chi.Router) {
+		r.Get("/", h.ListOpenExceptions)
+		r.Get("/{id}", h.GetControlException)
+		r.Post("/{id}/assign", h.AssignException)
+		r.Post("/{id}/resolve", h.RecordResolution)
 	})
 	r.Route("/v1/accruals", func(r chi.Router) {
 		r.Post("/", h.CreateAccrual)
@@ -816,6 +858,24 @@ func (h *Handler) RemoveCloseRequirement(w http.ResponseWriter, r *http.Request)
 		h.writeAuthzErr(w, err)
 		return
 	}
+	// ACC-06's own negative path, "close role cannot waive unresolved
+	// mandatory break": a PERIOD_CLOSE_CONFIG holder may not delete a
+	// checklist-added control while its latest run is an unresolved
+	// EXCEPTION. Removing the requirement would make the break disappear
+	// from the close, which is exactly the waiver the spec forbids. The
+	// baseline AR/AP controls are not checklist rows and are protected
+	// separately by validation.
+	if existing.Kind == domain.CloseRequirementSubledgerControl {
+		unresolved, err := h.store.HasUnresolvedException(r.Context(), existing.LegalEntityID, existing.Subledger, existing.BookID)
+		if err != nil {
+			h.writeStoreErr(w, err, "requirement_not_found")
+			return
+		}
+		if unresolved {
+			writeError(w, http.StatusUnprocessableEntity, "control_has_unresolved_exception", string(domain.ErrControlHasUnresolvedException))
+			return
+		}
+	}
 	removed, err := h.store.RemoveCloseRequirement(r.Context(), id, principalID, strings.TrimSpace(req.Reason), time.Now().UTC())
 	if errors.Is(err, domain.ErrCloseRequirementNotFound) {
 		writeError(w, http.StatusConflict, "requirement_already_removed", "")
@@ -1063,6 +1123,19 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 		}
 		writeError(w, http.StatusConflict, "invalid_period_transition",
 			fmt.Sprintf("%s; the period is %s and this command needs %s", domain.ErrInvalidPeriodTransition, fp.CloseStatus, mode.from))
+		return
+	}
+
+	// A6: the certifier must be independent from the preparer — the
+	// principal who most recently brought the period into mode.from
+	// (CLOSE_REVIEW for a hard close, AUTHORIZED_REOPEN for a reclose).
+	preparerID, err := h.store.GetLatestTransitionPrincipal(r.Context(), fp.FiscalPeriodID, mode.from)
+	if err != nil {
+		h.writeStoreErr(w, err, "period_not_found")
+		return
+	}
+	if preparerID == principalID {
+		writeError(w, http.StatusForbidden, "certifier_not_independent", string(domain.ErrCertifierNotIndependent))
 		return
 	}
 
@@ -1502,6 +1575,428 @@ func (h *Handler) ListSubledgerControlRuns(w http.ResponseWriter, r *http.Reques
 		list = []domain.SubledgerControlRun{}
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// ── ACC-06 governance (migration 000025) ────────────────────────────────────
+
+func (h *Handler) writeControlGovernanceErr(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, domain.ErrNoControlRunForScope):
+		writeError(w, http.StatusNotFound, "control_run_not_found", "")
+	case errors.Is(err, domain.ErrControlExceptionNotFound):
+		writeError(w, http.StatusNotFound, "control_exception_not_found", "")
+	case errors.Is(err, domain.ErrControlExceptionNotOpenOrAssigned):
+		writeError(w, http.StatusConflict, "control_exception_not_open_or_assigned", err.Error())
+	case errors.Is(err, domain.ErrControlHasUnresolvedException):
+		writeError(w, http.StatusUnprocessableEntity, "control_has_unresolved_exception", err.Error())
+	case errors.Is(err, domain.ErrControlSelfCertification):
+		writeError(w, http.StatusForbidden, "control_self_certification", err.Error())
+	case errors.Is(err, domain.ErrControlAlreadyCertified):
+		writeError(w, http.StatusConflict, "control_already_certified", err.Error())
+	default:
+		return false
+	}
+	return true
+}
+
+// GetControlRun answers ACC-06's own GetControlRun query.
+func (h *Handler) GetControlRun(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	run, err := h.store.GetControlRun(r.Context(), id)
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("GetControlRun: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, run.LegalEntityID, actionSubledgerControlView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+// GetControlException answers a single exception's own resolution-workflow
+// state.
+func (h *Handler) GetControlException(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	exc, err := h.store.GetControlException(r.Context(), id)
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("GetControlException: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, exc.LegalEntityID, actionSubledgerControlView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, exc)
+}
+
+// ListOpenExceptions answers ACC-06's own ListOpenExceptions query: every
+// outstanding (OPEN or ASSIGNED) exception for a legal entity.
+func (h *Handler) ListOpenExceptions(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionSubledgerControlView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	list, err := h.store.ListOpenExceptions(r.Context(), legalEntityID)
+	if err != nil {
+		h.log.Error("ListOpenExceptions: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.ControlException{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// GetCloseBlockingControls answers ACC-06's own GetCloseBlockingControls
+// query: every required SUBLEDGER_CONTROL (the AR/AP baseline plus the
+// entity's checklist-added controls) whose latest run is currently blocking.
+//
+// It deliberately reuses controlFindings, the same classification the close
+// readiness check runs (requiredControlIssues is now a thin formatter over
+// it), so this read can never disagree with what actually blocks a close.
+// legal_entity_id is mandatory; fiscal_period is optional. With a period, the
+// latest run is that period's and the reopen-reperformance rule applies; with
+// no period, the latest run for the control across all periods is used.
+func (h *Handler) GetCloseBlockingControls(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := strings.TrimSpace(r.URL.Query().Get("legal_entity_id"))
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+	fiscalPeriod := strings.TrimSpace(r.URL.Query().Get("fiscal_period"))
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionSubledgerControlView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	checklist, err := h.store.ListCloseRequirements(r.Context(), legalEntityID)
+	if err != nil {
+		h.writeStoreErr(w, err, "requirement_not_found")
+		return
+	}
+
+	var notBefore *time.Time
+	if fiscalPeriod != "" {
+		fp, err := h.store.GetFiscalPeriodByName(r.Context(), legalEntityID, fiscalPeriod)
+		if err != nil {
+			h.writeStoreErr(w, err, "period_not_found")
+			return
+		}
+		if fp.CloseStatus == domain.PeriodAuthorizedReopen {
+			notBefore = fp.ReopenedAt
+		}
+	}
+
+	required := requiredControls(checklist)
+	runs := make([]domain.SubledgerControlRun, 0, len(required))
+	for _, key := range required {
+		run, err := h.store.GetLatestControlRun(r.Context(), legalEntityID, fiscalPeriod, key.Subledger, key.BookID)
+		if errors.Is(err, domain.ErrNoControlRunForScope) {
+			continue
+		}
+		if err != nil {
+			h.log.Error("GetCloseBlockingControls: store unavailable", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+			return
+		}
+		runs = append(runs, *run)
+	}
+
+	requirementByKey := map[controlKey]domain.CloseRequirement{}
+	for _, cr := range checklist {
+		if cr.Kind == domain.CloseRequirementSubledgerControl {
+			requirementByKey[controlKey{Subledger: cr.Subledger, BookID: cr.BookID}] = cr
+		}
+	}
+	baseline := map[string]bool{}
+	for _, ledger := range domain.BaselineSubledgerControls {
+		baseline[ledger] = true
+	}
+
+	out := []domain.CloseBlockingControl{}
+	for _, finding := range controlFindings(required, runs, fiscalPeriod, notBefore) {
+		if finding.Kind == controlFindingMatched {
+			continue
+		}
+		item := domain.CloseBlockingControl{
+			LegalEntityID: legalEntityID,
+			Subledger:     finding.Key.Subledger,
+			BookID:        finding.Key.BookID,
+			Baseline:      baseline[finding.Key.Subledger],
+			Issue:         finding.Issue,
+			LatestRun:     finding.Run,
+		}
+		if cr, ok := requirementByKey[finding.Key]; ok {
+			item.RequirementID = cr.RequirementID
+			item.Baseline = false
+		}
+		switch finding.Kind {
+		case controlFindingMissing:
+			item.BlockingReason = domain.CloseBlockingReasonNoRun
+		case controlFindingStale:
+			item.BlockingReason = domain.CloseBlockingReasonNotReperformed
+		case controlFindingException:
+			exc, err := h.store.GetControlExceptionByRun(r.Context(), finding.Run.ControlRunID)
+			if err != nil && !errors.Is(err, domain.ErrControlExceptionNotFound) {
+				h.log.Error("GetCloseBlockingControls: store unavailable", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+				return
+			}
+			// Only an unresolved exception is still blocking; a RESOLVED
+			// one has a recorded owner and approval, which is the point of
+			// the governance layer.
+			if exc != nil && exc.Status == domain.ControlExceptionStatusResolved {
+				continue
+			}
+			item.BlockingReason = domain.CloseBlockingReasonUnresolvedException
+			item.ControlException = exc
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ExplainVariance answers ACC-06's own ExplainVariance query: the run and its
+// arithmetic, plus the exception's full resolution trail when the run landed
+// EXCEPTION. It is an assembly of GetControlRun and GetControlExceptionByRun,
+// not a second calculation — the numbers come from the immutable run.
+func (h *Handler) ExplainVariance(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	run, err := h.store.GetControlRun(r.Context(), id)
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("ExplainVariance: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, run.LegalEntityID, actionSubledgerControlView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	explanation := domain.VarianceExplanation{
+		ControlRun: run,
+		DifferenceBreakdown: domain.VarianceBreakdown{
+			SubledgerTotalAmount:   run.SubledgerTotalAmount,
+			GLControlBalanceAmount: run.GLControlBalanceAmount,
+			DifferenceAmount:       run.DifferenceAmount,
+			ToleranceAmount:        matchToleranceAmount,
+			WithinTolerance:        run.DifferenceAmount <= matchToleranceAmount && run.DifferenceAmount >= -matchToleranceAmount,
+		},
+	}
+	exc, err := h.store.GetControlExceptionByRun(r.Context(), run.ControlRunID)
+	if err != nil && !errors.Is(err, domain.ErrControlExceptionNotFound) {
+		h.log.Error("ExplainVariance: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	explanation.ControlException = exc
+	writeJSON(w, http.StatusOK, explanation)
+}
+
+// AssignException gives an EXCEPTION run's resolution workflow a real
+// owner — ACC-06's own "no resolution, owner or approval is recorded" gap.
+func (h *Handler) AssignException(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req domain.AssignExceptionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.AssignedToPrincipalID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "assigned_to_principal_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	exc, err := h.store.GetControlException(r.Context(), id)
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("AssignException: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, exc.LegalEntityID, actionSubledgerControlResolve); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.AssignException(r.Context(), id, req.AssignedToPrincipalID, principalID, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("AssignException: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// RecordResolution advances an exception to RESOLVED with a mandatory
+// resolution note — the real evidence ACC-06 requires instead of "resolved
+// by re-running until it matches."
+func (h *Handler) RecordResolution(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req domain.RecordResolutionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.ResolutionNote) == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", string(domain.ErrResolutionNoteRequired))
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	exc, err := h.store.GetControlException(r.Context(), id)
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("RecordResolution: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, exc.LegalEntityID, actionSubledgerControlResolve); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.RecordResolution(r.Context(), id, strings.TrimSpace(req.ResolutionNote), principalID, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("RecordResolution: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// certifyOrReject is CertifyControl and RejectControl's shared
+// implementation: both advance ONE specific run (named by the URL's {id},
+// not resolved from a scope) to CERTIFIED or FAILED.
+func (h *Handler) certifyOrReject(w http.ResponseWriter, r *http.Request, controlRunID, note, certificationStatus string) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	run, err := h.store.GetControlRun(r.Context(), controlRunID)
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("certifyOrReject: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, run.LegalEntityID, actionSubledgerControlCertify); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.CertifyControlRun(r.Context(), controlRunID, certificationStatus, note, principalID, principalID, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		if h.writeControlGovernanceErr(w, err) {
+			return
+		}
+		h.log.Error("certifyOrReject: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// CertifyControl is ACC-06's own CertifyControl command: it requires no
+// OPEN/ASSIGNED exception on this run (negative path "Certify with
+// unresolved material break") and maker-checker (the certifier must differ
+// from who ran it, and from who resolved its exception).
+func (h *Handler) CertifyControl(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req domain.CertifyControlRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	h.certifyOrReject(w, r, id, req.Note, domain.ControlCertificationCertified)
+}
+
+// RejectControl is ACC-06's own RejectControl command — the state model's
+// other terminal outcome ("...or Failed"): an explicit acknowledgment the
+// control did not pass this period, with a reason, rather than silence.
+func (h *Handler) RejectControl(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req domain.RejectControlRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "reason is required")
+		return
+	}
+	h.certifyOrReject(w, r, id, req.Reason, domain.ControlCertificationFailed)
 }
 
 // writeSubledgerControlErr maps an upstream dependency failure encountered
@@ -3143,6 +3638,14 @@ func (h *Handler) ExecuteAllocation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAllocationRuleTransition))
 		return
 	}
+	// A7 (SPEC_DEVIATIONS): "run certifier separate from driver owner" —
+	// applied unconditionally, the same interpretation B1 already made for
+	// every other maker-checker gate in this service rather than building a
+	// materiality ("high-risk pools") model the spec never defines.
+	if rule.CreatedByPrincipalID == principalID {
+		writeSelfApproval(w)
+		return
+	}
 
 	existing, err := h.store.GetAllocationRunByRuleAndPeriod(r.Context(), req.RuleID, req.FiscalPeriod)
 	if err == nil {
@@ -3229,7 +3732,7 @@ func (h *Handler) ExecuteAllocation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
 		return
 	}
-	if err := h.store.MarkAllocationRunPosted(r.Context(), run.RunID, journalID, time.Now().UTC()); err != nil {
+	if err := h.store.MarkAllocationRunPosted(r.Context(), run, journalID, time.Now().UTC(), correlationIDOf(r), principalID); err != nil {
 		h.log.Error("allocation journal posted but the run could not be marked POSTED",
 			zap.String("run_id", run.RunID), zap.String("journal_id", journalID), zap.Error(err))
 	}
@@ -3302,7 +3805,7 @@ func (h *Handler) ReprocessAllocationRun(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
 		return
 	}
-	if err := h.store.MarkAllocationRunPosted(r.Context(), run.RunID, journalID, time.Now().UTC()); err != nil {
+	if err := h.store.MarkAllocationRunPosted(r.Context(), run, journalID, time.Now().UTC(), correlationIDOf(r), principalID); err != nil {
 		h.log.Error("allocation journal posted but the run could not be marked POSTED", zap.String("run_id", run.RunID), zap.Error(err))
 	}
 	h.recordLineageEdge(r.Context(), rule.LegalEntityID, "allocation_run", run.RunID, "journal", journalID)
@@ -3663,7 +4166,7 @@ func (h *Handler) PostRevaluation(w http.ResponseWriter, r *http.Request) {
 		// performed and found no material movement. Marked POSTED with no
 		// journal rather than forced to invent one.
 		now := time.Now().UTC()
-		if err := h.store.MarkFXRevaluationPosted(r.Context(), id, "", principalID, now); err != nil {
+		if err := h.store.MarkFXRevaluationPosted(r.Context(), id, run.LegalEntityID, "", principalID, now, correlationIDOf(r)); err != nil {
 			h.writeFXRevaluationErr(w, err)
 			return
 		}
@@ -3689,7 +4192,7 @@ func (h *Handler) PostRevaluation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	if err := h.store.MarkFXRevaluationPosted(r.Context(), id, journalID, principalID, now); err != nil {
+	if err := h.store.MarkFXRevaluationPosted(r.Context(), id, run.LegalEntityID, journalID, principalID, now, correlationIDOf(r)); err != nil {
 		h.log.Error("FX revaluation journal posted but the run could not be marked POSTED",
 			zap.String("run_id", id), zap.String("journal_id", journalID), zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "run_not_recorded",
@@ -3921,6 +4424,19 @@ func (h *Handler) CreateMigrationAccountingBatch(w http.ResponseWriter, r *http.
 		Entries:              entries,
 	}
 	if err := h.store.CreateMigrationBatch(r.Context(), batch); err != nil {
+		if errors.Is(err, domain.ErrMigrationBatchRaceLost) {
+			// A concurrent create for the same source system won the race
+			// (SPEC_DEVIATIONS A9); answer with that winner instead of a 503
+			// that tells a loser to retry a request that would just lose again.
+			existing, getErr := h.store.GetMigrationBatchBySourceSystem(r.Context(), req.LegalEntityID, req.FiscalPeriod, req.SourceSystemName)
+			if getErr != nil {
+				h.log.Error("CreateMigrationAccountingBatch: lost the create race but could not load the winner", zap.Error(getErr))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", getErr.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
 		h.log.Error("failed to create migration batch", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
@@ -5658,49 +6174,96 @@ func requiredControls(checklist []domain.CloseRequirement) []controlKey {
 	return out
 }
 
-// requiredControlIssues requires, for each required control, that the LATEST
-// run for the period exists and MATCHED. Only the latest counts: a run that
+// controlFindingKind is how one required control currently stands. It is
+// shared by the close-readiness blocker list and the GetCloseBlockingControls
+// read, so the two can never disagree about what "blocking" means.
+type controlFindingKind int
+
+const (
+	controlFindingMatched controlFindingKind = iota
+	controlFindingMissing
+	controlFindingStale
+	controlFindingException
+)
+
+type controlFinding struct {
+	Key   controlKey
+	Run   *domain.SubledgerControlRun
+	Kind  controlFindingKind
+	Issue string
+}
+
+// controlFindings requires, for each required control, that the LATEST run
+// for the period exists and MATCHED. Only the latest counts: a run that
 // matched before further postings landed proves nothing about the books as
 // they are now, and an EXCEPTION that was since fixed and re-run is
 // superseded rather than blocking forever. An ASSETS run counts only for the
 // book it reconciled.
-func requiredControlIssues(required []controlKey, runs []domain.SubledgerControlRun, period string, notBefore *time.Time) ([]string, []domain.RelianceControlRun) {
+func controlFindings(required []controlKey, runs []domain.SubledgerControlRun, period string, notBefore *time.Time) []controlFinding {
 	latest := map[controlKey]domain.SubledgerControlRun{}
 	for _, run := range runs {
 		key := controlKey{Subledger: run.Subledger, BookID: run.BookID}
 		cur, seen := latest[key]
-		if !seen || run.RunAt.After(cur.RunAt) {
+		if !seen || run.RunAt.After(cur.RunAt) ||
+			(run.RunAt.Equal(cur.RunAt) && run.ControlRunID > cur.ControlRunID) {
 			latest[key] = run
 		}
 	}
-	var issues []string
-	var matched []domain.RelianceControlRun
+	findings := make([]controlFinding, 0, len(required))
 	for _, key := range required {
 		run, ok := latest[key]
+		f := controlFinding{Key: key}
+		if ok {
+			r := run
+			f.Run = &r
+		}
 		switch {
 		case !ok && completenessControls[key.Subledger]:
-			issues = append(issues, fmt.Sprintf(
+			f.Kind = controlFindingMissing
+			f.Issue = fmt.Sprintf(
 				"subledger_control_not_run: no %s control run for %s; run one (POST /v1/subledger-control/runs) before closing",
-				key.label(), period))
+				key.label(), period)
 		case !ok:
-			issues = append(issues, fmt.Sprintf(
+			f.Kind = controlFindingMissing
+			f.Issue = fmt.Sprintf(
 				"subledger_control_not_run: no %s subledger-to-GL control run for %s; run one (POST /v1/subledger-control/runs) before closing",
-				key.label(), period))
+				key.label(), period)
 		case notBefore != nil && !run.RunAt.After(*notBefore):
-			issues = append(issues, fmt.Sprintf(
+			f.Kind = controlFindingStale
+			f.Issue = fmt.Sprintf(
 				"subledger_control_not_reperformed: the latest %s control run (%s) predates the reopen at %s; re-run it before reclosing",
-				key.label(), run.ControlRunID, notBefore.UTC().Format(time.RFC3339)))
+				key.label(), run.ControlRunID, notBefore.UTC().Format(time.RFC3339))
 		case run.Status == "MATCHED":
-			matched = append(matched, domain.RelianceControlRun{
-				Subledger: key.Subledger, BookID: key.BookID, ControlRunID: run.ControlRunID, RunAt: run.RunAt})
+			f.Kind = controlFindingMatched
 		case completenessControls[key.Subledger]:
-			issues = append(issues, fmt.Sprintf("subledger_control_exception: %s: %s (run %s)",
-				key.label(), completenessFinding(run), run.ControlRunID))
+			f.Kind = controlFindingException
+			f.Issue = fmt.Sprintf("subledger_control_exception: %s: %s (run %s)",
+				key.label(), completenessFinding(run), run.ControlRunID)
 		default:
-			issues = append(issues, fmt.Sprintf(
+			f.Kind = controlFindingException
+			f.Issue = fmt.Sprintf(
 				"subledger_control_exception: %s subledger total %.2f does not agree with GL control account %s balance %.2f (difference %.2f; run %s)",
-				key.label(), run.SubledgerTotalAmount, run.ControlAccountCode, run.GLControlBalanceAmount, run.DifferenceAmount, run.ControlRunID))
+				key.label(), run.SubledgerTotalAmount, run.ControlAccountCode, run.GLControlBalanceAmount, run.DifferenceAmount, run.ControlRunID)
 		}
+		findings = append(findings, f)
+	}
+	return findings
+}
+
+// requiredControlIssues renders controlFindings into the two things the
+// close-readiness check returns: the blocker messages and the runs that
+// actually matched.
+func requiredControlIssues(required []controlKey, runs []domain.SubledgerControlRun, period string, notBefore *time.Time) ([]string, []domain.RelianceControlRun) {
+	var issues []string
+	var matched []domain.RelianceControlRun
+	for _, f := range controlFindings(required, runs, period, notBefore) {
+		if f.Kind == controlFindingMatched {
+			matched = append(matched, domain.RelianceControlRun{
+				Subledger: f.Key.Subledger, BookID: f.Key.BookID,
+				ControlRunID: f.Run.ControlRunID, RunAt: f.Run.RunAt})
+			continue
+		}
+		issues = append(issues, f.Issue)
 	}
 	return issues, matched
 }

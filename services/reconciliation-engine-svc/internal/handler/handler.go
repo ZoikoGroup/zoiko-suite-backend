@@ -1,6 +1,6 @@
 // Package handler is the HTTP surface for reconciliation-engine-svc
 // (DATA-07, ZS-SVC-N-001 §4). Every write goes through the store, which
-// already writes its own outbox_events row in the same transaction as
+// already enqueues its own eventing_outbox row in the same transaction as
 // the business write — this layer never publishes directly.
 //
 // Authorization is evaluated against the legal entity the definition or run
@@ -219,10 +219,14 @@ func (h *Handler) readBody(r *http.Request, v interface{}) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func (h *Handler) idempotencyClaim(principalID, operation, resourceID, requestSHA256, key string) domain.IdempotencyClaim {
+// idempotencyClaim builds the write's claim. The correlation id is the one the
+// envelope middleware parsed and validated (mandatory on writes), carried
+// down so the store's outbox event is traceable to this request.
+func (h *Handler) idempotencyClaim(r *http.Request, principalID, operation, resourceID, requestSHA256, key string) domain.IdempotencyClaim {
 	return domain.IdempotencyClaim{
 		OwnerScope: domain.SellerScope, PrincipalID: principalID, Key: key,
 		Operation: operation, RequestSHA256: requestSHA256, ResourceID: resourceID,
+		CorrelationID: svcenvelope.MustFromContext(r.Context()).CorrelationID,
 	}
 }
 
@@ -269,7 +273,7 @@ func (h *Handler) DefineReconciliation(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, req.LegalEntityID, ActionReconciliationManage) {
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "DefineReconciliation", req.LegalEntityID+"|"+req.Name, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "DefineReconciliation", req.LegalEntityID+"|"+req.Name, reqHash, r.Header.Get("Idempotency-Key"))
 	got, err := h.store.DefineReconciliation(r.Context(), tenantID, req, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)
@@ -324,7 +328,7 @@ func (h *Handler) CreateRuleVersion(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "CreateRuleVersion", def.DefinitionID, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "CreateRuleVersion", def.DefinitionID, reqHash, r.Header.Get("Idempotency-Key"))
 	got, err := h.store.CreateRuleVersion(r.Context(), tenantID, def.DefinitionID, req, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)
@@ -361,7 +365,7 @@ func (h *Handler) ApproveRuleVersion(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "ApproveRuleVersion", def.DefinitionID+"|"+chi.URLParam(r, "version"), "",
+	claim := h.idempotencyClaim(r, principalID, "ApproveRuleVersion", def.DefinitionID+"|"+chi.URLParam(r, "version"), "",
 		r.Header.Get("Idempotency-Key"))
 	got, err := h.store.ApproveRuleVersion(r.Context(), tenantID, def.DefinitionID, version, principalID, claim)
 	if err != nil {
@@ -406,7 +410,7 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		h.respondFromError(w, err)
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "StartRun", req.DefinitionID, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "StartRun", req.DefinitionID, reqHash, r.Header.Get("Idempotency-Key"))
 	if err := h.store.CheckIdempotency(r.Context(), tenantID, claim); err != nil {
 		h.respondFromError(w, err)
 		return
@@ -448,7 +452,7 @@ func (h *Handler) Match(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "Match", runID, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "Match", runID, reqHash, r.Header.Get("Idempotency-Key"))
 	got, err := h.store.Match(r.Context(), tenantID, runID, req, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)
@@ -469,7 +473,7 @@ func (h *Handler) RaiseException(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "RaiseException", runID+"|"+req.ItemID, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "RaiseException", runID+"|"+req.ItemID, reqHash, r.Header.Get("Idempotency-Key"))
 	got, err := h.store.RaiseException(r.Context(), tenantID, runID, req, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)
@@ -506,7 +510,7 @@ func (h *Handler) Reperform(w http.ResponseWriter, r *http.Request) {
 		h.respondFromError(w, domain.ErrLegacyRecord)
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "Reperform", runID, "", r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "Reperform", runID, "", r.Header.Get("Idempotency-Key"))
 	if err := h.store.CheckIdempotency(r.Context(), tenantID, claim); err != nil {
 		h.respondFromError(w, err)
 		return
@@ -578,7 +582,7 @@ func (h *Handler) Certify(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "Certify", runID, "", r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "Certify", runID, "", r.Header.Get("Idempotency-Key"))
 	got, err := h.store.Certify(r.Context(), tenantID, runID, principalID, authority, claim)
 	if err != nil {
 		h.respondFromError(w, err)
@@ -628,7 +632,7 @@ func (h *Handler) RevokeCertification(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "RevokeCertification", runID, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "RevokeCertification", runID, reqHash, r.Header.Get("Idempotency-Key"))
 	got, err := h.store.RevokeCertification(r.Context(), tenantID, runID, req, principalID, authority, claim)
 	if err != nil {
 		h.respondFromError(w, err)
@@ -649,7 +653,7 @@ func (h *Handler) SupersedeRun(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	claim := h.idempotencyClaim(principalID, "SupersedeRun", runID, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "SupersedeRun", runID, reqHash, r.Header.Get("Idempotency-Key"))
 	got, err := h.store.SupersedeRun(r.Context(), tenantID, runID, req, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)
@@ -813,7 +817,7 @@ func (h *Handler) AssignException(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	exceptionID := chi.URLParam(r, "exceptionID")
-	claim := h.idempotencyClaim(principalID, "AssignException", exceptionID, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "AssignException", exceptionID, reqHash, r.Header.Get("Idempotency-Key"))
 	got, err := h.store.AssignException(r.Context(), tenantID, exceptionID, req, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)
@@ -845,7 +849,7 @@ func (h *Handler) TransitionException(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	exceptionID := chi.URLParam(r, "exceptionID")
-	claim := h.idempotencyClaim(principalID, "TransitionException", exceptionID, reqHash, r.Header.Get("Idempotency-Key"))
+	claim := h.idempotencyClaim(r, principalID, "TransitionException", exceptionID, reqHash, r.Header.Get("Idempotency-Key"))
 	got, err := h.store.TransitionException(r.Context(), tenantID, exceptionID, req, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)

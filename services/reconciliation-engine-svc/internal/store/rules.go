@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/reconciliation-engine-svc/internal/domain"
-	"zoiko.io/reconciliation-engine-svc/internal/outbox"
 )
 
 // Definitions and rule versions (A11). A definition row is its identity; its
@@ -212,8 +211,7 @@ func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req
 			return err
 		}
 		out = d
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_definition", AggregateID: id,
-			EventType: "CONTROL.RuleVersionPublished", TenantID: &tenantID, Payload: v})
+		return s.enqueueEvent(ctx, tx, evRulesPublished, tenantID, d.LegalEntityID, id, actor, claim, v)
 	})
 	return out, err
 }
@@ -259,8 +257,7 @@ func (s *PgStore) CreateRuleVersion(ctx context.Context, tenantID, definitionID 
 			return err
 		}
 		out = v
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_definition", AggregateID: definitionID,
-			EventType: "CONTROL.RuleVersionPublished", TenantID: &tenantID, Payload: v})
+		return s.enqueueEvent(ctx, tx, evRulesPublished, tenantID, d.LegalEntityID, definitionID, actor, claim, v)
 	})
 	return out, err
 }
@@ -308,8 +305,7 @@ func (s *PgStore) ApproveRuleVersion(ctx context.Context, tenantID, definitionID
 			return fmt.Errorf("approve rule version: %w", err)
 		}
 		out = v
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_definition", AggregateID: definitionID,
-			EventType: "CONTROL.RuleVersionApproved", TenantID: &tenantID, Payload: v})
+		return s.enqueueEvent(ctx, tx, evRulesApproved, tenantID, d.LegalEntityID, definitionID, approver, claim, v)
 	})
 	return out, err
 }

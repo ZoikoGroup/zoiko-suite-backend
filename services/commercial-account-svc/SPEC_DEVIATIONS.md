@@ -144,7 +144,7 @@ remaining routes were not retired in this pass because existing tests and
 callers depend on them. Retiring them requires a consumer migration plan and
 is the main structural follow-up from this survey.
 
-### A4. Command idempotency and outbox coverage is incomplete
+### A4. Command idempotency and outbox coverage is incomplete — partially closed 2026-11-07
 
 §3 requires:
 
@@ -162,8 +162,8 @@ therefore cannot return the original result for a repeated idempotency key:
 
 | Command | Missing claim | Outbox |
 |---|---|---|
-| `PUT /v1/commercial/accounts/{id}/market` (`SetAccountMarket`) | yes | none |
-| `PUT /v1/commercial/currencies/{code}` (`PutCurrency`) | yes | none |
+| `PUT /v1/commercial/accounts/{id}/market` (`SetAccountMarket`) | **closed** | none |
+| `PUT /v1/commercial/currencies/{code}` (`PutCurrency`) | **closed** | none |
 | legacy `POST /v1/commercial-accounts` (`CreateCommercialAccount`) | yes | present |
 | legacy `POST /v1/memberships` (`CreateMembership`) | yes | present |
 | legacy `DELETE /v1/memberships/{id}` (`DeactivateMembership`) | yes | present |
@@ -186,6 +186,45 @@ therefore cannot return the original result for a repeated idempotency key:
 `StatementAction`, and the COM-05 invoice/payment/dunning/dispute/credit
 commands all have claims and replay paths. The table is the remaining gap, not
 a claim that every command in the service is unguarded.
+
+`SetAccountMarket` now claims the caller's `Idempotency-Key` via
+`commandFor`/`claimIdempotency`, the same mechanism every closed command in
+this table uses: a retry under the same key returns
+`domain.IdempotentReplayError` (`Idempotent-Replayed: true`, 200 with the
+requested market unchanged from the original call) instead of silently
+re-applying — this write happened to be a harmless overwrite either way, but
+the guarantee is now uniform with the rest of the service rather than an
+accidental exception.
+
+`PutCurrency` now claims it too. `UpsertCurrency` was already naturally
+idempotent for an identical retry (its `ON CONFLICT ... WHERE minor_units =
+EXCLUDED.minor_units` upsert leaves the same state for the same body), but
+natural idempotency does not catch a key reused for a genuinely *different*
+body — a different `sale_enabled` value would otherwise be accepted
+silently, each call quietly winning over the last with no way to tell a
+retry from a mistaken key reuse. The claim's request-hash check closes that:
+a same-key retry with a different body now replays the original row rather
+than applying the new one. A new `GetCurrency` read (used only to reload the
+resource on replay) was added alongside it.
+
+The remaining rows (fourteen legacy/retire/remove/recompute paths) are left
+for a separate pass — most are the service's deprecated legacy surface (A3),
+which is a smaller population to carry the same fix through than the table
+suggests at a glance, but each still needs its own request-hash and
+replay-load wiring checked individually.
+- *Manual check:* `internal/handler/com02_subscription_handler_test.go` —
+  `TestSetAccountMarket_RequiresIdempotencyKey`,
+  `TestSetAccountMarket_ReplayUnderSameKeyDoesNotReapply`;
+  `internal/store/com02_subscription_store_test.go` —
+  `TestSetAccountMarket_IsIdempotent` (real Postgres: a retry under the same
+  key with a *different* market code still replays the original value,
+  proving the claim — not just a no-op overwrite — is what blocks the
+  second write). `internal/handler/pricebook_handler_test.go` —
+  `TestPutCurrency_RequiresIdempotencyKey`,
+  `TestPutCurrency_ReplayUnderSameKeyDoesNotReapply`;
+  `internal/store/pricebook_store_test.go` — `TestPutCurrency_IsIdempotent`
+  (real Postgres: a retry under the same key with a different
+  `sale_enabled` value still replays the original row).
 
 ### A5. COM-03 policy publication invalidates globally, not per tenant
 
@@ -468,3 +507,101 @@ review of every restriction consumer.
   deployment prerequisite is in A1: remediate historical self-published rows
   before applying it. A `NOT VALID` constraint would deploy more easily but
   would leave the historical population unproven.
+- **B17. Events go through the shared transactional outbox (tracker #63).**
+  `internal/outbox` (the platform's original outbox pilot) and
+  `internal/events` are retired. `handler.Handler`'s publisher was never
+  called and is removed.
+  - *One helper.* All 44 write paths call `PgStore.emit`
+    (`internal/store/eventing.go`), which builds the canonical envelope and
+    runs `outbox.Enqueue` on the write's own transaction. That is still one
+    INSERT.
+    - The shared relay in `cmd/server` delivers the events.
+    - Migration 000021 adds `eventing_outbox` as `outbox.SchemaSQL` plus
+      `outbox.HardeningSQL`, both verbatim. `VerifySchema` gates startup.
+  - *Event names.* The domain is `commercial`, from the Event Catalogue's
+    Commercial Platform family (ZS-EVENT-001 §19). The canonical type keeps
+    the service's own aggregate and fact words, kebab-cased (§5.1).
+    - That reproduces every catalogue name the service already emitted:
+      `subscription.started`, `subscription.changed`,
+      `platform-invoice.issued` and `platform-payment.settled`.
+    - The catalogue's spelling wins in one place: `subscription.canceled`
+      becomes `commercial.subscription.cancelled`.
+    - Every existing name is still emitted as the legacy `event_type`.
+      audit-event-store-svc subscribes to this topic and stores events by
+      `event_type`, `source_service` and `schema_version`, which are all
+      unchanged.
+  - *Tenant: no event leaves without its real one.*
+    - Most paths already set the organization.
+    - **Platform scope.** The seller's catalogue and policy facts belong to
+      no organization: transition rules, migration offers, entitlement and
+      dunning policies, meter definitions, price versions and products. They
+      previously had a NULL tenant. They now carry the platform scope id
+      (`store.PlatformScopeID`, `00000000-…-f001`, the constant
+      authorization-svc and capability-registry-svc use), and are only ever
+      written on the seller plane.
+    - **Fixed: wrong tenant.** `commercial_subscription.*` and the billing
+      source transfer (the pilot's own paths) stored the commercial ACCOUNT id
+      as `tenant_id`. They now carry the organization the transaction is
+      scoped to, which the subscription RLS already ties the account to.
+    - **Fixed: missing tenant.** `usage.window_frozen`,
+      `usage.statement_certified`, `usage.window_reopened` and
+      `usage_adjustment.created` had no tenant.
+      - The seller-plane commands that emit them receive no organization,
+        `usage_statements` has none, and the seller plane cannot read
+        `subscriptions`.
+      - The organization comes from `usage_event_records`, which the seller
+        plane can read. A statement exists only because an event was
+        ingested for its subscription, and events are never deleted.
+      - It is read as one more column of the statement read each command
+        already does, so no extra round-trip. An adjustment takes it from
+        its source event.
+  - *Actor and correlation.* The old outbox carried neither.
+    - The correlation id now comes from the request envelope
+      (`X-Correlation-ID`, mandatory on writes) via the request context. The
+      store already reads the tenant the same way. The boundary worker has
+      no request, so it sends none rather than an invented one.
+    - The actor is the principal each path already records. Where a path
+      has none, the envelope's authenticated actor is used.
+    - `legal_entity_id` stays empty, as before: commercial objects carry
+      none, and the request's `X-Legal-Entity-Id` is the caller's context.
+  - *RLS on the outbox.* The policy follows this service's own pattern,
+    which has two writers, not the single tenant-or-relay policy other
+    services use.
+    - A tenant transaction reads and writes only its organization's events.
+    - The seller plane may write an event for any organization, or for the
+      platform scope, but reads none. Billing, payments, credits, dunning,
+      usage and the catalogue all run there.
+    - The relay sees every row.
+    - `tenant_id` is compared as text, like 000005 and every policy since:
+      an empty `app.tenant_id` must match nothing rather than raise.
+  - *Carry-over.* Undelivered `outbox_events` rows are rebuilt as the old
+    publisher's body, with a stable `evt-<outbox_event_id>` id and region
+    `legacy`. The tenant is resolved per aggregate type:
+    - an organization UUID is cast to text;
+    - the pilot's account ids map to their account's organization;
+    - platform aggregates take the platform scope;
+    - usage statements and adjustments take their usage events'
+      organization.
+    - An unmapped type, or a tenant that resolves to nothing, fails the
+      migration atomically.
+    - `outbox_events` is kept as delivery evidence (ZS-EVENT-001 §6.1).
+  - *Config.* `EVENT_RESIDENCY_REGION` and `EVENT_CLASSIFICATION` are
+    required at startup, with no default. A failed database pool is now
+    fatal at startup instead of a warning, because the outbox schema check
+    needs it.
+  - *Verification* (`internal/store/eventing_outbox_test.go`; the whole
+    store suite runs as a NOSUPERUSER NOBYPASSRLS role):
+    - one flow per COM group plus platform scope, checking keys, tenant,
+      actor and correlation;
+    - the pilot's tenant fix;
+    - a forced rollback, and a failed enqueue that rolls back the business
+      row and its idempotency claim;
+    - a replay adds nothing;
+    - isolation of both writers;
+    - relay delivery;
+    - a carry-over over real data, resolving tenants all four ways, after
+      running 000021's down file;
+    - an unresolvable row fails the migration.
+    - Three deliberate breakages were each caught: the pilot tenant
+      reverted, the seller-plane clause removed, and the statement
+      organization dropped.

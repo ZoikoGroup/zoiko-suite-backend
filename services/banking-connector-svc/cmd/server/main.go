@@ -24,6 +24,7 @@ import (
 	"zoiko.io/banking-connector-svc/internal/mtls"
 	"zoiko.io/banking-connector-svc/internal/store"
 	"zoiko.io/banking-connector-svc/internal/telemetry"
+	"zoiko.io/banking-connector-svc/internal/tokenization"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 )
@@ -40,6 +41,9 @@ func main() {
 	defer func() { _ = logger.Sync() }()
 
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		logger.Fatal("invalid configuration", zap.Error(err))
+	}
 	logger.Info("starting banking-connector-svc", zap.String("port", cfg.Port))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -73,7 +77,15 @@ func main() {
 		logger.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
 
-	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion))
+	// Tokenization of account numbers (TOKENIZATION_ENFORCED). While it is
+	// off no tokenizer is built and nothing calls key-management-svc.
+	var tokenizer tokenization.Tokenizer
+	if cfg.TokenizationEnforced {
+		tokenizer = tokenization.NewClient(cfg.TokenizationServiceURL)
+		logger.Info("account-number tokenization enforced", zap.String("tokenization_service_url", cfg.TokenizationServiceURL))
+	}
+	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion),
+		store.WithTokenization(tokenizer, cfg.TokenizationEnforced))
 
 	// Transactional outbox relay (ZS-EVENT-001 §6). Every BNK-02/03/04
 	// event is written to eventing_outbox in the same transaction as the

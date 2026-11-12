@@ -56,8 +56,8 @@ func (s *subStub) rec(ctx context.Context, name string, claim domain.Idempotency
 	s.tenant, s.claim = svcmiddleware.TenantFromContext(ctx), claim
 }
 
-func (s *subStub) SetAccountMarket(ctx context.Context, _, _, _ string, _ time.Time) error {
-	s.rec(ctx, "SetAccountMarket", domain.IdempotencyClaim{})
+func (s *subStub) SetAccountMarket(ctx context.Context, _, _, _ string, _ time.Time, c domain.IdempotencyClaim) error {
+	s.rec(ctx, "SetAccountMarket", c)
 	return s.err
 }
 func (s *subStub) StartSubscription(ctx context.Context, p domain.StartSubscriptionParams, c domain.IdempotencyClaim) (*domain.SubscriptionView, error) {
@@ -166,6 +166,36 @@ func TestSubscriptionHandler_SelfServiceStartActsOnTheVerifiedTenantOnly(t *test
 		body: startBody, headers: map[string]string{"Idempotency-Key": "k-1"}})
 	if w.Code != http.StatusUnauthorized || len(st.calls) != 0 {
 		t.Fatalf("a start without a verified tenant: HTTP %d, calls %v", w.Code, st.calls)
+	}
+}
+
+// SPEC_DEVIATIONS A4: SetAccountMarket now claims an Idempotency-Key.
+func TestSetAccountMarket_RequiresIdempotencyKey(t *testing.T) {
+	st := &subStub{}
+	w := serve(t, newSubRouter(st, &scopedAuthz{}), req{method: http.MethodPut,
+		path: "/v1/commercial/accounts/33333333-3333-3333-3333-333333333333/market",
+		body: `{"organization_id":"` + customerOrg + `","market_code":"US"}`,
+		headers: map[string]string{"X-Tenant-Id": tenantOrg}})
+	if w.Code != http.StatusBadRequest || len(st.calls) != 0 {
+		t.Fatalf("missing Idempotency-Key: HTTP %d, calls %v", w.Code, st.calls)
+	}
+}
+
+func TestSetAccountMarket_ReplayUnderSameKeyDoesNotReapply(t *testing.T) {
+	st := &subStub{}
+	r := newSubRouter(st, &scopedAuthz{})
+	body := `{"organization_id":"` + customerOrg + `","market_code":"US"}`
+	accountPath := "/v1/commercial/accounts/33333333-3333-3333-3333-333333333333/market"
+
+	w := serve(t, r, req{method: http.MethodPut, path: accountPath, body: body, headers: tenantHeaders(map[string]string{"X-Tenant-Id": tenantOrg})})
+	if w.Code != http.StatusOK || len(st.calls) != 1 {
+		t.Fatalf("first set: HTTP %d, calls %v", w.Code, st.calls)
+	}
+
+	st.err = &domain.IdempotentReplayError{ResourceID: "33333333-3333-3333-3333-333333333333"}
+	w = serve(t, r, req{method: http.MethodPut, path: accountPath, body: body, headers: tenantHeaders(map[string]string{"X-Tenant-Id": tenantOrg})})
+	if w.Code != http.StatusOK || w.Header().Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("replay: HTTP %d, Idempotent-Replayed=%q, body=%s", w.Code, w.Header().Get("Idempotent-Replayed"), w.Body.String())
 	}
 }
 

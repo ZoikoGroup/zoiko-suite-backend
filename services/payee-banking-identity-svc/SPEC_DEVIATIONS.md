@@ -355,6 +355,69 @@ tenant scoping are closed in this pass.
   reconstruct the full before/after object from the event alone. This is an
   interpretation, not a spec violation, but it constrains what an AP-10 event
   consumer could do without a follow-up read.
+- **B11. Account-identifier tokenization — client side only, off by default
+  (2026-11-11).** Security, Privacy, Residency & Cryptographic Architecture
+  Standard §14 requires tokenization of restricted identifiers, and bank
+  details are S3 Restricted. This service stores
+  `payee_destinations.account_identifier` raw, the gap `internal/domain`'s
+  package doc already records.
+  - *Client.* `internal/tokenization` holds a `Client`, a deterministic
+    `Fake` for tests and local development, and a `Tokenizer` interface,
+    shaped like `internal/authz`.
+    - It fails closed: unreachable, non-200, an undecodable body, an empty
+      token, or a token equal to the raw value all return
+      `ErrTokenizationServiceUnavailable`.
+    - A detokenization 403 is the distinct `ErrDetokenizationDenied`.
+  - *Write path.* With `TOKENIZATION_ENFORCED=true`, `ProposeDestination`
+    tokenizes the identifier before its transaction opens. The token is
+    stored and returned.
+    - If tokenization fails or no tokenizer is configured, the command is
+      refused: no destination, no command claim and no event. There is no
+      raw fallback.
+    - The fingerprint and last-4 are still computed from the raw value, so
+      duplicate detection and masked display are unchanged.
+    - An idempotent retry matches through the fingerprint, because a stored
+      token never equals the request's raw identifier. Without this, an
+      honest retry would be refused as a key conflict.
+  - *Off by default.* Unset or `false`, behaviour is unchanged and the
+    tokenizer is never called. That is a regression test. The flag is parsed
+    strictly: a typo refuses to start rather than reading as off.
+  - *PROPOSED contract, not verified with key-management-svc's owner.* That
+    service has no tokenize or detokenize endpoint today.
+    `internal/tokenization/client.go` is the one place to change.
+
+    ```
+    POST /v1/tokenize    headers X-Tenant-Id (required), X-Principal-Id, X-Correlation-ID
+                         {"value", "classification": "S3_RESTRICTED"} -> 200 {"token"}
+    POST /v1/detokenize  headers X-Tenant-Id (required), X-Principal-Id (required), X-Correlation-ID
+                         {"token"} -> 200 {"value"}; 403 = denied (SEC-T15 / SEC-T29)
+    ```
+
+    The tenant and principal headers are added beyond a body-only contract
+    because SEC-T29 requires tenant binding and SEC-INV-15 requires
+    detokenization evidence.
+  - *A migration state with an end.* `TOKENIZATION_ENFORCED` stays `false`
+    (compose) until key-management-svc implements the endpoints, the same
+    shape as authorization-svc's `ZS_ENVELOPE_ENFORCEMENT` rollout. Before
+    it is turned on:
+    1. The contract is confirmed, or this client is changed to match.
+    2. The `PayeeMasterPrivilegedRead` path, which today returns the full
+       identifier, is wired to detokenize under the separate elevated
+       authorization SEC-T15 requires. As built, it would return the token.
+       payment-authorization-svc reads destinations too.
+    3. Existing raw rows are backfilled. The immutability trigger on
+       `account_identifier` (000002) means that needs a controlled
+       migration.
+  - *Verification.*
+    - `internal/tokenization/client_test.go` covers the request shape, every
+      fail-closed path and the Fake.
+    - `internal/store/tokenization_test.go` (`-tags integration`, real
+      Postgres): the token is stored, fingerprint and last-4 stay raw-derived
+      and only the same tenant detokenizes; an enforced retry replays and a
+      different account conflicts; a failure writes nothing; off is
+      unchanged and never calls the tokenizer.
+    - Two deliberate breakages were each caught: a raw fallback, and raw
+      replay matching.
 
 ## Verification performed
 

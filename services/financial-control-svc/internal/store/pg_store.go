@@ -10,24 +10,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+	"zoiko.io/eventing/envelope"
 
 	"zoiko.io/financial-control-svc/internal/domain"
-	"zoiko.io/financial-control-svc/internal/events"
-	"zoiko.io/financial-control-svc/internal/outbox"
 )
 
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+
+	eventRegion         string
+	eventClassification envelope.Classification
 }
 
-func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore { return &PgStore{pool: pool, log: log} }
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
 	if tenantID == "" {
@@ -616,11 +623,11 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID, actor, correlationID,
 			return err
 		}
 		if prior != nil {
-			if err := supersedePrior(ctx, tx, tenantID, *prior, out, actor, correlationID, req.Reason); err != nil {
+			if err := s.supersedePrior(ctx, tx, tenantID, *prior, out, actor, correlationID, req.Reason); err != nil {
 				return err
 			}
 		}
-		return emit(ctx, tx, out, events.RunCreated, actor, correlationID, map[string]any{
+		return s.emit(ctx, tx, out, RunCreated, actor, correlationID, map[string]any{
 			"run_id": out.RunID, "control_definition_id": out.ControlDefinitionID, "control_code": code,
 			"rule_version": out.RuleVersion, "rule_digest": out.RuleDigest, "tolerance_id": out.ToleranceID,
 			"materiality_id": out.MaterialityID, "period_id": out.PeriodID, "trigger_type": out.TriggerType,
@@ -727,7 +734,7 @@ func (s *PgStore) AdvanceRun(ctx context.Context, tenantID, runID string, p Adva
 	var out *domain.ControlRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = advanceTx(ctx, tx, tenantID, runID, p)
+		out, err = s.advanceTx(ctx, tx, tenantID, runID, p)
 		return err
 	})
 	if err != nil {
@@ -743,7 +750,7 @@ const SkipVersionCheck = -1
 
 // advanceTx is AdvanceRun inside a caller-owned transaction, so a population
 // freeze or execution result commits atomically with its state movement.
-func advanceTx(ctx context.Context, tx pgx.Tx, tenantID, runID string, p AdvanceParams) (*domain.ControlRun, error) {
+func (s *PgStore) advanceTx(ctx context.Context, tx pgx.Tx, tenantID, runID string, p AdvanceParams) (*domain.ControlRun, error) {
 	var cur, out domain.ControlRun
 	if err := scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM control_runs
 		WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE`, tenantID, runID), &cur); err != nil {
@@ -805,7 +812,7 @@ func advanceTx(ctx context.Context, tx pgx.Tx, tenantID, runID string, p Advance
 		}
 	}
 	for _, et := range EventsFor(cur, out) {
-		if err := emit(ctx, tx, out, et, p.Actor, p.CorrelationID, map[string]any{
+		if err := s.emit(ctx, tx, out, et, p.Actor, p.CorrelationID, map[string]any{
 			"run_id": out.RunID, "control_definition_id": out.ControlDefinitionID,
 			"lifecycle_state": out.LifecycleState, "result_state": out.ResultState,
 			"certification_state": out.CertificationState, "version": out.Version, "reason": p.Reason,
@@ -821,13 +828,4 @@ func insertTransition(ctx context.Context, tx pgx.Tx, tenantID, runID, dimension
 		(tenant_id, run_id, dimension, from_state, to_state, reason, actor_id, correlation_id)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, tenantID, runID, dimension, from, to, reason, actor, correlationID)
 	return err
-}
-
-func emit(ctx context.Context, tx pgx.Tx, r domain.ControlRun, eventType, actor, correlationID string, payload map[string]any) error {
-	payload["occurred_at"] = time.Now().UTC().Format(time.RFC3339Nano)
-	a, c := actor, correlationID
-	return outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "control_run", AggregateID: r.RunID, EventType: eventType,
-		TenantID: r.TenantID, LegalEntityID: r.LegalEntityID, ActorID: &a, CorrelationID: &c, Payload: payload,
-	})
 }

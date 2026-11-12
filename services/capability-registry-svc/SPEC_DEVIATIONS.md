@@ -153,10 +153,11 @@ The domain comment that sends “security/privacy eligibility” to `policy-svc`
 These are implemented and were checked in code and against a fresh database,
 not inferred from comments:
 
-- **All six command paths use the migration-000002/000003 mechanisms.** There
+- **All six command paths use the migration-000002/000004 mechanisms.** There
   are 10 handlers, not 12: 6 commands and 4 queries. Each command calls
   `buildClaim`, and each corresponding store method calls `claimIdempotency`
-  and `insertOutboxEvent` in the same `withTx` transaction. The matrix is
+  and `enqueueEvent` (shared `eventing_outbox`, migration 000004 — see B13) in
+  the same `withTx` transaction. The matrix is
   complete; no command path omits either table.
 
   | Command | Operation | Idempotency claim | Outbox event |
@@ -713,6 +714,51 @@ Closed in this pass:
   technical availability reveals unreleased capabilities, incident restrictions
   and provider health. A reviewer could choose identity-only; the reason for the
   stricter choice is stated here rather than left implicit.
+
+- **B13. Events carry the platform scope as `tenant_id`, and `eventing_outbox`
+  has a CHECK constraint instead of RLS (2026-11-10, shared-outbox migration).**
+  The shared envelope (`services/eventing/envelope`) requires a tenant id on
+  every event. B12 establishes that nothing this service owns has one, so there
+  is no tenant to derive. The two available values were both rejected:
+
+  - The caller's `X-Tenant-Id` is real but wrong: it is the administrator's
+    tenant, not the data's. It would also split one capability's events across
+    Kafka partitions (the partition key is `sha256(tenant, aggregate)`), so an
+    update could overtake the create it follows.
+  - An invented per-event value is what the tracker's Priority 1b forbids.
+
+  Every event therefore carries `domain.PlatformScopeID`
+  (`00000000-0000-0000-0000-00000000f001`) — the same declared scope this
+  service already sends to authorization-svc as `legal_entity_id` and uses for
+  its mTLS identity. It is a stated scope, not a fallback for a missing tenant:
+  it is used unconditionally, never when a header happens to be absent. The
+  caller's `X-Tenant-Id` still scopes the idempotency key and nothing else.
+
+  The sibling adopters' tenant-isolation RLS policy on `eventing_outbox` is
+  deliberately **not** applied. With exactly one legitimate `tenant_id` value
+  it can never separate one tenant's rows from another's; under `FORCE RLS` it
+  would add a `set_config('app.tenant_id')` round-trip to every write and
+  hard-fail any write that forgot it. What is worth enforcing is that no code
+  path ever stamps a different tenant. The `eventing_outbox_platform_scope`
+  CHECK constraint (000004 Part 3) enforces exactly that, inside the INSERT,
+  with no session state. This is a property of single-value platform scope,
+  not an omission copied from — or missing relative to — the per-tenant
+  siblings.
+
+  Other envelope fields: `region` comes from `EVENT_RESIDENCY_REGION`
+  (required at startup, no default); `aggregate_version` is NULL because these
+  tables keep no per-aggregate version; every event's aggregate is the parent
+  capability, so one capability's history stays on one partition, in order.
+  The integration-health event used to be keyed on the
+  integration_capability_id; it now resolves its parent via `UPDATE … RETURNING
+  capability_id` (no extra statement) and carries `capability_id` in its data.
+
+  Consumer-visible change: events now use the canonical envelope with legacy
+  fields alongside (`event_id`, `event_type`, `tenant_id`, `actor_id`,
+  `correlation_id`, `payload`, ...). The old body's `entity_id`,
+  `occurred_at` and `event_version` fields are not among the legacy names the
+  shared envelope emits; a consumer reading them must switch to
+  `aggregateid`/`subject`, `time` or `emitted_at`, and `schemaversion`.
 
 ## Verification
 

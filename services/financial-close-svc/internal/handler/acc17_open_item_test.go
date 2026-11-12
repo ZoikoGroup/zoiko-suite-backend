@@ -9,6 +9,39 @@ import (
 	"zoiko.io/financial-close-svc/internal/domain"
 )
 
+// A9 (SPEC_DEVIATIONS): two concurrent creates for the same legal entity,
+// period and source system race the store's UNIQUE constraint; the loser
+// must be told who won (200, the existing batch), not a 503.
+func TestCreateMigrationAccountingBatch_ConcurrentCreateLoses_ReturnsWinner(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE"}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
+		ExpectedRowCount: 1, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
+		Entries: []domain.MigrationCrosswalkEntry{{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 500}},
+	}
+
+	// The winner is already on record (as a concurrent request would have
+	// left it), and the store reports this request's own insert lost the
+	// race — exactly what the real store's mapPgError does for a unique
+	// violation on migration_batches.
+	winner := &domain.MigrationBatch{BatchID: "winner-batch", LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", Status: domain.MigrationBatchStatusLoaded}
+	s.migrationBatches[winner.BatchID] = winner
+	s.createMigrationErr = domain.ErrMigrationBatchRaceLost
+
+	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("the race loser must be answered the winner: %d %s", rr.Code, rr.Body.String())
+	}
+	var got domain.MigrationBatch
+	_ = json.NewDecoder(rr.Body).Decode(&got)
+	if got.BatchID != winner.BatchID {
+		t.Fatalf("expected the winning batch %q, got %q", winner.BatchID, got.BatchID)
+	}
+}
+
 func TestValidateOpeningBalances_AROpenItemAlreadyExistsInHistory_QuarantinesBatch(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{

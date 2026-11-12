@@ -116,6 +116,29 @@ func TestResolveMismatch_FromDisputed_MovesToResolved(t *testing.T) {
 	}
 }
 
+// SPEC_DEVIATIONS A8: the resolver must differ from whoever raised the
+// dispute.
+func TestResolveMismatch_SamePrincipalAsDisputer_Refused(t *testing.T) {
+	s := newStubStoreReal()
+	seedEntry(s, "e1", domain.MatchStatusDisputed)
+	disputer := "user-1"
+	s.entries["e1"].DisputedByPrincipalID = &disputer
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
+
+	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{"resolution_note": "FX rounding", "outcome": domain.ResolutionAccepted}, disputer)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("resolver == disputer: want 403, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if s.entries["e1"].MatchStatus != domain.MatchStatusDisputed {
+		t.Fatal("a refused resolution must not move the pair")
+	}
+
+	resp = doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{"resolution_note": "FX rounding", "outcome": domain.ResolutionAccepted}, "user-2")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("an independent resolver must succeed: %d: %s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestResolveMismatch_FromMismatch_Refused(t *testing.T) {
 	// ResolveMismatch is only reachable from DISPUTED — a straight MISMATCH
 	// that was never disputed has no dispute to resolve.

@@ -152,7 +152,7 @@ func (x *e2e) execute(run *domain.ControlRun, key string) *domain.ControlRun {
 }
 
 func (x *e2e) events(runID string) map[string]int {
-	rows, err := testPool.Query(ctx, `SELECT event_type, count(*) FROM outbox_events
+	rows, err := testPool.Query(ctx, `SELECT event_type, count(*) FROM `+legacyEvents+`
 		WHERE tenant_id = $1 AND (aggregate_id = $2::text OR aggregate_id IN (SELECT exception_id::text FROM control_exceptions WHERE run_id::text = $2::text))
 		GROUP BY event_type`, x.tenant, runID)
 	require.NoError(x.t, err)

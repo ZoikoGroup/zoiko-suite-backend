@@ -105,7 +105,7 @@ func TestRevocation_RevokesCertificationAndRetainsTheOriginal(t *testing.T) {
 
 	// The event carries the prior certification, reason, evidence and effective time.
 	var payload map[string]any
-	require.NoError(t, testPool.QueryRow(ctx, `SELECT payload FROM outbox_events
+	require.NoError(t, testPool.QueryRow(ctx, `SELECT payload FROM `+legacyEvents+`
 		WHERE aggregate_id = $1 AND event_type = 'control.run.certification_revoked'`, run.RunID).Scan(&payload))
 	assert.Equal(t, "CERTIFIED", payload["prior_certification_state"])
 	assert.Equal(t, "REVOKED", payload["certification_state"])

@@ -90,6 +90,8 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP FUNCTION IF EXISTS reject_idempotency_key_update(), enforce_price_child_draft_only(),
 			enforce_price_version_lifecycle(), reject_commercial_product_mutation(),
 			enforce_commercial_currency_immutability() CASCADE;
+		DROP TABLE IF EXISTS eventing_outbox CASCADE;
+		DROP FUNCTION IF EXISTS eventing_outbox_payload_immutable() CASCADE;
 		DROP TABLE IF EXISTS outbox_events, subscription_status_events, billing_source_transfers,
 			subscription_change_requests, commercial_usage_meter_events,
 			contract_entitlement_overlays, evaluation_programs, commercial_subscriptions,
@@ -297,7 +299,7 @@ func TestRLS_PlatformTablesHaveNoPolicy(t *testing.T) {
 // organization_id themselves.
 func TestRLS_DirectTables_TenantIsolation(t *testing.T) {
 	admin := openAdminPool(t)
-	s := store.NewPgStore(appRolePool(t, admin))
+	s := store.NewPgStore(appRolePool(t, admin), testEventProfile)
 
 	accountA, _ := seedAccountAndSubscription(t, s, admin, orgA)
 	_, _ = seedAccountAndSubscription(t, s, admin, orgB)
@@ -324,7 +326,7 @@ func TestRLS_DirectTables_TenantIsolation(t *testing.T) {
 // parent chain.
 func TestRLS_DerivedTables_TenantIsolation(t *testing.T) {
 	admin := openAdminPool(t)
-	s := store.NewPgStore(appRolePool(t, admin))
+	s := store.NewPgStore(appRolePool(t, admin), testEventProfile)
 
 	_, subA := seedAccountAndSubscription(t, s, admin, orgA)
 	_, subB := seedAccountAndSubscription(t, s, admin, orgB)
@@ -388,7 +390,7 @@ func TestRLS_DerivedTables_TenantIsolation(t *testing.T) {
 // the snippet.) This asserts the store fails closed on its own.
 func TestRLS_TenantlessContext_SeesNothing(t *testing.T) {
 	admin := openAdminPool(t)
-	s := store.NewPgStore(appRolePool(t, admin))
+	s := store.NewPgStore(appRolePool(t, admin), testEventProfile)
 
 	accountA, subA := seedAccountAndSubscription(t, s, admin, orgA)
 
@@ -447,7 +449,7 @@ func TestRLS_DerivedWithCheckRefusesForeignParent(t *testing.T) {
 	ctx := context.Background()
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, testEventProfile)
 
 	accountA, _ := seedAccountAndSubscription(t, s, admin, orgA)
 	_, _ = seedAccountAndSubscription(t, s, admin, orgB)
@@ -493,7 +495,7 @@ func TestRLS_ParentPolicyCoupling(t *testing.T) {
 	ctx := context.Background()
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, testEventProfile)
 
 	_, subA := seedAccountAndSubscription(t, s, admin, orgA)
 	_, _ = seedAccountAndSubscription(t, s, admin, orgB)

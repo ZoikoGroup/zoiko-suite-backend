@@ -442,7 +442,7 @@ func (a *recordingAuthz) lastCall() authzCall {
 func newTestHandlerWithAuthz(az AuthzChecker) (*Handler, *stubStore) {
 	logger, _ := zap.NewDevelopment()
 	st := newStubStore()
-	return New(st, &stubPublisher{}, az, logger), st
+	return New(st, az, logger), st
 }
 
 func buildRequestWithHeaders(method, path string, body interface{}, tenantID, principalID string) *http.Request {

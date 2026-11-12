@@ -363,10 +363,21 @@ func resolvePairSides(req domain.CreateEntryRequest) (pairSides, string, error) 
 
 // ── GET /v1/intercompany/entries ─────────────────────────────────────────────────
 
+// ListEntries requires at least one of source_legal_entity_id/
+// target_legal_entity_id (SPEC_DEVIATIONS A2): without one, the
+// authorization check had nothing to check against and was skipped
+// entirely, returning every entry in the tenant to any caller with an
+// X-Principal-Id. No caller anywhere in the platform depends on the
+// unfiltered form — consolidation-svc's own elimination/match fetches
+// (its A5) already pass source_legal_entity_id per child entity.
 func (h *Handler) ListEntries(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	sourceEntityID := q.Get("source_legal_entity_id")
 	targetEntityID := q.Get("target_legal_entity_id")
+	if sourceEntityID == "" && targetEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "source_legal_entity_id or target_legal_entity_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -381,11 +392,6 @@ func (h *Handler) ListEntries(w http.ResponseWriter, r *http.Request) {
 	entityForAuthz := sourceEntityID
 	if entityForAuthz == "" {
 		entityForAuthz = targetEntityID
-	}
-	if entityForAuthz == "" {
-		writeError(w, http.StatusBadRequest, "missing_entity_filter",
-			"at least one of source_legal_entity_id or target_legal_entity_id is required")
-		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, entityForAuthz, actionViewEntry); err != nil {
 		h.writeAuthzErr(w, err)
@@ -1024,6 +1030,12 @@ func (h *Handler) ResolveMismatch(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, entry.TargetLegalEntityID, actionResolveMismatch); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	// SPEC_DEVIATIONS A8: the resolver must differ from whoever raised the
+	// dispute.
+	if entry.DisputedByPrincipalID != nil && *entry.DisputedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_resolution_forbidden", domain.ErrResolverIsDisputer.Error())
 		return
 	}
 

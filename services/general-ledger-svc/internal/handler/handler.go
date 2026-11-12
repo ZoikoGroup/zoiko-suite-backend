@@ -55,11 +55,16 @@ type Store interface {
 	CreateAccount(ctx context.Context, a *domain.Account) error
 	GetAccountByCode(ctx context.Context, tenantID, accountCode string) (*domain.Account, error)
 	ListAccounts(ctx context.Context, tenantID string) ([]domain.Account, error)
-	AmendAccountVersion(ctx context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, principalID string) (*domain.Account, bool, error)
+	AmendAccountVersion(ctx context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, sourcePolicyRef string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error)
 	ActivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 	DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
-	ReparentAccount(ctx context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, bool, error)
+	ReparentAccount(ctx context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, sourcePolicyRef string, principalID string) (*domain.Account, *domain.AccountChangeApproval, bool, error)
 	GetAccountAsOf(ctx context.Context, tenantID, accountCode string, asOf time.Time) (*domain.AccountVersion, error)
+
+	// ApproveAccountChange/GetAccountChangeApproval are ACC-01's maker-checker
+	// lifecycle (SPEC_DEVIATIONS A4/B16) — see migration 000031's doc comment.
+	ApproveAccountChange(ctx context.Context, tenantID, changeID, principalID, idempotencyKey string) (*domain.Account, bool, error)
+	GetAccountChangeApproval(ctx context.Context, tenantID, changeID string) (*domain.AccountChangeApproval, error)
 
 	// ACC-02 Account Mapping — see migration 000008's doc comment.
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
@@ -164,6 +169,11 @@ const (
 	actionActivateAccount   = "COA_ACCOUNT_ACTIVATE"
 	actionDeactivateAccount = "COA_ACCOUNT_DEACTIVATE"
 	actionReparentAccount   = "COA_ACCOUNT_REPARENT"
+	// actionApproveAccountChange gates ApproveAccountChange (SPEC_DEVIATIONS
+	// A4/B16) — a distinct action from actionAmendAccount/actionReparentAccount
+	// so the two can be granted to different people, the structural precondition
+	// for the SoD check itself (approver != proposer) to mean anything.
+	actionApproveAccountChange = "COA_ACCOUNT_CHANGE_APPROVE"
 	// actionOverridePostingRestriction gates the invariant #7 override —
 	// deliberately a distinct, more sensitive action than actionCreateJournal
 	// itself, so it can be granted to a narrower group.
@@ -393,6 +403,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{account_code}/reparent", h.ReparentAccount)
 		r.Post("/{account_code}/scoped-versions", h.CreateAccountScopeVersion)
 		r.Get("/{account_code}/scoped-versions", h.ListAccountScopeVersions)
+	})
+	r.Route("/v1/account-change-approvals", func(r chi.Router) {
+		r.Get("/{change_id}", h.GetAccountChangeApproval)
+		r.Post("/{change_id}/approve", h.ApproveAccountChange)
 	})
 	r.Route("/v1/account-mappings", func(r chi.Router) {
 		r.Post("/", h.SetAccountMapping)
@@ -1063,8 +1077,8 @@ func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
 	if req.EffectiveFrom != nil {
 		effectiveFrom = req.EffectiveFrom.Time
 	}
-	result, replay, err := h.store.AmendAccountVersion(r.Context(), tenantID, accountCode, idempotencyKey,
-		req.ExpectedVersion, effectiveFrom, &updated, req.Reason, req.EvidenceRefs, principalID)
+	result, pending, replay, err := h.store.AmendAccountVersion(r.Context(), tenantID, accountCode, idempotencyKey,
+		req.ExpectedVersion, effectiveFrom, &updated, req.Reason, req.EvidenceRefs, req.SourcePolicyRef, principalID)
 	if err != nil {
 		if h.writeAccountVersionErr(w, err) {
 			return
@@ -1077,6 +1091,12 @@ func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
 		// A retried command returns the recorded result without executing
 		// again; the header says so explicitly.
 		w.Header().Set("Idempotent-Replay", "true")
+	}
+	if pending != nil {
+		// A control-account amendment is not applied yet (SPEC_DEVIATIONS
+		// A4/B16): a different principal must call ApproveAccountChange.
+		writeJSON(w, http.StatusAccepted, pending)
+		return
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -1099,6 +1119,10 @@ func (h *Handler) writeAccountVersionErr(w http.ResponseWriter, err error) bool 
 		writeError(w, http.StatusUnprocessableEntity, "hierarchy_cycle", err.Error())
 	case errors.Is(err, domain.ErrAccountHierarchyBackdated):
 		writeError(w, http.StatusUnprocessableEntity, "hierarchy_backdated", err.Error())
+	case errors.Is(err, domain.ErrAccountChangeAlreadyPending):
+		writeError(w, http.StatusConflict, "account_change_already_pending", err.Error())
+	case errors.Is(err, domain.ErrAccountChangeReasonRequired):
+		writeError(w, http.StatusBadRequest, "reason_required", err.Error())
 	default:
 		return false
 	}
@@ -1317,8 +1341,8 @@ func (h *Handler) ReparentAccount(w http.ResponseWriter, r *http.Request) {
 	if req.EffectiveFrom != nil {
 		effectiveFrom = req.EffectiveFrom.Time
 	}
-	updated, replay, err := h.store.ReparentAccount(r.Context(), tenantID, accountCode, idempotencyKey,
-		req.ParentAccountID, req.ExpectedVersion, effectiveFrom, req.Reason, req.EvidenceRefs, principalID)
+	updated, pending, replay, err := h.store.ReparentAccount(r.Context(), tenantID, accountCode, idempotencyKey,
+		req.ParentAccountID, req.ExpectedVersion, effectiveFrom, req.Reason, req.EvidenceRefs, req.SourcePolicyRef, principalID)
 	if err != nil {
 		if h.writeAccountVersionErr(w, err) {
 			return
@@ -1332,7 +1356,86 @@ func (h *Handler) ReparentAccount(w http.ResponseWriter, r *http.Request) {
 		// again; the header says so explicitly.
 		w.Header().Set("Idempotent-Replay", "true")
 	}
+	if pending != nil {
+		// A reparent touching a control account is not applied yet
+		// (SPEC_DEVIATIONS A4/B16): a different principal must call
+		// ApproveAccountChange.
+		writeJSON(w, http.StatusAccepted, pending)
+		return
+	}
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// ApproveAccountChange is ACC-01's maker-checker second step: a different
+// principal than whoever proposed a control-account reparent or amendment
+// (ReparentAccount/AmendAccountVersion) applies it for real. See migration
+// 000031's doc comment (SPEC_DEVIATIONS A4/B16).
+func (h *Handler) ApproveAccountChange(w http.ResponseWriter, r *http.Request) {
+	changeID := chi.URLParam(r, "change_id")
+
+	idempotencyKey := strings.TrimSpace(r.Header.Get(svcenvelope.HeaderIdempotencyKey))
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required to approve an account change")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionApproveAccountChange); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	result, replay, err := h.store.ApproveAccountChange(r.Context(), tenantID, changeID, principalID, idempotencyKey)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrAccountChangeNotFound):
+			writeError(w, http.StatusNotFound, "account_change_not_found", "")
+		case errors.Is(err, domain.ErrAccountChangeNotPending):
+			writeError(w, http.StatusConflict, "account_change_not_pending", err.Error())
+		case errors.Is(err, domain.ErrAccountChangeSelfApproval):
+			writeError(w, http.StatusForbidden, "self_approval_not_permitted", err.Error())
+		case h.writeAccountVersionErr(w, err):
+		default:
+			h.log.Error("ApproveAccountChange: store unavailable", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		}
+		return
+	}
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetAccountChangeApproval returns one pending or decided material account
+// change, so a caller can display or act on what ReparentAccount/
+// AmendAccountVersion handed back as 202 Accepted.
+func (h *Handler) GetAccountChangeApproval(w http.ResponseWriter, r *http.Request) {
+	changeID := chi.URLParam(r, "change_id")
+
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	change, err := h.store.GetAccountChangeApproval(r.Context(), tenantID, changeID)
+	if errors.Is(err, domain.ErrAccountChangeNotFound) {
+		writeError(w, http.StatusNotFound, "account_change_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("GetAccountChangeApproval: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, change)
 }
 
 func (h *Handler) GetAccount(w http.ResponseWriter, r *http.Request) {

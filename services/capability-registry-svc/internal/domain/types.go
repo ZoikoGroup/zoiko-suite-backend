@@ -287,21 +287,35 @@ var (
 	ErrIdempotencyKeyReused = errorString("idempotency key was already used for a different request")
 )
 
-// IdempotencyClaim is recorded in the same transaction as the write it
-// guards. Operation is the fixed per-endpoint scope; ResponseStatus and
-// ResponseBody preserve the original successful HTTP response for replays.
+// PlatformScopeID is the one scope every object this service owns belongs
+// to. The registry tables carry no tenant_id (SPEC_DEVIATIONS B12): they are
+// platform catalogue data, identical for every tenant. The same value is the
+// legal_entity_id sent to authorization-svc, the mTLS identity's scope, and
+// the tenant_id stamped on every emitted event — a declared scope, not a
+// fallback for a missing tenant (SPEC_DEVIATIONS B13). eventing_outbox
+// enforces it with a CHECK constraint (migration 000004).
+const PlatformScopeID = "00000000-0000-0000-0000-00000000f001"
+
+// IdempotencyClaim is the per-command context every write receives, recorded
+// in the same transaction as the write it guards. Operation is the fixed
+// per-endpoint scope; ResponseStatus and ResponseBody preserve the original
+// successful HTTP response for replays. PrincipalID and CorrelationID are
+// also what the store stamps on the domain event it enqueues for the write —
+// the store builds that event from the row it persists, the same split
+// payee-banking-identity-svc uses.
+//
+// TenantID is the caller's X-Tenant-Id. It scopes the idempotency key only;
+// it is never the tenant of the data or of the event (see PlatformScopeID).
 type IdempotencyClaim struct {
 	Operation      string
 	TenantID       string
 	PrincipalID    string
+	CorrelationID  string
 	Key            string
 	RequestSHA256  string
 	ResourceID     string
 	ResponseStatus int
 	ResponseBody   []byte
-	OutboxEventID  string
-	OutboxEntityID string
-	OutboxPayload  []byte
 }
 
 // IdempotentReplayError reports that this exact (operation, principal,

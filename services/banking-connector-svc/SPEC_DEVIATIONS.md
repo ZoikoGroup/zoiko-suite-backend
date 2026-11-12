@@ -891,3 +891,111 @@ Original survey (2026-10-22):
 - `internal/store/main_integration_test.go` — caller-supplied disposable DB
   support.
 - `internal/store/outbox_events_test.go` — updated for optional assertions.
+
+## G. Account-number tokenization — client side only, off by default (2026-11-11)
+
+### G1. The gap
+
+Security, Privacy, Residency & Cryptographic Architecture Standard §14
+requires tokenization of restricted identifiers ("Business services use token
+whenever raw value is unnecessary"). Bank details are **S3 Restricted**:
+"tokenization where practical; detokenization/decrypt evidence".
+
+This service stores `bank_connections.account_number` as the raw value
+(`internal/store/pg_store.go`, `CreateConnection`). The raw number also rides
+in the `banking.connection.created` event payload, because `BankConnection`
+serializes `account_number`.
+
+### G2. What this pass adds
+
+- **Client.** `internal/tokenization` holds a client (`Client`), a
+  deterministic `Fake` for tests and local development, and a `Tokenizer`
+  interface. It mirrors `internal/authz`.
+  - It fails closed. Unreachable, non-200, an undecodable body, an empty
+    token, or a token equal to the raw value all return
+    `ErrTokenizationServiceUnavailable`.
+  - A detokenization 403 is the distinct `ErrDetokenizationDenied`.
+- **Write path.** With `TOKENIZATION_ENFORCED=true`, `CreateConnection`
+  tokenizes the account number before its transaction opens. The token is
+  what is stored, carried in the event and returned.
+  - If tokenization fails or no tokenizer is configured, the write is
+    refused and nothing is written. There is deliberately no "store it raw"
+    fallback.
+- **Off by default.** With `TOKENIZATION_ENFORCED` unset or `false`, behaviour
+  is unchanged: the raw value is stored, evented and returned exactly as
+  before, and the tokenizer is never called. That is a regression test, not
+  an assumption.
+- **Strict flag.** `TOKENIZATION_ENFORCED` is parsed strictly
+  (`Config.Validate`). Any value other than `true`, `false` or unset refuses
+  to start. `AUTHZ_MTLS_ENABLED`-style `== "true"` parsing would read a typo
+  as "off", which for a protection flag is fail-open.
+
+### G3. The endpoint contract is a PROPOSAL, not verified
+
+key-management-svc, owned by another developer, has no tokenize or detokenize
+endpoint; it manages key metadata only. The contract below is what this
+service *assumes*. It has not been agreed with key-management-svc's owner, and
+`internal/tokenization/client.go` is the one place to change if the real one
+differs.
+
+```
+POST /v1/tokenize
+  headers: X-Tenant-Id (required), X-Principal-Id, X-Correlation-ID
+  body:    {"value": "<raw>", "classification": "S3_RESTRICTED"}
+  200:     {"token": "<opaque>"}
+
+POST /v1/detokenize
+  headers: X-Tenant-Id (required), X-Principal-Id (required), X-Correlation-ID
+  body:    {"token": "<opaque>"}
+  200:     {"value": "<raw>"}
+  403:     elevated authorization missing (SEC-T15) or token not bound to
+           this tenant/context (SEC-T29)
+```
+
+The tenant and principal headers go beyond a body-only
+`{value, classification}` contract. SEC-T29 requires the service to bind a
+token to its tenant and deny cross-tenant detokenization, and SEC-INV-15
+requires detokenization evidence. Without a tenant and an actor on the call it
+can do neither. The `S3_RESTRICTED` spelling is also part of the proposal.
+
+### G4. A migration state with an end, not a permanent toggle
+
+`TOKENIZATION_ENFORCED` stays `false` (compose:
+`docker-compose.phase7.yml`) until key-management-svc implements the two
+endpoints. This has the same shape as authorization-svc's
+`ZS_ENVELOPE_ENFORCEMENT` rollout. Before it is turned on:
+
+1. **The contract (G3).** key-management-svc's owner confirms it, or this
+   client is changed to match.
+2. **Readers.** They return the stored token, so the read surfaces must be
+   revisited.
+   - `maskSensitiveFields` masks the token's characters, not account digits.
+   - `IBAN` is filled from `AccountNumber`.
+   - Any caller that needs the raw number must detokenize under the separate
+     elevated authorization SEC-T15 requires. This pass adds the client
+     method but wires no read path to it.
+3. **Existing rows.** They keep raw values. Backfilling them through the
+   tokenizer is separate, one-off work.
+4. **Column width.** The token must fit `account_number VARCHAR(128)`. A
+   longer one fails the insert, which refuses the write, so this is safe but
+   needs checking against the real token format.
+
+### G5. Verification
+
+- `internal/tokenization/client_test.go`:
+  - the request shape;
+  - fail-closed on 500, 404, undecodable body, empty token, a
+    token-equals-value echo and an unreachable service;
+  - the distinct detokenization denial;
+  - unbindable requests refused without a call;
+  - the Fake's determinism, tenant binding and failure injection.
+- `internal/store/tokenization_test.go` (`-tags integration`, real Postgres,
+  app role):
+  - enforced stores, events and returns the token, and only the same tenant
+    detokenizes it;
+  - a failed or impossible tokenization writes no row and no event;
+  - not-enforced writes exactly what a store built without the option
+    writes, and never calls the tokenizer.
+- Two deliberate breakages were each caught: a raw fallback on failure, and
+  enforcement ignored.
+- `internal/config/config_test.go`: strict flag parsing and the default URL.
