@@ -96,7 +96,7 @@ func (h *Handler) asyncCapable(pattern string, fn http.HandlerFunc) http.Handler
 		now := time.Now().UTC()
 		// Recorded outside the request's transaction: the operation must be
 		// committed before its background run looks it up.
-		op, created, err := h.operations.Create(store.WithoutUnit(r.Context()), apicontract.Operation{
+		op, created, err := h.operations.Create(store.WithTenant(store.WithoutUnit(r.Context()), tenant), apicontract.Operation{
 			ID: apicontract.NewOperationID(), TenantID: tenant, PrincipalID: actor, Type: spec.opType,
 			Route: r.URL.Path, State: apicontract.OperationQueued, Cancelable: true,
 			ResourceRef:    "/v1/packs/" + ref + "/versions/" + version + spec.resultSuffix,

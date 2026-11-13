@@ -5,6 +5,7 @@ package registryit_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -34,6 +35,11 @@ func (w *recordingWriter) WriteMessages(_ context.Context, msgs ...kafka.Message
 		return context.DeadlineExceeded
 	}
 	for _, m := range msgs {
+		// The production writer names the topic; kafka-go refuses a message
+		// that names one too, so the relay must leave it empty.
+		if m.Topic != "" {
+			return errors.New("kafka.(*Writer): Topic must not be specified for both Writer and Message")
+		}
 		w.keys = append(w.keys, string(m.Key))
 	}
 	return nil

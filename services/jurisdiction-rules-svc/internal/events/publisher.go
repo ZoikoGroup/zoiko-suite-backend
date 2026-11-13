@@ -441,10 +441,11 @@ func (w *OutboxWorker) processBatch() {
 		if e.PartitionKey != nil {
 			key = []byte(*e.PartitionKey)
 		}
+		// The writer names the topic: kafka-go refuses a message that names one
+		// too ("Topic must not be specified for both Writer and Message").
 		msg := kafka.Message{
 			Key:   key,
 			Value: e.EventPayload,
-			Topic: w.topic,
 		}
 		if err := w.producer.WriteMessages(ctx, msg); err != nil {
 			w.log.Error("outbox: kafka write failed",

@@ -17,12 +17,15 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 )
 
-func newEnvAsync(signer domain.Signer) *env {
+// The operation store runs as jur_rls_probe (no superuser, no BYPASSRLS), as the
+// service's own role does live: an operation written without its tenant is refused.
+func newEnvAsync(t *testing.T, signer domain.Signer) *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
 	r := newRouter()
+	ops, _ := probe(t)
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).
-		WithAggregateVersions(st).WithAsyncOperations(asyncpgx.New(st.OperationsDB()), st)
+		WithAggregateVersions(st).WithAsyncOperations(asyncpgx.New(ops.OperationsDB()), st)
 	if signer != nil {
 		h.WithSigner(signer)
 	}
@@ -51,7 +54,7 @@ var async = map[string]string{"Prefer": "respond-async"}
 func TestAPI5_CompileRunsAsAnOperation(t *testing.T) {
 	keyRef := "async-key-" + strings.ToLower(uuid.NewString()[:6])
 	signer, _ := newSigner(t, keyRef)
-	e := newEnvAsync(signer)
+	e := newEnvAsync(t, signer)
 	f := newFixture(t, e)
 
 	// A compile of a version still in DRAFT fails; the failure is the command's own answer.
