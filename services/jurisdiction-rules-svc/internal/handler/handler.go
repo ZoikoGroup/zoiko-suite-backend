@@ -892,7 +892,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if !createableRuleStatuses[ruleStatus] {
 		writeError(w, r, http.StatusBadRequest, "invalid_rule_status",
-			"rule_status must be DRAFT or ACTIVE at creation; SUPERSEDED and RETIRED are reached only via transition")
+			"rule_status must be DRAFT at creation; ACTIVE, SUPERSEDED and RETIRED are reached only via transition (ACTIVE with an approval reference)")
 		return
 	}
 
@@ -1059,6 +1059,13 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if current.RuleStatus != "ACTIVE" {
+				// The author is refused here, before workflow-svc is asked: the
+				// answer cannot change, so it must not turn into a 503 (retry)
+				// when workflow-svc is down. The store refuses it again.
+				if current.CreatedByPrincipalID != "" && current.CreatedByPrincipalID == principalID {
+					writeError(w, r, http.StatusForbidden, "self_approval_forbidden", "the rule's author cannot activate it")
+					return
+				}
 				if err := h.approvals.Verify(r.Context(), approvalRef, ruleID, current.CreatedByPrincipalID); err != nil {
 					if errors.Is(err, approval.ErrNotValid) {
 						writeError(w, r, http.StatusForbidden, "approval_not_valid", err.Error())
