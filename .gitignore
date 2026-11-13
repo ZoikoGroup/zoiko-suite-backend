@@ -60,3 +60,6 @@ scratch/
 # Suivo public-ai stack: local secrets and signed release files
 deployments/.env.public-ai
 deployments/public-ai-releases/
+
+# jurisdiction-rules-svc dev pack-signing key, written by the e2e (never commit a key)
+deployments/jurisdiction/dev-keys/

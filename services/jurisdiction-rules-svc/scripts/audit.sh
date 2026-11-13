@@ -104,7 +104,7 @@ chk "API-4 unknown filter → 400" "$(code "${RH[@]}" "$B/v1/sources?filter%5Bco
 chk "GET /v1/jurisdiction-summary" "$(code "${RH[@]}" $B/v1/jurisdiction-summary)" "200"
 chk "GET /v1/admin/outbox/parked" "$(code "${RH[@]}" $B/v1/admin/outbox/parked)" "200"
 chk "GET /v1/regimes" "$(code "${RH[@]}" $B/v1/regimes)" "200"
-chk "GET /v1/pack-coverage" "$(code "${RH[@]}" $B/v1/pack-coverage)" "200"
+chk "GET /v1/pack-coverage?jurisdiction=GB" "$(code "${RH[@]}" "$B/v1/pack-coverage?jurisdiction=GB")" "200"
 chk "GET /v1/operations/{unknown} → 404" "$(code "${RH[@]}" $B/v1/operations/op_000000000000000000000000)" "404"
 
 echo

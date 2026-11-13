@@ -1039,10 +1039,18 @@ services:
       CURSOR_SIGNING_KEY_HEX: "${JURISDICTION_CURSOR_SIGNING_KEY_HEX:-6a7572697364696374696f6e2d72756c65732d6465762d637572736f722d6b6579}"
       # JR-6: the regulatory feed consumer stays off until external-data-feed-svc
       # publishes regulatory.source.changed; set KAFKA_REGULATORY_FEED_TOPIC then.
+      # Pack signing on the dev stack: the e2e (--prepare-signing-key) writes a
+      # throwaway key to ./jurisdiction/dev-keys (gitignored) and starts the
+      # service with these two set. Production key custody waits on SEC-1.
+      PACK_SIGNING_KEY_REF: "${JURISDICTION_PACK_SIGNING_KEY_REF:-}"
+      PACK_SIGNING_KEY_FILE: "${JURISDICTION_PACK_SIGNING_KEY_FILE:-}"
+      RULE_EFFECTIVITY_INTERVAL_SECONDS: "${JURISDICTION_RULE_EFFECTIVITY_INTERVAL_SECONDS:-60}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "jurisdiction-rules-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.jurisdiction.events"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+    volumes:
+      - ./jurisdiction/dev-keys:/keys:ro
     depends_on:
       postgres:
         condition: service_healthy
