@@ -14,9 +14,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	"zoiko.io/jurisdiction-rules-svc/internal/entityregistry"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
@@ -382,6 +384,10 @@ func TestOpenAPIMatchesTheRouter(t *testing.T) {
 	h.WithRegistry(stub, pub).WithCertificationPolicy(1)
 	h.WithOperations(handler.OpsPolicy{})
 	h.WithEntityApplicability(entityReader).WithResolver(res)
+	// Every optional route group main.go mounts.
+	h.WithOutboxRecovery(parityOutbox{}).WithSummary(paritySummary{}).
+		WithEntityBackfill(parityRegistry{}, parityApplicability{}).
+		WithAsyncOperations(parityOperations{}, parityUnits{}).WithAggregateVersions(parityVersions{})
 	handler.RegisterRoutes(r, h)
 	routed := map[string]bool{}
 	_ = chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
@@ -408,4 +414,63 @@ func TestOpenAPIMatchesTheRouter(t *testing.T) {
 	if len(routed) < 20 {
 		t.Fatalf("only %d routes walked; the parity check is not seeing the router", len(routed))
 	}
+}
+
+// Stubs for the optional route groups: parity needs the routes mounted, never called.
+type parityOutbox struct{}
+
+func (parityOutbox) ListParkedOutboxEvents(context.Context, int, int) ([]*store.ParkedOutboxEvent, error) {
+	return nil, nil
+}
+func (parityOutbox) RequeueOutboxEvent(context.Context, string, string, string, string) (*store.OutboxRequeue, error) {
+	return nil, nil
+}
+
+type paritySummary struct{}
+
+func (paritySummary) JurisdictionSummary(context.Context) (*store.JurisdictionSummary, error) {
+	return nil, nil
+}
+
+type parityRegistry struct{}
+
+func (parityRegistry) ListEntities(context.Context, string) ([]entityregistry.Entity, error) {
+	return nil, nil
+}
+func (parityRegistry) ListAssignments(context.Context, string) ([]entityregistry.Assignment, error) {
+	return nil, nil
+}
+
+type parityApplicability struct{}
+
+func (parityApplicability) ApplyEntityApplicability(context.Context, string, string, domain.EntityJurisdictionApplicability) (bool, error) {
+	return false, nil
+}
+
+type parityOperations struct{}
+
+func (parityOperations) Create(context.Context, apicontract.Operation) (apicontract.Operation, bool, error) {
+	return apicontract.Operation{}, false, nil
+}
+func (parityOperations) Get(context.Context, string, string) (apicontract.Operation, error) {
+	return apicontract.Operation{}, nil
+}
+func (parityOperations) FindByKey(context.Context, string, string, string, string) (apicontract.Operation, bool, error) {
+	return apicontract.Operation{}, false, nil
+}
+func (parityOperations) Advance(context.Context, string, string, apicontract.OperationState, *apicontract.OperationProgress, *apicontract.Problem, string) (apicontract.Operation, error) {
+	return apicontract.Operation{}, nil
+}
+func (parityOperations) RequestCancel(context.Context, string, string) (apicontract.Operation, error) {
+	return apicontract.Operation{}, nil
+}
+
+type parityUnits struct{}
+
+func (parityUnits) BeginUnit(ctx context.Context, _ string) (context.Context, *store.Unit) { return ctx, nil }
+
+type parityVersions struct{}
+
+func (parityVersions) AggregateVersion(context.Context, string, string, bool, ...any) (int64, bool, error) {
+	return 0, false, nil
 }

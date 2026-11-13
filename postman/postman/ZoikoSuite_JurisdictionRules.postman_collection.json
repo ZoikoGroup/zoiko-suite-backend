@@ -2,13 +2,13 @@
     "info": {
         "_postman_id": "zoiko-jurisdiction-rules",
         "name": "ZoikoSuite - Jurisdiction Rules",
-        "description": "Minimal collection for jurisdiction-rules-svc (port 8082). Reads are open platform reference data. Writes require the authorization principal header (X-Principal-Id) plus the write-strict envelope headers (X-Request-Id, X-Source-Channel, Idempotency-Key). Error bodies are RFC 9457 application/problem+json. Fill jurisdictionId/ruleId from a Create response before calling the path-parameter requests.",
+        "description": "Minimal collection for jurisdiction-rules-svc (port 8082). Reads are open platform reference data. Writes require the authorization principal header (X-Principal-Id) plus the write-strict envelope headers (X-Request-Id, X-Source-Channel, Idempotency-Key). Error bodies are RFC 9457 application/problem+json. Fill jurisdictionId/ruleId from a Create response before calling the path-parameter requests.\n\nSince 12 Nov 2026 (D2-1): every /v1/admin/ write and /v1/operations/ command needs a verified identity (J-01): set {{envelopeJwt}} to the signed envelope from identity-context-svc (POST /v1/authenticate, then /v1/context/resolve). Lists page with page_size/cursor/filter[...] (API-4); aggregates answer ETag and take If-Match (API-3); compile and test runs accept Prefer: respond-async (API-5).",
         "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
     },
     "variable": [
         {
             "key": "baseUrl",
-            "value": "http://localhost:8082"
+            "value": "http://127.0.0.1:8082"
         },
         {
             "key": "principalId",
@@ -32,6 +32,38 @@
         },
         {
             "key": "ruleId",
+            "value": ""
+        },
+        {
+            "key": "envelopeJwt",
+            "value": ""
+        },
+        {
+            "key": "legalEntityId",
+            "value": "22222222-2222-2222-2222-222222222222"
+        },
+        {
+            "key": "operationId",
+            "value": ""
+        },
+        {
+            "key": "outboxId",
+            "value": ""
+        },
+        {
+            "key": "packRef",
+            "value": ""
+        },
+        {
+            "key": "packVersion",
+            "value": ""
+        },
+        {
+            "key": "nextCursor",
+            "value": ""
+        },
+        {
+            "key": "etag",
             "value": ""
         }
     ],
@@ -390,6 +422,603 @@
                             }
                         }
                     ]
+                }
+            ]
+        },
+        {
+            "name": "04 - Console summary and paging (JR-FE-1, API-4)",
+            "item": [
+                {
+                    "name": "Console summary",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdiction-summary",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Jurisdictions, first page",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdictions?page_size=2&filter[type]=COUNTRY",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            }
+                        ]
+                    },
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "var b = pm.response.json(); pm.collectionVariables.set('nextCursor', b.next_cursor || '');"
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "Jurisdictions, next page",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdictions?page_size=2&filter[type]=COUNTRY&cursor={{nextCursor}}",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Sources, paged and filtered",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/sources?page_size=20&filter[jurisdiction_id]={{jurisdictionId}}",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "05 - Concurrency (API-3)",
+            "item": [
+                {
+                    "name": "Read a pack version (ETag)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/packs/{{packRef}}/versions/{{packVersion}}",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            }
+                        ]
+                    },
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.collectionVariables.set('etag', pm.response.headers.get('ETag') || '');"
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "Submit for review with If-Match",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/packs/{{packRef}}/versions/{{packVersion}}/submit-review",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            },
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "If-Match",
+                                "value": "{{etag}}"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "06 - Asynchronous compile (API-5)",
+            "item": [
+                {
+                    "name": "Compile asynchronously",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/packs/{{packRef}}/versions/{{packVersion}}/compile",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            },
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "Prefer",
+                                "value": "respond-async"
+                            }
+                        ]
+                    },
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 202) { pm.collectionVariables.set('operationId', pm.response.json().id); }"
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "Poll the operation",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/operations/{{operationId}}",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Cancel the operation (queued only)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/operations/{{operationId}}/cancel",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            },
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{$guid}}"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "07 - Operations (J-10, J-16)",
+            "item": [
+                {
+                    "name": "Parked outbox events",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/admin/outbox/parked?page_size=50",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            }
+                        ]
+                    },
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "var b = pm.response.json(); var i = b.items || b; if (i.length) { pm.collectionVariables.set('outboxId', i[0].outbox_id); }"
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "Requeue a parked event",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/outbox/{{outboxId}}/requeue",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            },
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{$guid}}"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n  \"reason\": \"broker limit raised\",\n  \"evidence_ref\": \"INC-0000\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Backfill entity applicability (whole tenant)",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/entity-applicability:backfill",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            },
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{$guid}}"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{}"
+                        }
+                    }
+                },
+                {
+                    "name": "Entity jurisdictions after backfill",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/entities/{{legalEntityId}}/jurisdictions",
+                        "header": [
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Legal-Entity-Id",
+                                "value": "{{legalEntityId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{envelopeJwt}}"
+                            }
+                        ]
+                    }
                 }
             ]
         }
