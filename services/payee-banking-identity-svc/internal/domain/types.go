@@ -163,10 +163,18 @@ type PayeeDestination struct {
 	FinancialInstitution string
 	AccountIdentifier    string // full value — see package doc's honest gap on at-rest encryption
 	AccountLast4         string // masked display value, always safe to return
-	CountryCode          string
-	Currency             string
-	PayeeName            string
-	SourceType           SourceType
+
+	// AccountIdentifierToken is this destination's row in
+	// payee_destination_identifier_tokens (migration 000007), or "" when it
+	// has none. Never serialized. Non-empty is the ONE signal that the
+	// destination is tokenized: AccountIdentifier then holds no usable
+	// identifier, and the full value is only ever obtained by detokenizing
+	// this token. Empty means a legacy raw row, as before.
+	AccountIdentifierToken string `json:"-"`
+	CountryCode            string
+	Currency               string
+	PayeeName              string
+	SourceType             SourceType
 
 	Fingerprint string // SHA-256(institution|account|currency) — duplicate detection
 
@@ -279,3 +287,10 @@ const (
 	ErrIdempotencyKeyRequired     = sentinel("Idempotency-Key header is required")
 	ErrIdempotencyKeyConflict     = sentinel("idempotency key was already used for a different command, destination or request")
 )
+
+// Tokenized reports whether this destination's account identifier is held as
+// a token (see AccountIdentifierToken). It is decided by the token row's
+// presence, never by what AccountIdentifier looks like.
+func (d *PayeeDestination) Tokenized() bool {
+	return d != nil && d.AccountIdentifierToken != ""
+}

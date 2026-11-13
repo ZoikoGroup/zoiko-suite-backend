@@ -111,6 +111,13 @@ type Scope struct {
 	PrincipalID   string
 	LegalEntityID string
 	CorrelationID string
+
+	// IdempotencyKey, when set, is sent as Idempotency-Key instead of a fresh
+	// per-call value, so a retried call gets the vault's original answer
+	// back. The backfill (cmd/tokenize-backfill) sets it per row, which makes
+	// a re-run after a failure reuse the tokens the failed run minted rather
+	// than leave orphan copies in the vault.
+	IdempotencyKey string
 }
 
 // Purpose contexts sent as X-Purpose-Context (§4 "governed sensitive access").
@@ -208,9 +215,14 @@ func (c *Client) post(ctx context.Context, path, purpose string, scope Scope, in
 	if err != nil {
 		return ErrTokenizationServiceUnavailable
 	}
-	// A fresh request id per call doubles as the Idempotency-Key: the client
-	// does not retry, so each call is its own operation.
+	// A fresh request id per call doubles as the Idempotency-Key unless the
+	// caller supplied one: the client does not retry, so by default each call
+	// is its own operation.
 	requestID := uuid.NewString()
+	idempotencyKey := scope.IdempotencyKey
+	if idempotencyKey == "" {
+		idempotencyKey = requestID
+	}
 	correlationID := scope.CorrelationID
 	if correlationID == "" {
 		correlationID = requestID
@@ -223,7 +235,7 @@ func (c *Client) post(ctx context.Context, path, purpose string, scope Scope, in
 	req.Header.Set("X-Request-Id", requestID)
 	req.Header.Set("X-Source-Channel", "system")
 	req.Header.Set("X-Purpose-Context", purpose)
-	req.Header.Set("Idempotency-Key", requestID)
+	req.Header.Set("Idempotency-Key", idempotencyKey)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

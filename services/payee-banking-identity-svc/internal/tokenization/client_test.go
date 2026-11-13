@@ -125,6 +125,25 @@ func TestClient_DetokenizeDeniedIsDistinct(t *testing.T) {
 	}
 }
 
+// A caller-supplied idempotency key is sent as-is; without one, every call
+// gets its own.
+func TestClient_IdempotencyKey(t *testing.T) {
+	var keys []string
+	s := server(t, func(w http.ResponseWriter, r *http.Request) {
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		_ = json.NewEncoder(w).Encode(tokenizeResponse{Token: "tok_123"})
+	})
+	c := NewClient(s.URL)
+	keyed := scope
+	keyed.IdempotencyKey = "backfill:table:row-1"
+	_, _ = c.Tokenize(context.Background(), keyed, ClassificationRestricted, "v1")
+	_, _ = c.Tokenize(context.Background(), scope, ClassificationRestricted, "v1")
+	_, _ = c.Tokenize(context.Background(), scope, ClassificationRestricted, "v1")
+	if len(keys) != 3 || keys[0] != "backfill:table:row-1" || keys[1] == "" || keys[1] == keys[2] {
+		t.Fatalf("Idempotency-Key per call: %q", keys)
+	}
+}
+
 func TestClient_RefusesUnbindableRequestsWithoutCalling(t *testing.T) {
 	called := false
 	s := server(t, func(w http.ResponseWriter, _ *http.Request) { called = true })

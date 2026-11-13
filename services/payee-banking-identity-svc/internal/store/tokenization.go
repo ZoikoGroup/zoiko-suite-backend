@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
+
 	"zoiko.io/payee-banking-identity-svc/internal/tokenization"
 )
 
@@ -24,6 +26,19 @@ var ErrTokenizationNotConfigured = errors.New("tokenization enforced but no toke
 // very gap this exists to close.
 func WithTokenization(t tokenization.Tokenizer, enforced bool) Option {
 	return func(s *PgStore) { s.tokenizer, s.tokenizationEnforced = t, enforced }
+}
+
+// insertIdentifierToken writes a destination's token row (migration 000007)
+// in tx. source is WRITE for a destination proposed tokenized, BACKFILL for a
+// legacy row the backfill tokenized.
+func insertIdentifierToken(ctx context.Context, tx pgx.Tx, destinationID, tenantID, token, source string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO payee_destination_identifier_tokens (destination_id, tenant_id, account_identifier_token, source)
+		VALUES ($1, $2, $3, $4)`, destinationID, tenantID, token, source)
+	if err != nil {
+		return fmt.Errorf("insert account-identifier token: %w", err)
+	}
+	return nil
 }
 
 // protectAccountIdentifier returns the value to persist for a raw account
