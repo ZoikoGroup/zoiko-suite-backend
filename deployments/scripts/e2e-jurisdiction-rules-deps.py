@@ -14,8 +14,19 @@ failure names the edge that is broken:
                             granted admin is served; access-control 000052 templates
   kafka                     a registry event reaches zoiko.jurisdiction.events from
                             the outbox, with its aggregate_version (J-11, J-12)
-  workflow-svc              a rule activation citing an approval workflow-svc cannot
-                            confirm is refused (J-02), never applied
+  workflow-svc              J-02 live: an activation citing an unknown, a PENDING, a
+                            REJECTED, or another rule's APPROVED workflow is refused
+                            (403 approval_not_valid) and changes nothing; one citing
+                            an APPROVED workflow bound to the rule and decided by
+                            the approver activates it, with the reference on its
+                            status history. Without workflow-svc: the fail-closed 503
+  regulatory feed (kafka)   JR-6 live, when the service runs with
+                            KAFKA_REGULATORY_FEED_TOPIC: a regulatory.source.changed
+                            event (published here; its real producer,
+                            external-data-feed-svc, does not publish it yet) moves
+                            the ACTIVE rule citing the reference to UNDER_REVIEW,
+                            records the drift and legal.drift.detected; the same
+                            event redelivered changes nothing
   tenant-entity-registry    an entity created there (primary jurisdiction checked
                             against this service) is projected by the consumer;
                             after its mapping is lost, the J-10 backfill restores it,
@@ -24,13 +35,17 @@ failure names the edge that is broken:
                             principals, async compile (API-5), If-Match 412 (API-3),
                             sign and verify with the dev signing key, cursor paging
                             (API-4), parked-event requeue (J-16), rule effectivity
-                            event, console summary
+                            event (the rule activated through workflow-svc), console
+                            summary
 
-    python deployments/scripts/e2e-jurisdiction-rules-deps.py [--prepare-signing-key]
+    python deployments/scripts/e2e-jurisdiction-rules-deps.py [--prepare-signing-key] [--no-workflow]
 
 --prepare-signing-key writes a throwaway Ed25519 key to deployments/jurisdiction/
-dev-keys (gitignored) and prints the command that restarts the service with it;
-signing is checked only when the service runs with that key. First run
+dev-keys (gitignored) and prints the command that restarts the service with it
+(and with the feed consumer on); signing is checked only when the service runs
+with that key. --no-workflow runs without workflow-svc: the J-02 refusal is then
+the fail-closed 503, the effectivity rule is activated by a database fixture, and
+the workflow and feed sections are reported as SKIP. First run
 identity-context-svc's seed-demo-principals (the approver logs in as
 legal.counsel@) and seed-demo-rbac.ps1 (the demo admin and the approver need
 JURISDICTION_FULL and JURISDICTION_PACK_REGISTRY_FULL). The entity edge adds a
@@ -54,10 +69,11 @@ RESIDENCY_POLICY = "77777777-7777-7777-7777-777777777777"
 FISCAL_CALENDAR = "99999999-9999-9999-9999-999999999999"
 
 H = "http://127.0.0.1"
-JR, IDENTITY, TER = f"{H}:8082", f"{H}:8080", f"{H}:8081"
+JR, IDENTITY, TER, WF = f"{H}:8082", f"{H}:8080", f"{H}:8081", f"{H}:8090"
 PG, KAFKA, CONTAINER = "zoiko-postgres", "zoiko-kafka", "jurisdiction-rules-svc"
 TOPIC = "zoiko.jurisdiction.events"
 RUN = uuid.uuid4().hex[:8]
+WORKFLOW_LIVE = True  # main() clears it with --no-workflow or when workflow-svc is down
 KEY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jurisdiction", "dev-keys")
 KEY_REF = "jur-dev-signing"
 
@@ -68,6 +84,11 @@ def check(name, ok, detail=""):
     results.append((name, "PASS" if ok else "FAIL", detail))
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""), flush=True)
     return bool(ok)
+
+
+def skip(name, why):
+    results.append((name, "SKIP", why))
+    print(f"SKIP  {name}  — {why}", flush=True)
 
 
 def brief(body):
@@ -245,11 +266,93 @@ def rules_and_approval(jid):
     check("rules: the author cannot activate their own rule (403)", s == 403, f"HTTP {s} {b.get('code')}")
     s, _, b = jr("POST", f"/v1/admin/rules/{rid}/transition", principal=APPROVER, body={"new_status": "ACTIVE"},
                  headers={"X-Approval-Reference": str(uuid.uuid4())})
-    check("workflow-svc (J-02): an approval it cannot confirm is refused (403 approval_not_valid, or 503 fail-closed)",
-          s in (403, 503), f"HTTP {s} {b.get('code')}")
+    if WORKFLOW_LIVE:
+        check("workflow-svc (J-02): an approval workflow-svc does not know is refused (403 approval_not_valid)",
+              s == 403 and b.get("code") == "approval_not_valid", f"HTTP {s} {b.get('code')}")
+    else:
+        check("workflow-svc (J-02): workflow-svc down -> activation fails closed (503 approval_service_unavailable)",
+              s == 503 and b.get("code") == "approval_service_unavailable", f"HTTP {s} {b.get('code')}")
     s, _, cur = jr("GET", f"/v1/rules/{rid}")
     check("rules: a refused activation changes nothing (still DRAFT)", cur.get("rule_status") == "DRAFT", cur.get("rule_status"))
+    if WORKFLOW_LIVE:
+        workflow_outcomes(rid)
+    else:
+        skip("workflow-svc (J-02): live approve and refuse outcomes", "--no-workflow")
     return rid
+
+
+# ── workflow-svc: the approval a rule activation cites (J-02) ───────────────
+
+def open_approval(subject_id):
+    """An approval workflow opened by the demo admin, one SINGLE stage for the approver."""
+    s, _, wf = jr("POST", "/v1/workflows", base=WF, body={
+        "tenant_id": TENANT, "legal_entity_id": ENTITY, "workflow_type": "JURISDICTION_RULE_ACTIVATION",
+        "subject_type": "jurisdiction_rule", "subject_id": subject_id,
+        "stages": [{"stage_type": "SINGLE", "approver_principal_id": APPROVER}]})
+    return (wf.get("workflow_instance_id") if s in (200, 201) else None), f"HTTP {s} {brief(wf)}"
+
+
+def decide(wid, action="APPROVE"):
+    """The approver decides the workflow (If-Match from its current ETag, API-3)."""
+    _, h, _ = jr("GET", f"/v1/workflows/{wid}", principal=APPROVER, base=WF)
+    extra = {"If-Match": h.get("ETag")} if hasattr(h, "get") and h.get("ETag") else {}
+    s, _, b = jr("POST", f"/v1/workflows/{wid}/actions", principal=APPROVER, base=WF, headers=extra,
+                 body={"action": action, "rationale": f"e2e: rule reviewed ({action.lower()})"})
+    return s in (200, 201), f"HTTP {s} {brief(b)}"
+
+
+def approve_rule(rid):
+    """An APPROVED workflow bound to rule rid, decided by the approver: (workflow id, why)."""
+    wid, why = open_approval(rid)
+    if not wid:
+        return None, "open: " + why
+    ok, why = decide(wid)
+    return (wid, "") if ok else (None, "approve: " + why)
+
+
+def activate(rid, wid):
+    return jr("POST", f"/v1/admin/rules/{rid}/transition", principal=APPROVER, body={"new_status": "ACTIVE"},
+              headers={"X-Approval-Reference": wid})
+
+
+def refused(name, rid, wid, why):
+    if not check(f"setup: {name}", wid, why):
+        return
+    s, _, b = activate(rid, wid)
+    check(f"workflow-svc (J-02): activation citing {name} is refused (403 approval_not_valid)",
+          s == 403 and b.get("code") == "approval_not_valid", f"HTTP {s} {b.get('code')} {b.get('detail', '')}")
+
+
+def workflow_outcomes(rid):
+    wid, why = open_approval(rid)
+    refused("a PENDING workflow of this rule", rid, wid, why)
+
+    wid, why = open_approval(rid)
+    if wid:
+        ok, why = decide(wid, "REJECT")
+        wid = wid if ok else None
+    refused("a REJECTED workflow of this rule", rid, wid, why)
+
+    wid, why = approve_rule(str(uuid.uuid4()))
+    refused("an APPROVED workflow of another rule", rid, wid, why)
+
+    s, _, cur = jr("GET", f"/v1/rules/{rid}")
+    check("rules: after the three refusals the rule is still DRAFT", cur.get("rule_status") == "DRAFT", cur.get("rule_status"))
+
+    wid, why = approve_rule(rid)
+    if not check("workflow-svc: an approval of this rule, decided by the approver (APPROVED)", wid, why):
+        return
+    s, _, b = activate(rid, wid)
+    check("workflow-svc (J-02): activation citing the APPROVED workflow succeeds (200 ACTIVE)",
+          s == 200 and b.get("rule_status") == "ACTIVE", f"HTTP {s} {b.get('code') or b.get('rule_status')}")
+    s, _, hist = jr("GET", f"/v1/rules/{rid}/status-history")
+    rows = hist if isinstance(hist, list) else hist.get("items", [])
+    open_row = next((r for r in rows if r.get("known_to") is None), {})
+    check("rules: the status history records the ACTIVE row with the approval reference and the activator",
+          open_row.get("rule_status") == "ACTIVE" and open_row.get("change_reason") == wid and open_row.get("changed_by_principal_id") == APPROVER,
+          brief(open_row))
+    check("events: jurisdiction.rule.activated recorded with the activation",
+          until(lambda: psql(f"select count(*) from event_outbox where event_type='jurisdiction.rule.activated' and partition_key='{rid}'") == "1", 10))
 
 
 def pack_lifecycle(jid, jcode, signing):
@@ -402,21 +505,116 @@ def outbox_requeue():
 def effectivity(jid):
     # The image is distroless (no printenv): read the container's configuration instead.
     interval = container_env().get("RULE_EFFECTIVITY_INTERVAL_SECONDS") or "60"
-    start = datetime.now(timezone.utc) + timedelta(seconds=15)
-    body = {"rule_domain": "TAX", "rule_code": f"EFF{RUN}".upper(), "rule_name": "starts in fifteen seconds",
+    # Far enough ahead that the approval and the activation finish before the start.
+    lead = 40 if WORKFLOW_LIVE else 15
+    start = datetime.now(timezone.utc) + timedelta(seconds=lead)
+    body = {"rule_domain": "TAX", "rule_code": f"EFF{RUN}".upper(), "rule_name": f"starts in {lead} seconds",
             "effective_from": start.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "rule_payload": {}}
     s, _, rule = jr("POST", f"/v1/admin/jurisdictions/{jid}/rules", body=body)
     rid = rule.get("jurisdiction_rule_id")
-    # A rule is created DRAFT; activating it through the API needs workflow-svc
-    # (J-02), which the minimal stack leaves out. The watcher only reads
-    # rule_status, so the fixture activates the rule in the database.
-    psql(f"update jurisdiction_rules set rule_status='ACTIVE', updated_by_principal_id='e2e-fixture' where jurisdiction_rule_id='{rid}'")
-    check("setup: the future-dated rule is ACTIVE (database fixture, workflow-svc not running)",
-          psql(f"select rule_status from jurisdiction_rules where jurisdiction_rule_id='{rid}'") == "ACTIVE")
-    wait = int(interval) * 2 + 25
+    if WORKFLOW_LIVE:
+        wid, why = approve_rule(rid)
+        s2, _, b = activate(rid, wid) if wid else (0, {}, {"code": why})
+        check("setup: the future-dated rule is activated through the API (workflow-svc approval, J-02)",
+              s2 == 200 and b.get("rule_status") == "ACTIVE" and datetime.now(timezone.utc) < start,
+              f"HTTP {s2} {b.get('code') or b.get('rule_status')}")
+    else:
+        # Without workflow-svc the API cannot activate (J-02). The watcher only
+        # reads rule_status, so the fixture activates the rule in the database.
+        psql(f"update jurisdiction_rules set rule_status='ACTIVE', updated_by_principal_id='e2e-fixture' where jurisdiction_rule_id='{rid}'")
+        check("setup: the future-dated rule is ACTIVE (database fixture, --no-workflow)",
+              psql(f"select rule_status from jurisdiction_rules where jurisdiction_rule_id='{rid}'") == "ACTIVE")
+    wait = lead + int(interval) * 2 + 15
     check(f"s26: regulatory-rule.effective announced when the start passes (watcher every {interval}s)",
           s == 201 and until(lambda: psql(f"select count(*) from event_outbox where event_type='regulatory-rule.effective' and partition_key='{rid}'") == "1", wait, 2),
           f"HTTP {s}")
+
+
+FEED_ACTOR = "jurisdiction-rules-svc:regulatory-feed"
+
+
+def kafka_tool(tool, *args, stdin=None):
+    """Run a Kafka CLI tool in the broker container (apache/kafka, then confluent paths)."""
+    for exe in (f"/opt/kafka/bin/{tool}.sh", tool):
+        r = subprocess.run(["docker", "exec", "-i", KAFKA, exe, "--bootstrap-server", "localhost:9092", *args],
+                           input=stdin, capture_output=True)
+        if r.returncode == 0 or b"executable file not found" not in r.stderr + r.stdout:
+            return r
+    return r
+
+
+def publish_feed_event(topic, event):
+    return kafka_tool("kafka-console-producer", "--topic", topic, stdin=(json.dumps(event) + "\n").encode())
+
+
+def regulatory_feed(jid):
+    topic = container_env().get("KAFKA_REGULATORY_FEED_TOPIC", "")
+    if not topic:
+        skip("regulatory feed (JR-6): live consumer", "the service runs without KAFKA_REGULATORY_FEED_TOPIC")
+        return
+    if not WORKFLOW_LIVE:
+        skip("regulatory feed (JR-6): live consumer", "--no-workflow (the consumer only marks ACTIVE rules)")
+        return
+    # The real producer would create the topic on first publish; create it first
+    # so the consumer group gets its partition while the rule is approved.
+    r = kafka_tool("kafka-topics", "--create", "--if-not-exists", "--topic", topic, "--partitions", "1", "--replication-factor", "1")
+    check(f"setup: feed topic {topic} exists", r.returncode == 0, r.stderr.decode("utf8", "replace")[:200])
+
+    ref = f"e2e-feed:{RUN}"
+    payload = {"applies": ["B2C"], "rate": "0.0500"}
+    s, _, rule = jr("POST", f"/v1/admin/jurisdictions/{jid}/rules", body={
+        "rule_domain": "TAX", "rule_code": f"FEED{RUN}".upper(), "rule_name": "reduced rate (feed watched)",
+        "effective_from": "2025-03-01T00:00:00Z", "rule_payload": payload, "external_feed_reference": ref})
+    rid = rule.get("jurisdiction_rule_id")
+    if not check("feed: a rule citing an external feed reference (201)", s == 201 and rule.get("external_feed_reference") == ref,
+                 f"HTTP {s} {brief(rule)}"):
+        return
+    wid, why = approve_rule(rid)
+    s, _, b = activate(rid, wid) if wid else (0, {}, {"code": why})
+    if not check("feed: the rule is activated through workflow-svc (ACTIVE)", s == 200 and b.get("rule_status") == "ACTIVE",
+                 f"HTTP {s} {b.get('code') or b.get('rule_status')}"):
+        return
+
+    event = {"event_id": str(uuid.uuid4()), "event_type": "regulatory.source.changed", "correlation_id": f"e2e-jur-feed-{RUN}",
+             "payload": {"external_feed_reference": ref, "authority": "E2E Revenue Authority",
+                         "change_summary": "reduced rate amended", "observed_at": iso(datetime.now(timezone.utc)),
+                         "source_url": f"https://example.invalid/e2e/{RUN}/notice"}}
+    r = publish_feed_event(topic, event)
+    check("kafka: regulatory.source.changed published to the feed topic", r.returncode == 0, r.stderr.decode("utf8", "replace")[:200])
+
+    marked = until(lambda: (lambda x: x if x[2].get("legal_drift_state") == "UNDER_REVIEW" else None)(jr("GET", f"/v1/rules/{rid}")), 60, 2)
+    if not check("JR-6: the consumer moves the ACTIVE rule citing the reference to UNDER_REVIEW", bool(marked),
+                 "still " + str(jr("GET", f"/v1/rules/{rid}")[2].get("legal_drift_state")) if not marked else ""):
+        return
+    cur = marked[2]
+    check("JR-6: the drift never changes the rule's status or content (ACTIVE, same payload)",
+          cur.get("rule_status") == "ACTIVE" and cur.get("rule_payload") == payload, brief({k: cur.get(k) for k in ("rule_status", "rule_payload")}))
+    s, _, ev = jr("GET", f"/v1/rules/{rid}/drift-events")
+    evs = ev if isinstance(ev, list) else ev.get("items", [])
+    feed_evs = [e for e in evs if e.get("recorded_by_principal_id") == FEED_ACTOR]
+    check("JR-6: the drift event is recorded by the feed, quoting the authority and the event id",
+          len(feed_evs) == 1 and feed_evs[0].get("to_state") == "UNDER_REVIEW" and event["event_id"] in (feed_evs[0].get("reason") or "")
+          and "E2E Revenue Authority" in (feed_evs[0].get("reason") or ""), brief(feed_evs[:1]))
+    check("events: legal.drift.detected recorded for the rule",
+          until(lambda: psql(f"select count(*) from event_outbox where event_type='legal.drift.detected' and partition_key='{rid}'") == "1", 10),
+          psql(f"select count(*) from event_outbox where event_type='legal.drift.detected' and partition_key='{rid}'"))
+    check("JR-6: the event is claimed once (consumed_events)",
+          psql(f"select count(*) from consumed_events where event_id='{event['event_id']}'") == "1")
+
+    # A person resolves the drift; the same event redelivered must not reopen it.
+    s, _, b = jr("POST", f"/v1/admin/rules/{rid}/drift", body={"drift_state": "CURRENT", "reason": "e2e: reviewed, rule still correct"})
+    check("drift: a person records the review outcome (CURRENT)", s == 200 and b.get("legal_drift_state", (b.get("rule") or {}).get("legal_drift_state")) == "CURRENT",
+          f"HTTP {s} {brief(b)}")
+    r = publish_feed_event(topic, event)
+    time.sleep(8)  # the consumer polls every 500 ms; give it time to (not) act
+    _, _, cur = jr("GET", f"/v1/rules/{rid}")
+    _, _, ev = jr("GET", f"/v1/rules/{rid}/drift-events")
+    evs = ev if isinstance(ev, list) else ev.get("items", [])
+    check("JR-6: the same event redelivered changes nothing (still CURRENT, one feed drift event, one legal.drift.detected)",
+          r.returncode == 0 and cur.get("legal_drift_state") == "CURRENT"
+          and len([e for e in evs if e.get("recorded_by_principal_id") == FEED_ACTOR]) == 1
+          and psql(f"select count(*) from event_outbox where event_type='legal.drift.detected' and partition_key='{rid}'") == "1",
+          f"state={cur.get('legal_drift_state')}")
 
 
 def rls_runtime_role():
@@ -432,20 +630,27 @@ def prepare_signing_key():
     print(f"dev signing key: {os.path.abspath(path)}")
     print("restart the service with it (from deployments/):")
     print(f"  MSYS_NO_PATHCONV=1 JURISDICTION_PACK_SIGNING_KEY_REF={KEY_REF} JURISDICTION_PACK_SIGNING_KEY_FILE=/keys/pack-signing.key "
-          "JURISDICTION_RULE_EFFECTIVITY_INTERVAL_SECONDS=5 docker compose -p deployments -f docker-compose.yml up -d --no-deps --no-build --force-recreate jurisdiction-svc")
+          "JURISDICTION_RULE_EFFECTIVITY_INTERVAL_SECONDS=5 JURISDICTION_REGULATORY_FEED_TOPIC=zoiko.regulatory.feed.e2e docker compose -p deployments -f docker-compose.yml up -d --no-deps --no-build --force-recreate jurisdiction-svc")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prepare-signing-key", action="store_true")
+    ap.add_argument("--no-workflow", action="store_true", help="workflow-svc is not running: expect the fail-closed 503")
     a = ap.parse_args()
     if a.prepare_signing_key:
         prepare_signing_key()
         return 0
     signing = container_env().get("PACK_SIGNING_KEY_FILE", "").startswith("/") and os.path.exists(os.path.join(KEY_DIR, "pack-signing.key"))
 
+    global WORKFLOW_LIVE
+    WORKFLOW_LIVE = not a.no_workflow
     print(f"== jurisdiction-rules-svc dependency e2e (run {RUN})")
     preflight()
+    if WORKFLOW_LIVE:
+        s, _, _ = call("GET", f"{WF}/healthz", timeout=5)
+        if not check("workflow-svc: /healthz (run with --no-workflow to leave it out)", s == 200, f"HTTP {s}"):
+            WORKFLOW_LIVE = False
     identity_and_authz()
     jid = registry_and_kafka()
     if jid:
@@ -455,11 +660,15 @@ def main():
         paging()
         entity_edge(jid)
         effectivity(jid)
+        regulatory_feed(jid)
     outbox_requeue()
     rls_runtime_role()
 
     failed = [r for r in results if r[1] == "FAIL"]
-    print(f"\n== {len(results) - len(failed)} passed, {len(failed)} failed, {len(results)} checks")
+    skipped = [r for r in results if r[1] == "SKIP"]
+    print(f"\n== {len(results) - len(failed) - len(skipped)} passed, {len(failed)} failed, {len(skipped)} skipped, {len(results)} checks")
+    for name, _, detail in skipped:
+        print(f"   SKIP {name}  {detail}")
     for name, _, detail in failed:
         print(f"   FAIL {name}  {detail}")
     return len(failed)

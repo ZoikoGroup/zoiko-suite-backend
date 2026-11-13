@@ -3,8 +3,9 @@
 **Date:** 2026-11-13
 **Scope:** the backend of Jurisdictions & Rules. The console page (`/admin/jurisdictions`, JR-FE-1…3)
 is not built yet; its summary route is.
-**Result:** every suite green, with 0 skips. The live dependency e2e passed 59 of 59 checks and the
-live audit passed 24 of 24, both on the local compose stack.
+**Result:** every suite green, with 0 skips. The live dependency e2e passed 82 of 82 checks, with
+workflow-svc and the regulatory feed consumer in the stack, and the live audit passed 24 of 24, both on
+the local compose stack.
 
 This certificate records what was verified, against what, and what was not. Tracker status for every
 row stays 🔵 (built, verified by its implementer) until an independent audit sets ✅.
@@ -112,7 +113,7 @@ list is in `progress.md` §4.
 
 ### Live, against the running stack
 
-`deployments/scripts/e2e-jurisdiction-rules-deps.py` passed 59 of 59 checks. The stack was the
+`deployments/scripts/e2e-jurisdiction-rules-deps.py` passed 82 of 82 checks. The stack was the
 smallest one that covers every dependency edge:
 
 - postgres, kafka, redis;
@@ -121,7 +122,16 @@ smallest one that covers every dependency edge:
 - access-control;
 - authorization;
 - tenant-entity-registry;
-- this service.
+- workflow-svc, started with `--no-deps`: document-vault-svc, a teammate's service, is a compose
+  dependency only and is not needed for approvals;
+- this service, with the dev signing key and the feed consumer on
+  (`JURISDICTION_REGULATORY_FEED_TOPIC=zoiko.regulatory.feed.e2e`).
+
+governance-decision-log-svc was started after the run, so workflow-svc's ledger relay delivered the 15
+approval decisions the run made. Its outbox ended at 0.
+
+With workflow-svc stopped, `--no-workflow` passed 59 checks with 2 skipped (the workflow and feed
+sections), and activation failed closed with 503.
 
 | Edge | What was proven |
 |---|---|
@@ -129,9 +139,10 @@ smallest one that covers every dependency edge:
 | identity-context | The admin and the approver each receive a signed envelope. J-01: an admin write with headers only answers 401, and so does one with a forged `X-Identity-Basis`. Reads without an envelope are admitted and marked `missing`. |
 | authorization / access-control | A principal without grants is refused with 403. The granted admin is served. The nine 000052 templates are published. |
 | kafka | `jurisdiction.created` is committed with its write. The relay publishes it to `zoiko.jurisdiction.events`, and the envelope carries `payload_hash` and `aggregate_version` (J-11, J-12, J-15). |
-| workflow-svc | Not running. Activation fails closed with 503, and the rule stays DRAFT (J-02). |
+| workflow-svc (J-02) | An activation is refused with 403 `approval_not_valid`, giving the reason, when it cites any of these: <ul><li>an unknown id;</li><li>a PENDING workflow of the rule;</li><li>a REJECTED workflow of the rule;</li><li>an APPROVED workflow of another rule.</li></ul>After each refusal the rule stays DRAFT. An activation citing an APPROVED workflow of the rule, decided by the approver, answers 200 ACTIVE. The open status-history row holds the workflow id and the activator, and `jurisdiction.rule.activated` is recorded. With workflow-svc down, activation fails closed with 503. |
+| regulatory feed (JR-6) | A `regulatory.source.changed` event published to the feed topic moves the ACTIVE rule that cites the reference to `UNDER_REVIEW`. The rule's status and payload do not change. A drift event recorded by `jurisdiction-rules-svc:regulatory-feed` quotes the authority and the event id, and `legal.drift.detected` is recorded. A person then sets the drift back to CURRENT; the same event redelivered changes nothing. The e2e publishes the event itself, because its producer does not exist yet. |
 | tenant-entity-registry | An entity is created whose primary jurisdiction is checked live against this service. The consumer projects it, and another tenant cannot see it. After its mapping is deleted, the J-10 backfill restores it, and a rerun changes nothing. |
-| this service | The following were exercised: <ul><li>source review by a second principal;</li><li>a stale If-Match answering 412, then the ETag moving to 2;</li><li>an interpretation approved by its approver;</li><li>a rule with provenance;</li><li>a pack version, submitted for review;</li><li>an async compile that succeeded, which another tenant reads as 404;</li><li>signing and verifying the pack;</li><li>cursor paging, where another tenant's cursor answers 400;</li><li>a parked event requeued and then published, with its requeue evidence append-only;</li><li>`regulatory-rule.effective` announced when the rule's start date passed.</li></ul> |
+| this service | The following were exercised: <ul><li>source review by a second principal;</li><li>a stale If-Match answering 412, then the ETag moving to 2;</li><li>an interpretation approved by its approver;</li><li>a rule with provenance;</li><li>a pack version, submitted for review;</li><li>an async compile that succeeded, which another tenant reads as 404;</li><li>signing and verifying the pack;</li><li>cursor paging, where another tenant's cursor answers 400;</li><li>a parked event requeued and then published, with its requeue evidence append-only;</li><li>`regulatory-rule.effective` announced when the start date passed, for a rule activated through workflow-svc.</li></ul> |
 
 `scripts/audit.sh` was run live with `SKIP_SUITES=1`, because the suites had already run above. It
 passed 24 of 24 checks: database, live routes, negative paths, telemetry, and an outbox that drains.
@@ -147,13 +158,9 @@ Two guards were broken on purpose. A test failed for each, and both guards were 
 
 ## Not verified live (read this)
 
-- **workflow-svc approval outcomes.** Starting workflow-svc pulls in four more services, so the e2e saw
-  only the fail-closed 503. The invalid-approval case (403) and the valid-approval case (200) are
-  covered by `internal/handler/approval_test.go`.
-- **The rule effectivity check.** For the same reason, the e2e activates its future-dated rule with a
-  database fixture, not through the API.
-- **The regulatory feed consumer (JR-6).** It is built and tested, but it stays off
-  (`KAFKA_REGULATORY_FEED_TOPIC` is unset), because nothing publishes `regulatory.source.changed` yet.
+- **The real producer of the regulatory feed.** The consumer is proven live against Kafka with an
+  event the e2e publishes. external-data-feed-svc does not publish `regulatory.source.changed`, so
+  compose leaves the consumer off by default (`JURISDICTION_REGULATORY_FEED_TOPIC` empty).
 - **Entity creation for the e2e.** The demo admin needs `ENTITY_CREATE` in tenant-entity-registry. The
   e2e adds that as a development-only grant, the same way the other e2e scripts do.
 

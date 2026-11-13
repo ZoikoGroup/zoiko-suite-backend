@@ -1037,8 +1037,11 @@ services:
       # API-4: a fixed development key, so cursors survive a restart. Production
       # sets its own (required outside local/dev).
       CURSOR_SIGNING_KEY_HEX: "${JURISDICTION_CURSOR_SIGNING_KEY_HEX:-6a7572697364696374696f6e2d72756c65732d6465762d637572736f722d6b6579}"
-      # JR-6: the regulatory feed consumer stays off until external-data-feed-svc
-      # publishes regulatory.source.changed; set KAFKA_REGULATORY_FEED_TOPIC then.
+      # JR-6: the regulatory feed consumer stays off (empty topic) until
+      # external-data-feed-svc publishes regulatory.source.changed. The e2e
+      # switches it on with JURISDICTION_REGULATORY_FEED_TOPIC and publishes a
+      # synthetic event itself.
+      KAFKA_REGULATORY_FEED_TOPIC: "${JURISDICTION_REGULATORY_FEED_TOPIC:-}"
       # Pack signing on the dev stack: the e2e (--prepare-signing-key) writes a
       # throwaway key to ./jurisdiction/dev-keys (gitignored) and starts the
       # service with these two set. Production key custody waits on SEC-1.

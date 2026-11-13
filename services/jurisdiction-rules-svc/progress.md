@@ -43,10 +43,10 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 |---|---|---|---|
 | F02 | Rules of a jurisdiction (as of, known_at) · get rule (ETag) · status history | `GET …/{id}/rules`, `GET /v1/rules/{id}`, `GET …/status-history` | 🔵 (ETag on the rule read) |
 | F02 | Create rule (DRAFT) · transition (creator ≠ activator) | `POST /v1/admin/jurisdictions/{id}/rules`, `POST /v1/admin/rules/{id}/transition` | 🔵 (author refused before workflow-svc is asked; e2e 403) |
-| F06 | Activation approval confirmed with workflow-svc (J-02) | `X-Approval-Reference` → `internal/approval` | 🔵 |
+| F06 | Activation approval confirmed with workflow-svc (J-02) | `X-Approval-Reference` → `internal/approval` | 🔵 (e2e live: unknown, PENDING, REJECTED, other rule's approval → 403; APPROVED → 200 ACTIVE) |
 | F03 | Runtime rule pack with `pack_digest` | `GET …/{id}/rule-pack` | 🔵 |
 | F04 | Manual legal drift · drift history | `POST /v1/admin/rules/{id}/drift`, `GET …/drift-events`, `legal.drift.detected` | 🔵 |
-| F05 | Automatic drift from a regulatory feed (J-03/J-04) | consumer of a regulatory source-change event (`internal/consumer/feed.go`) | 🔵 consumer (off until configured) · ⛔ producer (external-data-feed-svc) |
+| F05 | Automatic drift from a regulatory feed (J-03/J-04) | consumer of a regulatory source-change event (`internal/consumer/feed.go`) | 🔵 consumer (off by default; e2e live with a synthetic event) · ⛔ producer (external-data-feed-svc) |
 | F12 | Validate action (J-06) | `POST /v1/validate-action` | 🔵 |
 
 ### 2.3 Entity applicability (Doc 03 §8.2 "entity-jurisdiction applicability mappings")
@@ -124,7 +124,7 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 | R10 | Negative paths named after their spec id | 🔵 (see §4; 17 🧭, 29 🟡) |
 | JR-FE-1 | Console summary route `GET /v1/jurisdiction-summary` | 🔵 |
 | S2 | asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, scripts/audit.sh, Postman | 🔵 (all present; Postman folders 04–07) |
-| S4 | `deployments/scripts/e2e-jurisdiction-rules-deps.py` | 🔵 (59/59 on 13 Nov) |
+| S4 | `deployments/scripts/e2e-jurisdiction-rules-deps.py` | 🔵 (82/82 on 13 Nov with workflow-svc and the feed consumer; 59 + 2 SKIP with `--no-workflow`) |
 
 ### 2.9 Decisions and blocked items (not buildable here)
 
@@ -258,7 +258,8 @@ case sends a real body and asserts status, `application/problem+json` and the pr
 | store (`jur_store_it`) | 92 | 0 | 0 |
 | registryit (`jur_reg_it`, async operations through the `jur_rls_probe` role) | 143 | 0 | 0 |
 | openapi / asyncapi contract tests | ✔ | — | — |
-| live e2e `deployments/scripts/e2e-jurisdiction-rules-deps.py` | 59 | 0 | — |
+| live e2e `deployments/scripts/e2e-jurisdiction-rules-deps.py` (with workflow-svc and the feed consumer, step 17) | 82 | 0 | 0 |
+| live e2e `--no-workflow` (workflow-svc stopped: fail-closed 503) | 59 | 0 | 2 (the workflow and feed sections) |
 | live `scripts/audit.sh` (`SKIP_SUITES=1`, the suites ran above) | 24 | 0 | — |
 
 ## 6. Evidence log
@@ -282,7 +283,18 @@ case sends a real body and asserts status, `application/problem+json` and the pr
 | 14 S2 | openapi 1.2.0, asyncapi, RUNBOOK, deviations, audit.sh, Postman | 0a9a8fbf | `TestOpenAPI*`, `TestAsyncAPI*` |
 | 15 S3/S4 | live run found four defects, each fixed with a test that fails on the old code: relay set the topic twice so nothing was ever published (pre-existing); async operations written without their tenant; 000005 never applied on old-lineage databases (000037); the author's own activation answered 503 when workflow-svc was down | c7ab467e, 1ba898ff, c66d811e, 75769129 | e2e 59/59; audit 24/24; 4 events parked by the relay bug requeued through J-16, outbox 0 pending / 0 parked |
 | 16 S6 | mutation check | — | J-01 gate accepting any basis → `TestJ01_AdminWritesNeedAVerifiedIdentity` fails (`204, want 401`); If-Match comparison disabled → `TestAPI3_SourceCommandsCheckIfMatch` fails (`expected 412, actual 200`). Both restored. |
+| 17 S4 | live: workflow-svc approval outcomes (J-02), effectivity through the API, the regulatory feed consumer (JR-6); compose passes `KAFKA_REGULATORY_FEED_TOPIC` from `JURISDICTION_REGULATORY_FEED_TOPIC` (empty = off) | — | e2e 82/82, audit 24/24; no defect found. Stack: postgres, kafka, redis, mtls-management, identity-context, tenant-entity-registry, access-control, authorization, workflow-svc (`--no-deps`, no document-vault), this service; governance-decision-log started afterwards so workflow-svc's 15 ledger records delivered (outbox 0) |
 
-Not exercised live: workflow-svc (J-02) is not in the minimal stack, so the e2e sees the fail-closed 503;
-the approval paths (invalid → 403, valid → 200) are covered by `internal/handler/approval_test.go`. The
-effectivity e2e activates its rule with a database fixture for the same reason.
+Step 17 replaced what steps 15–16 could not run live:
+- J-02: an activation citing an unknown id, a PENDING or a REJECTED workflow of the rule, or an APPROVED
+  workflow of another rule answers 403 `approval_not_valid` with the reason, and the rule stays DRAFT. One
+  citing an APPROVED workflow of the rule, decided by the approver, answers 200 ACTIVE; the open
+  status-history row holds the workflow id and the activator, and `jurisdiction.rule.activated` is recorded.
+- The effectivity rule is activated through workflow-svc, not a database fixture (the fixture stays for
+  `--no-workflow`).
+- JR-6: with the consumer on, a `regulatory.source.changed` event published to the feed topic moves the
+  ACTIVE rule citing the reference to `UNDER_REVIEW` (status and payload unchanged), records a drift event
+  by `jurisdiction-rules-svc:regulatory-feed` quoting the authority and event id, and `legal.drift.detected`.
+  After a person sets the drift back to CURRENT, the same event redelivered changes nothing
+  (`consumed_events`). The event is synthetic: its real producer, external-data-feed-svc, does not publish
+  it yet (F05 ⛔).

@@ -26,7 +26,7 @@ configured. Contracts: `openapi.yaml`, `asyncapi.yaml`. Deviations: `SPEC_DEVIAT
 | `IDENTITY_VERIFY_ADMIN` | `require` outside local/dev | J-01: writes under `/v1/admin/` and `/v1/operations/` need a verified envelope or mTLS peer; `off` is refused outside local/dev |
 | `CURSOR_SIGNING_KEY_HEX` | random per process in local/dev | API-4 cursor key, at least 32 bytes; **required outside local/dev** (and the same on every replica) |
 | `TENANT_REGISTRY_URL` | unset | enables `POST /v1/admin/entity-applicability:backfill` (J-10) |
-| `KAFKA_REGULATORY_FEED_TOPIC` | unset | enables the regulatory feed consumer (JR-6). Leave unset until external-data-feed-svc publishes `regulatory.source.changed` |
+| `KAFKA_REGULATORY_FEED_TOPIC` | unset | enables the regulatory feed consumer (JR-6); compose passes it from `JURISDICTION_REGULATORY_FEED_TOPIC`. Leave unset until external-data-feed-svc publishes `regulatory.source.changed` (the e2e sets it and publishes a synthetic event) |
 | `RULE_EFFECTIVITY_INTERVAL_SECONDS` | 60 | how often rules crossing their effective start/end are announced (5–3600) |
 | `RESOLVER_ENABLED`, `RESOLVER_RING`, `RESOLVER_REGION` | compose: enabled | the runtime resolver; production and staging must name ring and region |
 | `PACK_SIGNING_KEY_REF`, `PACK_SIGNING_KEY_FILE` | unset | pack signing; without them `…/sign` answers 503. Production key custody waits on SEC-1 (⛔) |

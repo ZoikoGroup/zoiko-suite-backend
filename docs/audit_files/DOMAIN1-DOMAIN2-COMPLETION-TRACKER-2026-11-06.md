@@ -78,7 +78,7 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D1-11 | siem-integration-svc :8141 | 🟡 | 11 | 0 | 0 | 2 | 0 | 8 | 1 | 0 | ✔ · ✔ · ✔ 1 pkg | none (phase6 compose only) | shared, dead-wired · 3/5 | SG-0 |
 | D1-12 | carta-svc :8142 | 🟡 | 8 | 0 | 2 | 1 | 0 | 4 | 1 | 0 | ✔ · ✔ · ✔ 2 pkgs | none (phase6 compose only) | shared, dead-wired · 2/3 | CA-0 |
 | D1-13 | key-management-svc :8143 | 🟡 | 11 | 0 | 1 | 0 | 0 | 9 | 1 | 0 | ✔ · ✔ · ✔ 3 pkgs | none (phase6 compose only) | shared, dead-wired · 5/5 | KM-0 |
-| D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 0 | 2 | 0 | 24 | 1 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs | S0–S4, S6 by the implementer (13 Nov); S5 open | legacy · 12/148 | JR-FE-1 |
+| D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 0 | 2 | 1 | 24 | 0 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs | S0–S4, S6 by the implementer (13 Nov); S5 built, not rendered live | v2.0 (FE `e3de6c6`) | JR-FE-3 |
 | D2-2 | governance-decision-log-svc :8083 | ✅ | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 9 pkgs (+ store IT) | S0–S6 verified 11 Nov (9 rows with independence waived by the user); 🏁 after the commit (verifier step 1) | v2.0 · 14/14 | Commit (R3) |
 | D2-3 | policy-svc :8085 | 🟡 | 14 | 0 | 7 | 2 | 1 | 3 | 0 | 1 | ✔ · ✔ · ✔ 12 pkgs | none | legacy · 7/39 | POL-0 |
 | D2-4 | obligations-svc :8088 | 🟡 | 14 | 0 | 4 | 5 | 2 | 3 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | none | legacy · 7/24 | OB-0 |
@@ -88,7 +88,7 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D2-8 | schema-registry-svc :8093 | 🟡 | 10 | 0 | 2 | 1 | 0 | 6 | 0 | 1 | ✔ · ✔ · ✔ 5 pkgs | none (no `progress.md`) | legacy · 5/5 | SR-0 |
 | D2-9 | retention-registry-svc :8148 | 🟡 | 11 | 0 | 4 | 1 | 1 | 4 | 0 | 1 | ✔ · ✔ · ✔ 4 pkgs | none (no openapi, no `progress.md`) | legacy · 7/7 | RR-0 |
 | D2-10 | libraries + GTRM compiler | 🟡 | 10 | 0 | 2 | 2 | 2 | 3 | 0 | 1 | ✔ · ✔ · ✔ 23 pkgs (gtrm root: stray `go.mod`) | none | — (no UI) | LIB-1 |
-| | **Total (23 sections, 26 units)** | | **392** | **0** | **151** | **79** | **36** | **99** | **12** | **15** | **26 / 26 modules green** | 0 🏁 (2 awaiting reconfirmation) | **4 v2.0 · 289/797** | |
+| | **Total (23 sections, 26 units)** | | **392** | **0** | **151** | **80** | **36** | **98** | **12** | **15** | **26 / 26 modules green** | 0 🏁 (2 awaiting reconfirmation) | **4 v2.0 · 289/797** | |
 
 "Unit" means `go test -count=1 ./...` without the `integration` tag. Store integration suites need a scratch Postgres and were not re-run on 6 Nov; each service's S0 task runs them.
 
@@ -783,8 +783,8 @@ These services answer "is this allowed, under which rules, who must approve, and
 | Spec | Doc 03 §8.2; ZS-JUR-001; ZS-SVC-V-001 PDC-02; REF-01, REF-10; Jurisdiction Pack Standard (`docs/architecture/jurisdiction-pack-wave*.md`) |
 | Latest score | 73 met / 4 partial / 2 failed of 79 (92.4%, 94.9% weighted), 19 Oct |
 | New since the audit | ZS-JUR-001 gap closing and jurisdiction-pack waves (30–31 Oct), REF-01 waves 1–3 (`a2d65f51`, `74db6105`, `645b1f35`), REF-3 waves 1–2 (`1302a620`, `dd86aade`), all by 07Yashjais. Not audited |
-| Stages | S0–S4 and S6 done by the implementer on 13 Nov (`progress.md`, `RELEASE_CERTIFICATE.md`; e2e 59/59, audit 24/24); S5 console not started; VC-1 open on every row |
-| Console | `/admin/jurisdictions` legacy |
+| Stages | S0–S4 and S6 done by the implementer on 13 Nov (`progress.md`, `RELEASE_CERTIFICATE.md`; e2e 82/82 with workflow-svc and the feed consumer, audit 24/24); S5 console not started; VC-1 open on every row |
+| Console | `/admin/jurisdictions` v2.0 (FE `e3de6c6`, 13 Nov); not yet rendered against the live stack, UI e2e open |
 
 **Features**
 
@@ -794,8 +794,8 @@ These services answer "is this allowed, under which rules, who must approve, and
 | D2-1.F02 | Effective-dated rules: `GET /v1/jurisdictions/{id}/rules`, `GET /v1/rules/{id}`, `GET …/status-history`, `POST /v1/admin/jurisdictions/{id}/rules`, `POST /v1/admin/rules/{id}/transition` (creator ≠ activator) | 🔵 | Rebuilt 13 Nov: unit of work, ETag/If-Match; the author's own activation is refused before workflow-svc is asked (`c66d811e`) (`services/jurisdiction-rules-svc/progress.md` §6) | VC-1 |
 | D2-1.F03 | Rule pack with `pack_digest`: `GET /v1/jurisdictions/{id}/rule-pack` | 🟡 | Reconfirm (was ✅): Governance audit (19 Oct); 13 Nov: suites green (unit 569, store 92, registryit 143) | VC-1 |
 | D2-1.F04 | Manual legal drift: `POST /v1/admin/rules/{id}/drift`, `GET /v1/rules/{id}/drift-events`, event `legal.drift.detected` | 🟡 | Reconfirm (was ✅): Governance audit (19 Oct); 13 Nov: suites green, drift writes in the request unit of work | VC-1 |
-| D2-1.F05 | Automatic drift from a regulatory feed (J-03, J-04) | ⛔ | Consumer built (`internal/consumer/feed.go`, `589729eb`, JR-6), off until configured; external-data-feed-svc publishes no regulatory-change event | Cross-team (producer) |
-| D2-1.F06 | Activation approval reference resolved against workflow-svc (J-02) | 🔵 | `internal/approval/client.go`, `WithApprovalVerifier` (`internal/handler/entity.go`); not audited; 13 Nov: author refused before the lookup (`c66d811e`); live e2e sees the fail-closed 503 (workflow-svc not in the stack) | VC-1 |
+| D2-1.F05 | Automatic drift from a regulatory feed (J-03, J-04) | ⛔ | Consumer built (`internal/consumer/feed.go`, `589729eb`, JR-6). 13 Nov: proven live with a synthetic `regulatory.source.changed` (e2e: ACTIVE rule → UNDER_REVIEW, drift event by the feed, `legal.drift.detected`, redelivery no-op); compose `JURISDICTION_REGULATORY_FEED_TOPIC` (empty = off). external-data-feed-svc publishes no regulatory-change event | Cross-team (producer) |
+| D2-1.F06 | Activation approval reference resolved against workflow-svc (J-02) | 🔵 | `internal/approval/client.go`, `WithApprovalVerifier` (`internal/handler/entity.go`); 13 Nov: author refused before the lookup (`c66d811e`); live e2e with workflow-svc: unknown / PENDING / REJECTED / other rule's APPROVED → 403 `approval_not_valid`, APPROVED → 200 ACTIVE with the reference on the status history; workflow-svc down → 503 (`--no-workflow`) | VC-1 |
 | D2-1.F07 | REF-01 registry commands: versioned jurisdictions `GET …/{id}/as-of`, `…/hierarchy`, aliases `GET/POST …/{id}/aliases`, `POST …/aliases/{id}/end`, `GET /v1/jurisdiction-code-mappings`, `GET /v1/jurisdiction-resolutions`, maker-checker imports `GET/POST /v1/admin/jurisdiction-imports`, `GET …/{batch}`, `POST …/approve`, `…/reject`, hierarchy change events | 🔵 | REF-01 waves 1–3; registered actions 000037, 000038; JR-1 pass 13 Nov: request unit of work, If-Match, paging, negative paths named (`services/jurisdiction-rules-svc/progress.md` §6) | VC-1 |
 | D2-1.F08 | REF-10 business calendars: `GET /v1/calendars`, `GET …/{code}`, `…/versions`, `…/versions/{v}`, `…/is-business-day`, `…/add-business-days`; `POST /v1/admin/calendars`, `…/{code}/versions`, `…/versions/{v}/publish`, `PUT …/sources`, `POST …/{code}/imports` (holiday import, observed holidays) | 🔵 | REF-3 wave 1 (`1302a620`); JR-1 pass 13 Nov: request unit of work, If-Match, paging, negative paths named (`services/jurisdiction-rules-svc/progress.md` §6) | VC-1 |
 | D2-1.F09 | REF-10 payment terms: `GET /v1/payment-terms/{code}`, `…/versions`, `…/versions/{v}`, `…/due-date`, `…/explain-due-date`; `POST /v1/admin/payment-terms`, `…/{code}/versions`, `…/versions/{v}/approve|supersede|retire` | 🔵 | REF-3 wave 2 (`dd86aade`); registered actions 000041; JR-1 pass 13 Nov: request unit of work, If-Match, paging, negative paths named (`services/jurisdiction-rules-svc/progress.md` §6) | VC-1 |
@@ -818,7 +818,7 @@ These services answer "is this allowed, under which rules, who must approve, and
 | D2-1.F26 | Decisions: owner of entity applicability (C8, J-05), one precedence model (J-08), public reads / `rule_payload` content / event naming (J-09) | 🧭 | Governance audit register | Decision |
 | D2-1.F27 | Cursor paging (API-4) on the many list routes | 🔵 | `b7e8c903`: signed cursors bound to tenant, route and filters on every list route; e2e (`services/jurisdiction-rules-svc/progress.md` §6) | VC-1 |
 | D2-1.F28 | Contract parity: openapi has 148 paths; no route-parity test | 🔵 | `TestOpenAPIMatchesTheRouter` + `TestOpenAPIDocumentIsValid`; openapi 1.2.0; asyncapi; Postman folders 04–07 | VC-1 |
-| D2-1.F29 | Console v2.0 (Jurisdictions, Rules, Packs, Calendars, Payment terms, Imports, Rollouts, Remediation) | ❌ | Legacy page. Backend summary route `GET /v1/jurisdiction-summary` built (`03e739ae`) | JR-FE-1…3 (page waits for the reference) |
+| D2-1.F29 | Console v2.0 (Jurisdictions, Rules, Packs, Calendars, Payment terms, Imports, Rollouts, Remediation) | 🟡 | FE `e3de6c6` (13 Nov): page rebuilt on the user's reference — 5 KPIs from `GET /v1/jurisdiction-summary`, coverage / publication / review-queue panels, 11 register tabs with drawers and maker-checker commands; client split into `lib/api/jurisdictions/*`. tsc, eslint, vitest and `next build` pass. Not rendered against the live stack yet | Live render; JR-FE-3 UI e2e |
 
 **Tasks**
 
@@ -828,8 +828,8 @@ These services answer "is this allowed, under which rules, who must approve, and
 - [x] **JR-3 · Outbox hygiene:** J-11, J-12, J-15 (`FOR UPDATE SKIP LOCKED`, two-worker test), J-16 (parked-event replay command, with authorization and evidence).
 - [x] **JR-4 · J-01:** remove the published `8082:8082` port from compose; verify the envelope (`IDENTITY_VERIFY=require` once callers send it).
 - [x] **JR-5 · API-4 and contract parity:** cursor paging on lists; add a router ↔ openapi parity test (pattern: `evidence-requirements-svc/internal/handler/openapi_parity_test.go`); extend the Postman collection (E-4).
-- [ ] **JR-6 · Drift consumer (J-03, J-04)** once external-data-feed-svc publishes a regulatory-change event with `external_feed_reference`: move matching rules to `UNDER_REVIEW` and record drift. *13 Nov: consumer built (`589729eb`), off until the producer exists.*
-- [x] **JR-7 · Live** *(13 Nov: e2e 59/59, audit 24/24; four defects found and fixed, see `progress.md` §6)*: rebuild; `scripts/audit.sh`; new `deployments/scripts/e2e-jurisdiction-rules-deps.py` (tenant-registry consumer, workflow approval reference, authorization decisions, Kafka events, pack sign/verify round trip).
+- [ ] **JR-6 · Drift consumer (J-03, J-04)** once external-data-feed-svc publishes a regulatory-change event with `external_feed_reference`: move matching rules to `UNDER_REVIEW` and record drift. *13 Nov: consumer built (`589729eb`) and proven live with a synthetic event; off by default until the producer exists.*
+- [x] **JR-7 · Live** *(13 Nov: e2e 59/59, audit 24/24; four defects found and fixed, see `progress.md` §6. Step 17: e2e 82/82 with workflow-svc approval outcomes, effectivity through the API and the feed consumer live; no new defect)*: rebuild; `scripts/audit.sh`; new `deployments/scripts/e2e-jurisdiction-rules-deps.py` (tenant-registry consumer, workflow approval reference, authorization decisions, Kafka events, pack sign/verify round trip).
 
 **Console (frontend)** — `app/admin/jurisdictions` (legacy) · client `lib/api/jurisdictions.ts` calls 12 of 148 routes (Appendix B). Rebuild in v2.0 following "Frontend rules for every console" below. This is the largest console gap overall; split the drawer forms per tab file.
 
@@ -843,8 +843,8 @@ These services answer "is this allowed, under which rules, who must approve, and
 | Footer | Required controls: the creator never activates · imports and payment terms are maker-checker · only signed packs deploy · evidence and a reason on every change |
 
 **Tasks**
-- [ ] **JR-FE-1 · Summary route + API client** for every route in Appendix B D2-1. Split the client by area if it passes ~800 lines (`lib/api/jurisdictions/*.ts`).
-- [ ] **JR-FE-2 · Page v2.0.**
+- [ ] **JR-FE-1 · Summary route + API client** for every route in Appendix B D2-1. Split the client by area if it passes ~800 lines (`lib/api/jurisdictions/*.ts`). *13 Nov: built (FE `e3de6c6`); route coverage to be recounted against Appendix B.*
+- [ ] **JR-FE-2 · Page v2.0.** *13 Nov: built (FE `e3de6c6`), 11 tabs; live render pending.*
 - [ ] **JR-FE-3 · UI E2E** `tests/e2e/console/jurisdictions.spec.ts`. Cover:
   - a rule created by one user and activated by another;
   - an import approved by a second user;
