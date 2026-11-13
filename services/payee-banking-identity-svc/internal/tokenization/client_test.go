@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-var scope = Scope{TenantID: "tenant-a", PrincipalID: "alice", CorrelationID: "corr-1"}
+var scope = Scope{TenantID: "tenant-a", PrincipalID: "alice", LegalEntityID: "le-1", CorrelationID: "corr-1"}
 
 // server answers /v1/tokenize and /v1/detokenize with handler, recording the
 // last request's tenant header.
@@ -20,11 +20,17 @@ func server(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	return s
 }
 
-func TestClient_TokenizeSendsTheProposedContract(t *testing.T) {
+// envelopeHeaders are the ZS-ARCH-SVC-001 §4 headers key-management-svc's
+// write-strict envelope refuses a POST without.
+var envelopeHeaders = []string{"X-Tenant-Id", "X-Principal-Id", "X-Legal-Entity-Id", "X-Correlation-ID",
+	"X-Request-Id", "X-Source-Channel", "X-Purpose-Context", "Idempotency-Key"}
+
+func TestClient_TokenizeSendsTheContract(t *testing.T) {
 	var gotPath, gotTenant, gotPrincipal, gotCorr string
 	var gotBody tokenizeRequest
+	var got http.Header
 	s := server(t, func(w http.ResponseWriter, r *http.Request) {
-		gotPath, gotTenant = r.URL.Path, r.Header.Get("X-Tenant-Id")
+		gotPath, gotTenant, got = r.URL.Path, r.Header.Get("X-Tenant-Id"), r.Header.Clone()
 		gotPrincipal, gotCorr = r.Header.Get("X-Principal-Id"), r.Header.Get("X-Correlation-ID")
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		_ = json.NewEncoder(w).Encode(tokenizeResponse{Token: "tok_123"})
@@ -39,19 +45,37 @@ func TestClient_TokenizeSendsTheProposedContract(t *testing.T) {
 	if gotBody.Value != "GB29NWBK60161331926819" || gotBody.Classification != "S3_RESTRICTED" {
 		t.Fatalf("body: %+v", gotBody)
 	}
+	for _, h := range envelopeHeaders {
+		if got.Get(h) == "" {
+			t.Errorf("tokenize sent no %s; key-management-svc refuses the request without it", h)
+		}
+	}
+	if got.Get("X-Legal-Entity-Id") != "le-1" || got.Get("X-Source-Channel") != "system" ||
+		got.Get("X-Purpose-Context") != "bank_detail_tokenization" {
+		t.Fatalf("envelope: %v", got)
+	}
 }
 
-func TestClient_DetokenizeSendsTheProposedContract(t *testing.T) {
+func TestClient_DetokenizeSendsTheContract(t *testing.T) {
 	var gotPath string
 	var gotBody detokenizeRequest
+	var got http.Header
 	s := server(t, func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
+		gotPath, got = r.URL.Path, r.Header.Clone()
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		_ = json.NewEncoder(w).Encode(detokenizeResponse{Value: "raw-value"})
 	})
 	v, err := NewClient(s.URL).Detokenize(context.Background(), scope, "tok_123")
 	if err != nil || v != "raw-value" || gotPath != "/v1/detokenize" || gotBody.Token != "tok_123" {
 		t.Fatalf("Detokenize = %q, %v (path %s, body %+v)", v, err, gotPath, gotBody)
+	}
+	for _, h := range envelopeHeaders {
+		if got.Get(h) == "" {
+			t.Errorf("detokenize sent no %s; key-management-svc refuses the request without it", h)
+		}
+	}
+	if got.Get("X-Purpose-Context") != "bank_detail_detokenization" {
+		t.Fatalf("purpose: %q", got.Get("X-Purpose-Context"))
 	}
 }
 
@@ -101,6 +125,25 @@ func TestClient_DetokenizeDeniedIsDistinct(t *testing.T) {
 	}
 }
 
+// A caller-supplied idempotency key is sent as-is; without one, every call
+// gets its own.
+func TestClient_IdempotencyKey(t *testing.T) {
+	var keys []string
+	s := server(t, func(w http.ResponseWriter, r *http.Request) {
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		_ = json.NewEncoder(w).Encode(tokenizeResponse{Token: "tok_123"})
+	})
+	c := NewClient(s.URL)
+	keyed := scope
+	keyed.IdempotencyKey = "backfill:table:row-1"
+	_, _ = c.Tokenize(context.Background(), keyed, ClassificationRestricted, "v1")
+	_, _ = c.Tokenize(context.Background(), scope, ClassificationRestricted, "v1")
+	_, _ = c.Tokenize(context.Background(), scope, ClassificationRestricted, "v1")
+	if len(keys) != 3 || keys[0] != "backfill:table:row-1" || keys[1] == "" || keys[1] == keys[2] {
+		t.Fatalf("Idempotency-Key per call: %q", keys)
+	}
+}
+
 func TestClient_RefusesUnbindableRequestsWithoutCalling(t *testing.T) {
 	called := false
 	s := server(t, func(w http.ResponseWriter, _ *http.Request) { called = true })
@@ -108,8 +151,14 @@ func TestClient_RefusesUnbindableRequestsWithoutCalling(t *testing.T) {
 	if _, err := c.Tokenize(context.Background(), Scope{}, ClassificationRestricted, "v"); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("no tenant: %v", err)
 	}
-	if _, err := c.Detokenize(context.Background(), Scope{TenantID: "t"}, "tok"); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := c.Detokenize(context.Background(), Scope{TenantID: "t", LegalEntityID: "le"}, "tok"); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("no principal on detokenize: %v", err)
+	}
+	if _, err := c.Tokenize(context.Background(), Scope{TenantID: "t", LegalEntityID: "le"}, ClassificationRestricted, "v"); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("no principal on tokenize: %v", err)
+	}
+	if _, err := c.Tokenize(context.Background(), Scope{TenantID: "t", PrincipalID: "p"}, ClassificationRestricted, "v"); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("no legal entity on tokenize: %v", err)
 	}
 	if called {
 		t.Fatal("an unbindable request reached the service")
@@ -129,7 +178,7 @@ func TestFake_IsDeterministicTenantBoundAndCanFail(t *testing.T) {
 	if v, err := f.Detokenize(ctx, scope, t1); err != nil || v != "12345678" {
 		t.Fatalf("round trip = %q, %v", v, err)
 	}
-	other := Scope{TenantID: "tenant-b", PrincipalID: "bob"}
+	other := Scope{TenantID: "tenant-b", PrincipalID: "bob", LegalEntityID: "le-1"}
 	if _, err := f.Detokenize(ctx, other, t1); !errors.Is(err, ErrDetokenizationDenied) {
 		t.Fatalf("another tenant detokenizing (SEC-T29) = %v, want ErrDetokenizationDenied", err)
 	}

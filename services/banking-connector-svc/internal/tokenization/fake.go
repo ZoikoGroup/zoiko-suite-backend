@@ -48,7 +48,7 @@ func (f *Fake) Tokenize(_ context.Context, scope Scope, classification, value st
 	if err := f.record(); err != nil {
 		return "", err
 	}
-	if scope.TenantID == "" || value == "" || classification == "" {
+	if !scope.bindable() || value == "" || classification == "" {
 		return "", ErrInvalidRequest
 	}
 	return fakePrefix + base64.RawURLEncoding.EncodeToString([]byte(scope.TenantID+"\x00"+value)), nil
@@ -58,7 +58,7 @@ func (f *Fake) Detokenize(_ context.Context, scope Scope, token string) (string,
 	if err := f.record(); err != nil {
 		return "", err
 	}
-	if scope.TenantID == "" || scope.PrincipalID == "" || token == "" {
+	if !scope.bindable() || token == "" {
 		return "", ErrInvalidRequest
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(token, fakePrefix))

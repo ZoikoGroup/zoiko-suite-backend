@@ -154,6 +154,16 @@ const destColumns = `
 	approved_by_principal_id, approved_at, superseded_by_destination_id, suspend_reason,
 	proposed_by_principal_id, created_at, updated_at`
 
+// destReadColumns is every destination READ's projection: destColumns plus
+// the destination's account-identifier token (migration 000007), or '' when
+// it has none — the read-precedence rule's input (domain.PayeeDestination.
+// Tokenized). destColumns alone stays the INSERT column list. The token is a
+// correlated subquery on the unaliased table name, so it works in SELECT ...
+// FROM payee_destinations and in INSERT/UPDATE ... RETURNING alike.
+const destReadColumns = destColumns + `,
+	COALESCE((SELECT t.account_identifier_token FROM payee_destination_identifier_tokens t
+		WHERE t.destination_id = payee_destinations.destination_id), '')`
+
 func scanDestination(row pgx.Row) (*domain.PayeeDestination, error) {
 	d := &domain.PayeeDestination{}
 	var supersededBy *string
@@ -161,7 +171,7 @@ func scanDestination(row pgx.Row) (*domain.PayeeDestination, error) {
 		&d.AccountIdentifier, &d.AccountLast4, &d.CountryCode, &d.Currency, &d.PayeeName, &d.SourceType, &d.Fingerprint, &d.Status,
 		&d.VerificationMethod, &d.VerificationEvidenceRef, &d.VerifiedByPrincipalID, &d.VerifiedAt,
 		&d.ApprovedByPrincipalID, &d.ApprovedAt, &supersededBy, &d.SuspendReason,
-		&d.ProposedByPrincipalID, &d.CreatedAt, &d.UpdatedAt)
+		&d.ProposedByPrincipalID, &d.CreatedAt, &d.UpdatedAt, &d.AccountIdentifierToken)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +232,7 @@ func (s *PgStore) recordCommandClaim(ctx context.Context, tx pgx.Tx, tenantID, i
 // failing the old state guard.
 func (s *PgStore) lockDestination(ctx context.Context, tx pgx.Tx, destinationID string) (*domain.PayeeDestination, error) {
 	d, err := scanDestination(tx.QueryRow(ctx,
-		`SELECT `+destColumns+` FROM payee_destinations WHERE destination_id = $1 FOR UPDATE`, destinationID))
+		`SELECT `+destReadColumns+` FROM payee_destinations WHERE destination_id = $1 FOR UPDATE`, destinationID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrInvalidTransition
 	}
@@ -230,19 +240,24 @@ func (s *PgStore) lockDestination(ctx context.Context, tx pgx.Tx, destinationID 
 }
 
 // proposalMatches reports whether a replayed proposal is the same request as
-// the stored destination. With tokenization enforced the stored
+// the stored destination. For a TOKENIZED destination the stored
 // AccountIdentifier is a token, never equal to the request's raw value, so
 // the account is compared through the fingerprint instead — computed from the
 // raw identifier at write time either way (domain.Fingerprint covers the
-// institution, the account and the currency, all of which are compared).
-// Without tokenization the comparison is exactly what it always was.
-func proposalMatches(d *domain.PayeeDestination, req domain.ProposeDestinationRequest, tokenized bool) bool {
+// institution, the account and the currency, all of which are compared). For
+// a legacy raw row the comparison is exactly what it always was.
+//
+// Whether the row is tokenized is the row's own fact (its token row), not
+// the current TOKENIZATION_ENFORCED setting: a destination tokenized while
+// enforcement was on stays tokenized after it is turned off, and a legacy row
+// stays raw after it is turned on.
+func proposalMatches(d *domain.PayeeDestination, req domain.ProposeDestinationRequest) bool {
 	scope := req.Scope
 	if scope == "" {
 		scope = "DEFAULT"
 	}
 	sameAccount := d.AccountIdentifier == req.AccountIdentifier
-	if tokenized {
+	if d.Tokenized() {
 		sameAccount = d.Fingerprint == domain.Fingerprint(req.FinancialInstitution, req.AccountIdentifier, req.Currency)
 	}
 	return d.LegalEntityID == req.LegalEntityID &&
@@ -277,11 +292,11 @@ func (s *PgStore) tryReplayProposal(ctx context.Context, tenantID, idempotencyKe
 			return domain.ErrIdempotencyKeyConflict
 		}
 		existing, err := scanDestination(tx.QueryRow(ctx,
-			`SELECT `+destColumns+` FROM payee_destinations WHERE destination_id = $1`, claimedDest))
+			`SELECT `+destReadColumns+` FROM payee_destinations WHERE destination_id = $1`, claimedDest))
 		if err != nil {
 			return err
 		}
-		if !proposalMatches(existing, req, s.tokenizationEnforced) {
+		if !proposalMatches(existing, req) {
 			return domain.ErrIdempotencyKeyConflict
 		}
 		out = existing
@@ -317,7 +332,7 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 	// TOKENIZATION_ENFORCED is on (refusing the whole write if tokenization
 	// fails), the raw identifier otherwise — exactly as before.
 	storedIdentifier, err := s.protectAccountIdentifier(ctx,
-		tokenization.Scope{TenantID: tenantID, PrincipalID: principalID, CorrelationID: correlationID}, req.AccountIdentifier)
+		tokenization.Scope{TenantID: tenantID, PrincipalID: principalID, LegalEntityID: req.LegalEntityID, CorrelationID: correlationID}, req.AccountIdentifier)
 	if err != nil {
 		return nil, false, err
 	}
@@ -337,11 +352,11 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 				return domain.ErrIdempotencyKeyConflict
 			}
 			existing, err := scanDestination(tx.QueryRow(ctx,
-				`SELECT `+destColumns+` FROM payee_destinations WHERE destination_id = $1`, claimedDest))
+				`SELECT `+destReadColumns+` FROM payee_destinations WHERE destination_id = $1`, claimedDest))
 			if err != nil {
 				return err
 			}
-			if !proposalMatches(existing, req, s.tokenizationEnforced) {
+			if !proposalMatches(existing, req) {
 				return domain.ErrIdempotencyKeyConflict
 			}
 			d, replay = existing, true
@@ -352,13 +367,22 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 			INSERT INTO payee_destinations (`+destColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'CANDIDATE',
 				'', '', '', NULL, '', NULL, NULL, '', $14, NOW(), NOW())
-			RETURNING `+destColumns,
+			RETURNING `+destReadColumns,
 			destinationID, nullableTenant(tenantID), req.LegalEntityID, req.PartyRef, scope, req.FinancialInstitution,
 			storedIdentifier, last4, req.CountryCode, req.Currency, req.PayeeName, req.SourceType, fingerprint,
 			principalID,
 		))
 		if err != nil {
 			return err
+		}
+		if s.tokenizationEnforced {
+			// The token row is what marks this destination tokenized for
+			// every later reader, so it commits with the destination or not
+			// at all.
+			d.AccountIdentifierToken = storedIdentifier
+			if err := insertIdentifierToken(ctx, tx, d.DestinationID, tenantID, storedIdentifier, "WRITE"); err != nil {
+				return err
+			}
 		}
 		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationProposed, "", principalID); err != nil {
 			return err
@@ -412,7 +436,7 @@ func (s *PgStore) FindDestination(ctx context.Context, destinationID string) (*d
 	var d *domain.PayeeDestination
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
-		d, err = scanDestination(tx.QueryRow(ctx, `SELECT `+destColumns+` FROM payee_destinations WHERE destination_id = $1`, destinationID))
+		d, err = scanDestination(tx.QueryRow(ctx, `SELECT `+destReadColumns+` FROM payee_destinations WHERE destination_id = $1`, destinationID))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
@@ -428,7 +452,7 @@ func (s *PgStore) FindDestination(ctx context.Context, destinationID string) (*d
 func (s *PgStore) ListVersions(ctx context.Context, partyRef string) ([]domain.PayeeDestination, error) {
 	var out []domain.PayeeDestination
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT `+destColumns+` FROM payee_destinations WHERE party_ref = $1 ORDER BY created_at ASC`, partyRef)
+		rows, err := tx.Query(ctx, `SELECT `+destReadColumns+` FROM payee_destinations WHERE party_ref = $1 ORDER BY created_at ASC`, partyRef)
 		if err != nil {
 			return err
 		}
@@ -453,7 +477,7 @@ func (s *PgStore) FindActiveDestination(ctx context.Context, partyRef, scope str
 	var d *domain.PayeeDestination
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
-		d, err = scanDestination(tx.QueryRow(ctx, `SELECT `+destColumns+` FROM payee_destinations WHERE party_ref = $1 AND scope = $2 AND status = 'ACTIVE'`, partyRef, scope))
+		d, err = scanDestination(tx.QueryRow(ctx, `SELECT `+destReadColumns+` FROM payee_destinations WHERE party_ref = $1 AND scope = $2 AND status = 'ACTIVE'`, partyRef, scope))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -493,7 +517,7 @@ func (s *PgStore) VerifyDestination(ctx context.Context, destinationID string, r
 			UPDATE payee_destinations SET status = 'VERIFIED', verification_method = $1, verification_evidence_ref = $2,
 				verified_by_principal_id = $3, verified_at = NOW(), updated_at = NOW()
 			WHERE destination_id = $4 AND status IN ('CANDIDATE', 'VERIFICATION_PENDING')
-			RETURNING `+destColumns,
+			RETURNING `+destReadColumns,
 			req.VerificationMethod, req.VerificationEvidenceRef, principalID, destinationID,
 		))
 		if err != nil {
@@ -546,7 +570,7 @@ func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, princip
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			UPDATE payee_destinations SET status = 'APPROVAL_PENDING', approved_by_principal_id = $1, approved_at = NOW(), updated_at = NOW()
 			WHERE destination_id = $2 AND status = 'VERIFIED'
-			RETURNING `+destColumns,
+			RETURNING `+destReadColumns,
 			principalID, destinationID,
 		))
 		if err != nil {
@@ -612,7 +636,7 @@ func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, princi
 
 		var oldActive *domain.PayeeDestination
 		oldActive, err = scanDestination(tx.QueryRow(ctx, `
-			SELECT `+destColumns+` FROM payee_destinations
+			SELECT `+destReadColumns+` FROM payee_destinations
 			WHERE party_ref = $1 AND scope = $2 AND status = 'ACTIVE'
 			FOR UPDATE`, current.PartyRef, current.Scope))
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -623,7 +647,7 @@ func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, princi
 				UPDATE payee_destinations
 				SET status = 'SUPERSEDED', superseded_by_destination_id = $1, updated_at = NOW()
 				WHERE destination_id = $2
-				RETURNING `+destColumns, destinationID, oldActive.DestinationID))
+				RETURNING `+destReadColumns, destinationID, oldActive.DestinationID))
 			if err != nil {
 				return err
 			}
@@ -644,7 +668,7 @@ func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, princi
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			UPDATE payee_destinations SET status = 'ACTIVE', updated_at = NOW()
 			WHERE destination_id = $1
-			RETURNING `+destColumns,
+			RETURNING `+destReadColumns,
 			destinationID,
 		))
 		if err != nil {
@@ -705,7 +729,7 @@ func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, 
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			UPDATE payee_destinations SET status = 'SUSPENDED', suspend_reason = $1, updated_at = NOW()
 			WHERE destination_id = $2 AND status = 'ACTIVE'
-			RETURNING `+destColumns,
+			RETURNING `+destReadColumns,
 			req.Reason, destinationID,
 		))
 		if err != nil {
@@ -764,7 +788,7 @@ func (s *PgStore) SupersedeDestination(ctx context.Context, destinationID string
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			UPDATE payee_destinations SET status = 'SUPERSEDED', updated_at = NOW()
 			WHERE destination_id = $1 AND status IN ('ACTIVE', 'APPROVAL_PENDING', 'VERIFIED')
-			RETURNING `+destColumns,
+			RETURNING `+destReadColumns,
 			destinationID,
 		))
 		if err != nil {

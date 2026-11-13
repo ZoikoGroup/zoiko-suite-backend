@@ -382,25 +382,32 @@ tenant scoping are closed in this pass.
   - *Off by default.* Unset or `false`, behaviour is unchanged and the
     tokenizer is never called. That is a regression test. The flag is parsed
     strictly: a typo refuses to start rather than reading as off.
-  - *PROPOSED contract, not verified with key-management-svc's owner.* That
-    service has no tokenize or detokenize endpoint today.
-    `internal/tokenization/client.go` is the one place to change.
+  - *Contract — proposed 2026-11-11, implemented by key-management-svc
+    2026-11-12.* `internal/tokenization/client.go` matches the server
+    (key-management-svc `internal/handler/tokenization.go`):
 
     ```
-    POST /v1/tokenize    headers X-Tenant-Id (required), X-Principal-Id, X-Correlation-ID
-                         {"value", "classification": "S3_RESTRICTED"} -> 200 {"token"}
-    POST /v1/detokenize  headers X-Tenant-Id (required), X-Principal-Id (required), X-Correlation-ID
-                         {"token"} -> 200 {"value"}; 403 = denied (SEC-T15 / SEC-T29)
+    POST /v1/tokenize    headers X-Tenant-Id, X-Principal-Id, X-Legal-Entity-Id (required), X-Correlation-ID
+                         + §4 envelope (X-Request-Id, X-Source-Channel, X-Purpose-Context, Idempotency-Key)
+                         {"value", "classification": "S3_RESTRICTED"} -> 200 {"token": "<uuid>"}
+    POST /v1/detokenize  headers as tokenize
+                         {"token"} -> 200 {"value"}; 403 = denied (SEC-T15 / SEC-T29; unknown token too)
     ```
 
-    The tenant and principal headers are added beyond a body-only contract
-    because SEC-T29 requires tenant binding and SEC-INV-15 requires
-    detokenization evidence.
+    Paths, bodies, the tenant/principal/correlation headers and the 403 are
+    as proposed. Changed on this side: the client now sends the full §4
+    envelope (without it key-management-svc's write-strict envelope refuses
+    the POST with 400), `Scope` carries the request's legal entity (the vault
+    authorizes `TOKEN_CREATE` at it and `TOKEN_DETOKENIZE` at the stored
+    one), and tokenize requires a principal.
   - *A migration state with an end.* `TOKENIZATION_ENFORCED` stays `false`
-    (compose) until key-management-svc implements the endpoints, the same
-    shape as authorization-svc's `ZS_ENVELOPE_ENFORCEMENT` rollout. Before
-    it is turned on:
-    1. The contract is confirmed, or this client is changed to match.
+    (compose). key-management-svc implementing the endpoints removes only
+    the first prerequisite. Same shape as authorization-svc's
+    `ZS_ENVELOPE_ENFORCEMENT` rollout. Before it is turned on:
+    1. Proposing principals hold `TOKEN_CREATE` in authorization-svc at
+       their legal entity, or every enforced proposal is refused (fail
+       closed); `TOKEN_DETOKENIZE` goes only to readers that need the raw
+       identifier (SEC-T15).
     2. The `PayeeMasterPrivilegedRead` path, which today returns the full
        identifier, is wired to detokenize under the separate elevated
        authorization SEC-T15 requires. As built, it would return the token.
@@ -418,6 +425,113 @@ tenant scoping are closed in this pass.
       unchanged and never calls the tokenizer.
     - Two deliberate breakages were each caught: a raw fallback, and raw
       replay matching.
+
+- **B12. Enforcement connected to real data (2026-11-13).** B11's
+  prerequisites, done. Enforcement is still **off by default**; it is now
+  safe to turn on.
+  - **Read precedence: a side table, not a shape.** Tokens live in
+    `payee_destination_identifier_tokens` (migration 000007), one row per
+    destination.
+    - **A row there means TOKENIZED.** `account_identifier` is never served
+      for that destination.
+    - **No row means a LEGACY raw value,** read exactly as before.
+    - The discriminator is the row's presence, never the stored string.
+    - It is not a column because 000002's trigger refuses **any** update to
+      a SUSPENDED or SUPERSEDED destination, whatever the column. A token
+      column could not be backfilled for terminal rows, which still hold raw
+      identifiers, without weakening that trigger. The side table needs
+      only INSERTs; 000002 is untouched and `account_identifier` is never
+      overwritten in place.
+    - The table is append-only (000002's own `reject_payee_event_mutation`)
+      and RLS-forced.
+    - `destReadColumns` reads it on every SELECT and RETURNING;
+      `domain.PayeeDestination.Tokenized()` is the rule in code.
+  - **Writes.** With `TOKENIZATION_ENFORCED=true`, the token row commits in
+    the proposal's own transaction. **Replay matching** now follows the
+    row's own tokenized state, not the current flag. Before, a destination
+    proposed with enforcement on was refused as a key conflict on an honest
+    retry made after enforcement was turned off.
+  - **Privileged reads.** Every path that reveals the identifier to a
+    `PAYEE_MASTER_PRIVILEGED_READ` holder now **detokenizes a tokenized
+    destination** under the reader's own principal. That covers by id,
+    versions, `/org10/parties/{party}/active`, and the verify and propose
+    responses. The vault's `TOKEN_DETOKENIZE` check, tenant binding and
+    audit therefore apply too, so the payee grant alone is not enough to see
+    a tokenized value.
+    - **On any detokenize failure the identifier is WITHHELD,** never failed
+      and never replaced by the token. It is blanked (exactly the
+      unprivileged view), and `X-Account-Identifier-Withheld` gives the
+      reason: `detokenize_denied`, `tokenization_unavailable` or
+      `tokenization_not_configured`. The rest of the destination is still
+      returned with 200.
+    - Why not fail the read: payment-authorization-svc reads destinations
+      through `/active` for its eligibility check and **never uses the
+      identifier** (its client decodes only id, legal entity, status and
+      the maker/verifier/approver). A 503 there would turn a vault outage
+      into blocked payments for no gain.
+    - `cmd/server` builds the client whenever `TOKENIZATION_SERVICE_URL` is
+      set, since tokenized rows stay tokenized after enforcement is off.
+  - **Backfill: `cmd/tokenize-backfill`.** It has the same guarantees as
+    banking-connector-svc's (its G6):
+    - round trip verified before any write;
+    - all or nothing;
+    - an RLS-bound role is refused;
+    - the Idempotency-Key is `row id + principal`;
+    - SUSPENDED and SUPERSEDED destinations are backfilled like any other.
+
+    One addition: a destination with **no tenant** (`tenant_id` NULL) stops
+    the run. A token cannot be bound to no tenant, and skipping it would
+    leave that row raw unnoticed.
+  - **Enabling it.**
+    - **Grants:** `seed-demo-rbac.ps1` gives `TOKEN_CREATE` and
+      `PAYEE_MASTER_ADMIN`/`APPROVE` to the demo principals.
+      `PAYEE_MASTER_PRIVILEGED_READ` and `TOKEN_DETOKENIZE` go only to the
+      BANK_DETAIL_READER role.
+    - **Locally:** `export TOKENIZATION_ENFORCED=true` before `docker
+      compose up`; the default stays `false`.
+    - **Compose fix:** `TOKENIZATION_SERVICE_URL` in `docker-compose.yml`
+      was `http://key-management-svc:8143`, which never resolved from the
+      main network (key-management-svc is in phase 6's compose project). It
+      is now `http://host.docker.internal:8143`.
+  - **Live run, 2026-11-13.** Native processes; real authorization-svc,
+    key-management-svc and this service; Postgres 16.
+    - **Legacy destination:** proposed raw by the pre-task binary, then
+      000007 applied and the backfill run.
+    - **Refusals first:** the RLS-bound role and the under-granted principal
+      were both refused, with nothing written.
+    - **Real backfill:** dry run, then the run, then a re-run (0
+      candidates).
+    - **New destination under enforcement:** the database holds the token,
+      no row holds the raw value, and the outbox event carries no raw value.
+    - **Payments path:** walked to ACTIVE (a different approver), then
+      `/org10/parties/{party}/active` gave the reader the exact identifier
+      and the demo principal a blank with `AccountLast4` only.
+    - **Backfilled destination:** read identically to the new one.
+  - **Still open.**
+    - `account_identifier` still holds the raw value for **backfilled**
+      rows. 000002 forbids changing it, and dropping it is a later decision.
+    - A refused backfill attempt leaves unreferenced tokens in the vault.
+  - **Verification.**
+    - **Tests:**
+      - `internal/store/backfill_integration_test.go` (`-tags
+        integration`): all legacy rows including a terminal one; a mismatch
+        writes nothing; no tenant stops the run; a failure or a dry run
+        writes nothing; the RLS role is refused; a replay still matches
+        after enforcement is turned off.
+      - `internal/handler/tokenized_read_test.go`: the reveal rules over a
+        stub store.
+      - `internal/handler/e2e_tokenized_integration_test.go`: the real
+        handler, PgStore and HTTP client against a vault-contract server.
+        It proposes, checks the database token, walks the destination to
+        ACTIVE, reads `/active` as reader, withheld and clerk, and checks
+        that a backfilled destination reads like a new one.
+    - **Deliberate breaks, each caught:**
+      - the token served on a failed detokenize;
+      - privileged readers never revealed;
+      - detokenizing under a service identity;
+      - replay keyed on raw only;
+      - the no-tenant check removed;
+      - the enforced propose skipping its token row.
 
 ## Verification performed
 

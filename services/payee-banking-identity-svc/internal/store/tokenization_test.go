@@ -71,10 +71,10 @@ func TestTokenization_EnforcedStoresTheTokenNotTheRawValue(t *testing.T) {
 	if fp != domain.Fingerprint("Token Bank", rawIdentifier, "GBP") || last4 != domain.Last4(rawIdentifier) {
 		t.Fatalf("fingerprint/last4 not derived from the raw identifier: %s / %s", fp, last4)
 	}
-	if v, err := fake.Detokenize(context.Background(), tokenization.Scope{TenantID: f.tenant, PrincipalID: "auditor"}, stored); err != nil || v != rawIdentifier {
+	if v, err := fake.Detokenize(context.Background(), tokenization.Scope{TenantID: f.tenant, PrincipalID: "auditor", LegalEntityID: "le-tok"}, stored); err != nil || v != rawIdentifier {
 		t.Fatalf("stored token detokenizes to %q, %v", v, err)
 	}
-	if _, err := fake.Detokenize(context.Background(), tokenization.Scope{TenantID: uuid.NewString(), PrincipalID: "auditor"}, stored); !errors.Is(err, tokenization.ErrDetokenizationDenied) {
+	if _, err := fake.Detokenize(context.Background(), tokenization.Scope{TenantID: uuid.NewString(), PrincipalID: "auditor", LegalEntityID: "le-tok"}, stored); !errors.Is(err, tokenization.ErrDetokenizationDenied) {
 		t.Fatalf("another tenant detokenized the stored token: %v", err)
 	}
 }

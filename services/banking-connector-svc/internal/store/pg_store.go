@@ -115,12 +115,21 @@ func (p *PgStore) CreateConnection(ctx context.Context, c *domain.BankConnection
 	// written, when TOKENIZATION_ENFORCED is on; otherwise it is unchanged.
 	// c carries the stored value from here on, so the event payload and the
 	// returned connection never hold a raw number the database does not.
-	stored, err := p.protectAccountNumber(ctx, tokenization.Scope{TenantID: tenantID, PrincipalID: actorID, CorrelationID: correlationID},
-		c.AccountNumber)
+	raw := c.AccountNumber
+	stored, err := p.protectAccountNumber(ctx, tokenization.Scope{TenantID: tenantID, PrincipalID: actorID, LegalEntityID: c.LegalEntityID, CorrelationID: correlationID},
+		raw)
 	if err != nil {
 		return err
 	}
-	c.AccountNumber = stored
+	tokenized := p.tokenizationEnforced
+	if tokenized {
+		// IBAN is the same number under another name (the handler fills it
+		// from the account number). Left raw, it went out in the
+		// connection.created event payload with only account_number
+		// tokenized.
+		c.AccountNumber, c.IBAN = stored, stored
+		c.AccountNumberToken, c.AccountNumberMasked = stored, domain.MaskAccountNumber(raw)
+	}
 
 	now := time.Now().UTC()
 	c.CreatedAt = now
@@ -134,6 +143,13 @@ func (p *PgStore) CreateConnection(ctx context.Context, c *domain.BankConnection
 	return p.withTenant(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, query, c.ConnectionID, c.TenantID, c.LegalEntityID, c.BankName, c.BIC, c.AccountNumber, c.Currency, c.Status, c.CreatedAt, c.UpdatedAt); err != nil {
 			return err
+		}
+		if tokenized {
+			// The token row is what marks this connection tokenized for every
+			// later reader, so it commits with the connection or not at all.
+			if err := insertAccountToken(ctx, tx, c, "WRITE"); err != nil {
+				return err
+			}
 		}
 		return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.bank-connection.created", "banking.connection.created",
 			"bank-connection", c.ConnectionID, c.TenantID, c.LegalEntityID, actorID, correlationID, c)

@@ -65,11 +65,17 @@ func main() {
 		logger.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
 
-	// Tokenization of account identifiers (TOKENIZATION_ENFORCED). While it
-	// is off no tokenizer is built and nothing calls key-management-svc.
+	// Tokenization of account identifiers. TOKENIZATION_ENFORCED decides only
+	// whether NEW destinations are tokenized. A privileged read of an
+	// existing tokenized destination needs the client regardless of that
+	// flag — a destination tokenized while enforcement was on stays
+	// tokenized after it is turned off — so the client is built whenever a
+	// service URL is configured. Building it makes no call.
 	var tokenizer tokenization.Tokenizer
-	if cfg.TokenizationEnforced {
+	if cfg.TokenizationServiceURL != "" {
 		tokenizer = tokenization.NewClient(cfg.TokenizationServiceURL)
+	}
+	if cfg.TokenizationEnforced {
 		logger.Info("account-identifier tokenization enforced", zap.String("tokenization_service_url", cfg.TokenizationServiceURL))
 	}
 	pgStore := store.NewPgStore(pool, logger, store.WithEventRegion(cfg.EventResidencyRegion),
@@ -105,7 +111,7 @@ func main() {
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	partyClient := counterparty.NewHTTPClient(cfg.CounterpartyServiceURL, logger)
 
-	h := handler.New(pgStore, authzClient, partyClient, logger)
+	h := handler.New(pgStore, authzClient, partyClient, logger).WithTokenizer(tokenizer)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
