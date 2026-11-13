@@ -28,9 +28,9 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 
 | ID | Operation | Route / consumer | Status |
 |---|---|---|---|
-| F01 | List / get (fail-closed) / ancestors | `GET /v1/jurisdictions`, `GET …/{id}`, `GET …/{id}/ancestors` | 🟡 reconfirm |
-| F01 | AddInternalJurisdiction | `POST /v1/admin/jurisdictions` (Idempotency-Key, event `jurisdiction.created`) | 🟡 reconfirm |
-| F01 | RetireJurisdiction | `POST /v1/admin/jurisdictions/{id}/deactivate` (If-Match, reason + evidence, `jurisdiction.deactivated`) | 🟡 reconfirm (J-13 If-Match built) |
+| F01 | List / get (fail-closed) / ancestors | `GET /v1/jurisdictions`, `GET …/{id}`, `GET …/{id}/ancestors` | 🔵 (API-4 paging; e2e 13 Nov) |
+| F01 | AddInternalJurisdiction | `POST /v1/admin/jurisdictions` (Idempotency-Key, event `jurisdiction.created`) | 🔵 (e2e: create, replay, event on Kafka) |
+| F01 | RetireJurisdiction | `POST /v1/admin/jurisdictions/{id}/deactivate` (If-Match, reason + evidence, `jurisdiction.deactivated`) | 🔵 (If-Match, unit of work) |
 | F07 | GetJurisdictionAsOf · GetHierarchy | `GET …/{id}/as-of`, `GET …/{id}/hierarchy` | 🔵 |
 | F07 | AmendJurisdictionAlias · end alias · list aliases | `POST/GET …/{id}/aliases`, `POST …/aliases/{alias_id}/end` | 🔵 |
 | F07 | ResolveJurisdiction · MapExternalJurisdictionCode | `GET /v1/jurisdiction-resolutions`, `GET /v1/jurisdiction-code-mappings` | 🔵 |
@@ -41,12 +41,12 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 
 | ID | Operation | Route | Status |
 |---|---|---|---|
-| F02 | Rules of a jurisdiction (as of, known_at) · get rule (ETag) · status history | `GET …/{id}/rules`, `GET /v1/rules/{id}`, `GET …/status-history` | 🟡 reconfirm |
-| F02 | Create rule (DRAFT) · transition (creator ≠ activator) | `POST /v1/admin/jurisdictions/{id}/rules`, `POST /v1/admin/rules/{id}/transition` | 🟡 reconfirm |
+| F02 | Rules of a jurisdiction (as of, known_at) · get rule (ETag) · status history | `GET …/{id}/rules`, `GET /v1/rules/{id}`, `GET …/status-history` | 🔵 (ETag on the rule read) |
+| F02 | Create rule (DRAFT) · transition (creator ≠ activator) | `POST /v1/admin/jurisdictions/{id}/rules`, `POST /v1/admin/rules/{id}/transition` | 🔵 (author refused before workflow-svc is asked; e2e 403) |
 | F06 | Activation approval confirmed with workflow-svc (J-02) | `X-Approval-Reference` → `internal/approval` | 🔵 |
-| F03 | Runtime rule pack with `pack_digest` | `GET …/{id}/rule-pack` | 🟡 reconfirm |
-| F04 | Manual legal drift · drift history | `POST /v1/admin/rules/{id}/drift`, `GET …/drift-events`, `legal.drift.detected` | 🟡 reconfirm |
-| F05 | Automatic drift from a regulatory feed (J-03/J-04) | consumer of a regulatory source-change event | ❌ consumer · ⛔ producer (external-data-feed-svc) |
+| F03 | Runtime rule pack with `pack_digest` | `GET …/{id}/rule-pack` | 🔵 |
+| F04 | Manual legal drift · drift history | `POST /v1/admin/rules/{id}/drift`, `GET …/drift-events`, `legal.drift.detected` | 🔵 |
+| F05 | Automatic drift from a regulatory feed (J-03/J-04) | consumer of a regulatory source-change event (`internal/consumer/feed.go`) | 🔵 consumer (off until configured) · ⛔ producer (external-data-feed-svc) |
 | F12 | Validate action (J-06) | `POST /v1/validate-action` | 🔵 |
 
 ### 2.3 Entity applicability (Doc 03 §8.2 "entity-jurisdiction applicability mappings")
@@ -55,8 +55,8 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 |---|---|---|---|
 | F22 | Projection from `entity.created` / `entity.jurisdiction.changed` | Kafka consumer (`internal/consumer/entity.go`) | 🔵 |
 | F22 | Read | `GET /v1/entities/{legal_entity_id}/jurisdictions` | 🔵 |
-| F22 | J-10 backfill from tenant-entity-registry for events past Kafka retention | — | ❌ |
-| F22 | Tenant isolation at the database (RLS + FORCE) | — | ❌ |
+| F22 | J-10 backfill from tenant-entity-registry for events past Kafka retention | `POST /v1/admin/entity-applicability:backfill` | 🔵 (e2e: restored, rerun no-op) |
+| F22 | Tenant isolation at the database (RLS + FORCE) | 000032 | 🔵 (probe-role tests; e2e) |
 
 ### 2.4 Pack registries, compiler, certification (ZS-JUR waves 0, 1, 3)
 
@@ -70,7 +70,7 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 | F15 | Compile · sign · verify · artifact | `POST …/compile`, `…/sign`, `POST /v1/packs/{ref}/versions/{v}/verify`, `GET …/artifact` | 🔵 |
 | F15 | Signing keys register / retire / revoke | `GET /v1/pack-signing-keys`, `POST /v1/admin/pack-signing-keys`, `…/retire`, `…/revoke` | 🔵 |
 | F16 | Certification harness: test bundle, test runs, reviews, certify | `POST/GET …/test-bundle`, `…/test-runs`, `…/reviews`, `…/certify`, `GET …/certification` | 🔵 |
-| — | API-5 async operations for compile and test runs (EST-5) | `Prefer: respond-async` → 202 + `/v1/operations/{id}` | ❌ |
+| — | API-5 async operations for compile and test runs (EST-5) | `Prefer: respond-async` → 202 + `/v1/operations/{id}`, `POST …/cancel` | 🔵 (e2e: compile succeeded async) |
 
 ### 2.5 Runtime resolution (ZS-JUR waves 2, 4–6; PDC-02)
 
@@ -80,10 +80,10 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 | F13 | Jurisdiction determination (JUR-1) | `POST /v1/jurisdiction-decisions:resolve` | 🔵 (ORG-6/ORG-7 inputs pending) |
 | F10 | Obligation rules + due-date calculation | `GET /v1/obligation-rules`, `…/{id}`, `POST /v1/admin/obligation-rules`, `PUT …/provenance`, `POST …/publish`, `POST /v1/obligation-calculations:calculate` | 🔵 |
 | F20 | Registrations, licences, schemes, thresholds | `POST /v1/registration-obligations:resolve`, `/v1/registration-identifiers:validate`, `/v1/licences:evaluate`, `/v1/scheme-elections:evaluate`, `/v1/threshold-monitors:evaluate` | 🔵 |
-| F20 | Tax calculation | `POST /v1/regulatory-calculations:execute` | 🔵 · events `regulatory-calculation.completed/.failed` ❌ |
+| F20 | Tax calculation | `POST /v1/regulatory-calculations:execute` | 🔵 · events `regulatory-calculation.completed/.failed` 🔵 |
 | F20 | Payroll parameters · retention · accounting mappings · submission profiles | `POST /v1/payroll-statutory-parameters:resolve`, `/v1/retention-rules:resolve`, `/v1/accounting-mappings:resolve`, `/v1/submission-profiles:resolve` | 🔵 |
-| F21 | Regulatory submissions lifecycle | `POST /v1/regulatory-submissions`, `GET …/{id}`, `POST …/{id}/events` | 🔵 · tenant isolation ❌ |
-| — | Decision evidence tenant isolation | `rule_decision_evidence` | ❌ |
+| F21 | Regulatory submissions lifecycle | `POST /v1/regulatory-submissions`, `GET …/{id}`, `POST …/{id}/events` | 🔵 · tenant isolation 🔵 (000032) |
+| — | Decision evidence tenant isolation | `rule_decision_evidence` (000032, operator cross-tenant read) | 🔵 |
 
 ### 2.6 Calendars and payment terms (REF-10, ZS-JUR §15)
 
@@ -105,26 +105,26 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 | F17 | §29 operations metrics | `GET /v1/ops/metrics` | 🔵 |
 | F18 | Rollout governance | `GET/POST /v1/admin/rollouts`, `GET …/{id}`, `…/attestations`, `…/expert-approvals`, `…/transition`, `PUT …/owner`, `PUT …/packs`, `POST /v1/admin/rollouts:seed-portfolio`, `GET /v1/rollout-checklists`, `GET /v1/jurisdiction-support/{code}` | 🔵 |
 | F19 | Remediation cases | `GET/POST /v1/admin/remediation-cases`, `GET …/{id}`, `POST …/close`, `GET …/decisions`, `POST …/dispositions` | 🔵 |
-| — | §26 rule lifecycle events `regulatory-rule.versioned/.effective/.expired` | effectivity watcher | ❌ |
+| — | §26 rule lifecycle events `regulatory-rule.versioned/.effective/.expired` | effectivity watcher (`internal/events/effectivity.go`, 000035) | 🔵 (e2e: `.effective` announced) |
 
 ### 2.8 Cross-cutting controls
 
 | ID | Control | Status |
 |---|---|---|
-| F23 / J-11 | Registry events written in the same transaction as the write | ❌ (written after commit, through the pool) |
-| F23 / J-12 | `aggregate_version` on registry events | ❌ |
-| F23 / J-15 | Outbox claim with `FOR UPDATE SKIP LOCKED` | ❌ |
-| F23 / J-16 | Parked outbox events: list + requeue (authorized, evidenced) | ❌ |
-| F24 / J-01 | No published service port; signed identity required | 🟡 (gate mounted, `IDENTITY_VERIFY=warn`, `8082:8082` published) |
-| F25 | Idempotency-Key replay, ETag/If-Match, bitemporal replay, append-only triggers, RFC 9457 | 🟡 reconfirm; If-Match covers only jurisdictions and rules |
-| F27 | API-4 cursor paging on list routes | ❌ |
+| F23 / J-11 | Registry events written in the same transaction as the write | 🔵 (request unit of work; 503 `event_not_recorded` aborts the write) |
+| F23 / J-12 | `aggregate_version` on registry events | 🔵 (e2e: on the Kafka envelope) |
+| F23 / J-15 | Outbox claim with `FOR UPDATE SKIP LOCKED` | 🔵 (two-relay test; live relay fixed 13 Nov) |
+| F23 / J-16 | Parked outbox events: list + requeue (authorized, evidenced) | 🔵 (e2e; 4 real parked events requeued live) |
+| F24 / J-01 | No published service port; signed identity required | 🔵 (`127.0.0.1:8082`; admin writes need an envelope or mTLS peer; reads stay `warn`) |
+| F25 | Idempotency-Key replay, ETag/If-Match, bitemporal replay, append-only triggers, RFC 9457 | 🔵 (If-Match on 14 aggregates, 000034) |
+| F27 | API-4 cursor paging on list routes | 🔵 (signed, tenant-bound cursors) |
 | F28 | Router ↔ openapi parity + kin-openapi validity | 🔵 (`TestOpenAPIMatchesTheRouter`, `TestOpenAPIDocumentIsValid`) |
-| R4 | RLS + FORCE on tenant data | ❌ (no table has RLS; three hold tenant data) |
-| R5 | Every checked action registered in access-control | 🔵 (83 actions, all registered; template coverage to confirm) |
-| R10 | Negative paths named after their spec id | ❌ (ids in comments only; JUR-NEG-16, 17, 21, 29, 30 untested; 11 Nov suite hollow) |
-| JR-FE-1 | Console summary route `GET /v1/jurisdiction-summary` | ❌ |
-| S2 | asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, scripts/audit.sh, Postman | ❌ (only openapi.yaml, SPEC_DEVIATIONS.md) |
-| S4 | `deployments/scripts/e2e-jurisdiction-rules-deps.py` | ❌ |
+| R4 | RLS + FORCE on tenant data | 🔵 (000032 on five tables incl. async_operations 000036) |
+| R5 | Every checked action registered in access-control | 🔵 (access-control 000052: six new actions, nine templates) |
+| R10 | Negative paths named after their spec id | 🔵 (see §4; 17 🧭, 29 🟡) |
+| JR-FE-1 | Console summary route `GET /v1/jurisdiction-summary` | 🔵 |
+| S2 | asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, scripts/audit.sh, Postman | 🔵 (all present; Postman folders 04–07) |
+| S4 | `deployments/scripts/e2e-jurisdiction-rules-deps.py` | 🔵 (59/59 on 13 Nov) |
 
 ### 2.9 Decisions and blocked items (not buildable here)
 
@@ -249,6 +249,40 @@ route does not have and never run. The suite is rewritten (`internal/handler/neg
 case sends a real body and asserts status, `application/problem+json` and the problem code; 4 tests,
 21 cases, all pass. Dev DB: `migrate.py status --db jurisdiction_rules` → 36/36 applied.
 
+**13 Nov 2026, after step 16.** Application Control blocks host test binaries, so the suites ran in a
+`golang:1.26-alpine` container (900 MB cap) against fresh scratch databases on the dev Postgres.
+
+| Suite | Pass | Fail | Skip |
+|---|---|---|---|
+| unit (all packages) | 569 | 0 | 85 (the store DB tests, run below) |
+| store (`jur_store_it`) | 92 | 0 | 0 |
+| registryit (`jur_reg_it`, async operations through the `jur_rls_probe` role) | 143 | 0 | 0 |
+| openapi / asyncapi contract tests | ✔ | — | — |
+| live e2e `deployments/scripts/e2e-jurisdiction-rules-deps.py` | 59 | 0 | — |
+| live `scripts/audit.sh` (`SKIP_SUITES=1`, the suites ran above) | 24 | 0 | — |
+
 ## 6. Evidence log
 
-One block per step, appended as each step lands.
+| Step | What landed | Commit | Proof |
+|---|---|---|---|
+| 1 JR-0 | `JUR_IT_DSN` for registryit; hollow negative suite rewritten (4 tests, 21 cases) | 29fb166b | baseline in §5 |
+| 2 J-11 | request unit of work; savepoint per statement; held response; outbox failure aborts with 503 `event_not_recorded` | 5c8cf652 | `registryit/unit_of_work_*` |
+| 3 R4 | 000032 RLS + FORCE on five tenant tables; operator cross-tenant read for decision evidence | be1dfe7f | `tenant_isolation_*` through `jur_rls_probe`; e2e "RLS" checks |
+| R5 | access-control 000052: six actions, nine role templates | 529ce58e | `registered_actions_test.go`; e2e "nine templates" |
+| 4 J-12/15/16 | `aggregate_version` on events; claim `FOR UPDATE SKIP LOCKED` under advisory lock; parked list + requeue (000033) | fa65733c, af349005 | `TestJ15_TwoRelaysPublishEachEventOnce`, `TestJ16_*`; e2e Kafka envelope + requeue |
+| 5 API-3 | `row_version` on 14 aggregates (000034); ETag; If-Match under row lock | af349005 | `TestAPI3_*`; e2e 412 then ETag 2 |
+| 6 API-4 | signed, tenant-bound cursors on every list route | b7e8c903 | `paging_*`; e2e paging, foreign cursor 400 |
+| 7 §26 | calculation events; rule `.versioned/.effective/.expired` watcher (000035) | e950eebf | `rule_effectivity_*`; e2e `.effective` |
+| 8 J-10 | backfill from tenant-entity-registry | 65d03d38 | `backfill_*`; e2e restore + rerun no-op |
+| 9 R10 | every negative path named after its id (§4) | 319f7c44 | `negative_paths_index_test.go` per package |
+| 10 JR-FE-1 | `GET /v1/jurisdiction-summary` | 03e739ae | `summary_*`; e2e summary read |
+| 11 API-5 | async compile / test runs, poll, cancel (000036) | 64fee24d | `TestAPI5_*`; e2e async compile succeeded |
+| 12 JR-6 | `regulatory.source.changed` consumer (producer ⛔) | 589729eb | `feed_consumer_*` |
+| 13 J-01 | loopback port; `IDENTITY_VERIFY_ADMIN=require` | 858eda1f | `TestJ01_AdminWritesNeedAVerifiedIdentity`; e2e 401 for headers-only and forged basis |
+| 14 S2 | openapi 1.2.0, asyncapi, RUNBOOK, deviations, audit.sh, Postman | 0a9a8fbf | `TestOpenAPI*`, `TestAsyncAPI*` |
+| 15 S3/S4 | live run found four defects, each fixed with a test that fails on the old code: relay set the topic twice so nothing was ever published (pre-existing); async operations written without their tenant; 000005 never applied on old-lineage databases (000037); the author's own activation answered 503 when workflow-svc was down | c7ab467e, 1ba898ff, c66d811e, 75769129 | e2e 59/59; audit 24/24; 4 events parked by the relay bug requeued through J-16, outbox 0 pending / 0 parked |
+| 16 S6 | mutation check | — | J-01 gate accepting any basis → `TestJ01_AdminWritesNeedAVerifiedIdentity` fails (`204, want 401`); If-Match comparison disabled → `TestAPI3_SourceCommandsCheckIfMatch` fails (`expected 412, actual 200`). Both restored. |
+
+Not exercised live: workflow-svc (J-02) is not in the minimal stack, so the e2e sees the fail-closed 503;
+the approval paths (invalid → 403, valid → 200) are covered by `internal/handler/approval_test.go`. The
+effectivity e2e activates its rule with a database fixture for the same reason.
