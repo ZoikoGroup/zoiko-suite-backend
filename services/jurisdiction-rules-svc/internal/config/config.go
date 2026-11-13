@@ -115,6 +115,12 @@ type Config struct {
 	// on another replica.
 	CursorSigningKey []byte
 
+	// IdentityVerifyAdmin is "require" (default outside local/dev) or "off":
+	// with require, every administrative write needs a verified identity
+	// (signed envelope or mTLS peer), whatever IDENTITY_VERIFY says for the
+	// rest of the API (J-01). "off" is refused outside local/dev.
+	IdentityVerifyAdmin string
+
 	// RuleEffectivityIntervalSeconds is how often the effectivity watcher
 	// announces rules reaching the start or end of their interval
 	// (regulatory-rule.effective / .expired). Default 60, 5 to 3600.
@@ -210,6 +216,12 @@ func Load() (*Config, error) {
 
 		RuleEffectivityIntervalSeconds: envInt("RULE_EFFECTIVITY_INTERVAL_SECONDS", 60),
 	}
+	if cfg.IdentityVerifyAdmin = strings.ToLower(strings.TrimSpace(os.Getenv("IDENTITY_VERIFY_ADMIN"))); cfg.IdentityVerifyAdmin == "" {
+		cfg.IdentityVerifyAdmin = "require"
+		if localEnv(cfg.Env) {
+			cfg.IdentityVerifyAdmin = "off"
+		}
+	}
 	key, err := cursorKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), localEnv(cfg.Env))
 	if err != nil {
 		return nil, err
@@ -294,6 +306,15 @@ func (c *Config) validate() error {
 		}
 	}
 
+	switch c.IdentityVerifyAdmin {
+	case "require":
+	case "off":
+		if !localEnv(c.Env) {
+			return fmt.Errorf("IDENTITY_VERIFY_ADMIN=off is refused outside local/dev: administrative writes would trust identity headers (J-01)")
+		}
+	default:
+		return fmt.Errorf("IDENTITY_VERIFY_ADMIN must be require or off, got %q", c.IdentityVerifyAdmin)
+	}
 	if c.RuleEffectivityIntervalSeconds < 5 || c.RuleEffectivityIntervalSeconds > 3600 {
 		return fmt.Errorf("RULE_EFFECTIVITY_INTERVAL_SECONDS must be between 5 and 3600, got %d", c.RuleEffectivityIntervalSeconds)
 	}

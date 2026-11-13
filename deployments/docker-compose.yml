@@ -989,8 +989,10 @@ services:
     container_name: jurisdiction-rules-svc
     mem_limit: 256m
     cpus: "0.5"
+    # J-01 / EST-3: reachable from the host only on the loopback interface
+    # (scripts, the e2e); everything else goes through the gateway.
     ports:
-      - "8082:8082"
+      - "127.0.0.1:8082:8082"
     environment:
       PORT: "8082"
       DB_HOST: postgres
@@ -1020,6 +1022,9 @@ services:
       # (out of this domain) do not forward the envelope yet. The code default
       # outside local is require.
       IDENTITY_VERIFY: "${JURISDICTION_IDENTITY_VERIFY:-warn}"
+      # J-01: administrative writes need a verified identity (the console's
+      # envelope or an mTLS peer) whatever IDENTITY_VERIFY says for the reads.
+      IDENTITY_VERIFY_ADMIN: "${JURISDICTION_IDENTITY_VERIFY_ADMIN:-require}"
       IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
@@ -1027,6 +1032,13 @@ services:
       # rule basis is recorded as rule_decision_evidence. Locally it serves every
       # RELEASED pack; production and staging must name RESOLVER_RING / _REGION.
       RESOLVER_ENABLED: "${RESOLVER_ENABLED:-true}"
+      # J-10: the entity applicability backfill reads the registry.
+      TENANT_REGISTRY_URL: "http://tenant-svc:8081"
+      # API-4: a fixed development key, so cursors survive a restart. Production
+      # sets its own (required outside local/dev).
+      CURSOR_SIGNING_KEY_HEX: "${JURISDICTION_CURSOR_SIGNING_KEY_HEX:-6a7572697364696374696f6e2d72756c65732d6465762d637572736f722d6b6579}"
+      # JR-6: the regulatory feed consumer stays off until external-data-feed-svc
+      # publishes regulatory.source.changed; set KAFKA_REGULATORY_FEED_TOPIC then.
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "jurisdiction-rules-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.jurisdiction.events"

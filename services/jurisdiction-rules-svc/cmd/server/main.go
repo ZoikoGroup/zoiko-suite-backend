@@ -170,6 +170,13 @@ func main() {
 	r.Use(otelchi.Middleware("jurisdiction-rules-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(gate.Middleware)
+	// J-01: administrative writes need a verified identity even while the
+	// gate runs in warn mode for the out-of-domain readers.
+	if cfg.IdentityVerifyAdmin == "require" {
+		r.Use(handler.RequireVerifiedIdentity(handler.AdminWrite))
+	} else {
+		log.Warn("IDENTITY_VERIFY_ADMIN=off: administrative writes trust identity headers (local/dev only)")
+	}
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 

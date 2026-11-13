@@ -20,7 +20,7 @@ func withEnv(t *testing.T, vars map[string]string) {
 	// KAFKA_BROKERS distinguishes the two: explicitly empty means "no event
 	// backbone", absent means "use the default".
 	for _, k := range []string{
-		"ENV", "PORT", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_SSLMODE", "CURSOR_SIGNING_KEY_HEX", "RULE_EFFECTIVITY_INTERVAL_SECONDS",
+		"ENV", "PORT", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_SSLMODE", "CURSOR_SIGNING_KEY_HEX", "RULE_EFFECTIVITY_INTERVAL_SECONDS", "IDENTITY_VERIFY_ADMIN",
 		"KAFKA_BROKERS", "KAFKA_GROUP_ID", "KAFKA_EVENTS_TOPIC", "KAFKA_ENTITY_TOPIC",
 		"AUTHZ_SERVICE_URL", "AUTHZ_PLATFORM_SCOPE_ID", "AUTHZ_ALLOW_STUB", "OTEL_EXPORTER_OTLP_ENDPOINT",
 		"PACK_SIGNING_KEY_REF", "PACK_SIGNING_KEY_FILE", "PACK_CERT_MIN_REVIEWS",
@@ -386,5 +386,27 @@ func TestLoad_RuleEffectivityIntervalIsBounded(t *testing.T) {
 		if _, err := config.Load(); err == nil {
 			t.Fatalf("interval %s must be refused", bad)
 		}
+	}
+}
+
+func TestLoad_AdminIdentityIsRequiredOutsideLocal(t *testing.T) {
+	withEnv(t, nil)
+	cfg, err := config.Load()
+	if err != nil || cfg.IdentityVerifyAdmin != "off" {
+		t.Fatalf("local default must be off: %v %+v", err, cfg)
+	}
+	prod := map[string]string{"ENV": "production", "DB_PASSWORD": "x", "DB_SSLMODE": "require", "AUTHZ_PLATFORM_SCOPE_ID": "scope", "CURSOR_SIGNING_KEY_HEX": testCursorKey}
+	withEnv(t, prod)
+	if cfg, err = config.Load(); err != nil || cfg.IdentityVerifyAdmin != "require" {
+		t.Fatalf("production default must be require: %v", err)
+	}
+	prod["IDENTITY_VERIFY_ADMIN"] = "off"
+	withEnv(t, prod)
+	if _, err = config.Load(); err == nil {
+		t.Fatal("off must be refused in production (J-01)")
+	}
+	withEnv(t, map[string]string{"IDENTITY_VERIFY_ADMIN": "maybe"})
+	if _, err = config.Load(); err == nil {
+		t.Fatal("an unknown mode must be refused")
 	}
 }
