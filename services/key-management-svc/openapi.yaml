@@ -121,6 +121,11 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: Key store (database) unavailable -- retryable, never reported as 404 or an empty list
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/keys/{id}:
     get:
@@ -149,6 +154,11 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '404':
           description: Key not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: Key store (database) unavailable -- retryable, never reported as 404 or an empty list
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -192,6 +202,11 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: Key store (database) unavailable -- retryable, never reported as 404 or an empty list
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
   /v1/keys/{id}/disable:
     post:
       summary: Disable a customer key
@@ -227,6 +242,11 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '404':
           description: Key not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: Key store (database) unavailable -- retryable, never reported as 404 or an empty list
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

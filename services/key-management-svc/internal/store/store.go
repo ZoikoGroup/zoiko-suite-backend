@@ -2,7 +2,7 @@ package store
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 	"time"
 
@@ -17,6 +17,12 @@ type Store interface {
 	RotateKey(ctx context.Context, tenantID, id string) (*domain.CustomerKey, error)
 	DisableKey(ctx context.Context, tenantID, id string) error
 }
+
+// ErrKeyNotFound is returned by every Store when no customer key with that ID
+// is visible to the tenant. It is the ONLY error the handler answers with 404:
+// anything else is the store failing (a database or connection error), which
+// is 503 — never "not found", and never a false-empty list.
+var ErrKeyNotFound = errors.New("key not found")
 
 // Vault is the token-vault contract behind POST /v1/tokenize and
 // /v1/detokenize. It is a separate interface from Store so the five key
@@ -100,7 +106,7 @@ func (m *MemoryStore) GetKeyByID(ctx context.Context, tenantID, id string) (*dom
 	defer m.mu.RUnlock()
 	k, ok := m.keys[id]
 	if !ok || k.TenantID != tenantID {
-		return nil, fmt.Errorf("key not found")
+		return nil, ErrKeyNotFound
 	}
 	return k, nil
 }
@@ -126,7 +132,7 @@ func (m *MemoryStore) RotateKey(ctx context.Context, tenantID, id string) (*doma
 	defer m.mu.Unlock()
 	k, ok := m.keys[id]
 	if !ok || k.TenantID != tenantID {
-		return nil, fmt.Errorf("key not found")
+		return nil, ErrKeyNotFound
 	}
 	now := time.Now()
 	k.KeyVersion++
@@ -141,7 +147,7 @@ func (m *MemoryStore) DisableKey(ctx context.Context, tenantID, id string) error
 	defer m.mu.Unlock()
 	k, ok := m.keys[id]
 	if !ok || k.TenantID != tenantID {
-		return fmt.Errorf("key not found")
+		return ErrKeyNotFound
 	}
 	k.State = domain.StateDisabled
 	k.UpdatedAt = time.Now()

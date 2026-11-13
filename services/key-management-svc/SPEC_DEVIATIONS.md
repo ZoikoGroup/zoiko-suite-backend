@@ -210,16 +210,40 @@ payee-banking-identity-svc's `internal/tokenization/client.go`:
 The token is the row's random UUID (36 characters): it fits
 banking-connector-svc's `VARCHAR(128)` and never equals the value.
 
-## 7. Pre-existing key-route behaviour, now more visible
+## 7. Key-route store errors — fixed 2026-11-13
 
-Not changed in this pass (the brief kept the 5 key routes' handler as-is),
-but a real database makes these matter:
-- `GetKey`, `RotateKey` and `DisableKey` answer **any** store error with 404,
-  so a database outage reads as "key not found";
-- `ListKeys` discards the store error and returns `200` with an empty list
-  during an outage.
+**Before (left as-is in the 2026-11-12 pass):**
+- `GetKey`, `RotateKey` and `DisableKey` answered **any** store error with
+  404, so a database outage read as "key not found";
+- `ListKeys` discarded the store error and answered `200` with an empty list.
 
-Both should become 5xx; that is a small follow-up to the handler.
+That was harmless while the store was an in-process map that could not fail.
+With Postgres it made an outage look like "no such key", during incident
+response, the moment someone is trying to disable a key.
+
+**Now** all four go through `writeKeyStoreErr`:
+- `store.ErrKeyNotFound` → 404;
+- a non-UUID tenant (`store.ErrInvalidTenant`) → 400;
+- **anything else → 503 `service_unavailable`, retryable, logged with the
+  operation.**
+
+`MemoryStore` returns the same `ErrKeyNotFound` sentinel as `PgStore`, so
+the mapping is identical on both. `openapi.yaml` documents the 503.
+
+**Tests** (`internal/handler/store_errors_test.go`):
+- a failing store gives 503 on all four routes;
+- a genuine miss is still 404, and a genuinely empty list is still 200
+  with `count: 0`;
+- against **real Postgres**: the same routes answer 404/200 with the pool
+  open, and 503 once the pool is closed;
+- a non-UUID tenant on Postgres is 400.
+
+**Breaks caught:**
+- `ListKeys` discarding its error again;
+- the not-found / store-failure distinction removed.
+
+`RegisterKey` still answers a store failure with 500 ("failed to register
+key"). It never claimed "not found", so it was outside this fix.
 
 ## 8. Verification (2026-11-12)
 

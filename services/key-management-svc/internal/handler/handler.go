@@ -247,7 +247,7 @@ func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 	}
 	key, err := h.store.GetKeyByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		h.errJSON(w, r, 404, "key not found")
+		h.writeKeyStoreErr(w, r, "get key", err)
 		return
 	}
 	if !h.authorize(w, r, principalID, key.LegalEntityID, KeyRead) {
@@ -279,7 +279,13 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, legalEntityID, KeyRead) {
 		return
 	}
-	keys, _ := h.store.ListKeys(r.Context(), tenantID, legalEntityID)
+	// The error used to be discarded, so a database outage answered 200 with
+	// an empty list — indistinguishable from "this entity has no keys".
+	keys, err := h.store.ListKeys(r.Context(), tenantID, legalEntityID)
+	if err != nil {
+		h.writeKeyStoreErr(w, r, "list keys", err)
+		return
+	}
 	if keys == nil {
 		keys = []domain.CustomerKey{}
 	}
@@ -303,7 +309,7 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	// mutation, which means fetching the row purely to learn whose it is.
 	existing, err := h.store.GetKeyByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, r, 404, "key not found")
+		h.writeKeyStoreErr(w, r, "rotate key (read)", err)
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, KeyRotate) {
@@ -312,7 +318,7 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 
 	key, err := h.store.RotateKey(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, r, 404, "key not found")
+		h.writeKeyStoreErr(w, r, "rotate key", err)
 		return
 	}
 	// Doc 05 §13.2 names "secret retrieval" and key lifecycle events as
@@ -340,7 +346,7 @@ func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
 	// until after disabling it.
 	existing, err := h.store.GetKeyByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, r, 404, "key not found")
+		h.writeKeyStoreErr(w, r, "disable key (read)", err)
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, KeyDisable) {
@@ -348,11 +354,33 @@ func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.DisableKey(r.Context(), tenantID, id); err != nil {
-		h.errJSON(w, r, 404, "key not found")
+		h.writeKeyStoreErr(w, r, "disable key", err)
 		return
 	}
 	h.siem.Stream(r.Context(), tenantID, "key.disabled", siem.SeverityHigh, "Key disabled: "+id)
 	h.okJSON(w, r, 200, map[string]string{"message": "key disabled"})
+}
+
+// writeKeyStoreErr answers a failed key-store call on the get, list, rotate
+// and disable routes.
+//
+// Only store.ErrKeyNotFound is a 404. Before Postgres these routes answered
+// every store error with 404 (and ListKeys discarded its error, answering an
+// empty 200), which was harmless while the store was an in-process map that
+// could not fail. With a database it meant an outage looked exactly like
+// "this key does not exist" — during incident response, the moment someone
+// is trying to disable a key. A store failure is now 503 and retryable, and
+// logged; a non-UUID tenant, which can never own a row, is 400.
+func (h *Handler) writeKeyStoreErr(w http.ResponseWriter, r *http.Request, op string, err error) {
+	switch {
+	case errors.Is(err, store.ErrKeyNotFound):
+		h.errJSON(w, r, http.StatusNotFound, "key not found")
+	case errors.Is(err, store.ErrInvalidTenant):
+		h.errJSON(w, r, http.StatusBadRequest, "X-Tenant-ID must be a UUID")
+	default:
+		h.logger.Error("key store unavailable", zap.String("op", op), zap.Error(err))
+		h.errJSON(w, r, http.StatusServiceUnavailable, "key store unavailable")
+	}
 }
 
 func (h *Handler) okJSON(w http.ResponseWriter, r *http.Request, code int, v interface{}) {

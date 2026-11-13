@@ -12,11 +12,6 @@ import (
 	"zoiko.io/key-management-svc/internal/domain"
 )
 
-// ErrKeyNotFound is returned when no customer key with that ID is visible to
-// the tenant. The handler answers every key-store error with 404, as it did
-// for MemoryStore.
-var ErrKeyNotFound = errors.New("key not found")
-
 // ErrInvalidTenant is returned for a tenant ID that is not a UUID. Every
 // tenant the platform issues is one (see migration 000001); refusing here
 // keeps a malformed header from ever reaching the ::uuid cast in the RLS
