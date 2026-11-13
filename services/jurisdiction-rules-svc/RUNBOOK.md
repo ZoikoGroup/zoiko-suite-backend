@@ -36,7 +36,12 @@ configured. Contracts: `openapi.yaml`, `asyncapi.yaml`. Deviations: `SPEC_DEVIAT
 
 1. Apply migrations before the new binary: `python deployments/migrate.py up --db jurisdiction_rules`
    (000032 tenant RLS, 000033 outbox requeues + UPDATE grant, 000034 aggregate row versions,
-   000035 effectivity watermark, 000036 async operations).
+   000035 effectivity watermark, 000036 async operations, 000037 schema convergence).
+   000037 is a no-op on a database built from the migrations directory. On a database first
+   migrated before 2 Nov 2026 it restores the rule provenance and parameter columns, the
+   provenance guard trigger and the foreign keys that 000005 never applied there. Without it,
+   rule provenance and every pack compile answer 503 (`column "regime_id" does not exist`).
+   If it fails on a foreign key, a legacy row has no parent: fix that row and rerun.
 2. Apply access-control 000052 (`--db access_control`): it registers the six new actions and
    publishes the nine role templates that carry every action this service checks. Grant roles
    from those templates; nobody can use the new routes before.
