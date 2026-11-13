@@ -26,6 +26,16 @@ for f in /migrations/connectivity-api-bridge/002_add_rls.sql /migrations/connect
   psql -v ON_ERROR_STOP=1 --username "$PGUSER" --dbname zoiko_connectivity_api_bridge -f "$f"
 done
 create_db_and_migrate "zoiko_banking_connector" "/migrations/banking-connector/001_init.sql"
+# 001 alone left banking-connector-svc with no row-level security (002), none
+# of BNK-02/03/04 (003-006, 008-009), no eventing outbox (007) -- so the
+# service refused to start ("eventing outbox schema missing") -- and no
+# account-number token table (010). Apply every migration it ships, in name
+# order, skipping the .down. files (its 001/002 predate the .up.sql naming).
+for f in $(LC_ALL=C ls /migrations/banking-connector/*.sql | grep -v '\.down\.' | LC_ALL=C sort); do
+  [ "$(basename "$f")" = "001_init.sql" ] && continue
+  echo "Applying $f to zoiko_banking_connector..."
+  psql -v ON_ERROR_STOP=1 --username "$PGUSER" --dbname zoiko_banking_connector -f "$f"
+done
 create_db_and_migrate "zoiko_hris_connector" "/migrations/hris-connector/001_init.sql"
 create_db_and_migrate "zoiko_tax_authority_interface" "/migrations/tax-authority-interface/001_init.sql"
 create_db_and_migrate "zoiko_esignature_integration" "/migrations/esignature-integration/001_init.sql"

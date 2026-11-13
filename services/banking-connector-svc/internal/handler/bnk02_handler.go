@@ -34,22 +34,32 @@ type BNK02Handler struct {
 	vault      clients.VaultClient
 }
 
-// RegisterBNK02Routes mounts BNK-02's routes on r. Called separately from
+// RegisterBNK02Routes registers BNK-02's routes on r. Called separately from
 // RegisterRoutes in cmd/server/main.go.
+//
+// Each route is registered by its full path, NOT under a mounted
+// r.Route("/v1/banking/connections", ...) subrouter. RegisterRoutes already
+// mounts "/v1/banking", and chi gives every request under the more specific
+// mount to that mount: a second subrouter at "/v1/banking/connections"
+// therefore captured POST /v1/banking/connections, GET /v1/banking/
+// connections/{id} and GET .../{id}/account-number, had no handler for them,
+// and answered 404 — in the assembled server only; tests that mounted
+// RegisterRoutes alone never saw it. Only the /v1/banking/accounts aliases
+// worked. Full-path routes sit beside the /v1/banking mount instead of
+// shadowing it (TestAssembledRouter_ConnectionRoutesAreReachable).
 func RegisterBNK02Routes(r chi.Router, h *Handler, bnk02Store store.BNK02Store, bankAccts clients.BankAccountClient, vault clients.VaultClient) {
 	bh := &BNK02Handler{Handler: h, bnk02Store: bnk02Store, bankAccts: bankAccts, vault: vault}
-	r.Route("/v1/banking/connections", func(r chi.Router) {
-		r.Post("/request", bh.InitiateConnection)
-		r.Get("/{id}/events", bh.GetConnectionEvents)
-		r.Post("/{id}/complete-authorization", bh.CompleteConnectionAuthorization)
-		r.Post("/{id}/activate", bh.ActivateConnection)
-		r.Post("/{id}/refresh", bh.RefreshConnection)
-		r.Post("/{id}/trigger-reconsent", bh.TriggerReconsent)
-		r.Post("/{id}/suspend", bh.SuspendConnection)
-		r.Post("/{id}/revoke", bh.RevokeConnection)
-		r.Post("/{id}/reconnect", bh.ReconnectProvider)
-		r.Post("/{id}/rotate-credential", bh.RotateConnectionCredential)
-	})
+	const c = "/v1/banking/connections"
+	r.Post(c+"/request", bh.InitiateConnection)
+	r.Get(c+"/{id}/events", bh.GetConnectionEvents)
+	r.Post(c+"/{id}/complete-authorization", bh.CompleteConnectionAuthorization)
+	r.Post(c+"/{id}/activate", bh.ActivateConnection)
+	r.Post(c+"/{id}/refresh", bh.RefreshConnection)
+	r.Post(c+"/{id}/trigger-reconsent", bh.TriggerReconsent)
+	r.Post(c+"/{id}/suspend", bh.SuspendConnection)
+	r.Post(c+"/{id}/revoke", bh.RevokeConnection)
+	r.Post(c+"/{id}/reconnect", bh.ReconnectProvider)
+	r.Post(c+"/{id}/rotate-credential", bh.RotateConnectionCredential)
 	r.Post("/v1/banking/region-policies", bh.CreateRegionPolicy)
 }
 

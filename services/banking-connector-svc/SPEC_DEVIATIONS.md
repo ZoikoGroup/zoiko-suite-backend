@@ -1014,3 +1014,148 @@ turned on:
 - Two deliberate breakages were each caught: a raw fallback on failure, and
   enforcement ignored.
 - `internal/config/config_test.go`: strict flag parsing and the default URL.
+
+### G6. Enforcement connected to real data (2026-11-13)
+
+G4's prerequisites, done. Enforcement is still **off by default**; it is now
+safe to turn on.
+
+**1. Read precedence: a side table, not a shape.** Tokens live in
+`bank_connection_account_tokens` (migration 010), one row per connection:
+the token, the masked display form, and `source` (`WRITE` or `BACKFILL`).
+- **A row there means TOKENIZED.** `account_number` is never read as a bank
+  number for that connection.
+- **No row means a LEGACY raw value**, read exactly as before.
+- The discriminator is the row's presence, never what the stored string looks
+  like.
+- It is not a column on `bank_connections` because migration 003's trigger
+  refuses **every** update to a REVOKED connection. A column could never be
+  backfilled for revoked rows, which still hold raw numbers, without
+  loosening that trigger. The side table needs only INSERTs, so the trigger
+  is untouched.
+- The table is append-only (its own trigger) and RLS-forced.
+- `bnk02Columns` reads it through correlated subqueries, so every connection
+  query gets the precedence input. `domain.BankConnection.Tokenized()` is the
+  rule in code.
+
+**2. Writes.** With `TOKENIZATION_ENFORCED=true`, `CreateConnection` writes
+the token row in the connection's own transaction, so the connection and its
+token commit together or not at all. It also tokenizes `iban`. The handler
+fills `iban` from the account number, and on 2026-11-12 it went out **raw**
+in the `connection.created` event while `account_number` was tokenized. That
+is now fixed and covered by a test.
+
+**3. Reads.**
+- **Masked view (get, list, and a tokenized create's response).** It shows
+  the stored masked form, computed from the raw number when the token was
+  written. It never calls the vault.
+  - Masking the stored value instead would show the token's own last
+    characters as if they were account digits.
+  - Detokenizing on every read would need `TOKEN_DETOKENIZE` for every
+    reader, which is the broad grant SEC-T15 rules out, plus one audit event
+    per row per list.
+  - Decided with the requester. The task brief had said "detokenize, then
+    mask".
+- **Full number:** `GET /v1/banking/connections/{id}/account-number` (and
+  `/accounts/{id}/...`), new. The caller must hold `TOKEN_DETOKENIZE` at the
+  connection's own legal entity, and this service checks that itself, so a
+  legacy raw row is no easier a route to the number. A tokenized connection
+  is then detokenized under the caller's own principal, so the vault's
+  grant check, tenant binding and audit event all apply.
+  - Fails closed: a vault refusal is 403; an unreachable or unconfigured
+    vault is 503; the token is never returned as the number.
+  - `Cache-Control: no-store`.
+- `cmd/server` builds the tokenization client whenever
+  `TOKENIZATION_SERVICE_URL` is set, not only when enforced. A connection
+  tokenized while enforcement was on stays tokenized after it is turned off.
+
+**4. Backfill: `cmd/tokenize-backfill`.** A tool, not a migration: each row
+needs a round trip through key-management-svc, which SQL cannot make, and it
+must be run deliberately by someone holding the grants. Its guarantees:
+- **Round trip first.** Each legacy row is tokenized, then detokenized and
+  compared exactly with the raw value. Every row is verified before
+  anything is written.
+- **All or nothing.** Any failure writes nothing. The token rows go in as
+  one transaction.
+- **Refuses an RLS-bound database role,** which would see no rows and report
+  success.
+- **Re-runnable.** Its Idempotency-Key is `row id + principal`. It must
+  include the principal: the 2026-11-13 live run showed that one refused
+  attempt by an under-granted principal otherwise made the vault answer
+  every later run by the right principal with 409.
+- **`bank_connections` is never updated,** and revoked connections are
+  backfilled like any other.
+- Run it as `go run ./cmd/tokenize-backfill -database-url <migration role>
+  -tokenization-url <kms> -principal svc-tokenization-backfill [-dry-run]`.
+
+**5. Enabling it.**
+- **Grants:** `deployments/scripts/seed-demo-rbac.ps1` gives the demo
+  principals `TOKEN_CREATE` (and `BANKING_CONNECTION_CREATE`) and creates two
+  narrow `TOKEN_DETOKENIZE` roles, on the legal entity only.
+- **Locally:** `export TOKENIZATION_ENFORCED=true` before `docker compose -f
+  deployments/docker-compose.phase7.yml up`. The compose default stays
+  `false`.
+- **Init fix:** `init-db-phase7.sh` applied only `001_init.sql` for this
+  service, so a fresh phase-7 volume had no outbox (the service refused to
+  start) and would never have had 010. It now applies every migration in
+  order.
+
+**6. Live run, 2026-11-13.** Native processes against Postgres 16:
+authorization-svc, key-management-svc and this service, with real HTTP
+throughout.
+- **Legacy row:** written raw by the pre-task binary. 010 applied, then the
+  backfill.
+- **Refusals first, nothing written:** an RLS-bound role was refused; the
+  demo principal, which lacks `TOKEN_DETOKENIZE`, failed the round trip.
+- **Real backfill:** dry run, then the run itself (1 tokenized), then a
+  re-run (0 candidates).
+- **New connection under enforcement:**
+  - **Database:** `account_number` and the event's `account_number`/`iban`
+    are the token; no row holds the raw value.
+  - **Masked view:** `******************5432` for the new connection,
+    `******************6819` for the backfilled one.
+  - **Full-number route:** the reader gets the exact number for both rows;
+    the demo principal gets 403.
+
+**7. Still open.**
+- **Raw column kept.** `bank_connections.account_number` still holds the
+  raw value for **backfilled** rows. Dropping or overwriting it is a
+  separate decision, the same "don't delete evidence" discipline as the
+  outbox migrations.
+- **Orphan vault tokens.** A refused backfill attempt leaves its tokens in
+  the vault: encrypted, unreferenced, append-only.
+- **List/get authorization.** Those routes still have no read authorization
+  (A1). Only the new full-number route does.
+
+**8. A pre-existing routing bug fixed.**
+`RegisterBNK02Routes` mounted its own subrouter at
+`/v1/banking/connections`, which captured `POST /v1/banking/connections`,
+`GET /v1/banking/connections/{id}` and (new) `.../account-number` from
+`RegisterRoutes` and answered **404** in the assembled server. Only the
+`/accounts` aliases worked, although the BNK-02 table above lists
+`GetConnection` as "Done".
+- Found when the live run's first create returned 404.
+- The routes are now registered by full path.
+- `TestAssembledRouter_ConnectionRoutesAreReachable` assembles them as
+  `main.go` does, and fails on the old registration.
+
+**9. Verification.**
+- **Tests:**
+  - `internal/store/backfill_test.go`: tokenizes every legacy row,
+    including a REVOKED one and skipping an empty one; a round-trip mismatch
+    writes nothing; a tokenize failure writes nothing; the RLS-bound role is
+    refused; a dry run writes nothing; an enforced create writes its token
+    row with no raw value in the event; token rows are append-only; a
+    backfilled row reads like a new one.
+  - `internal/handler/tokenized_read_test.go`: the masked view and the
+    full-number route's grant, vault-denied, vault-down and unconfigured
+    cases, and a legacy row.
+  - `internal/handler/assembled_router_test.go`.
+- **Deliberate breaks, each caught:**
+  - round-trip comparison removed;
+  - RLS-role check removed;
+  - raw `iban` left in the event;
+  - masked view masking the token;
+  - the route's own grant check removed;
+  - the token served on a vault failure;
+  - the subrouter mount restored.
