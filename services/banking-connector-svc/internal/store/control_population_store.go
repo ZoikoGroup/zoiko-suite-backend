@@ -195,7 +195,7 @@ func (p *PgStore) ControlPopulation(ctx context.Context, q domain.ControlPopulat
 				"statement_id":     stmtID,
 				"status":           status,
 				"statement_status": stmtStatus,
-					"direction":        amountDirection(r.Amount),
+				"direction":        amountDirection(r.Amount),
 			}
 		} else {
 			r.Attributes = map[string]string{
