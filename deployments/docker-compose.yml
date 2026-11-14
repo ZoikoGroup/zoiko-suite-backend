@@ -4264,8 +4264,15 @@ services:
   # fingerprint before authorizing) is not yet wired.
   payee-banking-identity-svc:
     build:
-      context: ../services/payee-banking-identity-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing - see the Dockerfile.
+      # Was context: ../services/payee-banking-identity-svc, dockerfile:
+      # Dockerfile -- that context cannot resolve the eventing replace
+      # directive at all (Docker cannot COPY from outside its build context),
+      # so this service's image had never actually built under this file.
+      # Found running this stack for real under TOKENIZATION_ENFORCED=true,
+      # the same bug as banking-connector-svc's phase-7 block.
+      context: ../services
+      dockerfile: payee-banking-identity-svc/Dockerfile
     container_name: payee-banking-identity-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4276,6 +4283,12 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payee_banking_identity?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payee-banking-identity.events"
+      # Required, no default (ZS-EVENT-001 §4 residency region) -- missing
+      # here entirely, so every mutating call would fail building its outbox
+      # event. Found running banking-connector-svc's identical gap for real
+      # (docker-compose.phase7.yml): "residency region \"\" must be a
+      # controlled lower-case code".
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       COUNTERPARTY_SERVICE_URL: "http://counterparty-management-svc:8124"
       # Account-identifier tokenization (Security Standard §14). OFF by default
@@ -4290,6 +4303,14 @@ services:
       # privileged read of an already-tokenized destination detokenizes.
       TOKENIZATION_SERVICE_URL: "http://host.docker.internal:8143"
       TOKENIZATION_ENFORCED: "${TOKENIZATION_ENFORCED:-false}"
+    # host.docker.internal does NOT resolve on this bridge network without
+    # this -- found running banking-connector-svc's identical setup for real
+    # (docker-compose.phase7.yml): every TOKENIZATION_SERVICE_URL call failed
+    # to resolve until this was added. host-gateway is Docker's own alias for
+    # whatever address reaches the host from inside a container; harmless on
+    # setups where it already resolves.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
