@@ -154,13 +154,25 @@ const destColumns = `
 	approved_by_principal_id, approved_at, superseded_by_destination_id, suspend_reason,
 	proposed_by_principal_id, created_at, updated_at`
 
-// destReadColumns is every destination READ's projection: destColumns plus
-// the destination's account-identifier token (migration 000007), or '' when
-// it has none — the read-precedence rule's input (domain.PayeeDestination.
-// Tokenized). destColumns alone stays the INSERT column list. The token is a
-// correlated subquery on the unaliased table name, so it works in SELECT ...
-// FROM payee_destinations and in INSERT/UPDATE ... RETURNING alike.
-const destReadColumns = destColumns + `,
+// destReadColumns is every destination READ's projection: destColumns, with
+// account_identifier wrapped in COALESCE(..., ”) -- a scrubbed row
+// (cmd/scrub-legacy-raw, migration 000008) has NULL there, which pgx cannot
+// scan into domain.PayeeDestination.AccountIdentifier's plain string field;
+// found live running the scrub for real, every read of a scrubbed
+// destination failed with a scan error until this was added. destColumns
+// alone (with the raw, non-NULL-safe column name) stays the INSERT column
+// list, where COALESCE in the target list would be invalid syntax. Plus the
+// destination's account-identifier token (migration 000007), or ” when it
+// has none — the read-precedence rule's input (domain.PayeeDestination.
+// Tokenized). The token is a correlated subquery on the unaliased table
+// name, so it works in SELECT ... FROM payee_destinations and in
+// INSERT/UPDATE ... RETURNING alike.
+const destReadColumns = `
+	destination_id, tenant_id, legal_entity_id, party_ref, scope, financial_institution,
+	COALESCE(account_identifier, ''), account_last4, country_code, currency, payee_name, source_type, fingerprint, status,
+	verification_method, verification_evidence_ref, verified_by_principal_id, verified_at,
+	approved_by_principal_id, approved_at, superseded_by_destination_id, suspend_reason,
+	proposed_by_principal_id, created_at, updated_at,
 	COALESCE((SELECT t.account_identifier_token FROM payee_destination_identifier_tokens t
 		WHERE t.destination_id = payee_destinations.destination_id), '')`
 
