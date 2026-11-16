@@ -129,29 +129,43 @@ func TestPayerAccountMustBeActiveVerifiedOfTheEntityInTheCurrency(t *testing.T) 
 	assert.ErrorIs(t, NewPayerAccounts(deadURL(), nil).Verify(context.Background(), "t-1", "p", "le-1", "acct-1", "GBP"), domain.ErrPayerUnavailable)
 }
 
-func TestApprovalPolicyFailsClosedButNoPolicyIsWithinThreshold(t *testing.T) {
+func policyReq() PolicyRequest {
+	return PolicyRequest{TenantID: "t-1", PrincipalID: "p-1", LegalEntityID: "le-1", Amount: "12345.50", Currency: "GBP",
+		DecisionID: "payroll-wfp-i-1-v3", Authorization: "Bearer env", CorrelationID: "corr-1"}
+}
+
+func TestApprovalPolicyFailsClosed(t *testing.T) {
 	var got map[string]any
+	var hdr http.Header
 	url := server(t, func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &got)
+		hdr = r.Header.Clone()
 		_, _ = w.Write([]byte(`{"result":"APPROVAL_REQUIRED","policy_version_id":"pol-9"}`))
 	})
-	res, ver, err := NewApprovalPolicy(url, nil).Evaluate(context.Background(), "t-1", "p-1", "le-1", 12345.5)
+	res, ver, err := NewApprovalPolicy(url, nil).Evaluate(context.Background(), policyReq())
 	require.NoError(t, err)
 	assert.Equal(t, "APPROVAL_REQUIRED", res)
 	assert.Equal(t, "pol-9", ver)
 	assert.Equal(t, "APPROVAL_THRESHOLD", got["policy_type"])
 	assert.Equal(t, "le-1", got["legal_entity_id"])
-	assert.JSONEq(t, `{"amount":12345.5}`, string(mustJSON(got["action_context"])))
+	assert.Equal(t, "payroll-wfp-i-1-v3", got["decision_id"], "a stable decision id: a retry records one decision")
+	assert.JSONEq(t, `{"amount":12345.50,"currency":"GBP"}`, string(mustJSON(got["action_context"])), "the exact decimal, never a float")
+	assert.Equal(t, "p-1", hdr.Get("X-Principal-Id"))
+	assert.Equal(t, "Bearer env", hdr.Get("Authorization"), "the caller's envelope is forwarded")
 
-	res, _, err = NewApprovalPolicy(server(t, reply(404, ``)), nil).Evaluate(context.Background(), "t", "p", "le", 1)
+	res, _, err = NewApprovalPolicy(server(t, reply(404, ``)), nil).Evaluate(context.Background(), policyReq())
 	require.NoError(t, err)
-	assert.Equal(t, "WITHIN_THRESHOLD", res, "policy-svc's own stance on an unconfigured policy")
+	assert.Equal(t, "APPROVAL_REQUIRED", res, "no governing threshold fails closed: the payment needs approval")
+	for name, want := range map[int]error{401: domain.ErrPolicyAccessDenied, 403: domain.ErrPolicyAccessDenied, 400: domain.ErrPolicyRefused, 409: domain.ErrPolicyRefused} {
+		_, _, err := NewApprovalPolicy(server(t, reply(name, ``)), nil).Evaluate(context.Background(), policyReq())
+		assert.ErrorIs(t, err, want, "HTTP %d", name)
+	}
 	for name, h := range map[string]http.HandlerFunc{"500": reply(500, ``), "garbage": reply(200, `nope`), "empty result": reply(200, `{}`)} {
-		_, _, err := NewApprovalPolicy(server(t, h), nil).Evaluate(context.Background(), "t", "p", "le", 1)
+		_, _, err := NewApprovalPolicy(server(t, h), nil).Evaluate(context.Background(), policyReq())
 		assert.ErrorIs(t, err, domain.ErrPolicyUnavailable, name)
 	}
-	_, _, err = NewApprovalPolicy(deadURL(), nil).Evaluate(context.Background(), "t", "p", "le", 1)
+	_, _, err = NewApprovalPolicy(deadURL(), nil).Evaluate(context.Background(), policyReq())
 	assert.ErrorIs(t, err, domain.ErrPolicyUnavailable)
 }
 

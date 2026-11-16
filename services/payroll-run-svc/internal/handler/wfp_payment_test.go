@@ -178,11 +178,12 @@ func (p *stubPayers) Verify(_ context.Context, _, principal, _, account, _ strin
 type stubPolicy struct {
 	result string
 	err    error
-	amount float64
+	amount string
+	req    paydeps.PolicyRequest
 }
 
-func (p *stubPolicy) Evaluate(_ context.Context, _, _, _ string, amount float64) (string, string, error) {
-	p.amount = amount
+func (p *stubPolicy) Evaluate(_ context.Context, in paydeps.PolicyRequest) (string, string, error) {
+	p.amount, p.req = in.Amount, in
 	if p.result == "" {
 		return "WITHIN_THRESHOLD", "pol-1", p.err
 	}
@@ -407,7 +408,9 @@ func TestWFP07_ValidateRepinsThePayeeAndAsksPolicyForTheQuorum(t *testing.T) {
 	require.NotNil(t, st.validated)
 	assert.Equal(t, "v2", st.validated.Payee.Version, "validation pins the destination as it is now")
 	assert.Equal(t, 1, st.validated.RequiredSignatures)
-	assert.Equal(t, 2400.4, g.policy.amount)
+	assert.Equal(t, "2400.4000", g.policy.amount, "the exact decimal, never a float")
+	assert.Equal(t, "GBP", g.policy.req.Currency)
+	assert.Regexp(t, `^payroll-wfp-.+-v\d+$`, g.policy.req.DecisionID, "one decision per instruction version")
 
 	g.policy.result = domain.PolicyApproval
 	rr = accDo(g.router, "POST", path, map[string]any{"expected_version": 3}, "p-1")

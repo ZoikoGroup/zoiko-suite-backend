@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -50,7 +51,7 @@ type PayerAccountVerifier interface {
 	Verify(ctx context.Context, tenantID, principalID, legalEntityID, accountID, currency string) error
 }
 type ApprovalThresholds interface {
-	Evaluate(ctx context.Context, tenantID, principalID, legalEntityID string, amount float64) (string, string, error)
+	Evaluate(ctx context.Context, in paydeps.PolicyRequest) (string, string, error)
 }
 type BankingHandoffer interface {
 	Handoff(ctx context.Context, r paydeps.HandoffRequest) (*paydeps.Attempt, error)
@@ -164,6 +165,10 @@ func (h *WFPPaymentHandler) writeErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
 	case errors.Is(err, domain.ErrIdentityMissing):
 		writeError(w, http.StatusUnauthorized, "identity_missing", err.Error())
+	case errors.Is(err, domain.ErrPolicyAccessDenied):
+		writeError(w, http.StatusForbidden, "POLICY_EVALUATE_DENIED", err.Error())
+	case errors.Is(err, domain.ErrPolicyRefused):
+		writeError(w, http.StatusUnprocessableEntity, "POLICY_REFUSED", err.Error())
 	default:
 		h.log.Error("wfp-07 store failure", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "payroll payment store unavailable")
@@ -431,12 +436,15 @@ func (h *WFPPaymentHandler) Validate(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, err)
 		return
 	}
-	amount, err := domain.ToLedgerAmount(p.Amount)
-	if err != nil {
+	if _, err := domain.ToLedgerAmount(p.Amount); err != nil {
 		h.writeErr(w, err)
 		return
 	}
-	result, policyVersion, err := h.deps.Policy.Evaluate(r.Context(), tenant, principal, p.LegalEntityID, amount)
+	result, policyVersion, err := h.deps.Policy.Evaluate(r.Context(), paydeps.PolicyRequest{
+		TenantID: tenant, PrincipalID: principal, LegalEntityID: p.LegalEntityID, Amount: p.Amount, Currency: p.Currency,
+		DecisionID:    fmt.Sprintf("payroll-wfp-%s-v%d", p.InstructionID, version),
+		Authorization: r.Header.Get("Authorization"), CorrelationID: getCorrelationID(r),
+	})
 	if err != nil {
 		h.writeErr(w, err)
 		return

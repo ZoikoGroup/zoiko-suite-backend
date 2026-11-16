@@ -251,6 +251,8 @@ var (
 	ErrPayerAccountInvalid        = errorString("the paying account is not an ACTIVE, ownership-verified account of this legal entity in this currency")
 	ErrPayerUnavailable           = errorString("treasury-svc could not be reached to validate the paying account")
 	ErrPolicyUnavailable          = errorString("policy-svc could not be reached to assess the approval threshold")
+	ErrPolicyAccessDenied         = errorString("policy-svc refused the caller: the principal may not evaluate approval thresholds")
+	ErrPolicyRefused              = errorString("policy-svc refused the evaluation request (amount, currency or decision id)")
 	ErrWorkerProfileUnavailable   = errorString("employee-master-svc could not be reached to resolve the worker's payee")
 	ErrApprovalInvalidated        = errorString("the payee, amount, account or result changed since validation; the approval no longer applies")
 	ErrSoDPreparerOrReceiver      = errorString("separation of duties: the preparer and the principal who received the result cannot approve its payment")
