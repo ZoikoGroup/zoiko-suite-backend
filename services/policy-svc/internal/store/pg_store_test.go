@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -727,6 +728,69 @@ func headerValue(m kafka.Message, key string) string {
 // ── control tests and attestations ───────────────────────────────────────────
 
 // Audit row "Control-test / attestation reads are scoped".
+// Migration 000010: the outbox, the evidence outbox and the activation
+// schedule are under FORCE RLS. A request transaction sees its own tenant's
+// rows and platform rows; only the relay context sees every tenant's.
+func TestRelayTables_RLS(t *testing.T) {
+	e := newEnv(t)
+	pA := e.family(t, tenantA, sp(tenantA), "RLS-A")
+	e.family(t, tenantB, sp(tenantB), "RLS-B")
+	vA := e.draft(t, tenantA, pA, sp(tenantA), nil, e.clock.Add(48*time.Hour), `{"threshold_amount": 1}`)
+	e.release(t, tenantA, vA) // future effective_from: SCHEDULED, one schedule row for tenant A
+
+	if n := e.count(t, `SELECT COUNT(*) FROM policy_activation_schedule WHERE tenant_id = $1`, tenantA); n != 1 {
+		t.Fatalf("setup: want 1 schedule row for tenant A, got %d", n)
+	}
+
+	read := func(tenant string, relay bool, table string) int {
+		t.Helper()
+		var n int
+		err := pgx.BeginFunc(context.Background(), e.app, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(context.Background(), `SELECT set_config('app.tenant_id', $1, true)`, tenant); err != nil {
+				return err
+			}
+			if relay {
+				if _, err := tx.Exec(context.Background(), `SELECT set_config('app.outbox_relay', 'true', true)`); err != nil {
+					return err
+				}
+			}
+			return tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM `+table+` WHERE tenant_id IS NOT NULL`).Scan(&n)
+		})
+		if err != nil {
+			t.Fatalf("read %s: %v", table, err)
+		}
+		return n
+	}
+	for _, table := range []string{"outbox", "policy_activation_schedule"} {
+		all := e.count(t, `SELECT COUNT(*) FROM `+table+` WHERE tenant_id IS NOT NULL`)
+		own := e.count(t, `SELECT COUNT(*) FROM `+table+` WHERE tenant_id = $1`, tenantB)
+		if got := read(tenantB, false, table); got != own {
+			t.Errorf("%s: tenant B sees %d tenant rows, want only its own %d", table, got, own)
+		}
+		if got := read("", false, table); got != 0 {
+			t.Errorf("%s: a connection with no tenant and no relay flag sees %d tenant rows", table, got)
+		}
+		if got := read("", true, table); got != all {
+			t.Errorf("%s: the relay sees %d rows, want all %d", table, got, all)
+		}
+	}
+	if got := read(tenantB, false, "policy_activation_schedule"); got != 0 {
+		t.Errorf("tenant B sees tenant A's schedule row")
+	}
+
+	// A request transaction cannot write a row for another tenant.
+	err := pgx.BeginFunc(context.Background(), e.app, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(context.Background(), `SELECT set_config('app.tenant_id', $1, true)`, tenantB); err != nil {
+			return err
+		}
+		_, err := tx.Exec(context.Background(), `INSERT INTO outbox (event_type, tenant_id, idempotency_key, payload) VALUES ('x', $1, 'k', '{}')`, tenantA)
+		return err
+	})
+	if err == nil {
+		t.Fatal("tenant B wrote an outbox row for tenant A")
+	}
+}
+
 func TestControlTests_TenantIsolation(t *testing.T) {
 	e := newEnv(t)
 	def, created, err := e.s.CreateControlTestDefinition(as(tenantA), domain.CreateControlTestDefinitionParams{

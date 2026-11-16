@@ -72,6 +72,20 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 	return tx.Commit(ctx)
 }
 
+// withRelay runs fn in a transaction marked as a background worker
+// (app.outbox_relay): the evidence relay, the activation scheduler and the
+// backlog metrics act for no tenant, and migration 000010's row-level
+// security lets only this context read every tenant's outbox, evidence-outbox
+// and schedule rows.
+func (s *PgStore) withRelay(ctx context.Context, fn func(pgx.Tx) error) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('app.outbox_relay', 'true', true);`); err != nil {
+			return fmt.Errorf("set_config app.outbox_relay: %w", err)
+		}
+		return fn(tx)
+	})
+}
+
 // isUniqueViolation reports whether err is a Postgres unique_violation.
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
@@ -967,23 +981,27 @@ func (s *PgStore) PromoteDueActivations(ctx context.Context, limit int) (int, er
 		id     string
 		tenant *string
 	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT policy_version_id, tenant_id FROM policy_activation_schedule
-		WHERE due_at <= $1 ORDER BY due_at LIMIT $2;`, s.now(), limit)
-	if err != nil {
-		return 0, s.domainError("PromoteDueActivations", err)
-	}
+	// Listing is cross-tenant (the relay context); each promotion then runs
+	// in its own version's tenant scope.
 	var list []due
-	for rows.Next() {
-		var d due
-		if err := rows.Scan(&d.id, &d.tenant); err != nil {
-			rows.Close()
-			return 0, s.domainError("PromoteDueActivations", err)
+	err := s.withRelay(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT policy_version_id, tenant_id FROM policy_activation_schedule
+			WHERE due_at <= $1 ORDER BY due_at LIMIT $2;`, s.now(), limit)
+		if err != nil {
+			return err
 		}
-		list = append(list, d)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var d due
+			if err := rows.Scan(&d.id, &d.tenant); err != nil {
+				return err
+			}
+			list = append(list, d)
+		}
+		return rows.Err()
+	})
+	if err != nil {
 		return 0, s.domainError("PromoteDueActivations", err)
 	}
 

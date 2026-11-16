@@ -66,9 +66,11 @@ func (s *PgStore) enqueue(ctx context.Context, tx pgx.Tx, ev OutboxEvent) error 
 
 // OutboxBacklog counts unpublished events and the age of the oldest one.
 func (s *PgStore) OutboxBacklog(ctx context.Context) (pending int64, oldestSeconds float64, err error) {
-	err = s.pool.QueryRow(ctx, `
-		SELECT COUNT(*), COALESCE(EXTRACT(EPOCH FROM (now() - MIN(created_at))), 0)::float8
-		FROM outbox WHERE published_at IS NULL;`).Scan(&pending, &oldestSeconds)
+	err = s.withRelay(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COUNT(*), COALESCE(EXTRACT(EPOCH FROM (now() - MIN(created_at))), 0)::float8
+			FROM outbox WHERE published_at IS NULL;`).Scan(&pending, &oldestSeconds)
+	})
 	if err != nil {
 		return 0, 0, s.domainError("OutboxBacklog", err)
 	}

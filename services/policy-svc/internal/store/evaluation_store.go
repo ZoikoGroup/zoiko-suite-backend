@@ -138,73 +138,80 @@ type PendingEvidence struct {
 // not pick the same rows while this one is delivering them.
 func (s *PgStore) ClaimEvidence(ctx context.Context, limit int, lease time.Duration) ([]PendingEvidence, error) {
 	now := s.now()
-	rows, err := s.pool.Query(ctx, `
-		UPDATE policy_evidence_outbox
-		SET next_attempt_at = $3, attempts = attempts + 1
-		WHERE evaluation_id IN (
-			SELECT evaluation_id FROM policy_evidence_outbox
-			WHERE delivered_at IS NULL AND failed_at IS NULL AND next_attempt_at <= $1
-			ORDER BY next_attempt_at
-			LIMIT $2
-			FOR UPDATE SKIP LOCKED
-		)
-		RETURNING evaluation_id, tenant_id, attempts;`, now, limit, now.Add(lease))
+	var out []PendingEvidence
+	err := s.withRelay(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			UPDATE policy_evidence_outbox
+			SET next_attempt_at = $3, attempts = attempts + 1
+			WHERE evaluation_id IN (
+				SELECT evaluation_id FROM policy_evidence_outbox
+				WHERE delivered_at IS NULL AND failed_at IS NULL AND next_attempt_at <= $1
+				ORDER BY next_attempt_at
+				LIMIT $2
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING evaluation_id, tenant_id, attempts;`, now, limit, now.Add(lease))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p PendingEvidence
+			if err := rows.Scan(&p.EvaluationID, &p.TenantID, &p.Attempts); err != nil {
+				return err
+			}
+			out = append(out, p)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, s.domainError("ClaimEvidence", err)
 	}
-	defer rows.Close()
-	var out []PendingEvidence
-	for rows.Next() {
-		var p PendingEvidence
-		if err := rows.Scan(&p.EvaluationID, &p.TenantID, &p.Attempts); err != nil {
-			return nil, s.domainError("ClaimEvidence", err)
-		}
-		out = append(out, p)
+	return out, nil
+}
+
+// relayExec runs one statement against the evidence outbox as the relay.
+func (s *PgStore) relayExec(ctx context.Context, op, sql string, args ...any) error {
+	if err := s.withRelay(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, sql, args...)
+		return err
+	}); err != nil {
+		return s.domainError(op, err)
 	}
-	return out, rows.Err()
+	return nil
 }
 
 // MarkEvidenceDelivered records that the ledger holds the evaluation.
 func (s *PgStore) MarkEvidenceDelivered(ctx context.Context, evaluationID string) error {
-	_, err := s.pool.Exec(ctx, `
+	return s.relayExec(ctx, "MarkEvidenceDelivered", `
 		UPDATE policy_evidence_outbox SET delivered_at = $2, last_error = NULL
 		WHERE evaluation_id = $1;`, evaluationID, s.now())
-	if err != nil {
-		return s.domainError("MarkEvidenceDelivered", err)
-	}
-	return nil
 }
 
 // MarkEvidenceRetry records a failed attempt and when to try again.
 func (s *PgStore) MarkEvidenceRetry(ctx context.Context, evaluationID, lastError string, next time.Time) error {
-	_, err := s.pool.Exec(ctx, `
+	return s.relayExec(ctx, "MarkEvidenceRetry", `
 		UPDATE policy_evidence_outbox SET last_error = $2, next_attempt_at = $3
 		WHERE evaluation_id = $1;`, evaluationID, lastError, next)
-	if err != nil {
-		return s.domainError("MarkEvidenceRetry", err)
-	}
-	return nil
 }
 
 // MarkEvidenceFailed parks an evaluation the ledger refused for good. It is
 // kept (and counted in EvidenceBacklog) for an operator, never retried.
 func (s *PgStore) MarkEvidenceFailed(ctx context.Context, evaluationID, lastError string) error {
-	_, err := s.pool.Exec(ctx, `
+	return s.relayExec(ctx, "MarkEvidenceFailed", `
 		UPDATE policy_evidence_outbox SET last_error = $2, failed_at = $3
 		WHERE evaluation_id = $1;`, evaluationID, lastError, s.now())
-	if err != nil {
-		return s.domainError("MarkEvidenceFailed", err)
-	}
-	return nil
 }
 
 // EvidenceBacklog counts evaluations not yet in the ledger, and those parked.
 func (s *PgStore) EvidenceBacklog(ctx context.Context) (pending, failed int64, err error) {
-	err = s.pool.QueryRow(ctx, `
-		SELECT
-			COUNT(*) FILTER (WHERE delivered_at IS NULL AND failed_at IS NULL),
-			COUNT(*) FILTER (WHERE failed_at IS NOT NULL)
-		FROM policy_evidence_outbox;`).Scan(&pending, &failed)
+	err = s.withRelay(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE delivered_at IS NULL AND failed_at IS NULL),
+				COUNT(*) FILTER (WHERE failed_at IS NOT NULL)
+			FROM policy_evidence_outbox;`).Scan(&pending, &failed)
+	})
 	if err != nil {
 		return 0, 0, s.domainError("EvidenceBacklog", err)
 	}

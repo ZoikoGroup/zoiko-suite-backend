@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -117,45 +118,57 @@ func backoff(attempts int) time.Duration {
 	return d
 }
 
+// AsRelay runs fn in a transaction marked as the relay (app.outbox_relay).
+// Row-level security (migration 000010) lets only that context read every
+// tenant's outbox rows; a request transaction sees its own tenant's.
+func AsRelay(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error {
+	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('app.outbox_relay', 'true', true);`); err != nil {
+			return fmt.Errorf("set_config app.outbox_relay: %w", err)
+		}
+		return fn(tx)
+	})
+}
+
 // RunOnce claims and publishes one batch, returning how many were published.
 func (w *Worker) RunOnce(ctx context.Context) int {
 	now := time.Now().UTC()
 	// The lease (next_attempt_at pushed forward) keeps a second instance off
 	// these rows while this one publishes them.
-	rows, err := w.pool.Query(ctx, `
-		UPDATE outbox SET next_attempt_at = $3, attempts = attempts + 1
-		WHERE outbox_id IN (
-			SELECT outbox_id FROM outbox
-			WHERE published_at IS NULL AND next_attempt_at <= $1
-			ORDER BY outbox_id
-			LIMIT $2
-			FOR UPDATE SKIP LOCKED
-		)
-		RETURNING outbox_id, event_id::text, event_type, event_version, schema_version, source_service,
-		          tenant_id::text, legal_entity_id::text, actor_id, correlation_id, causation_id,
-		          idempotency_key, aggregate_id, aggregate_version, payload, created_at, attempts,
-		          jurisdiction_context;`,
-		now, batchSize, now.Add(lease))
+	var batch []row
+	err := AsRelay(ctx, w.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			UPDATE outbox SET next_attempt_at = $3, attempts = attempts + 1
+			WHERE outbox_id IN (
+				SELECT outbox_id FROM outbox
+				WHERE published_at IS NULL AND next_attempt_at <= $1
+				ORDER BY outbox_id
+				LIMIT $2
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING outbox_id, event_id::text, event_type, event_version, schema_version, source_service,
+			          tenant_id::text, legal_entity_id::text, actor_id, correlation_id, causation_id,
+			          idempotency_key, aggregate_id, aggregate_version, payload, created_at, attempts,
+			          jurisdiction_context;`,
+			now, batchSize, now.Add(lease))
+		if err != nil {
+			return fmt.Errorf("claim: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.id, &r.eventID, &r.eventType, &r.eventVersion, &r.schemaVersion, &r.sourceService,
+				&r.tenantID, &r.legalEntityID, &r.actorID, &r.correlationID, &r.causationID,
+				&r.idempotencyKey, &r.aggregateID, &r.aggregateVersion, &r.payload, &r.createdAt, &r.attempts,
+				&r.jurisdiction); err != nil {
+				return fmt.Errorf("scan: %w", err)
+			}
+			batch = append(batch, r)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		w.log.Error("outbox: claim failed", zap.Error(err))
-		return 0
-	}
-	var batch []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.eventID, &r.eventType, &r.eventVersion, &r.schemaVersion, &r.sourceService,
-			&r.tenantID, &r.legalEntityID, &r.actorID, &r.correlationID, &r.causationID,
-			&r.idempotencyKey, &r.aggregateID, &r.aggregateVersion, &r.payload, &r.createdAt, &r.attempts,
-			&r.jurisdiction); err != nil {
-			rows.Close()
-			w.log.Error("outbox: scan failed", zap.Error(err))
-			return 0
-		}
-		batch = append(batch, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		w.log.Error("outbox: rows error", zap.Error(err))
 		return 0
 	}
 	if len(batch) == 0 {
@@ -196,7 +209,10 @@ func (w *Worker) RunOnce(ctx context.Context) int {
 	}
 
 	if len(published) > 0 {
-		if _, err := w.pool.Exec(ctx, `UPDATE outbox SET published_at = $2, last_error = NULL WHERE outbox_id = ANY($1);`, published, time.Now().UTC()); err != nil {
+		if err := AsRelay(ctx, w.pool, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE outbox SET published_at = $2, last_error = NULL WHERE outbox_id = ANY($1);`, published, time.Now().UTC())
+			return err
+		}); err != nil {
 			// Re-published after the lease: consumers dedupe by event_id.
 			w.log.Error("outbox: mark published failed", zap.Error(err))
 		}
@@ -207,7 +223,10 @@ func (w *Worker) RunOnce(ctx context.Context) int {
 			continue
 		}
 		next := time.Now().UTC().Add(backoff(r.attempts))
-		if _, uerr := w.pool.Exec(ctx, `UPDATE outbox SET last_error = $2, next_attempt_at = $3 WHERE outbox_id = $1;`, r.id, msg, next); uerr != nil {
+		if uerr := AsRelay(ctx, w.pool, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE outbox SET last_error = $2, next_attempt_at = $3 WHERE outbox_id = $1;`, r.id, msg, next)
+			return err
+		}); uerr != nil {
 			w.log.Error("outbox: mark retry failed", zap.Error(uerr))
 		}
 	}
