@@ -17,18 +17,14 @@ import (
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/domain"
 	"zoiko.io/policy-svc/internal/envelope"
+	"zoiko.io/policy-svc/internal/evaluator"
 	"zoiko.io/policy-svc/internal/resolve"
 	"zoiko.io/policy-svc/internal/store"
 )
 
-const (
-	policyTypeApprovalThreshold = "APPROVAL_THRESHOLD"
-
-	// evaluatorThreshold names the evaluator and its contract version; it is
-	// stored with every evaluation so a replay knows which logic produced it
-	// (V-001 PDC-I-03, PDC-I-17).
-	evaluatorThreshold = "policy-svc/APPROVAL_THRESHOLD@1"
-)
+// policyTypeApprovalThreshold is the one type with authoring-time payload
+// rules here; its evaluation is internal/evaluator's.
+const policyTypeApprovalThreshold = evaluator.TypeApprovalThreshold
 
 // evaluateRequest is the wire shape for POST /v1/policies/evaluate.
 //
@@ -211,19 +207,12 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var result string
-	var selectedRules []string
-	switch req.PolicyType {
-	case policyTypeApprovalThreshold:
-		result, selectedRules, ok = h.evaluateApprovalThreshold(w, r, req, selected)
-		if !ok {
-			return
-		}
-	default:
-		writeError(w, r, http.StatusNotImplemented, codeNotImplemented, "policy_type_not_implemented", "",
-			map[string]any{"policy_type": req.PolicyType})
+	outcome, err := evaluator.Evaluate(req.PolicyType, selected.PolicyVersionID, selected.RulePayload, req.ActionContext)
+	if err != nil {
+		h.writeEvaluationError(w, r, req.PolicyType, selected.PolicyVersionID, err)
 		return
 	}
+	result, selectedRules := outcome.Result, outcome.SelectedRuleIDs
 
 	action := req.ActionContext
 	if len(action) == 0 {
@@ -251,7 +240,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		ArtifactDigest:         selected.ArtifactDigest,
 		RuleBasis:              fmt.Sprintf("%s:%s", selected.PolicyCode, selected.PolicyVersionID),
 		SelectedRuleIDs:        selectedRules,
-		EvaluatorVersion:       evaluatorThreshold,
+		EvaluatorVersion:       outcome.EvaluatorVersion,
 		CorrelationID:          correlationID,
 		CausationID:            causation,
 		RequestID:              requestID,
@@ -365,97 +354,36 @@ func digestMatches(v *domain.ApplicablePolicyVersion) bool {
 }
 
 // decodeExactAmount extracts field from a raw JSON object as an exact
-// decimal value — never float64 (V-001 PDC-I-11). Returns (nil, false, nil)
-// if the field is absent or null.
+// decimal value, never float64 (V-001 PDC-I-11). Returns (nil, false, nil) if
+// the field is absent or null.
 func decodeExactAmount(raw json.RawMessage, field string) (*big.Rat, bool, error) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var obj map[string]interface{}
-	if err := dec.Decode(&obj); err != nil {
-		return nil, false, err
-	}
-	v, present := obj[field]
-	if !present || v == nil {
-		return nil, false, nil
-	}
-	num, ok := v.(json.Number)
-	if !ok {
-		return nil, false, fmt.Errorf("%s is not a JSON number", field)
-	}
-	amount, ok := new(big.Rat).SetString(num.String())
-	if !ok {
-		return nil, false, fmt.Errorf("%s is not a valid decimal number: %q", field, num.String())
-	}
-	return amount, true, nil
+	return evaluator.ExactAmount(raw, field)
 }
 
-// evaluateApprovalThreshold compares action_context.amount with the
-// version's rule_payload.threshold_amount, exactly: amount > threshold is
-// APPROVAL_REQUIRED, otherwise WITHIN_THRESHOLD. It writes its own error
-// response and returns ok=false when it cannot decide.
-func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Request, req evaluateRequest, v *domain.ApplicablePolicyVersion) (string, []string, bool) {
-	threshold, present, err := decodeExactAmount(v.RulePayload, "threshold_amount")
-	if err != nil || !present {
-		h.log.Error("evaluateApprovalThreshold: policy version has invalid/missing threshold_amount",
-			zap.String("policy_version_id", v.PolicyVersionID), zap.Error(err))
-		writeError(w, r, http.StatusInternalServerError, codeEvidenceIntegrity, "invalid_policy_payload", "", nil)
-		return "", nil, false
-	}
-	if len(req.ActionContext) == 0 {
-		missingField(w, r, "action_context.amount")
-		return "", nil, false
-	}
-	amount, present, err := decodeExactAmount(req.ActionContext, "amount")
-	if err != nil || !present {
-		missingField(w, r, "action_context.amount")
-		return "", nil, false
-	}
-	// A negative amount is always "within" any threshold, so accepting one
-	// would let a caller route any action past approval by flipping its sign.
-	// A refund or reversal is evaluated on its absolute size by its caller.
-	if amount.Sign() < 0 {
+// writeEvaluationError answers an evaluation the evaluator could not decide:
+// a problem with the caller's input is 400 naming the field, a type with no
+// evaluator is 501, and a stored payload that cannot be evaluated is 500
+// EVIDENCE_INTEGRITY_FAILED (authoring validation should have refused it).
+func (h *Handler) writeEvaluationError(w http.ResponseWriter, r *http.Request, policyType, versionID string, err error) {
+	var in *evaluator.InputError
+	switch {
+	case errors.As(err, &in) && in.Reason == "missing":
+		missingField(w, r, in.Field)
+	case errors.As(err, &in) && in.Reason == "currency_mismatch":
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "currency_mismatch",
+			"action_context.currency does not match the governing threshold's currency",
+			map[string]any{"field": in.Field, "policy_currency": in.Detail})
+	case errors.As(err, &in):
 		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_action_context",
-			"action_context.amount must not be negative", map[string]any{"field": "action_context.amount"})
-		return "", nil, false
+			in.Field+" "+in.Detail, map[string]any{"field": in.Field})
+	case errors.Is(err, evaluator.ErrNotImplemented):
+		writeError(w, r, http.StatusNotImplemented, codeNotImplemented, "policy_type_not_implemented", "",
+			map[string]any{"policy_type": policyType})
+	default:
+		h.log.Error("Evaluate: policy version cannot be evaluated",
+			zap.String("policy_version_id", versionID), zap.Error(err))
+		writeError(w, r, http.StatusInternalServerError, codeEvidenceIntegrity, "invalid_policy_payload", "", nil)
 	}
-	// A threshold in one currency says nothing about an amount in another
-	// (V-001 PDC-I-11: currency is explicit). A version that names its
-	// currency is only ever compared with an amount in that currency; the
-	// caller converts, this service never does.
-	rules := []string{v.PolicyVersionID + "#threshold_amount"}
-	if want := stringField(v.RulePayload, "currency"); want != "" {
-		got := stringField(req.ActionContext, "currency")
-		switch {
-		case got == "":
-			missingField(w, r, "action_context.currency")
-			return "", nil, false
-		case got != want:
-			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "currency_mismatch",
-				"action_context.currency does not match the governing threshold's currency",
-				map[string]any{"field": "action_context.currency", "policy_currency": want})
-			return "", nil, false
-		}
-		rules = append(rules, v.PolicyVersionID+"#currency")
-	}
-	result := "WITHIN_THRESHOLD"
-	if amount.Cmp(threshold) > 0 {
-		result = "APPROVAL_REQUIRED"
-	}
-	return result, rules, true
-}
-
-// stringField reads a top-level string field of a JSON object, "" if absent
-// or not a string.
-func stringField(raw json.RawMessage, field string) string {
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(raw, &obj) != nil {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(obj[field], &s) != nil {
-		return ""
-	}
-	return s
 }
 
 // canonicalOutcome maps this service's evaluation result onto the governance

@@ -345,6 +345,7 @@ func newRig(s *stubStore, c *stubCandidates, az *stubAuthz, opts ...rigOption) *
 	handler.RegisterControlTestRoutes(r, h)
 	handler.RegisterListRoutes(r, h)
 	handler.RegisterOperationRoutes(r, h)
+	handler.RegisterCertificationRoutes(r, h)
 	return &rig{store: s, cands: c, az: az, r: r}
 }
 

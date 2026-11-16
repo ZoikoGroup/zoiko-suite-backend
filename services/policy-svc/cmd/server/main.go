@@ -137,7 +137,10 @@ func main() {
 	defer outboxWorker.Stop()
 
 	// ── 4. Store, resolution cache, background workers ────────────────────────
-	pgStore := store.New(pool, log)
+	pgStore := store.New(pool, log).WithCertificationGate(cfg.CertificationGate)
+	if cfg.CertificationGate != "enforce" {
+		log.Warn("PDC-05 certification gate is not enforced: uncertified versions can be activated", zap.String("mode", cfg.CertificationGate))
+	}
 	resolutionCache := cache.New(pgStore)
 
 	// Evaluation evidence is stored before Evaluate answers; this relay
@@ -257,6 +260,7 @@ func main() {
 	handler.RegisterControlTestRoutes(r, h)
 	handler.RegisterListRoutes(r, h)
 	handler.RegisterOperationRoutes(r, h)
+	handler.RegisterCertificationRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

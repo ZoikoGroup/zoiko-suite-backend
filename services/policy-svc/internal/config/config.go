@@ -97,6 +97,12 @@ type Config struct {
 	// Local and dev generate one per process, which only means a cursor does
 	// not survive a restart.
 	CursorSigningKey []byte
+
+	// CertificationGate is the PDC-05 activation gate (POLICY_CERTIFICATION_GATE):
+	// enforce (default) refuses to activate or schedule an evaluable version
+	// that is not certified against its family's current test suite; warn logs
+	// and admits; off skips it.
+	CertificationGate string
 }
 
 // LocalEnv reports whether Env names a developer tier.
@@ -205,6 +211,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.CursorSigningKey = key
+	cfg.CertificationGate = strings.ToLower(env("POLICY_CERTIFICATION_GATE", "enforce"))
 	return cfg, nil
 }
 

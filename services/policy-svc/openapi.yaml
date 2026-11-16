@@ -1195,6 +1195,297 @@ paths:
         '409': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  # ── V-001 PDC-05: certification suites, waivers, simulation, rollback ─────
+  /v1/policies/{policy_id}/test-cases:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+    post:
+      tags: [certification]
+      operationId: createPolicyTestCase
+      x-spec-operation: V-001 PDC-05 §17.1 unit/boundary/regression examples
+      description: Adds a case to an evaluable family's suite (POLICY_TEST_MANAGE). Idempotent on test_code. A case's content never changes; retire it and add another. Changing the suite makes every earlier certification STALE.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateTestCaseRequest'}
+      responses:
+        '201': {description: Added, content: {application/json: {schema: {$ref: '#/components/schemas/TestCase'}}}}
+        '200': {description: Replay, content: {application/json: {schema: {$ref: '#/components/schemas/TestCase'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [certification]
+      operationId: listPolicyTestCases
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': {description: One page (API-4), content: {application/json: {schema: {$ref: '#/components/schemas/TestCasePage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policies/{policy_id}/test-cases/{test_case_id}/retire:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - {name: test_case_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [certification]
+      operationId: retirePolicyTestCase
+      x-spec-operation: V-001 PDC-05 test definitions versioned
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': {description: Retired (or already retired), content: {application/json: {schema: {$ref: '#/components/schemas/TestCase'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/test-runs:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [certification]
+      operationId: runPolicyTestSuite
+      x-spec-operation: V-001 PDC-05 §18.1 step 2 run mandatory suites
+      description: Runs the family's suite (static validation first) against the version with the production evaluator, in memory, and stores the immutable run (POLICY_TEST_RUN). A PASS emits policy.version.certified.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201': {description: The run, content: {application/json: {schema: {$ref: '#/components/schemas/TestRun'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [certification]
+      operationId: listPolicyTestRuns
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': {description: 'One page (API-4), newest first', content: {application/json: {schema: {$ref: '#/components/schemas/TestRunPage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-test-runs/{test_run_id}:
+    parameters:
+      - {name: test_run_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [certification]
+      operationId: getPolicyTestRun
+      responses:
+        '200': {description: The run, content: {application/json: {schema: {$ref: '#/components/schemas/TestRun'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/certification:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    get:
+      tags: [certification]
+      operationId: getPolicyVersionCertification
+      x-spec-operation: V-001 PDC-05 certification state
+      description: The version's standing against its family's current suite (CERTIFIED, WAIVED, FAILED, NOT_RUN, STALE, EXEMPT_NO_EVALUATOR). Activation and scheduling need CERTIFIED, WAIVED or EXEMPT_NO_EVALUATOR while POLICY_CERTIFICATION_GATE=enforce (409 CERTIFICATION_REQUIRED otherwise).
+      responses:
+        '200': {description: The certification, content: {application/json: {schema: {$ref: '#/components/schemas/Certification'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/waivers:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [certification]
+      operationId: requestPolicyTestWaiver
+      x-spec-operation: V-001 PDC-I-25 typed, scoped, time-bounded waiver
+      description: Asks to waive one failed mandatory case of this version (POLICY_WAIVER_REQUEST). expires_at is required and at most 180 days away. A waiver never turns a run into a pass.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RequestWaiverRequest'}
+      responses:
+        '201': {description: Requested, content: {application/json: {schema: {$ref: '#/components/schemas/Waiver'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [certification]
+      operationId: listPolicyTestWaivers
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': {description: One page (API-4), content: {application/json: {schema: {$ref: '#/components/schemas/WaiverPage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-waivers/{waiver_id}/approve:
+    parameters:
+      - {name: waiver_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [certification]
+      operationId: approvePolicyTestWaiver
+      description: Approves a requested waiver (POLICY_WAIVER_APPROVE). The requester can never approve (403 SOD_CONFLICT); an expired waiver cannot be approved.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': {description: Approved (or already approved), content: {application/json: {schema: {$ref: '#/components/schemas/Waiver'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-waivers/{waiver_id}/revoke:
+    parameters:
+      - {name: waiver_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [certification]
+      operationId: revokePolicyTestWaiver
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReasonRequest'}
+      responses:
+        '200': {description: Revoked (or already revoked), content: {application/json: {schema: {$ref: '#/components/schemas/Waiver'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/simulations:
+    post:
+      tags: [certification]
+      operationId: simulatePolicyVersion
+      x-spec-operation: V-001 PDC-05 POST /v1/simulations (differential simulation)
+      description: >-
+        Evaluates the candidate (and the baseline: the named version, or the one governing the
+        candidate's scope now; with none, the as-issued results) over the caller tenant's own
+        recorded evaluations of that policy type, at most 5000, synchronously. Writes only the
+        simulation and policy.simulation.completed (POLICY_SIMULATE). A truncated corpus or an
+        input the candidate cannot evaluate makes it PARTIAL.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SimulateRequest'}
+      responses:
+        '201': {description: The simulation, content: {application/json: {schema: {$ref: '#/components/schemas/SimulationRun'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/simulations/{simulation_id}:
+    parameters:
+      - {name: simulation_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [certification]
+      operationId: getPolicySimulation
+      responses:
+        '200': {description: The simulation, content: {application/json: {schema: {$ref: '#/components/schemas/SimulationRun'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/simulations/{simulation_id}/differences:
+    parameters:
+      - {name: simulation_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [certification]
+      operationId: listPolicySimulationDifferences
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': {description: 'The decisions whose result would change, one page (API-4)', content: {application/json: {schema: {$ref: '#/components/schemas/SimulationDiffPage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/rollback-draft:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [certification]
+      operationId: draftPolicyRollback
+      x-spec-operation: V-001 PDC-05 §18.1 step 8 governed rollback (PDC-I-28)
+      description: >-
+        Creates a DRAFT in the target's family and scope carrying the target's payload, taking
+        effect now or later (never backdated: NP-48). The target must have governed once
+        (SUPERSEDED or RETIRED). The draft then goes through review, approval, certification
+        and activation. POLICY_VERSION_CREATE (_GLOBAL for a global target).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rationale]
+              properties:
+                rationale: {type: string}
+                effective_from: {type: string, format: date-time, description: 'Default now; never in the past.'}
+      responses:
+        '201': {$ref: '#/components/responses/PolicyVersion'}
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
 components:
   securitySchemes:
     gatewayIdentity:
@@ -1299,6 +1590,153 @@ components:
         - type: object
           properties:
             items: {type: array, items: {$ref: '#/components/schemas/Attestation'}}
+    CreateTestCaseRequest:
+      type: object
+      required: [test_code, layer, description, action_context, expected_result]
+      properties:
+        test_case_id: {type: string, format: uuid}
+        test_code: {type: string, maxLength: 128}
+        layer: {type: string, enum: [UNIT, BOUNDARY, REGRESSION]}
+        mandatory: {type: boolean, default: true}
+        description: {type: string}
+        action_context: {type: object, additionalProperties: true}
+        expected_result: {type: string, description: 'The evaluator result expected, or INPUT_ERROR for a negative test.'}
+    TestCase:
+      allOf:
+        - $ref: '#/components/schemas/CreateTestCaseRequest'
+        - type: object
+          properties:
+            policy_id: {type: string, format: uuid}
+            tenant_id: {type: string, format: uuid}
+            test_status: {type: string, enum: [ACTIVE, RETIRED]}
+            created_at: {type: string, format: date-time}
+            created_by_principal_id: {type: string}
+            retired_at: {type: string, format: date-time}
+            retired_by_principal_id: {type: string}
+    CaseResult:
+      type: object
+      properties:
+        test_case_id: {type: string, format: uuid}
+        test_code: {type: string}
+        mandatory: {type: boolean}
+        expected: {type: string}
+        actual: {type: string}
+        error: {type: string}
+        passed: {type: boolean}
+    TestRun:
+      type: object
+      properties:
+        test_run_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        policy_id: {type: string, format: uuid}
+        policy_version_id: {type: string, format: uuid}
+        artifact_digest: {type: string}
+        suite_hash: {type: string}
+        evaluator_version: {type: string}
+        run_status: {type: string, enum: [PASS, FAIL]}
+        case_count: {type: integer}
+        failed_count: {type: integer}
+        static_findings: {type: array, items: {type: string}}
+        results: {type: array, items: {$ref: '#/components/schemas/CaseResult'}}
+        run_by_principal_id: {type: string}
+        run_at: {type: string, format: date-time}
+    Certification:
+      type: object
+      properties:
+        policy_version_id: {type: string, format: uuid}
+        status: {type: string, enum: [CERTIFIED, WAIVED, FAILED, NOT_RUN, STALE, EXEMPT_NO_EVALUATOR]}
+        suite_hash: {type: string}
+        test_run_id: {type: string, format: uuid}
+        unwaived_failed_test_case_ids: {type: array, items: {type: string, format: uuid}}
+        reason: {type: string}
+    RequestWaiverRequest:
+      type: object
+      required: [test_case_id, reason_code, justification, expires_at]
+      properties:
+        waiver_id: {type: string, format: uuid}
+        test_case_id: {type: string, format: uuid}
+        reason_code: {type: string, maxLength: 64}
+        justification: {type: string}
+        expires_at: {type: string, format: date-time, description: 'In the future and at most 180 days away.'}
+    Waiver:
+      type: object
+      properties:
+        waiver_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        policy_version_id: {type: string, format: uuid}
+        test_case_id: {type: string, format: uuid}
+        reason_code: {type: string}
+        justification: {type: string}
+        expires_at: {type: string, format: date-time}
+        waiver_status: {type: string, enum: [REQUESTED, APPROVED, REVOKED]}
+        requested_by_principal_id: {type: string}
+        requested_at: {type: string, format: date-time}
+        approved_by_principal_id: {type: string}
+        approved_at: {type: string, format: date-time}
+        revoked_by_principal_id: {type: string}
+        revoked_at: {type: string, format: date-time}
+        revocation_reason: {type: string}
+    SimulateRequest:
+      type: object
+      required: [candidate_version_id]
+      properties:
+        simulation_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid, description: 'Must equal the verified tenant when sent.'}
+        candidate_version_id: {type: string, format: uuid}
+        baseline_version_id: {type: string, format: uuid}
+        corpus_from: {type: string, format: date-time, description: 'Default 90 days before corpus_to.'}
+        corpus_to: {type: string, format: date-time, description: 'Default now.'}
+        corpus_limit: {type: integer, minimum: 0, maximum: 5000}
+    SimulationRun:
+      type: object
+      properties:
+        simulation_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        policy_type: {type: string}
+        candidate_version_id: {type: string, format: uuid}
+        baseline_version_id: {type: string, format: uuid}
+        sim_status: {type: string, enum: [COMPLETE, PARTIAL, FAILED]}
+        corpus_from: {type: string, format: date-time}
+        corpus_to: {type: string, format: date-time}
+        corpus_limit: {type: integer}
+        corpus_size: {type: integer}
+        changed_count: {type: integer}
+        error_count: {type: integer}
+        requested_by_principal_id: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+    SimulationDiff:
+      type: object
+      properties:
+        evaluation_id: {type: string, format: uuid}
+        decision_id: {type: string}
+        baseline_result: {type: string}
+        candidate_result: {type: string}
+        candidate_error: {type: string}
+    TestCasePage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/TestCase'}}
+    TestRunPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/TestRun'}}
+    WaiverPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/Waiver'}}
+    SimulationDiffPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/SimulationDiff'}}
     PolicySummary:
       type: object
       properties:

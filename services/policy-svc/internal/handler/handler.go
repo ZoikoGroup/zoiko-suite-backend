@@ -956,6 +956,9 @@ func (h *Handler) writeTransitionError(w http.ResponseWriter, r *http.Request, v
 	switch {
 	case errors.Is(err, domain.ErrPolicyVersionNotFound):
 		writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", extra)
+	case errors.Is(err, domain.ErrCertificationRequired):
+		writeError(w, r, http.StatusConflict, codeCertificationRequired, "certification_required",
+			err.Error()+": run the family's test suite against this version (POST /v1/policy-versions/{id}/test-runs) and waive or fix what fails", extra)
 	case errors.Is(err, domain.ErrApprovalRequired):
 		writeError(w, r, http.StatusConflict, codeApprovalRequired, "approval_required",
 			"submit the version for review and have an independent approver approve it before activation", extra)

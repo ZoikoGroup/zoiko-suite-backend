@@ -104,6 +104,8 @@ func (s *PgStore) domainError(op string, err error) error {
 		domain.ErrControlTestDefinitionNotFound, domain.ErrAttestationNotFound,
 		domain.ErrInvalidAttestationTransition,
 		domain.ErrPolicyRetired, domain.ErrPolicyInUse, domain.ErrEvidenceAlreadyRecorded,
+		domain.ErrCertificationRequired, domain.ErrTestCaseNotFound, domain.ErrWaiverNotFound, domain.ErrInvalidWaiver,
+		domain.ErrNoEvaluator, domain.ErrSimulationNotFound, domain.ErrNotRollbackEligible,
 	} {
 		if errors.Is(err, known) {
 			return err
@@ -123,6 +125,19 @@ type PgStore struct {
 	// the same process clock, so a version activated a moment ago is never
 	// "not yet known" because the database's clock ran ahead.
 	now func() time.Time
+
+	// gate is the PDC-05 certification gate on activation (domain.Gate*).
+	// New leaves it off; cmd/server sets POLICY_CERTIFICATION_GATE.
+	gate string
+}
+
+// WithCertificationGate sets the PDC-05 certification gate: "enforce"
+// refuses to activate or schedule an evaluable version that is not certified
+// against its family's current suite, "warn" logs and admits, anything else
+// is off.
+func (s *PgStore) WithCertificationGate(mode string) *PgStore {
+	s.gate = mode
+	return s
 }
 
 // New returns an open PgStore. Caller must call pool.Close() when done.
@@ -767,6 +782,11 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 		}
 		if err := expected(); err != nil {
 			return nil, err
+		}
+		if from == domain.StatusApproved {
+			if err := s.guardCertification(ctx, tx, v, policyType); err != nil {
+				return nil, err
+			}
 		}
 		if from == domain.StatusApproved {
 			if err := s.guardSupersession(ctx, tx, v, cmd.SupersedesVersionID); err != nil {
