@@ -23,10 +23,27 @@ type Store interface {
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// eventRegion is the residency region stamped on every outbox event. Empty
+	// means none was configured, and every event-emitting CRM write then fails
+	// (envelope.New refuses it) rather than emitting an event with a guessed region.
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by every outbox event.
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {

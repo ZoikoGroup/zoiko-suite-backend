@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/counterparty-management-svc/internal/domain"
 	"zoiko.io/counterparty-management-svc/internal/middleware"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 )
 
 // CRMStore is BIZ-06's own persistence contract — kept separate from the
@@ -69,6 +72,49 @@ func scanRelationship(row pgx.Row) (*domain.Relationship, error) {
 	return r, err
 }
 
+// crmEvent describes one BIZ-06 domain event, written to the eventing outbox
+// in the same transaction as the state change (ZS-EVENT-001 section 6), so a
+// committed change can never lose its event and a rolled-back one never emits.
+type crmEvent struct {
+	fact          string // past-tense fact under com.zoikosuite.business.<aggregate>.
+	legacyType    string // pre-standard event_type existing consumers filter on
+	aggregateType string
+	aggregateID   string
+	tenantID      string
+	legalEntityID string
+	correlationID string
+	actorID       string
+	data          map[string]any
+}
+
+func (s *PgStore) enqueueCRMEvent(ctx context.Context, tx pgx.Tx, e crmEvent) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.business." + e.aggregateType + "." + e.fact,
+		LegacyType:      e.legacyType,
+		Service:         "counterparty-management-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        e.tenantID,
+		LegalEntityID:   e.legalEntityID,
+		AggregateType:   e.aggregateType,
+		AggregateID:     e.aggregateID,
+		CorrelationID:   e.correlationID,
+		ActorID:         e.actorID,
+		ResidencyRegion: s.eventRegion,
+		// Relationship, pipeline and interaction data is confidential business
+		// information. Free-text notes are deliberately never put in an event.
+		Classification: envelope.Confidential,
+		Data:           e.data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s.%s event: %w", e.aggregateType, e.fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue %s.%s event: %w", e.aggregateType, e.fact, err)
+	}
+	return nil
+}
+
 // CreateRelationship — BIZ-06's own CreateRelationship command. If
 // CandidateCounterpartyID is supplied, the relationship lands with
 // party_link_status=CANDIDATE — an unresolved, unconfirmed match, never
@@ -99,6 +145,17 @@ func (s *PgStore) CreateRelationship(ctx context.Context, p domain.CreateRelatio
 	rel, err := scanRelationship(row)
 	if err != nil {
 		return nil, fmt.Errorf("insert relationship: %w", err)
+	}
+	if err := s.enqueueCRMEvent(ctx, tx, crmEvent{
+		fact: "created", legacyType: "relationship.created", aggregateType: "relationship", aggregateID: rel.RelationshipID,
+		tenantID: rel.TenantID, legalEntityID: rel.LegalEntityID, correlationID: p.CorrelationID, actorID: p.CreatedByPrincipalID,
+		data: map[string]any{
+			"relationship_id": rel.RelationshipID, "tenant_id": rel.TenantID, "legal_entity_id": rel.LegalEntityID,
+			"status": string(rel.Status), "party_link_status": string(rel.PartyLinkStatus),
+			"source": rel.Source, "channel": rel.Channel, "owner_principal_id": rel.OwnerPrincipalID,
+		},
+	}); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -183,12 +240,12 @@ func (s *PgStore) LogInteraction(ctx context.Context, p domain.LogInteractionPar
 	}
 	// Just proves the relationship exists in this tenant — interactions
 	// do not mutate the relationship row itself, so no locking is needed.
-	var relExists int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM relationships WHERE relationship_id=$1 AND tenant_id=$2`, p.RelationshipID, p.TenantID).Scan(&relExists); err != nil {
+	var legalEntityID string
+	if err := tx.QueryRow(ctx, `SELECT legal_entity_id FROM relationships WHERE relationship_id=$1 AND tenant_id=$2`, p.RelationshipID, p.TenantID).Scan(&legalEntityID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrRelationshipNotFound
+		}
 		return nil, err
-	}
-	if relExists == 0 {
-		return nil, domain.ErrRelationshipNotFound
 	}
 
 	interactionID := "int-" + uuid.New().String()
@@ -203,6 +260,17 @@ func (s *PgStore) LogInteraction(ctx context.Context, p domain.LogInteractionPar
 	i, err := scanInteraction(tx.QueryRow(ctx, query, args...))
 	if err != nil {
 		return nil, fmt.Errorf("insert interaction: %w", err)
+	}
+	if err := s.enqueueCRMEvent(ctx, tx, crmEvent{
+		fact: "logged", legacyType: "interaction.logged", aggregateType: "interaction", aggregateID: i.InteractionID,
+		tenantID: i.TenantID, legalEntityID: legalEntityID, correlationID: p.CorrelationID, actorID: p.LoggedByPrincipalID,
+		data: map[string]any{
+			"interaction_id": i.InteractionID, "relationship_id": i.RelationshipID, "tenant_id": i.TenantID,
+			"legal_entity_id": legalEntityID, "interaction_type": i.InteractionType, "channel": i.Channel,
+			"occurred_at": i.OccurredAt.UTC().Format(time.RFC3339Nano),
+		},
+	}); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -304,6 +372,17 @@ func (s *PgStore) CreateOpportunity(ctx context.Context, p domain.CreateOpportun
 		"oppstr-"+uuid.New().String(), opportunityID, p.TenantID, "", string(domain.StageLead), p.CreatedByPrincipalID, "opportunity created"); err != nil {
 		return nil, err
 	}
+	if err := s.enqueueCRMEvent(ctx, tx, crmEvent{
+		fact: "created", legacyType: "opportunity.created", aggregateType: "opportunity", aggregateID: o.OpportunityID,
+		tenantID: o.TenantID, legalEntityID: o.LegalEntityID, correlationID: p.CorrelationID, actorID: p.CreatedByPrincipalID,
+		data: map[string]any{
+			"opportunity_id": o.OpportunityID, "relationship_id": o.RelationshipID, "tenant_id": o.TenantID,
+			"legal_entity_id": o.LegalEntityID, "name": o.Name, "value": o.Value, "currency": o.Currency,
+			"stage": string(o.Stage), "status": string(o.Status),
+		},
+	}); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -365,6 +444,16 @@ func (s *PgStore) UpdateStage(ctx context.Context, p domain.UpdateStageParams) (
 	if _, err := tx.Exec(ctx, `INSERT INTO opportunity_stage_transitions (transition_id, opportunity_id, tenant_id, from_stage, to_stage, actor_principal_id, reason)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
 		"oppstr-"+uuid.New().String(), p.OpportunityID, p.TenantID, string(current.Stage), string(p.Stage), p.ActorPrincipalID, p.Reason); err != nil {
+		return nil, err
+	}
+	if err := s.enqueueCRMEvent(ctx, tx, crmEvent{
+		fact: "stage-changed", legacyType: "opportunity.stage_changed", aggregateType: "opportunity", aggregateID: o.OpportunityID,
+		tenantID: o.TenantID, legalEntityID: o.LegalEntityID, correlationID: p.CorrelationID, actorID: p.ActorPrincipalID,
+		data: map[string]any{
+			"opportunity_id": o.OpportunityID, "relationship_id": o.RelationshipID, "tenant_id": o.TenantID,
+			"legal_entity_id": o.LegalEntityID, "from_stage": string(current.Stage), "to_stage": string(o.Stage), "reason": p.Reason,
+		},
+	}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -550,6 +639,16 @@ func (s *PgStore) CloseRelationship(ctx context.Context, p domain.CloseRelations
 		WHERE relationship_id=$1 AND tenant_id=$2 RETURNING `+relationshipColumns,
 		p.RelationshipID, p.TenantID, p.ActorPrincipalID, p.ClosureReason))
 	if err != nil {
+		return nil, err
+	}
+	if err := s.enqueueCRMEvent(ctx, tx, crmEvent{
+		fact: "closed", legacyType: "relationship.closed", aggregateType: "relationship", aggregateID: r.RelationshipID,
+		tenantID: r.TenantID, legalEntityID: r.LegalEntityID, correlationID: p.CorrelationID, actorID: p.ActorPrincipalID,
+		data: map[string]any{
+			"relationship_id": r.RelationshipID, "tenant_id": r.TenantID, "legal_entity_id": r.LegalEntityID,
+			"status": string(r.Status), "closed_by": p.ActorPrincipalID, "closure_reason": p.ClosureReason,
+		},
+	}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
