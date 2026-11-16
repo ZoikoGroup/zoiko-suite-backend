@@ -65,6 +65,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	_, filename, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")

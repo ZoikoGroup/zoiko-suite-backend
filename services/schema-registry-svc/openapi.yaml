@@ -2,7 +2,7 @@ openapi: "3.1.0"
 
 info:
   title: Schema Registry Service
-  version: "1.2.0"
+  version: "1.3.0"
   description: |
     Canonical registry of event payload contracts for ZoikoSuite.
 
@@ -28,14 +28,30 @@ info:
     - Compatibility is evaluated against the current latest version only, and
       only under `BACKWARD` (the default); `NONE` skips the check and is
       recorded on the version. The analysis recurses into nested object
-      properties and array item schemas, but it compares a **subset** of JSON
-      Schema only: the declared `type` (a single string), `properties`,
-      `required`, and the `items` schema of arrays. It does NOT compare `enum`,
-      `format`, `pattern`, numeric or length bounds, `additionalProperties`,
-      `$ref`, or `allOf`/`anyOf`/`oneOf`; a change confined to those is
-      accepted. A schema that declares `type` as an array (for example
+      properties and array item schemas. It compares the declared `type` (a
+      single string), `properties`, `required` and the `items` schema of
+      arrays, and the validation keywords `enum`, `pattern`, `format`,
+      `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`,
+      `minLength`/`maxLength`, `minItems`/`maxItems` and `additionalProperties`
+      (ZS-EVENT-001 section 12). Anything that can reject a previously valid
+      event is breaking: a bound raised or lowered to reject more, a newly added
+      bound, pattern, format or enum, an enum value removed, and
+      `additionalProperties: false` where extras were allowed. An enum value
+      ADDED is also refused, because the registry cannot prove consumers
+      tolerate unknown values (section 12 makes that conditional); register it
+      under `NONE` as a recorded, controlled migration. Relaxing validation
+      (dropping or loosening a bound, pattern, format or enum) is compatible.
+      It does NOT compare `$ref` or `allOf`/`anyOf`/`oneOf`; a change confined
+      to those is accepted. A keyword whose value is not of the expected JSON
+      type is not compared, so an unusual stored schema can still be evolved.
+      A schema that declares `type` as an array (for example
       `["string","null"]`) is refused at registration with 400, because it
       cannot be compared. Violations are returned in a stable, sorted order.
+    - Ownership is sticky (ZS-EVENT-001 E-02). `owning_service` names the one
+      producer of an event. A later version that names a different owner is
+      refused with 409, under `NONE` as well; omitting it inherits the
+      registered owner. Changing the owner is a major architecture change, not
+      a schema registration.
     - Reads require a verified principal (`X-Principal-Id`). No separate read
       permission is checked — the requirement for one is not specified.
     - Registration is governed: authorization-svc must grant SCHEMA_PUBLISH on
@@ -402,7 +418,7 @@ components:
         force each time.
 
         - `BACKWARD` — the default. A new version must not break existing
-          consumers of the current latest version, as far as the compared subset
+          consumers of the current latest version, as far as the compared keywords
           of JSON Schema (see the invariants) can tell.
         - `NONE` — the check is skipped. Exists for the controlled-rollout case
           in §17.2; recorded on the row so the exemption is visible rather than

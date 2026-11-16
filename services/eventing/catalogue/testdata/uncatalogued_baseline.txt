@@ -1,0 +1,2 @@
+# Event types emitted by services that are not in catalogue.json. This list may only shrink.
+# Empty: the 32 types first found by the Wave 3 audit are now catalogued with origin=extension.

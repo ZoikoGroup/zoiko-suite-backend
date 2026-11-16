@@ -1,0 +1,483 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "collection-case": {
+      "address": "zoikosuite.ar.collection-case.v1",
+      "messages": {
+        "closed": {
+          "$ref": "#/components/messages/collection-case.closed"
+        },
+        "opened": {
+          "$ref": "#/components/messages/collection-case.opened"
+        }
+      }
+    },
+    "credit-note": {
+      "address": "zoikosuite.ar.credit-note.v1",
+      "messages": {
+        "issued": {
+          "$ref": "#/components/messages/credit-note.issued"
+        }
+      }
+    },
+    "customer-invoice": {
+      "address": "zoikosuite.ar.customer-invoice.v1",
+      "messages": {
+        "disputed": {
+          "$ref": "#/components/messages/customer-invoice.disputed"
+        },
+        "issued": {
+          "$ref": "#/components/messages/customer-invoice.issued"
+        },
+        "paid": {
+          "$ref": "#/components/messages/customer-invoice.paid"
+        },
+        "partially-paid": {
+          "$ref": "#/components/messages/customer-invoice.partially-paid"
+        },
+        "validated": {
+          "$ref": "#/components/messages/customer-invoice.validated"
+        }
+      }
+    },
+    "debit-note": {
+      "address": "zoikosuite.ar.debit-note.v1",
+      "messages": {
+        "issued": {
+          "$ref": "#/components/messages/debit-note.issued"
+        }
+      }
+    },
+    "quote": {
+      "address": "zoikosuite.ar.quote.v1",
+      "messages": {
+        "accepted": {
+          "$ref": "#/components/messages/quote.accepted"
+        }
+      }
+    },
+    "receivable": {
+      "address": "zoikosuite.ar.receivable.v1",
+      "messages": {
+        "written-off": {
+          "$ref": "#/components/messages/receivable.written-off"
+        }
+      }
+    },
+    "refund": {
+      "address": "zoikosuite.ar.refund.v1",
+      "messages": {
+        "authorized": {
+          "$ref": "#/components/messages/refund.authorized"
+        }
+      }
+    },
+    "sales-order": {
+      "address": "zoikosuite.ar.sales-order.v1",
+      "messages": {
+        "confirmed": {
+          "$ref": "#/components/messages/sales-order.confirmed"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "collection-case.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Collections. Primary consumers / intent: Reporting. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.collection-case.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Collection case: closed.",
+        "title": "collection-case closed",
+        "x-zoiko-event-type": "com.zoikosuite.ar.collection-case.closed",
+        "x-zoiko-origin": "spec"
+      },
+      "collection-case.opened": {
+        "contentType": "application/json",
+        "description": "Producer: Collections. Primary consumers / intent: Task/case workflow. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.collection-case.opened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Collection case: opened.",
+        "title": "collection-case opened",
+        "x-zoiko-event-type": "com.zoikosuite.ar.collection-case.opened",
+        "x-zoiko-origin": "spec"
+      },
+      "credit-note.issued": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Accounting/receivables/tax. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.credit-note.issued",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Credit note: issued.",
+        "title": "credit-note issued",
+        "x-zoiko-event-type": "com.zoikosuite.ar.credit-note.issued",
+        "x-zoiko-origin": "spec"
+      },
+      "customer-invoice.disputed": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Collections/case management. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.customer-invoice.disputed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Customer invoice: disputed.",
+        "title": "customer-invoice disputed",
+        "x-zoiko-event-type": "com.zoikosuite.ar.customer-invoice.disputed",
+        "x-zoiko-origin": "spec"
+      },
+      "customer-invoice.issued": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Accounting/receivables/reporting. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.customer-invoice.issued",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Customer invoice: issued.",
+        "title": "customer-invoice issued",
+        "x-zoiko-event-type": "com.zoikosuite.ar.customer-invoice.issued",
+        "x-zoiko-origin": "spec"
+      },
+      "customer-invoice.paid": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Receivables/reporting. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.customer-invoice.paid",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Customer invoice: paid.",
+        "title": "customer-invoice paid",
+        "x-zoiko-event-type": "com.zoikosuite.ar.customer-invoice.paid",
+        "x-zoiko-origin": "spec"
+      },
+      "customer-invoice.partially-paid": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Receivables/reporting. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.customer-invoice.partially-paid",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Customer invoice: partially-paid.",
+        "title": "customer-invoice partially-paid",
+        "x-zoiko-event-type": "com.zoikosuite.ar.customer-invoice.partially-paid",
+        "x-zoiko-origin": "spec"
+      },
+      "customer-invoice.validated": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Issue workflow. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.customer-invoice.validated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Customer invoice: validated.",
+        "title": "customer-invoice validated",
+        "x-zoiko-event-type": "com.zoikosuite.ar.customer-invoice.validated",
+        "x-zoiko-origin": "spec"
+      },
+      "debit-note.issued": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Accounting/receivables/tax. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.debit-note.issued",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Debit note: issued.",
+        "title": "debit-note issued",
+        "x-zoiko-event-type": "com.zoikosuite.ar.debit-note.issued",
+        "x-zoiko-origin": "spec"
+      },
+      "quote.accepted": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Sales order/workflow. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.quote.accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Quote: accepted.",
+        "title": "quote accepted",
+        "x-zoiko-event-type": "com.zoikosuite.ar.quote.accepted",
+        "x-zoiko-origin": "spec"
+      },
+      "receivable.written-off": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Accounting/reporting. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.receivable.written-off",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Receivable: written-off.",
+        "title": "receivable written-off",
+        "x-zoiko-event-type": "com.zoikosuite.ar.receivable.written-off",
+        "x-zoiko-origin": "spec"
+      },
+      "refund.authorized": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Payments/accounting. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.refund.authorized",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Refund: authorized.",
+        "title": "refund authorized",
+        "x-zoiko-event-type": "com.zoikosuite.ar.refund.authorized",
+        "x-zoiko-origin": "spec"
+      },
+      "sales-order.confirmed": {
+        "contentType": "application/json",
+        "description": "Producer: AR. Primary consumers / intent: Fulfillment/invoicing. Family: Accounts Receivable & Revenue. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ar.sales-order.confirmed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Sales order: confirmed.",
+        "title": "sales-order confirmed",
+        "x-zoiko-event-type": "com.zoikosuite.ar.sales-order.confirmed",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite ar domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.collection-case": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/collection-case"
+      },
+      "description": "Producer(s): Collections. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/collection-case/messages/closed"
+        },
+        {
+          "$ref": "#/channels/collection-case/messages/opened"
+        }
+      ],
+      "summary": "Publish collection-case facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.credit-note": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/credit-note"
+      },
+      "description": "Producer(s): AR. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/credit-note/messages/issued"
+        }
+      ],
+      "summary": "Publish credit-note facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.customer-invoice": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/customer-invoice"
+      },
+      "description": "Producer(s): AR. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/customer-invoice/messages/disputed"
+        },
+        {
+          "$ref": "#/channels/customer-invoice/messages/issued"
+        },
+        {
+          "$ref": "#/channels/customer-invoice/messages/paid"
+        },
+        {
+          "$ref": "#/channels/customer-invoice/messages/partially-paid"
+        },
+        {
+          "$ref": "#/channels/customer-invoice/messages/validated"
+        }
+      ],
+      "summary": "Publish customer-invoice facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.debit-note": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/debit-note"
+      },
+      "description": "Producer(s): AR. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/debit-note/messages/issued"
+        }
+      ],
+      "summary": "Publish debit-note facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.quote": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/quote"
+      },
+      "description": "Producer(s): AR. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/quote/messages/accepted"
+        }
+      ],
+      "summary": "Publish quote facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.receivable": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/receivable"
+      },
+      "description": "Producer(s): AR. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/receivable/messages/written-off"
+        }
+      ],
+      "summary": "Publish receivable facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.refund": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/refund"
+      },
+      "description": "Producer(s): AR. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/refund/messages/authorized"
+        }
+      ],
+      "summary": "Publish refund facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.sales-order": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/sales-order"
+      },
+      "description": "Producer(s): AR. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/sales-order/messages/confirmed"
+        }
+      ],
+      "summary": "Publish sales-order facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

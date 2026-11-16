@@ -1,0 +1,28 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.treasury.treasury-transfer.returned (treasury-svc, schema 1.0.0). OBSERVED contract inferred from 3 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "actor_principal": {
+      "type": "string"
+    },
+    "return_reason": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "transfer_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "actor_principal",
+    "return_reason",
+    "status",
+    "tenant_id",
+    "transfer_id"
+  ],
+  "type": "object"
+}

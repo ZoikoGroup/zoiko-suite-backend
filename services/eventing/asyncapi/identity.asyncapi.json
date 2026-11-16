@@ -1,0 +1,804 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "authentication": {
+      "address": "zoikosuite.identity.authentication.v1",
+      "messages": {
+        "succeeded": {
+          "$ref": "#/components/messages/authentication.succeeded"
+        }
+      }
+    },
+    "context": {
+      "address": "zoikosuite.identity.context.v1",
+      "messages": {
+        "resolution-failed": {
+          "$ref": "#/components/messages/context.resolution-failed"
+        },
+        "resolved": {
+          "$ref": "#/components/messages/context.resolved"
+        }
+      }
+    },
+    "federation": {
+      "address": "zoikosuite.identity.federation.v1",
+      "messages": {
+        "activated": {
+          "$ref": "#/components/messages/federation.activated"
+        },
+        "degraded": {
+          "$ref": "#/components/messages/federation.degraded"
+        },
+        "deprovision-applied": {
+          "$ref": "#/components/messages/federation.deprovision-applied"
+        },
+        "deprovision-escalated": {
+          "$ref": "#/components/messages/federation.deprovision-escalated"
+        },
+        "login-denied": {
+          "$ref": "#/components/messages/federation.login-denied"
+        },
+        "login-succeeded": {
+          "$ref": "#/components/messages/federation.login-succeeded"
+        },
+        "mapping-approved": {
+          "$ref": "#/components/messages/federation.mapping-approved"
+        },
+        "mapping-proposed": {
+          "$ref": "#/components/messages/federation.mapping-proposed"
+        },
+        "recovered": {
+          "$ref": "#/components/messages/federation.recovered"
+        },
+        "resumed": {
+          "$ref": "#/components/messages/federation.resumed"
+        },
+        "revoked": {
+          "$ref": "#/components/messages/federation.revoked"
+        },
+        "scim-token-issued": {
+          "$ref": "#/components/messages/federation.scim-token-issued"
+        },
+        "scim-token-revoked": {
+          "$ref": "#/components/messages/federation.scim-token-revoked"
+        },
+        "suspended": {
+          "$ref": "#/components/messages/federation.suspended"
+        },
+        "version-approved": {
+          "$ref": "#/components/messages/federation.version-approved"
+        },
+        "version-proposed": {
+          "$ref": "#/components/messages/federation.version-proposed"
+        },
+        "version-rejected": {
+          "$ref": "#/components/messages/federation.version-rejected"
+        }
+      }
+    },
+    "link": {
+      "address": "zoikosuite.identity.link.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/link.created"
+        }
+      }
+    },
+    "mfa-factor": {
+      "address": "zoikosuite.identity.mfa-factor.v1",
+      "messages": {
+        "enrolled": {
+          "$ref": "#/components/messages/mfa-factor.enrolled"
+        },
+        "reset": {
+          "$ref": "#/components/messages/mfa-factor.reset"
+        }
+      }
+    },
+    "principal": {
+      "address": "zoikosuite.identity.principal.v1",
+      "messages": {
+        "status-changed": {
+          "$ref": "#/components/messages/principal.status-changed"
+        }
+      }
+    },
+    "provisioning": {
+      "address": "zoikosuite.identity.provisioning.v1",
+      "messages": {
+        "applied": {
+          "$ref": "#/components/messages/provisioning.applied"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/provisioning.rejected"
+        }
+      }
+    },
+    "subject": {
+      "address": "zoikosuite.identity.subject.v1",
+      "messages": {
+        "disabled": {
+          "$ref": "#/components/messages/subject.disabled"
+        },
+        "merged": {
+          "$ref": "#/components/messages/subject.merged"
+        }
+      }
+    },
+    "support-context": {
+      "address": "zoikosuite.identity.support-context.v1",
+      "messages": {
+        "attached": {
+          "$ref": "#/components/messages/support-context.attached"
+        },
+        "reviewed": {
+          "$ref": "#/components/messages/support-context.reviewed"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "authentication.succeeded": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.authentication.succeeded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authentication: succeeded.",
+        "title": "authentication succeeded",
+        "x-zoiko-event-type": "com.zoikosuite.identity.authentication.succeeded",
+        "x-zoiko-origin": "extension"
+      },
+      "context.resolution-failed": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.context.resolution-failed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Context: resolution-failed.",
+        "title": "context resolution-failed",
+        "x-zoiko-event-type": "com.zoikosuite.identity.context.resolution-failed",
+        "x-zoiko-origin": "extension"
+      },
+      "context.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.context.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Context: resolved.",
+        "title": "context resolved",
+        "x-zoiko-event-type": "com.zoikosuite.identity.context.resolved",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.activated": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.activated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: activated.",
+        "title": "federation activated",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.activated",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.degraded": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.degraded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: degraded.",
+        "title": "federation degraded",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.degraded",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.deprovision-applied": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.deprovision-applied",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: deprovision-applied.",
+        "title": "federation deprovision-applied",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.deprovision-applied",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.deprovision-escalated": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.deprovision-escalated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: deprovision-escalated.",
+        "title": "federation deprovision-escalated",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.deprovision-escalated",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.login-denied": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.login-denied",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: login-denied.",
+        "title": "federation login-denied",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.login-denied",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.login-succeeded": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.login-succeeded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: login-succeeded.",
+        "title": "federation login-succeeded",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.login-succeeded",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.mapping-approved": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.mapping-approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: mapping-approved.",
+        "title": "federation mapping-approved",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.mapping-approved",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.mapping-proposed": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.mapping-proposed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: mapping-proposed.",
+        "title": "federation mapping-proposed",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.mapping-proposed",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.recovered": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.recovered",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: recovered.",
+        "title": "federation recovered",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.recovered",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.resumed": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.resumed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: resumed.",
+        "title": "federation resumed",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.resumed",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.revoked": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.revoked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: revoked.",
+        "title": "federation revoked",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.revoked",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.scim-token-issued": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.scim-token-issued",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: scim-token-issued.",
+        "title": "federation scim-token-issued",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.scim-token-issued",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.scim-token-revoked": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.scim-token-revoked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: scim-token-revoked.",
+        "title": "federation scim-token-revoked",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.scim-token-revoked",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.suspended": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.suspended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: suspended.",
+        "title": "federation suspended",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.suspended",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.version-approved": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.version-approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: version-approved.",
+        "title": "federation version-approved",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.version-approved",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.version-proposed": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.version-proposed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: version-proposed.",
+        "title": "federation version-proposed",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.version-proposed",
+        "x-zoiko-origin": "extension"
+      },
+      "federation.version-rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.federation.version-rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Federation: version-rejected.",
+        "title": "federation version-rejected",
+        "x-zoiko-event-type": "com.zoikosuite.identity.federation.version-rejected",
+        "x-zoiko-origin": "extension"
+      },
+      "link.created": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.link.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Link: created.",
+        "title": "link created",
+        "x-zoiko-event-type": "com.zoikosuite.identity.link.created",
+        "x-zoiko-origin": "extension"
+      },
+      "mfa-factor.enrolled": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.mfa-factor.enrolled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Mfa Factor: enrolled.",
+        "title": "mfa-factor enrolled",
+        "x-zoiko-event-type": "com.zoikosuite.identity.mfa-factor.enrolled",
+        "x-zoiko-origin": "extension"
+      },
+      "mfa-factor.reset": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.mfa-factor.reset",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Mfa Factor: reset.",
+        "title": "mfa-factor reset",
+        "x-zoiko-event-type": "com.zoikosuite.identity.mfa-factor.reset",
+        "x-zoiko-origin": "extension"
+      },
+      "principal.status-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.principal.status-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Principal: status-changed.",
+        "title": "principal status-changed",
+        "x-zoiko-event-type": "com.zoikosuite.identity.principal.status-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "provisioning.applied": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.provisioning.applied",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Provisioning: applied.",
+        "title": "provisioning applied",
+        "x-zoiko-event-type": "com.zoikosuite.identity.provisioning.applied",
+        "x-zoiko-origin": "extension"
+      },
+      "provisioning.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.provisioning.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Provisioning: rejected.",
+        "title": "provisioning rejected",
+        "x-zoiko-event-type": "com.zoikosuite.identity.provisioning.rejected",
+        "x-zoiko-origin": "extension"
+      },
+      "subject.disabled": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.subject.disabled",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Subject: disabled.",
+        "title": "subject disabled",
+        "x-zoiko-event-type": "com.zoikosuite.identity.subject.disabled",
+        "x-zoiko-origin": "extension"
+      },
+      "subject.merged": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.subject.merged",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Subject: merged.",
+        "title": "subject merged",
+        "x-zoiko-event-type": "com.zoikosuite.identity.subject.merged",
+        "x-zoiko-origin": "extension"
+      },
+      "support-context.attached": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.support-context.attached",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Support Context: attached.",
+        "title": "support-context attached",
+        "x-zoiko-event-type": "com.zoikosuite.identity.support-context.attached",
+        "x-zoiko-origin": "extension"
+      },
+      "support-context.reviewed": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.support-context.reviewed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Support Context: reviewed.",
+        "title": "support-context reviewed",
+        "x-zoiko-event-type": "com.zoikosuite.identity.support-context.reviewed",
+        "x-zoiko-origin": "extension"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite identity domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.authentication": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/authentication"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/authentication/messages/succeeded"
+        }
+      ],
+      "summary": "Publish authentication facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.context": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/context"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/context/messages/resolution-failed"
+        },
+        {
+          "$ref": "#/channels/context/messages/resolved"
+        }
+      ],
+      "summary": "Publish context facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.federation": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/federation"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/federation/messages/activated"
+        },
+        {
+          "$ref": "#/channels/federation/messages/degraded"
+        },
+        {
+          "$ref": "#/channels/federation/messages/deprovision-applied"
+        },
+        {
+          "$ref": "#/channels/federation/messages/deprovision-escalated"
+        },
+        {
+          "$ref": "#/channels/federation/messages/login-denied"
+        },
+        {
+          "$ref": "#/channels/federation/messages/login-succeeded"
+        },
+        {
+          "$ref": "#/channels/federation/messages/mapping-approved"
+        },
+        {
+          "$ref": "#/channels/federation/messages/mapping-proposed"
+        },
+        {
+          "$ref": "#/channels/federation/messages/recovered"
+        },
+        {
+          "$ref": "#/channels/federation/messages/resumed"
+        },
+        {
+          "$ref": "#/channels/federation/messages/revoked"
+        },
+        {
+          "$ref": "#/channels/federation/messages/scim-token-issued"
+        },
+        {
+          "$ref": "#/channels/federation/messages/scim-token-revoked"
+        },
+        {
+          "$ref": "#/channels/federation/messages/suspended"
+        },
+        {
+          "$ref": "#/channels/federation/messages/version-approved"
+        },
+        {
+          "$ref": "#/channels/federation/messages/version-proposed"
+        },
+        {
+          "$ref": "#/channels/federation/messages/version-rejected"
+        }
+      ],
+      "summary": "Publish federation facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.link": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/link"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/link/messages/created"
+        }
+      ],
+      "summary": "Publish link facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.mfa-factor": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/mfa-factor"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/mfa-factor/messages/enrolled"
+        },
+        {
+          "$ref": "#/channels/mfa-factor/messages/reset"
+        }
+      ],
+      "summary": "Publish mfa-factor facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.principal": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/principal"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/principal/messages/status-changed"
+        }
+      ],
+      "summary": "Publish principal facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.provisioning": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/provisioning"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/provisioning/messages/applied"
+        },
+        {
+          "$ref": "#/channels/provisioning/messages/rejected"
+        }
+      ],
+      "summary": "Publish provisioning facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.subject": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/subject"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/subject/messages/disabled"
+        },
+        {
+          "$ref": "#/channels/subject/messages/merged"
+        }
+      ],
+      "summary": "Publish subject facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.support-context": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/support-context"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/support-context/messages/attached"
+        },
+        {
+          "$ref": "#/channels/support-context/messages/reviewed"
+        }
+      ],
+      "summary": "Publish support-context facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

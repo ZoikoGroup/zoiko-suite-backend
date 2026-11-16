@@ -31,7 +31,7 @@ func (r *fedRig) link(t *testing.T, conn, subject, principal string) *federation
 
 func eventFn(m store.IdentityMerge) ([]outbox.Record, error) {
 	return []outbox.Record{{EventID: "evt-merge-" + m.MergeID, EventType: "identity.subject.merged", TenantID: m.TenantID,
-		PartitionKey: m.SurvivorID, Payload: []byte(`{"merge_id":"` + m.MergeID + `"}`)}}, nil
+		PartitionKey: m.SurvivorID, Payload: []byte(`{"payload":{"merge_id":"` + m.MergeID + `"}}`)}}, nil
 }
 
 func (r *fedRig) merge(survivor, duplicate string) (*store.IdentityMerge, bool, error) {
@@ -82,7 +82,7 @@ func TestMerge_MovesLinksDisablesDuplicateAndKeepsItsRow(t *testing.T) {
 		VALUES ('p-1','t-1','HUMAN','new|subject','n@zoiko.io','New','ACTIVE')`)
 	assert.Error(t, err, "a merged-away id is never reused")
 
-	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.subject.merged'`))
+	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.subject.merged'`))
 	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM access_decision_log WHERE action_type='IDENTITY_MERGED_AWAY' AND principal_id='p-1'`))
 	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM access_decision_log WHERE action_type='IDENTITY_MERGED_IN' AND principal_id='p-2'`))
 }
@@ -98,7 +98,7 @@ func TestMerge_IsIdempotentPerDuplicate(t *testing.T) {
 	assert.False(t, created, "the replay makes no second merge")
 	assert.Equal(t, first.MergeID, again.MergeID)
 	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM principal_merges`))
-	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.subject.merged'`), "and no second event")
+	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.subject.merged'`), "and no second event")
 
 	_, _, err = r.merge("p-3", "p-1")
 	assert.ErrorIs(t, err, store.ErrMergeConflict, "a duplicate is merged into one survivor only")
@@ -131,7 +131,7 @@ func TestMerge_RefusalsChangeNothing(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrMergeConflict, "a survivor cannot itself be merged away: merges do not chain")
 
 	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM principal_merges`))
-	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.subject.merged'`))
+	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.subject.merged'`))
 	assert.Equal(t, 1, r.count(t, `SELECT count(*) FROM principals WHERE principal_id='p-4' AND status='ACTIVE'`),
 		"a refused merge leaves the duplicate alone")
 }

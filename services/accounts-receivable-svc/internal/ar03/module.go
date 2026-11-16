@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/accounts-receivable-svc/internal/ar02"
 	"zoiko.io/accounts-receivable-svc/internal/domain"
+	"zoiko.io/accounts-receivable-svc/internal/catalogref"
 	"zoiko.io/accounts-receivable-svc/internal/kit"
 )
 
@@ -22,6 +23,7 @@ type Module struct {
 	deps      kit.Deps
 	profiles  kit.ProfileResolver // AR-01
 	openItems kit.OpenItems       // AR-07; nil until it is wired -> credit exposure is reported unavailable, never guessed
+	catalog   catalogref.Checker  // BIZ-07; nil = a catalog:<offering>:<version> ref cannot be verified -> approval is 503
 }
 
 var (
@@ -377,4 +379,11 @@ func (m *Module) CreateFromQuote(ctx context.Context, tx pgx.Tx, c kit.Caller, i
 		return "", err
 	}
 	return h.OrderID, nil
+}
+
+// WithCatalog wires the BIZ-07 catalog check used at approval for orders whose
+// catalog_version_ref is a catalog:<offering_id>:<version_id> ref.
+func (m *Module) WithCatalog(c catalogref.Checker) *Module {
+	m.catalog = c
+	return m
 }

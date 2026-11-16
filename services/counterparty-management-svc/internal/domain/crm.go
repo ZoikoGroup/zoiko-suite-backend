@@ -176,6 +176,7 @@ type CommercialObjectLink struct {
 // both CounterpartyID-related fields empty to create an unlinked
 // relationship (e.g. before any party identity is known at all).
 type CreateRelationshipParams struct {
+	CorrelationID                     string
 	TenantID, LegalEntityID           string
 	CandidateCounterpartyID           string
 	Source, Channel, OwnerPrincipalID string
@@ -188,17 +189,20 @@ type ConfirmPartyLinkParams struct {
 }
 
 type LogInteractionParams struct {
+	CorrelationID                                                                  string
 	RelationshipID, TenantID, InteractionType, Channel, Notes, LoggedByPrincipalID string
 	OccurredAt                                                                     *time.Time
 }
 
 type CreateOpportunityParams struct {
+	CorrelationID                                                             string
 	RelationshipID, TenantID, LegalEntityID, Name, Currency, OwnerPrincipalID string
 	Value                                                                     float64
 	CreatedByPrincipalID                                                      string
 }
 
 type UpdateStageParams struct {
+	CorrelationID                             string
 	OpportunityID, TenantID, ActorPrincipalID string
 	Stage                                     OpportunityStage
 	Reason                                    string
@@ -225,6 +229,7 @@ type MarkDormantParams struct {
 }
 
 type CloseRelationshipParams struct {
+	CorrelationID                                             string
 	RelationshipID, TenantID, ActorPrincipalID, ClosureReason string
 }
 

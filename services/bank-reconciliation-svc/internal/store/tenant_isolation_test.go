@@ -42,6 +42,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/contracttest"
+
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
 	svcmiddleware "zoiko.io/bank-reconciliation-svc/internal/middleware"
 	"zoiko.io/bank-reconciliation-svc/internal/store"
@@ -170,7 +172,7 @@ func TestMain(m *testing.M) {
 
 	testStore = store.New(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
-	code := m.Run()
+	code := contracttest.FinishSuite(testPool, "../../contracts/events", m.Run())
 
 	testPool.Close()
 	if pg != nil {

@@ -1,0 +1,28 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.tax.authority-callback.quarantined (tax-authority-interface-svc, schema 1.0.0). OBSERVED contract inferred from 4 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "body_hash": {
+      "type": "string"
+    },
+    "event_ref": {
+      "type": "string"
+    },
+    "outcome": {
+      "type": "string"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "body_hash",
+    "event_ref",
+    "outcome",
+    "owner",
+    "provider"
+  ],
+  "type": "object"
+}

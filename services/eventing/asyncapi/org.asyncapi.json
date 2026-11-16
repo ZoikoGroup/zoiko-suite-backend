@@ -1,0 +1,417 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "establishment": {
+      "address": "zoikosuite.org.establishment.v1",
+      "messages": {
+        "changed": {
+          "$ref": "#/components/messages/establishment.changed"
+        },
+        "registered": {
+          "$ref": "#/components/messages/establishment.registered"
+        }
+      }
+    },
+    "legal-entity": {
+      "address": "zoikosuite.org.legal-entity.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/legal-entity.created"
+        },
+        "status-changed": {
+          "$ref": "#/components/messages/legal-entity.status-changed"
+        },
+        "updated": {
+          "$ref": "#/components/messages/legal-entity.updated"
+        }
+      }
+    },
+    "ownership": {
+      "address": "zoikosuite.org.ownership.v1",
+      "messages": {
+        "changed": {
+          "$ref": "#/components/messages/ownership.changed"
+        }
+      }
+    },
+    "party": {
+      "address": "zoikosuite.org.party.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/party.created"
+        }
+      }
+    },
+    "party-role": {
+      "address": "zoikosuite.org.party-role.v1",
+      "messages": {
+        "granted": {
+          "$ref": "#/components/messages/party-role.granted"
+        },
+        "revoked": {
+          "$ref": "#/components/messages/party-role.revoked"
+        }
+      }
+    },
+    "registration": {
+      "address": "zoikosuite.org.registration.v1",
+      "messages": {
+        "added": {
+          "$ref": "#/components/messages/registration.added"
+        },
+        "expired": {
+          "$ref": "#/components/messages/registration.expired"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "establishment.changed": {
+        "contentType": "application/json",
+        "description": "Producer: Establishment Service. Primary consumers / intent: Tax, reporting. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.establishment.changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Establishment: changed.",
+        "title": "establishment changed",
+        "x-zoiko-event-type": "com.zoikosuite.org.establishment.changed",
+        "x-zoiko-origin": "spec"
+      },
+      "establishment.registered": {
+        "contentType": "application/json",
+        "description": "Producer: Establishment Service. Primary consumers / intent: Tax, invoicing, legal. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.establishment.registered",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Establishment: registered.",
+        "title": "establishment registered",
+        "x-zoiko-event-type": "com.zoikosuite.org.establishment.registered",
+        "x-zoiko-origin": "spec"
+      },
+      "legal-entity.created": {
+        "contentType": "application/json",
+        "description": "Producer: Legal Entity Service. Primary consumers / intent: Accounting, tax, legal, reporting. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.legal-entity.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Legal entity: created.",
+        "title": "legal-entity created",
+        "x-zoiko-event-type": "com.zoikosuite.org.legal-entity.created",
+        "x-zoiko-origin": "spec"
+      },
+      "legal-entity.status-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Legal Entity Service. Primary consumers / intent: Accounting/tax posting guards. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.legal-entity.status-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Legal entity: status-changed.",
+        "title": "legal-entity status-changed",
+        "x-zoiko-event-type": "com.zoikosuite.org.legal-entity.status-changed",
+        "x-zoiko-origin": "spec"
+      },
+      "legal-entity.updated": {
+        "contentType": "application/json",
+        "description": "Producer: Legal Entity Service. Primary consumers / intent: Dependent domain read models. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.legal-entity.updated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Legal entity: updated.",
+        "title": "legal-entity updated",
+        "x-zoiko-event-type": "com.zoikosuite.org.legal-entity.updated",
+        "x-zoiko-origin": "spec"
+      },
+      "ownership.changed": {
+        "contentType": "application/json",
+        "description": "Producer: Ownership Service. Primary consumers / intent: Consolidation/legal/reporting. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.ownership.changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Ownership relationship: changed.",
+        "title": "ownership changed",
+        "x-zoiko-event-type": "com.zoikosuite.org.ownership.changed",
+        "x-zoiko-origin": "spec"
+      },
+      "party-role.granted": {
+        "contentType": "application/json",
+        "description": "Producer: Party Service. Primary consumers / intent: AR/AP/workforce. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.party-role.granted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Party role: granted.",
+        "title": "party-role granted",
+        "x-zoiko-event-type": "com.zoikosuite.org.party-role.granted",
+        "x-zoiko-origin": "spec"
+      },
+      "party-role.revoked": {
+        "contentType": "application/json",
+        "description": "Producer: Party Service. Primary consumers / intent: AR/AP/workforce. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.party-role.revoked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Party role: revoked.",
+        "title": "party-role revoked",
+        "x-zoiko-event-type": "com.zoikosuite.org.party-role.revoked",
+        "x-zoiko-origin": "spec"
+      },
+      "party.created": {
+        "contentType": "application/json",
+        "description": "Producer: Party Service. Primary consumers / intent: AR/AP/Legal/CRM. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.party.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Party: created.",
+        "title": "party created",
+        "x-zoiko-event-type": "com.zoikosuite.org.party.created",
+        "x-zoiko-origin": "spec"
+      },
+      "registration.added": {
+        "contentType": "application/json",
+        "description": "Producer: Registration Service. Primary consumers / intent: Tax/legal/reporting. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.registration.added",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Registration: added.",
+        "title": "registration added",
+        "x-zoiko-event-type": "com.zoikosuite.org.registration.added",
+        "x-zoiko-origin": "spec"
+      },
+      "registration.expired": {
+        "contentType": "application/json",
+        "description": "Producer: Registration Service. Primary consumers / intent: Tax/legal workflows. Family: Organization & Master Data. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.org.registration.expired",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Registration: expired.",
+        "title": "registration expired",
+        "x-zoiko-event-type": "com.zoikosuite.org.registration.expired",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite org domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.establishment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/establishment"
+      },
+      "description": "Producer(s): Establishment Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/establishment/messages/changed"
+        },
+        {
+          "$ref": "#/channels/establishment/messages/registered"
+        }
+      ],
+      "summary": "Publish establishment facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.legal-entity": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/legal-entity"
+      },
+      "description": "Producer(s): Legal Entity Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/legal-entity/messages/created"
+        },
+        {
+          "$ref": "#/channels/legal-entity/messages/status-changed"
+        },
+        {
+          "$ref": "#/channels/legal-entity/messages/updated"
+        }
+      ],
+      "summary": "Publish legal-entity facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.ownership": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/ownership"
+      },
+      "description": "Producer(s): Ownership Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/ownership/messages/changed"
+        }
+      ],
+      "summary": "Publish ownership facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.party": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/party"
+      },
+      "description": "Producer(s): Party Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/party/messages/created"
+        }
+      ],
+      "summary": "Publish party facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.party-role": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/party-role"
+      },
+      "description": "Producer(s): Party Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/party-role/messages/granted"
+        },
+        {
+          "$ref": "#/channels/party-role/messages/revoked"
+        }
+      ],
+      "summary": "Publish party-role facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.registration": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/registration"
+      },
+      "description": "Producer(s): Registration Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/registration/messages/added"
+        },
+        {
+          "$ref": "#/channels/registration/messages/expired"
+        }
+      ],
+      "summary": "Publish registration facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"type":"object","description":"ZS-EVENT-001 payload of com.zoikosuite.migration.job.integrity-violations-detected (migration-integrity-svc, schema 1.0.0): a validation run found invalid records.","properties":{"job_id":{"type":"string"},"invalid_count":{"type":"integer"}},"required":["job_id","invalid_count"]}

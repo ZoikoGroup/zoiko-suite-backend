@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
@@ -80,7 +81,7 @@ func TestPgStore_PublishForm_RejectsSelfPublish(t *testing.T) {
 
 	// Negative control at the DB layer — the CHECK constraint refuses the
 	// same self-publish even bypassing the store entirely.
-	if _, err := pool.Exec(context.Background(),
+	if err := execAsTenant(t, pool, testTenantID,
 		`UPDATE form_definitions SET status='PUBLISHED', published_by_principal_id='owner-1', published_at=now() WHERE form_id=$1`,
 		form.FormID); err == nil {
 		t.Fatal("expected the CHECK constraint to refuse a self-publish written directly")
@@ -181,7 +182,7 @@ func TestPgStore_SaveDraft_ThenSubmit_ValuesBecomeImmutable(t *testing.T) {
 	}
 
 	// Negative control at the DB layer.
-	if _, err := pool.Exec(context.Background(),
+	if err := execAsTenant(t, pool, testTenantID,
 		`UPDATE form_submissions SET submitted_values='{"amount":"999"}'::jsonb WHERE submission_id=$1`, draft.SubmissionID); err == nil {
 		t.Fatal("expected the trigger to refuse mutating submitted_values after SUBMITTED")
 	}
@@ -352,7 +353,7 @@ func TestPgStore_SupersedeSubmission_ForwardLinksThenRejectsDoubleSupersede(t *t
 
 	// Negative control at the DB layer — the trigger refuses re-pointing
 	// an already-set superseded_by_submission_id.
-	if _, err := pool.Exec(context.Background(),
+	if err := execAsTenant(t, pool, testTenantID,
 		`UPDATE form_submissions SET superseded_by_submission_id=$1 WHERE submission_id=$2`,
 		another.SubmissionID, original.SubmissionID); err == nil {
 		t.Fatal("expected the trigger to refuse re-pointing an existing supersession link")
@@ -551,4 +552,22 @@ func TestPgStore_ListPendingSubmissions_OnlySubmittedOrValidating(t *testing.T) 
 	if len(pending) != 1 || pending[0].SubmissionID != submitted.SubmissionID {
 		t.Fatalf("expected exactly the one SUBMITTED submission, got %+v", pending)
 	}
+}
+
+// execAsTenant runs raw SQL in a transaction with app.tenant_id set, so the target
+// row is visible under RLS for any role (not only a superuser) and a constraint or
+// trigger — not row invisibility — is what must refuse the statement.
+func execAsTenant(t *testing.T, pool *pgxpool.Pool, tenantID, sql string, args ...any) error {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantID); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	_, err = tx.Exec(ctx, sql, args...)
+	return err
 }

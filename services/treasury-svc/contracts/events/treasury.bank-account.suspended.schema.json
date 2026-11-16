@@ -1,0 +1,28 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.treasury.bank-account.suspended (treasury-svc, schema 1.0.0). OBSERVED contract inferred from 3 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "account_status": {
+      "type": "string"
+    },
+    "bank_account_id": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "suspend_reason": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_status",
+    "bank_account_id",
+    "legal_entity_id",
+    "suspend_reason",
+    "tenant_id"
+  ],
+  "type": "object"
+}

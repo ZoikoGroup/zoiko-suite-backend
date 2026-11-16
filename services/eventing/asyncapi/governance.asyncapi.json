@@ -1,0 +1,480 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "authorization-policy": {
+      "address": "zoikosuite.governance.authorization-policy.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/authorization-policy.published"
+        }
+      }
+    },
+    "delegation": {
+      "address": "zoikosuite.governance.delegation.v1",
+      "messages": {
+        "granted": {
+          "$ref": "#/components/messages/delegation.granted"
+        },
+        "revoked": {
+          "$ref": "#/components/messages/delegation.revoked"
+        }
+      }
+    },
+    "legal-hold": {
+      "address": "zoikosuite.governance.legal-hold.v1",
+      "messages": {
+        "placed": {
+          "$ref": "#/components/messages/legal-hold.placed"
+        },
+        "released": {
+          "$ref": "#/components/messages/legal-hold.released"
+        }
+      }
+    },
+    "residency-policy": {
+      "address": "zoikosuite.governance.residency-policy.v1",
+      "messages": {
+        "changed": {
+          "$ref": "#/components/messages/residency-policy.changed"
+        }
+      }
+    },
+    "retention-policy": {
+      "address": "zoikosuite.governance.retention-policy.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/retention-policy.published"
+        }
+      }
+    },
+    "schema": {
+      "address": "zoikosuite.governance.schema.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/schema.published"
+        }
+      }
+    },
+    "sod-policy": {
+      "address": "zoikosuite.governance.sod-policy.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/sod-policy.published"
+        }
+      }
+    },
+    "tenant": {
+      "address": "zoikosuite.governance.tenant.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/tenant.created"
+        },
+        "status-changed": {
+          "$ref": "#/components/messages/tenant.status-changed"
+        }
+      }
+    },
+    "workflow-definition": {
+      "address": "zoikosuite.governance.workflow-definition.v1",
+      "messages": {
+        "published": {
+          "$ref": "#/components/messages/workflow-definition.published"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "authorization-policy.published": {
+        "contentType": "application/json",
+        "description": "Producer: Authorization Service. Primary consumers / intent: Gateway/domain services. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.authorization-policy.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Policy: published.",
+        "title": "authorization-policy published",
+        "x-zoiko-event-type": "com.zoikosuite.governance.authorization-policy.published",
+        "x-zoiko-origin": "spec"
+      },
+      "delegation.granted": {
+        "contentType": "application/json",
+        "description": "Producer: Role & Delegation. Primary consumers / intent: Workflow/approvals. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.delegation.granted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Delegation: granted.",
+        "title": "delegation granted",
+        "x-zoiko-event-type": "com.zoikosuite.governance.delegation.granted",
+        "x-zoiko-origin": "spec"
+      },
+      "delegation.revoked": {
+        "contentType": "application/json",
+        "description": "Producer: Role & Delegation. Primary consumers / intent: Workflow/approvals. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.delegation.revoked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Delegation: revoked.",
+        "title": "delegation revoked",
+        "x-zoiko-event-type": "com.zoikosuite.governance.delegation.revoked",
+        "x-zoiko-origin": "spec"
+      },
+      "legal-hold.placed": {
+        "contentType": "application/json",
+        "description": "Producer: Legal Hold Service. Primary consumers / intent: Disposition/document/archive. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.legal-hold.placed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Legal hold: placed.",
+        "title": "legal-hold placed",
+        "x-zoiko-event-type": "com.zoikosuite.governance.legal-hold.placed",
+        "x-zoiko-origin": "spec"
+      },
+      "legal-hold.released": {
+        "contentType": "application/json",
+        "description": "Producer: Legal Hold Service. Primary consumers / intent: Disposition/document/archive. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.legal-hold.released",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Legal hold: released.",
+        "title": "legal-hold released",
+        "x-zoiko-event-type": "com.zoikosuite.governance.legal-hold.released",
+        "x-zoiko-origin": "spec"
+      },
+      "residency-policy.changed": {
+        "contentType": "application/json",
+        "description": "Producer: GTRM/Policy. Primary consumers / intent: Routing, data platform, integrations. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.residency-policy.changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tenant residency policy: changed.",
+        "title": "residency-policy changed",
+        "x-zoiko-event-type": "com.zoikosuite.governance.residency-policy.changed",
+        "x-zoiko-origin": "spec"
+      },
+      "retention-policy.published": {
+        "contentType": "application/json",
+        "description": "Producer: Retention Service. Primary consumers / intent: Domain stores/archive. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.retention-policy.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Retention policy: published.",
+        "title": "retention-policy published",
+        "x-zoiko-event-type": "com.zoikosuite.governance.retention-policy.published",
+        "x-zoiko-origin": "spec"
+      },
+      "schema.published": {
+        "contentType": "application/json",
+        "description": "Producer: Schema Registry. Primary consumers / intent: Producers/consumers/CI. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.schema.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Schema: published.",
+        "title": "schema published",
+        "x-zoiko-event-type": "com.zoikosuite.governance.schema.published",
+        "x-zoiko-origin": "spec"
+      },
+      "sod-policy.published": {
+        "contentType": "application/json",
+        "description": "Producer: SoD Service. Primary consumers / intent: Approval engines. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.sod-policy.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "SoD policy: published.",
+        "title": "sod-policy published",
+        "x-zoiko-event-type": "com.zoikosuite.governance.sod-policy.published",
+        "x-zoiko-origin": "spec"
+      },
+      "tenant.created": {
+        "contentType": "application/json",
+        "description": "Producer: Tenant Service. Primary consumers / intent: GTRM, entitlement, observability. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.tenant.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tenant: created.",
+        "title": "tenant created",
+        "x-zoiko-event-type": "com.zoikosuite.governance.tenant.created",
+        "x-zoiko-origin": "spec"
+      },
+      "tenant.status-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Tenant Service. Primary consumers / intent: Gateway, commercial, operations. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.tenant.status-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tenant: status-changed.",
+        "title": "tenant status-changed",
+        "x-zoiko-event-type": "com.zoikosuite.governance.tenant.status-changed",
+        "x-zoiko-origin": "spec"
+      },
+      "workflow-definition.published": {
+        "contentType": "application/json",
+        "description": "Producer: Workflow Service. Primary consumers / intent: Workflow runtime. Family: Governance & Control. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.governance.workflow-definition.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Workflow definition: published.",
+        "title": "workflow-definition published",
+        "x-zoiko-event-type": "com.zoikosuite.governance.workflow-definition.published",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite governance domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.authorization-policy": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/authorization-policy"
+      },
+      "description": "Producer(s): Authorization Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/authorization-policy/messages/published"
+        }
+      ],
+      "summary": "Publish authorization-policy facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.delegation": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/delegation"
+      },
+      "description": "Producer(s): Role & Delegation. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/delegation/messages/granted"
+        },
+        {
+          "$ref": "#/channels/delegation/messages/revoked"
+        }
+      ],
+      "summary": "Publish delegation facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.legal-hold": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/legal-hold"
+      },
+      "description": "Producer(s): Legal Hold Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/legal-hold/messages/placed"
+        },
+        {
+          "$ref": "#/channels/legal-hold/messages/released"
+        }
+      ],
+      "summary": "Publish legal-hold facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.residency-policy": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/residency-policy"
+      },
+      "description": "Producer(s): GTRM/Policy. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/residency-policy/messages/changed"
+        }
+      ],
+      "summary": "Publish residency-policy facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.retention-policy": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/retention-policy"
+      },
+      "description": "Producer(s): Retention Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/retention-policy/messages/published"
+        }
+      ],
+      "summary": "Publish retention-policy facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.schema": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/schema"
+      },
+      "description": "Producer(s): Schema Registry. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/schema/messages/published"
+        }
+      ],
+      "summary": "Publish schema facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.sod-policy": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/sod-policy"
+      },
+      "description": "Producer(s): SoD Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/sod-policy/messages/published"
+        }
+      ],
+      "summary": "Publish sod-policy facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.tenant": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/tenant"
+      },
+      "description": "Producer(s): Tenant Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/tenant/messages/created"
+        },
+        {
+          "$ref": "#/channels/tenant/messages/status-changed"
+        }
+      ],
+      "summary": "Publish tenant facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.workflow-definition": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/workflow-definition"
+      },
+      "description": "Producer(s): Workflow Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/workflow-definition/messages/published"
+        }
+      ],
+      "summary": "Publish workflow-definition facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

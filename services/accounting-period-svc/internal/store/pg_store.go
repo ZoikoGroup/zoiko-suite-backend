@@ -21,6 +21,7 @@ import (
 
 	"zoiko.io/accounting-period-svc/internal/domain"
 	"zoiko.io/accounting-period-svc/internal/service"
+	eventingoutbox "zoiko.io/eventing/outbox"
 )
 
 // PgStore is the Postgres-backed store.
@@ -300,11 +301,15 @@ func (t *pgTx) CalendarUsage(ctx context.Context, calendarID, versionID string) 
 
 // Enqueue writes the event in the CALLER's transaction: a change that commits
 // always has its event, and a change that rolls back never leaks one.
+//
+// Events go to the shared eventing outbox (ZS-EVENT-001 section 6), delivered by
+// eventing's relay. The service's own accounting_period_outbox is no longer
+// written; its rows are drained by the legacy relay until the table is empty.
 func (t *pgTx) Enqueue(ctx context.Context, e service.OutboxEntry) error {
-	_, err := t.tx.Exec(ctx, `
-		INSERT INTO accounting_period_outbox (tenant_id, object_id, event_type, payload)
-		VALUES ($1, $2::uuid, $3, $4)`, e.TenantID, e.ObjectID, e.EventType, e.Payload)
-	if err != nil {
+	if e.Envelope == nil {
+		return fmt.Errorf("enqueue %s: no envelope", e.EventType)
+	}
+	if err := eventingoutbox.Enqueue(ctx, t.tx, e.Envelope); err != nil {
 		return fmt.Errorf("enqueue %s: %w", e.EventType, err)
 	}
 	return nil

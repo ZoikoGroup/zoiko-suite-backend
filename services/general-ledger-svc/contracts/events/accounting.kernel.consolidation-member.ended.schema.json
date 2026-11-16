@@ -1,0 +1,20 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.consolidation-member.ended (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 5 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "effective_to": {
+      "type": "string"
+    },
+    "group_id": {
+      "type": "string"
+    },
+    "member_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "effective_to",
+    "group_id",
+    "member_id"
+  ],
+  "type": "object"
+}

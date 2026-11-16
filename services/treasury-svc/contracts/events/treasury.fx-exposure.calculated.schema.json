@@ -1,0 +1,36 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.treasury.fx-exposure.calculated (treasury-svc, schema 1.0.0). OBSERVED contract inferred from 19 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "exposure_currency": {
+      "type": "string"
+    },
+    "functional_currency": {
+      "type": "string"
+    },
+    "has_stale_component": {
+      "type": "boolean"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "snapshot_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "exposure_currency",
+    "functional_currency",
+    "has_stale_component",
+    "legal_entity_id",
+    "snapshot_id",
+    "status",
+    "tenant_id"
+  ],
+  "type": "object"
+}
