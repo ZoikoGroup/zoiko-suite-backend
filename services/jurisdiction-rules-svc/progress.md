@@ -298,3 +298,26 @@ Step 17 replaced what steps 15–16 could not run live:
   After a person sets the drift back to CURRENT, the same event redelivered changes nothing
   (`consumed_events`). The event is synthetic: its real producer, external-data-feed-svc, does not publish
   it yet (F05 ⛔).
+
+| Step | Change | Commit | Evidence |
+|---|---|---|---|
+| 18 S5 | `GET /v1/jurisdictions/{id}/rules?scope=all` (paged `filter[scope]=all`): the register view, DRAFT and future-dated included, newest first; other scopes 400 `invalid_scope` | 4b5d31ee | `TestGetRules_ScopeAllIsTheRegisterView`; store `FindRules` register view; image rebuilt and used live |
+| 19 S5 | console `/admin/jurisdictions` rendered and every command driven through its dialog against the live stack (same 10 containers), as maker (admin), checker (legal counsel) and a third person (tax officer) | FE 326958d | 137 UI checks: 120 pass; 13 console defects fixed (below); vitest 187/187, tsc, eslint, `next build` |
+
+Step 19, defects found in the console and fixed (FE `326958d`):
+- Results lost: actions refreshed the page while the dialog was open, so a state-only command (Approve and
+  activate) unmounted with its result. The page now refreshes when the result is closed.
+- Wrapped responses not unwrapped (pending approvals, artifact, certification, resolve, determination,
+  evaluators); workflow-svc decisions sent without If-Match (428); DRAFT rules never listed (step 18).
+- Ring, region and calendar codes upper-cased by the console and always refused (the service wants lower case).
+- Recorded negative answers (409/422 with the decision) shown as "returned 422"; blank dates refused
+  (`effective_at is required`); wrong examples (validate-action, typed parameters, evaluators).
+- Calendar and obligation publish unreachable from the UI (sources only settable on the newest version; regime
+  only as a raw id); commands offered that the service always refuses (approving an import with invalid rows,
+  closing a remediation case one opened); misleading messages for `source_not_ready`,
+  `import_version_conflict` and a bare `conflict`.
+
+Not run live (17 checks): certify and everything after it in the pack lifecycle. Certification needs a
+certifier independent of the author, compiler, test author and reviewers: three principals with
+JURISDICTION_* grants. Locally only admin and legal counsel hold them; granting a third is the user's call
+(tracker JR-8). The rest of the gaps are in the tracker, D2-1 "Remaining gaps (16 Nov)".

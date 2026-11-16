@@ -78,7 +78,7 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D1-11 | siem-integration-svc :8141 | 🟡 | 11 | 0 | 0 | 2 | 0 | 8 | 1 | 0 | ✔ · ✔ · ✔ 1 pkg | none (phase6 compose only) | shared, dead-wired · 3/5 | SG-0 |
 | D1-12 | carta-svc :8142 | 🟡 | 8 | 0 | 2 | 1 | 0 | 4 | 1 | 0 | ✔ · ✔ · ✔ 2 pkgs | none (phase6 compose only) | shared, dead-wired · 2/3 | CA-0 |
 | D1-13 | key-management-svc :8143 | 🟡 | 11 | 0 | 1 | 0 | 0 | 9 | 1 | 0 | ✔ · ✔ · ✔ 3 pkgs | none (phase6 compose only) | shared, dead-wired · 5/5 | KM-0 |
-| D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 0 | 2 | 1 | 24 | 0 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs | S0–S4, S6 by the implementer (13 Nov); S5 built, not rendered live | v2.0 (FE `e3de6c6`) | JR-FE-3 |
+| D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 0 | 2 | 1 | 24 | 0 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs | S0–S4, S6 by the implementer (13 Nov); S5 rendered and driven live 16 Nov (UI 120/137; pack release half blocked on a third certifier) | v2.0 · 143/148 (FE `326958d`) | JR-8, JR-FE-3 |
 | D2-2 | governance-decision-log-svc :8083 | ✅ | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 9 pkgs (+ store IT) | S0–S6 verified 11 Nov (9 rows with independence waived by the user); 🏁 after the commit (verifier step 1) | v2.0 · 14/14 | Commit (R3) |
 | D2-3 | policy-svc :8085 | 🟡 | 14 | 0 | 7 | 2 | 1 | 3 | 0 | 1 | ✔ · ✔ · ✔ 12 pkgs | none | legacy · 7/39 | POL-0 |
 | D2-4 | obligations-svc :8088 | 🟡 | 14 | 0 | 4 | 5 | 2 | 3 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | none | legacy · 7/24 | OB-0 |
@@ -783,15 +783,15 @@ These services answer "is this allowed, under which rules, who must approve, and
 | Spec | Doc 03 §8.2; ZS-JUR-001; ZS-SVC-V-001 PDC-02; REF-01, REF-10; Jurisdiction Pack Standard (`docs/architecture/jurisdiction-pack-wave*.md`) |
 | Latest score | 73 met / 4 partial / 2 failed of 79 (92.4%, 94.9% weighted), 19 Oct |
 | New since the audit | ZS-JUR-001 gap closing and jurisdiction-pack waves (30–31 Oct), REF-01 waves 1–3 (`a2d65f51`, `74db6105`, `645b1f35`), REF-3 waves 1–2 (`1302a620`, `dd86aade`), all by 07Yashjais. Not audited |
-| Stages | S0–S4 and S6 done by the implementer on 13 Nov (`progress.md`, `RELEASE_CERTIFICATE.md`; e2e 82/82 with workflow-svc and the feed consumer, audit 24/24); S5 console not started; VC-1 open on every row |
-| Console | `/admin/jurisdictions` v2.0 (FE `e3de6c6`, 13 Nov); not yet rendered against the live stack, UI e2e open |
+| Stages | S0–S4 and S6 done by the implementer on 13 Nov (`progress.md`, `RELEASE_CERTIFICATE.md`; e2e 82/82 with workflow-svc and the feed consumer, audit 24/24); S5 console rendered and driven live on 16 Nov (`progress.md` §6 steps 18–19); VC-1 open on every row |
+| Console | `/admin/jurisdictions` v2.0 (FE `e3de6c6` 13 Nov, live fixes `326958d` 16 Nov). 16 Nov: every command driven through its dialog against the live stack (10 containers) as maker, checker and a third person: 120/137 pass, 13 console defects fixed. The other 17 are the pack release half (certify onward), blocked because only two local principals hold JURISDICTION grants (JR-8). Client calls 143 of 148 routes; the 5 not called are single-record reads served by their list routes |
 
 **Features**
 
 | ID | Feature | Status | Evidence | What is needed |
 |---|---|---|---|---|
 | D2-1.F01 | Jurisdiction registry: `GET /v1/jurisdictions`, `GET …/{id}` (fail-closed check; 503 = cannot answer), `GET …/{id}/ancestors`, `POST /v1/admin/jurisdictions`, `POST …/{id}/deactivate` | 🔵 | Rebuilt 13 Nov: request unit of work (J-11), If-Match on deactivate, API-4 paging; e2e create, replay, Kafka event (`services/jurisdiction-rules-svc/progress.md` §6) | VC-1 |
-| D2-1.F02 | Effective-dated rules: `GET /v1/jurisdictions/{id}/rules`, `GET /v1/rules/{id}`, `GET …/status-history`, `POST /v1/admin/jurisdictions/{id}/rules`, `POST /v1/admin/rules/{id}/transition` (creator ≠ activator) | 🔵 | Rebuilt 13 Nov: unit of work, ETag/If-Match; the author's own activation is refused before workflow-svc is asked (`c66d811e`) (`services/jurisdiction-rules-svc/progress.md` §6) | VC-1 |
+| D2-1.F02 | Effective-dated rules: `GET /v1/jurisdictions/{id}/rules`, `GET /v1/rules/{id}`, `GET …/status-history`, `POST /v1/admin/jurisdictions/{id}/rules`, `POST /v1/admin/rules/{id}/transition` (creator ≠ activator) | 🔵 | Rebuilt 13 Nov: unit of work, ETag/If-Match; the author's own activation is refused before workflow-svc is asked (`c66d811e`) (`services/jurisdiction-rules-svc/progress.md` §6). 16 Nov: `scope=all` register view on the rules list (DRAFT and future-dated included; `4b5d31ee`), used by the console; propose → request approval → approve and activate → drift → retire driven live through the UI | VC-1 |
 | D2-1.F03 | Rule pack with `pack_digest`: `GET /v1/jurisdictions/{id}/rule-pack` | 🟡 | Reconfirm (was ✅): Governance audit (19 Oct); 13 Nov: suites green (unit 569, store 92, registryit 143) | VC-1 |
 | D2-1.F04 | Manual legal drift: `POST /v1/admin/rules/{id}/drift`, `GET /v1/rules/{id}/drift-events`, event `legal.drift.detected` | 🟡 | Reconfirm (was ✅): Governance audit (19 Oct); 13 Nov: suites green, drift writes in the request unit of work | VC-1 |
 | D2-1.F05 | Automatic drift from a regulatory feed (J-03, J-04) | ⛔ | Consumer built (`internal/consumer/feed.go`, `589729eb`, JR-6). 13 Nov: proven live with a synthetic `regulatory.source.changed` (e2e: ACTIVE rule → UNDER_REVIEW, drift event by the feed, `legal.drift.detected`, redelivery no-op); compose `JURISDICTION_REGULATORY_FEED_TOPIC` (empty = off). external-data-feed-svc publishes no regulatory-change event | Cross-team (producer) |
@@ -818,7 +818,7 @@ These services answer "is this allowed, under which rules, who must approve, and
 | D2-1.F26 | Decisions: owner of entity applicability (C8, J-05), one precedence model (J-08), public reads / `rule_payload` content / event naming (J-09) | 🧭 | Governance audit register | Decision |
 | D2-1.F27 | Cursor paging (API-4) on the many list routes | 🔵 | `b7e8c903`: signed cursors bound to tenant, route and filters on every list route; e2e (`services/jurisdiction-rules-svc/progress.md` §6) | VC-1 |
 | D2-1.F28 | Contract parity: openapi has 148 paths; no route-parity test | 🔵 | `TestOpenAPIMatchesTheRouter` + `TestOpenAPIDocumentIsValid`; openapi 1.2.0; asyncapi; Postman folders 04–07 | VC-1 |
-| D2-1.F29 | Console v2.0 (Jurisdictions, Rules, Packs, Calendars, Payment terms, Imports, Rollouts, Remediation) | 🟡 | FE `e3de6c6` (13 Nov): page rebuilt on the user's reference — 5 KPIs from `GET /v1/jurisdiction-summary`, coverage / publication / review-queue panels, 11 register tabs with drawers and maker-checker commands; client split into `lib/api/jurisdictions/*`. tsc, eslint, vitest and `next build` pass. Not rendered against the live stack yet | Live render; JR-FE-3 UI e2e |
+| D2-1.F29 | Console v2.0 (Jurisdictions, Rules, Packs, Calendars, Payment terms, Imports, Rollouts, Remediation) | 🟡 | FE `e3de6c6` (13 Nov): page rebuilt on the user's reference — 5 KPIs from `GET /v1/jurisdiction-summary`, coverage / publication / review-queue panels, 11 register tabs with drawers and maker-checker commands; client split into `lib/api/jurisdictions/*`. tsc, eslint, vitest and `next build` pass. 16 Nov (FE `326958d`): rendered and driven live, 120/137 UI checks; 13 defects fixed (results lost on refresh, wrapped response shapes, workflow If-Match, DRAFT rules unlisted, lower-case codes upper-cased, recorded negative answers shown as errors, blank dates, wrong examples, calendar/obligation publish unreachable, refused commands offered, misleading messages); vitest 187/187 | JR-8 (pack release half live); JR-FE-3 spec in the repo |
 
 **Tasks**
 
@@ -831,7 +831,7 @@ These services answer "is this allowed, under which rules, who must approve, and
 - [ ] **JR-6 · Drift consumer (J-03, J-04)** once external-data-feed-svc publishes a regulatory-change event with `external_feed_reference`: move matching rules to `UNDER_REVIEW` and record drift. *13 Nov: consumer built (`589729eb`) and proven live with a synthetic event; off by default until the producer exists.*
 - [x] **JR-7 · Live** *(13 Nov: e2e 59/59, audit 24/24; four defects found and fixed, see `progress.md` §6. Step 17: e2e 82/82 with workflow-svc approval outcomes, effectivity through the API and the feed consumer live; no new defect)*: rebuild; `scripts/audit.sh`; new `deployments/scripts/e2e-jurisdiction-rules-deps.py` (tenant-registry consumer, workflow approval reference, authorization decisions, Kafka events, pack sign/verify round trip).
 
-**Console (frontend)** — `app/admin/jurisdictions` (legacy) · client `lib/api/jurisdictions.ts` calls 12 of 148 routes (Appendix B). Rebuild in v2.0 following "Frontend rules for every console" below. This is the largest console gap overall; split the drawer forms per tab file.
+**Console (frontend)** — `app/admin/jurisdictions` v2.0 · client `lib/api/jurisdictions/*.ts` calls 143 of 148 routes (Appendix B; recounted 16 Nov). *Was: legacy page, 12 of 148.* Rebuild in v2.0 following "Frontend rules for every console" below. This is the largest console gap overall; split the drawer forms per tab file.
 
 | Part | Content |
 |---|---|
@@ -843,9 +843,10 @@ These services answer "is this allowed, under which rules, who must approve, and
 | Footer | Required controls: the creator never activates · imports and payment terms are maker-checker · only signed packs deploy · evidence and a reason on every change |
 
 **Tasks**
-- [ ] **JR-FE-1 · Summary route + API client** for every route in Appendix B D2-1. Split the client by area if it passes ~800 lines (`lib/api/jurisdictions/*.ts`). *13 Nov: built (FE `e3de6c6`); route coverage to be recounted against Appendix B.*
-- [ ] **JR-FE-2 · Page v2.0.** *13 Nov: built (FE `e3de6c6`), 11 tabs; live render pending.*
-- [ ] **JR-FE-3 · UI E2E** `tests/e2e/console/jurisdictions.spec.ts`. Cover:
+- [x] **JR-FE-1 · Summary route + API client** for every route in Appendix B D2-1. Split the client by area if it passes ~800 lines (`lib/api/jurisdictions/*.ts`). *13 Nov: built (FE `e3de6c6`). 16 Nov: 143 of 148 routes called; not called: `GET /v1/calendars/{code}`, `…/versions/{v}`, `GET /v1/obligation-rules/{id}`, `GET /v1/regimes/{regime}`, `GET /v1/payment-terms/{code}/versions/{v}` (single-record reads, served by their list routes).*
+- [x] **JR-FE-2 · Page v2.0.** *13 Nov: built (FE `e3de6c6`), 11 tabs. 16 Nov: rendered and driven live; 13 defects fixed (FE `326958d`, BE `4b5d31ee`).*
+- [ ] **JR-8 · Pack release half live.** Certification needs a certifier independent of the version's author, compiler, test author and every approving reviewer, so three principals with JURISDICTION_* grants on the platform scope. Locally only admin (3333…) and legal counsel (6666…) hold them. Once a third holds them (user decision: grant through the Authorization console or approve a local grant), run certify → publish → deploy → resolve RESOLVED → block/unblock → hotfix + retrospective → second version → rollback → supersede → withdraw → remediation dispositions and close (second person) through the UI.
+- [ ] **JR-FE-3 · UI E2E** `tests/e2e/console/jurisdictions.spec.ts`. *16 Nov: a live harness drives every command (scratch, 137 checks); to be moved into the repo as this spec.* Cover:
   - a rule created by one user and activated by another;
   - an import approved by a second user;
   - business-day arithmetic shown from a published calendar;
@@ -855,6 +856,23 @@ These services answer "is this allowed, under which rules, who must approve, and
   - empty and unavailable states.
 
 **Blocked and decisions:** external-data-feed-svc event; C8/J-05, J-08, J-09.
+
+**Remaining gaps (16 Nov)**
+
+| # | Gap | Rows | Owner | Kind |
+|---|---|---|---|---|
+| 1 | Pack release half not driven live through the console: certify, publish, deploy, rollback, supersede, withdraw, emergency block / unblock, hotfix + retrospective, a RESOLVED answer, remediation dispositions and close, obligation due date and calculation from a released pack, submission register + provider events under a released profile | F16, F17, F19, F20, F21, F29 | Us, once a third principal holds JURISDICTION grants (user decision) | JR-8 |
+| 2 | UI e2e spec not in the repo (the live harness is in scratch) | F29 | Us | JR-FE-3 |
+| 3 | Regulatory-change producer: external-data-feed-svc publishes no `regulatory.source.changed` (consumer built and proven with a synthetic event) | F05 | Teammate (external-data-feed-svc) | Cross-team |
+| 4 | Decisions: owner of entity applicability (C8, J-05), one precedence model (J-08), public reads / `rule_payload` content / event naming (J-09); JUR-NEG-29 consistency policy | F26 | Architecture owners | Decision |
+| 5 | JUR-1 determination inputs: ORG-6 establishments and ORG-7 registrations do not exist yet | F13 | tenant-entity-registry-svc (D1-2) | Dependency |
+| 6 | Production pack signing key and `RESOLVER_RING` / `RESOLVER_REGION` | F15, F11 | Platform ops (SEC-1) | Production |
+| 7 | Reads accept a headers-only identity (`warn`) until tax and payroll readers forward the envelope | F24 | Reader services (outside D1/D2) | Cross-team |
+| 8 | JUR-NEG-17 | — | Tax Engineering | Decision |
+| 9 | Async operations: the console cannot list or cancel an operation (`operation.cancel` exists in the client, no entry point) | F25 | Us | Console |
+| 10 | Error taxonomy: `source_not_ready` covers "no source cited", "source not reviewed / superseded" and (obligation rules) "no regime or interpretation"; a ring-order clash is a bare 409 `conflict` with no detail. The console words both; distinct codes would be clearer | F08, F10, F17 | Us | Backend improvement |
+| 11 | Independent verification (VC-1) on every row: 0 of 29 verified by someone other than the implementer | all | Verifier | VC-1 |
+| 12 | Cosmetic: country flags render as letters on Windows (no flag-emoji font) | F29 | Us | Console |
 
 ---
 
