@@ -83,8 +83,8 @@ func TestExtensionsAreMarkedAndOwned(t *testing.T) {
 	all, _ := All()
 	spec, _ := Spec()
 	ext := len(all) - len(spec)
-	if ext != 301 {
-		t.Fatalf("expected 301 extension entries, got %d", ext)
+	if ext != 321 {
+		t.Fatalf("expected 321 extension entries, got %d", ext)
 	}
 	for _, e := range all {
 		if e.Origin != "" && e.Origin != "extension" {

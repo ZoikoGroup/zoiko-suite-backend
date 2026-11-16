@@ -37,6 +37,14 @@
         }
       }
     },
+    "allocation-run": {
+      "address": "zoikosuite.accounting.allocation-run.v1",
+      "messages": {
+        "posted": {
+          "$ref": "#/components/messages/allocation-run.posted"
+        }
+      }
+    },
     "balance-snapshot": {
       "address": "zoikosuite.accounting.balance-snapshot.v1",
       "messages": {
@@ -89,6 +97,14 @@
       "messages": {
         "completed": {
           "$ref": "#/components/messages/fx-revaluation.completed"
+        }
+      }
+    },
+    "fx-revaluation-run": {
+      "address": "zoikosuite.accounting.fx-revaluation-run.v1",
+      "messages": {
+        "posted": {
+          "$ref": "#/components/messages/fx-revaluation-run.posted"
         }
       }
     },
@@ -327,11 +343,62 @@
     "reconciliation-break": {
       "address": "zoikosuite.accounting.reconciliation-break.v1",
       "messages": {
+        "assigned": {
+          "$ref": "#/components/messages/reconciliation-break.assigned"
+        },
         "detected": {
           "$ref": "#/components/messages/reconciliation-break.detected"
         },
         "resolved": {
           "$ref": "#/components/messages/reconciliation-break.resolved"
+        },
+        "status-changed": {
+          "$ref": "#/components/messages/reconciliation-break.status-changed"
+        }
+      }
+    },
+    "reconciliation-certification": {
+      "address": "zoikosuite.accounting.reconciliation-certification.v1",
+      "messages": {
+        "issued": {
+          "$ref": "#/components/messages/reconciliation-certification.issued"
+        },
+        "revoked": {
+          "$ref": "#/components/messages/reconciliation-certification.revoked"
+        }
+      }
+    },
+    "reconciliation-definition": {
+      "address": "zoikosuite.accounting.reconciliation-definition.v1",
+      "messages": {
+        "rule-version-approved": {
+          "$ref": "#/components/messages/reconciliation-definition.rule-version-approved"
+        },
+        "rule-version-published": {
+          "$ref": "#/components/messages/reconciliation-definition.rule-version-published"
+        }
+      }
+    },
+    "reconciliation-run": {
+      "address": "zoikosuite.accounting.reconciliation-run.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/reconciliation-run.completed"
+        },
+        "failed": {
+          "$ref": "#/components/messages/reconciliation-run.failed"
+        },
+        "reperformed": {
+          "$ref": "#/components/messages/reconciliation-run.reperformed"
+        },
+        "started": {
+          "$ref": "#/components/messages/reconciliation-run.started"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/reconciliation-run.superseded"
+        },
+        "variance-found": {
+          "$ref": "#/components/messages/reconciliation-run.variance-found"
         }
       }
     }
@@ -409,6 +476,18 @@
         "title": "accounting-event rejected",
         "x-zoiko-event-type": "com.zoikosuite.accounting.accounting-event.rejected",
         "x-zoiko-origin": "spec"
+      },
+      "allocation-run.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.allocation-run.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Allocation Run: posted.",
+        "title": "allocation-run posted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.allocation-run.posted",
+        "x-zoiko-origin": "extension"
       },
       "allocation.posted": {
         "contentType": "application/json",
@@ -528,6 +607,18 @@
         "summary": "Financial Snapshot: integrity-failed.",
         "title": "financial-snapshot integrity-failed",
         "x-zoiko-event-type": "com.zoikosuite.accounting.financial-snapshot.integrity-failed",
+        "x-zoiko-origin": "extension"
+      },
+      "fx-revaluation-run.posted": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.fx-revaluation-run.posted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Fx Revaluation Run: posted.",
+        "title": "fx-revaluation-run posted",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.fx-revaluation-run.posted",
         "x-zoiko-origin": "extension"
       },
       "fx-revaluation.completed": {
@@ -1370,6 +1461,18 @@
         "x-zoiko-event-type": "com.zoikosuite.accounting.period.subledger-control-exception",
         "x-zoiko-origin": "extension"
       },
+      "reconciliation-break.assigned": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-break.assigned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Break: assigned.",
+        "title": "reconciliation-break assigned",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-break.assigned",
+        "x-zoiko-origin": "extension"
+      },
       "reconciliation-break.detected": {
         "contentType": "application/json",
         "description": "Producer: Reconciliation Engine. Primary consumers / intent: Ops/close workflow. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
@@ -1393,6 +1496,138 @@
         "title": "reconciliation-break resolved",
         "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-break.resolved",
         "x-zoiko-origin": "spec"
+      },
+      "reconciliation-break.status-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-break.status-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Break: status-changed.",
+        "title": "reconciliation-break status-changed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-break.status-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-certification.issued": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-certification.issued",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Certification: issued.",
+        "title": "reconciliation-certification issued",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-certification.issued",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-certification.revoked": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-certification.revoked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Certification: revoked.",
+        "title": "reconciliation-certification revoked",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-certification.revoked",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-definition.rule-version-approved": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-definition.rule-version-approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Definition: rule-version-approved.",
+        "title": "reconciliation-definition rule-version-approved",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-definition.rule-version-approved",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-definition.rule-version-published": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-definition.rule-version-published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Definition: rule-version-published.",
+        "title": "reconciliation-definition rule-version-published",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-definition.rule-version-published",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-run.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-run.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Run: completed.",
+        "title": "reconciliation-run completed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-run.completed",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-run.failed": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-run.failed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Run: failed.",
+        "title": "reconciliation-run failed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-run.failed",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-run.reperformed": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-run.reperformed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Run: reperformed.",
+        "title": "reconciliation-run reperformed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-run.reperformed",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-run.started": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-run.started",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Run: started.",
+        "title": "reconciliation-run started",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-run.started",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-run.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-run.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Run: superseded.",
+        "title": "reconciliation-run superseded",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-run.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-run.variance-found": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-run.variance-found",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Run: variance-found.",
+        "title": "reconciliation-run variance-found",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-run.variance-found",
+        "x-zoiko-origin": "extension"
       }
     },
     "schemas": {
@@ -1566,6 +1801,19 @@
       ],
       "summary": "Publish allocation facts after the authoritative commit (transactional outbox)."
     },
+    "publish.allocation-run": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/allocation-run"
+      },
+      "description": "Producer(s): Financial Close Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/allocation-run/messages/posted"
+        }
+      ],
+      "summary": "Publish allocation-run facts after the authoritative commit (transactional outbox)."
+    },
     "publish.balance-snapshot": {
       "action": "send",
       "channel": {
@@ -1645,6 +1893,19 @@
         }
       ],
       "summary": "Publish fx-revaluation facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.fx-revaluation-run": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/fx-revaluation-run"
+      },
+      "description": "Producer(s): Financial Close Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/fx-revaluation-run/messages/posted"
+        }
+      ],
+      "summary": "Publish fx-revaluation-run facts after the authoritative commit (transactional outbox)."
     },
     "publish.intercompany-entry": {
       "action": "send",
@@ -1908,16 +2169,82 @@
       "channel": {
         "$ref": "#/channels/reconciliation-break"
       },
-      "description": "Producer(s): Reconciliation Engine. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "description": "Producer(s): Reconciliation Engine, Reconciliation Engine Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
       "messages": [
+        {
+          "$ref": "#/channels/reconciliation-break/messages/assigned"
+        },
         {
           "$ref": "#/channels/reconciliation-break/messages/detected"
         },
         {
           "$ref": "#/channels/reconciliation-break/messages/resolved"
+        },
+        {
+          "$ref": "#/channels/reconciliation-break/messages/status-changed"
         }
       ],
       "summary": "Publish reconciliation-break facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.reconciliation-certification": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/reconciliation-certification"
+      },
+      "description": "Producer(s): Reconciliation Engine Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/reconciliation-certification/messages/issued"
+        },
+        {
+          "$ref": "#/channels/reconciliation-certification/messages/revoked"
+        }
+      ],
+      "summary": "Publish reconciliation-certification facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.reconciliation-definition": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/reconciliation-definition"
+      },
+      "description": "Producer(s): Reconciliation Engine Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/reconciliation-definition/messages/rule-version-approved"
+        },
+        {
+          "$ref": "#/channels/reconciliation-definition/messages/rule-version-published"
+        }
+      ],
+      "summary": "Publish reconciliation-definition facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.reconciliation-run": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/reconciliation-run"
+      },
+      "description": "Producer(s): Reconciliation Engine Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/reconciliation-run/messages/completed"
+        },
+        {
+          "$ref": "#/channels/reconciliation-run/messages/failed"
+        },
+        {
+          "$ref": "#/channels/reconciliation-run/messages/reperformed"
+        },
+        {
+          "$ref": "#/channels/reconciliation-run/messages/started"
+        },
+        {
+          "$ref": "#/channels/reconciliation-run/messages/superseded"
+        },
+        {
+          "$ref": "#/channels/reconciliation-run/messages/variance-found"
+        }
+      ],
+      "summary": "Publish reconciliation-run facts after the authoritative commit (transactional outbox)."
     }
   }
 }
