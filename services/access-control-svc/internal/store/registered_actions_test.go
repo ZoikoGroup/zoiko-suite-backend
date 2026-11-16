@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
 	"zoiko.io/access-control-svc/internal/store"
 )
 
@@ -155,8 +156,11 @@ var registeredActionMigrations = []struct {
 // templates carrying actions earlier migrations registered (rule R5).
 var templatePublishers = []string{"000052_jurisdiction_rules_templates"}
 
-// permCatalog is the permission catalogue used by alias tests.
-var permCatalog = store.NewPermissionCatalogue(testStore)
+// newPermCatalog is the permission catalogue used by alias tests. It is a
+// function, not a package-level var: a var would be initialised before
+// TestMain assigns testStore, which captured a nil store and panicked on the
+// first Lookup.
+func newPermCatalog() *store.PermissionCatalogue { return store.NewPermissionCatalogue(testStore) }
 
 func TestRegisteredPermissionDefinitions(t *testing.T) {
 	ctx := context.Background()
@@ -255,33 +259,33 @@ func TestRegisteredPermissionDownRefusesWhileGrantedAndOtherwiseRemovesOwnAction
 // either name must satisfy a check for the other.
 
 func TestS9D1_CanonicalGrantSatisfiesLegacyCheck(t *testing.T) {
-	ctx := context.Background()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
 	// Bundle grants canonical name
-	actions := []string{"payment.release"}
-	known, err := permCatalog.Lookup(ctx, actions)
+	actions := []string{"iam.role.manage"}
+	known, err := newPermCatalog().Lookup(ctx, actions)
 	require.NoError(t, err)
-	require.Contains(t, known, "payment.release", "canonical action must be found")
+	require.Contains(t, known, "iam.role.manage", "canonical action must be found")
 	// The legacy alias should also be present in the map
-	require.Contains(t, known, "PAYMENT_RELEASE", "legacy alias must be included for canonical grant")
-	require.Equal(t, known["payment.release"].RiskTier, known["PAYMENT_RELEASE"].RiskTier, "risk tier must match")
+	require.Contains(t, known, "ROLE_MANAGE", "legacy alias must be included for canonical grant")
+	require.Equal(t, known["iam.role.manage"].RiskTier, known["ROLE_MANAGE"].RiskTier, "risk tier must match")
 }
 
 func TestS9D1_LegacyGrantSatisfiesCanonicalCheck(t *testing.T) {
-	ctx := context.Background()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
 	// Bundle grants legacy name
-	actions := []string{"PAYMENT_RELEASE"}
-	known, err := permCatalog.Lookup(ctx, actions)
+	actions := []string{"ROLE_MANAGE"}
+	known, err := newPermCatalog().Lookup(ctx, actions)
 	require.NoError(t, err)
-	require.Contains(t, known, "PAYMENT_RELEASE", "legacy action must be found")
+	require.Contains(t, known, "ROLE_MANAGE", "legacy action must be found")
 	// The canonical name should also be present in the map
-	require.Contains(t, known, "payment.release", "canonical alias must be included for legacy grant")
-	require.Equal(t, known["PAYMENT_RELEASE"].RiskTier, known["payment.release"].RiskTier, "risk tier must match")
+	require.Contains(t, known, "iam.role.manage", "canonical alias must be included for legacy grant")
+	require.Equal(t, known["ROLE_MANAGE"].RiskTier, known["iam.role.manage"].RiskTier, "risk tier must match")
 }
 
 func TestS9D1_UnknownActionStillRefused(t *testing.T) {
-	ctx := context.Background()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
 	actions := []string{"UNKNOWN_ACTION_THAT_DOES_NOT_EXIST"}
-	known, err := permCatalog.Lookup(ctx, actions)
+	known, err := newPermCatalog().Lookup(ctx, actions)
 	require.NoError(t, err)
 	require.Empty(t, known, "unknown action must not be found")
 }
@@ -292,9 +296,9 @@ func TestS9D1_AliasCannotPointAtUnregisteredAction(t *testing.T) {
 	// First verify the constraint exists by checking a known alias
 	var aliasFor string
 	err := ownerPool.QueryRow(ctx,
-		`SELECT alias_for FROM permission_definitions WHERE action_name = 'PAYMENT_RELEASE'`).Scan(&aliasFor)
+		`SELECT alias_for FROM permission_definitions WHERE action_name = 'ROLE_MANAGE'`).Scan(&aliasFor)
 	require.NoError(t, err)
-	require.Equal(t, "payment.release", aliasFor, "PAYMENT_RELEASE must alias to payment.release")
+	require.Equal(t, "iam.role.manage", aliasFor, "ROLE_MANAGE must alias to iam.role.manage")
 
 	// The FK constraint prevents creating an alias to a non-existent action
 	// This is tested implicitly by the migration - if the constraint didn't

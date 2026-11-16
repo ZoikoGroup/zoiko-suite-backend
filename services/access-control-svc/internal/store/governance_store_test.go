@@ -73,10 +73,15 @@ func TestTemplatesSeedTheArchetypes(t *testing.T) {
 			archetypes++
 			// 000021, 000022 and 000023 published versions 2, 3 and 4 of the
 			// read-only archetype (governance-platform, accounting-kernel and
-			// migration reads); every other archetype is at 1.
+			// migration reads); 000050 published version 2 of the IAM access
+			// administrator (adds iam.assignment.read). Every other archetype
+			// is at 1.
 			want := 1
-			if tpl.TemplateCode == "VIEWER_AUDITOR_READ_ONLY" {
+			switch tpl.TemplateCode {
+			case "VIEWER_AUDITOR_READ_ONLY":
 				want = 4
+			case "IAM_ACCESS_ADMINISTRATOR":
+				want = 2
 			}
 			require.Equal(t, want, tpl.LatestVersion, tpl.TemplateCode)
 			require.NotEmpty(t, tpl.LatestActions)

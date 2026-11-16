@@ -111,29 +111,60 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// When using an external DB (TEST_DATABASE_URL), we assume migrations and
-	// app role are already provisioned (e.g., by CI's postgres service container).
-	// When using embedded postgres, we must provision them ourselves.
-	if pg != nil {
+	// A TEST_DATABASE_URL does not mean the schema is there. CI points this
+	// suite at a bare postgres:16 service container, so assuming migrations had
+	// already run made every assertion fail with `relation "role_definitions"
+	// does not exist` -- and the job burned its 600s timeout instead of telling
+	// anyone why. Provision whenever the schema is absent, whichever way the
+	// DSN arrived. Provisioning is skipped when the schema is present because
+	// the migrations are not written to be re-runnable.
+	if err := ownerPool.QueryRow(ctx, "SELECT current_database()").Scan(&dbName); err != nil {
+		fmt.Printf("resolve database name: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+	var haveSchema bool
+	if err := ownerPool.QueryRow(ctx, "SELECT to_regclass('public.role_definitions') IS NOT NULL").Scan(&haveSchema); err != nil {
+		fmt.Printf("schema probe: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+	if !haveSchema {
 		if err := applyMigrations(ctx, ownerPool); err != nil {
 			fmt.Printf("migrations: %v\n", err)
 			ownerPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
-		if err := createAppRole(ctx, ownerPool, dbName); err != nil {
-			fmt.Printf("app role: %v\n", err)
-			ownerPool.Close()
+	}
+	// Grants are refreshed even when the role already exists: migrations above
+	// may have created tables after the last run's grant list was applied.
+	if err := createAppRole(ctx, ownerPool, dbName); err != nil {
+		fmt.Printf("app role: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
 			_ = pg.Stop()
-			os.Exit(1)
 		}
+		os.Exit(1)
+	}
 
-		appDSN := fmt.Sprintf("postgres://%s:%s@localhost:%d/%s?sslmode=disable", appRole, appPass, dbPort, dbName)
-		appPool, err = pgxpool.New(ctx, appDSN)
-	} else {
-		// Use the same DSN for the app pool when connecting to an external DB.
-		// The external DB should already have the app role provisioned.
-		appPool, err = pgxpool.New(ctx, dsn)
+	// The app pool always connects as the ordinary role. Connecting it as the
+	// superuser (as an external DSN would do) bypasses row security, so every
+	// policy assertion below would pass without a policy existing at all.
+	appCfg, err := pgxpool.ParseConfig(dsn)
+	if err == nil {
+		appCfg.ConnConfig.User = appRole
+		appCfg.ConnConfig.Password = appPass
+		appCfg.ConnConfig.Database = dbName
+		appPool, err = pgxpool.NewWithConfig(ctx, appCfg)
 	}
 	if err != nil {
 		fmt.Printf("app pool: %v\n", err)
@@ -244,15 +275,20 @@ func splitSQL(sql string) []string {
 		}
 
 		if inDollarQuote {
-			current.WriteByte(c)
-			// Check for end of dollar-quoted string ($tag$ or $$)
-			if c == '$' && i+len(dollarTag) <= len(sql) && sql[i:i+len(dollarTag)] == dollarTag {
+			// Compare the whole end marker ($tag$) before writing anything. The
+			// previous version wrote the first '$', then compared
+			// `sql[i:i+len(dollarTag)]` after clearing dollarTag, and advanced
+			// i by len(dollarTag)-1 == -1. The end marker was then re-read as
+			// an opening marker, so every migration with a dollar-quoted
+			// function body failed to split.
+			if c == '$' && strings.HasPrefix(sql[i:], dollarTag) {
+				current.WriteString(dollarTag)
+				i += len(dollarTag) - 1
 				inDollarQuote = false
 				dollarTag = ""
-				// Advance past the rest of the end marker (already wrote first $)
-				i += len(dollarTag) - 1
 				continue
 			}
+			current.WriteByte(c)
 			continue
 		}
 
@@ -301,11 +337,10 @@ func splitSQL(sql string) []string {
 			}
 			if j < len(sql) && sql[j] == '$' {
 				inDollarQuote = true
-				dollarTag = "$" + tag + "$"
-				// Write the opening $tag$
-				for k := i + 1; k <= j; k++ {
-					current.WriteByte(sql[k])
-				}
+				dollarTag = sql[i : j+1] // $tag$ including both dollars
+				// Write the whole opening marker: the leading '$' was not
+				// written by any earlier branch.
+				current.WriteString(dollarTag)
 				i = j
 				continue
 			} else {
@@ -329,9 +364,21 @@ func splitSQL(sql string) []string {
 }
 
 func createAppRole(ctx context.Context, pool *pgxpool.Pool, dbName string) error {
-	stmts := []string{
-		fmt.Sprintf("DROP ROLE IF EXISTS %s", appRole),
-		fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS", appRole, appPass),
+	// Only CREATE when absent. DROP ROLE is not an option once the role holds
+	// grants: Postgres refuses to drop a role that owns dependencies, so a
+	// second run against the same database would fail here instead of testing.
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`, appRole).Scan(&exists); err != nil {
+		return fmt.Errorf("look up role %s: %w", appRole, err)
+	}
+
+	var stmts []string
+	if !exists {
+		stmts = append(stmts,
+			fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS", appRole, appPass),
+		)
+	}
+	stmts = append(stmts,
 		fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s", dbName, appRole),
 		fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", appRole),
 		fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %s", appRole),
@@ -342,7 +389,7 @@ func createAppRole(ctx context.Context, pool *pgxpool.Pool, dbName string) error
 		// sequences is a grant list that breaks the moment a table gets an
 		// identity column.
 		fmt.Sprintf("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s", appRole),
-	}
+	)
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
 			return fmt.Errorf("%s: %w", s, err)

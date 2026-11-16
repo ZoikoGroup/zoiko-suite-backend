@@ -57,10 +57,12 @@ const permissionColumns = `
 // "Payment.Release" is not "payment.release", and a bundle granting the
 // former would grant something no service checks.
 //
-// S9-D1 aliases: if an action has an alias_for pointing to a canonical
-// action, the canonical action's definition is also included in the map
-// under the alias name, so that checkTaxonomy and roleRisk see them as
-// equivalent.
+// S9-D1 aliases: a LEGACY row with alias_for is the same capability as the
+// TAXONOMY row it names, so a grant of either name answers a check for the
+// other. Resolution runs in both directions: asking for the canonical name
+// also returns the legacy rows aliased to it, and asking for a legacy name
+// also returns its canonical row. Each extra name is followed once, which
+// terminates because a row is only queued when it is not already known.
 func (c *PermissionCatalogue) Lookup(ctx context.Context, actions []string) (map[string]domain.PermissionDefinition, error) {
 	tenantID, err := requestTenant(ctx)
 	if err != nil {
@@ -71,36 +73,59 @@ func (c *PermissionCatalogue) Lookup(ctx context.Context, actions []string) (map
 		return out, nil
 	}
 	err = c.s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, "SELECT "+permissionColumns+" FROM permission_definitions p WHERE p.active_flag AND p.action_name = ANY($1)", actions)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var d domain.PermissionDefinition
-			var aliasFor *string
-			if err := rows.Scan(&d.ActionName, &d.Naming, &d.RiskTier, &d.Description, &d.Protected, &aliasFor); err != nil {
+		pending := actions
+		for len(pending) > 0 {
+			defs, err := lookupDefinitions(ctx, tx, pending)
+			if err != nil {
 				return err
 			}
-			out[d.ActionName] = d
-			// S9-D1: if this is a LEGACY entry with an alias_for, also include
-			// the canonical definition under the alias name.
-			if aliasFor != nil && *aliasFor != "" {
-				// Fetch the canonical definition
-				var cd domain.PermissionDefinition
-				err := tx.QueryRow(ctx, "SELECT "+permissionColumns+" FROM permission_definitions WHERE action_name = $1 AND active_flag", *aliasFor).Scan(&cd.ActionName, &cd.Naming, &cd.RiskTier, &cd.Description, &cd.Protected, &aliasFor)
-				if err == nil {
-					// Add the canonical definition under the alias name
-					out[*aliasFor] = cd
+			var next []string
+			for _, d := range defs {
+				if _, known := out[d.action.ActionName]; known {
+					continue
+				}
+				out[d.action.ActionName] = d.action
+				if d.aliasFor != nil && *d.aliasFor != "" {
+					next = append(next, *d.aliasFor)
 				}
 			}
+			pending = next
 		}
-		return rows.Err()
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("read permission_definitions: %w", err)
 	}
 	return out, nil
+}
+
+type permissionLookup struct {
+	action   domain.PermissionDefinition
+	aliasFor *string
+}
+
+// lookupDefinitions selects requested names plus any LEGACY row aliased to
+// one of them. Rows are read in full before the next query runs, so the
+// connection is never used while a result set is open.
+func lookupDefinitions(ctx context.Context, tx pgx.Tx, names []string) ([]permissionLookup, error) {
+	rows, err := tx.Query(ctx, "SELECT "+permissionColumns+
+		" FROM permission_definitions p"+
+		" WHERE p.active_flag AND (p.action_name = ANY($1) OR p.alias_for = ANY($1))", names)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []permissionLookup
+	for rows.Next() {
+		var l permissionLookup
+		if err := rows.Scan(&l.action.ActionName, &l.action.Naming, &l.action.RiskTier,
+			&l.action.Description, &l.action.Protected, &l.aliasFor); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
 }
 
 // List reads the registry, optionally narrowed by naming and a name search.
