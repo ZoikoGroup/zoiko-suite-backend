@@ -457,6 +457,7 @@ func (h *Handler) GetAncestors(w http.ResponseWriter, r *http.Request) {
 // Query parameters (all optional):
 //
 //	domain=PAYROLL        filter by rule_domain (VARCHAR, data driven)
+//	scope=all             every rule recorded here, any status or period (register view)
 //	effective_at=2024-01-01T00:00:00Z  point-in-time (RFC3339). Defaults to now.
 //	limit=50              page size (max 100, default 50)
 //	offset=0              zero-based page offset
@@ -476,8 +477,15 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	p, ok := h.beginList(w, r, []string{"domain"}, map[string]string{"domain": "domain"})
+	p, ok := h.beginList(w, r, []string{"domain", "scope"}, map[string]string{"domain": "domain", "scope": "scope"})
 	if !ok {
+		return
+	}
+	// scope=all is the register view: every rule recorded here, DRAFT and
+	// future-dated included, newest first (effective_at does not apply).
+	scope := p.filter("scope")
+	if scope != "" && scope != "all" {
+		writeError(w, r, http.StatusBadRequest, "invalid_scope", "scope must be all, or omitted for the rules in force at effective_at")
 		return
 	}
 
@@ -485,6 +493,7 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 		JurisdictionID: jurisdictionID,
 		Domain:         p.filter("domain"), // empty string means all domains
 		EffectiveAt:    effectiveAt,
+		AllVersions:    scope == "all",
 		Limit:          p.fetch(),
 		Offset:         p.offset,
 	})

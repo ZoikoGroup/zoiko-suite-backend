@@ -737,6 +737,11 @@ paths:
         requested `effective_at` falls inside their effective period, because a
         historical action has to remain explainable against the rules that governed it.
 
+        `scope=all` (paged: `filter[scope]=all`) is the register view instead: every
+        rule recorded on the jurisdiction, DRAFT and future-dated included, newest
+        first; `effective_at` does not apply. It is what an author and an approver
+        work from, since a DRAFT awaiting activation is in no point-in-time answer.
+
         This endpoint keeps answering after the jurisdiction is deactivated, for the
         same reason.
       operationId: getRules
@@ -746,6 +751,10 @@ paths:
           in: query
           description: Filter by rule_domain, e.g. PAYROLL, TAX, EMPLOYMENT, FILING, RETENTION, BENEFITS.
           schema: { type: string }
+        - name: scope
+          in: query
+          description: "`all` lists every rule recorded here (any status or period), newest first."
+          schema: { type: string, enum: [all] }
         - $ref: '#/components/parameters/EffectiveAt'
         - $ref: '#/components/parameters/Limit100'
         - $ref: '#/components/parameters/Offset'

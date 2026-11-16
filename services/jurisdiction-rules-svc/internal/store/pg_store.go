@@ -71,6 +71,12 @@ type FindRulesParams struct {
 	// Zero value is treated as time.Now() inside FindRules.
 	EffectiveAt time.Time
 
+	// AllVersions lists every rule recorded on the jurisdiction — DRAFT,
+	// future-dated, ended and superseded included — newest first, and ignores
+	// EffectiveAt. It is the register view an author and an approver work
+	// from: a DRAFT awaiting activation is in no point-in-time answer.
+	AllVersions bool
+
 	// Limit is the page size. 0 defaults to 50; max enforced at 100.
 	Limit int
 
@@ -895,8 +901,19 @@ func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*dom
 		  AND  (effective_to IS NULL OR effective_to > $3)
 		ORDER BY rule_domain ASC, effective_from ASC, jurisdiction_rule_id ASC
 		LIMIT  $4 OFFSET $5`
+	args := []any{params.JurisdictionID, params.Domain, at, limit, offset}
+	if params.AllVersions {
+		query = `
+		SELECT ` + ruleColumns + `
+		FROM   jurisdiction_rules
+		WHERE  jurisdiction_id = $1
+		  AND  ($2 = '' OR rule_domain = $2)
+		ORDER BY created_at DESC, jurisdiction_rule_id ASC
+		LIMIT  $3 OFFSET $4`
+		args = []any{params.JurisdictionID, params.Domain, limit, offset}
+	}
 
-	rows, err := s.db(ctx).Query(ctx, query, params.JurisdictionID, params.Domain, at, limit, offset)
+	rows, err := s.db(ctx).Query(ctx, query, args...)
 	if err != nil {
 		s.log.Error("pg FindRules failed",
 			zap.String("jurisdiction_id", params.JurisdictionID),
