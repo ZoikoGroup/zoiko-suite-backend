@@ -429,7 +429,12 @@ func (h *Handler) ApprovePayment(w http.ResponseWriter, r *http.Request) {
 		Authorization: r.Header.Get("Authorization"),
 		RequestID:     r.Header.Get("X-Request-Id"),
 		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		DecisionID:    "payment-authorization-" + authorizationID,
 	}, verifiedTenant, a.LegalEntityID, a.NetAmount)
+	if errors.Is(err, domain.ErrPolicyAccessDenied) {
+		writeError(w, http.StatusForbidden, "policy-svc refused the caller (POLICY_EVALUATE)")
+		return
+	}
 	if err != nil {
 		h.log.Error("ApprovePayment: policy evaluation failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "policy-svc unavailable")
