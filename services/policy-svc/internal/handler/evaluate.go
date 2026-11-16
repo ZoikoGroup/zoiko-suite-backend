@@ -410,6 +410,14 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 		missingField(w, r, "action_context.amount")
 		return "", nil, false
 	}
+	// A negative amount is always "within" any threshold, so accepting one
+	// would let a caller route any action past approval by flipping its sign.
+	// A refund or reversal is evaluated on its absolute size by its caller.
+	if amount.Sign() < 0 {
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_action_context",
+			"action_context.amount must not be negative", map[string]any{"field": "action_context.amount"})
+		return "", nil, false
+	}
 	result := "WITHIN_THRESHOLD"
 	if amount.Cmp(threshold) > 0 {
 		result = "APPROVAL_REQUIRED"

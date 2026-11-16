@@ -20,10 +20,10 @@ import (
 	"errors"
 	"net/http"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/domain"
@@ -190,7 +190,7 @@ func (h *Handler) DraftAccountingPolicy(w http.ResponseWriter, r *http.Request) 
 	if created {
 		status = http.StatusCreated
 	}
-	w.Header().Set("ETag", `"`+strconv.Itoa(v.RowVersion)+`"`)
+	apicontract.WriteETag(w, int64(v.RowVersion))
 	writeJSON(w, status, v)
 }
 
@@ -222,7 +222,7 @@ func (h *Handler) GetAccountingPolicyVersion(w http.ResponseWriter, r *http.Requ
 		h.storeUnavailable(w, r, "GetAccountingPolicyVersion", err)
 		return
 	}
-	w.Header().Set("ETag", `"`+strconv.Itoa(v.RowVersion)+`"`)
+	apicontract.WriteETag(w, int64(v.RowVersion))
 	writeJSON(w, http.StatusOK, v)
 }
 

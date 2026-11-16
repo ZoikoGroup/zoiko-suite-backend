@@ -25,7 +25,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -114,21 +113,8 @@ func (h *Handler) accountingCommand(route string) http.HandlerFunc {
 			return
 		}
 
-		expected, ok := ifMatch(r)
+		expected, ok := commandVersion(w, r, req.ExpectedVersion)
 		if !ok {
-			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_if_match", "If-Match must be a row_version", nil)
-			return
-		}
-		if req.ExpectedVersion != nil {
-			if expected != nil && *expected != *req.ExpectedVersion {
-				writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "expected_version_mismatch", "If-Match and expected_version disagree", nil)
-				return
-			}
-			expected = req.ExpectedVersion
-		}
-		if expected == nil {
-			writeError(w, r, http.StatusPreconditionRequired, codeInvalidRequest, "expected_version_required",
-				"send the version's row_version as If-Match or expected_version (GET the version for its ETag)", nil)
 			return
 		}
 
@@ -200,9 +186,12 @@ func (h *Handler) accountingCommand(route string) http.HandlerFunc {
 		} else if !h.authorize(w, r, principalID, spec.action, existing.LegalEntityID) {
 			return
 		}
+		if refuseStale(w, r, expected, existing.RowVersion) {
+			return
+		}
 
 		res, err := h.store.Transition(r.Context(), domain.TransitionCommand{
-			PolicyVersionID: versionID, Command: spec.command, ActorID: principalID, ExpectedVersion: expected,
+			PolicyVersionID: versionID, Command: spec.command, ActorID: principalID, ExpectedVersion: &expected,
 			Reason: reason, ApprovalReference: strings.TrimSpace(req.ApprovalReference), Outcome: outcome,
 			SupersedesVersionID: supersedes, BreakGlassSessionID: sessionID, Meta: eventMeta(r, principalID),
 		})
@@ -221,8 +210,7 @@ func (h *Handler) accountingCommand(route string) http.HandlerFunc {
 			h.storeUnavailable(w, r, "accountingCommand", err)
 			return
 		}
-		w.Header().Set("ETag", `"`+strconv.Itoa(out.RowVersion)+`"`)
-		writeJSON(w, http.StatusOK, out)
+		writeJSONWithETag(w, http.StatusOK, out, int64(out.RowVersion))
 	}
 }
 

@@ -119,8 +119,8 @@ func TestAccountingCommands_SupersedeNamesTheVersionItReplaces(t *testing.T) {
 func TestAccountingCommands_InputRefusals(t *testing.T) {
 	st := acctVersionStub()
 	g := newAcctRig(st, nil)
-	expect(t, g.do(http.MethodPost, versionURL+"approve", `{}`), http.StatusPreconditionRequired, "INVALID_REQUEST")
-	expect(t, g.do(http.MethodPost, versionURL+"approve", `{}`, header("If-Match", "x")), http.StatusBadRequest, "INVALID_REQUEST")
+	expect(t, g.do(http.MethodPost, versionURL+"approve", `{}`), http.StatusPreconditionRequired, "precondition_required")
+	expect(t, g.do(http.MethodPost, versionURL+"approve", `{}`, header("If-Match", "x")), http.StatusBadRequest, "invalid_if_match")
 	expect(t, g.do(http.MethodPost, versionURL+"approve", `{"expected_version":2}`, ifMatchOne()), http.StatusBadRequest, "INVALID_REQUEST")
 	expect(t, g.do(http.MethodPost, versionURL+"review-suspension", `{"outcome":"UPHELD"}`, ifMatchOne()), http.StatusBadRequest, "INVALID_REQUEST")
 	expect(t, g.do(http.MethodPost, versionURL+"review-suspension", `{"reason_code":"RC","outcome":"MAYBE"}`, ifMatchOne()), http.StatusBadRequest, "INVALID_REQUEST")
@@ -265,7 +265,7 @@ func TestEmergencySuspend_NeedsAReasonAndTheOrdinaryRules(t *testing.T) {
 	az := &emergencyAuthz{stubAuthz: &stubAuthz{}, basis: "break_glass:session=" + sessionID}
 	g := newAcctRigClient(st, az)
 	expect(t, g.do(http.MethodPost, versionURL+"emergency-suspend", `{}`, ifMatchOne(), header(handlerSessionHeader, sessionID)), http.StatusBadRequest, "INVALID_REQUEST")
-	expect(t, g.do(http.MethodPost, versionURL+"emergency-suspend", emergencyBody(), header(handlerSessionHeader, sessionID)), http.StatusPreconditionRequired, "INVALID_REQUEST")
+	expect(t, g.do(http.MethodPost, versionURL+"emergency-suspend", emergencyBody(), header(handlerSessionHeader, sessionID)), http.StatusPreconditionRequired, "precondition_required")
 	if az.calls != 0 || st.transitionCalls != 0 {
 		t.Error("an invalid emergency request reached authorization or the store")
 	}
