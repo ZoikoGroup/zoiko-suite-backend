@@ -99,10 +99,71 @@ channels:
           - $ref: "#/components/messages/PartyRoleAdded"
           - $ref: "#/components/messages/PartyRoleRemoved"
           - $ref: "#/components/messages/PartyIdentifierLinked"
+          - $ref: "#/components/messages/PartyIdentifierVerified"
           - $ref: "#/components/messages/MasterConflictOpened"
           - $ref: "#/components/messages/PartiesMerged"
           - $ref: "#/components/messages/PartySplit"
           - $ref: "#/components/messages/MasterConflictResolved"
+          # ── ORG-08 addresses ─────────────────────────────────────────────
+          - $ref: "#/components/messages/AddressCreated"
+          - $ref: "#/components/messages/AddressVerified"
+          - $ref: "#/components/messages/AddressSuperseded"
+          - $ref: "#/components/messages/AddressLinked"
+          # ── ORG-08 establishments ────────────────────────────────────────
+          - $ref: "#/components/messages/EstablishmentCreated"
+          - $ref: "#/components/messages/EstablishmentActivated"
+          - $ref: "#/components/messages/EstablishmentDeactivated"
+          - $ref: "#/components/messages/EstablishmentClosed"
+          # ── MDM-01 party contact points ──────────────────────────────────
+          - $ref: "#/components/messages/ContactPointProposed"
+          - $ref: "#/components/messages/ContactPointVerified"
+          - $ref: "#/components/messages/ContactPointRetired"
+          # ── ORG-09 registrations ─────────────────────────────────────────
+          - $ref: "#/components/messages/RegistrationCreated"
+          - $ref: "#/components/messages/RegistrationVerified"
+          - $ref: "#/components/messages/RegistrationRenewed"
+          - $ref: "#/components/messages/RegistrationSuspended"
+          - $ref: "#/components/messages/RegistrationExpiring"
+          - $ref: "#/components/messages/RegistrationExpired"
+          - $ref: "#/components/messages/RegistrationRevoked"
+          - $ref: "#/components/messages/RegistrationSuperseded"
+          # ── REF-03 exchange rates ─────────────────────────────────────────
+          - $ref: "#/components/messages/FXRateObserved"
+          - $ref: "#/components/messages/FXRateApproved"
+          - $ref: "#/components/messages/FXRateSetClosed"
+          - $ref: "#/components/messages/FXRateSetSuperseded"
+          - $ref: "#/components/messages/FXRateSuperseded"
+          # ── REF-06 accounting books ───────────────────────────────────────
+          - $ref: "#/components/messages/AccountingBookCreated"
+          - $ref: "#/components/messages/AccountingBookActivated"
+          - $ref: "#/components/messages/AccountingBookBasisChanged"
+          - $ref: "#/components/messages/AccountingBookPostingSuspended"
+          - $ref: "#/components/messages/AccountingBookRetired"
+          # ── REF-08 financial dimensions ───────────────────────────────────
+          - $ref: "#/components/messages/DimensionTypeCreated"
+          - $ref: "#/components/messages/DimensionValueCreated"
+          - $ref: "#/components/messages/DimensionValueActivated"
+          - $ref: "#/components/messages/DimensionValueDeactivated"
+          - $ref: "#/components/messages/DimensionHierarchyProposed"
+          - $ref: "#/components/messages/DimensionHierarchyChanged"
+          - $ref: "#/components/messages/DimensionSourceMapped"
+          # ── REF-09 units of measure ───────────────────────────────────────
+          - $ref: "#/components/messages/QuantityDimensionCreated"
+          - $ref: "#/components/messages/UnitCreated"
+          - $ref: "#/components/messages/UnitConversionProposed"
+          - $ref: "#/components/messages/UnitConversionActivated"
+          - $ref: "#/components/messages/UnitConversionSuperseded"
+          - $ref: "#/components/messages/UnitRetired"
+          # ── MDM-04 reference releases ─────────────────────────────────────
+          - $ref: "#/components/messages/ReferenceSetCreated"
+          - $ref: "#/components/messages/ReferenceReleaseStaged"
+          - $ref: "#/components/messages/ReferenceReleasePublished"
+          # ── ORG-9 master imports ──────────────────────────────────────────
+          - $ref: "#/components/messages/MasterImportUploaded"
+          - $ref: "#/components/messages/MasterImportValidated"
+          - $ref: "#/components/messages/MasterImportApproved"
+          - $ref: "#/components/messages/MasterImportCompleted"
+          - $ref: "#/components/messages/MasterImportCancelled"
           # ── §8 NP5 ───────────────────────────────────────────────────────
           - $ref: "#/components/messages/RegistryConflictQuarantined"
           - $ref: "#/components/messages/RegistryConflictResolved"
@@ -384,6 +445,497 @@ components:
       name: master.conflict.resolved
       title: A stewardship case was decided
       description: Carries the case id, conflict_type, decision and the party the decision settled on.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AddressCreated:
+      name: address.created
+      title: An address was recorded
+      description: Carries identifiers, the address type, country and source class, never the address itself.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AddressVerified:
+      name: address.verified
+      title: An address version passed a verification observation
+      description: |
+        Emitted only when a version reaches VERIFIED. It says an observation passed, not that the address is
+        a legal registered office or still current. Carries verifier, result and confidence.
+      x-spec-event: AddressVerified
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AddressSuperseded:
+      name: address.superseded
+      title: An address version was replaced by a newer one
+      description: Carries superseded_version_no and the new version's valid_from. Historical versions stay readable.
+      x-spec-event: AddressSuperseded
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AddressLinked:
+      name: address.linked
+      title: An address was linked to a party
+      description: Carries party_id, link_id, link_type and valid_from.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EstablishmentCreated:
+      name: establishment.created
+      title: An establishment was proposed
+      description: Carries identifiers, type, address id and status, never the name or the address.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EstablishmentActivated:
+      name: establishment.activated
+      title: An establishment became ACTIVE
+      description: |
+        A recorded presence fact, not a tax or registration conclusion; those are decided by their own domains.
+        `effective_date` is the date it took effect, which can precede the time it was recorded.
+      x-spec-event: EstablishmentActivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EstablishmentDeactivated:
+      name: establishment.deactivated
+      title: An establishment became INACTIVE
+      description: The spec names no event for deactivation. It can be activated again.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EstablishmentClosed:
+      name: establishment.closed
+      title: An establishment was closed
+      description: Final. `effective_date` is the end of the presence; history stays readable.
+      x-spec-event: EstablishmentClosed
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ContactPointProposed:
+      name: party.contact_point.proposed
+      title: A party contact point was proposed
+      description: Carries identifiers, channel, purpose, status, validity and the sha256 digest of the address, never the address.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ContactPointVerified:
+      name: party.contact_point.verified
+      title: A party contact point was verified on evidence
+      description: Verified by a principal other than the proposer. Never carries the address; read it through the permissioned contact point read.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ContactPointRetired:
+      name: party.contact_point.retired
+      title: A party contact point was retired
+      description: Final. valid_to is the time of retirement. Never carries the address.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationCreated:
+      name: registration.created
+      title: A registration or licence was recorded, unverified
+      description: Carries identifiers, type, jurisdiction, holder and dates, never the number.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationVerified:
+      name: registration.verified
+      title: A registration became ACTIVE on evidence
+      description: |
+        Records what an authority was shown to say; it concludes nothing about tax or legal sufficiency. Never carries the number.
+      x-spec-event: RegistrationVerified
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationRenewed:
+      name: registration.renewed
+      title: A registration was renewed to a later expiry date
+      description: Carries the new `expiry_date`. An expired registration renewed is ACTIVE again (`to_status`).
+      x-spec-event: RegistrationRenewed
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationSuspended:
+      name: registration.suspended
+      title: A registration was suspended
+      description: The spec names no event for suspension.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationExpiring:
+      name: registration.expiring
+      title: An active registration expires soon
+      description: |
+        From the expiry sweep, once per expiry date, `days_left` days ahead (30 by default). A renewal to a new date
+        warns again in its own window.
+      x-spec-event: RegistrationExpiring
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationExpired:
+      name: registration.expired
+      title: A registration expired
+      description: |
+        From the sweep (actor system:expiry-sweep) or ExpireRegistration. `effective_date` is the first day it was no
+        longer valid. Consumers should not rely on this alone: reads compute in_force from the dates.
+      x-spec-event: RegistrationExpired
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationRevoked:
+      name: registration.revoked
+      title: A registration was revoked
+      description: Final.
+      x-spec-event: RegistrationRevoked
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistrationSuperseded:
+      name: registration.superseded
+      title: A registration was replaced by a verified successor
+      description: The spec names no event for supersession. The successor's own registration.verified precedes it.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    PartyIdentifierVerified:
+      name: party.identifier.verified
+      title: An external identifier was verified, or verified by a higher authority
+      description: |
+        Published only when an observation passed the acceptance rules (`effect` VERIFIED or SOURCE_UPGRADED). Carries the
+        scheme, scope, source class and reference, source version, observation id and observed_at, never the value.
+        A dispute by a higher authority is published as master.conflict.opened instead.
+      x-spec-event: identifier_verified
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateObserved:
+      name: fx.rate.observed
+      title: An exchange-rate observation was recorded
+      description: |
+        Carries the pair, rate type, rate (an exact decimal string), market date, source, status and outlier/manual flags,
+        and the reference and hash of the raw payload, never the payload. VALIDATED means it passed its checks; OBSERVED
+        means it is manual or outlying and needs independent approval before use.
+      x-spec-event: FXRateObserved
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateApproved:
+      name: fx.rate.approved
+      title: A rate set was approved
+      description: |
+        Carries the set, its version, rate type, market date and every member's pair and rate. A superseding set names
+        `supersedes_set_id`: a consumer that read the old set re-reads.
+      x-spec-event: FXRateApproved
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateSetClosed:
+      name: fx.rate_set.closed
+      title: A rate set was certified and is now immutable
+      description: A certified set is never edited; a correction is a superseding set.
+      x-spec-event: FXRateSetClosed
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateSetSuperseded:
+      name: fx.rate_set.superseded
+      title: A rate set was corrected by a superseding set
+      description: Carries `superseded_by_set_id`. The old set stays readable as of the time before the correction.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    FXRateSuperseded:
+      name: fx.rate.superseded
+      title: An exchange-rate observation was superseded
+      description: |
+        Replaced by another observation (`superseded_by_id`), or dropped by a superseding set (empty). Carries the reason.
+        The superseded observation stays readable.
+      x-spec-event: FXRateSuperseded
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookCreated:
+      name: accounting.book.created
+      title: An accounting book was opened as a draft
+      description: Carries the book's type, owner, status, basis version, framework and currencies.
+      x-spec-event: AccountingBookCreated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookActivated:
+      name: accounting.book.activated
+      title: An accounting book became ACTIVE and may take postings
+      description: |
+        Also published when a book whose posting was suspended is activated again. `effective_date` is when it took effect,
+        which can precede the time it was recorded.
+      x-spec-event: AccountingBookActivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookBasisChanged:
+      name: accounting.book.basis_changed
+      title: A book's basis changed from its effective date
+      description: |
+        Carries the new framework and currencies, the previous ones, and `effective_date`, the day the new basis starts.
+        A change is prospective: how earlier periods were booked is unchanged, and the previous basis stays retrievable.
+      x-spec-event: BookBasisChanged
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookPostingSuspended:
+      name: accounting.book.posting_suspended
+      title: Posting to a book was suspended
+      description: A posting service must stop posting to this book from `effective_date` until it is activated again.
+      x-spec-event: BookPostingSuspended
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AccountingBookRetired:
+      name: accounting.book.retired
+      title: An accounting book was retired
+      description: Final. No new postings; history, basis versions and report lineage stay retrievable.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    DimensionTypeCreated:
+      name: dimension.type.created
+      title: A dimension type was defined
+      description: Carries the type code, whether it is hierarchical and controlled, and its source domain.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    DimensionValueCreated:
+      name: dimension.value.created
+      title: A dimension value was created as a draft
+      description: Carries the type and value codes, the owning entity when any, the first parent and the label.
+      x-spec-event: DimensionValueCreated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    DimensionValueActivated:
+      name: dimension.value.activated
+      title: A dimension value became ACTIVE and can take postings
+      description: "`effective_date` is when it took effect."
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    DimensionValueDeactivated:
+      name: dimension.value.deactivated
+      title: A dimension value became INACTIVE and rejects new postings
+      description: |
+        Remains valid for history. `posting_exception_until` is set when an explicit controlled exception keeps new postings
+        acceptable until that date; a posting service must honour it and nothing else.
+      x-spec-event: DimensionValueDeactivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    DimensionHierarchyProposed:
+      name: dimension.hierarchy.proposed
+      title: A hierarchy change of a controlled type awaits independent approval
+      description: Nothing is in force yet. Carries the proposed parent and label and the proposer.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    DimensionHierarchyChanged:
+      name: dimension.hierarchy.changed
+      title: A value's parent or label changes from its effective date
+      description: |
+        Carries the new and previous parent and label and `effective_date`. A change is prospective: roll-ups for earlier
+        dates are unchanged and stay reconstructable. Consumers holding their own copy of the hierarchy apply it from that date.
+      x-spec-event: DimensionHierarchyChanged
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    DimensionSourceMapped:
+      name: dimension.source.mapped
+      title: An operational source object was mapped to a dimension value
+      description: Carries the source domain and object, the mapping version, and the previous value when it replaced a mapping.
+      x-spec-event: SourceDimensionMapped
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    QuantityDimensionCreated:
+      name: unit.dimension.created
+      title: A quantity dimension was defined with its base unit
+      description: Carries the dimension code and the base unit code.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitCreated:
+      name: unit.created
+      title: A unit of measure was created
+      description: A base unit is ACTIVE at once; any other unit is a DRAFT until a conversion takes effect.
+      x-spec-event: UnitCreated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitConversionProposed:
+      name: unit.conversion.proposed
+      title: A non-standard conversion awaits independent approval
+      description: Nothing is in force yet. Carries the exact factor, its source class and reference, and the proposer.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitConversionActivated:
+      name: unit.conversion.activated
+      title: A conversion version took effect
+      description: Carries the version number, the exact factor as a fraction and its validity start. A previous version, when replaced, is named.
+      x-spec-event: ConversionRuleActivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitConversionSuperseded:
+      name: unit.conversion.superseded
+      title: A conversion version was replaced from a later date
+      description: Carries the superseded version with its end date. Results it produced stay reproducible from that version.
+      x-spec-event: ConversionRuleSuperseded
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    UnitRetired:
+      name: unit.retired
+      title: A unit was retired and rejects new use
+      description: Carries the retirement date and reason. History is kept.
+      x-spec-event: UnitRetired
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ReferenceSetCreated:
+      name: reference.set.created
+      title: A governed reference set was defined
+      description: Carries the set code, its source authority and whether it takes user-assigned codes.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ReferenceReleaseStaged:
+      name: reference.release.staged
+      title: A reference release awaits independent publication
+      description: Nothing is in force yet. Carries the release version, effective date, compatibility and the count of changes by type.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    ReferenceReleasePublished:
+      name: reference.release.published
+      title: A reference release was published and governs from its effective date
+      description: |
+        Carries `reference_set_id`, `release_version`, `effective_from` and `compatibility`, which tells a consumer whether it
+        may adopt the release automatically, must migrate, or must preserve the old version for historical processing. The
+        changed codes are read from the registry at the release.
+      x-spec-event: reference_release_published
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportUploaded:
+      name: master_import.uploaded
+      title: A master import file was uploaded and awaits validation
+      description: Carries the import id, source name and version, the content hash, the row count and the uploader. Never a row.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportValidated:
+      name: master_import.validated
+      title: A master import was validated and is previewable or blocked
+      description: "`status` is PREVIEW_READY, or BLOCKED when any row is invalid; the counts say how many rows are valid and invalid."
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportApproved:
+      name: master_import.approved
+      title: A master import was approved, by someone other than its uploader, and is starting
+      description: Carries the approver and the evidence reference.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportCompleted:
+      name: master_import.completed
+      title: A master import ended, reconciled or failed
+      description: |
+        `status` is COMPLETED when every row received is accounted for exactly once, FAILED when not or when the work could not
+        be carried out. Carries the counts and the reconciliation. Outcomes per row are read from the registry.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    MasterImportCancelled:
+      name: master_import.cancelled
+      title: A master import was cancelled before it started importing
+      description: Nothing was created.
       x-spec-event: null
       x-delivery: outbox
       payload:

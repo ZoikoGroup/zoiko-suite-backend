@@ -15,7 +15,7 @@
 // That mattered, because the explicit filters did not hold on their own:
 //
 //   - GetCommercialAccount and GetMembership wrote the tenant predicate as
-//     ($2 = '' OR organization_id::text = $2), where $2 is the tenant from
+//     ($2 = ” OR organization_id::text = $2), where $2 is the tenant from
 //     the request context. TenantFromContext returns "" when the request
 //     carried no X-Tenant-Id, and middleware.TenantContext lets such a
 //     request through — so a header-less caller disabled its own tenant
@@ -41,10 +41,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"zoiko.io/eventing/envelope"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // isLiveSubscriptionConflict reports that the account already holds a live
@@ -104,10 +104,17 @@ type Store interface {
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	eventRegion         string
+	eventClassification envelope.Classification
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // withTenant runs fn inside a transaction with app.tenant_id set from the
@@ -213,10 +220,7 @@ func (s *PgStore) CreateCommercialAccount(ctx context.Context, a *domain.Commerc
 			return err
 		}
 		tenantID := a.OrganizationID
-		return outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "commercial_account", AggregateID: a.CommercialAccountID,
-			EventType: "commercial_account.created", Payload: a, TenantID: &tenantID,
-		})
+		return s.emit(ctx, tx, "commercial_account.created", "commercial_account", a.CommercialAccountID, tenantID, a.CreatedByPrincipalID, a)
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -307,10 +311,7 @@ func (s *PgStore) CreateMembership(ctx context.Context, m *domain.Membership) er
 			return err
 		}
 		tenantID := m.OrganizationID
-		return outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "membership", AggregateID: m.MembershipID,
-			EventType: "membership.created", Payload: m, TenantID: &tenantID,
-		})
+		return s.emit(ctx, tx, "membership.created", "membership", m.MembershipID, tenantID, m.CreatedByPrincipalID, m)
 	})
 	if err != nil {
 		return fmt.Errorf("insert membership: %w", err)
@@ -411,10 +412,7 @@ func (s *PgStore) DeactivateMembership(ctx context.Context, membershipID, organi
 			return nil
 		}
 		tenantID := organizationID
-		return outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "membership", AggregateID: membershipID,
-			EventType: "membership.deactivated", Payload: map[string]string{"membership_id": membershipID}, TenantID: &tenantID,
-		})
+		return s.emit(ctx, tx, "membership.deactivated", "membership", membershipID, tenantID, "", map[string]string{"membership_id": membershipID})
 	})
 	if err != nil {
 		return fmt.Errorf("deactivate membership: %w", err)

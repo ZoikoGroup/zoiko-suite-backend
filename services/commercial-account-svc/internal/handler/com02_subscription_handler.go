@@ -295,7 +295,8 @@ func (h *SubscriptionHandler) SetAccountMarket(w http.ResponseWriter, r *http.Re
 		return
 	}
 	var req setMarketRequest
-	if _, ok := readBody(w, r, &req, false); !ok {
+	raw, ok := readBody(w, r, &req, false)
+	if !ok {
 		return
 	}
 	if !queryMarketPattern.MatchString(req.MarketCode) {
@@ -306,7 +307,17 @@ func (h *SubscriptionHandler) SetAccountMarket(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
-	if err := h.store.SetAccountMarket(sc.ctx, accountID, req.MarketCode, sc.principal, h.now()); err != nil {
+	cmd, ok := commandFor(w, r, domain.SellerScope, sc.principal, "SetAccountMarket", accountID, raw, false)
+	if !ok {
+		return
+	}
+	if err := h.store.SetAccountMarket(sc.ctx, accountID, req.MarketCode, sc.principal, h.now(), cmd.claim); err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			w.Header().Set("Idempotent-Replayed", "true")
+			writeJSON(w, http.StatusOK, map[string]string{"commercial_account_id": accountID, "market_code": req.MarketCode})
+			return
+		}
 		writeFailure(w, r, h.logger, err)
 		return
 	}

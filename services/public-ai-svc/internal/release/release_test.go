@@ -12,6 +12,7 @@ import (
 
 	"zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/metrics"
 	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
 )
@@ -373,4 +374,58 @@ func TestKBReleaseIdentityFields(t *testing.T) {
 	if m.ProductID != "zoikosuite" || m.Audience != knowledge.Audience || !m.SignedAt.Equal(now) {
 		t.Fatalf("identity: product=%q audience=%q signed=%v", m.ProductID, m.Audience, m.SignedAt)
 	}
+}
+
+// SEC-T030: a correctly signed release whose chunk text no longer matches its
+// checksum is refused, readiness goes off, and the refusal is counted with
+// reason "checksum" so PublicAIReleaseRejected pages.
+func TestChecksumMismatchIsCountedForAlert(t *testing.T) {
+	e := setup(t)
+	before := rejections(t, "checksum")
+	kb, _, _, err := BuildKB(filepath.Join(fixtures, "kb"), "kb-test-sum", now, e.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m knowledge.Manifest
+	if err := json.Unmarshal(kb, &m); err != nil {
+		t.Fatal(err)
+	}
+	m.Chunks[0].PlainText += " tampered after the checksum was taken"
+	bad, _ := json.Marshal(m)
+	sig, err := signing.Sign(e.key, bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = e.st.PutRelease(ctx, store.Release{ReleaseID: "kb-test-sum", Kind: "kb", Manifest: bad, Signature: sig, CreatedAt: now})
+	_ = e.st.SetPointer(ctx, "kb", "kb-test-sum", nil)
+	if err := e.rt.Refresh(ctx); !errors.Is(err, knowledge.ErrChecksumMismatch) {
+		t.Fatalf("refresh error = %v, want a checksum mismatch", err)
+	}
+	if e.rt.Ready(time.Minute) {
+		t.Fatal("runtime must not be ready with a tampered release")
+	}
+	if got := rejections(t, "checksum"); got != before+1 {
+		t.Fatalf("release rejections{reason=checksum} = %v, want %v", got, before+1)
+	}
+}
+
+func rejections(t *testing.T, reason string) float64 {
+	t.Helper()
+	mfs, err := metrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "public_ai_release_rejections_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "reason" && l.GetValue() == reason {
+					return m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }

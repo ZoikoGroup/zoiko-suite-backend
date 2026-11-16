@@ -52,9 +52,12 @@ func (s *pbStub) rec(name string, claim domain.IdempotencyClaim, ifMatch int) {
 	s.lastClaim, s.lastIfMat = claim, ifMatch
 }
 
-func (s *pbStub) UpsertCurrency(_ context.Context, c *domain.CommercialCurrency) (*domain.CommercialCurrency, error) {
-	s.calls = append(s.calls, "UpsertCurrency")
+func (s *pbStub) UpsertCurrency(_ context.Context, c *domain.CommercialCurrency, claim domain.IdempotencyClaim) (*domain.CommercialCurrency, error) {
+	s.rec("UpsertCurrency", claim, 0)
 	return c, s.err
+}
+func (s *pbStub) GetCurrency(_ context.Context, code string) (*domain.CommercialCurrency, error) {
+	return &domain.CommercialCurrency{CurrencyCode: code}, nil
 }
 func (s *pbStub) ListCurrencies(context.Context) ([]domain.CommercialCurrency, error) {
 	return nil, s.err
@@ -260,6 +263,33 @@ func TestPriceBookHandler_CommandsRequireIdempotencyKeyAndIfMatch(t *testing.T) 
 	}
 	if len(st.calls) != 0 {
 		t.Fatalf("an unprotected command reached the store: %v", st.calls)
+	}
+}
+
+// SPEC_DEVIATIONS A4: PutCurrency now claims an Idempotency-Key.
+func TestPutCurrency_RequiresIdempotencyKey(t *testing.T) {
+	st := &pbStub{}
+	w := serve(t, newPBRouter(st, &actionAuthz{}), req{method: http.MethodPut, path: "/v1/commercial/currencies/USD",
+		body: `{"minor_units":2,"sale_enabled":true}`})
+	if w.Code != http.StatusBadRequest || problemCode(t, w) != CodeIdempotencyKeyRequired || len(st.calls) != 0 {
+		t.Fatalf("missing Idempotency-Key: HTTP %d, calls %v", w.Code, st.calls)
+	}
+}
+
+func TestPutCurrency_ReplayUnderSameKeyDoesNotReapply(t *testing.T) {
+	st := &pbStub{}
+	r := newPBRouter(st, &actionAuthz{})
+	body := `{"minor_units":2,"sale_enabled":true}`
+
+	w := serve(t, r, req{method: http.MethodPut, path: "/v1/commercial/currencies/USD", body: body, headers: map[string]string{"Idempotency-Key": "k-1"}})
+	if w.Code != http.StatusOK || len(st.calls) != 1 {
+		t.Fatalf("first put: HTTP %d, calls %v", w.Code, st.calls)
+	}
+
+	st.err = &domain.IdempotentReplayError{ResourceID: "USD"}
+	w = serve(t, r, req{method: http.MethodPut, path: "/v1/commercial/currencies/USD", body: body, headers: map[string]string{"Idempotency-Key": "k-1"}})
+	if w.Code != http.StatusOK || w.Header().Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("replay: HTTP %d, Idempotent-Replayed=%q, body=%s", w.Code, w.Header().Get("Idempotent-Replayed"), w.Body.String())
 	}
 }
 

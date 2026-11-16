@@ -55,6 +55,7 @@ func TestSecretScanSelfTest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A Windows checkout (core.autocrlf) has CRLF; the markers use LF.
 	s := strings.ReplaceAll(string(b), "\r\n", "\n")
 	for _, want := range []string{"gitleaks self-test", "dir /scan", "ghp_", "did not flag a planted", "exit 1"} {
 		if !strings.Contains(s, want) {

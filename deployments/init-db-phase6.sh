@@ -45,6 +45,10 @@ create_db migration_integrity
 apply_migration migration_integrity /migrations/migration-integrity/000001_initial_schema.up.sql
 apply_migration migration_integrity /migrations/migration-integrity/000002_add_eventing_outbox.up.sql
 
+# ── Key Management Service (customer-key metadata + token vault) ───────────
+create_db key_management
+apply_migration key_management /migrations/key-management/000001_initial_schema.up.sql
+
 echo "=== Phase 6 databases initialised successfully ==="
 
 # ── Runtime role: zoiko_app (least-privilege, RLS-respecting) ──────────────
@@ -56,7 +60,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
 EOSQL
 
 for db in authorization_svc anomaly_detection forecasting compliance_risk_scoring \
-    reconciliation_intelligence reporting_orchestration migration_integrity; do
+    reconciliation_intelligence reporting_orchestration migration_integrity key_management; do
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" <<-EOSQL
         GRANT CONNECT ON DATABASE $db TO zoiko_app;
         GRANT USAGE ON SCHEMA public TO zoiko_app;

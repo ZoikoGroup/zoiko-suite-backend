@@ -97,6 +97,8 @@ type Handler struct {
 
 	// entities is the optional entity-jurisdiction applicability projection (see WithEntityApplicability).
 	entities EntityApplicabilityReader
+	// entityFacts is the optional establishment and registration projection (see WithEntityFacts).
+	entityFacts EntityFactReader
 
 	// approvals confirms the X-Approval-Reference an activation cites (see
 	// WithApprovalVerifier, J-02). Nil only in local/dev.

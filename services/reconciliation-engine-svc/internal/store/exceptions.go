@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/reconciliation-engine-svc/internal/domain"
-	"zoiko.io/reconciliation-engine-svc/internal/outbox"
 )
 
 // Exception governance (A7) and materiality (A4). See domain/governance.go
@@ -194,7 +193,7 @@ func (s *PgStore) AssignException(ctx context.Context, tenantID, exceptionID str
 	}
 	var out *domain.ReconciliationException
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		_, e, err := lockException(ctx, tx, tenantID, exceptionID)
+		run, e, err := lockException(ctx, tx, tenantID, exceptionID)
 		if err != nil {
 			return err
 		}
@@ -215,8 +214,7 @@ func (s *PgStore) AssignException(ctx context.Context, tenantID, exceptionID str
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_exception", AggregateID: exceptionID,
-			EventType: "CONTROL.ExceptionUpdated", TenantID: &tenantID, Payload: got})
+		return s.enqueueEvent(ctx, tx, evBreakAssigned, tenantID, run.LegalEntityID, exceptionID, actor, claim, got)
 	})
 	return out, err
 }
@@ -285,8 +283,7 @@ func (s *PgStore) TransitionException(ctx context.Context, tenantID, exceptionID
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_exception", AggregateID: exceptionID,
-			EventType: "CONTROL.ExceptionUpdated", TenantID: &tenantID, Payload: got})
+		return s.enqueueEvent(ctx, tx, evBreakStatusChanged, tenantID, run.LegalEntityID, exceptionID, actor, claim, got)
 	})
 	return out, err
 }

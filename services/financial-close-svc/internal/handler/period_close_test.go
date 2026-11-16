@@ -419,6 +419,76 @@ func TestReclose_ReperformedEvidenceCloses(t *testing.T) {
 	}
 }
 
+// ── A6: certifier independent from preparer ─────────────────────────────
+
+// The certifier (hard-close) must differ from whoever prepared the period
+// for close review (SPEC_DEVIATIONS A6, ACC-14 "close certifier independent
+// from preparers"). Refused as 403 self_approval-style, and does not move
+// the period.
+func TestHardClose_SamePrincipalAsCloseReviewPreparer_Refused(t *testing.T) {
+	s := newStubStore()
+	newOpenPeriod(s, "fp-1")
+	cl := closeClients()
+	r := newGatedRouter(s, &stubAuthZ{}, cl)
+	doReq(r, http.MethodPost, "/v1/close/periods/fp-1/soft-close", nil, "controller-1")
+	doReq(r, http.MethodPost, "/v1/close/periods/fp-1/close-review", nil, "controller-1")
+
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/hard-close", nil, "controller-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("certifier == preparer: want 403, got %d %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "certifier_not_independent") {
+		t.Fatalf("refusal must name certifier_not_independent: %s", rr.Body.String())
+	}
+	if s.periods["fp-1"].CloseStatus != domain.PeriodCloseReview {
+		t.Fatal("a refused hard-close must not move the period")
+	}
+
+	// A different principal certifies cleanly.
+	rr = doReq(r, http.MethodPost, "/v1/close/periods/fp-1/hard-close", nil, "controller-2")
+	if rr.Code != http.StatusOK || s.periods["fp-1"].CloseStatus != domain.PeriodHardClosed {
+		t.Fatalf("an independent certifier must succeed: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+// The same independence rule applies to reclose, against whoever approved
+// the reopen (the transition into AUTHORIZED_REOPEN).
+func TestReclose_SamePrincipalAsReopenApprover_Refused(t *testing.T) {
+	s := newStubStore()
+	newOpenPeriod(s, "fp-1")
+	cl := closeClients()
+	r := newGatedRouter(s, &stubAuthZ{}, cl)
+	doReq(r, http.MethodPost, "/v1/close/periods/fp-1/soft-close", nil, "accountant-1")
+	doReq(r, http.MethodPost, "/v1/close/periods/fp-1/close-review", nil, "accountant-1")
+	doReq(r, http.MethodPost, "/v1/close/periods/fp-1/hard-close", nil, "controller-1")
+
+	rrReq := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reopen-requests",
+		domain.RequestReopenRequest{Reason: "misposting found", ReopenUntil: time.Now().UTC().Add(48 * time.Hour)}, "accountant-1")
+	var req domain.ReopenRequest
+	_ = json.Unmarshal(rrReq.Body.Bytes(), &req)
+	if rr := doReq(r, http.MethodPost, "/v1/close/reopen-requests/"+req.RequestID+"/approve", nil, "controller-2"); rr.Code != http.StatusOK {
+		t.Fatalf("approve reopen: %d %s", rr.Code, rr.Body.String())
+	}
+
+	at := s.periods["fp-1"].ReopenedAt.Add(time.Hour)
+	bothMatchedAt(s, at)
+	cl.bankRecon = []domain.BankAccountReconStatus{certifiedAt("acct-barclays", "2026-10-30", at)}
+
+	// controller-2 approved the reopen; controller-2 reclosing is refused.
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reclose", nil, "controller-2")
+	if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "certifier_not_independent") {
+		t.Fatalf("reclose by the reopen approver: want 403 certifier_not_independent, got %d %s", rr.Code, rr.Body.String())
+	}
+	if s.periods["fp-1"].CloseStatus != domain.PeriodAuthorizedReopen {
+		t.Fatal("a refused reclose must not move the period")
+	}
+
+	rr = doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reclose", nil, "controller-3")
+	if rr.Code != http.StatusOK || s.periods["fp-1"].CloseStatus != domain.PeriodReclosed {
+		t.Fatalf("an independent reclose must succeed: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 // ── History and available actions ────────────────────────────────────────
 
 func TestCloseHistory_RecordsEveryTransition(t *testing.T) {

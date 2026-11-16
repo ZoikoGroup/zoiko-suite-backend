@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // GovernanceStore is the COM-02 part 2c contract.
@@ -80,13 +79,12 @@ func (a *subscriptionAggregate) discountComponent(now time.Time, productCode, co
 	return nil, nil, domain.ErrDiscountNotApplicable
 }
 
-func discountEvent(ctx context.Context, tx pgx.Tx, eventType, org string, d *domain.DiscountApplication, actor string, at time.Time) error {
-	return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "subscription_discount", AggregateID: d.DiscountApplicationID,
-		EventType: eventType, TenantID: &org, Payload: map[string]any{
-			"discount_application_id": d.DiscountApplicationID, "subscription_id": d.SubscriptionID,
-			"price_version_id": d.PriceVersionID, "component_key": d.ComponentKey, "status": d.Status,
-			"approval_basis": d.ApprovalBasis, "actor_id": actor, "occurred_at": at.UTC(),
-		}})
+func (s *PgStore) discountEvent(ctx context.Context, tx pgx.Tx, eventType, org string, d *domain.DiscountApplication, actor string, at time.Time) error {
+	return s.emit(ctx, tx, eventType, "subscription_discount", d.DiscountApplicationID, org, actor, map[string]any{
+		"discount_application_id": d.DiscountApplicationID, "subscription_id": d.SubscriptionID,
+		"price_version_id": d.PriceVersionID, "component_key": d.ComponentKey, "status": d.Status,
+		"approval_basis": d.ApprovalBasis, "actor_id": actor, "occurred_at": at.UTC(),
+	})
 }
 
 // ProposeDiscount applies a catalogue discount component to a subscription.
@@ -136,7 +134,7 @@ func (s *PgStore) ProposeDiscount(ctx context.Context, p domain.ProposeDiscountP
 		if status == domain.DiscountApproved {
 			eventType = "subscription.discount_approved"
 		}
-		return discountEvent(ctx, tx, eventType, a.sub.OrganizationID, d, p.Actor, p.Now)
+		return s.discountEvent(ctx, tx, eventType, a.sub.OrganizationID, d, p.Actor, p.Now)
 	})
 	return out, err
 }
@@ -206,7 +204,7 @@ func (s *PgStore) DecideDiscount(ctx context.Context, subscriptionID, discountID
 			return err
 		}
 		out = d
-		return discountEvent(ctx, tx, eventType, a.sub.OrganizationID, d, actor, now)
+		return s.discountEvent(ctx, tx, eventType, a.sub.OrganizationID, d, actor, now)
 	})
 	return out, err
 }
@@ -273,9 +271,8 @@ func loadMigrationOffer(ctx context.Context, tx pgx.Tx, id string, forUpdate boo
 	return o, nil
 }
 
-func migrationEvent(ctx context.Context, tx pgx.Tx, eventType string, o *domain.MigrationOffer) error {
-	return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "price_migration_offer", AggregateID: o.MigrationOfferID,
-		EventType: eventType, Payload: o})
+func (s *PgStore) migrationEvent(ctx context.Context, tx pgx.Tx, eventType string, o *domain.MigrationOffer) error {
+	return s.emit(ctx, tx, eventType, "price_migration_offer", o.MigrationOfferID, PlatformScopeID, "", o)
 }
 
 // CreateMigrationOffer drafts an offer from one price version to a later
@@ -321,7 +318,7 @@ func (s *PgStore) CreateMigrationOffer(ctx context.Context, o *domain.MigrationO
 		if out, err = loadMigrationOffer(ctx, tx, o.MigrationOfferID, false); err != nil {
 			return err
 		}
-		return migrationEvent(ctx, tx, "migration_offer.created", out)
+		return s.migrationEvent(ctx, tx, "migration_offer.created", out)
 	})
 	return out, err
 }
@@ -369,7 +366,7 @@ func (s *PgStore) PublishMigrationOffer(ctx context.Context, offerID string, exp
 		if out, err = loadMigrationOffer(ctx, tx, offerID, false); err != nil {
 			return err
 		}
-		return migrationEvent(ctx, tx, "migration_offer.published", out)
+		return s.migrationEvent(ctx, tx, "migration_offer.published", out)
 	})
 	return out, err
 }
@@ -399,7 +396,7 @@ func (s *PgStore) WithdrawMigrationOffer(ctx context.Context, offerID string, ex
 		if out, err = loadMigrationOffer(ctx, tx, offerID, false); err != nil {
 			return err
 		}
-		return migrationEvent(ctx, tx, "migration_offer.withdrawn", out)
+		return s.migrationEvent(ctx, tx, "migration_offer.withdrawn", out)
 	})
 	return out, err
 }
@@ -545,7 +542,7 @@ func (s *PgStore) ProcessNextBoundary(ctx context.Context, now time.Time) (bool,
 		return false, err
 	}
 
-	outcome, perr := processBoundary(ctx, tx, it, now)
+	outcome, perr := s.processBoundary(ctx, tx, it, now)
 	if perr == nil {
 		_, perr = tx.Exec(ctx, `UPDATE subscription_boundary_queue SET status = 'DONE', processed_at = $2, outcome = $3
 			WHERE boundary_id = $1::uuid`, it.id, now, outcome)
@@ -589,7 +586,7 @@ func (s *PgStore) recordBoundaryFailure(ctx context.Context, it boundaryItem, ca
 // the state at scheduling time: a version voided since, a term already
 // renewed, a subscription that has since ended — each is skipped, with the
 // reason recorded as the outcome.
-func processBoundary(ctx context.Context, tx pgx.Tx, it boundaryItem, now time.Time) (string, error) {
+func (s *PgStore) processBoundary(ctx context.Context, tx pgx.Tx, it boundaryItem, now time.Time) (string, error) {
 	a, err := loadAggregate(ctx, tx, it.subID, true)
 	if err != nil {
 		return "", err
@@ -612,7 +609,7 @@ func processBoundary(ctx context.Context, tx pgx.Tx, it boundaryItem, now time.T
 				return "SKIPPED_NO_EVENT", nil
 			}
 			m.changeID = v.ChangeID
-			if err := emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
+			if err := s.emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
 				ChangeType: v.ChangeType, Status: v.LifecycleStatus, EffectiveAt: v.EffectiveFrom, EndsAt: a.sub.EndsAt,
 			}); err != nil {
 				return "", err
@@ -623,7 +620,7 @@ func processBoundary(ctx context.Context, tx pgx.Tx, it boundaryItem, now time.T
 			// with the transition itself — negative path #09's "stale
 			// cache invalidated" previously had nothing automatic behind
 			// it; only an explicit :recompute call did.
-			if _, err := recomputeEntitlementsTx(ctx, tx, it.org, boundaryWorkerActor, now); err != nil {
+			if _, err := s.recomputeEntitlementsTx(ctx, tx, it.org, boundaryWorkerActor, now); err != nil {
 				return "", err
 			}
 			return "EVENT_PUBLISHED", nil
@@ -647,7 +644,7 @@ func processBoundary(ctx context.Context, tx pgx.Tx, it boundaryItem, now time.T
 			// the window scope is one usage window per subscription term
 			// (COM-04), and a term ending is what closes it, cancellation
 			// or non-renewal notwithstanding.
-			if err := freezeAndCertifyTermUsage(ctx, tx, it.subID, *it.termNo, boundaryWorkerActor, now); err != nil {
+			if err := s.freezeAndCertifyTermUsage(ctx, tx, it.subID, *it.termNo, boundaryWorkerActor, now); err != nil {
 				return "", fmt.Errorf("freeze/certify usage for term %d: %w", *it.termNo, err)
 			}
 		}
@@ -661,7 +658,7 @@ func processBoundary(ctx context.Context, tx pgx.Tx, it boundaryItem, now time.T
 		case a.sub.EndsAt != nil && !a.sub.EndsAt.After(term.EndsAt):
 			return "SKIPPED_ENDED", nil
 		}
-		return "RENEWED", renewApply(ctx, tx, a, m)
+		return "RENEWED", s.renewApply(ctx, tx, a, m)
 	}
 	return "", fmt.Errorf("unknown boundary kind %q", it.kind)
 }

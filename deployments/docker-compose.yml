@@ -929,6 +929,8 @@ services:
       KAFKA_GROUP_ID: "tenant-entity-registry-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.entity.events"
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
+      # ORG-03 s4.3: a legal entity fiscal_calendar_id is checked against fiscal-calendar-svc (read-only, fail-closed).
+      FISCAL_CALENDAR_URL: "http://fiscal-calendar-svc:8173"
       # Was "http://tenant-svc:8081" — this service's own address, commented
       # "mock stub authz points back". main.go treated any URL other than the
       # literal "http://authorization-svc" as production wiring, so that value
@@ -1379,6 +1381,10 @@ services:
       # as legal_entity_id — authorization-svc rejects an empty one.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # S3-B3: a secret:// reference is accepted only if the vault governs its path (read-only, fail-closed). The principal needs
+      # the vault's SECRET_POLICY_LIST action in each tenant scope, granted at onboarding like the other service principals.
+      SECRET_VAULT_URL: "http://secret-vault-integration-svc:8087"
+      SECRET_VAULT_PRINCIPAL_ID: "svc-configuration"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "configuration-feature-flag-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.configuration.events"
@@ -3482,8 +3488,9 @@ services:
   # authorization-svc, fail-closed. Postgres RLS + explicit tenant_id filters.
   financial-control-svc:
     build:
-      context: ../services/financial-control-svc
-      dockerfile: Dockerfile
+      # Context is services/ so the go.mod replace ../eventing resolves.
+      context: ../services
+      dockerfile: financial-control-svc/Dockerfile
     container_name: financial-control-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -3500,6 +3507,9 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.financial-control.events"
       KAFKA_GROUP_ID: "financial-control-svc"
+      # Required ZS-EVENT-001 envelope attributes (no default; startup refuses without them).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      EVENT_CLASSIFICATION: "${EVENT_CLASSIFICATION_FINANCIAL_CONTROL:-confidential}"
       # Registered source systems for control populations (name=base-url). A run can select a
       # registered system by name but can never supply a URL. Each source must implement
       # docs/architecture/control-population-contract.md; until then, runs against it end
@@ -4484,6 +4494,18 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.payee-banking-identity.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       COUNTERPARTY_SERVICE_URL: "http://counterparty-management-svc:8124"
+      # Account-identifier tokenization (Security Standard §14). OFF by default
+      # and opt-in only: export TOKENIZATION_ENFORCED=true before
+      # `docker compose up` to tokenize new destinations (SPEC_DEVIATIONS.md
+      # B12 has the enablement steps, including the one-off backfill).
+      # key-management-svc runs from docker-compose.phase6.yml, a separate
+      # compose project and network, published on host port 8143 — so it is
+      # reached through the host, as banking-connector-svc's phase-7 block
+      # does. (The previous "http://key-management-svc:8143" never resolved
+      # from this network.) The URL is used even with enforcement off: a
+      # privileged read of an already-tokenized destination detokenizes.
+      TOKENIZATION_SERVICE_URL: "http://host.docker.internal:8143"
+      TOKENIZATION_ENFORCED: "${TOKENIZATION_ENFORCED:-false}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4645,8 +4667,9 @@ services:
   # Plane 2 tenant/workspace/legal_entity data.
   commercial-account-svc:
     build:
-      context: ../services/commercial-account-svc
-      dockerfile: Dockerfile
+      # Context is services/ so the go.mod replace ../eventing resolves.
+      context: ../services
+      dockerfile: commercial-account-svc/Dockerfile
     container_name: commercial-account-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4666,6 +4689,9 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/commercial_account?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
+      # Required ZS-EVENT-001 envelope attributes (no default; startup refuses without them).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      EVENT_CLASSIFICATION: "${EVENT_CLASSIFICATION_COMMERCIAL_ACCOUNT:-confidential}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
@@ -4689,8 +4715,9 @@ services:
   # separate objects — never compressed into one feature flag.
   capability-registry-svc:
     build:
-      context: ../services/capability-registry-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: capability-registry-svc/Dockerfile
     container_name: capability-registry-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4713,6 +4740,9 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/capability_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
+      # Required: stamped on every event (ZS-EVENT-001 §4); the service
+      # refuses to start without it. Same default as the other adopters.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:

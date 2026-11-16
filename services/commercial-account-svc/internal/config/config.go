@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 )
 
 type Config struct {
@@ -19,7 +20,18 @@ type Config struct {
 	AuthzMTLSEnabled         bool
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
+
+	// EventResidencyRegion and EventClassification are the ZS-EVENT-001 §4
+	// envelope attributes stamped on every event. Both are governed,
+	// per-deployment decisions, so both are required with no default: the
+	// shared envelope rejects an empty or unrecognised value, which would fail
+	// every write at request time. Load refuses them at startup instead.
+	EventResidencyRegion string
+	EventClassification  string
 }
+
+// residencyRegion is the envelope library's controlled-code shape.
+var residencyRegion = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 func Load() (*Config, error) {
 	port := os.Getenv("PORT")
@@ -30,7 +42,20 @@ func Load() (*Config, error) {
 	if dbURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
+	region := os.Getenv("EVENT_RESIDENCY_REGION")
+	if !residencyRegion.MatchString(region) {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required and must be a lower-case region code (e.g. \"uk\", \"eu-west\"), got %q", region)
+	}
+	classification := os.Getenv("EVENT_CLASSIFICATION")
+	switch classification {
+	case "public", "internal", "confidential", "restricted":
+	default:
+		return nil, fmt.Errorf("EVENT_CLASSIFICATION is required and must be one of public, internal, confidential, restricted, got %q", classification)
+	}
 	return &Config{
+		EventResidencyRegion: region,
+		EventClassification:  classification,
+
 		Port:             port,
 		DatabaseURL:      dbURL,
 		KafkaBrokers:     getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),

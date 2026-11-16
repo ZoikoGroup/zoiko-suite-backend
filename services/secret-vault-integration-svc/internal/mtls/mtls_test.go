@@ -1,6 +1,7 @@
 package mtls
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -25,8 +27,11 @@ type fakeIssuer struct {
 	srv       *httptest.Server
 	calls     atomic.Int32
 	down      atomic.Bool
-	lastReq   provisionRequest
+	lastReq   csrRequest
+	lastBody  []byte
+	lastCSR   *x509.CertificateRequest
 	lastHdr   http.Header
+	lastPath  string
 	notBefore time.Time
 }
 
@@ -42,16 +47,22 @@ func newFakeIssuer(t *testing.T) *fakeIssuer {
 			return
 		}
 		f.lastHdr = r.Header.Clone()
-		_ = json.NewDecoder(r.Body).Decode(&f.lastReq)
+		f.lastPath = r.URL.Path
+		f.lastBody, _ = io.ReadAll(r.Body)
+		_ = json.Unmarshal(f.lastBody, &f.lastReq)
 		n := f.calls.Add(1)
-		key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		tmpl := &x509.Certificate{SerialNumber: big.NewInt(int64(n + 1)), Subject: pkix.Name{CommonName: f.lastReq.CommonName},
+		blk, _ := pem.Decode([]byte(f.lastReq.CSR))
+		csr, err := x509.ParseCertificateRequest(blk.Bytes)
+		if err != nil || csr.CheckSignature() != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		f.lastCSR = csr
+		tmpl := &x509.Certificate{SerialNumber: big.NewInt(int64(n + 1)), Subject: pkix.Name{CommonName: csr.Subject.CommonName}, URIs: csr.URIs,
 			NotBefore: f.notBefore, NotAfter: f.notBefore.Add(time.Duration(f.lastReq.RotationDays) * 24 * time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
-		der, _ := x509.CreateCertificate(rand.Reader, tmpl, caTmpl, &key.PublicKey, caKey)
-		keyDER, _ := x509.MarshalECPrivateKey(key)
+		der, _ := x509.CreateCertificate(rand.Reader, tmpl, caTmpl, csr.PublicKey, caKey)
 		var res provisionResult
 		res.Certificate.CertificatePEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
-		res.PrivateKeyPEM = string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
 		res.CACertPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(res)
@@ -74,8 +85,18 @@ func TestProvision_RequestsShortLivedAutoRotatingCert(t *testing.T) {
 	f := newFakeIssuer(t)
 	now := time.Now()
 	rc := newRenewing(t, f, &now)
-	if f.lastReq.RotationDays != 1 || !f.lastReq.AutoRotate {
-		t.Fatalf("must request a 1-day auto-rotating cert, asked for %+v", f.lastReq)
+	if f.lastReq.RotationDays != 1 {
+		t.Fatalf("must request a 1-day cert, asked for %+v", f.lastReq)
+	}
+	// S4-C2: the key is generated here and only a CSR is sent.
+	if bytes.Contains(f.lastBody, []byte("PRIVATE KEY")) || f.lastCSR == nil {
+		t.Fatalf("the request must carry a CSR and no private key: %s", f.lastBody)
+	}
+	if f.lastCSR.Subject.CommonName != "secret-vault-integration-svc" || len(f.lastCSR.URIs) != 1 || f.lastCSR.URIs[0].String() != "spiffe://zoiko/local/secret-vault-integration-svc" {
+		t.Fatalf("the CSR must name the service and its SPIFFE URI SAN: %+v %v", f.lastCSR.Subject, f.lastCSR.URIs)
+	}
+	if f.lastPath != "/v1/mtls/certificates/csr" {
+		t.Fatalf("must use the CSR endpoint, used %s", f.lastPath)
 	}
 	if life := rc.cert.Leaf.NotAfter.Sub(rc.cert.Leaf.NotBefore); life > 24*time.Hour {
 		t.Fatalf("leaf lifetime %v exceeds a day", life)

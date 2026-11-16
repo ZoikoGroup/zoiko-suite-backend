@@ -23,6 +23,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"zoiko.io/configuration-feature-flag-svc/internal/vaultref"
 
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
@@ -180,6 +181,11 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, authzClient, cfg.AuthZPlatformScopeID, domainMetrics, log)
+	if cfg.SecretVaultURL != "" {
+		h.WithSecretReferences(vaultref.NewClient(cfg.SecretVaultURL, cfg.SecretVaultPrincipalID, 2*time.Second, log))
+	} else {
+		log.Warn("SECRET_VAULT_URL unset: secret references are checked for shape only, not against the vault")
+	}
 	handler.RegisterRoutes(r, h)
 
 	// ── 7. Health probes + metrics ────────────────────────────────────────────

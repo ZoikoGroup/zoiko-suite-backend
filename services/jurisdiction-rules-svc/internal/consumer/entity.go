@@ -39,6 +39,7 @@ type EntityConsumer struct {
 	log     *zap.Logger
 	store   ApplicabilityStore
 	metrics *telemetry.Metrics
+	facts   FactStore
 }
 
 // WithMetrics counts every consumed event by result, so a projection that has
@@ -96,6 +97,9 @@ func (c *EntityConsumer) Handle(ctx context.Context, raw []byte) error {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		c.log.Error("entity event: undecodable envelope — skipped", zap.Error(err), zap.Int("bytes", len(raw)))
 		return nil
+	}
+	if isFactEvent(env.EventType) {
+		return c.handleFact(ctx, env)
 	}
 	if env.EventType != EventEntityCreated && env.EventType != EventEntityJurisdictionChanged {
 		return nil

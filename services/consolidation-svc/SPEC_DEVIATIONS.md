@@ -115,15 +115,27 @@ consolidation entries in a group entity's statutory ledger.
   silently. Missing-entity detection is only "the GL call failed". Scope:
   read ACC-15/16 snapshot ids per child, refuse uncertified inputs
   (`CONSOLIDATION_INPUT_UNCERTIFIED`), store snapshot id and hash per input.
-- **A5. The elimination-bound check on proposals is tenant-wide.**
-  `CreateEliminationProposal` compares an ELIMINATION proposal against the sum
-  of **all** eliminable (MATCHED or CLOSED, B6) intercompany amounts in the tenant, regardless of group,
-  period or entity pair, and sums per-line the larger of debit/credit (so a
-  balanced two-line 100 proposal counts as 200). The negative path
-  "Elimination exceeds matched reciprocal balance" is therefore not
-  meaningfully enforced. Depends on intercompany-accounting-svc A1
-  (`GetReciprocalBalances`) and A4 (period on the pair); the proposal also
-  needs to name which pair or entity pair it eliminates.
+- **A5. The elimination-bound check on proposals is tenant-wide. — Closed
+  2026-11-05.** `CreateEliminationProposal` used to compare an ELIMINATION
+  proposal against the sum of **all** eliminable (MATCHED or CLOSED, B6)
+  intercompany amounts in the tenant, regardless of group, period or entity
+  pair, and summed per-line the larger of debit/credit (so a balanced
+  two-line 100 proposal counted as 200). `CreateEliminationProposalRequest`
+  now requires `source_legal_entity_id`/`target_legal_entity_id` for an
+  ELIMINATION adjustment, and the bound check calls
+  intercompany-accounting-svc's `GetReciprocalBalances` for that exact pair
+  and period (already built for `ExplainElimination`, A10) instead of
+  summing the tenant-wide entries list. The pair is persisted on the
+  adjustment (migration `000009`; NULL for MANUAL adjustments). This also
+  fixed a live regression: intercompany-accounting-svc's own A2 authorization
+  fix (requiring an entity filter) had silently broken this service's
+  tenant-wide `FetchEliminableIntercompanyEntries` call, which this pass
+  replaced with one call per child legal entity.
+  - *Manual check:* a handler test proves an unrelated pair's large balance
+    no longer validates this pair's proposal, that the named pair/period
+    actually reaches `GetReciprocalBalances`, and a missing-pair request is
+    refused 400; a real-Postgres round trip proves the pair persists (NULL
+    for MANUAL).
 - **A6. Run state model and governance commands are absent.** Spec: "Draft →
   CollectingInputs → Locked → Processing → Review → Certified/Superseded".
   Built: RUNNING → COMPLETED / FAILED, all inside one HTTP request.
@@ -188,13 +200,20 @@ consolidation entries in a group entity's statutory ledger.
   no integrity evidence. The payload also formats the balance with `%f`.
   Scope: a managed signing key (the platform's open "Snapshot signature/key
   profile" decision, §29) or drop the claim and rely on ACC-16.
-- **A13. List endpoints skip authorization when unfiltered.** `GET
-  /v1/consolidation/runs` and `GET /v1/consolidation/adjustments` check
-  authorization only when `group_legal_entity_id` is supplied; without it they
-  return every run or adjustment in the tenant to any caller with an
-  `X-Principal-Id`. No other service calls these endpoints (checked across
-  the repository), so requiring the filter is safe, but it is an API contract
-  change and is left for an explicit decision.
+- **A13. List endpoints skip authorization when unfiltered. — Closed
+  2026-11-06.** `GET /v1/consolidation/runs` and `GET
+  /v1/consolidation/adjustments` used to check authorization only when
+  `group_legal_entity_id` was supplied; without it they returned every run
+  or adjustment in the tenant to any caller with an `X-Principal-Id`. No
+  other service calls these endpoints (checked across the repository, same
+  check repeated at the time of this fix), so `group_legal_entity_id` is now
+  required (400 `missing_fields` without it) and the authorization check is
+  unconditional.
+  - *Manual check:* `internal/handler/handler_test.go` —
+    `TestListRuns_NoGroupFilter_Refused`/`TestListAdjustments_NoGroupFilter_Refused`
+    (400), `TestListRuns_GroupFilter_Authorized`/`TestListAdjustments_GroupFilter_Authorized`
+    (200 with the filter), `TestListRuns_AuthzDenied_Refused` (403 is still
+    reachable, not bypassed).
 - **A14. No `Idempotency-Key`/`expected_version`, and `StartRun` was not
   idempotent. — Closed for `Idempotency-Key` (B11).** Every mutating command
   now requires an `Idempotency-Key` and records it in `command_idempotency`

@@ -377,7 +377,8 @@ func (h *PriceBookHandler) PutCurrency(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req putCurrencyRequest
-	if _, ok := readBody(w, r, &req, false); !ok {
+	raw, ok := readBody(w, r, &req, false)
+	if !ok {
 		return
 	}
 	if req.MinorUnits == nil || req.SaleEnabled == nil || *req.MinorUnits < 0 || *req.MinorUnits > 4 {
@@ -385,10 +386,25 @@ func (h *PriceBookHandler) PutCurrency(w http.ResponseWriter, r *http.Request) {
 			Detail: "minor_units (0-4) and sale_enabled are both required"})
 		return
 	}
+	cmd, ok := h.newCommand(w, r, principal, "PutCurrency", code, raw, false)
+	if !ok {
+		return
+	}
 	c, err := h.store.UpsertCurrency(r.Context(), &domain.CommercialCurrency{
 		CurrencyCode: code, MinorUnits: *req.MinorUnits, SaleEnabled: *req.SaleEnabled, UpdatedByPrincipalID: principal,
-	})
+	}, cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			existing, gerr := h.store.GetCurrency(r.Context(), replay.ResourceID)
+			if gerr != nil {
+				h.fail(w, r, gerr)
+				return
+			}
+			w.Header().Set("Idempotent-Replayed", "true")
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}

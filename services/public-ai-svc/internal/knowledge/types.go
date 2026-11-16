@@ -5,6 +5,7 @@
 package knowledge
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -168,11 +169,15 @@ func (m Manifest) Validate() error {
 			return fmt.Errorf("chunk %s changed its parent's tier or market scope", c.ChunkID)
 		}
 		if c.TextSHA256 != sha256Hex(c.PlainText) {
-			return fmt.Errorf("chunk %s text does not match its checksum", c.ChunkID)
+			return fmt.Errorf("chunk %s: %w", c.ChunkID, ErrChecksumMismatch)
 		}
 	}
 	return nil
 }
+
+// ErrChecksumMismatch: a chunk's text no longer matches its recorded
+// checksum (KB-008, SEC-T030); the release is refused.
+var ErrChecksumMismatch = errors.New("text does not match its checksum")
 
 func sameSet(a, b []string) bool {
 	if len(a) != len(b) {

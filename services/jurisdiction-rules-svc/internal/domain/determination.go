@@ -102,6 +102,10 @@ type Determination struct {
 	Candidates   []Candidate `json:"candidates"`
 	Claim        ClaimCheck  `json:"claim"`
 	Explanation  []string    `json:"explanation"`
+	// JUR-1: the establishment and registration facts consulted, the facts still needed, and supplied inputs that do not decide.
+	Facts        []FactEvidence `json:"facts,omitempty"`
+	MissingFacts []MissingFact  `json:"missing_facts,omitempty"`
+	Inputs       []InputFact    `json:"inputs,omitempty"`
 }
 
 // ValidPurpose reports whether p is a known determination purpose.

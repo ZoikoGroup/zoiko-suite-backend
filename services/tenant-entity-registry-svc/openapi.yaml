@@ -2264,7 +2264,7 @@ paths:
         - bearerAuth: []
       parameters:
         - { name: status, in: query, required: false, schema: { type: string, enum: [OPEN, RESOLVED, DISMISSED] } }
-        - { name: case_type, in: query, required: false, schema: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT] } }
+        - { name: case_type, in: query, required: false, schema: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT, VERIFICATION_CONFLICT] } }
         - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
         - { name: cursor, in: query, required: false, schema: { type: string } }
       responses:
@@ -2282,7 +2282,7 @@ paths:
         `CREATE_NEW` (creates the party the held request asked for, as the requester's), `LINK_EXISTING` (names one of
         the candidates) or `DISMISS`. FACT_CONFLICT: `ACCEPT_PROPOSED_FACT` (the verified fact is superseded, never
         edited, and the accepted fact is verified now, so what was known earlier stays answerable) or `KEEP_VERIFIED`.
-        IDENTIFIER_CONFLICT: `KEEP_HOLDER` or `MOVE_TO_REQUESTER`. Merging is `:merge`.
+        IDENTIFIER_CONFLICT: `KEEP_HOLDER` or `MOVE_TO_REQUESTER`. VERIFICATION_CONFLICT: `KEEP_VERIFIED` or `ACCEPT_OBSERVATION`. Merging is `:merge`.
       tags: [Parties]
       security:
         - bearerAuth: []
@@ -2315,6 +2315,2140 @@ paths:
           description: The history, oldest first
           content: { application/json: { schema: { $ref: "#/components/schemas/MergeHistory" } } }
         "404": { $ref: "#/components/responses/NotFound" }
+
+
+  # ── ORG-08 Addresses ────────────────────────────────────────────────────────
+  /v1/addresses:
+    post:
+      operationId: createAddress
+      summary: ORG-08 CreateAddress - a structured address; the source value is kept
+      description: |
+        The structured fields are stored exactly as entered, with a normalized comparison form beside them.
+        create_request_id makes a retry return the first result; the same id with different content is a 409
+        IDEMPOTENCY_MISMATCH. A REGISTERED address is a legal assertion and is recorded only with
+        source_class AUTHORITY_REGISTRY or AUTHORITY_DOCUMENT (400 SOURCE_UNVERIFIED otherwise): a valid postal
+        address is not a legally registered one.
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateAddressRequest" } } }
+      responses:
+        "201":
+          description: Address recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressOutcome" } } }
+        "200":
+          description: Replay of an earlier create_request_id
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "create_request_id was used for a different address", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: searchAddresses
+      summary: ORG-08 SearchAddresses - over the normalized comparison form
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: "Words of the address; street and st. compare equal." }
+        - { name: country, in: query, schema: { type: string, minLength: 2, maxLength: 2 } }
+        - { name: postal_code, in: query, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Addresses, with next_cursor when more remain
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AddressSummary" } }
+                  next_cursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/addresses/{addressID}:
+    get:
+      operationId: getAddress
+      summary: ORG-08 GetAddress - the version in force at as_of
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: addressID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string }, description: "RFC3339 or YYYY-MM-DD; absent means now." }
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every version." }
+      responses:
+        "200":
+          description: The address; version is null when nothing was in force at as_of
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/addresses/{addressID}/versions:
+    post:
+      operationId: amendAddress
+      summary: ORG-08 AmendAddress - add a version; the prior one is superseded, never edited
+      description: |
+        expected_version is the current_version last read. The address type never changes. A new version starts
+        UNVERIFIED. Identical content is a 200 no-op.
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: addressID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AmendAddressRequest" } } }
+      responses:
+        "201":
+          description: New version recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressOutcome" } } }
+        "200":
+          description: Nothing changed
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/addresses/{addressID}:verify:
+    post:
+      operationId: verifyAddress
+      summary: ORG-08 VerifyAddress - record what a verifier observed
+      description: |
+        An observation, not a certificate. Only a confident PASSED moves the version to VERIFIED; LOW_CONFIDENCE
+        and FAILED are recorded and surfaced and the address is left as it was. Verification never makes an address
+        a registered office. The local rules verifier is available; EXTERNAL_PROVIDER is BLOCKED (503).
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: addressID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VerifyAddressRequest" } } }
+      responses:
+        "200":
+          description: The observation and the version it was made on
+          content: { application/json: { schema: { $ref: "#/components/schemas/VerifyOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/parties/{partyID}/addresses:
+    post:
+      operationId: linkAddressToParty
+      summary: ORG-08 LinkAddressToParty - use an address for a party in the address's own capacity
+      description: |
+        link_type must equal the address type. A new REGISTERED link ends the party's previous one on its start
+        date; both stay queryable. A party has one live registered office.
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/LinkAddressRequest" } } }
+      responses:
+        "201":
+          description: Linked
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressLinkOutcome" } } }
+        "200":
+          description: Already linked
+          content: { application/json: { schema: { $ref: "#/components/schemas/AddressLinkOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_master_version, or the party is not live", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listPartyAddresses
+      summary: ORG-08 a party's addresses, current or historical
+      tags: [Addresses]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: include_ended, in: query, schema: { type: boolean }, description: "Include links that have ended." }
+      responses:
+        "200":
+          description: Links with the address version in force at as_of
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/PartyAddress" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── MDM-01 Party contact points ─────────────────────────────────────────────
+  /v1/parties/{partyID}/contact-points:
+    post:
+      operationId: createContactPoint
+      summary: "MDM-01 CreateContactPoint - propose an email contact point for a party, starting PROPOSED"
+      description: |
+        The party must belong to the caller's tenant (404 otherwise) and be usable (not INACTIVE or merged). The address is
+        validated and normalised (trimmed, domain lower-cased, one address, no display name, at most 254 characters). A party
+        has at most one live contact point per channel and address (409). Needs PARTY_CONTACT_CREATE. The response never
+        echoes the address. Cross-tenant contact lookup is not offered.
+      tags: [ContactPoints]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - $ref: "#/components/parameters/CorrelationID"
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateContactPointRequest" } } }
+      responses:
+        "201":
+          description: Contact point recorded as PROPOSED
+          content: { application/json: { schema: { $ref: "#/components/schemas/ContactPointOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "A live contact point with that address exists, or the party is not usable", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listPartyContactPoints
+      summary: "MDM-01 ListPartyContactPoints - the contact points of a party in force at as_of, addresses included"
+      description: |
+        Needs PARTY_CONTACT_READ, because the rows carry the address. Without status every state is returned;
+        status=VERIFIED is what a notifier asks for. as_of (RFC3339 or a date, default now) limits the result to rows in force
+        at that instant: valid_from <= as_of and (no valid_to or as_of < valid_to). The address is never logged.
+      tags: [ContactPoints]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PartyID"
+        - { name: channel, in: query, schema: { type: string, enum: [EMAIL] } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/ContactStatus" } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Contact points in force at as_of
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contact_points]
+                properties:
+                  contact_points:
+                    type: array
+                    items: { $ref: "#/components/schemas/ContactPointItem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/party-contact-points/{contactPointID}:verify:
+    post:
+      operationId: verifyContactPoint
+      summary: "MDM-01 VerifyContactPoint - PROPOSED to VERIFIED on evidence, by someone other than the proposer"
+      description: |
+        evidence_ref is required. The principal who proposed the contact point cannot verify it: 403 SOD_DENIED, whatever
+        permissions they hold. Needs PARTY_CONTACT_VERIFY. No verification is automatic.
+      tags: [ContactPoints]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: contactPointID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VerifyContactPointRequest" } } }
+      responses:
+        "200":
+          description: Verified
+          content: { application/json: { schema: { $ref: "#/components/schemas/ContactPointOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the contact point is not PROPOSED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/party-contact-points/{contactPointID}:retire:
+    post:
+      operationId: retireContactPoint
+      summary: "MDM-01 RetireContactPoint - end a contact point, finally"
+      description: |
+        reason is required. valid_to is set to the time of retirement and the status becomes RETIRED, which is final. A
+        retired address can be proposed again as a new contact point. Needs PARTY_CONTACT_RETIRE.
+      tags: [ContactPoints]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: contactPointID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RetireContactPointRequest" } } }
+      responses:
+        "200":
+          description: Retired
+          content: { application/json: { schema: { $ref: "#/components/schemas/ContactPointOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the contact point is already RETIRED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ── ORG-08 Establishments ───────────────────────────────────────────────────
+  /v1/establishments:
+    post:
+      operationId: createEstablishment
+      summary: ORG-08 CreateEstablishment - record a legal-presence fact, starting PROPOSED
+      description: |
+        An establishment has its own id and stands at an address; the address does not make it one, and nothing is
+        inferred from it. evidence_ref and source_class are required. create_request_id makes a retry return the
+        first result (409 IDEMPOTENCY_MISMATCH if it carries different content). The entity must be operational.
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateEstablishmentRequest" } } }
+      responses:
+        "201":
+          description: Establishment recorded as PROPOSED
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "200":
+          description: Replay of an earlier create_request_id
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "create_request_id was used for a different establishment, or the entity is not operational", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/establishments/{establishmentID}:
+    get:
+      operationId: getEstablishment
+      summary: ORG-08 GetEstablishment - with the address version in force at as_of
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: establishmentID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every recorded status change." }
+      responses:
+        "200":
+          description: The establishment
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/establishments/{establishmentID}:activate:
+    post:
+      operationId: activateEstablishment
+      summary: ORG-08 ChangeEstablishmentStatus to ACTIVE (PROPOSED or INACTIVE to ACTIVE)
+      description: |
+        A material establishment (BRANCH, PERMANENT_ESTABLISHMENT) cannot be activated by the principal who proposed
+        it: 403 SOD_DENIED. The permission does not lift that.
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: establishmentID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChangeEstablishmentStatusRequest" } } }
+      responses:
+        "200":
+          description: Activated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow this move", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/establishments/{establishmentID}:deactivate:
+    post:
+      operationId: deactivateEstablishment
+      summary: ORG-08 ChangeEstablishmentStatus to INACTIVE (ACTIVE to INACTIVE); reason required
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: establishmentID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChangeEstablishmentStatusRequest" } } }
+      responses:
+        "200":
+          description: Deactivated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow this move", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/establishments/{establishmentID}:close:
+    post:
+      operationId: closeEstablishment
+      summary: ORG-08 ChangeEstablishmentStatus to CLOSED (final); reason required, sets the end of the presence
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: establishmentID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChangeEstablishmentStatusRequest" } } }
+      responses:
+        "200":
+          description: Closed; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/EstablishmentOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow this move", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/entities/{entityID}/establishments:
+    get:
+      operationId: listEntityEstablishments
+      summary: ORG-08 ListEntityEstablishments, or GetEstablishmentsAsOf when as_of is given
+      description: |
+        Without as_of, lists by current status. With as_of, returns the establishments that were ACTIVE on that
+        date, reconstructed from the recorded transitions, each with its address version then.
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/EstablishmentStatus" } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Establishments (a list, or the as-of reconstruction)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  as_of: { type: string, format: date-time }
+                  items:
+                    type: array
+                    items:
+                      oneOf:
+                        - { $ref: "#/components/schemas/Establishment" }
+                        - { $ref: "#/components/schemas/EstablishmentView" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entities/{entityID}/addresses:
+    get:
+      operationId: listEntityAddresses
+      summary: ORG-08 an entity's addresses; the registered office is one, now or as it was
+      description: |
+        POST /v1/entities/{id}/registered-office still writes the ORG-03 profile version. When the office is sent
+        as a structured address (lines or line1, locality or city, country) it is also recorded here as a REGISTERED
+        address from authority evidence, ending the previous one on the new start date. An unstructured office, or a
+        change that does not start after the current one, stays in the profile history only.
+      tags: [Establishments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: include_ended, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Links with the address version in force at as_of
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/PartyAddress" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── ORG-09 Registrations and licences ───────────────────────────────────────
+  /v1/registrations:
+    post:
+      operationId: createRegistration
+      summary: ORG-09 CreateRegistration - record a registration or licence, DRAFT (unverified)
+      description: |
+        Generic evidence that a holder (a legal entity or a party) is registered or licensed by an authority. It
+        starts DRAFT and never reads as in force until verified. It decides no tax semantics: a TAX_REFERENCE is a
+        reference, and TAX-01 stays authoritative for what it means. create_request_id makes a retry return the first
+        result. A live registration with the same authority, type, jurisdiction and number is a 409
+        DUPLICATE_CANDIDATE. supersedes_id names the registration this one replaces when it is verified.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateRegistrationRequest" } } }
+      responses:
+        "201":
+          description: Registration recorded as DRAFT
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "200":
+          description: Replay of an earlier create_request_id
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "A live registration of this number exists, create_request_id was used for a different registration, or the holder or the registration to supersede is not in a state that allows it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listRegistrations
+      summary: ORG-09 list registrations by holder, type, status or jurisdiction
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: holder_legal_entity_id, in: query, schema: { type: string, format: uuid } }
+        - { name: holder_party_id, in: query, schema: { type: string, format: uuid } }
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/RegistrationType" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/RegistrationStatus" } }
+        - { name: jurisdiction, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: reveal, in: query, schema: { type: boolean }, description: "Show sensitive numbers unmasked; needs the reveal permission (403 without it)." }
+      responses:
+        "200":
+          description: Registrations, with next_cursor when more remain; sensitive numbers masked unless revealed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Registration" } }
+                  next_cursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/registrations:find:
+    get:
+      operationId: findRegistrationsByNumber
+      summary: ORG-09 FindByNumber - on the normalized number, so "gb 123-456" finds "GB123456"
+      description: Sensitive numbers are masked unless revealed. The ORG-03 registry-number lookup for legal entities is unchanged.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: number, in: query, required: true, schema: { type: string } }
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/RegistrationType" } }
+        - { name: authority, in: query, schema: { type: string } }
+        - { name: jurisdiction, in: query, schema: { type: string } }
+        - { name: reveal, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Matching registrations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Registration" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/registrations/expiring:
+    get:
+      operationId: listExpiringRegistrations
+      summary: ORG-09 ListExpiringRegistrations - expiring within within_days of as_of, soonest first
+      description: |
+        Includes any ACTIVE or SUSPENDED registration already past its expiry date that the sweep has not yet recorded:
+        expiry is surfaced from the dates, whether or not the sweep has run.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: within_days, in: query, schema: { type: integer, minimum: 0, maximum: 3650, default: 30 } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: reveal, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: Registrations by expiry date
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Registration" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/registrations/{registrationID}:
+    get:
+      operationId: getRegistration
+      summary: ORG-09 GetRegistration - with in_force and lapsed computed from the dates
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: reveal, in: query, schema: { type: boolean }, description: "Unmask a sensitive number; refused (403) without the reveal permission." }
+      responses:
+        "200":
+          description: The registration
+          content: { application/json: { schema: { $ref: "#/components/schemas/Registration" } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/registrations/{registrationID}/history:
+    get:
+      operationId: getRegistrationHistory
+      summary: ORG-09 GetRegistrationHistory - every recorded step, in order
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The steps, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/RegistrationTransition" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/registrations/{registrationID}:verify:
+    post:
+      operationId: verifyRegistration
+      summary: ORG-09 VerifyRegistration - DRAFT or SUSPENDED to ACTIVE, on evidence
+      description: |
+        A material registration (PERMIT, LICENSE, REGULATED) is not verified by the principal who created it: 403
+        SOD_DENIED, held by the table as well. A registration past its expiry date is renewed, not verified. Verifying a
+        registration that supersedes another ends the other as SUPERSEDED.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VerifyRegistrationRequest" } } }
+      responses:
+        "200":
+          description: Verified; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/registrations/{registrationID}:renew:
+    post:
+      operationId: renewRegistration
+      summary: ORG-09 RenewRegistration - a later expiry on evidence; an expired one becomes ACTIVE again
+      description: |
+        new_expiry_date must be later than the current one. A material registration is not renewed by the principal who
+        last verified or renewed it: 403 SOD_DENIED.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RenewRegistrationRequest" } } }
+      responses:
+        "200":
+          description: Renewed; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/registrations/{registrationID}:suspend:
+    post:
+      operationId: suspendRegistration
+      summary: ORG-09 SuspendRegistration - ACTIVE to SUSPENDED; reason and evidence required
+      description: A suspended registration is verified again to return to ACTIVE.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationEndRequest" } } }
+      responses:
+        "200":
+          description: Suspended; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/registrations/{registrationID}:expire:
+    post:
+      operationId: expireRegistration
+      summary: ORG-09 ExpireRegistration - ACTIVE or SUSPENDED to EXPIRED. The sweep does this itself when the date passes.
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationEndRequest" } } }
+      responses:
+        "200":
+          description: Expired; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/registrations/{registrationID}:revoke:
+    post:
+      operationId: revokeRegistration
+      summary: ORG-09 RevokeRegistration - to REVOKED (final) from DRAFT, ACTIVE, SUSPENDED or EXPIRED
+      tags: [Registrations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: registrationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationEndRequest" } } }
+      responses:
+        "200":
+          description: Revoked; the step is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/RegistrationOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ── ORG-09 / MDM-03 identifier verification ─────────────────────────────────
+  /v1/identifiers/{identifierID}:verify:
+    post:
+      operationId: verifyIdentifier
+      summary: ORG-09 VerifyIdentifier - record one observation of an external identifier and apply s14.1 precedence
+      description: |
+        Records what an authority or provider said (result MATCH, MISMATCH or NOT_FOUND), with its source, version,
+        exchange reference, time and evidence. The service calls no authority itself: whoever did, through the exchange
+        layer, or a steward holding the evidence, records the answer. The observation is always kept; whether it changes
+        the identifier is decided by precedence and freshness, never last-write-wins.
+
+        A provider or authority MATCH verifies (an LEI needs authority_status ISSUED). A tenant assertion or system import
+        verifies nothing. An observation older than the freshness window (90 days for an LEI, 365 for other schemes) or
+        older than the one already applied is recorded and not applied. A higher authority takes over a verification. A
+        higher authority that DISAGREES with a verified identifier opens a VERIFICATION_CONFLICT stewardship case and the
+        identifier becomes CONFLICTED: it is not overwritten, and no create links to it automatically until a steward
+        decides KEEP_VERIFIED or ACCEPT_OBSERVATION. The response's `effect` and `effect_note` say which of these happened.
+
+        For an LEI the value must be a well-formed ISO 17442 identifier (400 otherwise). `lei_alignment` compares a
+        verified LEI with the legal entity profile's LEI: ORG-03 owns the profile, so a difference is reported and never
+        written over. An LEI is one verified external identifier, never the platform's own key.
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: identifierID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/VerifyIdentifierRequest" } } }
+      responses:
+        "200":
+          description: The observation, the identifier, the party and any case it opened. A sensitive identifier's value is masked.
+          content: { application/json: { schema: { $ref: "#/components/schemas/IdentifierVerifyOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_master_version, the party is not live, or the identifier has ended", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/identifiers/{identifierID}/verifications:
+    get:
+      operationId: listIdentifierVerifications
+      summary: ORG-09 the observations recorded for an identifier, newest first, applied or not
+      tags: [Parties]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: identifierID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The observations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/IdentifierObservation" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── REF-03 Foreign exchange rates ───────────────────────────────────────────
+  /v1/fx/sources:
+    post:
+      operationId: createFxSource
+      summary: REF-03 register and approve a source of exchange rates
+      description: Only an active, registered source can feed rates. FXSource is owned here; currency identity is not.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateFXSourceRequest" } } }
+      responses:
+        "201":
+          description: Source registered
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXSource" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "A source with that code exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listFxSources
+      summary: REF-03 the tenant's exchange-rate sources
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Sources
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/FXSource" } }
+
+  /v1/fx/sources/{sourceID}:withdraw:
+    post:
+      operationId: withdrawFxSource
+      summary: "REF-03 withdraw a source: no new rates from it; existing rates stay"
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: sourceID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/WithdrawFXSourceRequest" } } }
+      responses:
+        "200":
+          description: Withdrawn
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXSource" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or already withdrawn", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/sources/{sourceID}/rates:
+    get:
+      operationId: listFxRatesBySource
+      summary: REF-03 ListRatesBySource - a source's observations by market date, newest first
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: sourceID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Observations, with next_cursor when more remain
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/FXObservation" } }
+                  next_cursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/fx/observations:
+    post:
+      operationId: ingestFxObservation
+      summary: REF-03 IngestFXObservation - record one rate a source reported, with the evidence it came with
+      description: |
+        The rate is an exact decimal string (at most 20 integer digits and 18 decimals): never a float. Rate type is
+        mandatory and types are never conflated. Both currencies are confirmed with currency-registry-svc, read-only and
+        fail-closed: an unknown currency is 400 REFERENCE_RETIRED and an unreachable registry is 503, never an assumed
+        currency. The observation is checked for duplicates (a provider observation id, or the same source, pair, type and
+        instant: a replay returns the first, a different rate under the same key is 409) and for outliers against the last
+        accepted rate of the pair and type; the results are kept as `checks`. A manual (MANUAL_EXCEPTION source) or
+        outlying rate stays OBSERVED and needs independent approval; the rest are VALIDATED.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/IngestFXObservationRequest" } } }
+      responses:
+        "201":
+          description: Observation recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXIngestOutcome" } } }
+        "200":
+          description: Replay of an observation already recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXIngestOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The same key was recorded with a different rate, or the source is withdrawn", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/fx/observations/{observationID}:supersede:
+    post:
+      operationId: supersedeFxObservation
+      summary: REF-03 SupersedeRateObservation - replace an observation that is not yet in a rate set
+      description: |
+        The replacement is for the same pair, rate type and market date and is validated like any ingestion. A rate that is
+        in a set is never edited or replaced in place: it is corrected by a superseding set (`approveFxRateSet` with
+        supersedes_set_id).
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: observationID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/SupersedeFXObservationRequest" } } }
+      responses:
+        "201":
+          description: Replaced; the old observation is SUPERSEDED
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXIngestOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The observation is in a rate set or already superseded", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/fx/rate-sets:
+    post:
+      operationId: approveFxRateSet
+      summary: REF-03 ApproveFXRateSet - approve observations into a rate set for a rate type and market date
+      description: |
+        One rate per pair; every observation is of the set's rate type and market date. A manual or outlying observation
+        needs override_reason and is not approved by the principal who ingested it (403 SOD_DENIED; the table holds it too).
+        An observation already approved in another set is a 409. supersedes_set_id makes the set a correction of an
+        APPROVED or CLOSED one of the same name, type and date: the old set is SUPERSEDED but stays readable, and rates the
+        correction drops stop being in force.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ApproveFXRateSetRequest" } } }
+      responses:
+        "201":
+          description: Rate set approved
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRateSet" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "A live set of that name, type and date exists, or an observation is already approved or superseded", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/rate-sets/{setID}:
+    get:
+      operationId: getFxRateSet
+      summary: REF-03 GetRateSet - a set with its member observations
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The set
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRateSet" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/fx/rate-sets/{setID}:close:
+    post:
+      operationId: closeFxRateSet
+      summary: REF-03 CloseRateSet - certify an APPROVED set; it is then immutable
+      description: A certified set is never edited. A correction is a superseding set.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CloseFXRateSetRequest" } } }
+      responses:
+        "200":
+          description: Closed
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRateSet" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The set is not APPROVED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/rates:
+    get:
+      operationId: getFxRate
+      summary: REF-03 GetRate - the approved direct rate for a pair, rate type and market date
+      description: |
+        Nothing is inverted, crossed or substituted: if there is no approved rate the answer is 404 FX_RATE_MISSING, never
+        an older date, another rate type or an unapproved observation. An authoritative calculation that needs the rate is
+        blocked or routed to an explicit exception. `rates:explain` derives an inverse or cross rate, openly.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: base, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: quote, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: rate_type, in: query, required: true, schema: { $ref: "#/components/schemas/FXRateType" } }
+        - { name: market_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: set_name, in: query, schema: { type: string, default: DEFAULT } }
+      responses:
+        "200":
+          description: The rate and the observation it came from
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRate" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { description: "FX_RATE_MISSING: no approved rate", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/rates:history:
+    get:
+      operationId: getFxHistoricalRate
+      summary: REF-03 GetHistoricalRate - the rate as it was known at known_at
+      description: |
+        Answers with the rate set that was live at known_at, so a rate that a later correction replaced still answers "what
+        was in force then". A historical rate is never silently replaced.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: base, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: quote, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: rate_type, in: query, required: true, schema: { $ref: "#/components/schemas/FXRateType" } }
+        - { name: market_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: known_at, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: set_name, in: query, schema: { type: string, default: DEFAULT } }
+      responses:
+        "200":
+          description: The rate as known then
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRate" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { description: "FX_RATE_MISSING: no approved rate was in force at known_at", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/fx/rates:explain:
+    get:
+      operationId: explainDerivedFxCrossRate
+      summary: REF-03 ExplainDerivedCrossRate - the rate, how it was reached, and from which approved observations
+      description: |
+        Tries the direct rate, then the inverse, then a cross through a pivot currency (via, default USD): nothing else.
+        A derived rate is exact arithmetic on approved components, rounded half up to 18 decimals with the exact fraction
+        returned beside it, and lists every component with its direction and set.
+      tags: [FX]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: base, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: quote, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 3 } }
+        - { name: rate_type, in: query, required: true, schema: { $ref: "#/components/schemas/FXRateType" } }
+        - { name: market_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: set_name, in: query, schema: { type: string, default: DEFAULT } }
+        - { name: via, in: query, schema: { type: string, minLength: 3, maxLength: 3 }, description: "Pivot currency for a cross rate. Default USD." }
+        - { name: known_at, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: The rate, the method and its components
+          content: { application/json: { schema: { $ref: "#/components/schemas/FXRate" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { description: "FX_RATE_MISSING: a needed component has no approved rate", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ── REF-06 Accounting books ─────────────────────────────────────────────────
+  /v1/books:
+    post:
+      operationId: createAccountingBook
+      summary: REF-06 CreateAccountingBook - open a DRAFT book with its first basis
+      description: |
+        A book belongs to one legal entity or to a group (a group owns only consolidation and management books). Its code is
+        unique within its owner for ever: a retired code is not reused. The framework must be allowed for the book type (a
+        tax book is on a TAX_BASIS, not IFRS); LOCAL_GAAP and REGULATORY_BASIS name the standard in framework_detail. Both
+        currencies are confirmed with currency-registry-svc, read-only and fail-closed. There is no default book and no
+        default type. A book owns no ledger lines or balances and no accounting policy content.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateAccountingBookRequest" } } }
+      responses:
+        "201":
+          description: Book opened as DRAFT
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The book code is already used by this entity or group, or the entity is not operational", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+    get:
+      operationId: listGroupBooks
+      summary: REF-06 a group's books
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: group_code, in: query, required: true, schema: { type: string } }
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/BookType" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/BookStatus" } }
+      responses:
+        "200":
+          description: The group's books
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AccountingBook" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/entities/{entityID}/books:
+    get:
+      operationId: listEntityBooks
+      summary: REF-06 ListEntityBooks
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/BookType" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/BookStatus" } }
+      responses:
+        "200":
+          description: "The entity's books, which stay separate: statutory, management, tax, consolidation and regulatory"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/AccountingBook" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/books/{bookID}:
+    get:
+      operationId: getAccountingBook
+      summary: REF-06 GetAccountingBook - the book as it was on as_of, with its status then, its basis then and whether it could post
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string }, description: "RFC3339 or YYYY-MM-DD; absent means now." }
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every status change." }
+      responses:
+        "200":
+          description: The book
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/books/{bookID}/as-of:
+    get:
+      operationId: getBookAsOf
+      summary: REF-06 GetBookAsOf - the same as getAccountingBook with the date required
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, required: true, schema: { type: string } }
+        - { name: history, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: The book as it was then; the historical basis version is reconstructed
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/books/{bookID}/posting-eligibility:
+    get:
+      operationId: getBookPostingEligibility
+      summary: REF-06 BookPostingEligibility - may this book take a posting on that date, and if not why
+      description: |
+        A posting service names the book explicitly and asks here; there is no default ledger. A book posts only when it
+        was ACTIVE on the date with a basis in force. A draft, a book whose posting is suspended, a retired book, a book
+        before it began, and a book with no basis in force all answer eligible=false with the reason.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The answer
+          content: { application/json: { schema: { $ref: "#/components/schemas/PostingEligibility" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/books/{bookID}/basis:
+    get:
+      operationId: explainBookBasis
+      summary: REF-06 ExplainBookBasis - the basis in force, every version, and how the book differs from its siblings
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The explanation
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookBasisExplanation" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      operationId: amendBookBasis
+      summary: REF-06 AmendBookBasis - add the next basis version; prospective, never rewriting earlier periods
+      description: |
+        expected_version is the book's record_version last read. For a book in use (anything but DRAFT) valid_from is today
+        or later and after the current basis began: a basis change cannot rewrite how earlier periods were booked. A DRAFT
+        book, never in use, may be corrected on or after the day its basis starts. The framework is checked against the
+        book's type. A retired book keeps its basis and takes no new one.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AmendBookBasisRequest" } } }
+      responses:
+        "201":
+          description: New basis version recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the book is retired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /v1/books/{bookID}:activate:
+    post:
+      operationId: activateBook
+      summary: REF-06 ActivateBook - DRAFT or POSTING_SUSPENDED to ACTIVE
+      description: |
+        A statutory, tax or regulatory book is not activated by the principal who created it: 403 SOD_DENIED, held by the
+        table as well. A second live book of the same entity, type and framework is a 409: parallel books differ in framework,
+        so "the" book is never ambiguous.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/BookStatusRequest" } } }
+      responses:
+        "200":
+          description: Activated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, the lifecycle does not allow it, or a parallel live book has the same framework", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/books/{bookID}:suspend-posting:
+    post:
+      operationId: suspendBookPosting
+      summary: REF-06 SuspendPosting - ACTIVE to POSTING_SUSPENDED; reason required
+      description: The book stays readable and its history intact; it takes no new posting until activated again.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/BookStatusRequest" } } }
+      responses:
+        "200":
+          description: Posting suspended; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/books/{bookID}:retire:
+    post:
+      operationId: retireBook
+      summary: REF-06 RetireBook - to RETIRED (final); reason required
+      description: Retirement prevents new postings but retains historical retrieval and report lineage, including the basis versions.
+      tags: [Books]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: bookID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/BookStatusRequest" } } }
+      responses:
+        "200":
+          description: Retired; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/BookOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the book is already retired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ── REF-08 Financial dimensions ─────────────────────────────────────────────
+  /v1/dimension-types:
+    post:
+      operationId: createDimensionType
+      summary: REF-08 CreateDimensionType - define a kind of dimension, such as cost centre, project or region
+      description: |
+        `hierarchical` says whether values form a hierarchy; `controlled` marks a hierarchy that feeds reporting or control
+        aggregation, so a change to it waits for independent approval. `source_domain` names the operational domain that feeds
+        the type, when one does (PROJECT, LOCATION, PRODUCT). A type is immutable.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateDimensionTypeRequest" } } }
+      responses:
+        "201":
+          description: Type created
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionType" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "A type with that code exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listDimensionTypes
+      summary: REF-08 the tenant's dimension types
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Types
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/DimensionType" } }
+
+  /v1/dimension-types/{typeCode}/hierarchy:
+    get:
+      operationId: getDimensionHierarchyAsOf
+      summary: REF-08 GetHierarchyAsOf - every value of a type with its label and parent as they stood on a date
+      description: |
+        Reconstructs the roll-up on either side of a change: a value created after the date is absent, a value moved later is
+        where it was. With legal_entity_id the answer is the tenant-wide values and that entity's own.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: typeCode, in: path, required: true, schema: { type: string } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: legal_entity_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The hierarchy, shallowest nodes first
+          content: { application/json: { schema: { $ref: "#/components/schemas/HierarchyAsOf" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/dimension-types/{typeCode}/posting-eligible-values:
+    get:
+      operationId: listPostingEligibleDimensionValues
+      summary: REF-08 ListPostingEligibleValues - the values that could take a new posting on a date
+      description: |
+        Inactive and draft values are absent. An inactive value covered by an explicit controlled exception is listed with
+        exception true. This registry answers; the posting service must ask, because it cannot stop a posting itself.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: typeCode, in: path, required: true, schema: { type: string } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: legal_entity_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Eligible values
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/EligibleDimensionValue" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/dimension-values:
+    post:
+      operationId: createDimensionValue
+      summary: REF-08 CreateDimensionValue - open a DRAFT value with its first placement
+      description: |
+        A code is stable within its scope: unique per type, per entity for an entity's own values, and an entity's code never
+        shadows a tenant-wide one (409). A parent is of the same type and tenant-wide or of the same entity; a type with no
+        hierarchy takes none. The first placement needs no review: it is a new node, not a change to an existing aggregation.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateDimensionValueRequest" } } }
+      responses:
+        "201":
+          description: Value created as DRAFT
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The code is already used in this scope or another scope of the type, or the entity is not operational", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}:
+    get:
+      operationId: getDimensionValue
+      summary: REF-08 GetDimensionValue - the value as it was on a date
+      description: |
+        The label and parent then, the status then, the roll-up path then (root first) and whether it could take a posting.
+        A pending hierarchy change is shown but does not affect the roll-up until approved.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: as_of, in: query, schema: { type: string } }
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every hierarchy version and status change." }
+      responses:
+        "200":
+          description: The value
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionValueView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/dimension-values/{valueID}/hierarchy:
+    post:
+      operationId: reparentDimensionValue
+      summary: REF-08 ReparentDimensionValue - propose the next hierarchy version, a new parent or root and optionally a new label
+      description: |
+        Prospective only: valid_from is today or later and after the current version began, so a change never rewrites a roll-up
+        already reported. A loop is refused on the date it takes effect and on every later date a version of the type's hierarchy
+        begins. Renaming never changes the value's identity or code. For a controlled type the version is PENDING until someone
+        other than its proposer approves it; for any other type it takes effect directly.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ReparentDimensionValueRequest" } } }
+      responses:
+        "201":
+          description: Version recorded, PENDING or APPROVED
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or a change is already pending", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}/hierarchy/{versionNo}:approve:
+    post:
+      operationId: approveDimensionHierarchy
+      summary: REF-08 approve a pending hierarchy change of a controlled type
+      description: |
+        Not by the principal who proposed it (403 SOD_DENIED, held by the table as well). Approval checks again for loops and
+        refuses a change whose date has passed or that the hierarchy has overtaken (409); propose it again.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: versionNo, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ApproveDimensionHierarchyRequest" } } }
+      responses:
+        "200":
+          description: Approved; it takes effect from its valid_from
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, the version is not pending, or the proposal is stale", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}:activate:
+    post:
+      operationId: activateDimensionValue
+      summary: REF-08 ActivateDimensionValue - DRAFT or INACTIVE to ACTIVE
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/DimensionStatusRequest" } } }
+      responses:
+        "200":
+          description: Activated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}:deactivate:
+    post:
+      operationId: deactivateDimensionValue
+      summary: REF-08 DeactivateDimensionValue - ACTIVE to INACTIVE; reason required
+      description: |
+        An inactive value remains valid for history and rejects new postings. exception_until is an explicit controlled
+        exception: new postings are still accepted until that date, which must be after the deactivation and within 90 days of it.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/DimensionStatusRequest" } } }
+      responses:
+        "200":
+          description: Deactivated; the transition is recorded
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or the lifecycle does not allow it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimension-values/{valueID}/source-mappings:
+    post:
+      operationId: mapDimensionSourceObject
+      summary: REF-08 MapSourceObject - map an operational source object to a value, by version
+      description: |
+        The source object (a project, a location) is owned elsewhere. The value must be ACTIVE, and when the type names a
+        source_domain the mapping is in that domain. A new mapping ends the source object's previous one where it begins, and
+        both versions are kept. Mapping it to the value it already maps to is a 200 no-op.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: valueID, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/MapSourceObjectRequest" } } }
+      responses:
+        "201":
+          description: Mapped
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionMappingOutcome" } } }
+        "200":
+          description: Already mapped to this value
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionMappingOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The value is not ACTIVE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/dimensions:resolve:
+    get:
+      operationId: resolveDimension
+      summary: REF-08 ResolveDimension - find a value by code, or by the operational source object mapped to it
+      description: |
+        By code (type_code and code): the caller's entity's own value wins, otherwise the tenant-wide one; a code that exists
+        only in another entity is not found. By source (type_code, source_domain and source_object_id): the mapping in force
+        on as_of. Either way the answer includes the value as it was on that date and whether it could take a posting. There
+        is no guessing: nothing found is a 404.
+      tags: [Dimensions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: type_code, in: query, required: true, schema: { type: string } }
+        - { name: code, in: query, schema: { type: string } }
+        - { name: legal_entity_id, in: query, schema: { type: string, format: uuid } }
+        - { name: source_domain, in: query, schema: { type: string } }
+        - { name: source_object_id, in: query, schema: { type: string } }
+        - { name: as_of, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The value and how it was found
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionResolution" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  # ── REF-09 Units of measure ─────────────────────────────────────────────────
+  /v1/quantity-dimensions:
+    post:
+      operationId: createQuantityDimension
+      summary: "REF-09 create a quantity dimension (length, mass, volume, count) with its base unit"
+      description: |
+        A dimension has exactly one base unit, ACTIVE from the start: its factor is 1 by definition. Every other unit of the
+        dimension converts to it, so a conversion across dimensions cannot be defined.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateQuantityDimensionRequest" } } }
+      responses:
+        "201":
+          description: Dimension and base unit created
+          content: { application/json: { schema: { $ref: "#/components/schemas/DimensionWithBase" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The dimension or unit code already exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listQuantityDimensions
+      summary: "REF-09 the quantity dimensions of the tenant"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Dimensions with their base unit codes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/QuantityDimension" } }
+
+  /v1/quantity-dimensions/{dimensionCode}/units:
+    get:
+      operationId: listUnitsByDimension
+      summary: "REF-09 ListUnitsByDimension - the units of a dimension, the base first"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: dimensionCode, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The units
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Unit" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/units:
+    post:
+      operationId: createUnit
+      summary: "REF-09 CreateUnit - a non-base unit of an existing dimension, a draft until its conversion is in force"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateUnitRequest" } } }
+      responses:
+        "201":
+          description: Draft unit created
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The unit code already exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/units:convert:
+    get:
+      operationId: convertQuantity
+      summary: "REF-09 ConvertQuantity - exact conversion between two units of one dimension on a date"
+      description: |
+        Dimensionality is checked before any arithmetic: units of different dimensions are refused (422 DIMENSION_MISMATCH).
+        The arithmetic is exact; only the final figure is rounded, half away from zero, to the target unit's decimals, and the
+        unrounded fraction is returned beside it. The result names the conversion version applied to each unit, which the
+        calling domain retains with the business fact so the number can be reproduced. A unit with no approved conversion in
+        force on the date is 404 CONVERSION_MISSING, never a guess.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: quantity, in: query, required: true, schema: { type: string }, description: "An exact decimal, which may be negative." }
+        - { name: from, in: query, required: true, schema: { type: string } }
+        - { name: to, in: query, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: The converted quantity and the versions applied
+          content: { application/json: { schema: { $ref: "#/components/schemas/ConversionResult" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+  /v1/units/{unitCode}:
+    get:
+      operationId: getUnit
+      summary: "REF-09 GetUnit - the unit as it was on a date, with the conversion then in force"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/AsOf"
+        - { name: history, in: query, schema: { type: boolean }, description: "Include every conversion version." }
+      responses:
+        "200":
+          description: The unit
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitView" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/units/{unitCode}/conversions:
+    post:
+      operationId: proposeConversion
+      summary: "REF-09 the first conversion of a unit to its dimension's base unit"
+      description: |
+        The factor is how many base units one of this unit is, a decimal or a fraction, held exactly. A STANDARD conversion
+        takes effect at once. An ORGANISATION or MANUAL_OVERRIDE conversion is PENDING until someone other than its proposer
+        approves it.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ProposeConversionRequest" } } }
+      responses:
+        "201":
+          description: Conversion recorded, PENDING or ACTIVE
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, a conversion already active or pending, or the unit is retired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/units/{unitCode}/conversions:supersede:
+    post:
+      operationId: supersedeConversion
+      summary: "REF-09 SupersedeConversion - replace the active conversion from a later date"
+      description: |
+        Prospective only: valid_from is today or later and after the active conversion began, so a quantity already converted
+        is never rewritten. The replaced version stays readable and reproduces earlier results.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ProposeConversionRequest" } } }
+      responses:
+        "201":
+          description: Replacement recorded, PENDING or ACTIVE
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, nothing to supersede, or a change already pending", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/units/{unitCode}/conversions/{versionNo}:
+    get:
+      operationId: getConversionVersion
+      summary: "REF-09 GetConversionVersion - one version of a unit's conversion, as applied by a past result"
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - { name: versionNo, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: The version
+          content: { application/json: { schema: { $ref: "#/components/schemas/ConversionVersion" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/units/{unitCode}/conversions/{versionNo}:approve:
+    post:
+      operationId: approveConversion
+      summary: "REF-09 ApproveConversion - take a pending conversion into effect"
+      description: |
+        Refused (403 SOD_DENIED) when the approver proposed it. A replacement ends the active conversion where it begins.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - { name: versionNo, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ApproveConversionRequest" } } }
+      responses:
+        "200":
+          description: Conversion in force
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, not pending, or the hierarchy of versions moved on", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/units/{unitCode}:retire:
+    post:
+      operationId: retireUnit
+      summary: "REF-09 RetireUnit - reject new use of a unit from today"
+      description: |
+        Nothing is deleted: conversions made before remain reproducible. A base unit retires only when every other unit of its
+        dimension is already retired.
+      tags: [Units]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: unitCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RetireUnitRequest" } } }
+      responses:
+        "200":
+          description: Unit retired
+          content: { application/json: { schema: { $ref: "#/components/schemas/UnitOutcome" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, already retired, or other units still convert through it", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  # ── MDM-04 Reference releases ───────────────────────────────────────────────
+  /v1/reference-sets:
+    post:
+      operationId: createReferenceSet
+      summary: "MDM-04 define a governed reference set, a domain-neutral code list"
+      description: |
+        A set changes only by releases. `allow_custom` says whether releases may add user-assigned codes; an official code list
+        takes none.
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateReferenceSetRequest" } } }
+      responses:
+        "201":
+          description: Set defined
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReferenceSet" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The set already exists", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listReferenceSets
+      summary: "MDM-04 the reference sets of the tenant, with the release in force today"
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The sets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/ReferenceSet" } }
+
+  /v1/reference-sets/{setCode}/releases:
+    post:
+      operationId: stageReferenceRelease
+      summary: "MDM-04 stage a release: its changes to codes, source, effective date and compatibility"
+      description: |
+        The changes are checked against the set as published: ADD of an existing code, a change to a code that is not active, a
+        replacement that is not live once the release is applied, and a custom code in a set that takes none are all refused
+        naming the code. The effective date must follow every release already published. The release governs nothing until
+        someone other than its stager publishes it.
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setCode, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/StageReferenceReleaseRequest" } } }
+      responses:
+        "201":
+          description: Release staged
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReferenceRelease" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The version exists, or the effective date does not follow the published releases", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+    get:
+      operationId: listReferenceReleases
+      summary: "MDM-04 the releases of a set, staged and published, by effective date"
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setCode, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The releases
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/ReferenceRelease" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/reference-sets/{setCode}/releases/{version}:publish:
+    post:
+      operationId: publishReferenceRelease
+      summary: "MDM-04 publish a staged release, putting it in force from its effective date"
+      description: |
+        Refused (403 SOD_DENIED) when the publisher staged it. The changes are checked again against what has been published
+        since staging. A published release is final; a later release supersedes it.
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setCode, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/PublishReferenceReleaseRequest" } } }
+      responses:
+        "200":
+          description: Release published
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReferenceRelease" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Already published, or the set changed since the release was staged", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/reference/{setCode}/{code}:
+    get:
+      operationId: resolveReference
+      summary: "MDM-04 Resolve reference - a code as it stood on a date, with its release, validity and supersession"
+      description: |
+        Answers from published releases only. `status` is ACTIVE, RETIRED or SUPERSEDED: a retired or superseded code is still
+        returned, with `valid_to` and `superseded_by`, so a consumer reading old data can interpret it. A code not yet added on
+        the date, or never added, is 404. `release` pins the answer to one exact published release and those before it, whatever
+        the date, for processing that must interpret codes under the release it was built on. The date is ignored when a release
+        is pinned. `history=true` adds every published change to the code.
+      tags: [Reference]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: setCode, in: path, required: true, schema: { type: string } }
+        - { name: code, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/AsOf"
+        - { name: release, in: query, schema: { type: string }, description: "An exact published release version." }
+        - { name: history, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: The code and the release that governed it
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReferenceResolution" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── ORG-9 Master imports (API-5 async operations) ───────────────────────────
+  /v1/master-imports:
+    post:
+      operationId: createMasterImport
+      summary: "ORG-9 upload a file of party rows; always asynchronous, answers 202 with an operation"
+      description: |
+        The file moves through upload, validate, preview, approve, import and reconcile. This call records the rows exactly as
+        received (with their SHA-256, checked against `manifest_sha256` when the sender gives one) and starts validation as an
+        operation: poll `Location`. Every row is checked and every problem of every row is kept, so a sender gets all the errors
+        at once. A retry carrying the same `Idempotency-Key` from the same principal is the same operation, never a second import;
+        the same key with a different file is refused (409 IDEMPOTENCY_MISMATCH).
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/CreateMasterImportRequest" } } }
+      responses:
+        "202":
+          description: Accepted; validation is running
+          headers:
+            Location: { schema: { type: string }, description: "/v1/operations/{id}" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "The Idempotency-Key was used for a different request", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/master-imports/{importID}:
+    get:
+      operationId: getMasterImport
+      summary: "ORG-9 an import: status, row counts and, once finished, its reconciliation"
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: importID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The import
+          content: { application/json: { schema: { $ref: "#/components/schemas/MasterImport" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/master-imports/{importID}/rows:
+    get:
+      operationId: listImportRows
+      summary: "ORG-9 each row's verdict, errors and outcome, by row number"
+      description: |
+        The row as received is never returned, because it can carry identifiers. A row that matched an existing party or needs
+        review is a CONFLICT left for stewardship, with the party and case it names: an import never overwrites.
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: importID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, VALID, INVALID, IMPORTED, CONFLICT, FAILED] } }
+        - { name: after_row, in: query, schema: { type: integer, minimum: 0 }, description: "Return rows after this row number." }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 }, description: "Default 50." }
+      responses:
+        "200":
+          description: The rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/ImportRow" } }
+                  next_after_row: { type: integer, description: "Present when more rows may follow." }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/master-imports/{importID}:approve:
+    post:
+      operationId: approveMasterImport
+      summary: "ORG-9 approve a previewed import, starting it; always asynchronous, answers 202 with an operation"
+      description: |
+        Refused when the file has any invalid row (409), and refused (403 SOD_DENIED) when the approver uploaded it. Importing
+        creates the parties of the valid rows through the ordinary party creation path, as the principal who uploaded the file;
+        a row that matches an existing party is recorded as a conflict, never overwritten. The operation cannot be cancelled once
+        it has started creating parties. Approving twice returns the same operation.
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: importID, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string } }
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ApproveMasterImportRequest" } } }
+      responses:
+        "202":
+          description: Accepted; the import is running
+          headers:
+            Location: { schema: { type: string }, description: "/v1/operations/{id}" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, a file with invalid rows, or not ready for approval", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/operations/{operationID}:
+    get:
+      operationId: getOperation
+      summary: "API-5 poll an operation of the tenant"
+      description: "States: queued, running, waiting_external, succeeded, failed, cancel_requested, cancelled. A finished operation names its resource in `resource_ref`; a failed one carries a problem."
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: operationID, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The operation
+          content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/operations/{operationID}:cancel:
+    post:
+      operationId: cancelOperation
+      summary: "API-5 ask an operation to stop, before its point of no return"
+      tags: [MasterImports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: operationID, in: path, required: true, schema: { type: string } }
+      responses:
+        "202":
+          description: Cancellation requested; the operation ends cancelled
+          content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The operation is finished or past its point of no return", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
 
 components:
@@ -2434,7 +4568,7 @@ components:
       type: object
       required: [decision, note, expected_case_version]
       properties:
-        decision: { type: string, enum: [CREATE_NEW, LINK_EXISTING, DISMISS, ACCEPT_PROPOSED_FACT, KEEP_VERIFIED, KEEP_HOLDER, MOVE_TO_REQUESTER] }
+        decision: { type: string, enum: [CREATE_NEW, LINK_EXISTING, DISMISS, ACCEPT_PROPOSED_FACT, KEEP_VERIFIED, KEEP_HOLDER, MOVE_TO_REQUESTER, ACCEPT_OBSERVATION] }
         party_id: { type: string, format: uuid, description: "LINK_EXISTING only: one of the case's candidates." }
         note: { type: string }
         expected_case_version: { type: integer, format: int64 }
@@ -2495,6 +4629,1530 @@ components:
         resolves_to: { type: string, format: uuid, description: "The survivor this id resolves to; itself when it was not merged away." }
         alias_ids: { type: array, items: { type: string, format: uuid } }
         lineage: { type: array, items: { $ref: "#/components/schemas/LineageEvent" } }
+
+    AddressType:
+      type: string
+      description: "REGISTERED, PRINCIPAL_PLACE, OPERATING, BILLING, REMITTANCE, TAX, EMPLOYMENT_ESTABLISHMENT or a custom X_UPPER_CASE type."
+      pattern: '^(REGISTERED|PRINCIPAL_PLACE|OPERATING|BILLING|REMITTANCE|TAX|EMPLOYMENT_ESTABLISHMENT|X_[A-Z0-9_]{1,30})$'
+
+    AddressFields:
+      type: object
+      required: [lines, locality, country, source_class, evidence_ref]
+      properties:
+        lines: { type: array, minItems: 1, maxItems: 4, items: { type: string, minLength: 1, maxLength: 200 } }
+        locality: { type: string }
+        subdivision: { type: string }
+        postal_code: { type: string, maxLength: 20 }
+        country: { type: string, minLength: 2, maxLength: 2, description: "ISO 3166-1 alpha-2. A well-shaped but unassigned code is recorded and fails verification." }
+        formatted: { type: string, description: "Free-text rendering as supplied, kept apart from the structured fields." }
+        valid_from: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    CreateAddressRequest:
+      allOf:
+        - $ref: "#/components/schemas/AddressFields"
+        - type: object
+          required: [address_type]
+          properties:
+            create_request_id: { type: string, maxLength: 128 }
+            address_type: { $ref: "#/components/schemas/AddressType" }
+
+    AmendAddressRequest:
+      allOf:
+        - $ref: "#/components/schemas/AddressFields"
+        - type: object
+          required: [expected_version, reason]
+          properties:
+            expected_version: { type: integer, minimum: 1 }
+            reason: { type: string }
+
+    VerifyAddressRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        verifier: { type: string, enum: [LOCAL_RULES, EXTERNAL_PROVIDER], description: "EXTERNAL_PROVIDER is BLOCKED and answers 503." }
+        correlation_id: { type: string }
+
+    LinkAddressRequest:
+      type: object
+      required: [address_id, link_type, evidence_ref, expected_master_version]
+      properties:
+        address_id: { type: string, format: uuid }
+        link_type: { $ref: "#/components/schemas/AddressType" }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        expected_master_version: { type: integer, minimum: 1 }
+        correlation_id: { type: string }
+
+    Address:
+      type: object
+      required: [address_id, tenant_id, address_type, current_version, created_by, created_at]
+      properties:
+        address_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        address_type: { $ref: "#/components/schemas/AddressType" }
+        current_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    AddressVersion:
+      type: object
+      required: [version_no, lines, locality, country, normalized, valid_from, verification_state, source_class, evidence_ref, recorded_by, recorded_at]
+      properties:
+        version_no: { type: integer }
+        lines: { type: array, items: { type: string } }
+        locality: { type: string }
+        subdivision: { type: string }
+        postal_code: { type: string }
+        country: { type: string }
+        formatted: { type: string }
+        normalized: { type: string, description: "Comparison form; never replaces the source fields." }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        verification_state: { type: string, enum: [UNVERIFIED, VERIFIED, SUPERSEDED] }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        recorded_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+        superseded_at: { type: string, format: date-time }
+        reason: { type: string }
+
+    AddressObservation:
+      type: object
+      required: [version_no, verifier, result, confidence, findings, normalized_seen, observed_at]
+      properties:
+        verification_id: { type: string, format: uuid }
+        version_no: { type: integer }
+        verifier: { type: string }
+        result: { type: string, enum: [PASSED, LOW_CONFIDENCE, FAILED] }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        findings: { type: array, items: { type: string } }
+        normalized_seen: { type: string }
+        observed_by: { type: string }
+        observed_at: { type: string, format: date-time }
+
+    AddressOutcome:
+      type: object
+      required: [address, version]
+      properties:
+        address: { $ref: "#/components/schemas/Address" }
+        version: { $ref: "#/components/schemas/AddressVersion" }
+
+    VerifyOutcome:
+      type: object
+      required: [address, version, observation]
+      properties:
+        address: { $ref: "#/components/schemas/Address" }
+        version: { $ref: "#/components/schemas/AddressVersion" }
+        observation: { $ref: "#/components/schemas/AddressObservation" }
+
+    AddressView:
+      type: object
+      required: [address, version, verifications]
+      properties:
+        address: { $ref: "#/components/schemas/Address" }
+        version: { nullable: true, allOf: [{ $ref: "#/components/schemas/AddressVersion" }] }
+        verifications: { type: array, items: { $ref: "#/components/schemas/AddressObservation" } }
+        history: { type: array, items: { $ref: "#/components/schemas/AddressVersion" } }
+
+    AddressSummary:
+      type: object
+      required: [address_id, address_type, version_no, locality, country, verification_state, normalized]
+      properties:
+        address_id: { type: string, format: uuid }
+        address_type: { $ref: "#/components/schemas/AddressType" }
+        version_no: { type: integer }
+        locality: { type: string }
+        postal_code: { type: string }
+        country: { type: string }
+        verification_state: { type: string }
+        normalized: { type: string }
+
+    AddressLink:
+      type: object
+      required: [link_id, address_id, link_type, valid_from, evidence_ref, linked_by, linked_at]
+      properties:
+        link_id: { type: string, format: uuid }
+        address_id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid, description: "Set instead of party_id when the link is an entity's." }
+        link_type: { $ref: "#/components/schemas/AddressType" }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        evidence_ref: { type: string }
+        linked_by: { type: string }
+        linked_at: { type: string, format: date-time }
+
+    AddressLinkOutcome:
+      type: object
+      required: [link, party]
+      properties:
+        link: { $ref: "#/components/schemas/AddressLink" }
+        party: { $ref: "#/components/schemas/Party" }
+        ended: { $ref: "#/components/schemas/AddressLink" }
+
+    PartyAddress:
+      type: object
+      required: [link, version]
+      properties:
+        link: { $ref: "#/components/schemas/AddressLink" }
+        version: { nullable: true, allOf: [{ $ref: "#/components/schemas/AddressVersion" }] }
+
+    EstablishmentType:
+      type: string
+      enum: [BRANCH, PERMANENT_ESTABLISHMENT, PLACE_OF_BUSINESS, REPRESENTATIVE_OFFICE, OPERATING_SITE, EMPLOYMENT_SITE]
+      description: "BRANCH and PERMANENT_ESTABLISHMENT are material: activated by a principal other than the proposer."
+
+    EstablishmentStatus:
+      type: string
+      enum: [PROPOSED, ACTIVE, INACTIVE, CLOSED]
+
+    CreateEstablishmentRequest:
+      type: object
+      required: [legal_entity_id, establishment_type, name, address_id, source_class, evidence_ref]
+      properties:
+        create_request_id: { type: string, maxLength: 128 }
+        legal_entity_id: { type: string, format: uuid }
+        establishment_type: { $ref: "#/components/schemas/EstablishmentType" }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        address_id: { type: string, format: uuid }
+        valid_from: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ChangeEstablishmentStatusRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        effective_date: { type: string, format: date, description: "Defaults to today. Not before the establishment began or its last change." }
+        reason: { type: string, description: "Required to deactivate or close." }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    Establishment:
+      type: object
+      required: [establishment_id, tenant_id, legal_entity_id, establishment_type, name, address_id, status, material, valid_from, source_class, evidence_ref, record_version, created_by, created_at]
+      properties:
+        establishment_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        establishment_type: { $ref: "#/components/schemas/EstablishmentType" }
+        name: { type: string }
+        address_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/EstablishmentStatus" }
+        material: { type: boolean }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        activated_by: { type: string }
+
+    EstablishmentTransition:
+      type: object
+      required: [seq, to_status, effective_date, command, evidence_ref, actor, version_after, occurred_at]
+      properties:
+        seq: { type: integer }
+        from_status: { $ref: "#/components/schemas/EstablishmentStatus" }
+        to_status: { $ref: "#/components/schemas/EstablishmentStatus" }
+        effective_date: { type: string, format: date }
+        command: { type: string }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        actor: { type: string }
+        version_before: { type: integer }
+        version_after: { type: integer }
+        occurred_at: { type: string, format: date-time }
+
+    ContactStatus:
+      type: string
+      enum: [PROPOSED, VERIFIED, RETIRED]
+
+    CreateContactPointRequest:
+      type: object
+      required: [channel, value, source_class]
+      properties:
+        channel: { type: string, enum: [EMAIL] }
+        value: { type: string, maxLength: 254, description: "One email address, no display name. Stored with the domain lower-cased." }
+        purpose: { type: string, enum: [GENERAL, BILLING, LEGAL_NOTICE], default: GENERAL }
+        source_class: { type: string, enum: [AUTHORITY_REGISTRY, AUTHORITY_DOCUMENT, TENANT_ASSERTED, SYSTEM_IMPORT, EXTERNAL_PROVIDER] }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date-time, description: "Defaults to now." }
+        correlation_id: { type: string }
+
+    VerifyContactPointRequest:
+      type: object
+      required: [evidence_ref]
+      properties:
+        expected_version: { type: integer, format: int64 }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    RetireContactPointRequest:
+      type: object
+      required: [reason]
+      properties:
+        expected_version: { type: integer, format: int64 }
+        reason: { type: string }
+        correlation_id: { type: string }
+
+    ContactPointRecord:
+      type: object
+      description: A contact point as a command returns it. The address is never included; value_digest is its sha256.
+      required: [contact_point_id, tenant_id, party_id, channel, value_digest, purpose, status, source_class, valid_from, record_version]
+      properties:
+        contact_point_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        channel: { type: string, enum: [EMAIL] }
+        value_digest: { type: string }
+        purpose: { type: string, enum: [GENERAL, BILLING, LEGAL_NOTICE] }
+        status: { $ref: "#/components/schemas/ContactStatus" }
+        source_class: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, nullable: true }
+        evidence_ref: { type: string }
+        created_by: { type: string }
+        verified_by: { type: string }
+        verified_at: { type: string, format: date-time, nullable: true }
+        retired_by: { type: string }
+        retired_at: { type: string, format: date-time, nullable: true }
+        record_version: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+
+    ContactPointOutcome:
+      type: object
+      required: [contact_point]
+      properties:
+        contact_point: { $ref: "#/components/schemas/ContactPointRecord" }
+
+    ContactPointItem:
+      type: object
+      required: [contact_point_id, party_id, channel, value, purpose, status, valid_from, valid_to, source_class, verified_at, evidence_ref, record_version]
+      properties:
+        contact_point_id: { type: string, format: uuid }
+        party_id: { type: string, format: uuid }
+        channel: { type: string, enum: [EMAIL] }
+        value: { type: string }
+        purpose: { type: string, enum: [GENERAL, BILLING, LEGAL_NOTICE] }
+        status: { $ref: "#/components/schemas/ContactStatus" }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, nullable: true }
+        source_class: { type: string }
+        verified_at: { type: string, format: date-time, nullable: true }
+        evidence_ref: { type: string }
+        record_version: { type: integer, format: int64 }
+
+    EstablishmentOutcome:
+      type: object
+      required: [establishment, transition]
+      properties:
+        establishment: { $ref: "#/components/schemas/Establishment" }
+        transition: { $ref: "#/components/schemas/EstablishmentTransition" }
+
+    EstablishmentView:
+      type: object
+      required: [establishment, address]
+      properties:
+        establishment: { $ref: "#/components/schemas/Establishment" }
+        address: { nullable: true, allOf: [{ $ref: "#/components/schemas/AddressVersion" }] }
+        history: { type: array, items: { $ref: "#/components/schemas/EstablishmentTransition" } }
+
+    RegistrationType:
+      type: string
+      enum: [COMPANY_REGISTRATION, TAX_REFERENCE, EMPLOYER_PAYROLL, PERMIT, LICENSE, REGULATED, OTHER_GOVERNED]
+      description: |
+        PERMIT, LICENSE and REGULATED are material: verified and renewed by independent principals. TAX_REFERENCE and
+        EMPLOYER_PAYROLL numbers are sensitive and masked unless revealed. TAX_REFERENCE is evidence only; TAX-01 owns tax semantics.
+
+    RegistrationStatus:
+      type: string
+      enum: [DRAFT, ACTIVE, SUSPENDED, EXPIRED, REVOKED, SUPERSEDED]
+
+    CreateRegistrationRequest:
+      type: object
+      required: [registration_type, issuing_authority, jurisdiction, number, effective_from, source_class, evidence_ref]
+      description: Name exactly one holder, holder_legal_entity_id or holder_party_id.
+      properties:
+        create_request_id: { type: string, maxLength: 128 }
+        registration_type: { $ref: "#/components/schemas/RegistrationType" }
+        issuing_authority: { type: string, minLength: 1, maxLength: 200 }
+        jurisdiction: { type: string, minLength: 1, maxLength: 16 }
+        number: { type: string, minLength: 1, maxLength: 100 }
+        holder_legal_entity_id: { type: string, format: uuid }
+        holder_party_id: { type: string, format: uuid }
+        issue_date: { type: string, format: date }
+        effective_from: { type: string, format: date }
+        expiry_date: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string, pattern: '^[0-9a-f]{64}$', description: "SHA-256 of the source document." }
+        supersedes_id: { type: string, format: uuid }
+        correlation_id: { type: string }
+
+    VerifyRegistrationRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        reason: { type: string }
+        correlation_id: { type: string }
+
+    RenewRegistrationRequest:
+      type: object
+      required: [expected_version, new_expiry_date, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        new_expiry_date: { type: string, format: date }
+        issue_date: { type: string, format: date }
+        effective_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        correlation_id: { type: string }
+
+    RegistrationEndRequest:
+      type: object
+      required: [expected_version, reason, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        effective_date: { type: string, format: date, description: "Defaults to today." }
+        correlation_id: { type: string }
+
+    Registration:
+      type: object
+      required: [registration_id, tenant_id, registration_type, issuing_authority, jurisdiction, number, status, material, effective_from, source_class, evidence_ref, record_version, created_by, created_at, in_force]
+      properties:
+        registration_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        registration_type: { $ref: "#/components/schemas/RegistrationType" }
+        issuing_authority: { type: string }
+        jurisdiction: { type: string }
+        number: { type: string, description: "As recorded; masked to its last four characters for a sensitive type unless revealed." }
+        number_masked: { type: boolean }
+        holder_legal_entity_id: { type: string, format: uuid }
+        holder_party_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/RegistrationStatus" }
+        material: { type: boolean }
+        issue_date: { type: string, format: date }
+        effective_from: { type: string, format: date }
+        expiry_date: { type: string, format: date }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string }
+        supersedes_id: { type: string, format: uuid }
+        superseded_by_id: { type: string, format: uuid }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        verified_by: { type: string }
+        verified_at: { type: string, format: date-time }
+        in_force: { type: boolean, description: "What a consumer may rely on: ACTIVE, begun and not past its expiry date. A DRAFT never is." }
+        lapsed: { type: boolean, description: "The dates say it has expired but the sweep has not yet recorded it." }
+
+    RegistrationTransition:
+      type: object
+      required: [seq, command, to_status, effective_date, evidence_ref, actor, version_after, occurred_at]
+      properties:
+        seq: { type: integer }
+        command: { type: string }
+        from_status: { $ref: "#/components/schemas/RegistrationStatus" }
+        to_status: { $ref: "#/components/schemas/RegistrationStatus" }
+        effective_date: { type: string, format: date }
+        expiry_after: { type: string, format: date }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string }
+        actor: { type: string }
+        version_before: { type: integer }
+        version_after: { type: integer }
+        occurred_at: { type: string, format: date-time }
+
+    RegistrationOutcome:
+      type: object
+      required: [registration, transition]
+      properties:
+        registration: { $ref: "#/components/schemas/Registration" }
+        transition: { $ref: "#/components/schemas/RegistrationTransition" }
+        superseded: { $ref: "#/components/schemas/Registration" }
+
+    VerifyIdentifierRequest:
+      type: object
+      required: [expected_master_version, result, source_class, source_ref, observed_at, evidence_ref]
+      properties:
+        expected_master_version: { type: integer, minimum: 1 }
+        result: { type: string, enum: [MATCH, MISMATCH, NOT_FOUND] }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        source_ref: { type: string, description: "The authority or provider that answered." }
+        source_version: { type: string, description: "The data version of the answer." }
+        exchange_ref: { type: string, description: "The exchange-layer (XIC) reference that carried it." }
+        observed_at: { type: string, format: date-time, description: "When the source said it. Not in the future." }
+        authority_status: { type: string, description: "For an LEI, the registration status the LOU reports (ISSUED, LAPSED, RETIRED, ...). Only ISSUED verifies." }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        correlation_id: { type: string }
+
+    IdentifierObservation:
+      type: object
+      required: [observation_id, identifier_id, result, source_class, source_ref, observed_at, evidence_ref, effect, effect_note, status_before, status_after, recorded_by, recorded_at]
+      properties:
+        observation_id: { type: string, format: uuid }
+        identifier_id: { type: string, format: uuid }
+        result: { type: string, enum: [MATCH, MISMATCH, NOT_FOUND] }
+        source_class: { $ref: "#/components/schemas/PartySourceClass" }
+        source_ref: { type: string }
+        source_version: { type: string }
+        exchange_ref: { type: string }
+        observed_at: { type: string, format: date-time }
+        authority_status: { type: string }
+        evidence_ref: { type: string }
+        evidence_hash: { type: string }
+        effect: { type: string, enum: [VERIFIED, SOURCE_UPGRADED, FAILED, CONFLICT_OPENED, NO_CHANGE] }
+        effect_note: { type: string, description: "Why the observation did or did not change the identifier." }
+        case_id: { type: string, format: uuid }
+        status_before: { type: string }
+        status_after: { type: string }
+        recorded_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+
+    IdentifierVerifyOutcome:
+      type: object
+      required: [identifier, observation, party, lei_alignment]
+      properties:
+        identifier: { $ref: "#/components/schemas/PartyIdentifier" }
+        observation: { $ref: "#/components/schemas/IdentifierObservation" }
+        party: { $ref: "#/components/schemas/Party" }
+        case: { $ref: "#/components/schemas/ResolutionCase" }
+        lei_alignment: { type: string, enum: [ALIGNED, PROFILE_ABSENT, DIFFERS, NOT_LINKED, NOT_APPLICABLE] }
+
+    FXRateType:
+      type: string
+      enum: [SPOT, AVERAGE, CLOSING, TAX, CONTRACTUAL, OTHER_GOVERNED]
+      description: Mandatory. Types are never conflated.
+
+    FXDecimal:
+      type: string
+      pattern: '^(0|[1-9][0-9]{0,19})(\.[0-9]{1,18})?$'
+      description: An exact decimal as a string. Never a JSON number, so no float ever touches a rate.
+
+    FXSourceClass:
+      type: string
+      enum: [PROVIDER, CENTRAL_BANK, INTERNAL_TREASURY, MANUAL_EXCEPTION]
+
+    CreateFXSourceRequest:
+      type: object
+      required: [source_code, name, source_class]
+      properties:
+        source_code: { type: string, minLength: 1, maxLength: 40 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        source_class: { $ref: "#/components/schemas/FXSourceClass" }
+        timezone: { type: string, description: "IANA zone of the source, so a market date and its cutoff read the same to everyone. Default UTC." }
+        correlation_id: { type: string }
+
+    WithdrawFXSourceRequest:
+      type: object
+      required: [expected_version, reason]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string }
+        correlation_id: { type: string }
+
+    FXSource:
+      type: object
+      required: [source_id, tenant_id, source_code, name, source_class, timezone, status, record_version, created_by, created_at]
+      properties:
+        source_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        source_code: { type: string }
+        name: { type: string }
+        source_class: { $ref: "#/components/schemas/FXSourceClass" }
+        timezone: { type: string }
+        status: { type: string, enum: [ACTIVE, WITHDRAWN] }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        withdrawn_by: { type: string }
+        withdrawn_at: { type: string, format: date-time }
+
+    IngestFXObservationRequest:
+      type: object
+      required: [source_id, base_currency, quote_currency, rate_type, rate, market_date, observed_at, payload_ref]
+      properties:
+        source_id: { type: string, format: uuid }
+        base_currency: { type: string, pattern: '^[A-Z]{3}$' }
+        quote_currency: { type: string, pattern: '^[A-Z]{3}$', description: "Units of quote currency per one unit of base currency." }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        rate: { $ref: "#/components/schemas/FXDecimal" }
+        market_date: { type: string, format: date }
+        observed_at: { type: string, format: date-time }
+        provider_observation_id: { type: string }
+        payload_ref: { type: string, description: "Reference to the raw provider payload. Required." }
+        payload_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        reason: { type: string, description: "Required, with evidence_ref, for a MANUAL_EXCEPTION source." }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    SupersedeFXObservationRequest:
+      allOf:
+        - $ref: "#/components/schemas/IngestFXObservationRequest"
+        - type: object
+          required: [reason]
+          properties:
+            reason: { type: string }
+
+    FXCheck:
+      type: object
+      required: [check, result]
+      properties:
+        check: { type: string, description: "source_approved, duplicate, outlier or manual_exception." }
+        result: { type: string, enum: [PASS, FLAGGED] }
+        detail: { type: string }
+
+    FXObservation:
+      type: object
+      required: [observation_id, tenant_id, source_id, base_currency, quote_currency, rate_type, rate, market_date, observed_at, payload_ref, status, manual, outlier, needs_independent_approval, checks, ingested_by, ingested_at]
+      properties:
+        observation_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        source_id: { type: string, format: uuid }
+        base_currency: { type: string }
+        quote_currency: { type: string }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        rate: { $ref: "#/components/schemas/FXDecimal" }
+        market_date: { type: string, format: date }
+        observed_at: { type: string, format: date-time }
+        provider_observation_id: { type: string }
+        payload_ref: { type: string }
+        payload_hash: { type: string }
+        status: { type: string, enum: [OBSERVED, VALIDATED, APPROVED, SUPERSEDED] }
+        manual: { type: boolean }
+        outlier: { type: boolean }
+        needs_independent_approval: { type: boolean }
+        checks: { type: array, items: { $ref: "#/components/schemas/FXCheck" } }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        ingested_by: { type: string }
+        ingested_at: { type: string, format: date-time }
+        superseded_by_id: { type: string, format: uuid }
+        superseded_at: { type: string, format: date-time }
+
+    FXIngestOutcome:
+      type: object
+      required: [observation]
+      properties:
+        observation: { $ref: "#/components/schemas/FXObservation" }
+        superseded: { $ref: "#/components/schemas/FXObservation" }
+
+    ApproveFXRateSetRequest:
+      type: object
+      required: [rate_type, market_date, observation_ids, evidence_ref]
+      properties:
+        set_name: { type: string, maxLength: 40, description: "Default DEFAULT." }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        market_date: { type: string, format: date }
+        observation_ids: { type: array, minItems: 1, maxItems: 500, items: { type: string, format: uuid } }
+        override_reason: { type: string, description: "Required when the set includes a manual or outlying observation." }
+        evidence_ref: { type: string }
+        supersedes_set_id: { type: string, format: uuid }
+        correlation_id: { type: string }
+
+    CloseFXRateSetRequest:
+      type: object
+      required: [evidence_ref]
+      properties:
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    FXRateSet:
+      type: object
+      required: [set_id, tenant_id, set_name, rate_type, market_date, set_version, status, evidence_ref, approved_by, approved_at]
+      properties:
+        set_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        set_name: { type: string }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        market_date: { type: string, format: date }
+        set_version: { type: integer }
+        status: { type: string, enum: [APPROVED, CLOSED, SUPERSEDED] }
+        supersedes_set_id: { type: string, format: uuid }
+        superseded_by_set_id: { type: string, format: uuid }
+        override_reason: { type: string }
+        evidence_ref: { type: string }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+        closed_by: { type: string }
+        closed_at: { type: string, format: date-time }
+        superseded_at: { type: string, format: date-time }
+        members: { type: array, items: { $ref: "#/components/schemas/FXObservation" } }
+
+    FXComponent:
+      type: object
+      required: [observation_id, base_currency, quote_currency, rate, direction, source_id, set_id, set_version, market_date]
+      properties:
+        observation_id: { type: string, format: uuid }
+        base_currency: { type: string }
+        quote_currency: { type: string }
+        rate: { $ref: "#/components/schemas/FXDecimal" }
+        direction: { type: string, enum: [DIRECT, INVERTED], description: "INVERTED when the reciprocal of the observed rate is used." }
+        source_id: { type: string, format: uuid }
+        set_id: { type: string, format: uuid }
+        set_version: { type: integer }
+        market_date: { type: string, format: date }
+
+    FXRate:
+      type: object
+      required: [base_currency, quote_currency, rate_type, market_date, rate, method, formula, components]
+      properties:
+        base_currency: { type: string }
+        quote_currency: { type: string }
+        rate_type: { $ref: "#/components/schemas/FXRateType" }
+        market_date: { type: string, format: date }
+        rate: { $ref: "#/components/schemas/FXDecimal" }
+        method: { type: string, enum: [DIRECT, INVERSE, CROSS] }
+        formula: { type: string }
+        rounding: { type: string, description: "How a derived rate is rounded. Absent for a direct rate." }
+        exact: { type: string, description: "The unrounded fraction of a derived rate, numerator/denominator." }
+        components: { type: array, items: { $ref: "#/components/schemas/FXComponent" } }
+
+    BookType:
+      type: string
+      enum: [STATUTORY, MANAGEMENT, TAX, CONSOLIDATION, REGULATORY]
+      description: Books of different types stay separate even where their charts overlap. STATUTORY, TAX and REGULATORY are material.
+
+    BookStatus:
+      type: string
+      enum: [DRAFT, ACTIVE, POSTING_SUSPENDED, RETIRED]
+
+    BookFramework:
+      type: string
+      enum: [IFRS, IFRS_SME, US_GAAP, LOCAL_GAAP, TAX_BASIS, MANAGEMENT_BASIS, REGULATORY_BASIS]
+      description: |
+        STATUTORY: IFRS, IFRS_SME, US_GAAP, LOCAL_GAAP. MANAGEMENT: MANAGEMENT_BASIS, IFRS, US_GAAP, LOCAL_GAAP.
+        TAX: TAX_BASIS. CONSOLIDATION: IFRS, IFRS_SME, US_GAAP, LOCAL_GAAP. REGULATORY: REGULATORY_BASIS, LOCAL_GAAP.
+
+    BookBasisFields:
+      type: object
+      required: [framework, functional_currency, presentation_currency, evidence_ref]
+      properties:
+        framework: { $ref: "#/components/schemas/BookFramework" }
+        framework_detail: { type: string, description: "Names the standard behind LOCAL_GAAP or REGULATORY_BASIS, e.g. UK GAAP FRS 102. Required for those." }
+        functional_currency: { type: string, pattern: '^[A-Z]{3}$' }
+        presentation_currency: { type: string, pattern: '^[A-Z]{3}$' }
+        chart_ref: { type: string, description: "A reference to the chart of accounts; the chart itself is not held here." }
+        policy_ref: { type: string, description: "A reference to the accounting policy (REF-07); not held here." }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+
+    CreateAccountingBookRequest:
+      allOf:
+        - $ref: "#/components/schemas/BookBasisFields"
+        - type: object
+          required: [book_code, name, book_type, purpose]
+          description: Name exactly one owner, legal_entity_id or group_code.
+          properties:
+            legal_entity_id: { type: string, format: uuid }
+            group_code: { type: string, maxLength: 40 }
+            book_code: { type: string, pattern: '^[A-Z0-9][A-Z0-9_.-]{0,39}$' }
+            name: { type: string, maxLength: 200 }
+            book_type: { $ref: "#/components/schemas/BookType" }
+            purpose: { type: string, maxLength: 500 }
+            correlation_id: { type: string }
+
+    AmendBookBasisRequest:
+      allOf:
+        - $ref: "#/components/schemas/BookBasisFields"
+        - type: object
+          required: [expected_version, reason]
+          properties:
+            expected_version: { type: integer, minimum: 1 }
+            reason: { type: string }
+            correlation_id: { type: string }
+
+    BookStatusRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string, description: "Required to suspend posting or retire." }
+        evidence_ref: { type: string }
+        effective_date: { type: string, format: date, description: "Defaults to today. Not before the last change." }
+        correlation_id: { type: string }
+
+    AccountingBook:
+      type: object
+      required: [book_id, tenant_id, book_code, name, book_type, purpose, status, material, current_basis, record_version, created_by, created_at]
+      properties:
+        book_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        group_code: { type: string }
+        book_code: { type: string }
+        name: { type: string }
+        book_type: { $ref: "#/components/schemas/BookType" }
+        purpose: { type: string }
+        status: { $ref: "#/components/schemas/BookStatus" }
+        material: { type: boolean }
+        current_basis: { type: integer }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        activated_by: { type: string }
+
+    BookBasisVersion:
+      type: object
+      required: [version_no, framework, functional_currency, presentation_currency, valid_from, evidence_ref, recorded_by, recorded_at]
+      properties:
+        version_no: { type: integer }
+        framework: { $ref: "#/components/schemas/BookFramework" }
+        framework_detail: { type: string }
+        functional_currency: { type: string }
+        presentation_currency: { type: string }
+        chart_ref: { type: string }
+        policy_ref: { type: string }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        recorded_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+
+    BookTransition:
+      type: object
+      required: [seq, to_status, effective_date, command, evidence_ref, actor, version_after, occurred_at]
+      properties:
+        seq: { type: integer }
+        from_status: { $ref: "#/components/schemas/BookStatus" }
+        to_status: { $ref: "#/components/schemas/BookStatus" }
+        effective_date: { type: string, format: date }
+        command: { type: string }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        actor: { type: string }
+        version_before: { type: integer }
+        version_after: { type: integer }
+        occurred_at: { type: string, format: date-time }
+
+    BookOutcome:
+      type: object
+      required: [book, basis]
+      properties:
+        book: { $ref: "#/components/schemas/AccountingBook" }
+        basis: { $ref: "#/components/schemas/BookBasisVersion" }
+        transition: { $ref: "#/components/schemas/BookTransition" }
+
+    PostingEligibility:
+      type: object
+      required: [book_id, as_of, eligible]
+      properties:
+        book_id: { type: string, format: uuid }
+        as_of: { type: string, format: date }
+        eligible: { type: boolean }
+        reason: { type: string, enum: [NOT_ACTIVE, POSTING_SUSPENDED, RETIRED, NOT_YET_EFFECTIVE, NO_BASIS_IN_FORCE] }
+
+    BookView:
+      type: object
+      required: [book, as_of, status_as_of, basis, posting_eligibility]
+      properties:
+        book: { $ref: "#/components/schemas/AccountingBook" }
+        as_of: { type: string, format: date }
+        status_as_of: { type: string, description: "The book's status on as_of; empty before it began." }
+        basis: { nullable: true, allOf: [{ $ref: "#/components/schemas/BookBasisVersion" }] }
+        posting_eligibility: { $ref: "#/components/schemas/PostingEligibility" }
+        history: { type: array, items: { $ref: "#/components/schemas/BookTransition" } }
+
+    BookBasisExplanation:
+      type: object
+      required: [book, as_of, basis_in_force, versions, allowed_frameworks, parallel_books, notes]
+      properties:
+        book: { $ref: "#/components/schemas/AccountingBook" }
+        as_of: { type: string, format: date }
+        basis_in_force: { nullable: true, allOf: [{ $ref: "#/components/schemas/BookBasisVersion" }] }
+        versions: { type: array, items: { $ref: "#/components/schemas/BookBasisVersion" } }
+        allowed_frameworks: { type: array, items: { $ref: "#/components/schemas/BookFramework" } }
+        entity_default_currency: { type: string }
+        functional_matches_entity: { type: boolean, description: "Stated, not enforced: a parallel book may differ from its entity's currency." }
+        parallel_books:
+          type: array
+          items:
+            type: object
+            required: [book_id, book_code, book_type, status]
+            properties:
+              book_id: { type: string, format: uuid }
+              book_code: { type: string }
+              book_type: { $ref: "#/components/schemas/BookType" }
+              status: { $ref: "#/components/schemas/BookStatus" }
+              framework: { $ref: "#/components/schemas/BookFramework" }
+        notes: { type: array, items: { type: string } }
+
+    CreateDimensionTypeRequest:
+      type: object
+      required: [type_code, name, hierarchical, controlled]
+      properties:
+        type_code: { type: string, pattern: '^[A-Z][A-Z0-9_]{1,39}$' }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        hierarchical: { type: boolean }
+        controlled: { type: boolean, description: "A hierarchy feeding reporting or control aggregation: a change is independently reviewed. Needs hierarchical." }
+        source_domain: { type: string, maxLength: 40 }
+        correlation_id: { type: string }
+
+    DimensionType:
+      type: object
+      required: [type_id, tenant_id, type_code, name, hierarchical, controlled, created_by, created_at]
+      properties:
+        type_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        type_code: { type: string }
+        name: { type: string }
+        description: { type: string }
+        hierarchical: { type: boolean }
+        controlled: { type: boolean }
+        source_domain: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    CreateDimensionValueRequest:
+      type: object
+      required: [type_code, code, label, evidence_ref]
+      properties:
+        type_code: { type: string }
+        legal_entity_id: { type: string, format: uuid, description: "Omit for a tenant-wide value." }
+        code: { type: string, pattern: '^[A-Z0-9][A-Z0-9_.-]{0,39}$' }
+        label: { type: string, maxLength: 200 }
+        parent_value_id: { type: string, format: uuid }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ReparentDimensionValueRequest:
+      type: object
+      required: [expected_version, reason, evidence_ref]
+      description: Name parent_value_id, or set root true, not both and not neither.
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        parent_value_id: { type: string, format: uuid }
+        root: { type: boolean }
+        new_label: { type: string, maxLength: 200 }
+        valid_from: { type: string, format: date }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ApproveDimensionHierarchyRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    DimensionStatusRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string, description: "Required to deactivate." }
+        evidence_ref: { type: string }
+        effective_date: { type: string, format: date, description: "Defaults to today. Not before the last change." }
+        exception_until: { type: string, format: date, description: "Deactivation only. A controlled exception, within 90 days of the deactivation." }
+        correlation_id: { type: string }
+
+    MapSourceObjectRequest:
+      type: object
+      required: [source_domain, source_object_id, evidence_ref]
+      properties:
+        source_domain: { type: string, maxLength: 40 }
+        source_object_id: { type: string, maxLength: 200 }
+        valid_from: { type: string, format: date }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    DimensionValue:
+      type: object
+      required: [value_id, tenant_id, type_id, type_code, code, status, current_version, record_version, created_by, created_at]
+      properties:
+        value_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        type_id: { type: string, format: uuid }
+        type_code: { type: string }
+        legal_entity_id: { type: string, format: uuid }
+        code: { type: string, description: "Stable for the life of the value." }
+        status: { type: string, enum: [DRAFT, ACTIVE, INACTIVE] }
+        current_version: { type: integer }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    DimensionHierarchyVersion:
+      type: object
+      required: [version_no, label, status, valid_from, evidence_ref, proposed_by, proposed_at]
+      properties:
+        version_no: { type: integer }
+        parent_value_id: { type: string, format: uuid }
+        parent_code: { type: string }
+        label: { type: string }
+        status: { type: string, enum: [PENDING, APPROVED] }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        proposed_by: { type: string }
+        proposed_at: { type: string, format: date-time }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+
+    DimensionTransition:
+      type: object
+      required: [seq, to_status, effective_date, command, evidence_ref, actor, version_after, occurred_at]
+      properties:
+        seq: { type: integer }
+        from_status: { type: string }
+        to_status: { type: string }
+        effective_date: { type: string, format: date }
+        command: { type: string }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        exception_until: { type: string, format: date }
+        actor: { type: string }
+        version_before: { type: integer }
+        version_after: { type: integer }
+        occurred_at: { type: string, format: date-time }
+
+    DimensionOutcome:
+      type: object
+      required: [value]
+      properties:
+        value: { $ref: "#/components/schemas/DimensionValue" }
+        hierarchy: { $ref: "#/components/schemas/DimensionHierarchyVersion" }
+        transition: { $ref: "#/components/schemas/DimensionTransition" }
+
+    UnitFields:
+      type: object
+      required: [unit_code, name, symbol]
+      properties:
+        unit_code: { type: string, pattern: "^[A-Z][A-Z0-9_]{0,19}$" }
+        name: { type: string, maxLength: 200 }
+        symbol: { type: string, maxLength: 20 }
+        decimals: { type: integer, minimum: 0, maximum: 18, description: "Quantities in this unit are rounded to this many decimals. Default 6." }
+        source_standard: { type: string, maxLength: 200 }
+
+    CreateQuantityDimensionRequest:
+      type: object
+      required: [dimension_code, name, base_unit]
+      properties:
+        dimension_code: { type: string, pattern: "^[A-Z][A-Z0-9_]{1,29}$" }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        base_unit: { $ref: "#/components/schemas/UnitFields" }
+        correlation_id: { type: string }
+
+    QuantityDimension:
+      type: object
+      required: [dimension_id, tenant_id, dimension_code, name, created_by, created_at]
+      properties:
+        dimension_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        dimension_code: { type: string }
+        name: { type: string }
+        description: { type: string }
+        base_unit_code: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    DimensionWithBase:
+      type: object
+      required: [dimension, base_unit]
+      properties:
+        dimension: { $ref: "#/components/schemas/QuantityDimension" }
+        base_unit: { $ref: "#/components/schemas/Unit" }
+
+    CreateUnitRequest:
+      type: object
+      required: [dimension_code, unit_code, name, symbol]
+      properties:
+        dimension_code: { type: string }
+        unit_code: { type: string, pattern: "^[A-Z][A-Z0-9_]{0,19}$" }
+        name: { type: string, maxLength: 200 }
+        symbol: { type: string, maxLength: 20 }
+        decimals: { type: integer, minimum: 0, maximum: 18 }
+        source_standard: { type: string, maxLength: 200 }
+        correlation_id: { type: string }
+
+    Unit:
+      type: object
+      required: [unit_id, tenant_id, dimension_code, unit_code, name, symbol, is_base, status, decimals, record_version, created_by, created_at]
+      properties:
+        unit_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        dimension_code: { type: string }
+        unit_code: { type: string }
+        name: { type: string }
+        symbol: { type: string }
+        is_base: { type: boolean }
+        status: { type: string, enum: [DRAFT, ACTIVE, RETIRED] }
+        decimals: { type: integer }
+        source_standard: { type: string }
+        record_version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        retired_on: { type: string, format: date }
+        retire_reason: { type: string }
+        retired_by: { type: string }
+
+    ProposeConversionRequest:
+      type: object
+      required: [expected_version, factor, source_class, source_ref, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        factor: { type: string, description: "How many base units one of this unit is: a positive decimal such as 1.609344, or a fraction such as 1609344/1000000. Held exactly." }
+        source_class: { type: string, enum: [STANDARD, ORGANISATION, MANUAL_OVERRIDE] }
+        source_ref: { type: string, maxLength: 300 }
+        valid_from: { type: string, format: date }
+        reason: { type: string, description: "Required for MANUAL_OVERRIDE." }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ApproveConversionRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    RetireUnitRequest:
+      type: object
+      required: [expected_version, reason, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ConversionVersion:
+      type: object
+      required: [version_no, factor, factor_decimal, source_class, source_ref, status, valid_from, evidence_ref, proposed_by, proposed_at]
+      properties:
+        version_no: { type: integer }
+        factor: { type: string, description: "The exact reduced fraction, numerator/denominator (a whole number when the denominator is 1)." }
+        factor_decimal: { type: string, description: "The factor to 18 decimals, for reading; use factor for arithmetic." }
+        source_class: { type: string, enum: [STANDARD, ORGANISATION, MANUAL_OVERRIDE] }
+        source_ref: { type: string }
+        status: { type: string, enum: [PENDING, ACTIVE, SUPERSEDED] }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        supersedes_version: { type: integer }
+        reason: { type: string }
+        evidence_ref: { type: string }
+        proposed_by: { type: string }
+        proposed_at: { type: string, format: date-time }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+
+    UnitOutcome:
+      type: object
+      required: [unit]
+      properties:
+        unit: { $ref: "#/components/schemas/Unit" }
+        conversion: { $ref: "#/components/schemas/ConversionVersion" }
+        previous_conversion: { $ref: "#/components/schemas/ConversionVersion" }
+
+    UnitView:
+      type: object
+      required: [unit, as_of, usable]
+      properties:
+        unit: { $ref: "#/components/schemas/Unit" }
+        as_of: { type: string, format: date }
+        conversion: { oneOf: [{ $ref: "#/components/schemas/ConversionVersion" }, { type: "null" }] }
+        usable: { type: boolean, description: "Whether a conversion involving the unit is possible on the date." }
+        reason: { type: string }
+        pending_conversion: { $ref: "#/components/schemas/ConversionVersion" }
+        conversion_versions: { type: array, items: { $ref: "#/components/schemas/ConversionVersion" } }
+
+    ConversionPin:
+      type: object
+      required: [unit_code, is_base, factor, factor_decimal]
+      properties:
+        unit_code: { type: string }
+        is_base: { type: boolean }
+        version_no: { type: integer, description: "Absent for a base unit, whose factor is 1 by definition." }
+        factor: { type: string }
+        factor_decimal: { type: string }
+        source_class: { type: string }
+        source_ref: { type: string }
+        valid_from: { type: string, format: date }
+
+    ConversionResult:
+      type: object
+      required: [dimension, as_of, input_quantity, from_unit, to_unit, value, exact_fraction, decimals, rounding, from, to]
+      properties:
+        dimension: { type: string }
+        as_of: { type: string, format: date }
+        input_quantity: { type: string }
+        from_unit: { type: string }
+        to_unit: { type: string }
+        value: { type: string, description: "Rounded to the target unit's decimals." }
+        exact_fraction: { type: string, description: "The unrounded result, a reduced numerator/denominator." }
+        decimals: { type: integer }
+        rounding: { type: string }
+        from: { $ref: "#/components/schemas/ConversionPin" }
+        to: { $ref: "#/components/schemas/ConversionPin" }
+
+    CreateReferenceSetRequest:
+      type: object
+      required: [set_code, name, source_authority]
+      properties:
+        set_code: { type: string, pattern: "^[A-Z][A-Z0-9_]{1,39}$", description: "For example ISO_3166_COUNTRY." }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        source_authority: { type: string, maxLength: 300 }
+        allow_custom: { type: boolean }
+        correlation_id: { type: string }
+
+    ReferenceSet:
+      type: object
+      required: [set_id, tenant_id, set_code, name, source_authority, allow_custom, created_by, created_at]
+      properties:
+        set_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        set_code: { type: string }
+        name: { type: string }
+        description: { type: string }
+        source_authority: { type: string }
+        allow_custom: { type: boolean }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        current_release: { type: string, description: "The release in force today, when one is." }
+
+    ReferenceEntryInput:
+      type: object
+      required: [code, change_type]
+      properties:
+        code: { type: string }
+        change_type: { type: string, enum: [ADD, MODIFY_METADATA, SUPERSEDE, RETIRE, CORRECT] }
+        label: { type: string, maxLength: 300, description: "Required except for RETIRE and SUPERSEDE." }
+        origin: { type: string, enum: [OFFICIAL, CUSTOM], description: "OFFICIAL when absent; a code's origin never changes." }
+        metadata: { type: object, additionalProperties: true }
+        replaced_by_code: { type: string, description: "For SUPERSEDE, and only then." }
+        reason: { type: string, description: "Required for SUPERSEDE, RETIRE and CORRECT." }
+
+    StageReferenceReleaseRequest:
+      type: object
+      required: [release_version, source_published_at, effective_from, compatibility, evidence_ref, entries]
+      properties:
+        release_version: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$" }
+        source_published_at: { type: string, format: date-time, description: "When the source published it, apart from the date from which it governs." }
+        effective_from: { type: string, format: date }
+        source_authority: { type: string, description: "Defaults to the set's authority." }
+        compatibility: { type: string, enum: [AUTO_ADOPT, REQUIRES_MIGRATION, PRESERVE_OLD] }
+        checksum: { type: string, pattern: "^[0-9a-f]{64}$" }
+        evidence_ref: { type: string }
+        entries: { type: array, minItems: 1, maxItems: 5000, items: { $ref: "#/components/schemas/ReferenceEntryInput" } }
+        correlation_id: { type: string }
+
+    PublishReferenceReleaseRequest:
+      type: object
+      required: [evidence_ref]
+      properties:
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    ReferenceRelease:
+      type: object
+      required: [release_id, set_code, release_version, status, source_published_at, effective_from, source_authority, compatibility, evidence_ref, staged_by, staged_at, entry_count]
+      properties:
+        release_id: { type: string, format: uuid }
+        set_code: { type: string }
+        release_version: { type: string }
+        status: { type: string, enum: [STAGED, PUBLISHED] }
+        source_published_at: { type: string, format: date-time }
+        effective_from: { type: string, format: date }
+        source_authority: { type: string }
+        compatibility: { type: string, enum: [AUTO_ADOPT, REQUIRES_MIGRATION, PRESERVE_OLD] }
+        checksum: { type: string }
+        evidence_ref: { type: string }
+        staged_by: { type: string }
+        staged_at: { type: string, format: date-time }
+        released_by: { type: string }
+        released_at: { type: string, format: date-time }
+        release_evidence: { type: string }
+        publish_seq: { type: integer }
+        entry_count: { type: integer }
+        changes: { type: object, additionalProperties: { type: integer } }
+
+    ReferenceReleaseRef:
+      type: object
+      required: [release_version, effective_from, source_published_at, source_authority, compatibility, evidence_ref, publish_seq]
+      properties:
+        release_version: { type: string }
+        effective_from: { type: string, format: date }
+        source_published_at: { type: string, format: date-time }
+        source_authority: { type: string }
+        compatibility: { type: string }
+        checksum: { type: string }
+        evidence_ref: { type: string }
+        publish_seq: { type: integer }
+
+    ReferenceHistoryItem:
+      type: object
+      required: [release, change_type, origin]
+      properties:
+        release: { $ref: "#/components/schemas/ReferenceReleaseRef" }
+        change_type: { type: string }
+        label: { type: string }
+        origin: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        replaced_by_code: { type: string }
+        reason: { type: string }
+
+    ReferenceResolution:
+      type: object
+      required: [set_code, code, as_of, status, label, origin, metadata, release, valid_from, change_type]
+      properties:
+        set_code: { type: string }
+        code: { type: string }
+        as_of: { type: string, format: date }
+        status: { type: string, enum: [ACTIVE, RETIRED, SUPERSEDED] }
+        label: { type: string }
+        origin: { type: string, enum: [OFFICIAL, CUSTOM] }
+        metadata: { type: object, additionalProperties: true }
+        release: { $ref: "#/components/schemas/ReferenceReleaseRef" }
+        valid_from: { type: string, format: date, description: "The effective date of the release that added the code." }
+        valid_to: { type: string, format: date, description: "The effective date of the release that retired or superseded it." }
+        change_type: { type: string, description: "What the governing release did to the code." }
+        superseded_by: { type: string }
+        supersedes: { type: array, items: { type: string } }
+        pinned_release: { type: string }
+        history: { type: array, items: { $ref: "#/components/schemas/ReferenceHistoryItem" } }
+
+    CreateMasterImportRequest:
+      type: object
+      required: [kind, source_name, source_version, evidence_ref, valid_from, rows]
+      properties:
+        kind: { type: string, enum: [PARTY] }
+        source_name: { type: string, maxLength: 200 }
+        source_version: { type: string, maxLength: 100 }
+        manifest_sha256: { type: string, pattern: "^[0-9a-f]{64}$", description: "SHA-256 of the compacted rows; refused if it does not match what was received." }
+        source_class: { type: string, description: "SYSTEM_IMPORT when absent." }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date, description: "When the facts in the file began to hold, unless a row says otherwise." }
+        rows:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          items: { $ref: "#/components/schemas/ImportPartyRow" }
+        correlation_id: { type: string }
+
+    ImportPartyRow:
+      type: object
+      required: [row_ref, party_kind, names]
+      description: "Any other field makes the row invalid; nothing is silently dropped."
+      properties:
+        row_ref: { type: string, description: "The sender's own key for the record, unique within the file." }
+        party_kind: { type: string, enum: [LEGAL_ENTITY, ORGANIZATION_NON_LEGAL, NATURAL_PERSON, PUBLIC_AUTHORITY] }
+        names: { type: array, items: { type: object, additionalProperties: true } }
+        country: { type: string }
+        identifiers: { type: array, items: { type: object, additionalProperties: true } }
+        legal_entity_id: { type: string, format: uuid }
+        valid_from: { type: string, format: date }
+
+    ApproveMasterImportRequest:
+      type: object
+      required: [expected_version, evidence_ref]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        evidence_ref: { type: string }
+        correlation_id: { type: string }
+
+    Reconciliation:
+      type: object
+      required: [source_rows, staged_rows, invalid, imported, conflicts, failed, unresolved, matched]
+      description: "Every row received is accounted for exactly once: imported, a conflict, failed or invalid, with none unresolved."
+      properties:
+        source_rows: { type: integer }
+        staged_rows: { type: integer }
+        invalid: { type: integer }
+        imported: { type: integer }
+        conflicts: { type: integer }
+        failed: { type: integer }
+        unresolved: { type: integer }
+        matched: { type: boolean }
+
+    MasterImport:
+      type: object
+      required: [import_id, tenant_id, kind, status, source_name, source_version, content_sha256, source_class, evidence_ref, valid_from, row_count, valid_rows, invalid_rows, imported_rows, conflict_rows, failed_rows, uploaded_by, uploaded_at, record_version]
+      properties:
+        import_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        kind: { type: string }
+        status: { type: string, enum: [UPLOADED, VALIDATING, PREVIEW_READY, BLOCKED, APPROVED, IMPORTING, COMPLETED, FAILED, CANCELLED] }
+        source_name: { type: string }
+        source_version: { type: string }
+        content_sha256: { type: string }
+        source_class: { type: string }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date }
+        row_count: { type: integer }
+        valid_rows: { type: integer }
+        invalid_rows: { type: integer }
+        imported_rows: { type: integer }
+        conflict_rows: { type: integer }
+        failed_rows: { type: integer }
+        uploaded_by: { type: string }
+        uploaded_at: { type: string, format: date-time }
+        validated_at: { type: string, format: date-time }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+        approval_evidence: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        validate_operation_id: { type: string }
+        import_operation_id: { type: string }
+        reconciliation: { $ref: "#/components/schemas/Reconciliation" }
+        record_version: { type: integer }
+
+    RowIssue:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, enum: [MALFORMED_ROW, ROW_REF_INVALID, DUPLICATE_ROW_REF, DUPLICATE_IDENTIFIER, ROW_INVALID, CREATE_FAILED] }
+        message: { type: string }
+
+    ImportRow:
+      type: object
+      required: [row_no, row_ref, status, updated_at]
+      properties:
+        row_no: { type: integer }
+        row_ref: { type: string }
+        status: { type: string, enum: [PENDING, VALID, INVALID, IMPORTED, CONFLICT, FAILED] }
+        errors: { type: array, items: { $ref: "#/components/schemas/RowIssue" } }
+        outcome: { type: string, description: "What party creation answered: CREATED, MATCHED_EXISTING or REVIEW_REQUIRED." }
+        party_id: { type: string, format: uuid }
+        case_id: { type: string, format: uuid }
+        updated_at: { type: string, format: date-time }
+
+    Operation:
+      type: object
+      required: [id, type, state, cancelable, created_at, updated_at]
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [master_import.validate, master_import.import] }
+        state: { type: string, enum: [queued, running, waiting_external, succeeded, failed, cancel_requested, cancelled] }
+        progress:
+          type: object
+          properties:
+            completed_units: { type: integer }
+            total_units: { type: integer }
+        resource_ref: { type: string, description: "The resource the operation produced or worked on, for example /v1/master-imports/{id}." }
+        problem: { type: object, additionalProperties: true }
+        cancelable: { type: boolean, description: "False once past the point of no return." }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+
+    DimensionEligibility:
+      type: object
+      required: [value_id, as_of, eligible]
+      properties:
+        value_id: { type: string, format: uuid }
+        as_of: { type: string, format: date }
+        eligible: { type: boolean }
+        exception: { type: boolean, description: "Inactive, but a controlled exception still covers the date." }
+        reason: { type: string, enum: [NOT_ACTIVE, INACTIVE, NOT_YET_EFFECTIVE] }
+
+    DimensionPathNode:
+      type: object
+      required: [value_id, code, label]
+      properties:
+        value_id: { type: string, format: uuid }
+        code: { type: string }
+        label: { type: string }
+
+    DimensionValueView:
+      type: object
+      required: [value, as_of, status_as_of, hierarchy, posting_eligibility, path]
+      properties:
+        value: { $ref: "#/components/schemas/DimensionValue" }
+        as_of: { type: string, format: date }
+        hierarchy: { nullable: true, allOf: [{ $ref: "#/components/schemas/DimensionHierarchyVersion" }] }
+        status_as_of: { type: string, description: "Empty before the value began." }
+        posting_eligibility: { $ref: "#/components/schemas/DimensionEligibility" }
+        path: { type: array, items: { $ref: "#/components/schemas/DimensionPathNode" }, description: "From the root to the parent, as the hierarchy stood on the date." }
+        pending_change: { $ref: "#/components/schemas/DimensionHierarchyVersion" }
+        hierarchy_history: { type: array, items: { $ref: "#/components/schemas/DimensionHierarchyVersion" } }
+        status_history: { type: array, items: { $ref: "#/components/schemas/DimensionTransition" } }
+
+    HierarchyNode:
+      type: object
+      required: [value_id, code, label, status, depth]
+      properties:
+        value_id: { type: string, format: uuid }
+        code: { type: string }
+        label: { type: string }
+        legal_entity_id: { type: string, format: uuid }
+        parent_value_id: { type: string, format: uuid }
+        status: { type: string }
+        depth: { type: integer }
+
+    HierarchyAsOf:
+      type: object
+      required: [type_code, as_of, nodes]
+      properties:
+        type_code: { type: string }
+        as_of: { type: string, format: date }
+        nodes: { type: array, items: { $ref: "#/components/schemas/HierarchyNode" } }
+
+    EligibleDimensionValue:
+      type: object
+      required: [value_id, code, label]
+      properties:
+        value_id: { type: string, format: uuid }
+        code: { type: string }
+        label: { type: string }
+        legal_entity_id: { type: string, format: uuid }
+        exception: { type: boolean }
+
+    DimensionSourceMapping:
+      type: object
+      required: [mapping_id, value_id, source_domain, source_object_id, version_no, valid_from, evidence_ref, recorded_by, recorded_at]
+      properties:
+        mapping_id: { type: string, format: uuid }
+        type_code: { type: string }
+        value_id: { type: string, format: uuid }
+        source_domain: { type: string }
+        source_object_id: { type: string }
+        version_no: { type: integer }
+        valid_from: { type: string, format: date }
+        valid_to: { type: string, format: date }
+        evidence_ref: { type: string }
+        recorded_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+
+    DimensionMappingOutcome:
+      type: object
+      required: [mapping]
+      properties:
+        mapping: { $ref: "#/components/schemas/DimensionSourceMapping" }
+        previous: { $ref: "#/components/schemas/DimensionSourceMapping" }
+
+    DimensionResolution:
+      type: object
+      required: [via, value]
+      properties:
+        via: { type: string, enum: [CODE, SOURCE_MAPPING] }
+        value: { $ref: "#/components/schemas/DimensionValueView" }
+        mapping: { $ref: "#/components/schemas/DimensionSourceMapping" }
 
     IdentifierScheme:
       type: string
@@ -2570,7 +6228,7 @@ components:
       properties:
         case_id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
-        case_type: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT] }
+        case_type: { type: string, enum: [DUPLICATE_REVIEW, IDENTIFIER_CONFLICT, FACT_CONFLICT, VERIFICATION_CONFLICT] }
         status: { type: string, enum: [OPEN, RESOLVED, DISMISSED] }
         subject_party_id: { type: string, format: uuid }
         candidates: { type: array, items: { $ref: "#/components/schemas/PartyMatchCandidate" } }
@@ -2622,7 +6280,7 @@ components:
         scope: { type: string }
         value: { type: string }
         masked: { type: boolean }
-        verification_status: { type: string, enum: [UNVERIFIED, VERIFIED, FAILED] }
+        verification_status: { type: string, enum: [UNVERIFIED, VERIFIED, FAILED, CONFLICTED] }
         evidence_ref: { type: string }
         linked_at: { type: string, format: date-time }
 

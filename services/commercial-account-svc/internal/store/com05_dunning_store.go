@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // DunningStore is the COM-05 persistence contract, part 5d.
@@ -93,8 +92,7 @@ func (s *PgStore) PublishDunningPolicy(ctx context.Context, p *domain.DunningPol
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dunning_policy", AggregateID: fmt.Sprint(got.PolicyVersion),
-			EventType: "dunning_policy.published", Payload: got})
+		return s.emit(ctx, tx, "dunning_policy.published", "dunning_policy", fmt.Sprint(got.PolicyVersion), PlatformScopeID, claim.PrincipalID, got)
 	})
 	return out, err
 }
@@ -166,8 +164,7 @@ func (s *PgStore) StartDunning(ctx context.Context, caseID, invoiceID, actor str
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dunning_case", AggregateID: caseID,
-			EventType: "dunning.started", TenantID: &inv.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "dunning.started", "dunning_case", caseID, inv.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -207,7 +204,7 @@ func (s *PgStore) AdvanceDunning(ctx context.Context, caseID, actor string, now 
 		// it just as a genuine regression would.
 		restrictionID := c.AppliedRestrictionID
 		if restrictionID == nil && (next == domain.DunningRestricted || next == domain.DunningSuspended) {
-			restriction, err := applyRestrictionTx(ctx, tx, &domain.CommercialRestriction{
+			restriction, err := s.applyRestrictionTx(ctx, tx, &domain.CommercialRestriction{
 				RestrictionID: domain.NewCommercialID(domain.PrefixRestriction), OrganizationID: c.OrganizationID,
 				Level: domain.RestrictionRestricted, ReasonCode: "DUNNING_ESCALATION",
 				PolicyRef: caseID, BasisRef: c.InvoiceID, AppliedAt: now, AppliedByPrincipalID: actor,
@@ -221,7 +218,7 @@ func (s *PgStore) AdvanceDunning(ctx context.Context, caseID, actor string, now 
 			WHERE case_id = $1`, caseID, next, now, restrictionID); err != nil {
 			return err
 		}
-		if _, err := recomputeEntitlementsTx(ctx, tx, c.OrganizationID, actor, now); err != nil {
+		if _, err := s.recomputeEntitlementsTx(ctx, tx, c.OrganizationID, actor, now); err != nil {
 			return err
 		}
 		got, err := loadDunningCase(ctx, tx, caseID, false)
@@ -229,8 +226,7 @@ func (s *PgStore) AdvanceDunning(ctx context.Context, caseID, actor string, now 
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dunning_case", AggregateID: caseID,
-			EventType: "dunning.advanced", TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "dunning.advanced", "dunning_case", caseID, got.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -257,11 +253,11 @@ func (s *PgStore) StopDunning(ctx context.Context, caseID, actor, reason string,
 		// closing it — a resolved dunning case must not leave a tenant
 		// permanently restricted.
 		if c.AppliedRestrictionID != nil {
-			if _, err := removeRestrictionTx(ctx, tx, *c.AppliedRestrictionID, actor, "dunning case "+caseID+" closed: "+reason, now); err != nil {
+			if _, err := s.removeRestrictionTx(ctx, tx, *c.AppliedRestrictionID, actor, "dunning case "+caseID+" closed: "+reason, now); err != nil {
 				return err
 			}
 		}
-		if _, err := recomputeEntitlementsTx(ctx, tx, c.OrganizationID, actor, now); err != nil {
+		if _, err := s.recomputeEntitlementsTx(ctx, tx, c.OrganizationID, actor, now); err != nil {
 			return err
 		}
 		got, err := loadDunningCase(ctx, tx, caseID, false)
@@ -269,8 +265,7 @@ func (s *PgStore) StopDunning(ctx context.Context, caseID, actor, reason string,
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dunning_case", AggregateID: caseID,
-			EventType: "dunning.ended", TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "dunning.ended", "dunning_case", caseID, got.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -446,8 +441,7 @@ func (s *PgStore) ReconcileCommercialAccount(ctx context.Context, organizationID
 		}
 		out = &domain.CommercialReconciliation{ReconciliationID: id, OrganizationID: organizationID, Status: status,
 			InvoiceCount: len(invoices), ExceptionCount: len(exceptions), Exceptions: exceptions, RunAt: now, RunByPrincipalID: actor}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "commercial_reconciliation", AggregateID: id,
-			EventType: "commercial_account.reconciled", TenantID: &organizationID, Payload: out})
+		return s.emit(ctx, tx, "commercial_account.reconciled", "commercial_reconciliation", id, organizationID, actor, out)
 	})
 	return out, err
 }

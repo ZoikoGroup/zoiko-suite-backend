@@ -349,6 +349,12 @@ func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 	metrics.ObserveTurn(string(env.Status), internalReason, time.Since(now))
+	// Doc 05 §25: outcomes by release and market feed the abstain-rate and
+	// per-market panels; a visitor's Stop is counted on its own (Doc 05 §12).
+	metrics.TurnOutcome(string(env.Status), env.KnowledgeReleaseID, firstNonEmpty(env.MarketCode, firstNonEmpty(req.MarketCode, sess.MarketCode)))
+	if errors.Is(ctx.Err(), context.Canceled) {
+		metrics.TurnCancelled()
+	}
 	for _, a := range env.Actions {
 		metrics.CTAOffered(a.RouteKey) // offers and clicks are separate measures (Doc 09 §20)
 	}

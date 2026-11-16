@@ -21,8 +21,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -135,6 +137,19 @@ func mapPgError(err error) error {
 		// invalid_text_representation — not a UUID at all.
 		return domain.ErrInvalidIdentifier
 	}
+	// A violated sod_* constraint (migration 000031) is a maker-checker
+	// refusal, not an outage: ApproveAccountChange checks first, so reaching
+	// the database means a race, and either way the answer is
+	// ErrAccountChangeSelfApproval. Same reasoning as financial-close-svc's
+	// own sod_* constraints.
+	if pgErr.Code == "23514" && strings.HasPrefix(pgErr.ConstraintName, "sod_") {
+		return domain.ErrAccountChangeSelfApproval
+	}
+	// idx_account_change_approvals_pending: at most one outstanding material
+	// change per account (migration 000031).
+	if pgErr.Code == "23505" && pgErr.ConstraintName == "idx_account_change_approvals_pending" {
+		return domain.ErrAccountChangeAlreadyPending
+	}
 	return err
 }
 
@@ -241,6 +256,52 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 // retry must answer with the journal that exists, and the caller's own
 // unstored description/status would otherwise be echoed back attached to a
 // stranger's journal_id.
+// unregisteredAccountCodes answers which of this journal's distinct line
+// account codes name no row in this tenant's chart of accounts — ACC-01's
+// bootstrap gap (SPEC_DEVIATIONS A9) made observable without refusing
+// anything. Returns nil (not an error) when every code is registered, so a
+// caller can cheaply skip enriching the event in the common case.
+func unregisteredAccountCodes(ctx context.Context, tx pgx.Tx, tenantID string, lines []domain.JournalLine) ([]string, error) {
+	seen := map[string]bool{}
+	var codes []string
+	for _, l := range lines {
+		if l.AccountCode == "" || seen[l.AccountCode] {
+			continue
+		}
+		seen[l.AccountCode] = true
+		codes = append(codes, l.AccountCode)
+	}
+	if len(codes) == 0 {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT account_code FROM chart_of_accounts
+		WHERE tenant_id = $1 AND account_code = ANY($2)
+	`, tenantID, codes)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+	registered := make(map[string]bool, len(codes))
+	for rows.Next() {
+		var code string
+		if err := rows.Scan(&code); err != nil {
+			return nil, err
+		}
+		registered[code] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPgError(err)
+	}
+	var unregistered []string
+	for _, c := range codes {
+		if !registered[c] {
+			unregistered = append(unregistered, c)
+		}
+	}
+	return unregistered, nil
+}
+
 func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.JournalHeader, lines []domain.JournalLine) (resultLines []domain.JournalLine, created bool, err error) {
 	now := time.Now().UTC()
 	if h.CreatedAt.IsZero() {
@@ -420,6 +481,23 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 		// alone. Emit it alongside the created fact.
 		if h.CloseJournalDesignation != nil && *h.CloseJournalDesignation != "" {
 			createdData["close_journal_designation"] = *h.CloseJournalDesignation
+		}
+		// SPEC_DEVIATIONS A9 (general-ledger-svc): an account code this
+		// journal posted to but the chart has never heard of is still
+		// deliberately let through (the bootstrap gap — see
+		// checkAccountRestrictions' own comment) rather than refused. This
+		// does not change that; it makes the fact observable, so real usage
+		// can be measured before any enforcement is considered. Enriches the
+		// existing "created" event rather than inventing a second one, the
+		// same pattern soft_close_override_reason/close_journal_designation
+		// already use.
+		if unregistered, err := unregisteredAccountCodes(ctx, tx, tenantID, lines); err != nil {
+			return err
+		} else if len(unregistered) > 0 {
+			createdData["unregistered_account_codes"] = unregistered
+			s.log.Warn("journal posted to unregistered account code(s)",
+				zap.String("journal_id", h.JournalID), zap.String("tenant_id", h.TenantID),
+				zap.Strings("account_codes", unregistered))
 		}
 		if err := s.enqueueJournalEvent(ctx, tx, "created", h.TenantID, h.LegalEntityID,
 			h.JournalID, h.CreatedByPrincipalID, h.CorrelationID, createdData); err != nil {
@@ -1215,7 +1293,8 @@ func scanAccount(row pgx.Row) (*domain.Account, error) {
 const accountVersionColumns = `account_version_id, tenant_id, account_id, account_code,
 	version, account_name, account_type, parent_account_id, is_control_account,
 	direct_posting_restricted, status, effective_from, effective_to, change_kind,
-	COALESCE(change_reason, ''), evidence_refs, created_at, created_by_principal_id`
+	COALESCE(change_reason, ''), evidence_refs, created_at, created_by_principal_id,
+	COALESCE(source_policy_ref, '')`
 
 func scanAccountVersion(row pgx.Row) (*domain.AccountVersion, error) {
 	var v domain.AccountVersion
@@ -1225,6 +1304,7 @@ func scanAccountVersion(row pgx.Row) (*domain.AccountVersion, error) {
 		&v.Version, &v.AccountName, &accountType, &v.ParentAccountID, &v.IsControlAccount,
 		&v.DirectPostingRestricted, &v.Status, &v.EffectiveFrom, &v.EffectiveTo, &v.ChangeKind,
 		&v.ChangeReason, &v.EvidenceRefs, &v.CreatedAt, &v.CreatedByPrincipalID,
+		&v.SourcePolicyRef,
 	); err != nil {
 		return nil, err
 	}
@@ -1241,12 +1321,14 @@ func insertAccountVersion(ctx context.Context, tx pgx.Tx, v *domain.AccountVersi
 			account_version_id, tenant_id, account_id, account_code, version,
 			account_name, account_type, parent_account_id, is_control_account,
 			direct_posting_restricted, status, effective_from, effective_to,
-			change_kind, change_reason, evidence_refs, created_at, created_by_principal_id
+			change_kind, change_reason, evidence_refs, created_at, created_by_principal_id,
+			source_policy_ref
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 	`, v.AccountVersionID, v.TenantID, v.AccountID, v.AccountCode, v.Version,
 		v.AccountName, string(v.AccountType), v.ParentAccountID, v.IsControlAccount,
 		v.DirectPostingRestricted, v.Status, v.EffectiveFrom, v.EffectiveTo,
-		v.ChangeKind, nullableString(v.ChangeReason), v.EvidenceRefs, v.CreatedAt, v.CreatedByPrincipalID)
+		v.ChangeKind, nullableString(v.ChangeReason), v.EvidenceRefs, v.CreatedAt, v.CreatedByPrincipalID,
+		nullableString(v.SourcePolicyRef))
 	return mapPgError(err)
 }
 
@@ -1265,7 +1347,7 @@ func nullableString(s string) *string {
 	return &s
 }
 
-func accountVersionFromAccount(a *domain.Account, version int64, effectiveFrom time.Time, changeKind, reason, principalID string, evidence []string) *domain.AccountVersion {
+func accountVersionFromAccount(a *domain.Account, version int64, effectiveFrom time.Time, changeKind, reason, principalID string, evidence []string, sourcePolicyRef string) *domain.AccountVersion {
 	return &domain.AccountVersion{
 		AccountVersionID:        uuid.NewString(),
 		AccountID:               a.AccountID,
@@ -1282,6 +1364,7 @@ func accountVersionFromAccount(a *domain.Account, version int64, effectiveFrom t
 		ChangeKind:              changeKind,
 		ChangeReason:            reason,
 		EvidenceRefs:            evidence,
+		SourcePolicyRef:         sourcePolicyRef,
 		CreatedAt:               time.Now().UTC(),
 		CreatedByPrincipalID:    principalID,
 	}
@@ -1320,8 +1403,13 @@ func (s *PgStore) CreateAccount(ctx context.Context, a *domain.Account) error {
 		if err != nil {
 			return mapPgError(err)
 		}
-		return insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			a, 1, a.CreatedAt, "CREATED", "initial version", a.CreatedByPrincipalID, nil))
+		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
+			a, 1, a.CreatedAt, "CREATED", "initial version", a.CreatedByPrincipalID, nil, "")); err != nil {
+			return err
+		}
+		return s.enqueueAccountEvent(ctx, tx, "created", tenantID, a.AccountID, a.CreatedByPrincipalID, map[string]any{
+			"account_code": a.AccountCode, "account_name": a.AccountName, "account_type": string(a.AccountType),
+		})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -1368,8 +1456,9 @@ func currentAccountVersionEffectiveFrom(ctx context.Context, tx pgx.Tx, tenantID
 
 // Command names recorded in command_idempotency.command.
 const (
-	commandAmendAccount    = "AMEND_ACCOUNT_VERSION"
-	commandReparentAccount = "REPARENT_ACCOUNT"
+	commandAmendAccount         = "AMEND_ACCOUNT_VERSION"
+	commandReparentAccount      = "REPARENT_ACCOUNT"
+	commandApproveAccountChange = "APPROVE_ACCOUNT_CHANGE"
 
 	// ACC-02 commands reuse this same table and the same lookup/record
 	// helpers. command_idempotency.account_code is a generic claimed-identity
@@ -1429,6 +1518,232 @@ func readAccountForReplay(ctx context.Context, tx pgx.Tx, tenantID, accountCode 
 	return a, mapPgError(err)
 }
 
+// ── ACC-01 maker-checker (SPEC_DEVIATIONS A4/B16) ──────────────────────────
+//
+// isControlAccountChange answers whether a reparent/amendment touches a
+// control account on either side — the only case ACC-01's SoD line requires
+// a second, different principal's approval for. cur is the account as it
+// stands now; newParentIsControl/proposedIsControl are the one or two facts
+// specific to the command being gated.
+
+const accountChangeApprovalColumns = `
+	change_id, tenant_id, account_id, account_code, change_kind, expected_version,
+	new_parent_account_id, amendment, effective_from, reason, evidence_refs, status,
+	proposed_at, proposed_by_principal_id, approved_at, approved_by_principal_id,
+	COALESCE(source_policy_ref, '')`
+
+func scanAccountChangeApproval(row pgx.Row) (*domain.AccountChangeApproval, error) {
+	var c domain.AccountChangeApproval
+	var amendmentJSON []byte
+	if err := row.Scan(
+		&c.ChangeID, &c.TenantID, &c.AccountID, &c.AccountCode, &c.ChangeKind, &c.ExpectedVersion,
+		&c.NewParentAccountID, &amendmentJSON, &c.EffectiveFrom, &c.Reason, &c.EvidenceRefs, &c.Status,
+		&c.ProposedAt, &c.ProposedByPrincipalID, &c.ApprovedAt, &c.ApprovedByPrincipalID,
+		&c.SourcePolicyRef,
+	); err != nil {
+		return nil, err
+	}
+	if len(amendmentJSON) > 0 {
+		var a domain.Account
+		if err := json.Unmarshal(amendmentJSON, &a); err != nil {
+			return nil, fmt.Errorf("unmarshal account_change_approvals.amendment: %w", err)
+		}
+		c.Amendment = &a
+	}
+	return &c, nil
+}
+
+// insertAccountChangeApproval records a pending material change. It is the
+// only write ReparentAccount/AmendAccountVersion make when the gate trips —
+// chart_of_accounts and account_versions are left untouched until
+// ApproveAccountChange applies the change for real.
+func insertAccountChangeApproval(ctx context.Context, tx pgx.Tx, c *domain.AccountChangeApproval) error {
+	var amendmentJSON []byte
+	if c.Amendment != nil {
+		var err error
+		amendmentJSON, err = json.Marshal(c.Amendment)
+		if err != nil {
+			return fmt.Errorf("marshal account_change_approvals.amendment: %w", err)
+		}
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO account_change_approvals (
+			change_id, tenant_id, account_id, account_code, change_kind, expected_version,
+			new_parent_account_id, amendment, effective_from, reason, evidence_refs, status,
+			proposed_at, proposed_by_principal_id, source_policy_ref
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'PENDING',$12,$13,$14)
+	`, c.ChangeID, c.TenantID, c.AccountID, c.AccountCode, c.ChangeKind, c.ExpectedVersion,
+		c.NewParentAccountID, amendmentJSON, c.EffectiveFrom, nullableString(c.Reason), c.EvidenceRefs,
+		c.ProposedAt, c.ProposedByPrincipalID, nullableString(c.SourcePolicyRef))
+	return mapPgError(err)
+}
+
+// GetAccountChangeApproval is the minimal read a caller needs to display or
+// act on a pending change — ACC-01's spec names no query for this, the same
+// necessary-plumbing addition ACC-02's GetMappingByID already made for its
+// own governed lifecycle.
+func (s *PgStore) GetAccountChangeApproval(ctx context.Context, tenantID, changeID string) (*domain.AccountChangeApproval, error) {
+	var out *domain.AccountChangeApproval
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		c, err := scanAccountChangeApproval(tx.QueryRow(ctx, `
+			SELECT `+accountChangeApprovalColumns+` FROM account_change_approvals
+			WHERE tenant_id = $1 AND change_id = $2
+		`, tenantID, changeID))
+		if err != nil {
+			return mapPgError(err)
+		}
+		out = c
+		return nil
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAccountChangeNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ApproveAccountChange applies a pending reparent or amendment: it is the
+// second half of ReparentAccount/AmendAccountVersion's apply logic, run
+// under a fresh row lock once a different principal has signed off. The
+// pending row is re-validated against the account's CURRENT state (not just
+// the state captured at proposal time), because the account may have moved
+// on in between: a stale expected_version is refused exactly as a direct
+// ReparentAccount/AmendAccountVersion call would refuse it.
+func (s *PgStore) ApproveAccountChange(ctx context.Context, tenantID, changeID, principalID, idempotencyKey string) (*domain.Account, bool, error) {
+	var out *domain.Account
+	replay := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claimed, claimedOK, err := lookupCommandIdempotency(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claimedOK {
+			if claimed.Command != commandApproveAccountChange || claimed.AccountCode != changeID {
+				return fmt.Errorf("%w: key was claimed by %s on %s",
+					domain.ErrIdempotencyKeyConflict, claimed.Command, claimed.AccountCode)
+			}
+			replay = true
+			change, err := scanAccountChangeApproval(tx.QueryRow(ctx, `
+				SELECT `+accountChangeApprovalColumns+` FROM account_change_approvals
+				WHERE tenant_id = $1 AND change_id = $2
+			`, tenantID, changeID))
+			if err != nil {
+				return mapPgError(err)
+			}
+			replayed, err := readAccountForReplay(ctx, tx, tenantID, change.AccountCode)
+			if err != nil {
+				return err
+			}
+			out = replayed
+			return nil
+		}
+
+		change, err := scanAccountChangeApproval(tx.QueryRow(ctx, `
+			SELECT `+accountChangeApprovalColumns+` FROM account_change_approvals
+			WHERE tenant_id = $1 AND change_id = $2 FOR UPDATE
+		`, tenantID, changeID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrAccountChangeNotFound
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if change.Status != domain.AccountChangeStatusPending {
+			return domain.ErrAccountChangeNotPending
+		}
+		if change.ProposedByPrincipalID == principalID {
+			return domain.ErrAccountChangeSelfApproval
+		}
+
+		cur, err := accountForUpdate(ctx, tx, tenantID, change.AccountCode)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrAccountNotFound
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if cur.Version != change.ExpectedVersion {
+			return domain.ErrAccountVersionConflict
+		}
+
+		updated := *cur
+		changeKind := change.ChangeKind
+		switch changeKind {
+		case domain.AccountChangeKindReparented:
+			updated.ParentAccountID = change.NewParentAccountID
+		case domain.AccountChangeKindAmended:
+			if change.Amendment == nil {
+				return fmt.Errorf("account change %s is AMENDED with no amendment payload", changeID)
+			}
+			updated.AccountName = change.Amendment.AccountName
+			updated.AccountType = change.Amendment.AccountType
+			updated.ParentAccountID = change.Amendment.ParentAccountID
+			updated.IsControlAccount = change.Amendment.IsControlAccount
+			updated.DirectPostingRestricted = change.Amendment.DirectPostingRestricted
+			updated.Status = change.Amendment.Status
+		default:
+			return fmt.Errorf("account change %s has unknown change_kind %q", changeID, changeKind)
+		}
+		updated.Version = cur.Version + 1
+
+		if err := closeCurrentAccountVersion(ctx, tx, tenantID, cur.AccountID, change.EffectiveFrom); err != nil {
+			return err
+		}
+		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
+			&updated, updated.Version, change.EffectiveFrom, changeKind, change.Reason, change.ProposedByPrincipalID, change.EvidenceRefs, change.SourcePolicyRef)); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE chart_of_accounts
+			SET account_name = $1, account_type = $2, parent_account_id = $3,
+			    is_control_account = $4, direct_posting_restricted = $5, status = $6, version = $7
+			WHERE tenant_id = $8 AND account_code = $9 AND version = $10
+		`, updated.AccountName, string(updated.AccountType), updated.ParentAccountID,
+			updated.IsControlAccount, updated.DirectPostingRestricted, updated.Status,
+			updated.Version, tenantID, change.AccountCode, cur.Version)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrAccountVersionConflict
+		}
+
+		now := time.Now().UTC()
+		tag, err = tx.Exec(ctx, `
+			UPDATE account_change_approvals
+			SET status = 'APPROVED', approved_at = $1, approved_by_principal_id = $2
+			WHERE tenant_id = $3 AND change_id = $4 AND status = 'PENDING'
+		`, now, principalID, tenantID, changeID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrAccountChangeNotPending
+		}
+		if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandApproveAccountChange, changeID); err != nil {
+			return err
+		}
+
+		fact := "hierarchy-changed"
+		if changeKind == domain.AccountChangeKindAmended {
+			fact = "amended"
+		}
+		if err := s.enqueueAccountEvent(ctx, tx, fact, tenantID, cur.AccountID, change.ProposedByPrincipalID, map[string]any{
+			"account_code": change.AccountCode, "reason": change.Reason, "approved_by_principal_id": principalID,
+		}); err != nil {
+			return err
+		}
+		out = &updated
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, replay, nil
+}
+
 // AmendAccountVersion appends a new immutable version and advances the head
 // row in the same transaction. The head row is a projection for existing
 // readers; history lives only in account_versions. expectedVersion, when
@@ -1440,6 +1755,14 @@ func readAccountForReplay(ctx context.Context, tx pgx.Tx, tenantID, accountCode 
 // nothing; a key recorded for a different command or account is a conflict;
 // an unrecorded key runs the amendment and is recorded in the same
 // transaction. The second return value is true when the call replayed.
+//
+// When the account is a control account now or would become one (either
+// side of the change), this does not apply the amendment: it records a
+// pending domain.AccountChangeApproval instead (the returned account is
+// unchanged) and a different principal must call ApproveAccountChange —
+// ACC-01's SoD line, "Creator cannot approve material control-account or
+// hierarchy change" (SPEC_DEVIATIONS A4/B16). An ordinary account's
+// amendment is completely unaffected by this gate.
 func (s *PgStore) AmendAccountVersion(
 	ctx context.Context,
 	tenantID, accountCode, idempotencyKey string,
@@ -1448,9 +1771,11 @@ func (s *PgStore) AmendAccountVersion(
 	a *domain.Account,
 	reason string,
 	evidenceRefs []string,
+	sourcePolicyRef string,
 	principalID string,
-) (*domain.Account, bool, error) {
+) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
 	var out *domain.Account
+	var pending *domain.AccountChangeApproval
 	replay := false
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		claimed, claimedOK, err := lookupCommandIdempotency(ctx, tx, tenantID, idempotencyKey)
@@ -1505,13 +1830,44 @@ func (s *PgStore) AmendAccountVersion(
 		updated.IsControlAccount = a.IsControlAccount
 		updated.DirectPostingRestricted = a.DirectPostingRestricted
 		updated.Status = a.Status
-		updated.Version = cur.Version + 1
 
+		if cur.IsControlAccount || updated.IsControlAccount {
+			if strings.TrimSpace(reason) == "" {
+				return domain.ErrAccountChangeReasonRequired
+			}
+			change := &domain.AccountChangeApproval{
+				ChangeID:              uuid.NewString(),
+				TenantID:              tenantID,
+				AccountID:             cur.AccountID,
+				AccountCode:           accountCode,
+				ChangeKind:            domain.AccountChangeKindAmended,
+				ExpectedVersion:       cur.Version,
+				Amendment:             &updated,
+				EffectiveFrom:         effective,
+				Reason:                reason,
+				EvidenceRefs:          evidenceRefs,
+				SourcePolicyRef:       sourcePolicyRef,
+				Status:                domain.AccountChangeStatusPending,
+				ProposedAt:            time.Now().UTC(),
+				ProposedByPrincipalID: principalID,
+			}
+			if err := insertAccountChangeApproval(ctx, tx, change); err != nil {
+				return err
+			}
+			if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandAmendAccount, accountCode); err != nil {
+				return err
+			}
+			out = cur
+			pending = change
+			return nil
+		}
+
+		updated.Version = cur.Version + 1
 		if err := closeCurrentAccountVersion(ctx, tx, tenantID, cur.AccountID, effective); err != nil {
 			return err
 		}
 		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			&updated, updated.Version, effective, "AMENDED", reason, principalID, evidenceRefs)); err != nil {
+			&updated, updated.Version, effective, "AMENDED", reason, principalID, evidenceRefs, sourcePolicyRef)); err != nil {
 			return err
 		}
 
@@ -1537,9 +1893,9 @@ func (s *PgStore) AmendAccountVersion(
 		return nil
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	return out, replay, nil
+	return out, pending, replay, nil
 }
 
 // GetAccountAsOf reconstructs the account version in force at asOf. The
@@ -2318,6 +2674,35 @@ func (s *PgStore) SupersedeMapping(ctx context.Context, tenantID, mappingID, pri
 	return out, replay, nil
 }
 
+// enqueueAccountEvent writes one ACC-01 account lifecycle event to the
+// transactional outbox (SPEC_DEVIATIONS A5: "AccountCreated; AccountActivated;
+// AccountDeactivated; AccountHierarchyChanged" were specified but never
+// emitted). Accounts are tenant-scoped, not legal-entity-scoped (A1), so
+// legalEntityID is always "", the same posture enqueueMappingEvent already
+// takes for ACC-02.
+func (s *PgStore) enqueueAccountEvent(ctx context.Context, tx pgx.Tx, fact, tenantID, accountID, actorID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.account." + fact,
+		Service:         "general-ledger-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		AggregateType:   "account",
+		AggregateID:     accountID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build account.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue account.%s event: %w", fact, err)
+	}
+	return nil
+}
+
 // enqueueMappingEvent writes one ACC-02 mapping lifecycle event to the
 // transactional outbox, mirroring enqueueJournalEvent's shape. Mappings are
 // tenant-scoped, not legal-entity-scoped, so legalEntityID is always "".
@@ -2398,7 +2783,7 @@ func (s *PgStore) changeAccountStatus(
 			return err
 		}
 		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			&updated, updated.Version, effective, changeKind, reason, principalID, evidenceRefs)); err != nil {
+			&updated, updated.Version, effective, changeKind, reason, principalID, evidenceRefs, "")); err != nil {
 			return err
 		}
 		tag, err := tx.Exec(ctx, `
@@ -2412,7 +2797,9 @@ func (s *PgStore) changeAccountStatus(
 			return domain.ErrAccountVersionConflict
 		}
 		out = &updated
-		return nil
+		return s.enqueueAccountEvent(ctx, tx, strings.ToLower(changeKind), tenantID, cur.AccountID, principalID, map[string]any{
+			"account_code": accountCode, "reason": reason,
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -2446,6 +2833,14 @@ func (s *PgStore) ActivateAccount(ctx context.Context, tenantID, accountCode str
 // nothing; a key recorded for a different command or account is a conflict;
 // an unrecorded key runs the move and is recorded in the same transaction.
 // The second return value is true when the call replayed.
+//
+// When the account being moved, or the parent it is moving under, is a
+// control account, this does not move it: it records a pending
+// domain.AccountChangeApproval instead (the returned account is unchanged)
+// and a different principal must call ApproveAccountChange — ACC-01's SoD
+// line, "Creator cannot approve material control-account or hierarchy
+// change" (SPEC_DEVIATIONS A4/B16). Reparenting between two ordinary,
+// non-control accounts is completely unaffected by this gate.
 func (s *PgStore) ReparentAccount(
 	ctx context.Context,
 	tenantID, accountCode, idempotencyKey string,
@@ -2454,9 +2849,11 @@ func (s *PgStore) ReparentAccount(
 	effectiveFrom time.Time,
 	reason string,
 	evidenceRefs []string,
+	sourcePolicyRef string,
 	principalID string,
-) (*domain.Account, bool, error) {
+) (*domain.Account, *domain.AccountChangeApproval, bool, error) {
 	var out *domain.Account
+	var pending *domain.AccountChangeApproval
 	replay := false
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		claimed, claimedOK, err := lookupCommandIdempotency(ctx, tx, tenantID, idempotencyKey)
@@ -2488,14 +2885,16 @@ func (s *PgStore) ReparentAccount(
 			return domain.ErrAccountVersionConflict
 		}
 
+		parentIsControl := false
 		if parentAccountID != nil {
 			if *parentAccountID == cur.AccountID {
 				return domain.ErrAccountHierarchyCycle
 			}
 			var parentExists bool
 			if err := tx.QueryRow(ctx, `
-				SELECT EXISTS(SELECT 1 FROM chart_of_accounts WHERE tenant_id = $1 AND account_id = $2)
-			`, tenantID, *parentAccountID).Scan(&parentExists); err != nil {
+				SELECT EXISTS(SELECT 1 FROM chart_of_accounts WHERE tenant_id = $1 AND account_id = $2),
+				       COALESCE((SELECT is_control_account FROM chart_of_accounts WHERE tenant_id = $1 AND account_id = $2), FALSE)
+			`, tenantID, *parentAccountID).Scan(&parentExists, &parentIsControl); err != nil {
 				return mapPgError(err)
 			}
 			if !parentExists {
@@ -2547,6 +2946,37 @@ func (s *PgStore) ReparentAccount(
 			return domain.ErrAccountEffectiveDate
 		}
 
+		if cur.IsControlAccount || parentIsControl {
+			if strings.TrimSpace(reason) == "" {
+				return domain.ErrAccountChangeReasonRequired
+			}
+			change := &domain.AccountChangeApproval{
+				ChangeID:              uuid.NewString(),
+				TenantID:              tenantID,
+				AccountID:             cur.AccountID,
+				AccountCode:           accountCode,
+				ChangeKind:            domain.AccountChangeKindReparented,
+				ExpectedVersion:       cur.Version,
+				NewParentAccountID:    parentAccountID,
+				EffectiveFrom:         effective,
+				Reason:                reason,
+				EvidenceRefs:          evidenceRefs,
+				SourcePolicyRef:       sourcePolicyRef,
+				Status:                domain.AccountChangeStatusPending,
+				ProposedAt:            time.Now().UTC(),
+				ProposedByPrincipalID: principalID,
+			}
+			if err := insertAccountChangeApproval(ctx, tx, change); err != nil {
+				return err
+			}
+			if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandReparentAccount, accountCode); err != nil {
+				return err
+			}
+			out = cur
+			pending = change
+			return nil
+		}
+
 		updated := *cur
 		updated.ParentAccountID = parentAccountID
 		updated.Version = cur.Version + 1
@@ -2554,7 +2984,7 @@ func (s *PgStore) ReparentAccount(
 			return err
 		}
 		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
-			&updated, updated.Version, effective, "REPARENTED", reason, principalID, evidenceRefs)); err != nil {
+			&updated, updated.Version, effective, "REPARENTED", reason, principalID, evidenceRefs, sourcePolicyRef)); err != nil {
 			return err
 		}
 		tag, err := tx.Exec(ctx, `
@@ -2571,12 +3001,14 @@ func (s *PgStore) ReparentAccount(
 			return err
 		}
 		out = &updated
-		return nil
+		return s.enqueueAccountEvent(ctx, tx, "hierarchy-changed", tenantID, cur.AccountID, principalID, map[string]any{
+			"account_code": accountCode, "new_parent_account_id": parentAccountID, "reason": reason,
+		})
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	return out, replay, nil
+	return out, pending, replay, nil
 }
 
 func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error) {

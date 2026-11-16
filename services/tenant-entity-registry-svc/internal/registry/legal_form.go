@@ -40,10 +40,8 @@ func validateLegalForm(code, source, localText *string) error {
 	return nil
 }
 
-// validateFiscalCalendarRef checks the one thing this service can: that the
-// reference is a well-formed id. §4.3's "permitted calendar/currency
-// references" belongs to REF-04 Fiscal Calendar, which does not exist in the
-// estate yet; there is nothing to resolve it against.
+// validateFiscalCalendarRef checks that the reference is a well-formed id. Whether the calendar exists
+// for the tenant is checked against fiscal-calendar-svc (REF-04) by checkFiscalCalendar, when it is wired.
 func validateFiscalCalendarRef(id string) error {
 	if _, err := uuid.Parse(strings.TrimSpace(id)); err != nil {
 		return fmt.Errorf("%w: fiscal_calendar_id must be a UUID", ErrInvalidInput)

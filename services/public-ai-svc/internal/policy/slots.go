@@ -104,7 +104,10 @@ var rescheduleRe = regexp.MustCompile(`(?i)\b(?:reschedul\w*|cancel\w*|move|chan
 // cancellation gets the plain route (Doc 10 COM-05), never a question.
 func DemoReply(text, workstream string) (Template, bool) {
 	if rescheduleRe.MatchString(text) {
-		return RouteTemplates["I08"], false
+		return TplDemoReschedule, false // Doc 10 COM-05
+	}
+	if demoCoverageRe.MatchString(text) {
+		return TplDemoCoverage, true // Doc 02 §22 Demo chip, S10
 	}
 	if label := WorkstreamLabels[workstream]; label != "" {
 		return Template{RouteTemplates["I08"].Status, "A tailored demo can focus on " + label + ". The secure demo form lets you choose that topic and enter your contact details there, not in this chat. Nothing is booked until you send the form.", "demo", false, ""}, false
@@ -130,7 +133,8 @@ var GroundedQualifiers = map[string]GroundedQualifier{
 	"I01": {"T02", "The precise capabilities available depend on market, plan and deployment status.", ""},
 	"I02": {"T03", "", "Which area would you like to explore: accounting, workforce, governance, or integrations?"},
 	"I03": {"T04", "Whether a particular consolidation or intercompany workflow is available for your organization depends on the approved plan and implementation scope.", ""},
-	"I06": {"T06", "Availability, entitlements and post-trial conditions depend on your market and current terms.", ""},
+	// Doc 02 T06, plus S01 turn 3: terms are shown before the visitor proceeds.
+	"I06": {"T06", "Availability, entitlements and post-trial conditions depend on your market and current terms. The sign-up page will present the applicable terms before you decide to proceed.", ""},
 	"I10": {"T08", "I cannot confirm a specific connector or version unless it is in the current approved integration matrix.", "Which system are you considering?"},
 	"I11": {"T09", "A scoped review is needed before any timeline or compatibility commitment.", ""},
 	"I17": {"T12", "Filing capabilities and supported jurisdictions are not universal; I can point you to current published coverage, not provide tax advice.", ""},

@@ -12,7 +12,7 @@ var templateIDs map[string]string
 
 func init() {
 	ids := map[string]Template{
-		"T01": TplWelcome, "T05": TplClarifyMarket,
+		"T01": TplWelcome, "T05": TplClarifyMarket, "T06": TplClarifyTrialMarket,
 		"T07": BoundaryTemplates["I09"], "T11": BoundaryTemplates["I14"], "T14": TplEvidenceAssurance,
 		"T10": TplAbstainCertification, "T16": RouteTemplates["I23"], "T17": RouteTemplates["I22"],
 		"T18": BoundaryTemplates["I25"], "T19": ExceptionTemplates[X07CrossProduct], "T20": ExceptionTemplates[X04RegulatedAdvice],

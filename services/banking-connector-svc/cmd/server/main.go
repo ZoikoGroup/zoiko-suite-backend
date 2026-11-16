@@ -24,6 +24,7 @@ import (
 	"zoiko.io/banking-connector-svc/internal/mtls"
 	"zoiko.io/banking-connector-svc/internal/store"
 	"zoiko.io/banking-connector-svc/internal/telemetry"
+	"zoiko.io/banking-connector-svc/internal/tokenization"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 )
@@ -40,6 +41,9 @@ func main() {
 	defer func() { _ = logger.Sync() }()
 
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		logger.Fatal("invalid configuration", zap.Error(err))
+	}
 	logger.Info("starting banking-connector-svc", zap.String("port", cfg.Port))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -73,7 +77,23 @@ func main() {
 		logger.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
 
-	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion))
+	// Tokenization of account numbers. TOKENIZATION_ENFORCED decides only
+	// whether NEW connections are tokenized. Reading an existing tokenized
+	// connection's full number (the privileged account-number route) needs
+	// the client regardless of that flag — a connection tokenized while
+	// enforcement was on stays tokenized after it is turned off — so the
+	// client is built whenever a service URL is configured. Building it makes
+	// no call; nothing reaches key-management-svc until a write is enforced
+	// or a tokenized row is read in full.
+	var tokenizer tokenization.Tokenizer
+	if cfg.TokenizationServiceURL != "" {
+		tokenizer = tokenization.NewClient(cfg.TokenizationServiceURL)
+	}
+	if cfg.TokenizationEnforced {
+		logger.Info("account-number tokenization enforced", zap.String("tokenization_service_url", cfg.TokenizationServiceURL))
+	}
+	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion),
+		store.WithTokenization(tokenizer, cfg.TokenizationEnforced))
 
 	// Transactional outbox relay (ZS-EVENT-001 §6). Every BNK-02/03/04
 	// event is written to eventing_outbox in the same transaction as the
@@ -114,7 +134,7 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(st, authzClient, logger)
+	h := handler.New(st, authzClient, logger).WithTokenizer(tokenizer)
 
 	// BNK-02 dependencies — real HTTP clients to secret-vault-integration-svc
 	// (revoke only — see internal/clients/vault.go's own doc comment on why

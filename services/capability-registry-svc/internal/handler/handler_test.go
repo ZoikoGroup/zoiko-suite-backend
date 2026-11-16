@@ -19,7 +19,6 @@ import (
 	authzpkg "zoiko.io/capability-registry-svc/internal/authz"
 	"zoiko.io/capability-registry-svc/internal/domain"
 	svcenvelope "zoiko.io/capability-registry-svc/internal/envelope"
-	"zoiko.io/capability-registry-svc/internal/events"
 	svcmiddleware "zoiko.io/capability-registry-svc/internal/middleware"
 )
 
@@ -32,7 +31,20 @@ type stubStore struct {
 	integrations  map[string][]domain.IntegrationCapability
 	releases      map[string][]domain.Release
 	claims        map[string][]domain.CapabilityClaim
-	published     []events.PublishParams
+	published     []stubEvent
+}
+
+// stubEvent is what the real store enqueues in eventing_outbox alongside each
+// committed write (store.enqueueEvent). The stub mirrors that contract — one
+// event per committed write, keyed on the parent capability, none on a
+// replay or a failed write — so these tests pin which write a handler drives.
+// store/eventing_outbox_test.go proves the real store meets the same
+// contract against Postgres.
+type stubEvent struct {
+	EventType     string
+	EntityID      string
+	ActorID       string
+	CorrelationID string
 }
 
 type stubIdempotencyKey struct {
@@ -61,7 +73,7 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) withIdempotency(claim domain.IdempotencyClaim, write func() error) error {
+func (s *stubStore) withIdempotency(claim domain.IdempotencyClaim, eventType string, aggregateID func() string, write func() error) error {
 	s.idempotencyMu.Lock()
 	defer s.idempotencyMu.Unlock()
 
@@ -77,16 +89,10 @@ func (s *stubStore) withIdempotency(claim domain.IdempotencyClaim, write func() 
 	if err := write(); err != nil {
 		return err
 	}
-	if len(claim.OutboxPayload) > 0 {
-		var event events.Event
-		if err := json.Unmarshal(claim.OutboxPayload, &event); err != nil {
-			return err
-		}
-		s.published = append(s.published, events.PublishParams{
-			EventType: event.EventType, EntityID: event.EntityID, TenantID: event.TenantID,
-			ActorID: event.ActorID, CorrelationID: event.CorrelationID, Payload: event.Payload,
-		})
-	}
+	s.published = append(s.published, stubEvent{
+		EventType: eventType, EntityID: aggregateID(),
+		ActorID: claim.PrincipalID, CorrelationID: claim.CorrelationID,
+	})
 	s.idempotency[key] = stubIdempotencyResult{
 		requestHash: claim.RequestSHA256, resourceID: claim.ResourceID,
 		status: claim.ResponseStatus, body: append([]byte(nil), claim.ResponseBody...),
@@ -95,7 +101,7 @@ func (s *stubStore) withIdempotency(claim domain.IdempotencyClaim, write func() 
 }
 
 func (s *stubStore) CreateCapability(_ context.Context, c *domain.Capability, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "capability.created", func() string { return c.CapabilityID }, func() error {
 		if _, exists := s.byCode[c.CapabilityCode]; exists {
 			return domain.ErrConflict
 		}
@@ -120,7 +126,7 @@ func (s *stubStore) GetCapabilityByCode(_ context.Context, code string) (*domain
 }
 
 func (s *stubStore) CreateMarketRelease(_ context.Context, m *domain.MarketRelease, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "market_release.created", func() string { return m.CapabilityID }, func() error {
 		if _, ok := s.capabilities[m.CapabilityID]; !ok {
 			return domain.ErrCapabilityNotFound
 		}
@@ -146,7 +152,7 @@ func (s *stubStore) GetMarketReleaseByID(_ context.Context, id string) (*domain.
 }
 
 func (s *stubStore) CreateIntegrationCapability(_ context.Context, i *domain.IntegrationCapability, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "integration_capability.created", func() string { return i.CapabilityID }, func() error {
 		if _, ok := s.capabilities[i.CapabilityID]; !ok {
 			return domain.ErrCapabilityNotFound
 		}
@@ -171,11 +177,13 @@ func (s *stubStore) GetIntegrationCapabilityByID(_ context.Context, id string) (
 }
 
 func (s *stubStore) UpdateIntegrationHealth(_ context.Context, id, status string, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	var parent string
+	return s.withIdempotency(claim, "integration_capability.health_updated", func() string { return parent }, func() error {
 		for capID, list := range s.integrations {
 			for i := range list {
 				if list[i].IntegrationCapabilityID == id {
 					list[i].HealthStatus = status
+					parent = capID
 					s.integrations[capID] = list
 					return nil
 				}
@@ -186,7 +194,7 @@ func (s *stubStore) UpdateIntegrationHealth(_ context.Context, id, status string
 }
 
 func (s *stubStore) CreateRelease(_ context.Context, r *domain.Release, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "capability_release.state_changed", func() string { return r.CapabilityID }, func() error {
 		if _, ok := s.capabilities[r.CapabilityID]; !ok {
 			return domain.ErrCapabilityNotFound
 		}
@@ -221,7 +229,7 @@ func (s *stubStore) GetReleaseByID(_ context.Context, id string) (*domain.Releas
 }
 
 func (s *stubStore) CreateCapabilityClaim(_ context.Context, c *domain.CapabilityClaim, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "capability_claim.created", func() string { return c.CapabilityID }, func() error {
 		if _, ok := s.capabilities[c.CapabilityID]; !ok {
 			return domain.ErrCapabilityNotFound
 		}
