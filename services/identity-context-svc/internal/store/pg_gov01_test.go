@@ -52,7 +52,7 @@ func eventFor(id, tenantID string) outbox.Record {
 		EventType:    "identity.context.resolved",
 		TenantID:     tenantID,
 		PartitionKey: id,
-		Payload:      []byte(`{"session_context_id":"` + id + `"}`),
+		Payload:      []byte(`{"payload":{"session_context_id":"` + id + `"}}`),
 	}
 }
 
@@ -70,7 +70,7 @@ func TestInsertSessionContextWithEvent_IsAtomic(t *testing.T) {
 
 	var sessions, events int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM session_contexts WHERE session_context_id='sc-1'`).Scan(&sessions))
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_id='evt-sc-1'`).Scan(&events))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM eventing_outbox WHERE event_type='com.zoikosuite.identity.context.resolved' AND aggregate_id='sc-1'`).Scan(&events))
 
 	assert.Equal(t, 1, sessions)
 	assert.Equal(t, 1, events, "the event must land in the same transaction as the row it attests")
@@ -92,7 +92,7 @@ func TestInsertSessionContextWithEvent_RollsBackBothOnFailure(t *testing.T) {
 	require.Error(t, err)
 
 	var events int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_id='evt-sc-2'`).Scan(&events))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM eventing_outbox WHERE event_type='com.zoikosuite.identity.context.resolved' AND aggregate_id='sc-2'`).Scan(&events))
 	assert.Zero(t, events, "the event must roll back with the row it attests")
 }
 
@@ -289,7 +289,7 @@ func TestSupportContext_InsertAndFindLive(t *testing.T) {
 	sc := supportFor("sup-1", "tenant-a", "eng-1", "lead-9", time.Hour)
 	require.NoError(t, s.InsertSupportContextWithEvent(ctx, sc, outbox.Record{
 		EventID: "evt-sup-1", EventType: "identity.support_context.attached",
-		TenantID: "tenant-a", PartitionKey: "sup-1", Payload: []byte(`{}`),
+		TenantID: "tenant-a", PartitionKey: "sup-1", Payload: []byte(`{"payload":{}}`),
 	}))
 
 	live, err := s.FindLiveSupportContext(ctx, "eng-1", "tenant-a", time.Now().UTC())
@@ -298,7 +298,7 @@ func TestSupportContext_InsertAndFindLive(t *testing.T) {
 	assert.Equal(t, "sup-1", live.SupportContextID)
 
 	var events int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_id='evt-sup-1'`).Scan(&events))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM eventing_outbox WHERE event_type='com.zoikosuite.identity.support-context.attached' AND aggregate_id='sup-1'`).Scan(&events))
 	assert.Equal(t, 1, events, "a privileged elevation the security team was never told about is the failure to prevent")
 }
 
@@ -693,14 +693,14 @@ func TestSupportContext_ReviewAndItsEventAreAtomicAndOnce(t *testing.T) {
 
 	rec := outbox.Record{
 		EventID: "evt-rev-1", EventType: "identity.support_context.reviewed",
-		TenantID: "tenant-a", PartitionKey: "sup-rev", Payload: []byte(`{"support_context_id":"sup-rev"}`),
+		TenantID: "tenant-a", PartitionKey: "sup-rev", Payload: []byte(`{"payload":{"support_context_id":"sup-rev"}}`),
 	}
 	changed, err := s.MarkSupportContextReviewedWithEvent(ctx, "sup-rev", "tenant-a", "security-1", now, rec)
 	require.NoError(t, err)
 	assert.True(t, changed)
 
 	var n int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_type='identity.support_context.reviewed'`).Scan(&n))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.support-context.reviewed'`).Scan(&n))
 	assert.Equal(t, 1, n, "the review event must be enqueued with the review")
 
 	rec2 := rec
@@ -708,7 +708,7 @@ func TestSupportContext_ReviewAndItsEventAreAtomicAndOnce(t *testing.T) {
 	changed, err = s.MarkSupportContextReviewedWithEvent(ctx, "sup-rev", "tenant-a", "someone-else", now, rec2)
 	require.NoError(t, err)
 	assert.False(t, changed)
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_type='identity.support_context.reviewed'`).Scan(&n))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.support-context.reviewed'`).Scan(&n))
 	assert.Equal(t, 1, n, "a repeat review must not enqueue a second event")
 
 	got, err := s.FindSupportContext(ctx, "sup-rev", "tenant-a")
