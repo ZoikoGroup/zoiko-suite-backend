@@ -243,8 +243,9 @@ services:
 
   counterparty-management-svc:
     build:
-      context: ../services/counterparty-management-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing - see the Dockerfile.
+      context: ../services
+      dockerfile: counterparty-management-svc/Dockerfile
     container_name: counterparty-management-svc-p5
     ports:
       - "8124:8124"
@@ -253,6 +254,7 @@ services:
       DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/counterparty_management?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
       JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:

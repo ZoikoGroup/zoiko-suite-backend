@@ -263,3 +263,60 @@ emitted by any current test, so its schema is derived from the code only.
   schema task; still open.
 
 Catalogue is now 462 entries = 196 spec + 266 extensions.
+
+### identity-context-svc migrated to the eventing outbox
+
+Decision taken: events with no tenant (a resolution that failed before a tenant was known) are
+scoped to a reserved `platform` tenant, so every event fits the section 4 envelope and none is lost.
+
+What changed (all behind the existing seams, so the ~45 call sites are untouched):
+- `internal/outbox/eventing.go` converts the rendered legacy record into the canonical eventing
+  envelope. `Store.EnqueueTx`/`Enqueue` and `PgStore.outboxEnqueueTx` write to `eventing_outbox`
+  (migration 000020) in the same transaction as before. The envelope still emits the legacy
+  `event_type`, `payload`, `source_service`, `tenant_id` ..., so authorization-svc, the gateway and
+  the SIEM need no change. Dropped, as for the period events: the legacy `event_version` and the
+  `evt-` id prefix (ids are now UUIDv7). A duplicate enqueue by a retrying caller is no longer
+  absorbed by `ON CONFLICT (event_id)`.
+- Canonical names: `identity.mfa_factor.enrolled` becomes `com.zoikosuite.identity.mfa-factor.enrolled`
+  (underscores to hyphens; `session.invalidated` and `principal.status.changed` are mapped by hand).
+  `identity` is a new extension domain (ZS-IAM-001 section 23 names it; section 19 of ZS-EVENT-001 does not).
+- `main` requires `EVENT_RESIDENCY_REGION` (compose and the Kubernetes manifest set it), verifies the
+  table, and runs eventing's relay beside the legacy relay, which only drains `event_outbox` now.
+- The secret scan of `envelope.New` now runs on identity payloads. A payload holding a credential
+  makes the enqueue (and so the business write) fail closed; the suite shows no current payload trips it.
+- 30 types captured from the store suite (327 events) are catalogued (extensions, catalogue 492 =
+  196 spec + 296 extensions) with schemas in `contracts/events/`, validated by every store test.
+  All 30 names are past tense, so the lint needed no exceptions.
+
+Not done:
+- 40 names in the source were not captured (their tests use fake publishers, no database):
+  `authentication.failed/throttled`, `login_session.*`, `password*`, `refresh_token.reuse_detected`,
+  `step_up.*`, `subject.created/enabled/invited`, `idp.*`, `group*`, `scim_*`, `retention.*`,
+  `context.cache_invalidated/tenant_invalidated`, `session.revoked/invalidated`,
+  `support_context.revoked`, `token.exchanged`, ... (some, like `session.risk.changed`, are consumed,
+  not emitted). They have neither catalogue entries nor schemas, and the emitted-type audit cannot
+  see them. Capture them with a recording sink in their package tests.
+- `PurgePublishedOutbox` only prunes the legacy `event_outbox`; published rows in `eventing_outbox`
+  have no retention yet.
+- notification-svc is still on its own outbox.
+
+### counterparty-management-svc (BIZ-06 CRM) migrated to the eventing outbox
+
+Five events, written to `eventing_outbox` (migration 000004) in the same transaction as the change
+by the store, and no longer published directly by the handler:
+`com.zoikosuite.business.relationship.created`, `relationship.closed`, `interaction.logged`,
+`opportunity.created`, `opportunity.stage-changed` (legacy names `relationship.created`,
+`opportunity.stage_changed`, ... are still emitted beside them). They are `extension` entries under
+the existing `business` domain, producer `Counterparty Management Service`, with payload schemas in
+`counterparty-management-svc/contracts/events` that the store tests enforce on every outbox row.
+Free-text interaction notes are never put in an event.
+
+Behaviour changes to know about:
+- `EVENT_RESIDENCY_REGION` is now required (compose and phase5 set it, default `local`); the service
+  refuses to start without it, and a write whose event cannot be built is rolled back.
+- Delivery is now at-least-once through the relay; the old direct publish dropped the event with a
+  warning when Kafka failed.
+- The Docker build context moved to `services/` (Dockerfile, `Dockerfile.dockerignore`, both compose files).
+- Not migrated: the existing counterparty events (`counterparty.*`) still use the old direct publisher,
+  and `CloseOpportunity` still emits no event (it changes the stage to CLOSED_WON/LOST but never
+  published `opportunity.stage_changed`; left as it was).

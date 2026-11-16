@@ -571,6 +571,7 @@ services:
       REDIS_TLS_ENABLED: "${REDIS_TLS_ENABLED:-false}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "identity-context-svc"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       # PUBLISH topic only. The reader subscribes to the topics the events it
       # handles are actually published on — it used to read this one alone, so
       # authority.revoked, role.updated and entity.updated never ended a session.

@@ -42,6 +42,36 @@
         }
       }
     },
+    "interaction": {
+      "address": "zoikosuite.business.interaction.v1",
+      "messages": {
+        "logged": {
+          "$ref": "#/components/messages/interaction.logged"
+        }
+      }
+    },
+    "opportunity": {
+      "address": "zoikosuite.business.opportunity.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/opportunity.created"
+        },
+        "stage-changed": {
+          "$ref": "#/components/messages/opportunity.stage-changed"
+        }
+      }
+    },
+    "relationship": {
+      "address": "zoikosuite.business.relationship.v1",
+      "messages": {
+        "closed": {
+          "$ref": "#/components/messages/relationship.closed"
+        },
+        "created": {
+          "$ref": "#/components/messages/relationship.created"
+        }
+      }
+    },
     "task": {
       "address": "zoikosuite.business.task.v1",
       "messages": {
@@ -147,6 +177,66 @@
         "title": "form submitted",
         "x-zoiko-event-type": "com.zoikosuite.business.form.submitted",
         "x-zoiko-origin": "spec"
+      },
+      "interaction.logged": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.interaction.logged",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Interaction: logged.",
+        "title": "interaction logged",
+        "x-zoiko-event-type": "com.zoikosuite.business.interaction.logged",
+        "x-zoiko-origin": "extension"
+      },
+      "opportunity.created": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.opportunity.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Opportunity: created.",
+        "title": "opportunity created",
+        "x-zoiko-event-type": "com.zoikosuite.business.opportunity.created",
+        "x-zoiko-origin": "extension"
+      },
+      "opportunity.stage-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.opportunity.stage-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Opportunity: stage-changed.",
+        "title": "opportunity stage-changed",
+        "x-zoiko-event-type": "com.zoikosuite.business.opportunity.stage-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "relationship.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.relationship.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Relationship: closed.",
+        "title": "relationship closed",
+        "x-zoiko-event-type": "com.zoikosuite.business.relationship.closed",
+        "x-zoiko-origin": "extension"
+      },
+      "relationship.created": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.relationship.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Relationship: created.",
+        "title": "relationship created",
+        "x-zoiko-event-type": "com.zoikosuite.business.relationship.created",
+        "x-zoiko-origin": "extension"
       },
       "task.completed": {
         "contentType": "application/json",
@@ -365,6 +455,51 @@
         }
       ],
       "summary": "Publish form facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.interaction": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/interaction"
+      },
+      "description": "Producer(s): Counterparty Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/interaction/messages/logged"
+        }
+      ],
+      "summary": "Publish interaction facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.opportunity": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/opportunity"
+      },
+      "description": "Producer(s): Counterparty Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/opportunity/messages/created"
+        },
+        {
+          "$ref": "#/channels/opportunity/messages/stage-changed"
+        }
+      ],
+      "summary": "Publish opportunity facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.relationship": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/relationship"
+      },
+      "description": "Producer(s): Counterparty Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/relationship/messages/closed"
+        },
+        {
+          "$ref": "#/channels/relationship/messages/created"
+        }
+      ],
+      "summary": "Publish relationship facts after the authoritative commit (transactional outbox)."
     },
     "publish.task": {
       "action": "send",

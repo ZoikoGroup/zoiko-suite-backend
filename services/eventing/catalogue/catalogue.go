@@ -76,7 +76,7 @@ var Domains = []string{
 // never drift into them. Each is an open architecture question (section 19's
 // "Data, AI & Integrations" family uses the data.* domain for connector and import
 // facts): adopt the domain into section 19, or migrate the producer to an existing one.
-var ExtensionDomains = []string{"integration", "connectivity", "treasury", "reconciliation", "einvoice", "migration"}
+var ExtensionDomains = []string{"integration", "connectivity", "treasury", "reconciliation", "einvoice", "migration", "identity"}
 
 var (
 	once    sync.Once
