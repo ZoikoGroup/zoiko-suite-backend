@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/contracttest"
+
 	"zoiko.io/treasury-svc/internal/domain"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
 	"zoiko.io/treasury-svc/internal/store"
@@ -127,7 +129,7 @@ func TestMain(m *testing.M) {
 
 	testStore = store.New(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
-	code := m.Run()
+	code := contracttest.FinishSuite(testPool, "../../contracts/events", m.Run())
 
 	testPool.Close()
 	if pg != nil {
