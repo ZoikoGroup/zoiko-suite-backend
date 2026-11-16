@@ -103,7 +103,8 @@ func TestRevocation_RevokesProspectivelyAndRetainsTheCertification(t *testing.T)
 
 	// The event carries the prior certification, reason, evidence and effective time.
 	var payload []byte
-	if err := f.admin.QueryRow(f.ctx, `SELECT payload FROM outbox_events WHERE event_type = 'CONTROL.CertificationRevoked'
+	if err := f.admin.QueryRow(f.ctx, `SELECT convert_from(payload, 'UTF8')::jsonb -> 'data' FROM eventing_outbox
+		WHERE event_type = 'com.zoikosuite.accounting.reconciliation-certification.revoked'
 		AND aggregate_id = $1`, before.CertificationID).Scan(&payload); err != nil {
 		t.Fatalf("revocation event: %v", err)
 	}

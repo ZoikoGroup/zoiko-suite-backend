@@ -2,9 +2,9 @@
 #   docker build -t public-ai-svc services/public-ai-svc
 # The image contains the server, the healthcheck probe and the kbctl operator
 # tool. It contains no fixtures, keys or secrets.
-FROM golang:1.27-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
-# go.mod pins toolchain go1.27.3 (standard-library security fixes). The
-# digest-pinned builder image ships exactly go1.27.3 (GOLANG_VERSION), so the
+FROM golang:1.27-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder
+# go.mod pins toolchain go1.27.4 (standard-library security fixes). The
+# digest-pinned builder image ships exactly go1.27.4 (GOLANG_VERSION), so the
 # build never downloads a toolchain: GOTOOLCHAIN=local fails instead of
 # fetching if the two ever disagree. Bump both together.
 ENV GOTOOLCHAIN=local

@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/reconciliation-engine-svc/internal/domain"
-	"zoiko.io/reconciliation-engine-svc/internal/outbox"
 )
 
 // ── RevokeCertification ─────────────────────────────────────────────────────
@@ -152,8 +151,7 @@ func (s *PgStore) RevokeCertification(ctx context.Context, tenantID, runID strin
 		out = v
 		// DQC-05's dqc.certification.revoked: the prior certification, the
 		// reason and the effective time (revoked_at), plus the evidence.
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "certification", AggregateID: certID,
-			EventType: "CONTROL.CertificationRevoked", TenantID: &tenantID, Payload: v})
+		return s.enqueueEvent(ctx, tx, evCertRevoked, tenantID, run.LegalEntityID, certID, actor, claim, v)
 	})
 	return out, err
 }

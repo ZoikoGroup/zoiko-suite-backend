@@ -55,7 +55,7 @@ func TestIdempotency_CertifyRetryReplaysTheOriginalResult(t *testing.T) {
 	assert.Equal(t, transitions, countRows(t, `SELECT count(*) FROM control_run_transitions WHERE run_id = $1`, run.RunID),
 		"nothing is applied twice")
 	assert.Equal(t, 1, countRows(t, `SELECT count(*) FROM control_certifications WHERE run_id = $1`, run.RunID))
-	assert.Equal(t, 1, countRows(t, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'control.run.certified'`, run.RunID))
+	assert.Equal(t, 1, countRows(t, `SELECT count(*) FROM `+legacyEvents+` WHERE aggregate_id = $1 AND event_type = 'control.run.certified'`, run.RunID))
 
 	// The same key for the other decision, or another run, is a conflict.
 	_, _, err = testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", key, store.SkipVersionCheck,

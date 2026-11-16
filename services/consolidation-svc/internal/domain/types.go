@@ -105,6 +105,12 @@ type ConsolidationAdjustment struct {
 
 	ConsolidationBookJournalID *string `json:"consolidation_book_journal_id,omitempty"`
 
+	// SourceLegalEntityID/TargetLegalEntityID name the intercompany pair an
+	// ELIMINATION adjustment eliminates (A5) — nil for MANUAL adjustments,
+	// which have no pair to bound against.
+	SourceLegalEntityID *string `json:"source_legal_entity_id,omitempty"`
+	TargetLegalEntityID *string `json:"target_legal_entity_id,omitempty"`
+
 	CreatedAt             time.Time  `json:"created_at"`
 	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
 	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
@@ -157,6 +163,14 @@ type CreateEliminationProposalRequest struct {
 	AdjustmentType     string                        `json:"adjustment_type"`
 	Description        string                        `json:"description"`
 	Lines              []ConsolidationAdjustmentLine `json:"lines"`
+
+	// SourceLegalEntityID/TargetLegalEntityID are required when
+	// AdjustmentType is ELIMINATION (A5): they name the intercompany pair
+	// this proposal eliminates, so its amount is bounded against THAT
+	// pair's reciprocal balance, not every eliminable balance in the
+	// tenant.
+	SourceLegalEntityID string `json:"source_legal_entity_id,omitempty"`
+	TargetLegalEntityID string `json:"target_legal_entity_id,omitempty"`
 }
 
 type ReverseConsolidationAdjustmentRequest struct {

@@ -16,34 +16,34 @@ const (
 )
 
 const (
-	ProviderAWSKMS     KeyProvider = "AWS_KMS"
-	ProviderAzureKV    KeyProvider = "AZURE_KEY_VAULT"
-	ProviderGCPKMS     KeyProvider = "GCP_KMS"
-	ProviderVault      KeyProvider = "HASHICORP_VAULT"
+	ProviderAWSKMS      KeyProvider = "AWS_KMS"
+	ProviderAzureKV     KeyProvider = "AZURE_KEY_VAULT"
+	ProviderGCPKMS      KeyProvider = "GCP_KMS"
+	ProviderVault       KeyProvider = "HASHICORP_VAULT"
 	ProviderExternalHSM KeyProvider = "EXTERNAL_HSM"
 )
 
 const (
-	StateEnabled  KeyState = "ENABLED"
-	StateDisabled KeyState = "DISABLED"
+	StateEnabled         KeyState = "ENABLED"
+	StateDisabled        KeyState = "DISABLED"
 	StatePendingRotation KeyState = "PENDING_ROTATION"
-	StateRevoked  KeyState = "REVOKED"
+	StateRevoked         KeyState = "REVOKED"
 )
 
 type CustomerKey struct {
-	ID            string      `json:"id"`
-	TenantID      string      `json:"tenant_id"`
-	LegalEntityID string      `json:"legal_entity_id"`
-	KeyAlias      string      `json:"key_alias"`
-	KeyModel      KeyModel    `json:"key_model"`
-	KeyProvider   KeyProvider `json:"key_provider"`
-	ExternalKeyARN string     `json:"external_key_arn"` // e.g. arn:aws:kms:us-east-1:123456789012:key/...
-	KeyVersion    int         `json:"key_version"`
-	State         KeyState    `json:"state"`
-	RotationCount int         `json:"rotation_count"`
-	LastRotatedAt *time.Time  `json:"last_rotated_at,omitempty"`
-	CreatedAt     time.Time   `json:"created_at"`
-	UpdatedAt     time.Time   `json:"updated_at"`
+	ID             string      `json:"id"`
+	TenantID       string      `json:"tenant_id"`
+	LegalEntityID  string      `json:"legal_entity_id"`
+	KeyAlias       string      `json:"key_alias"`
+	KeyModel       KeyModel    `json:"key_model"`
+	KeyProvider    KeyProvider `json:"key_provider"`
+	ExternalKeyARN string      `json:"external_key_arn"` // e.g. arn:aws:kms:us-east-1:123456789012:key/...
+	KeyVersion     int         `json:"key_version"`
+	State          KeyState    `json:"state"`
+	RotationCount  int         `json:"rotation_count"`
+	LastRotatedAt  *time.Time  `json:"last_rotated_at,omitempty"`
+	CreatedAt      time.Time   `json:"created_at"`
+	UpdatedAt      time.Time   `json:"updated_at"`
 }
 
 type RegisterKeyRequest struct {

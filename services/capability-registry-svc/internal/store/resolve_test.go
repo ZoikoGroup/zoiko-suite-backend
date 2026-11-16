@@ -20,7 +20,7 @@ import (
 func TestPgStoreCreateRelease_NonexistentCapabilityMapsToNotFound(t *testing.T) {
 	_, pool := openIdempotencyTestPool(t)
 	ctx := context.Background()
-	store := NewPgStore(pool)
+	store := newTestStore(pool)
 
 	for _, capabilityID := range []string{uuid.NewString(), "not-a-uuid"} {
 		t.Run(capabilityID, func(t *testing.T) {
@@ -49,7 +49,7 @@ func TestPgStoreResolveCapability_LegalApprovalFailsClosed(t *testing.T) {
 		t.Run(legalStatus, func(t *testing.T) {
 			_, pool := openIdempotencyTestPool(t)
 			ctx := context.Background()
-			store := NewPgStore(pool)
+			store := newTestStore(pool)
 
 			capability := newTestCapability("RESOLVE_LEGAL_" + legalStatus)
 			if err := store.CreateCapability(ctx, capability, testIdempotencyClaim(
@@ -107,7 +107,7 @@ func TestPgStoreResolveCapability_LegalApprovalFailsClosed(t *testing.T) {
 func TestPgStoreResolveCapability_ReleaseTieBreakerIsDeterministic(t *testing.T) {
 	_, pool := openIdempotencyTestPool(t)
 	ctx := context.Background()
-	store := NewPgStore(pool)
+	store := newTestStore(pool)
 
 	capability := newTestCapability("RESOLVE_RELEASE_TIE")
 	if err := store.CreateCapability(ctx, capability, testIdempotencyClaim(

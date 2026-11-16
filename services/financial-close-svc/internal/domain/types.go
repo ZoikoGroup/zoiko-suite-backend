@@ -55,6 +55,126 @@ type SubledgerControlRun struct {
 	Status                 string    `json:"status"` // MATCHED | EXCEPTION
 	RunAt                  time.Time `json:"run_at"`
 	RunByPrincipalID       string    `json:"run_by_principal_id"`
+
+	// CertificationStatus and the fields below are migration 000025's ACC-06
+	// governance layer (SPEC_DEVIATIONS A1). Status above is the run's own
+	// immutable finding; CertificationStatus is a separate fact layered on
+	// top — "has a human signed off this period's control is reliable" —
+	// nil until CertifyControl or RejectControl runs.
+	CertificationStatus    *string    `json:"certification_status,omitempty"` // CERTIFIED | FAILED
+	CertifiedAt            *time.Time `json:"certified_at,omitempty"`
+	CertifiedByPrincipalID *string    `json:"certified_by_principal_id,omitempty"`
+	CertificationNote      string     `json:"certification_note,omitempty"`
+}
+
+// Control exception lifecycle states (ACC-06's state model for an
+// EXCEPTION run's resolution workflow).
+const (
+	ControlExceptionStatusOpen     = "OPEN"
+	ControlExceptionStatusAssigned = "ASSIGNED"
+	ControlExceptionStatusResolved = "RESOLVED"
+)
+
+// ControlExceptionCertificationCertified/Failed are SubledgerControlRun's
+// CertificationStatus values — ACC-06's "Certified or Failed" terminal
+// split.
+const (
+	ControlCertificationCertified = "CERTIFIED"
+	ControlCertificationFailed    = "FAILED"
+)
+
+// ControlException is the companion row a run that lands EXCEPTION gets:
+// its own resolution workflow, with a real owner and a real recorded
+// approval — the exact gap SPEC_DEVIATIONS A1 names ("a break is 'resolved'
+// by running the control again until it matches; no resolution, owner or
+// approval is recorded").
+type ControlException struct {
+	ControlExceptionID    string     `json:"control_exception_id"`
+	TenantID              string     `json:"tenant_id"`
+	ControlRunID          string     `json:"control_run_id"`
+	LegalEntityID         string     `json:"legal_entity_id"`
+	FiscalPeriod          string     `json:"fiscal_period"`
+	Subledger             string     `json:"subledger"`
+	BookID                string     `json:"book_id,omitempty"`
+	Status                string     `json:"status"` // OPEN | ASSIGNED | RESOLVED
+	AssignedToPrincipalID string     `json:"assigned_to_principal_id,omitempty"`
+	AssignedAt            *time.Time `json:"assigned_at,omitempty"`
+	ResolutionNote        string     `json:"resolution_note,omitempty"`
+	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
+	ResolvedByPrincipalID string     `json:"resolved_by_principal_id,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+}
+
+type AssignExceptionRequest struct {
+	AssignedToPrincipalID string `json:"assigned_to_principal_id"`
+}
+
+// RecordResolutionRequest is RecordResolution's body: a real resolution
+// note is mandatory, not optional evidence (ACC-06's own evidence/lineage
+// requirement: "matching evidence, exceptions and approver").
+type RecordResolutionRequest struct {
+	ResolutionNote string `json:"resolution_note"`
+}
+
+// CertifyControlRequest/RejectControlRequest act on one specific run, named
+// by the URL's {id} — not resolved from a scope — so the certifier is
+// always certifying (or failing) the exact finding they looked at.
+type CertifyControlRequest struct {
+	Note string `json:"note,omitempty"`
+}
+
+type RejectControlRequest struct {
+	Reason string `json:"reason"`
+}
+
+// Close blocking reasons for GetCloseBlockingControls. They mirror the
+// three ways the close-readiness check treats a required control as not
+// proven: never run, run but still carrying an unresolved exception, or
+// stale after a reopen (the run predates the reopen, so it proves nothing
+// about the reopened books).
+const (
+	CloseBlockingReasonNoRun               = "NO_CONTROL_RUN"
+	CloseBlockingReasonUnresolvedException = "UNRESOLVED_EXCEPTION"
+	CloseBlockingReasonNotReperformed      = "NOT_REPERFORMED"
+)
+
+// CloseBlockingControl is one required SUBLEDGER_CONTROL that is currently
+// keeping the entity's close from being proven, with the latest finding and
+// (when one exists) its resolution workflow. GetCloseBlockingControls is the
+// read contract behind this; the classification reuses the same
+// requiredControlIssues logic the close itself runs.
+type CloseBlockingControl struct {
+	RequirementID string `json:"requirement_id,omitempty"`
+	LegalEntityID string `json:"legal_entity_id"`
+	Subledger     string `json:"subledger"`
+	BookID        string `json:"book_id,omitempty"`
+	// Baseline is true for the AR/AP controls every entity must prove even
+	// though they are not checklist rows (and therefore cannot be removed).
+	Baseline         bool                 `json:"baseline"`
+	BlockingReason   string               `json:"blocking_reason"`
+	Issue            string               `json:"issue"`
+	LatestRun        *SubledgerControlRun `json:"latest_run,omitempty"`
+	ControlException *ControlException    `json:"control_exception,omitempty"`
+}
+
+// VarianceBreakdown is the arithmetic half of ExplainVariance: the two totals
+// that produced the finding, their difference, and the tolerance the run was
+// judged against.
+type VarianceBreakdown struct {
+	SubledgerTotalAmount   float64 `json:"subledger_total_amount"`
+	GLControlBalanceAmount float64 `json:"gl_control_balance_amount"`
+	DifferenceAmount       float64 `json:"difference_amount"`
+	ToleranceAmount        float64 `json:"tolerance_amount"`
+	WithinTolerance        bool    `json:"within_tolerance"`
+}
+
+// VarianceExplanation is ACC-06's ExplainVariance query: the run, why it
+// found what it found, and — for an EXCEPTION run — the exception's complete
+// resolution trail (who was assigned, who resolved it, when, and the note).
+type VarianceExplanation struct {
+	ControlRun          *SubledgerControlRun `json:"control_run"`
+	DifferenceBreakdown VarianceBreakdown    `json:"difference_breakdown"`
+	ControlException    *ControlException    `json:"control_exception,omitempty"`
 }
 
 type RunSubledgerControlRequest struct {
@@ -1069,6 +1189,29 @@ var (
 	// throughout the AST/INV/PRJ build — the caller must say which book.
 	ErrBookIDRequiredForAssets = errorString("book_id is required when subledger is ASSETS")
 
+	// ── ACC-06 Subledger Control governance (migration 000025) ──────────
+
+	ErrControlExceptionNotFound = errorString("control exception not found")
+	// ErrControlExceptionNotOpenOrAssigned guards AssignException and
+	// RecordResolution: an exception already RESOLVED is closed history,
+	// not something a later command re-opens.
+	ErrControlExceptionNotOpenOrAssigned = errorString("control exception is not OPEN or ASSIGNED")
+	ErrResolutionNoteRequired            = errorString("resolution_note is required")
+	ErrNoControlRunForScope              = errorString("no subledger control run exists for this legal_entity_id/fiscal_period/subledger/book_id")
+	// ErrControlHasUnresolvedException is ACC-06's own negative path,
+	// "Certify with unresolved material break": a legal entity may not
+	// remove a SUBLEDGER_CONTROL close requirement, or certify a control,
+	// while that control's latest run carries an OPEN or ASSIGNED
+	// exception — "close role cannot waive unresolved mandatory break."
+	ErrControlHasUnresolvedException = errorString("the control's latest run carries an unresolved (OPEN or ASSIGNED) exception")
+	// ErrControlSelfCertification is ACC-06's maker-checker: "Preparer
+	// cannot certify own material control." The certifier must differ from
+	// whoever ran the control, and from whoever resolved its exception (if
+	// any) — the same person closing both ends of the loop is exactly the
+	// bypass maker-checker exists to prevent.
+	ErrControlSelfCertification = errorString("the principal who ran or resolved this control cannot also certify it")
+	ErrControlAlreadyCertified  = errorString("this control run is already certified or failed")
+
 	// ErrControlAccountMappingNotFound is returned when
 	// control_account_mapping_key names no current mapping — ACC-06 must
 	// never guess which GL account a subledger reconciles against.
@@ -1204,6 +1347,12 @@ var (
 	ErrPriorRevaluationNotPosted = errorString("prior revaluation run is not POSTED and cannot be reversed")
 
 	ErrMigrationBatchNotFound          = errorString("migration batch not found")
+	// ErrMigrationBatchRaceLost (SPEC_DEVIATIONS A9): two concurrent creates
+	// for the same (legal_entity_id, fiscal_period, source_system_name) race
+	// past the handler's own existence check; the migration_batches UNIQUE
+	// constraint still decides a single winner, and the handler re-reads and
+	// returns that winner rather than answering the loser 503.
+	ErrMigrationBatchRaceLost          = errorString("a concurrent create for this legal entity, period and source system already won")
 	ErrNoMigrationEntries              = errorString("a migration batch must include at least one crosswalk entry")
 	ErrInvalidMigrationBatchTransition = errorString("migration batch is not in a status that allows this action")
 
@@ -1318,10 +1467,10 @@ const (
 // GLJournalTypeAccrual, but are a different purpose).
 const (
 	GLJournalPurposeAccrual        = "ACCRUAL"         // ACC-07 recognition
-	GLJournalPurposePrepayment     = "PREPAYMENT"       // ACC-08 recognition and termination
-	GLJournalPurposeAllocation     = "ALLOCATION"       // ACC-09 allocation
-	GLJournalPurposeRevaluation    = "REVALUATION"      // ACC-10 FX revaluation
-	GLJournalPurposeOpeningBalance = "OPENING_BALANCE"  // ACC-17 opening balances
+	GLJournalPurposePrepayment     = "PREPAYMENT"      // ACC-08 recognition and termination
+	GLJournalPurposeAllocation     = "ALLOCATION"      // ACC-09 allocation
+	GLJournalPurposeRevaluation    = "REVALUATION"     // ACC-10 FX revaluation
+	GLJournalPurposeOpeningBalance = "OPENING_BALANCE" // ACC-17 opening balances
 )
 
 // general-ledger-svc's closed close-journal designations (its

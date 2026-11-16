@@ -1,7 +1,9 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"regexp"
 )
 
 type Config struct {
@@ -27,6 +29,26 @@ type Config struct {
 	// e.g. "general-ledger=http://general-ledger-svc:8098". Only registered
 	// systems can be read; a definition can never supply a URL.
 	SourceEndpoints string
+
+	// EventResidencyRegion is the regional data-bearing context
+	// (ZS-EVENT-001 §4, envelope.Spec.ResidencyRegion) stamped on every
+	// emitted event. Required, with no default: the envelope rejects an
+	// empty region, so a missing value would fail every write at request
+	// time. Validate refuses it at startup instead, and the code never
+	// invents a region nobody configured.
+	EventResidencyRegion string
+}
+
+// residencyRegion is the envelope library's controlled-code shape.
+var residencyRegion = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// Validate reports configuration the service cannot run with.
+func (c *Config) Validate() error {
+	if !residencyRegion.MatchString(c.EventResidencyRegion) {
+		return fmt.Errorf("EVENT_RESIDENCY_REGION is required and must be a lower-case region code (e.g. \"uk\", \"eu-west\"), got %q",
+			c.EventResidencyRegion)
+	}
+	return nil
 }
 
 func Load() *Config {
@@ -51,6 +73,7 @@ func Load() *Config {
 		AuthzMTLSURL:             authzMTLSURL,
 		MTLSManagementServiceURL: mtlsManagementServiceURL,
 		SourceEndpoints:          os.Getenv("SOURCE_ENDPOINTS"),
+		EventResidencyRegion:     os.Getenv("EVENT_RESIDENCY_REGION"),
 	}
 }
 

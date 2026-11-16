@@ -389,7 +389,7 @@ func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ s
 	return map[string]float64{"1000-Cash": 10000.0}, nil
 }
 
-func (c *stubClients) FetchEliminableIntercompanyEntries(_ context.Context, _, principalID string) ([]clients.IntercompanyEntry, error) {
+func (c *stubClients) FetchEliminableIntercompanyEntries(_ context.Context, _, principalID string, _ []string) ([]clients.IntercompanyEntry, error) {
 	c.principalIDReceived = principalID
 	if c.intercompanyErr != nil {
 		return nil, c.intercompanyErr
@@ -774,5 +774,52 @@ func TestGetRun_NotFound(t *testing.T) {
 	rr := doReq(r, http.MethodGet, "/v1/consolidation/runs/nonexistent-id", nil, "principal-1")
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+// SPEC_DEVIATIONS A13: ListRuns/ListAdjustments used to skip authorization
+// entirely when group_legal_entity_id was omitted, returning every run or
+// adjustment in the tenant to any caller with an X-Principal-Id.
+func TestListRuns_NoGroupFilter_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
+	rr := doReq(r, http.MethodGet, "/v1/consolidation/runs/", nil, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unfiltered list: want 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListRuns_GroupFilter_Authorized(t *testing.T) {
+	s := newStubStore()
+	s.runs["run-1"] = &domain.ConsolidationRun{ConsolidationRunID: "run-1", GroupLegalEntityID: "group-1", Status: "COMPLETED"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	rr := doReq(r, http.MethodGet, "/v1/consolidation/runs/?group_legal_entity_id=group-1", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("filtered list: want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListRuns_AuthzDenied_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubClients{})
+	rr := doReq(r, http.MethodGet, "/v1/consolidation/runs/?group_legal_entity_id=group-1", nil, "principal-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("denied group: want 403, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListAdjustments_NoGroupFilter_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
+	rr := doReq(r, http.MethodGet, "/v1/consolidation/adjustments/", nil, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unfiltered list: want 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListAdjustments_GroupFilter_Authorized(t *testing.T) {
+	s := newStubStore()
+	s.adjustments["adj-1"] = &domain.ConsolidationAdjustment{ConsolidationAdjustmentID: "adj-1", GroupLegalEntityID: "group-1"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	rr := doReq(r, http.MethodGet, "/v1/consolidation/adjustments/?group_legal_entity_id=group-1", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("filtered list: want 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 }

@@ -134,10 +134,15 @@ func TestTheCloseSealsThePeriodAndAReopenLiftsTheSeal(t *testing.T) {
 	k := &stubKernel{}
 	cl := closeClients()
 	r := kernelRouter(s, cl, k, false, true, nil)
-	for _, step := range []string{"soft-close", "close-review", "hard-close"} {
+	for _, step := range []string{"soft-close", "close-review"} {
 		if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/"+step, nil, "controller-1"); rr.Code != http.StatusOK {
 			t.Fatalf("%s: %d %s", step, rr.Code, rr.Body.String())
 		}
+	}
+	// A6: the certifier must differ from whoever prepared close review, so
+	// hard-close is a different principal from the soft-close/close-review steps.
+	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/hard-close", nil, "controller-2"); rr.Code != http.StatusOK {
+		t.Fatalf("hard-close: %d %s", rr.Code, rr.Body.String())
 	}
 	if k.actions() != "SEAL" || k.calls[0].Period != "2026-10" {
 		t.Fatalf("closing seals the period once: %v", k.calls)

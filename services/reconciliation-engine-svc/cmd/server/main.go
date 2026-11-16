@@ -12,12 +12,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
+
 	"zoiko.io/reconciliation-engine-svc/internal/authz"
 	"zoiko.io/reconciliation-engine-svc/internal/config"
-	"zoiko.io/reconciliation-engine-svc/internal/events"
 	"zoiko.io/reconciliation-engine-svc/internal/handler"
 	"zoiko.io/reconciliation-engine-svc/internal/mtls"
-	"zoiko.io/reconciliation-engine-svc/internal/outbox"
 	"zoiko.io/reconciliation-engine-svc/internal/source"
 	"zoiko.io/reconciliation-engine-svc/internal/store"
 	"zoiko.io/reconciliation-engine-svc/internal/telemetry"
@@ -33,6 +34,9 @@ func main() {
 		panic(err)
 	}
 	defer logger.Sync() //nolint:errcheck
+	if err := cfg.Validate(); err != nil {
+		logger.Fatal("invalid configuration", zap.Error(err))
+	}
 
 	logger.Info("Starting reconciliation-engine-svc", zap.String("port", cfg.Port))
 
@@ -56,16 +60,31 @@ func main() {
 		logger.Fatal("database ping failed", zap.Error(err))
 	}
 	logger.Info("Connected to PostgreSQL database")
-	dataStore := store.NewPgStore(dbPool)
 
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewPublisher(brokers, cfg.KafkaTopic, logger)
-	defer publisher.Close() //nolint:errcheck
+	// The shared outbox table must exist with the library's exact shape
+	// (migration 000012) before anything is enqueued or relayed.
+	if err := outbox.VerifySchema(ctx, dbPool); err != nil {
+		logger.Fatal("eventing outbox schema check failed", zap.Error(err))
+	}
+	dataStore := store.NewPgStore(dbPool, store.WithEventRegion(cfg.EventResidencyRegion))
 
-	relay := outbox.NewRelay(dbPool, publisher, 5*time.Second, 50, logger)
-	relayCtx, relayCancel := context.WithCancel(context.Background())
-	defer relayCancel()
-	go relay.Start(relayCtx)
+	// The shared relay (services/eventing) delivers eventing_outbox rows:
+	// leased claims, bounded retries with backoff, quarantine, acks=all.
+	writer, err := kafkaout.New(kafkaout.Config{Brokers: strings.Split(cfg.KafkaBrokers, ","), Topic: cfg.KafkaTopic})
+	if err != nil {
+		logger.Fatal("eventing outbox writer", zap.Error(err))
+	}
+	relay, err := outbox.NewRelay(dbPool, writer, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("eventing outbox relay", zap.Error(err))
+	}
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		relay.Run(relayCtx)
+	}()
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
@@ -111,7 +130,6 @@ func main() {
 	<-quit
 
 	logger.Info("Shutting down server...")
-	relayCancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -119,6 +137,17 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("Server forced to shutdown", zap.Error(err))
 	}
+
+	// Stop the relay after the last request has committed, and let its
+	// in-flight pass finish before the pool closes under it.
+	stopRelay()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("eventing outbox relay did not stop before the shutdown deadline")
+	}
+	writer.Close() //nolint:errcheck
+	dbPool.Close()
 
 	logger.Info("Server exiting")
 }

@@ -63,10 +63,15 @@ var (
 	TplAbstainStale      = Template{contract.Abstain, "I can't verify the current position on that right now, so I won't guess.", "", false, ""}
 	TplAbstainConflict   = Template{contract.Abstain, "I can't give a reliable answer on that right now because the official information is being reviewed.", "", false, ""}
 	TplClarifyMarket     = Template{contract.Clarify, "I can help you compare ZoikoSuite plans. Prices, taxes, billing options and availability are market-dependent. Which country are you evaluating ZoikoSuite for?", "", false, ""} // Doc 02 T05
-	TplClarifyPlan       = Template{contract.Clarify, "Which plan are you asking about?", "pricing", false, ""}
-	TplUnavailable       = Template{contract.Unavailable, "I'm unable to retrieve reliable information right now. Please try again or use the official ZoikoSuite Support Center.", "support", false, ""}                                           // Doc 02 T24 (the widget shows the reference)
-	TplOutOfScope        = Template{contract.Abstain, "I'm here to help with ZoikoSuite capabilities, plans, security, integrations, demos and support. I can help you find the right product information or support route.", "support", false, ""} // Doc 02 T25
-	TplClarifyGiveUp     = Template{contract.Abstain, "I'm not sure I can help with that here. The support team can point you in the right direction.", "support", false, ""}
+	// TplClarifyTrialMarket asks for the market when the question is about the
+	// trial: Doc 02 §18 S01 turn 1, word for word. The 30-day figure is the
+	// published pricing page's (Doc 01 §19, Doc 03 S03); a market's trial
+	// claims must state the same length or the release review flags it.
+	TplClarifyTrialMarket = Template{contract.Clarify, "The published pricing page describes a 30-day trial for eligible Starter and Growth plans. Eligibility varies by market. Which country are you evaluating ZoikoSuite for?", "", false, ""}
+	TplClarifyPlan        = Template{contract.Clarify, "Which plan are you asking about?", "pricing", false, ""}
+	TplUnavailable        = Template{contract.Unavailable, "I'm unable to retrieve reliable information right now. Please try again or use the official ZoikoSuite Support Center.", "support", false, ""}                                           // Doc 02 T24 (the widget shows the reference)
+	TplOutOfScope         = Template{contract.Abstain, "I'm here to help with ZoikoSuite capabilities, plans, security, integrations, demos and support. I can help you find the right product information or support route.", "support", false, ""} // Doc 02 T25
+	TplClarifyGiveUp      = Template{contract.Abstain, "I'm not sure I can help with that here. The support team can point you in the right direction.", "support", false, ""}
 	// TplAbstainCoverage: a regional capability in a named country without
 	// market-specific evidence (G12, G13): no assumed coverage.
 	TplAbstainCoverage = Template{contract.Abstain, "I can't confirm what's available in that country from approved ZoikoSuite sources. The team can confirm coverage for your country.", "demo", false, ""}
@@ -86,7 +91,7 @@ var (
 func init() {
 	for p, r := range map[*Template]string{
 		&TplAbstainNoEvidence: contract.ReasonNoEvidence, &TplAbstainStale: contract.ReasonExpiredSource,
-		&TplAbstainConflict: contract.ReasonClaimConflict, &TplClarifyMarket: contract.ReasonMarketRequired,
+		&TplAbstainConflict: contract.ReasonClaimConflict, &TplClarifyMarket: contract.ReasonMarketRequired, &TplClarifyTrialMarket: contract.ReasonMarketRequired,
 		&TplClarifyPlan: contract.ReasonPlanRequired, &TplUnavailable: contract.ReasonKnowledgeUnavailable,
 		&TplOutOfScope: contract.ReasonOutOfScope, &TplClarifyGiveUp: contract.ReasonClarifyExhausted,
 		&TplAbstainCoverage: contract.ReasonMarketNotCovered, &TplWelcome: contract.ReasonGreeting,
@@ -175,7 +180,7 @@ var TplEvidenceAssurance = Template{contract.Abstain, "ZoikoSuite describes evid
 
 // TplAbstainCertification answers a certification question that has no
 // verified trust claim: T10's due-diligence guidance, never a status.
-var TplAbstainCertification = Template{contract.Abstain, "I can't confirm a certification status from an approved trust claim in this chat. For due diligence, please review the current Trust Center or request scoped evidence.", "trust", false, contract.ReasonNoEvidence}
+var TplAbstainCertification = Template{contract.Abstain, "I can't confirm a certification status from an approved trust claim in this chat, and readiness activity for a security framework is not the same as an independent certification. For due diligence, please review the current Trust Center or request scoped evidence.", "trust", false, contract.ReasonNoEvidence}
 
 // TplDemoAccepted follows "yes" to a demo offer (Doc 02 S10): the official
 // form is opened; nothing is booked, scheduled or submitted from the chat.
@@ -240,14 +245,20 @@ var PartnershipRe = regexp.MustCompile(`(?i)\b(?:become|be|becoming) (?:an? )?(?
 var TplNoTools = Template{contract.RefusedAction, "I can't browse the web, call other systems or use external tools. I answer only from approved, public ZoikoSuite information.", "", false, contract.ReasonActionDenied}
 
 // ToolRequestRe asks the assistant to browse, search the web or run a tool.
-var ToolRequestRe = regexp.MustCompile(`(?i)\b(?:search|browse|google|look up) (?:the )?(?:web|internet|online)\b|\b(?:use|run|call|invoke) (?:an? )?(?:external |third-party )?(?:tool|plugin|api|function)s?\b|\bweb search\b`)
+var ToolRequestRe = regexp.MustCompile(`(?i)\b(?:search|browse|google|look up) (?:the )?(?:web|internet|online)\b|\b(?:use|run|call|invoke) (?:an? )?(?:external |third-party )?(?:tool|plugin|api|function)s?\b|\bweb search\b` +
+	// QA-T071 paraphrases: "Google this for me", "Fetch this URL and tell me what it says".
+	`|\bgoogle (?:this|that|it)\b|\b(?:fetch|open|visit|read|load|scrape|crawl) (?:this|that|the|a) (?:url|link|website|web ?page)\b`)
 
 // TplCredentialShared answers a visitor who says they shared a secret
 // (Doc 06 §20, Doc 02 T22) without the secret itself being in the message.
 var TplCredentialShared = ExceptionTemplates[X03SensitiveInput]
 
 // CredentialSharedRe: "I pasted my bank password", "I shared my PIN".
-var CredentialSharedRe = regexp.MustCompile(`(?i)\b(?:i|we)(?:'ve| have)? (?:pasted|shared|typed|sent|posted|entered|included)\b.{0,30}\b(?:password|passcode|pin|otp|one-time code|card number|bank details|credentials?|api key|token)\b`)
+// QA-T071 adds "I just typed…", "I accidentally shared my bank login…",
+// "just pasted my bank pwd" and "my credentials are in my last message".
+var CredentialSharedRe = regexp.MustCompile(`(?i)\b(?:i|we)(?:'ve| have)?\s+(?:just\s+|accidentally\s+|mistakenly\s+|also\s+)?(?:pasted|shared|typed|sent|posted|entered|included|put|gave|wrote)\b.{0,40}\b(?:password|passcode|pin|pwd|otp|one-time code|card number|bank details|bank login|banking login|login details|credentials?|api key|token)\b` +
+	`|^\s*(?:just\s+|oops,?\s+)?(?:pasted|typed|shared)\b.{0,30}\b(?:password|passcode|pwd|pin|credentials?|login details)\b` +
+	`|\b(?:password|passcode|pwd|credentials?|login details)\s+(?:is|are)\s+in\s+(?:my|the)\s+(?:last|previous|earlier)\s+message\b`)
 
 // TplSessionLimit: the conversation reached its per-session token cap
 // (Doc 06 §13). Only fixed content is served here; a new conversation has a

@@ -13,6 +13,33 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/capability-registry-svc/internal/domain"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
+)
+
+// Event types. Canonical types follow ZS-EVENT-001 §4
+// (com.zoikosuite.<domain>.<aggregate>.<fact>); the legacy types are the
+// pre-standard event_type strings existing consumers filter on, carried
+// alongside the canonical ones until every consumer has migrated.
+const (
+	eventCapabilityCreated             = "com.zoikosuite.platform.capability.created"
+	legacyCapabilityCreated            = "capability.created"
+	eventMarketReleaseCreated          = "com.zoikosuite.platform.market-release.created"
+	legacyMarketReleaseCreated         = "market_release.created"
+	eventIntegrationCapabilityCreated  = "com.zoikosuite.platform.integration-capability.created"
+	legacyIntegrationCapabilityCreated = "integration_capability.created"
+	eventIntegrationHealthUpdated      = "com.zoikosuite.platform.integration-capability.health-updated"
+	legacyIntegrationHealthUpdated     = "integration_capability.health_updated"
+	eventReleaseStateChanged           = "com.zoikosuite.platform.capability-release.state-changed"
+	legacyReleaseStateChanged          = "capability_release.state_changed"
+	eventCapabilityClaimCreated        = "com.zoikosuite.platform.capability-claim.created"
+	legacyCapabilityClaimCreated       = "capability_claim.created"
+
+	// aggregateCapability is the aggregate every event is about. Market
+	// releases, integration capabilities, releases and claims are children
+	// of a capability, so keying every event on the capability keeps one
+	// capability's whole history on one partition, in commit order.
+	aggregateCapability = "capability"
 )
 
 func isUniqueViolation(err error) bool {
@@ -77,11 +104,72 @@ type Store interface {
 }
 
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore at construction.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (ZS-EVENT-001 §4, envelope.Spec.ResidencyRegion — required, a controlled
+// lower-case code such as "uk" or "eu-west"). It comes from
+// EVENT_RESIDENCY_REGION, which config.Load requires: without it every write
+// would fail envelope validation, so the service refuses to start instead.
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// enqueueEvent builds and enqueues the one event a write produces, inside the
+// write's own transaction — the whole point of the transactional outbox
+// (ZS-EVENT-001 §6): the event and the state change it reports commit
+// atomically, or neither does. It is a single INSERT, so a write still costs
+// exactly what it did on the old outbox_events path.
+//
+// Every write path calls this one helper (modelled on
+// payee-banking-identity-svc's), so the envelope shape lives in one place.
+// tenant_id is always domain.PlatformScopeID (SPEC_DEVIATIONS B13); the
+// caller's X-Tenant-Id scopes only the idempotency key. aggregate_version is
+// left unset: these tables have no per-aggregate version counter, and the
+// envelope treats it as optional rather than inventing one.
+//
+// legacyType is passed explicitly every time: envelope.New silently defaults
+// it to the canonical type when empty, which would break every consumer
+// still filtering on the old name.
+func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, canonicalType, legacyType, capabilityID string, claim domain.IdempotencyClaim, data any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            canonicalType,
+		LegacyType:      legacyType,
+		Service:         "capability-registry-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        domain.PlatformScopeID,
+		AggregateType:   aggregateCapability,
+		AggregateID:     capabilityID,
+		CorrelationID:   claim.CorrelationID,
+		ActorID:         claim.PrincipalID,
+		ResidencyRegion: s.eventRegion,
+		// Confidential, as in the template: claim events carry not-yet-public
+		// marketing wording and approver principal IDs, and release events
+		// reveal unreleased capabilities — all gated reads in this service.
+		Classification: envelope.Confidential,
+		Data:           data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", canonicalType, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue %s event: %w", canonicalType, err)
+	}
+	return nil
 }
 
 // claimIdempotency is INV-08's actual enforcement point, run inside the same
@@ -148,20 +236,6 @@ func (s *PgStore) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return tx.Commit(ctx)
 }
 
-func insertOutboxEvent(ctx context.Context, tx pgx.Tx, claim domain.IdempotencyClaim) error {
-	if claim.OutboxEventID == "" || len(claim.OutboxPayload) == 0 {
-		return errors.New("outbox event is missing its ID or payload")
-	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO outbox_events (outbox_event_id, entity_id, payload)
-		VALUES ($1, $2, $3)
-	`, claim.OutboxEventID, claim.OutboxEntityID, claim.OutboxPayload)
-	if err != nil {
-		return fmt.Errorf("insert outbox event: %w", err)
-	}
-	return nil
-}
-
 func (s *PgStore) CreateCapability(ctx context.Context, c *domain.Capability, claim domain.IdempotencyClaim) error {
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		if err := claimIdempotency(ctx, tx, claim); err != nil {
@@ -181,7 +255,7 @@ func (s *PgStore) CreateCapability(ctx context.Context, c *domain.Capability, cl
 			}
 			return fmt.Errorf("insert capability: %w", err)
 		}
-		return insertOutboxEvent(ctx, tx, claim)
+		return s.enqueueEvent(ctx, tx, eventCapabilityCreated, legacyCapabilityCreated, c.CapabilityID, claim, c)
 	})
 }
 
@@ -238,7 +312,7 @@ func (s *PgStore) CreateMarketRelease(ctx context.Context, m *domain.MarketRelea
 			}
 			return fmt.Errorf("insert market release: %w", err)
 		}
-		return insertOutboxEvent(ctx, tx, claim)
+		return s.enqueueEvent(ctx, tx, eventMarketReleaseCreated, legacyMarketReleaseCreated, m.CapabilityID, claim, m)
 	})
 }
 
@@ -323,7 +397,7 @@ func (s *PgStore) CreateIntegrationCapability(ctx context.Context, i *domain.Int
 			}
 			return fmt.Errorf("insert integration capability: %w", err)
 		}
-		return insertOutboxEvent(ctx, tx, claim)
+		return s.enqueueEvent(ctx, tx, eventIntegrationCapabilityCreated, legacyIntegrationCapabilityCreated, i.CapabilityID, claim, i)
 	})
 }
 
@@ -374,17 +448,28 @@ func (s *PgStore) UpdateIntegrationHealth(ctx context.Context, integrationCapabi
 			return err
 		}
 		now := time.Now().UTC()
-		tag, err := tx.Exec(ctx, `
+		// RETURNING capability_id gives the event its aggregate in the same
+		// statement: the health update is keyed on its parent capability like
+		// every other event, so it can never overtake the
+		// integration_capability.created event it follows.
+		var capabilityID string
+		err := tx.QueryRow(ctx, `
 			UPDATE integration_capabilities SET health_status = $1, updated_at = $2
 			WHERE integration_capability_id = $3
-		`, healthStatus, now, integrationCapabilityID)
+			RETURNING capability_id::text
+		`, healthStatus, now, integrationCapabilityID).Scan(&capabilityID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrIntegrationCapabilityNotFound
+		}
 		if err != nil {
 			return fmt.Errorf("update integration health: %w", err)
 		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrIntegrationCapabilityNotFound
-		}
-		return insertOutboxEvent(ctx, tx, claim)
+		return s.enqueueEvent(ctx, tx, eventIntegrationHealthUpdated, legacyIntegrationHealthUpdated, capabilityID, claim,
+			map[string]string{
+				"integration_capability_id": integrationCapabilityID,
+				"capability_id":             capabilityID,
+				"health_status":             healthStatus,
+			})
 	})
 }
 
@@ -407,7 +492,7 @@ func (s *PgStore) CreateRelease(ctx context.Context, r *domain.Release, claim do
 			}
 			return fmt.Errorf("insert release: %w", err)
 		}
-		return insertOutboxEvent(ctx, tx, claim)
+		return s.enqueueEvent(ctx, tx, eventReleaseStateChanged, legacyReleaseStateChanged, r.CapabilityID, claim, r)
 	})
 }
 
@@ -478,7 +563,7 @@ func (s *PgStore) CreateCapabilityClaim(ctx context.Context, c *domain.Capabilit
 			}
 			return fmt.Errorf("insert capability claim: %w", err)
 		}
-		return insertOutboxEvent(ctx, tx, claim)
+		return s.enqueueEvent(ctx, tx, eventCapabilityClaimCreated, legacyCapabilityClaimCreated, c.CapabilityID, claim, c)
 	})
 }
 

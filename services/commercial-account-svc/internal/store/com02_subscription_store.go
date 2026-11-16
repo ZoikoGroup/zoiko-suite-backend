@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // SubscriptionStore is the COM-02 persistence contract. Every method runs in
@@ -20,7 +19,7 @@ import (
 // scope set to the customer's organization by the handler, after the
 // operator's platform permission has been checked.
 type SubscriptionStore interface {
-	SetAccountMarket(ctx context.Context, accountID, marketCode, actor string, now time.Time) error
+	SetAccountMarket(ctx context.Context, accountID, marketCode, actor string, now time.Time, claim domain.IdempotencyClaim) error
 	StartSubscription(ctx context.Context, p domain.StartSubscriptionParams, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error)
 	ActivateSubscription(ctx context.Context, c domain.SubscriptionCommand, customerConfirmation bool, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error)
 	ScheduleCancellation(ctx context.Context, c domain.SubscriptionCommand, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error)
@@ -69,8 +68,19 @@ func (s *PgStore) subscriptionTx(ctx context.Context, fn func(pgx.Tx) error) err
 // SetAccountMarket records the market a customer buys in. It is seller-side
 // data: it decides which offers the account is sold, never the account's own
 // tax or business settings.
-func (s *PgStore) SetAccountMarket(ctx context.Context, accountID, marketCode, actor string, now time.Time) error {
+//
+// Claims the caller's Idempotency-Key (SPEC_DEVIATIONS A4): a retry after a
+// lost response returns domain.IdempotentReplayError (resourceID is the
+// account id) instead of silently re-applying the same market change, which
+// would be harmless here only by coincidence (the write is a plain
+// overwrite, not additive) — the claim is the same guarantee every other
+// canonical command in this service already makes, not a reaction to a
+// specific bug this write has.
+func (s *PgStore) SetAccountMarket(ctx context.Context, accountID, marketCode, actor string, now time.Time, claim domain.IdempotencyClaim) error {
 	return s.subscriptionTx(ctx, func(tx pgx.Tx) error {
+		if err := claimIdempotency(ctx, tx, claim); err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE commercial_accounts
 			   SET market_code = $2, market_set_at = $3, market_set_by_principal_id = $4, updated_at = $3
@@ -552,13 +562,11 @@ type subscriptionEvent struct {
 	OccurredAt     time.Time               `json:"occurred_at"`
 }
 
-func emitSubscriptionEvent(ctx context.Context, tx pgx.Tx, eventType string, sub *domain.Subscription, m changeMeta, e subscriptionEvent) error {
+func (s *PgStore) emitSubscriptionEvent(ctx context.Context, tx pgx.Tx, eventType string, sub *domain.Subscription, m changeMeta, e subscriptionEvent) error {
 	e.SubscriptionID, e.OrganizationID, e.ChangeID = sub.SubscriptionID, sub.OrganizationID, m.changeID
 	e.ActorID, e.Channel, e.OccurredAt = m.actor, m.channel, m.now
 	org := sub.OrganizationID
-	return outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "subscription", AggregateID: sub.SubscriptionID, EventType: eventType, Payload: e, TenantID: &org,
-	})
+	return s.emit(ctx, tx, eventType, "subscription", sub.SubscriptionID, org, m.actor, e)
 }
 
 // ── StartSubscription ────────────────────────────────────────────────────────
@@ -674,7 +682,7 @@ func (s *PgStore) StartSubscription(ctx context.Context, p domain.StartSubscript
 		if err := agg.applyPlan(ctx, tx, lp, items, plan, m); err != nil {
 			return err
 		}
-		if err := emitSubscriptionEvent(ctx, tx, "subscription.started", agg.sub, m, subscriptionEvent{
+		if err := s.emitSubscriptionEvent(ctx, tx, "subscription.started", agg.sub, m, subscriptionEvent{
 			ChangeType: domain.ChangeStarted, Status: lp.Versions[0].Status, EffectiveAt: p.StartsAt,
 			EndsAt: lp.EndsAt, PriceVersionID: plan.PriceVersionID, Schedule: lp.Versions,
 		}); err != nil {
@@ -684,7 +692,7 @@ func (s *PgStore) StartSubscription(ctx context.Context, p domain.StartSubscript
 		// dependent entitlement state. A start that is already effective is a
 		// real transition; a future start is left to the boundary worker.
 		if !p.StartsAt.After(p.Now) {
-			if _, err := recomputeEntitlementsTx(ctx, tx, org, p.Actor, p.Now); err != nil {
+			if _, err := s.recomputeEntitlementsTx(ctx, tx, org, p.Actor, p.Now); err != nil {
 				return err
 			}
 		}
@@ -785,13 +793,13 @@ func (s *PgStore) ActivateSubscription(ctx context.Context, c domain.Subscriptio
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, lp.EndsAt); err != nil {
 			return err
 		}
-		if err := emitSubscriptionEvent(ctx, tx, "subscription.activated", a.sub, m, subscriptionEvent{
+		if err := s.emitSubscriptionEvent(ctx, tx, "subscription.activated", a.sub, m, subscriptionEvent{
 			ChangeType: lp.Versions[0].ChangeType, Status: domain.LifecycleActive,
 			EffectiveAt: lp.Versions[0].EffectiveFrom, EndsAt: lp.EndsAt, Schedule: lp.Versions,
 		}); err != nil {
 			return err
 		}
-		return recomputeAfterLifecycle(ctx, tx, a, m)
+		return s.recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -826,12 +834,12 @@ func (s *PgStore) ScheduleCancellation(ctx context.Context, c domain.Subscriptio
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, &boundary); err != nil {
 			return err
 		}
-		if err := emitSubscriptionEvent(ctx, tx, "subscription.cancellation_scheduled", a.sub, m, subscriptionEvent{
+		if err := s.emitSubscriptionEvent(ctx, tx, "subscription.cancellation_scheduled", a.sub, m, subscriptionEvent{
 			ChangeType: domain.ChangeCancellationScheduled, Status: domain.LifecycleCanceled, EffectiveAt: boundary, EndsAt: &boundary,
 		}); err != nil {
 			return err
 		}
-		return recomputeAfterLifecycle(ctx, tx, a, m)
+		return s.recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -865,12 +873,12 @@ func (s *PgStore) CancelNow(ctx context.Context, c domain.SubscriptionCommand, c
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, &endsAt); err != nil {
 			return err
 		}
-		if err := emitSubscriptionEvent(ctx, tx, "subscription.canceled", a.sub, m, subscriptionEvent{
+		if err := s.emitSubscriptionEvent(ctx, tx, "subscription.canceled", a.sub, m, subscriptionEvent{
 			ChangeType: domain.ChangeCanceledNow, Status: domain.LifecycleCanceled, EffectiveAt: c.Now, EndsAt: &endsAt,
 		}); err != nil {
 			return err
 		}
-		return recomputeAfterLifecycle(ctx, tx, a, m)
+		return s.recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -893,12 +901,12 @@ func (s *PgStore) Reactivate(ctx context.Context, c domain.SubscriptionCommand, 
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, nil); err != nil {
 			return err
 		}
-		if err := emitSubscriptionEvent(ctx, tx, "subscription.changed", a.sub, m, subscriptionEvent{
+		if err := s.emitSubscriptionEvent(ctx, tx, "subscription.changed", a.sub, m, subscriptionEvent{
 			ChangeType: domain.ChangeReactivated, Status: domain.LifecycleActive, EffectiveAt: c.Now,
 		}); err != nil {
 			return err
 		}
-		return recomputeAfterLifecycle(ctx, tx, a, m)
+		return s.recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -911,10 +919,10 @@ func (s *PgStore) Reactivate(ctx context.Context, c domain.SubscriptionCommand, 
 // (COM-CTRL-003).
 func (s *PgStore) Renew(ctx context.Context, c domain.SubscriptionCommand, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error) {
 	return s.subscriptionCommand(ctx, c, claim, func(tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
-		if err := renewApply(ctx, tx, a, m); err != nil {
+		if err := s.renewApply(ctx, tx, a, m); err != nil {
 			return err
 		}
-		return recomputeAfterLifecycle(ctx, tx, a, m)
+		return s.recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -924,16 +932,16 @@ func (s *PgStore) Renew(ctx context.Context, c domain.SubscriptionCommand, claim
 // EntitlementSnapshotChanged with the transition, not after a separate
 // operator call. A future start/activation is intentionally skipped: its
 // boundary worker will recompute when the effective time arrives.
-func recomputeAfterLifecycle(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
+func (s *PgStore) recomputeAfterLifecycle(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
 	if a.sub.StartsAt.After(m.now) {
 		return nil
 	}
-	_, err := recomputeEntitlementsTx(ctx, tx, a.sub.OrganizationID, m.actor, m.now)
+	_, err := s.recomputeEntitlementsTx(ctx, tx, a.sub.OrganizationID, m.actor, m.now)
 	return err
 }
 
 // renewApply is Renew's body, shared with the boundary worker.
-func renewApply(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
+func (s *PgStore) renewApply(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
 	spans, lt := a.termSpans()
 	if len(lt) == 0 {
 		return fmt.Errorf("%w: the subscription has no term to renew", domain.ErrSubscriptionInvalidState)
@@ -966,7 +974,7 @@ func renewApply(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, m chan
 	if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, endsAt); err != nil {
 		return err
 	}
-	return emitSubscriptionEvent(ctx, tx, "subscription.renewed", a.sub, m, subscriptionEvent{
+	return s.emitSubscriptionEvent(ctx, tx, "subscription.renewed", a.sub, m, subscriptionEvent{
 		EffectiveAt: next.StartsAt, EndsAt: endsAt, TermNo: a.nextTermNo(),
 	})
 }

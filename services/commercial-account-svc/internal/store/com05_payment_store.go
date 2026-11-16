@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // PaymentStore is the COM-05 persistence contract, part 5b.
@@ -135,8 +134,7 @@ func (s *PgStore) CollectPayment(ctx context.Context, attemptID, invoiceID, acto
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "payment_attempt", AggregateID: attemptID,
-			EventType: "payment_attempt.created", TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "payment_attempt.created", "payment_attempt", attemptID, got.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -199,13 +197,12 @@ func (s *PgStore) RecordProviderOutcome(ctx context.Context, req domain.RecordOu
 			if err != nil {
 				return err
 			}
-			if err := emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.Amount, "DEBIT",
+			if err := s.emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.Amount, "DEBIT",
 				"payment_attempt", got.AttemptID); err != nil {
 				return err
 			}
 		}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "payment_attempt", AggregateID: req.AttemptID,
-			EventType: eventType, TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, eventType, "payment_attempt", req.AttemptID, got.OrganizationID, claim.PrincipalID, got)
 	})
 	return out, err
 }

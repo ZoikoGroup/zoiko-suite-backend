@@ -43,18 +43,31 @@ reconciliation-engine-svc holds for DATA-07.
   instead of fetching every entry and adding them up itself; moving it onto
   this endpoint is that service's change, not this one.
 - **A2. `ListUnmatchedIntercompany` does not exist as such; the list endpoint
-  that stands in for it is unscoped.** `GET /v1/intercompany/entries` has no
-  status filter, no period filter and no pagination. When neither
-  `source_legal_entity_id` nor `target_legal_entity_id` is given it **skips the
-  authorization check entirely** and returns every entry in the tenant to any
-  caller with an `X-Principal-Id` header. This conflicts with the spec's
-  "Scoped read" control and "cross-entity isolation with authorized group
-  scope" (NFR). It cannot be closed by simply requiring a filter:
-  consolidation-svc's `FetchMatchedIntercompanyEntries` depends on the
-  unfiltered call (it filters for MATCHED on its side). Scope: add `status`
-  and period filters plus cursor pagination; require either an entity filter
-  or a group-scope authorization (a group-level action checked on the group
-  entity); move consolidation-svc onto the scoped form in the same change.
+  that stands in for it was unscoped. — The unscoped-read gap closed
+  2026-11-06.** `GET /v1/intercompany/entries` has no status filter, no
+  period filter and no pagination. When neither `source_legal_entity_id` nor
+  `target_legal_entity_id` is given it used to **skip the authorization check
+  entirely** and return every entry in the tenant to any caller with an
+  `X-Principal-Id` header — this conflicted with the spec's "Scoped read"
+  control and "cross-entity isolation with authorized group scope" (NFR).
+  `ListEntries` now refuses (400 `missing_fields`) a request naming neither
+  filter, and the authorization check (against whichever side is given) is
+  unconditional rather than skipped when both are empty.
+  consolidation-svc's own A5 pass already moved it off the unfiltered call
+  (one `source_legal_entity_id`-filtered call per child entity), so no
+  caller anywhere in the platform depends on the unfiltered form — checked
+  across the repository.
+  Still open: `status` and period filters, cursor pagination, and the
+  group-scope authorization alternative (a group-level action checked on the
+  group entity, for a caller that legitimately wants a group-wide view
+  without naming one entity) — none of these are needed to close the
+  security gap itself, so left for a separate pass.
+  - *Manual check:* `internal/handler/a2_list_scope_test.go` —
+    `TestListEntries_NoEntityFilter_Refused` (400), `TestListEntries_SourceOnlyFilter_Authorized`
+    and `TestListEntries_TargetOnlyFilter_Authorized` (200, each filter alone
+    is enough), `TestListEntries_AuthzDenied_Refused` (403 is still reachable,
+    the check is not bypassed by supplying a filter the caller fails
+    authorization on).
 - **A3. `ExplainMismatch` is a free-text string. — Closed (B9).** Migration
   000007 adds `intercompany_match_attempts`: one append-only, tenant-scoped
   row per applied MatchIntercompany attempt, written in the `UpdateMatch`
@@ -119,15 +132,24 @@ reconciliation-engine-svc holds for DATA-07.
   Matched/MismatchDetected), so no acknowledgement event is invented. All
   three new events are enqueued in the same guarded transaction as the
   state change; a failed enqueue rolls the change back.
-- **A8. No segregation of duties on resolution.** §14: "One entity cannot
-  certify both sides of material mismatch without compensating control."
-  Dispute and resolve use different actions, but both are authorized on the
-  **target** entity only, and nothing stops the principal who raised a dispute
-  from resolving it, or a target-entity user from resolving a mismatch with no
-  source-entity involvement. There is no materiality notion to scope it.
-  Needs a decision on what "certify both sides" means here (resolver ≠
-  disputer; or source and target each acknowledge; or a materiality threshold
-  above which both are required) before it is built.
+- **A8. No segregation of duties on resolution. — Resolver ≠ disputer closed
+  2026-11-06.** §14: "One entity cannot certify both sides of material
+  mismatch without compensating control." Dispute and resolve use different
+  actions, but both are authorized on the **target** entity only, and
+  nothing stopped the principal who raised a dispute from resolving it.
+  `ResolveMismatch` now refuses (403 `self_resolution_forbidden`) a
+  principal who is also the pair's own `DisputedByPrincipalID`, applied
+  unconditionally rather than building a materiality model the spec never
+  defines — the same interpretation financial-close-svc's B1 made for every
+  maker-checker gate in that register.
+  Still open: nothing requires source-entity involvement in a resolution a
+  target-entity user alone can make (the spec's "both sides" reading beyond
+  resolver-independence), and there is still no materiality threshold above
+  which that stronger reading would apply. Left open — a real design
+  decision on what "both sides" requires, not a mechanical fix.
+  - *Manual check:* `internal/handler/acc11_lifecycle_test.go` —
+    `TestResolveMismatch_SamePrincipalAsDisputer_Refused` (403, and the pair
+    does not move), an independent resolver still succeeds.
 - **A9. No `Closed` state, and `RESOLVED` records no outcome. — Closed
   (B8).** Migration 000006 adds `CLOSED`, the terminal state of a MATCHED
   pair (`POST …/entries/{id}/close`, with a required reason). It also

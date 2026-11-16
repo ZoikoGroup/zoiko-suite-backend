@@ -102,6 +102,30 @@ groups:
           runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-04-rollback-and-safe-static-doc-08-19"
           summary: "Assistant: no verified knowledge/claim release active (serving fallbacks)"
 
+      # SEC-T030 (Doc 06): a release whose signature fails or whose chunk text
+      # no longer matches its checksum was refused. That is tampering or a
+      # broken build, not just staleness: page and freeze promotion.
+      - alert: PublicAIReleaseIntegrityRejected
+        expr: sum by (reason) (increase(public_ai_release_rejections_total{reason=~"signature|checksum"}[15m])) > 0
+        labels:
+          severity: page
+          freeze_promotion: "true"
+        annotations:
+          runbook: "RB-04"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-04-rollback-and-safe-static-doc-08-19"
+          summary: "Assistant: a release failed its {{ $labels.reason }} check and was refused (possible tampering)"
+
+      # Any other refusal (draft or synthetic content, invalid claims, policy
+      # mismatch) needs the release owner, not a page.
+      - alert: PublicAIReleaseRejected
+        expr: sum by (reason) (increase(public_ai_release_rejections_total{reason!~"signature|checksum"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          runbook: "RB-04"
+          runbook_url: "https://github.com/ZoikoGroup/zoiko-suite-backend/blob/main/services/public-ai-svc/RUNBOOK.md#rb-04-rollback-and-safe-static-doc-08-19"
+          summary: "Assistant: a release was refused at load ({{ $labels.reason }})"
+
       # Event integrity (Doc 05 §20, CT-047): dead letters need a replay
       # decision (kbctl dlq-replay, CT-042).
       - alert: PublicAIEventsDeadLettered
@@ -128,7 +152,7 @@ groups:
       # Doc 08 §13: a revoked source reached the commit check. The answer was
       # withheld, but revocation propagation is lagging somewhere.
       - alert: PublicAIRevocationRejectedAtCommit
-        expr: increase(public_ai_commit_revocation_rejections_total[15m]) > 0
+        expr: sum by (release, market) (increase(public_ai_commit_revocation_rejections_total[15m])) > 0
         labels:
           severity: page
           freeze_promotion: "true"

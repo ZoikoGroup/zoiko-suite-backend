@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/envelope"
+
 	"zoiko.io/financial-control-svc/internal/domain"
 	"zoiko.io/financial-control-svc/internal/store"
 )
@@ -75,7 +77,7 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	}
-	testStore = store.New(testPool, zap.NewNop())
+	testStore = store.New(testPool, zap.NewNop(), store.WithEventProfile(testEventRegion, envelope.Confidential))
 	code := m.Run()
 	testPool.Close()
 	_ = pg.Stop()
@@ -337,7 +339,7 @@ func TestRun_AdvanceHappyPath_WritesTransitionsAndOutbox(t *testing.T) {
 	assert.Equal(t, 1, dims["RESULT"])
 	assert.Equal(t, 1, dims["CERTIFICATION"])
 
-	rows, err := testPool.Query(ctx, `SELECT event_type FROM outbox_events WHERE tenant_id = $1 AND aggregate_id = $2 ORDER BY created_at, outbox_event_id`, tenant, run.RunID)
+	rows, err := testPool.Query(ctx, `SELECT event_type FROM `+legacyEvents+` WHERE tenant_id = $1 AND aggregate_id = $2 ORDER BY created_at, outbox_id`, tenant, run.RunID)
 	require.NoError(t, err)
 	defer rows.Close()
 	seen := map[string]bool{}
@@ -403,7 +405,7 @@ func TestRun_TechnicalFailureCanNeverBecomePass(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition, "NOT_EVALUATED is not certifiable")
 
 	var failedEvents int
-	require.NoError(t, testPool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'control.run.failed'`, run.RunID).Scan(&failedEvents))
+	require.NoError(t, testPool.QueryRow(ctx, `SELECT count(*) FROM `+legacyEvents+` WHERE aggregate_id = $1 AND event_type = 'control.run.failed'`, run.RunID).Scan(&failedEvents))
 	assert.Equal(t, 1, failedEvents)
 }
 

@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/payee-banking-identity-svc/internal/authz"
 	"zoiko.io/payee-banking-identity-svc/internal/config"
 	"zoiko.io/payee-banking-identity-svc/internal/counterparty"
@@ -22,8 +24,7 @@ import (
 	"zoiko.io/payee-banking-identity-svc/internal/health"
 	"zoiko.io/payee-banking-identity-svc/internal/middleware"
 	"zoiko.io/payee-banking-identity-svc/internal/store"
-	"zoiko.io/eventing/kafkaout"
-	"zoiko.io/eventing/outbox"
+	"zoiko.io/payee-banking-identity-svc/internal/tokenization"
 )
 
 func main() {
@@ -64,7 +65,21 @@ func main() {
 		logger.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
 
-	pgStore := store.NewPgStore(pool, logger, store.WithEventRegion(cfg.EventResidencyRegion))
+	// Tokenization of account identifiers. TOKENIZATION_ENFORCED decides only
+	// whether NEW destinations are tokenized. A privileged read of an
+	// existing tokenized destination needs the client regardless of that
+	// flag — a destination tokenized while enforcement was on stays
+	// tokenized after it is turned off — so the client is built whenever a
+	// service URL is configured. Building it makes no call.
+	var tokenizer tokenization.Tokenizer
+	if cfg.TokenizationServiceURL != "" {
+		tokenizer = tokenization.NewClient(cfg.TokenizationServiceURL)
+	}
+	if cfg.TokenizationEnforced {
+		logger.Info("account-identifier tokenization enforced", zap.String("tokenization_service_url", cfg.TokenizationServiceURL))
+	}
+	pgStore := store.NewPgStore(pool, logger, store.WithEventRegion(cfg.EventResidencyRegion),
+		store.WithTokenization(tokenizer, cfg.TokenizationEnforced))
 
 	// Transactional outbox relay (ZS-EVENT-001 §6). Every ORG-10 event is
 	// written to eventing_outbox in the same transaction as the state
@@ -96,7 +111,7 @@ func main() {
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	partyClient := counterparty.NewHTTPClient(cfg.CounterpartyServiceURL, logger)
 
-	h := handler.New(pgStore, authzClient, partyClient, logger)
+	h := handler.New(pgStore, authzClient, partyClient, logger).WithTokenizer(tokenizer)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
