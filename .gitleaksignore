@@ -53,3 +53,8 @@ b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integrati
 # already pushed.
 737515e70c7e1268e62b181a6c98fe119ecfe28a:services/identity-context-svc/internal/context/handler_au09_test.go:generic-api-key:119
 5724147f4da998f5d6f11872732cdf4bb6e37cfe:services/identity-context-svc/internal/context/handler_lifecycle_test.go:generic-api-key:196
+#
+# eventing secret gate (ZS-EVENT-001 E-15): services/eventing/envelope/secrets_test.go carries a
+# synthetic JWT as a test vector the gate must refuse. It is not a credential. The line now
+# carries `gitleaks:allow`; this covers the commit that introduced it, already pushed.
+1d8de38117e437afca4d7c1fd10164d81664e4e7:services/eventing/envelope/secrets_test.go:jwt:31

@@ -28,7 +28,7 @@ func TestEnvelopeNewBlocksAccessToken_EV_T09(t *testing.T) {
 
 func TestScanSecrets_ValuesThatAreSecretWhereverTheySit(t *testing.T) {
 	cases := map[string]string{
-		"jwt":        `{"note":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r"}`,
+		"jwt":        `{"note":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r"}`, // gitleaks:allow -- synthetic JWT: a test vector the secret gate must refuse
 		"pem":        `{"x":"-----BEGIN RSA PRIVATE KEY-----\nMIIE"}`,
 		"bearer":     `{"header":"Bearer abcdefghijklmnop1234567890"}`,
 		"aws key id": `{"x":"AKIAIOSFODNN7EXAMPLE"}`,
