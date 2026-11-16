@@ -317,7 +317,21 @@ Step 19, defects found in the console and fixed (FE `326958d`):
   closing a remediation case one opened); misleading messages for `source_not_ready`,
   `import_version_conflict` and a bare `conflict`.
 
-Not run live (17 checks): certify and everything after it in the pack lifecycle. Certification needs a
+| Step | Change | Commit | Evidence |
+|---|---|---|---|
+| 20 S5 | `provenance_incomplete` (nothing cited; an obligation rule without regime, interpretation or sources, named) apart from `source_not_ready` (a cited source not reviewed or superseded); `ring_ordinal_taken` naming the ring that holds the order (was a bare 409 `conflict`) | b00bd5fc | registryit calendar / obligation publish and taken-ordinal assertions; store 92/0/0, registryit 143/0/0 on fresh databases; e2e 82/82 |
+| 21 S5 | pack release half driven live through the console: the tax officer granted `CONSOLE_DEMO_OPERATOR` on the platform scope through the Authorization console (the user's decision) and certified; then publish, deploy, block / unblock, hotfix + retrospective, rollback, supersede, withdraw, remediation | FE 65b5121 | live harness 146/146 (fresh data); `tests/e2e/console/jurisdictions.spec.ts` 9/9 with `playwright.jurisdictions.config.ts`; vitest 189/189 |
+
+Step 21, console defects found and fixed: gate reasons of a blocked deploy or supersede dropped;
+Declare hotfix offered only on CERTIFIED / RELEASED versions (the service allows DRAFT / REVIEW, naming an
+older released version); Compile and Submit test bundle offered on DRAFT (the service takes both only
+under REVIEW); a failed async operation shown without its reason (`problem`, not `error`). Added: an
+async-operation lookup with Cancel (no list route), the ring list in rollout order, the country code as a
+badge instead of emoji flags. Still not driven live: positive answers of the calculation, obligation
+due-date and submission-profile evaluators (the test pack carries one rule), and a hotfix's own release
+(two approving reviewers, the incident commander's ring-order exception: needs a fourth granted principal).
+
+Before step 21 (not run live then, 17 checks): certify and everything after it in the pack lifecycle. Certification needs a
 certifier independent of the author, compiler, test author and reviewers: three principals with
 JURISDICTION_* grants. Locally only admin and legal counsel hold them; granting a third is the user's call
 (tracker JR-8). The rest of the gaps are in the tracker, D2-1 "Remaining gaps (16 Nov)".
