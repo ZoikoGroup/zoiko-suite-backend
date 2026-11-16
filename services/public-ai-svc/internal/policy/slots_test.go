@@ -41,8 +41,10 @@ func TestDemoReply(t *testing.T) {
 		t.Fatalf("S10: %q", tpl.Text)
 	}
 	tpl, ask = DemoReply("I need to reschedule my demo.", "")
-	if ask || tpl.Text != RouteTemplates["I08"].Text {
-		t.Fatalf("reschedule must get the plain route: %q", tpl.Text)
+	// Doc 10 COM-05: an existing booking goes to its reschedule route;
+	// nothing is looked up or changed from the chat.
+	if ask || tpl.Text != TplDemoReschedule.Text {
+		t.Fatalf("reschedule must get the reschedule route: %q", tpl.Text)
 	}
 	for _, r := range []string{tpl.Text, TplDemoQualify.Text} {
 		if strings.Contains(strings.ToLower(r), "booked for you") && !strings.Contains(r, "haven't booked") {

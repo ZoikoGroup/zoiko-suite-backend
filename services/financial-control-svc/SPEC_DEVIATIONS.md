@@ -199,9 +199,9 @@ policies a run pins.
   certification (the certifier cannot have created or acted on the run) and
   every waiver (not by the exception owner). There is no per-control policy to
   relax it.
-- **B5. ZS-EVENT-001 CloudEvents naming is not used.** Events use the
-  platform's shared envelope with ZS-EVENT attributes as extra fields; a
-  platform-wide decision is needed (closure §5).
+- **B5. ZS-EVENT-001 CloudEvents naming is not used.** *Superseded by B10.*
+  Events now use the shared CloudEvents-aligned envelope (`services/eventing`),
+  which still carries the legacy fields the audit store reads.
 - **B6. How certification revocation works (A1).**
   - *State.* Only the certification dimension moves, CERTIFIED → REVOKED.
     `domain.ValidateCertificationRevocation` admits it only on a lifecycle
@@ -410,3 +410,88 @@ policies a run pins.
     resolved one being reported again after a re-apply. Otherwise it drops
     the table. The same `DO $$ … RAISE EXCEPTION` guard as 000006/000007,
     with a table check so it can be re-run.
+- **B10. Events go through the shared transactional outbox (tracker #63).**
+  `internal/outbox` and `internal/events` are retired.
+  - *One helper.* `enqueueEvent` (`internal/store/eventing.go`) builds every
+    event. `emit` (aggregate `control-run`) and `emitException` (aggregate
+    `control-exception`) are one-line wrappers over it.
+    - It runs `outbox.Enqueue` on the command's own transaction, which is
+      still one INSERT.
+    - The shared relay in `cmd/server` delivers the events. It uses leased
+      claims, bounded backoff, a broker probe, quarantine and `acks=all`.
+    - Migration 000012 adds `eventing_outbox` as `outbox.SchemaSQL` plus
+      `outbox.HardeningSQL`, both verbatim. `VerifySchema` gates startup.
+  - *Event names.* ZS-CONTROL-001 §26 ("Domain Event Contract") names the
+    events `control.run.certified`, `control.exception.sla_breached` and so
+    on. ZS-EVENT-001 §5.1 requires
+    `com.zoikosuite.<domain>.<aggregate>.<past-tense-fact>` in lower-case
+    kebab form. The Event Catalogue's §19 inventory lists no family for this
+    producer: its "Governance & Control" family is `governance.*` platform
+    events.
+    - So the canonical type keeps §26's own words, prefixed and kebab-cased:
+      `com.zoikosuite.control.run.ready-for-certification`.
+    - Every §26 name is still emitted as the legacy `event_type`.
+    - `TestEventingOutbox_CanonicalTypes` lists all 21 types.
+  - *Aggregate version.* Run events carry the run's post-change version as
+    `aggregateversion`. The old publisher read the same value from the
+    payload's `version`.
+  - *Classification and region.* `EVENT_RESIDENCY_REGION` and
+    `EVENT_CLASSIFICATION` are now required at startup, with no default.
+    - Before, a blank value was published as `UNSPECIFIED`, which the shared
+      envelope rejects.
+    - Both stay per-deployment decisions; the service does not pick a
+      classification.
+  - *RLS on the outbox (a change to 000001's design).* 000001 left
+    `outbox_events` without RLS because its relay polled every tenant with
+    no tenant scope set. The shared relay marks its transactions with
+    `app.outbox_relay`, so `eventing_outbox` now has the same isolation as
+    every tenant table: own tenant, or the relay.
+    - Every event write runs in `withRLS`, which sets `app.tenant_id`. That
+      includes the sweeper and the late-data check, which apply each change
+      under that row's tenant. So the policy refuses no legitimate writer.
+    - The policy casts only the setting:
+      `tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid::text`.
+      The policies in 000001 compare as UUID, so a request may spell its
+      tenant in upper case. A plain text comparison would refuse that
+      request's event write and fail the command.
+    - The stored `tenant_id` is always canonical text, and the column is
+      never cast, so no row can make the relay's scan raise.
+  - *Carry-over.* Undelivered `outbox_events` rows are carried over, rebuilt
+    as the body the old publisher sent.
+    - `event_id` is the old `outbox_event_id`, which was already the stable
+      `X-Event-ID`.
+    - `tenant_id` and `legal_entity_id` are cast explicitly from UUID to
+      text.
+    - The old relay's dead letters (`publish_attempts >= 10`) arrive
+      `quarantined`.
+    - An unmapped aggregate type fails the migration atomically.
+    - `published_at`, `residency_region` and `classification` are left out
+      of the rebuilt body. The old publisher stamped them at publish time.
+    - `outbox_events` is kept as delivery evidence (ZS-EVENT-001 §6.1).
+  - *Ordering.* The partition key is the library's
+    `sha256(tenant 0x00 aggregate 0x00 id)`. The old one was
+    `sha256(tenant ":" id)`. Ordering is still per aggregate, as before.
+  - *Consumer-visible body changes.*
+    - The legacy fields the audit store reads are kept: `event_type`,
+      `emitted_at`, `schema_version`, `source_service`, `payload`, plus the
+      tenant, entity, actor and correlation.
+    - The old extra attributes now use their canonical names:
+      `aggregate_id` becomes `aggregateid`, `payload_hash` becomes
+      `payloadhash`, `residency_region` becomes `residencyregion`.
+    - `event_version` and `aggregate_type` are no longer in the body.
+    - The SLA sweep's events keep their existing correlation id `sweep`.
+  - *Verification* (`internal/store/eventing_outbox_integration_test.go`,
+    `-tags integration`):
+    - all seven call sites, each step's exact events, keys, actor,
+      correlation, entity and version;
+    - a forced rollback, and a failed enqueue that rolls back the run and
+      its idempotency record;
+    - a replay adds nothing;
+    - isolation as a NOSUPERUSER NOBYPASSRLS role, including an upper-case
+      tenant;
+    - the shared relay delivers both tenants' events and retries under the
+      same id;
+    - the carry-over, including casts, quarantine and relay delivery;
+    - an unmapped aggregate fails the migration.
+    - Three deliberate breakages were each caught: dropped correlation,
+      exception events keyed on the run, and a text-compare policy.

@@ -926,6 +926,41 @@ $BUNDLES = @(
             # actions above.
             "COMMERCIAL_CURRENCY_MANAGE"
         )
+    },
+    @{
+        # banking-connector-svc: create a bank connection and ingest its
+        # statements (the BANKING_* constants in internal/handler/handler.go).
+        # Needed by the tokenization live check, which creates a connection
+        # through the real API.
+        Code    = "BANKING_CONNECTOR_FULL"
+        Service = "banking-connector-svc"
+        Actions = @("BANKING_CONNECTION_CREATE", "BANKING_STATEMENT_INGEST")
+    },
+    @{
+        # payee-banking-identity-svc (ORG-10): propose and approve payee
+        # destinations. Maker-checker still holds: authorization-svc's
+        # own-object SoD refuses the proposer approving their own destination.
+        # PAYEE_MASTER_PRIVILEGED_READ (the FULL account identifier) is
+        # deliberately NOT here -- see BANK_DETAIL_READER below.
+        Code    = "PAYEE_MASTER_FULL"
+        Service = "payee-banking-identity-svc"
+        Actions = @("PAYEE_MASTER_ADMIN", "PAYEE_MASTER_APPROVE")
+    },
+    @{
+        # key-management-svc's token vault. TOKEN_CREATE only: with
+        # TOKENIZATION_ENFORCED on, every connection the demo principal creates
+        # and every payee destination it proposes is tokenized under its own
+        # principal, which therefore needs TOKEN_CREATE at its legal entity.
+        # Creating a token discloses nothing.
+        #
+        # TOKEN_DETOKENIZE is deliberately NOT here. Everything in $BUNDLES
+        # lands on CONSOLE_DEMO_OPERATOR, assigned to both demo principals on
+        # the legal entity AND the tenant -- the broad grant Security Standard
+        # SEC-T15 says detokenization must not be. It is granted only by the
+        # two narrow roles in $TOKENIZATION_ROLES below.
+        Code    = "KMS_TOKENIZE"
+        Service = "key-management-svc"
+        Actions = @("TOKEN_CREATE")
     }
 )
 
@@ -1664,6 +1699,124 @@ foreach ($pair in $REF01_SOD_PAIRS) {
         Write-Host "     maker unexpectedly holds $($pair[1])" -ForegroundColor Red
     } else {
         Write-Host ("     maker/checker split holds for {0}" -f $pair[1]) -ForegroundColor Green
+    }
+}
+
+# --- Token vault: who may see raw bank details (TOKEN_DETOKENIZE) -----------
+#
+# Security Standard SEC-T15: "detokenization requires additional scoped
+# approval". So TOKEN_DETOKENIZE is held by exactly two principals, each for a
+# stated reason, on the demo LEGAL ENTITY ONLY -- not the tenant, not the
+# platform scope, and never the console's demo principals:
+#
+#   TOKENIZATION_BACKFILL -> svc-tokenization-backfill
+#       TOKEN_CREATE + TOKEN_DETOKENIZE. The one-off backfill
+#       (cmd/tokenize-backfill in banking-connector-svc and
+#       payee-banking-identity-svc) tokenizes each legacy raw value and must
+#       detokenize it straight back to prove the round trip before writing
+#       anything. It needs both, and nothing else.
+#
+#   BANK_DETAIL_READER -> $BANK_DETAIL_READER_ID
+#       TOKEN_DETOKENIZE + PAYEE_MASTER_PRIVILEGED_READ. The one reader who
+#       genuinely needs a full account number: banking-connector-svc's
+#       GET .../connections/{id}/account-number checks TOKEN_DETOKENIZE, and
+#       payee-banking-identity-svc reveals a tokenized identifier only to a
+#       principal holding BOTH its own PAYEE_MASTER_PRIVILEGED_READ and the
+#       vault's TOKEN_DETOKENIZE.
+#
+# The demo principals keep TOKEN_CREATE (KMS_TOKENIZE above) and get masked
+# views only; the verification below fails the seed if either of them ever
+# ends up holding TOKEN_DETOKENIZE.
+$TOKEN_BACKFILL_ID     = "svc-tokenization-backfill"
+$BANK_DETAIL_READER_ID = "77777777-7777-4777-8777-777777777777"
+$TOKENIZATION_ROLES = @(
+    @{
+        RoleId     = "5eed0000-0000-4000-8000-00000000a011"
+        Code       = "TOKENIZATION_BACKFILL"
+        Name       = "Token vault backfill (one-off)"
+        Principal  = $TOKEN_BACKFILL_ID
+        BundleCode = "TOKEN_BACKFILL"
+        Actions    = @("TOKEN_CREATE", "TOKEN_DETOKENIZE")
+    },
+    @{
+        RoleId     = "5eed0000-0000-4000-8000-00000000a012"
+        Code       = "BANK_DETAIL_READER"
+        Name       = "Bank detail reader (full account numbers)"
+        Principal  = $BANK_DETAIL_READER_ID
+        BundleCode = "BANK_DETAIL_READ"
+        Actions    = @("TOKEN_DETOKENIZE", "PAYEE_MASTER_PRIVILEGED_READ")
+    }
+)
+
+foreach ($r in $TOKENIZATION_ROLES) {
+    $roleMissing = @()
+    foreach ($action in $r.Actions) {
+        $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+            principal_id = $r.Principal; legal_entity_id = $LEGAL_ENTITY; action_type = $action
+        }
+        if ($probe.body.decision_outcome -ne "GRANTED") { $roleMissing += $action }
+    }
+    if ($roleMissing.Count -eq 0) {
+        Write-Host "$($r.Code): already granted to $($r.Principal)" -ForegroundColor Green
+        continue
+    }
+    Write-Host "$($r.Code): $($roleMissing.Count) grants missing" -ForegroundColor Yellow
+    Write-Host "role $($r.Code)" -NoNewline
+    try {
+        $role = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/roles" -Body @{
+            role_id                 = $r.RoleId
+            tenant_id               = $TENANT_ID
+            role_code               = $r.Code
+            role_name               = $r.Name
+            role_scope_type         = "LEGAL_ENTITY"
+            created_by_principal_id = $SEED_ADMIN_ID
+        }
+        Write-Host "  -> $($role.status)"
+    } catch {
+        Write-Host "  -> already exists, or could not be created; continuing to the bundle" -ForegroundColor DarkGray
+    }
+    $bundle = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/roles/$($r.RoleId)/permission-bundles" -Body @{
+        bundle_code       = $r.BundleCode
+        permitted_actions = $r.Actions
+    }
+    Write-Host "bundle $($r.BundleCode)  -> $($bundle.status) [$($bundle.body.permitted_actions -join ', ')]"
+    # The legal entity only -- deliberately no tenant or platform-scope
+    # assignment, unlike the REF05/REF01 roles.
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $LEGAL_ENTITY -Label "legal entity"
+}
+
+Write-Host "Verifying token-vault grants:" -ForegroundColor Cyan
+foreach ($r in $TOKENIZATION_ROLES) {
+    foreach ($action in $r.Actions) {
+        $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+            principal_id = $r.Principal; legal_entity_id = $LEGAL_ENTITY; action_type = $action
+        }
+        if ($probe.body.decision_outcome -ne "GRANTED") {
+            $failed += "$action ($($r.Code) for $($r.Principal))"
+            Write-Host ("     {0,-28} {1,-28} -> {2}" -f $r.Principal, $action, $probe.body.decision_outcome) -ForegroundColor Red
+        } else {
+            Write-Host ("     {0,-28} {1,-28} -> GRANTED" -f $r.Principal, $action) -ForegroundColor Green
+        }
+    }
+}
+# The narrowness is the point: neither console demo principal may detokenize.
+foreach ($p in @($PRINCIPAL_ID, $APPROVER_ID)) {
+    foreach ($scope in @($LEGAL_ENTITY, $TENANT_ID)) {
+        try {
+            $outcome = (Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $p; legal_entity_id = $scope; action_type = "TOKEN_DETOKENIZE"
+            }).body.decision_outcome
+        } catch {
+            # A tenant-as-entity probe can be refused outright
+            # (tenant_scope_mismatch) -- which is not a grant either.
+            $outcome = "REFUSED"
+        }
+        if ($outcome -eq "GRANTED") {
+            $failed += "$p unexpectedly holds TOKEN_DETOKENIZE on $scope"
+            Write-Host "     $p holds TOKEN_DETOKENIZE on $scope -- too broad" -ForegroundColor Red
+        } else {
+            Write-Host "     $p does not hold TOKEN_DETOKENIZE on $scope ($outcome)" -ForegroundColor Green
+        }
     }
 }
 

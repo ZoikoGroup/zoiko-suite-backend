@@ -17,7 +17,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // ── D1: evidence package query ──────────────────────────────────────────────
@@ -112,17 +111,13 @@ func (s *PgStore) RegisterTaxJurisdiction(ctx context.Context, organizationID st
 // any of the commands that call this, so a tenant-supplied accounting-book
 // reference has no field to be injected through (COM-CTRL-033, negative
 // path #44 refused by construction).
-func emitAccountingEvent(ctx context.Context, tx pgx.Tx, organizationID, mappingKey, amount, direction, sourceType, sourceID string) error {
-	return outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "accounting_event", AggregateID: sourceID,
-		EventType: "accounting_event.recorded", TenantID: &organizationID,
-		Payload: map[string]any{
-			"accounting_mapping_key": mappingKey,
-			"amount":                 amount,
-			"direction":              direction,
-			"source_type":            sourceType,
-			"source_id":              sourceID,
-		},
+func (s *PgStore) emitAccountingEvent(ctx context.Context, tx pgx.Tx, organizationID, mappingKey, amount, direction, sourceType, sourceID string) error {
+	return s.emit(ctx, tx, "accounting_event.recorded", "accounting_event", sourceID, organizationID, "", map[string]any{
+		"accounting_mapping_key": mappingKey,
+		"amount":                 amount,
+		"direction":              direction,
+		"source_type":            sourceType,
+		"source_id":              sourceID,
 	})
 }
 
@@ -218,8 +213,7 @@ func (s *PgStore) OpenDispute(ctx context.Context, disputeID, invoiceID, payment
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dispute_case", AggregateID: disputeID,
-			EventType: "dispute.opened", TenantID: &attempt.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "dispute.opened", "dispute_case", disputeID, attempt.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -253,8 +247,7 @@ func (s *PgStore) RecordDisputeOutcome(ctx context.Context, disputeID string, ou
 		if outcome == domain.DisputeLost {
 			eventType = "dispute.lost"
 		}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dispute_case", AggregateID: disputeID,
-			EventType: eventType, TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, eventType, "dispute_case", disputeID, got.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -286,8 +279,7 @@ func (s *PgStore) CloseDispute(ctx context.Context, disputeID, notes, actor stri
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dispute_case", AggregateID: disputeID,
-			EventType: "dispute.resolved", TenantID: &got.OrganizationID, Payload: got})
+		return s.emit(ctx, tx, "dispute.resolved", "dispute_case", disputeID, got.OrganizationID, actor, got)
 	})
 	return out, err
 }

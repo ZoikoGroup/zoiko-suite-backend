@@ -164,7 +164,7 @@ func (s *PgStore) RecordWatermarkCheck(ctx context.Context, tenantID string, c W
 			}
 			if !unresolved && (prior == nil || *prior != c.Observed) {
 				e := domain.LateDataException(run, c.Snapshot, c.Observed, c.OwnerRole, c.At)
-				if err := openException(ctx, tx, run, e, "opened by late-data check: source changed after certification",
+				if err := s.openException(ctx, tx, run, e, "opened by late-data check: source changed after certification",
 					c.Actor, c.CorrelationID, map[string]any{
 						"side": string(c.Snapshot.Side), "population_id": c.Snapshot.PopulationID, "spec_ref": c.Snapshot.SpecRef,
 						"frozen_watermark": c.Snapshot.Watermark, "observed_watermark": c.Observed,

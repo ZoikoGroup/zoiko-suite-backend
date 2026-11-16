@@ -14,17 +14,18 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 
 	"zoiko.io/commercial-account-svc/internal/authz"
 	"zoiko.io/commercial-account-svc/internal/boundary"
 	"zoiko.io/commercial-account-svc/internal/config"
 	svcenvelope "zoiko.io/commercial-account-svc/internal/envelope"
-	"zoiko.io/commercial-account-svc/internal/events"
 	"zoiko.io/commercial-account-svc/internal/handler"
 	"zoiko.io/commercial-account-svc/internal/health"
 	"zoiko.io/commercial-account-svc/internal/middleware"
 	"zoiko.io/commercial-account-svc/internal/mtls"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 	"zoiko.io/commercial-account-svc/internal/store"
 	"zoiko.io/commercial-account-svc/internal/telemetry"
 )
@@ -60,14 +61,19 @@ func main() {
 	poolCfg.HealthCheckPeriod = 1 * time.Minute
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		logger.Warn("unable to connect to database on startup", zap.Error(err))
-	} else {
-		logger.Info("connected to postgres database")
+		// Fatal, not a warning: the outbox schema check below and every write
+		// need the pool, and a nil pool would only fail later, per request.
+		logger.Fatal("unable to create database pool", zap.Error(err))
 	}
+	logger.Info("connected to postgres database")
 
-	pgStore := store.NewPgStore(pool)
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+	// The shared outbox table must exist with the library's exact shape
+	// (migration 000021) before anything is enqueued or relayed.
+	if err := outbox.VerifySchema(ctx, pool); err != nil {
+		logger.Fatal("eventing outbox schema check failed", zap.Error(err))
+	}
+	pgStore := store.NewPgStore(pool,
+		store.WithEventProfile(cfg.EventResidencyRegion, envelope.Classification(cfg.EventClassification)))
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
@@ -81,7 +87,7 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, authzClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -111,14 +117,25 @@ func main() {
 	handler.RegisterDunningRoutes(r, handler.NewDunningHandler(pgStore, authzClient, logger))
 	handler.RegisterDisputeRoutes(r, handler.NewDisputeHandler(pgStore, pgStore, authzClient, logger))
 
-	// Outbox relay (doc7 backlog item 32 pilot): publishes rows written by
-	// PgStore.CreateSubscription in the same transaction as the business
-	// write, decoupling "the fact is durable" from "Kafka was reachable at
-	// that exact moment." Runs until relayCancel is called at shutdown.
+	// Shared outbox relay (services/eventing): delivers every eventing_outbox
+	// row the store wrote in the same transaction as its business write —
+	// leased claims, bounded retries with backoff, quarantine, acks=all.
+	writer, err := kafkaout.New(kafkaout.Config{Brokers: strings.Split(cfg.KafkaBrokers, ","), Topic: cfg.KafkaEventsTopic})
+	if err != nil {
+		logger.Fatal("eventing outbox writer", zap.Error(err))
+	}
+	relay, err := outbox.NewRelay(pool, writer, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("eventing outbox relay", zap.Error(err))
+	}
+	// relayCtx also stops the boundary worker below.
 	relayCtx, relayCancel := context.WithCancel(context.Background())
 	defer relayCancel()
-	relay := outbox.NewRelay(pool, publisher, 5*time.Second, 50, logger)
-	go relay.Start(relayCtx)
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		relay.Run(relayCtx)
+	}()
 
 	// Subscription boundary worker: renews auto-renewing terms at their end
 	// and publishes events for versions as they take effect. Safe to run in
@@ -151,8 +168,15 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
 	}
-	if pool != nil {
-		pool.Close()
+	// Stop the relay and the boundary worker after the last request has
+	// committed, let the relay's in-flight pass finish, then close the pool.
+	relayCancel()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("eventing outbox relay did not stop before the shutdown deadline")
 	}
+	_ = writer.Close()
+	pool.Close()
 	logger.Info("server stopped cleanly")
 }

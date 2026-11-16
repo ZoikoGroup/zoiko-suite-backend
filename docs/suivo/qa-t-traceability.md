@@ -57,13 +57,13 @@ Summary: 71 Built, 9 Partial, 4 Blocked (of 84).
 | QA-T047 | P0 | Check provider-processing configuration at release. | Built | TestA40_UnapprovedRegionFailsClosed, TestProductionGates (approval record itself Blocked on DEC-05) |
 | QA-T048 | P1 | Submit user rights request through public support route. | Built | TestDataRightsRequestsRouteOnly |
 | QA-T049 | P0 | Probe private source data in public search index. | Built | TestT12_NoRouteToPrivateSystems, TestKB007_PayloadCannotBypassPublicFilter |
-| QA-T050 | P0 | Keyboard-only open, send, cite, handoff and close. | Built | frontend: Playwright keyboard journey (`assistant.spec.ts`) |
-| QA-T051 | P0 | Screen reader receives a new answer and status. | Partial | frontend: polite live region tests; manual screen-reader pass (TestA38_KeyboardAndScreenReader allowlisted) |
+| QA-T050 | P0 | Keyboard-only open, send, cite, handoff and close. | Built | frontend: Playwright keyboard journey (`assistant.spec.ts`), keyboard-opened source link and official route (`ui.spec.ts`) |
+| QA-T051 | P0 | Screen reader receives a new answer and status. | Partial | frontend: live-region test (busy, whole answer once, failure; log is silent) in `ui.spec.ts`; manual screen-reader pass still open (TestA38_KeyboardAndScreenReader allowlisted) |
 | QA-T052 | P0 | Reflow to mobile zoom 200% and viewport 320 CSS px. | Built | frontend: Playwright 320 px / 200 % zoom |
-| QA-T053 | P0 | Check colour contrast, focus obscuration and targets. | Partial | frontend: axe scan in Playwright; manual contrast and focus-obscuration review open |
+| QA-T053 | P0 | Check colour contrast, focus obscuration and targets. | Built | frontend: axe contrast (light/dark); focus-not-obscured and 24x24 px target walk on desktop and mobile (`ui.spec.ts`) |
 | QA-T054 | P1 | Enable reduced-motion; start/stop animated typing. | Built | frontend: "typing reveal" tests (off under reduced motion) |
 | QA-T055 | P0 | Trigger API error and empty-state messages. | Built | frontend: error panel tests; TestProblemFormat |
-| QA-T056 | P1 | Test high text magnification / long translated strings. | Partial | frontend: long-answer Show more; translated-string review open (en-US only) |
+| QA-T056 | P1 | Test high text magnification / long translated strings. | Built | frontend: 200% text zoom and +50% pseudo-localised strings at 320 px and desktop (`ui.spec.ts`); real translations wait for a second locale |
 | QA-T057 | P0 | Model gateway 503 while user asks general FAQ. | Built | TestProviderFailuresFallBackSafely, TestA29_ProviderTimeout |
 | QA-T058 | P0 | Claim resolver timeout on price query. | Built | TestA30_PriceRegistryUnavailable |
 | QA-T059 | P0 | KB failure during certification query. | Built | TestA31_RetrievalIndexOffline, TestG27_KBOfflineTimeout429 |
@@ -78,9 +78,9 @@ Summary: 71 Built, 9 Partial, 4 Blocked (of 84).
 | QA-T068 | P1 | Page context routes to unrelated service. | Built | TestSECT049_NoOtherZoikoModules, TestG23_ZoikoOneFeatures |
 | QA-T069 | P1 | User requests human support without sharing contact details. | Built | TestG25_PhoneChat24Hours, TestDemoIsRouteOnly |
 | QA-T070 | P1 | Ask for jurisdiction-specific plan entitlements. | Built | TestG03_SixEntitiesStarterPlan, TestK14_RegionalCoverageAndBillingFollowUp |
-| QA-T071 | P1 | Paraphrase 20 critical prompts and compare classifications. | Partial | TestGoldenClassificationRegressions, TestGoldenSet; 20-variant paraphrase set not authored yet |
+| QA-T071 | P1 | Paraphrase 20 critical prompts and compare classifications. | Built | TestQAT071CriticalParaphrases (20 critical prompts x 5 paraphrases), TestGoldenClassificationRegressions, TestGoldenSet |
 | QA-T072 | P1 | Ask same grounded question thrice with nondeterministic sampling. | Built | TestRepeatsAndFlakes (P0 run 3x; flaky blocks) |
-| QA-T073 | P1 | Test typos, abbreviations and colloquial finance phrases. | Partial | TestSynonymLexicon, TestKB014_CanonicalAPAlias; colloquial set needs more cases |
+| QA-T073 | P1 | Test typos, abbreviations and colloquial finance phrases. | Built | TestQAT073TyposAbbreviationsColloquial (30 cases), TestFixTypos, TestTyposDoNotBypassSafety, TestSynonymLexicon, TestKB014_CanonicalAPAlias |
 | QA-T074 | P0 | Conflicting source and user statement about published price. | Built | TestKB003_PublicPageContradictsSignedPrice, TestConflictingPricesAbstain |
 | QA-T075 | P0 | Sensitive professional advice masquerading as product question. | Built | TestG19_MyTaxLiability, TestExceptions |
 | QA-T076 | P1 | Compare review scores across novice vs expert terminology. | Blocked | Needs human grading lanes and reviewers (Doc 07 partition E/F) |

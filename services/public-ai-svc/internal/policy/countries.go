@@ -302,3 +302,12 @@ func MarketOf(text string) string {
 	}
 	return ""
 }
+
+// WithoutMarket returns text with every country name it contains replaced by
+// a space, so what is left can be judged on its own.
+func WithoutMarket(text string) string {
+	for _, a := range countryAliases {
+		text = a.re.ReplaceAllString(text, " ")
+	}
+	return text
+}

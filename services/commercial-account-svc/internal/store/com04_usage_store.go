@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // UsageStore is the COM-04 persistence contract.
@@ -93,8 +92,7 @@ func (s *PgStore) RegisterMeterDefinition(ctx context.Context, m *domain.MeterDe
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "meter_definition",
-			AggregateID: got.MeterKey + "/" + fmt.Sprint(got.MeterVersion), EventType: "meter_definition.registered", Payload: got})
+		return s.emit(ctx, tx, "meter_definition.registered", "meter_definition", got.MeterKey+"/"+fmt.Sprint(got.MeterVersion), PlatformScopeID, claim.PrincipalID, got)
 	})
 	return out, err
 }
@@ -376,8 +374,7 @@ func (s *PgStore) RegisterUsageEvent(ctx context.Context, organizationID, subscr
 				}
 			}
 			out = e
-			return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_event", AggregateID: meterKey + "/" + usageEventID,
-				EventType: "usage.quarantined", TenantID: &organizationID, Payload: e})
+			return s.emit(ctx, tx, "usage.quarantined", "usage_event", meterKey+"/"+usageEventID, organizationID, claim.PrincipalID, e)
 		}
 
 		st, err := findOrCreateOpenStatement(ctx, tx, subscriptionID, termNo, *m, observedAt)
@@ -408,8 +405,7 @@ func (s *PgStore) RegisterUsageEvent(ctx context.Context, organizationID, subscr
 			return err
 		}
 		out = e
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_event", AggregateID: meterKey + "/" + usageEventID,
-			EventType: "usage.accepted", TenantID: &organizationID, Payload: e})
+		return s.emit(ctx, tx, "usage.accepted", "usage_event", meterKey+"/"+usageEventID, organizationID, claim.PrincipalID, e)
 	})
 	return out, err
 }
@@ -478,9 +474,7 @@ func (s *PgStore) registerLateEvent(ctx context.Context, tx pgx.Tx, organization
 	if err := bumpStatement(ctx, tx, &target.StatementID, in.Quantity, observedAt, true); err != nil {
 		return e, err
 	}
-	return e, outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_event", AggregateID: m.MeterKey + "/" + usageEventID,
-		EventType: "usage.late_adjustment_created", TenantID: &organizationID,
-		Payload: map[string]any{"adjustment_id": adjID, "origin_statement_id": origin.StatementID, "target_statement_id": target.StatementID}})
+	return e, s.emit(ctx, tx, "usage.late_adjustment_created", "usage_event", m.MeterKey+"/"+usageEventID, organizationID, "", map[string]any{"adjustment_id": adjID, "origin_statement_id": origin.StatementID, "target_statement_id": target.StatementID})
 }
 
 const usageAdjustmentColumns = `adjustment_id, origin_statement_id, target_statement_id, meter_key, source_usage_event_id,
@@ -552,8 +546,7 @@ func (s *PgStore) CreateUsageAdjustment(ctx context.Context, targetStatementID, 
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_adjustment", AggregateID: adjID,
-			EventType: "usage_adjustment.created", Payload: got})
+		return s.emit(ctx, tx, "usage_adjustment.created", "usage_adjustment", adjID, source.OrganizationID, actor, got)
 	})
 	return out, err
 }
@@ -693,6 +686,47 @@ func scanStatement(row pgx.Row) (*domain.UsageStatement, error) {
 	return &st, nil
 }
 
+// statementOrganization is the organization a usage statement belongs to,
+// as one more column of the statement read that already precedes each
+// statement event — so the event knows its tenant with no extra round-trip.
+//
+// usage_statements carries no organization_id, and the seller plane these
+// commands run on cannot read subscriptions (tenant-only RLS, 000007). It can
+// read usage_event_records, which records the organization on every event:
+// a statement is only ever created by an ingested event for its subscription
+// (findOrCreateOpenStatement), events are never deleted, and one
+// subscription belongs to one organization — so any event of the statement's
+// subscription names it. If none did, the column is NULL and the event is
+// refused (no tenant) rather than attributed to anyone.
+const statementOrganization = `(SELECT e.organization_id::text FROM usage_event_records e
+	WHERE e.subscription_id = usage_statements.subscription_id LIMIT 1)`
+
+// loadStatementForEvent is loadStatement plus the statement's organization.
+func loadStatementForEvent(ctx context.Context, tx pgx.Tx, statementID string) (*domain.UsageStatement, string, error) {
+	var org *string
+	st, err := scanStatement(withExtraScan{tx.QueryRow(ctx, `SELECT `+usageStatementColumns+`, `+statementOrganization+`
+		FROM usage_statements WHERE statement_id = $1`, statementID), []any{&org}})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", domain.ErrStatementNotFound
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	if org == nil {
+		return st, "", nil
+	}
+	return st, *org, nil
+}
+
+// withExtraScan appends destinations to a row's Scan, so a scanner written
+// for a fixed column list can read extra trailing columns.
+type withExtraScan struct {
+	pgx.Row
+	extra []any
+}
+
+func (r withExtraScan) Scan(dest ...any) error { return r.Row.Scan(append(dest, r.extra...)...) }
+
 func loadStatement(ctx context.Context, tx pgx.Tx, statementID string, forUpdate bool) (*domain.UsageStatement, error) {
 	q := `SELECT ` + usageStatementColumns + ` FROM usage_statements WHERE statement_id = $1`
 	if forUpdate {
@@ -763,7 +797,7 @@ func adjustmentEvents(ctx context.Context, tx pgx.Tx, statementID string) ([]dom
 
 // closeWindow is CloseUsageWindow's body, shared between the handler-facing
 // command and the boundary worker at term end.
-func closeWindow(ctx context.Context, tx pgx.Tx, subscriptionID string, termNo int, meterKey, actor string, now time.Time) (*domain.UsageStatement, error) {
+func (s *PgStore) closeWindow(ctx context.Context, tx pgx.Tx, subscriptionID string, termNo int, meterKey, actor string, now time.Time) (*domain.UsageStatement, error) {
 	var statementID string
 	err := tx.QueryRow(ctx, `SELECT statement_id FROM usage_statements
 		WHERE subscription_id = $1 AND term_no = $2 AND meter_key = $3 AND status <> 'SUPERSEDED'`,
@@ -785,19 +819,18 @@ func closeWindow(ctx context.Context, tx pgx.Tx, subscriptionID string, termNo i
 		WHERE statement_id = $1`, statementID, now, actor); err != nil {
 		return nil, err
 	}
-	got, err := loadStatement(ctx, tx, statementID, false)
+	got, org, err := loadStatementForEvent(ctx, tx, statementID)
 	if err != nil {
 		return nil, err
 	}
-	return got, outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_statement", AggregateID: statementID,
-		EventType: "usage.window_frozen", Payload: got})
+	return got, s.emit(ctx, tx, "usage.window_frozen", "usage_statement", statementID, org, actor, got)
 }
 
 // freezeAndCertifyTermUsage closes and certifies every usage statement open
 // for a subscription's term, whatever meter each is under — called by the
 // boundary worker exactly once when that term ends (migration 000011 wires
 // no separate usage-window calendar; the subscription term IS the window).
-func freezeAndCertifyTermUsage(ctx context.Context, tx pgx.Tx, subscriptionID string, termNo int, actor string, now time.Time) error {
+func (s *PgStore) freezeAndCertifyTermUsage(ctx context.Context, tx pgx.Tx, subscriptionID string, termNo int, actor string, now time.Time) error {
 	rows, err := tx.Query(ctx, `SELECT meter_key FROM usage_statements
 		WHERE subscription_id = $1 AND term_no = $2 AND status = 'OPEN'`, subscriptionID, termNo)
 	if err != nil {
@@ -808,11 +841,11 @@ func freezeAndCertifyTermUsage(ctx context.Context, tx pgx.Tx, subscriptionID st
 		return err
 	}
 	for _, meterKey := range meterKeys {
-		st, err := closeWindow(ctx, tx, subscriptionID, termNo, meterKey, actor, now)
+		st, err := s.closeWindow(ctx, tx, subscriptionID, termNo, meterKey, actor, now)
 		if err != nil {
 			return err
 		}
-		if _, err := certifyStatement(ctx, tx, st.StatementID, actor, now); err != nil {
+		if _, err := s.certifyStatement(ctx, tx, st.StatementID, actor, now); err != nil {
 			return err
 		}
 	}
@@ -825,7 +858,7 @@ func (s *PgStore) CloseUsageWindow(ctx context.Context, subscriptionID string, t
 		if err := claimIdempotency(ctx, tx, claim); err != nil {
 			return err
 		}
-		got, err := closeWindow(ctx, tx, subscriptionID, termNo, meterKey, actor, now)
+		got, err := s.closeWindow(ctx, tx, subscriptionID, termNo, meterKey, actor, now)
 		out = got
 		return err
 	})
@@ -838,7 +871,7 @@ func (s *PgStore) CloseUsageWindow(ctx context.Context, subscriptionID string, t
 // that already has adjustment lines targeting it certifies as ADJUSTED
 // instead of CERTIFIED, so a reader can see at a glance that its total
 // isn't purely this window's own organic usage.
-func certifyStatement(ctx context.Context, tx pgx.Tx, statementID, actor string, now time.Time) (*domain.UsageStatement, error) {
+func (s *PgStore) certifyStatement(ctx context.Context, tx pgx.Tx, statementID, actor string, now time.Time) (*domain.UsageStatement, error) {
 	st, err := loadStatement(ctx, tx, statementID, true)
 	if err != nil {
 		return nil, err
@@ -875,12 +908,11 @@ func certifyStatement(ctx context.Context, tx pgx.Tx, statementID, actor string,
 		statementID, status, total, now, actor); err != nil {
 		return nil, err
 	}
-	got, err := loadStatement(ctx, tx, statementID, false)
+	got, org, err := loadStatementForEvent(ctx, tx, statementID)
 	if err != nil {
 		return nil, err
 	}
-	return got, outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_statement", AggregateID: statementID,
-		EventType: "usage.statement_certified", Payload: got})
+	return got, s.emit(ctx, tx, "usage.statement_certified", "usage_statement", statementID, org, actor, got)
 }
 
 func (s *PgStore) CertifyUsageStatement(ctx context.Context, statementID, actor string, now time.Time, claim domain.IdempotencyClaim) (*domain.UsageStatement, error) {
@@ -889,7 +921,7 @@ func (s *PgStore) CertifyUsageStatement(ctx context.Context, statementID, actor 
 		if err := claimIdempotency(ctx, tx, claim); err != nil {
 			return err
 		}
-		got, err := certifyStatement(ctx, tx, statementID, actor, now)
+		got, err := s.certifyStatement(ctx, tx, statementID, actor, now)
 		out = got
 		return err
 	})
@@ -944,14 +976,13 @@ func (s *PgStore) ReopenWindow(ctx context.Context, statementID, actor, reason s
 			WHERE statement_id = $1 AND status = 'ACCEPTED'`, statementID, replacementID); err != nil {
 			return err
 		}
-		got, err := loadStatement(ctx, tx, replacementID, false)
+		got, org, err := loadStatementForEvent(ctx, tx, replacementID)
 		if err != nil {
 			return err
 		}
 		out = got
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_statement", AggregateID: statementID,
-			EventType: "usage.window_reopened", Payload: map[string]any{"superseded_statement_id": statementID,
-				"replacement_statement_id": replacementID, "reason": reason, "actor_id": actor}})
+		return s.emit(ctx, tx, "usage.window_reopened", "usage_statement", statementID, org, actor, map[string]any{"superseded_statement_id": statementID,
+			"replacement_statement_id": replacementID, "reason": reason, "actor_id": actor})
 	})
 	return out, err
 }
