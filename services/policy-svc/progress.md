@@ -1,6 +1,57 @@
 # Policy Service — Progress & Phase Plan
 
-## Governance Platform audit closure — 2026-10-14 (current status)
+## Completion pass — 16 November 2026 (current status; supersedes everything below)
+
+Tracker: `docs/audit_files/DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md` §D2-3. Branch
+`shashi-changes`. Suite (golang:1.26, scratch Postgres 16, store suites as a NOSUPERUSER
+NOBYPASSRLS role, `REQUIRE_DB_TESTS=1`): **240 passing (224 top-level), 0 failing, 0 skipped**
+across 13 packages, up from 206 at the start of the pass. Migrations 000010–000012 were checked
+up/down/up on scratch.
+
+### Commits of this pass
+
+| Commit | What |
+|---|---|
+| `9f8a20f9` | Authorize lifecycle commands once (was twice); one precondition rule for GOV-05 and accounting (If-Match or `expected_version`, `*` refused, 428/412); apicontract ETags on accounting; no list ETags; negative amounts refused |
+| `fd691bc9` | 000010: RLS + FORCE on `outbox`, `policy_evidence_outbox`, `policy_activation_schedule`; workers use the relay context; migration-number guard |
+| `2e8bf383` | `/v1/policies/summary`, `/v1/policy-families`, `/v1/policy-versions`, `/v1/policy-evaluations`, `/v1/control-test-definitions` (GET), `/v1/attestations` (GET); API-4 cursors on every register and per-parent list |
+| `e3f18884` | 000011 family retirement (`POST /v1/policies/{id}/retire`); evidence re-drive (`…/redeliver`); control-test and attestation events; access-control 000057 |
+| `09389ff1` | Optional `currency` on APPROVAL_THRESHOLD, enforced at evaluation |
+| `991ad87d` | `TestREF07_StaleVersionIs412`, `TestR5_EveryCheckedActionIsRegistered` (mutation-checked) |
+| `deae0af3` | V-001 PDC-05: `internal/evaluator`, 000012, test suites, runs, certification gate, waivers, simulation, rollback drafts; access-control 000058 |
+| `de8264f6` | payroll-run-svc: forwards identity, exact amount and currency, stable decision id, 404 fails closed |
+| `14191b5a` | notification-svc: legal-basis reads over policy-svc's mTLS listener; compose enables `:8449` and the certification gate |
+| `956e68cc` | expense-claim-svc, payment-authorization-svc: 401/403 is 403 not 503 (P-13), stable decision ids, payment-authorization 404 fails closed |
+
+### Feature matrix (S0)
+
+| Row | Spec | Feature | Status | Evidence |
+|---|---|---|---|---|
+| F01 | Doc 03 §8.1, GOV-05 | Families and versions; get, history, compare, transitions | built | `TestPolicies_TenantOwnedAndIsolated`, `TestVersions_*`, `TestLists_PerParentListsArePaged` |
+| F02 | GOV-05 | Lifecycle with maker-checker, own-object SoD, suspension review; If-Match or expected_version | built | `TestLifecycle_*` (DB and handler), `TestLifecycle_AuthorizesOncePerCommand`, `TestLifecycle_ExpectedVersionFromBodyOrIfMatch` |
+| F03 | Doc 03 §8.1, V-001 §14 | Evaluate, resolve, explain, evidence; decision replay; digest check; currency | built | `TestEvaluate_*`, `TestEvaluations_DurableReconcilableAndIsolated`, evaluator tests |
+| F04 | D-02, C6 | Evidence relay to the ledger as `svc-policy`; re-drive of FAILED | built | `TestRedeliverEvidence_*`, relay tests; live: GDL e2e "policy relay" |
+| F05 | Doc 03, C3 | 28 published + 3 consumed events, transactional outbox, RLS relay context | built | `TestAsyncAPI_MatchesTheCode`, `TestOutboxRelay_*`, `TestRelayTables_RLS` |
+| F06 | doc7 §E3/§E6 | Control tests and attestations, registers, events | built | `TestControlTests_TenantIsolation` (events), `TestLists_*` |
+| F07 | X5, EST-1 | Identity gate; mTLS peer listener on in compose | built; compose `warn` until EST-1 | identity gate tests |
+| F08 | P-01 | SPEND_CONTROL, SIGNATORY_MATRIX, SOD_RULE, LEGAL_BASIS evaluators | 🧭 business rules requested | SPEC_DEVIATIONS P-01 |
+| F09 | API-2 | openapi.yaml with router parity, `x-spec-operation` on PDC-05 routes | built | `TestOpenAPI_MatchesTheRouter` |
+| F10 | REF-07 | Accounting policy | built, verified | REF-2 suites + `TestREF07_StaleVersionIs412` |
+| F11 | P-13 | Callers report 401/403 as 403 | built (cross-service) | `TestEvaluate_RefusedCallerIsNotAnOutage` in both callers |
+| F12 | V-001 PDC-05 | Suites, certification gate, waivers, simulation, rollback | built | `TestPDC05_*` (DB + handler) |
+| F13 | API-4 | Cursor paging | built | `TestLists_*`, `TestRegisters_ScopedFilteredPagedAndCounted` |
+| F14 | S4/S5 | Dependency E2E and console v2.0 | open | POL-5, POL-FE-1…3 |
+| — | D8 | Family retirement | built | `TestRetirePolicy_*` |
+| — | R5 | Every checked action registered | built | `TestR5_EveryCheckedActionIsRegistered` |
+
+### Still open
+
+- **P-01** business rules (message sent to the business owners; see SPEC_DEVIATIONS).
+- **POL-5** live E2E (`deployments/scripts/e2e-policy-deps.py`), Kafka proof (X3), RELEASE_CERTIFICATE.
+- **POL-FE-1…3** console v2.0 (`app/admin/policies`); the legacy page activates a DRAFT directly and cannot work against GOV-05.
+- **EST-1** `POLICY_IDENTITY_VERIFY=enforce` (estate switch-over); **EST-9** grants by template for the new actions; **WF-6** (workflow-svc re-checks global `policy.*` events).
+
+## Governance Platform audit closure — 2026-10-14
 
 This section supersedes the status paragraphs below them. Those describe the
 July build; several of their claims stopped being true when the canonical
