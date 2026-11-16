@@ -418,11 +418,44 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 			"action_context.amount must not be negative", map[string]any{"field": "action_context.amount"})
 		return "", nil, false
 	}
+	// A threshold in one currency says nothing about an amount in another
+	// (V-001 PDC-I-11: currency is explicit). A version that names its
+	// currency is only ever compared with an amount in that currency; the
+	// caller converts, this service never does.
+	rules := []string{v.PolicyVersionID + "#threshold_amount"}
+	if want := stringField(v.RulePayload, "currency"); want != "" {
+		got := stringField(req.ActionContext, "currency")
+		switch {
+		case got == "":
+			missingField(w, r, "action_context.currency")
+			return "", nil, false
+		case got != want:
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "currency_mismatch",
+				"action_context.currency does not match the governing threshold's currency",
+				map[string]any{"field": "action_context.currency", "policy_currency": want})
+			return "", nil, false
+		}
+		rules = append(rules, v.PolicyVersionID+"#currency")
+	}
 	result := "WITHIN_THRESHOLD"
 	if amount.Cmp(threshold) > 0 {
 		result = "APPROVAL_REQUIRED"
 	}
-	return result, []string{v.PolicyVersionID + "#threshold_amount"}, true
+	return result, rules, true
+}
+
+// stringField reads a top-level string field of a JSON object, "" if absent
+// or not a string.
+func stringField(raw json.RawMessage, field string) string {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(obj[field], &s) != nil {
+		return ""
+	}
+	return s
 }
 
 // canonicalOutcome maps this service's evaluation result onto the governance

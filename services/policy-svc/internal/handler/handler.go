@@ -574,6 +574,29 @@ func validateRulePayload(w http.ResponseWriter, r *http.Request, policyType stri
 			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", "threshold_amount must not be negative", nil)
 			return false
 		}
+		if raw, present := obj["currency"]; present {
+			var cur string
+			if json.Unmarshal(raw, &cur) != nil || !isCurrencyCode(cur) {
+				writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload",
+					"currency must be an ISO 4217 code (three upper-case letters)", map[string]any{"field": "rule_payload.currency"})
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isCurrencyCode reports whether s has the shape of an ISO 4217 code. Which
+// codes exist is reference data (tenant-entity-registry's FX set), not a list
+// kept here.
+func isCurrencyCode(s string) bool {
+	if len(s) != 3 {
+		return false
+	}
+	for _, c := range s {
+		if c < 'A' || c > 'Z' {
+			return false
+		}
 	}
 	return true
 }

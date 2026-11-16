@@ -111,3 +111,44 @@ func TestRedeliverEvidence_Contract(t *testing.T) {
 		t.Fatal("a denied redelivery reached the store")
 	}
 }
+
+// G11: a threshold that names its currency is only compared with an amount in
+// that currency; one that names none keeps answering currency-less callers.
+func TestEvaluate_ThresholdCurrencyMustMatch(t *testing.T) {
+	gbp := `{"threshold_amount": 5000, "currency": "GBP"}`
+	rig := func() *rig {
+		return newRig(&stubStore{}, &stubCandidates{candidates: []*domain.ApplicablePolicyVersion{
+			activeThreshold(versionID, policyID, strPtr(testTenant), nil, gbp),
+		}}, nil)
+	}
+	body := func(ctx string) string {
+		return `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"` + testTenant + `","decision_id":"d","action_context":` + ctx + `}`
+	}
+	got := expect(t, rig().do(http.MethodPost, "/v1/policies/evaluate", body(`{"amount":7500,"currency":"GBP"}`)), http.StatusOK, "")
+	if got["result"] != "APPROVAL_REQUIRED" {
+		t.Fatalf("same currency: %v", got)
+	}
+	expect(t, rig().do(http.MethodPost, "/v1/policies/evaluate", body(`{"amount":7500,"currency":"EUR"}`)), http.StatusBadRequest, "INVALID_REQUEST")
+	expect(t, rig().do(http.MethodPost, "/v1/policies/evaluate", body(`{"amount":7500}`)), http.StatusBadRequest, "INVALID_REQUEST")
+
+	// No currency on the version: the legacy contract still answers.
+	g := evalRig(nil)
+	expect(t, g.do(http.MethodPost, "/v1/policies/evaluate", body(`{"amount":7500,"currency":"EUR"}`)), http.StatusOK, "")
+}
+
+func TestCreateVersion_ThresholdCurrencyShape(t *testing.T) {
+	for payload, ok := range map[string]bool{
+		`{"threshold_amount":1,"currency":"USD"}`: true,
+		`{"threshold_amount":1}`:                  true,
+		`{"threshold_amount":1,"currency":"usd"}`: false,
+		`{"threshold_amount":1,"currency":"US"}`:  false,
+		`{"threshold_amount":1,"currency":840}`:   false,
+	} {
+		st := &stubStore{policy: &domain.Policy{PolicyID: policyID, PolicyType: "APPROVAL_THRESHOLD", TenantID: strPtr(testTenant)},
+			version: &domain.PolicyVersion{PolicyVersionID: versionID, RowVersion: 1}, versionCreated: true}
+		w := newRig(st, nil, nil).do(http.MethodPost, "/v1/policies/"+policyID+"/versions", `{"rule_payload":`+payload+`,"effective_from":"2026-11-01T00:00:00Z"}`)
+		if ok && w.Code != http.StatusCreated || !ok && w.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d %s", payload, w.Code, w.Body.String())
+		}
+	}
+}

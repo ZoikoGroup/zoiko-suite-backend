@@ -1386,7 +1386,7 @@ components:
         policy_version_id: {type: string, format: uuid}
         tenant_id: {type: string, format: uuid, nullable: true}
         legal_entity_id: {type: string, format: uuid, nullable: true}
-        rule_payload: {type: object, additionalProperties: true}
+        rule_payload: {type: object, additionalProperties: true, description: "APPROVAL_THRESHOLD: {threshold_amount (exact decimal, >= 0), currency (optional ISO 4217; when set, evaluation needs the same action_context.currency)}."}
         effective_from: {type: string, format: date-time}
         effective_to: {type: string, format: date-time, nullable: true}
         source: {type: string}
@@ -1512,7 +1512,7 @@ components:
         policy_type: {type: string}
         tenant_id: {type: string, format: uuid, nullable: true}
         legal_entity_id: {type: string, format: uuid, nullable: true}
-        action_context: {type: object, additionalProperties: true}
+        action_context: {type: object, additionalProperties: true, description: "APPROVAL_THRESHOLD: {amount (exact decimal, >= 0), currency (required when the governing version names one; must match)}."}
         decision_id: {type: string}
         as_of: {type: string, format: date-time}
         known_at: {type: string, format: date-time}
