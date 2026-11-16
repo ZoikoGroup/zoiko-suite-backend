@@ -1,0 +1,32 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.einvoice.network-attempt.prepared (tax-authority-interface-svc, schema 1.0.0). OBSERVED contract inferred from 4 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "filing_type": {
+      "type": "string"
+    },
+    "interface_id": {
+      "type": "string"
+    },
+    "payload_hash": {
+      "type": "string"
+    },
+    "rail": {
+      "type": "string"
+    },
+    "submission_id": {
+      "type": "string"
+    },
+    "tax_period": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "filing_type",
+    "interface_id",
+    "payload_hash",
+    "rail",
+    "submission_id",
+    "tax_period"
+  ],
+  "type": "object"
+}

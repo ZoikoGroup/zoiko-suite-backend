@@ -1,0 +1,44 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.migration-batch.staged (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 6 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "batch_code": {
+      "type": "string"
+    },
+    "batch_id": {
+      "type": "string"
+    },
+    "batch_kind": {
+      "type": "string"
+    },
+    "book_id": {
+      "type": "string"
+    },
+    "cutover_date": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "line_count": {
+      "type": "integer"
+    },
+    "lines_hash": {
+      "type": "string"
+    },
+    "source_extract_hash": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "batch_code",
+    "batch_id",
+    "batch_kind",
+    "book_id",
+    "cutover_date",
+    "legal_entity_id",
+    "line_count",
+    "lines_hash",
+    "source_extract_hash"
+  ],
+  "type": "object"
+}

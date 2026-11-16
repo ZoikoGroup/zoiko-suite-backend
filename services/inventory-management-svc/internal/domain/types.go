@@ -1031,7 +1031,34 @@ var (
 	ErrCatalogVersionInvalid = errorString("offering version is missing, inactive or incompatible with requested use")
 
 	ErrInvalidMappingType = errorString("mapping_type must be one of TAX, ACCOUNTING, PRODUCT")
+
+	// ErrCatalogMappingRequired — BIZ-07 failure/degradation row: "Missing
+	// required mapping blocks use in protected transaction." An offering
+	// version cannot become ACTIVE (and so cannot be used by any protected
+	// transaction) until every RequiredCatalogMappingTypes entry is linked.
+	ErrCatalogMappingRequired = errorString("offering version is missing a required mapping")
 )
+
+// RequiredCatalogMappingTypes are the mappings an offering version must carry
+// before activation: the tax and accounting treatment a transaction needs.
+// PRODUCT is optional descriptive linkage.
+var RequiredCatalogMappingTypes = []string{"TAX", "ACCOUNTING"}
+
+// MissingRequiredCatalogMappings returns the required mapping types not
+// present in linked, in RequiredCatalogMappingTypes order.
+func MissingRequiredCatalogMappings(linked []CatalogMapping) []string {
+	have := make(map[string]bool, len(linked))
+	for _, m := range linked {
+		have[m.MappingType] = true
+	}
+	var missing []string
+	for _, t := range RequiredCatalogMappingTypes {
+		if !have[t] {
+			missing = append(missing, t)
+		}
+	}
+	return missing
+}
 
 // ── INV-04 RecalculateValuation / RebuildCostLayersControlled (migration 000010) ──
 

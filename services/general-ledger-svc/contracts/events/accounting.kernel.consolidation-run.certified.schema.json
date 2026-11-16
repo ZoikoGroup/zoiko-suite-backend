@@ -1,0 +1,32 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.consolidation-run.certified (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 5 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "consolidation_run_id": {
+      "type": "string"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "group_id": {
+      "type": "string"
+    },
+    "group_snapshot_id": {
+      "type": "string"
+    },
+    "mapping_version": {
+      "type": "integer"
+    },
+    "run_hash": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "consolidation_run_id",
+    "fiscal_period",
+    "group_id",
+    "group_snapshot_id",
+    "mapping_version",
+    "run_hash"
+  ],
+  "type": "object"
+}

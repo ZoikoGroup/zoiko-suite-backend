@@ -89,16 +89,7 @@ func (s *Store) EnqueueTx(ctx context.Context, tx pgx.Tx, rec Record) error {
 	if !json.Valid(rec.Payload) {
 		return fmt.Errorf("outbox: event %q payload is not valid JSON", rec.EventType)
 	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO event_outbox (event_id, event_type, tenant_id, partition_key, payload)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (event_id) DO NOTHING`,
-		rec.EventID, rec.EventType, rec.TenantID, rec.PartitionKey, rec.Payload,
-	)
-	if err != nil {
-		return fmt.Errorf("outbox: enqueue %q: %w", rec.EventType, err)
-	}
-	return nil
+	return EnqueueEventingTx(ctx, tx, rec)
 }
 
 // Enqueue writes the event in its own transaction, scoped to rec.TenantID.
@@ -115,14 +106,8 @@ func (s *Store) Enqueue(ctx context.Context, rec Record) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded on the commit path
 
-	if rec.TenantID != "" {
-		if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", rec.TenantID); err != nil {
-			return fmt.Errorf("outbox: set_config app.tenant_id: %w", err)
-		}
-	} else {
-		if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
-			return fmt.Errorf("outbox: set_config app.outbox_relay: %w", err)
-		}
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", EventingTenant(rec.TenantID)); err != nil {
+		return fmt.Errorf("outbox: set_config app.tenant_id: %w", err)
 	}
 
 	if err := s.EnqueueTx(ctx, tx, rec); err != nil {

@@ -1,0 +1,312 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "capability": {
+      "address": "zoikosuite.platform.capability.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/capability.created"
+        }
+      }
+    },
+    "capability-claim": {
+      "address": "zoikosuite.platform.capability-claim.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/capability-claim.created"
+        }
+      }
+    },
+    "capability-release": {
+      "address": "zoikosuite.platform.capability-release.v1",
+      "messages": {
+        "state-changed": {
+          "$ref": "#/components/messages/capability-release.state-changed"
+        }
+      }
+    },
+    "integration-capability": {
+      "address": "zoikosuite.platform.integration-capability.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/integration-capability.created"
+        },
+        "health-updated": {
+          "$ref": "#/components/messages/integration-capability.health-updated"
+        }
+      }
+    },
+    "market-release": {
+      "address": "zoikosuite.platform.market-release.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/market-release.created"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "capability-claim.created": {
+        "contentType": "application/json",
+        "description": "Producer: Capability Registry Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Platform (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.platform.capability-claim.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Capability Claim: created.",
+        "title": "capability-claim created",
+        "x-zoiko-event-type": "com.zoikosuite.platform.capability-claim.created",
+        "x-zoiko-origin": "extension"
+      },
+      "capability-release.state-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Capability Registry Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Platform (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.platform.capability-release.state-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Capability Release: state-changed.",
+        "title": "capability-release state-changed",
+        "x-zoiko-event-type": "com.zoikosuite.platform.capability-release.state-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "capability.created": {
+        "contentType": "application/json",
+        "description": "Producer: Capability Registry Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Platform (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.platform.capability.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Capability: created.",
+        "title": "capability created",
+        "x-zoiko-event-type": "com.zoikosuite.platform.capability.created",
+        "x-zoiko-origin": "extension"
+      },
+      "integration-capability.created": {
+        "contentType": "application/json",
+        "description": "Producer: Capability Registry Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Platform (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.platform.integration-capability.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Integration Capability: created.",
+        "title": "integration-capability created",
+        "x-zoiko-event-type": "com.zoikosuite.platform.integration-capability.created",
+        "x-zoiko-origin": "extension"
+      },
+      "integration-capability.health-updated": {
+        "contentType": "application/json",
+        "description": "Producer: Capability Registry Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Platform (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.platform.integration-capability.health-updated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Integration Capability: health-updated.",
+        "title": "integration-capability health-updated",
+        "x-zoiko-event-type": "com.zoikosuite.platform.integration-capability.health-updated",
+        "x-zoiko-origin": "extension"
+      },
+      "market-release.created": {
+        "contentType": "application/json",
+        "description": "Producer: Capability Registry Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Platform (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.platform.market-release.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Market Release: created.",
+        "title": "market-release created",
+        "x-zoiko-event-type": "com.zoikosuite.platform.market-release.created",
+        "x-zoiko-origin": "extension"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite platform domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.capability": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/capability"
+      },
+      "description": "Producer(s): Capability Registry Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/capability/messages/created"
+        }
+      ],
+      "summary": "Publish capability facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.capability-claim": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/capability-claim"
+      },
+      "description": "Producer(s): Capability Registry Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/capability-claim/messages/created"
+        }
+      ],
+      "summary": "Publish capability-claim facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.capability-release": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/capability-release"
+      },
+      "description": "Producer(s): Capability Registry Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/capability-release/messages/state-changed"
+        }
+      ],
+      "summary": "Publish capability-release facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.integration-capability": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/integration-capability"
+      },
+      "description": "Producer(s): Capability Registry Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/integration-capability/messages/created"
+        },
+        {
+          "$ref": "#/channels/integration-capability/messages/health-updated"
+        }
+      ],
+      "summary": "Publish integration-capability facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.market-release": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/market-release"
+      },
+      "description": "Producer(s): Capability Registry Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/market-release/messages/created"
+        }
+      ],
+      "summary": "Publish market-release facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

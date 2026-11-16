@@ -1,0 +1,32 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.callback.applied (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 7 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "attempt_id": {
+      "type": "string"
+    },
+    "callback_receipt_id": {
+      "type": "string"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "from_state": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "to_state": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "attempt_id",
+    "callback_receipt_id",
+    "connection_id",
+    "from_state",
+    "tenant_id",
+    "to_state"
+  ],
+  "type": "object"
+}

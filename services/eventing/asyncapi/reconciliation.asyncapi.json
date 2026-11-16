@@ -1,0 +1,198 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "job": {
+      "address": "zoikosuite.reconciliation.job.v1",
+      "messages": {
+        "analyzed": {
+          "$ref": "#/components/messages/job.analyzed"
+        },
+        "resolution-recommended": {
+          "$ref": "#/components/messages/job.resolution-recommended"
+        },
+        "unmatched-flagged": {
+          "$ref": "#/components/messages/job.unmatched-flagged"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "job.analyzed": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Intelligence Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reconciliation (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reconciliation.job.analyzed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Job: analyzed.",
+        "title": "job analyzed",
+        "x-zoiko-event-type": "com.zoikosuite.reconciliation.job.analyzed",
+        "x-zoiko-origin": "extension"
+      },
+      "job.resolution-recommended": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Intelligence Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reconciliation (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reconciliation.job.resolution-recommended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Job: resolution-recommended.",
+        "title": "job resolution-recommended",
+        "x-zoiko-event-type": "com.zoikosuite.reconciliation.job.resolution-recommended",
+        "x-zoiko-origin": "extension"
+      },
+      "job.unmatched-flagged": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Intelligence Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reconciliation (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reconciliation.job.unmatched-flagged",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Job: unmatched-flagged.",
+        "title": "job unmatched-flagged",
+        "x-zoiko-event-type": "com.zoikosuite.reconciliation.job.unmatched-flagged",
+        "x-zoiko-origin": "extension"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite reconciliation domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.job": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/job"
+      },
+      "description": "Producer(s): Reconciliation Intelligence Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/job/messages/analyzed"
+        },
+        {
+          "$ref": "#/channels/job/messages/resolution-recommended"
+        },
+        {
+          "$ref": "#/channels/job/messages/unmatched-flagged"
+        }
+      ],
+      "summary": "Publish job facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

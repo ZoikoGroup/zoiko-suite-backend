@@ -1,0 +1,22 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.reconciliation.matched (bank-reconciliation-svc, schema 1.0.0). OBSERVED contract inferred from 16 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "matched_journal_id": {
+      "type": "string"
+    },
+    "matched_journal_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "statement_line_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "matched_journal_id",
+    "statement_line_id"
+  ],
+  "type": "object"
+}

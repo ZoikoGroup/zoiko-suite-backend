@@ -1,0 +1,134 @@
+asyncapi: "2.6.0"
+
+info:
+  title: Inventory Management Service — BIZ-07 Catalog Event Contract
+  version: "1.0.0"
+  description: |
+    The BIZ-07 (Product & Service Catalog) events inventory-management-svc publishes
+    (ZS-SVC-P-001 section 9: OfferingCreated; OfferingActivated; OfferingSuspended;
+    OfferingRetired; OfferingVersionSuperseded).
+
+    Spec names are PascalCase; the wire names are lower.dotted. Each message records
+    the spec name in `x-spec-event`.
+
+    Delivery is at-least-once to the service's Kafka topic, keyed by `offering_id`;
+    consumers must dedupe on `event_id`. Publish failures are logged, not retried by
+    the service.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+
+channels:
+  zoiko.inventory.events:
+    description: Default topic (KAFKA_EVENTS_TOPIC overrides it per environment).
+    publish:
+      operationId: catalogEvents
+      message:
+        oneOf:
+          - $ref: "#/components/messages/OfferingCreated"
+          - $ref: "#/components/messages/OfferingActivated"
+          - $ref: "#/components/messages/OfferingSuspended"
+          - $ref: "#/components/messages/OfferingRetired"
+          - $ref: "#/components/messages/OfferingVersionSuperseded"
+
+components:
+  messages:
+    OfferingCreated:
+      name: catalog.offering.created
+      x-spec-event: OfferingCreated
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - properties:
+              event_type: { const: catalog.offering.created }
+              payload:
+                type: object
+                required: [offering_id, sku_code, version_id]
+                properties:
+                  offering_id: { type: string, format: uuid }
+                  sku_code: { type: string }
+                  version_id: { type: string, format: uuid }
+    OfferingActivated:
+      name: catalog.offering.activated
+      x-spec-event: OfferingActivated
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - properties:
+              event_type: { const: catalog.offering.activated }
+              payload:
+                type: object
+                required: [offering_id, version_id, activated_at]
+                properties:
+                  offering_id: { type: string, format: uuid }
+                  version_id: { type: string, format: uuid }
+                  activated_at: { type: string, format: date-time }
+    OfferingSuspended:
+      name: catalog.offering.suspended
+      x-spec-event: OfferingSuspended
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - properties:
+              event_type: { const: catalog.offering.suspended }
+              payload:
+                type: object
+                required: [offering_id, version_id]
+                properties:
+                  offering_id: { type: string, format: uuid }
+                  version_id: { type: string, format: uuid }
+                  suspension_reason: { type: [string, "null"] }
+    OfferingRetired:
+      name: catalog.offering.retired
+      x-spec-event: OfferingRetired
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - properties:
+              event_type: { const: catalog.offering.retired }
+              payload:
+                type: object
+                required: [offering_id, version_id]
+                properties:
+                  offering_id: { type: string, format: uuid }
+                  version_id: { type: string, format: uuid }
+                  retirement_reason: { type: [string, "null"] }
+    OfferingVersionSuperseded:
+      name: catalog.offering_version.superseded
+      x-spec-event: OfferingVersionSuperseded
+      summary: A newly activated version displaced the previously ACTIVE one.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - properties:
+              event_type: { const: catalog.offering_version.superseded }
+              payload:
+                type: object
+                required: [offering_id, version_id]
+                properties:
+                  offering_id: { type: string, format: uuid }
+                  version_id:
+                    type: string
+                    format: uuid
+                    description: The superseded version.
+
+  schemas:
+    Envelope:
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, tenant_id, payload]
+      properties:
+        event_id: { type: string, description: "evt-<uuid>; dedupe key" }
+        event_type: { type: string }
+        event_version: { type: string, const: "1.0" }
+        emitted_at: { type: string, format: date-time }
+        schema_version: { type: string, const: "1.0" }
+        source_service: { type: string, const: inventory-management-svc }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        actor_id: { type: string }
+        correlation_id: { type: string }
+        payload: { type: object }

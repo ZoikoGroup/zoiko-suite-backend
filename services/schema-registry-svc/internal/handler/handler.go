@@ -172,6 +172,24 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ownership is sticky (ZS-EVENT-001 E-02, EV-T23). Omitting owning_service
+	// inherits the registered owner; naming a different one is refused whatever
+	// the compatibility mode, because NONE relaxes schema evolution, not who
+	// may publish the event.
+	owner := req.OwningService
+	if current != nil && current.OwningService != "" {
+		if owner != "" && owner != current.OwningService {
+			h.log.Warn("schema registration refused: ownership change",
+				zap.String("event_name", eventName),
+				zap.String("registered_owner", current.OwningService),
+				zap.String("principal_id", principalID),
+			)
+			writeError(w, http.StatusConflict, domain.ErrOwnershipChange.Error())
+			return
+		}
+		owner = current.OwningService
+	}
+
 	// currentVersion is both the compatibility baseline and the optimistic
 	// concurrency token handed to the store. 0 means "no version yet".
 	currentVersion := 0
@@ -208,7 +226,7 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 		EventName:         eventName,
 		JSONSchema:        req.JSONSchema,
 		CompatibilityMode: mode,
-		OwningService:     req.OwningService,
+		OwningService:     owner,
 		RegisteredBy:      principalID,
 		RegisteredAt:      time.Now().UTC(),
 		IdempotencyKey:    idempotencyKey,

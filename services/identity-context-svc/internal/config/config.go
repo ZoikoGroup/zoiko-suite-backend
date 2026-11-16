@@ -66,6 +66,10 @@ type Config struct {
 	Redis RedisConfig
 	Kafka KafkaConfig
 
+	// EventResidencyRegion is the residency region stamped on every event this
+	// service emits (ZS-EVENT-001 section 14, EVENT_RESIDENCY_REGION). Required.
+	EventResidencyRegion string
+
 	// Upstream Tier 0 service base URLs (read-only calls only)
 	TenantRegistryURL string
 	AccessControlURL  string
@@ -402,6 +406,7 @@ func Load() (*Config, error) {
 			SessionTTLSeconds:     envInt("SESSION_CACHE_TTL_SECONDS", 300),
 			RoleProfileTTLSeconds: envInt("ROLE_PROFILE_CACHE_TTL_SECONDS", 900),
 		},
+		EventResidencyRegion: env("EVENT_RESIDENCY_REGION", ""),
 		Kafka: KafkaConfig{
 			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
 			GroupID: env("KAFKA_GROUP_ID", "identity-context-svc"),

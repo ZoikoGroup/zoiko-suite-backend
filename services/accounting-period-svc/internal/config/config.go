@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -10,6 +11,10 @@ import (
 type Config struct {
 	Env  string
 	Port int
+
+	// EventResidencyRegion is the authoritative regional data-bearing context of
+	// outbox events (ZS-EVENT-001 section 4 residencyregion). Required at startup.
+	EventResidencyRegion string
 
 	DB DBConfig
 
@@ -63,9 +68,14 @@ type KafkaConfig struct {
 }
 
 func Load() (*Config, error) {
+	region := env("EVENT_RESIDENCY_REGION", "")
+	if region == "" {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required")
+	}
 	return &Config{
-		Env:  env("ENV", "local"),
-		Port: envInt("PORT", 8174),
+		Env:                  env("ENV", "local"),
+		Port:                 envInt("PORT", 8174),
+		EventResidencyRegion: region,
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),

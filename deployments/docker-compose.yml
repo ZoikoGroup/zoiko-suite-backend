@@ -571,6 +571,7 @@ services:
       REDIS_TLS_ENABLED: "${REDIS_TLS_ENABLED:-false}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "identity-context-svc"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       # PUBLISH topic only. The reader subscribes to the topics the events it
       # handles are actually published on — it used to read this one alone, so
       # authority.revoked, role.updated and entity.updated never ended a session.
@@ -2865,8 +2866,9 @@ services:
   # Needs authz actions PERIOD_STATE_COMMAND / PERIOD_MATERIALIZE seeded.
   accounting-period-svc:
     build:
-      context: ../services/accounting-period-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: accounting-period-svc/Dockerfile
     container_name: accounting-period-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2882,6 +2884,8 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.accounting-period.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       FISCAL_CALENDAR_URL: "http://fiscal-calendar-svc:8173"
       FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"
@@ -4423,8 +4427,9 @@ services:
 
   counterparty-management-svc:
     build:
-      context: ../services/counterparty-management-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing - see the Dockerfile.
+      context: ../services
+      dockerfile: counterparty-management-svc/Dockerfile
     container_name: counterparty-management-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4435,6 +4440,7 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/counterparty_management?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:

@@ -1,0 +1,20 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.book.status-changed (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 129 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "book_id": {
+      "type": "string"
+    },
+    "from": {
+      "type": "string"
+    },
+    "to": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "book_id",
+    "from",
+    "to"
+  ],
+  "type": "object"
+}

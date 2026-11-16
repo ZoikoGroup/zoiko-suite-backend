@@ -256,7 +256,7 @@ func TestORG01_MergedIDResolvesToSurvivor(t *testing.T) {
 	assert.Equal(t, domain.PrincipalStatusDisabled, dup.Status)
 
 	var outboxed int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM event_outbox WHERE event_type = 'identity.subject.merged'`).Scan(&outboxed))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.subject.merged'`).Scan(&outboxed))
 	assert.Zero(t, outboxed, "the store enqueues exactly the records it is given")
 }
 

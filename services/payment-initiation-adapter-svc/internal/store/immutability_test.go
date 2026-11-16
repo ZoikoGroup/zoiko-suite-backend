@@ -18,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/contracttest"
+
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
 	"zoiko.io/payment-initiation-adapter-svc/internal/middleware"
 	"zoiko.io/payment-initiation-adapter-svc/internal/store"
@@ -112,7 +114,7 @@ func TestMain(m *testing.M) {
 
 	testStore = store.NewPgStore(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
-	code := m.Run()
+	code := contracttest.FinishSuite(testPool, "../../contracts/events", m.Run())
 	testPool.Close()
 	stop()
 	os.Exit(code)

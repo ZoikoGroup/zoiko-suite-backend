@@ -14,6 +14,7 @@ const (
 	CodeQuoteExpired               = "QUOTE_EXPIRED"
 	CodeOrderNotBillable           = "ORDER_NOT_BILLABLE"
 	CodeTaxDeterminationMissing    = "TAX_DETERMINATION_MISSING"
+	CodeCatalogVersionInvalid      = "CATALOG_VERSION_INVALID"
 	CodeInvoiceApprovalInvalidated = "INVOICE_APPROVAL_INVALIDATED"
 	CodeInvoiceNumberCollision     = "INVOICE_NUMBER_COLLISION"
 	CodeInvoiceAlreadyIssued       = "INVOICE_ALREADY_ISSUED"

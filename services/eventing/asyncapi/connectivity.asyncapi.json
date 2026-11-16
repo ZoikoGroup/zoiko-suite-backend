@@ -1,0 +1,459 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "bridge": {
+      "address": "zoikosuite.connectivity.bridge.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/bridge.created"
+        },
+        "ingested": {
+          "$ref": "#/components/messages/bridge.ingested"
+        }
+      }
+    },
+    "connector": {
+      "address": "zoikosuite.connectivity.connector.v1",
+      "messages": {
+        "activated": {
+          "$ref": "#/components/messages/connector.activated"
+        },
+        "approval-requested": {
+          "$ref": "#/components/messages/connector.approval-requested"
+        },
+        "approved": {
+          "$ref": "#/components/messages/connector.approved"
+        },
+        "config-changed": {
+          "$ref": "#/components/messages/connector.config-changed"
+        },
+        "degraded": {
+          "$ref": "#/components/messages/connector.degraded"
+        },
+        "scope-changed": {
+          "$ref": "#/components/messages/connector.scope-changed"
+        }
+      }
+    },
+    "external-profile": {
+      "address": "zoikosuite.connectivity.external-profile.v1",
+      "messages": {
+        "certified": {
+          "$ref": "#/components/messages/external-profile.certified"
+        },
+        "deprecated": {
+          "$ref": "#/components/messages/external-profile.deprecated"
+        },
+        "published": {
+          "$ref": "#/components/messages/external-profile.published"
+        },
+        "unsupported": {
+          "$ref": "#/components/messages/external-profile.unsupported"
+        }
+      }
+    },
+    "sync": {
+      "address": "zoikosuite.connectivity.sync.v1",
+      "messages": {
+        "checkpoint-advanced": {
+          "$ref": "#/components/messages/sync.checkpoint-advanced"
+        },
+        "checkpoint-reset-applied": {
+          "$ref": "#/components/messages/sync.checkpoint-reset-applied"
+        },
+        "checkpoint-reset-requested": {
+          "$ref": "#/components/messages/sync.checkpoint-reset-requested"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "bridge.created": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.bridge.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bridge: created.",
+        "title": "bridge created",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.bridge.created",
+        "x-zoiko-origin": "extension"
+      },
+      "bridge.ingested": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.bridge.ingested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bridge: ingested.",
+        "title": "bridge ingested",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.bridge.ingested",
+        "x-zoiko-origin": "extension"
+      },
+      "connector.activated": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.connector.activated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Connector: activated.",
+        "title": "connector activated",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.connector.activated",
+        "x-zoiko-origin": "extension"
+      },
+      "connector.approval-requested": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.connector.approval-requested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Connector: approval-requested.",
+        "title": "connector approval-requested",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.connector.approval-requested",
+        "x-zoiko-origin": "extension"
+      },
+      "connector.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.connector.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Connector: approved.",
+        "title": "connector approved",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.connector.approved",
+        "x-zoiko-origin": "extension"
+      },
+      "connector.config-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.connector.config-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Connector: config-changed.",
+        "title": "connector config-changed",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.connector.config-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "connector.degraded": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.connector.degraded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Connector: degraded.",
+        "title": "connector degraded",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.connector.degraded",
+        "x-zoiko-origin": "extension"
+      },
+      "connector.scope-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.connector.scope-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Connector: scope-changed.",
+        "title": "connector scope-changed",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.connector.scope-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "external-profile.certified": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.external-profile.certified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "External Profile: certified.",
+        "title": "external-profile certified",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.external-profile.certified",
+        "x-zoiko-origin": "extension"
+      },
+      "external-profile.deprecated": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.external-profile.deprecated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "External Profile: deprecated.",
+        "title": "external-profile deprecated",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.external-profile.deprecated",
+        "x-zoiko-origin": "extension"
+      },
+      "external-profile.published": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.external-profile.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "External Profile: published.",
+        "title": "external-profile published",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.external-profile.published",
+        "x-zoiko-origin": "extension"
+      },
+      "external-profile.unsupported": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.external-profile.unsupported",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "External Profile: unsupported.",
+        "title": "external-profile unsupported",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.external-profile.unsupported",
+        "x-zoiko-origin": "extension"
+      },
+      "sync.checkpoint-advanced": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.sync.checkpoint-advanced",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Sync: checkpoint-advanced.",
+        "title": "sync checkpoint-advanced",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.sync.checkpoint-advanced",
+        "x-zoiko-origin": "extension"
+      },
+      "sync.checkpoint-reset-applied": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.sync.checkpoint-reset-applied",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Sync: checkpoint-reset-applied.",
+        "title": "sync checkpoint-reset-applied",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.sync.checkpoint-reset-applied",
+        "x-zoiko-origin": "extension"
+      },
+      "sync.checkpoint-reset-requested": {
+        "contentType": "application/json",
+        "description": "Producer: Connectivity Api Bridge Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Connectivity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.connectivity.sync.checkpoint-reset-requested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Sync: checkpoint-reset-requested.",
+        "title": "sync checkpoint-reset-requested",
+        "x-zoiko-event-type": "com.zoikosuite.connectivity.sync.checkpoint-reset-requested",
+        "x-zoiko-origin": "extension"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite connectivity domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.bridge": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/bridge"
+      },
+      "description": "Producer(s): Connectivity Api Bridge Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/bridge/messages/created"
+        },
+        {
+          "$ref": "#/channels/bridge/messages/ingested"
+        }
+      ],
+      "summary": "Publish bridge facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.connector": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/connector"
+      },
+      "description": "Producer(s): Connectivity Api Bridge Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/connector/messages/activated"
+        },
+        {
+          "$ref": "#/channels/connector/messages/approval-requested"
+        },
+        {
+          "$ref": "#/channels/connector/messages/approved"
+        },
+        {
+          "$ref": "#/channels/connector/messages/config-changed"
+        },
+        {
+          "$ref": "#/channels/connector/messages/degraded"
+        },
+        {
+          "$ref": "#/channels/connector/messages/scope-changed"
+        }
+      ],
+      "summary": "Publish connector facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.external-profile": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/external-profile"
+      },
+      "description": "Producer(s): Connectivity Api Bridge Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/external-profile/messages/certified"
+        },
+        {
+          "$ref": "#/channels/external-profile/messages/deprecated"
+        },
+        {
+          "$ref": "#/channels/external-profile/messages/published"
+        },
+        {
+          "$ref": "#/channels/external-profile/messages/unsupported"
+        }
+      ],
+      "summary": "Publish external-profile facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.sync": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/sync"
+      },
+      "description": "Producer(s): Connectivity Api Bridge Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/sync/messages/checkpoint-advanced"
+        },
+        {
+          "$ref": "#/channels/sync/messages/checkpoint-reset-applied"
+        },
+        {
+          "$ref": "#/channels/sync/messages/checkpoint-reset-requested"
+        }
+      ],
+      "summary": "Publish sync facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

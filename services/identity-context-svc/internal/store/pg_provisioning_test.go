@@ -269,7 +269,7 @@ func TestProvisioning_MappingNeedsABaselineRoleAndAnIndependentApprover(t *testi
 	if _, err := r.admin.Exec(ctx, `UPDATE federation_mapping_versions SET config = '{"entries":[]}' WHERE version = 2`); err == nil {
 		t.Fatal("a mapping version is immutable")
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type = 'identity.federation.mapping_approved'`) != 2 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.mapping-approved'`) != 2 {
 		t.Fatal("approvals are announced")
 	}
 }
@@ -360,8 +360,8 @@ func TestProvisioning_CreateGrantsOnlyWhatTheApprovedMappingNames(t *testing.T) 
 	if subj != "federated:"+r.conn+":dir-1" {
 		t.Fatalf("the principal's subject is bound to the connection and the stable id, never the email: %q", subj)
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.link.created'`) != 1 ||
-		r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.provisioning.applied'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.link.created'`) != 1 ||
+		r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.provisioning.applied'`) != 1 {
 		t.Fatal("identity_link_created and provisioning_applied are announced")
 	}
 	if r.count(t, `SELECT count(*) FROM federation_provisioning_events WHERE status='APPLIED' AND source='SCIM' AND operation='CREATE'`) != 1 {
@@ -456,7 +456,7 @@ func TestProvisioning_EmailCollisionQuarantinesInsteadOfMerging(t *testing.T) {
 	if _, err := r.prov.ResolveException(ctx, "t-1", "admin", ex[0].ExceptionID, "again"); !errors.Is(err, federation.ErrExceptionState) {
 		t.Fatalf("%v", err)
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.provisioning.rejected'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.provisioning.rejected'`) != 1 {
 		t.Fatal("provisioning_rejected is announced")
 	}
 	// an address that exists on someone ELSE'S principal (not provisioned by federation at all) also quarantines
@@ -702,7 +702,7 @@ func TestProvisioning_DeprovisionEndsAccessFirstAndAsksQuestionsAfterwards(t *te
 	if r.count(t, `SELECT count(*) FROM federation_links WHERE link_id=$1 AND access_revoked_at IS NOT NULL`, link.LinkID) != 0 {
 		t.Fatal("not complete until access control has revoked")
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.deprovision_applied'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.deprovision-applied'`) != 1 {
 		t.Fatal("deprovision_applied is announced")
 	}
 	if r.count(t, `SELECT count(*) FROM access_decision_log WHERE principal_id=$1 AND action_type='FEDERATION_DEPROVISION'`, link.PrincipalID) != 1 {
@@ -776,7 +776,7 @@ func TestProvisioning_SessionEvictionFailureIsRetriedAndEscalated(t *testing.T) 
 	if len(ex) != 1 || ex[0].Kind != federation.ExcDeprovisionLate || !strings.Contains(ex[0].Detail, "sessions are still live") {
 		t.Fatalf("%+v", ex)
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.deprovision_escalated'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.deprovision-escalated'`) != 1 {
 		t.Fatal("the escalation is announced")
 	}
 	lat, _ := r.prov.Latency(ctx, "t-1", r.conn, 10)

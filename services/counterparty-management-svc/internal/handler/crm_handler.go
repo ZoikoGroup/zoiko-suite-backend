@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/counterparty-management-svc/internal/domain"
-	"zoiko.io/counterparty-management-svc/internal/events"
 	"zoiko.io/counterparty-management-svc/internal/middleware"
 	"zoiko.io/counterparty-management-svc/internal/store"
 )
@@ -19,6 +18,10 @@ const (
 	actionCRMCreate = "CRM_CREATE"
 	actionCRMManage = "CRM_MANAGE"
 	actionCRMClose  = "CRM_CLOSE"
+	// Read actions. Consent data is purpose-controlled (spec section 8), so it
+	// has its own action rather than riding on CRM_READ.
+	actionCRMRead        = "CRM_READ"
+	actionCRMConsentRead = "CRM_CONSENT_READ"
 )
 
 // crmHandler embeds *Handler so it reuses requirePrincipal/writeAuthzErr
@@ -84,6 +87,7 @@ func (h *crmHandler) CreateRelationship(w http.ResponseWriter, r *http.Request) 
 	}
 
 	rel, err := h.store.CreateRelationship(r.Context(), domain.CreateRelationshipParams{
+		CorrelationID: r.Header.Get("X-Correlation-ID"), 
 		TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: req.LegalEntityID,
 		CandidateCounterpartyID: req.CandidateCounterpartyID, Source: req.Source, Channel: req.Channel,
 		OwnerPrincipalID: req.OwnerPrincipalID, CreatedByPrincipalID: principalID,
@@ -92,20 +96,13 @@ func (h *crmHandler) CreateRelationship(w http.ResponseWriter, r *http.Request) 
 		h.writeCRMErr(w, err)
 		return
 	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "relationship.created", CounterpartyID: rel.RelationshipID, TenantID: rel.TenantID, LegalEntityID: rel.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rel,
-	}); err != nil {
-		h.logger.Warn("failed to publish relationship.created event", zap.Error(err))
-	}
 	writeJSON(w, http.StatusCreated, rel)
 }
 
 // GetRelationship — BIZ-06's own GetRelationship query.
 func (h *crmHandler) GetRelationship(w http.ResponseWriter, r *http.Request) {
-	rel, err := h.store.GetRelationship(r.Context(), chi.URLParam(r, "relationship_id"))
-	if err != nil {
-		h.writeCRMErr(w, err)
+	rel, ok := h.authorizeRelationshipRead(w, r, actionCRMRead)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, rel)
@@ -186,7 +183,7 @@ func (h *crmHandler) LogInteraction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	interaction, err := h.store.LogInteraction(r.Context(), domain.LogInteractionParams{
+	interaction, err := h.store.LogInteraction(r.Context(), domain.LogInteractionParams{CorrelationID: r.Header.Get("X-Correlation-ID"), 
 		RelationshipID: relationshipID, TenantID: middleware.GetTenantID(r.Context()), InteractionType: req.InteractionType,
 		Channel: req.Channel, Notes: req.Notes, LoggedByPrincipalID: principalID,
 	})
@@ -194,17 +191,14 @@ func (h *crmHandler) LogInteraction(w http.ResponseWriter, r *http.Request) {
 		h.writeCRMErr(w, err)
 		return
 	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "interaction.logged", CounterpartyID: relationshipID, TenantID: existing.TenantID, LegalEntityID: existing.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: interaction,
-	}); err != nil {
-		h.logger.Warn("failed to publish interaction.logged event", zap.Error(err))
-	}
 	writeJSON(w, http.StatusCreated, interaction)
 }
 
 // GetTimeline — BIZ-06's own GetTimeline query.
 func (h *crmHandler) GetTimeline(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeRelationshipRead(w, r, actionCRMRead); !ok {
+		return
+	}
 	relationshipID := chi.URLParam(r, "relationship_id")
 	timeline, err := h.store.GetTimeline(r.Context(), middleware.GetTenantID(r.Context()), relationshipID)
 	if err != nil {
@@ -251,7 +245,7 @@ func (h *crmHandler) CreateOpportunity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	opp, err := h.store.CreateOpportunity(r.Context(), domain.CreateOpportunityParams{
+	opp, err := h.store.CreateOpportunity(r.Context(), domain.CreateOpportunityParams{CorrelationID: r.Header.Get("X-Correlation-ID"), 
 		RelationshipID: relationshipID, TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: req.LegalEntityID,
 		Name: req.Name, Value: req.Value, Currency: req.Currency, OwnerPrincipalID: req.OwnerPrincipalID, CreatedByPrincipalID: principalID,
 	})
@@ -259,20 +253,22 @@ func (h *crmHandler) CreateOpportunity(w http.ResponseWriter, r *http.Request) {
 		h.writeCRMErr(w, err)
 		return
 	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "opportunity.created", CounterpartyID: opp.OpportunityID, TenantID: opp.TenantID, LegalEntityID: opp.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: opp,
-	}); err != nil {
-		h.logger.Warn("failed to publish opportunity.created event", zap.Error(err))
-	}
 	writeJSON(w, http.StatusCreated, opp)
 }
 
 // GetOpportunity — BIZ-06's own GetOpportunity query.
 func (h *crmHandler) GetOpportunity(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	opp, err := h.store.GetOpportunity(r.Context(), chi.URLParam(r, "opportunity_id"))
 	if err != nil {
 		h.writeCRMErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, opp.LegalEntityID, actionCRMRead); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, opp)
@@ -309,18 +305,12 @@ func (h *crmHandler) UpdateStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	opp, err := h.store.UpdateStage(r.Context(), domain.UpdateStageParams{
+	opp, err := h.store.UpdateStage(r.Context(), domain.UpdateStageParams{CorrelationID: r.Header.Get("X-Correlation-ID"), 
 		OpportunityID: opportunityID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, Stage: req.Stage, Reason: req.Reason,
 	})
 	if err != nil {
 		h.writeCRMErr(w, err)
 		return
-	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "opportunity.stage_changed", CounterpartyID: opportunityID, TenantID: opp.TenantID, LegalEntityID: opp.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: opp,
-	}); err != nil {
-		h.logger.Warn("failed to publish opportunity.stage_changed event", zap.Error(err))
 	}
 	writeJSON(w, http.StatusOK, opp)
 }
@@ -484,18 +474,12 @@ func (h *crmHandler) CloseRelationship(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rel, err := h.store.CloseRelationship(r.Context(), domain.CloseRelationshipParams{
+	rel, err := h.store.CloseRelationship(r.Context(), domain.CloseRelationshipParams{CorrelationID: r.Header.Get("X-Correlation-ID"), 
 		RelationshipID: relationshipID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, ClosureReason: req.ClosureReason,
 	})
 	if err != nil {
 		h.writeCRMErr(w, err)
 		return
-	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "relationship.closed", CounterpartyID: relationshipID, TenantID: rel.TenantID, LegalEntityID: rel.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rel,
-	}); err != nil {
-		h.logger.Warn("failed to publish relationship.closed event", zap.Error(err))
 	}
 	writeJSON(w, http.StatusOK, rel)
 }
@@ -587,6 +571,9 @@ func (h *crmHandler) LinkCommercialObject(w http.ResponseWriter, r *http.Request
 
 // GetLinkedFinancialObjects — BIZ-06's own GetLinkedFinancialObjects query.
 func (h *crmHandler) GetLinkedFinancialObjects(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeRelationshipRead(w, r, actionCRMRead); !ok {
+		return
+	}
 	relationshipID := chi.URLParam(r, "relationship_id")
 	links, err := h.store.GetLinkedFinancialObjects(r.Context(), middleware.GetTenantID(r.Context()), relationshipID)
 	if err != nil {
@@ -645,6 +632,9 @@ func (h *crmHandler) RecordConsent(w http.ResponseWriter, r *http.Request) {
 
 // GetConsentContext — BIZ-06's own GetConsentContext query.
 func (h *crmHandler) GetConsentContext(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeRelationshipRead(w, r, actionCRMConsentRead); !ok {
+		return
+	}
 	relationshipID := chi.URLParam(r, "relationship_id")
 	consents, err := h.store.GetConsentContext(r.Context(), middleware.GetTenantID(r.Context()), relationshipID)
 	if err != nil {
@@ -655,6 +645,26 @@ func (h *crmHandler) GetConsentContext(w http.ResponseWriter, r *http.Request) {
 		consents = []domain.ConsentRecord{}
 	}
 	writeJSON(w, http.StatusOK, consents)
+}
+
+// authorizeRelationshipRead is the fetch-then-authorize step shared by every
+// relationship-scoped read: require a principal, load the relationship
+// (tenant-scoped by RLS), then check the action on its legal entity.
+func (h *crmHandler) authorizeRelationshipRead(w http.ResponseWriter, r *http.Request, action string) (*domain.Relationship, bool) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, false
+	}
+	rel, err := h.store.GetRelationship(r.Context(), chi.URLParam(r, "relationship_id"))
+	if err != nil {
+		h.writeCRMErr(w, err)
+		return nil, false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, rel.LegalEntityID, action); err != nil {
+		h.writeAuthzErr(w, err)
+		return nil, false
+	}
+	return rel, true
 }
 
 func (h *crmHandler) writeCRMErr(w http.ResponseWriter, err error) {

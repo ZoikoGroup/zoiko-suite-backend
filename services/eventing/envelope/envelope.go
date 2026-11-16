@@ -233,6 +233,11 @@ func New(s Spec) (*Envelope, error) {
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, invalid("data must be a JSON object")
 	}
+	// E-15 / EV-T09: secret material never leaves in an event. The error names
+	// the JSON paths, never the values.
+	if hits := ScanSecrets(data); len(hits) > 0 {
+		return nil, invalid("data holds prohibited secret material at %s (E-15, section 13); remove it or send a reference", strings.Join(hits, ", "))
+	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -425,4 +430,11 @@ func WithPublishedAt(rendered []byte, publishedAt time.Time) ([]byte, error) {
 	}
 	out = append(out, rest...)
 	return out, nil
+}
+
+// ValidType reports whether t is an event type New would accept: the
+// canonical com.zoikosuite.<domain>.<aggregate>.<fact> shape with no version
+// suffix (§5.1, §4). The catalogue uses it so the two can never disagree.
+func ValidType(t string) bool {
+	return typePattern.MatchString(t) && !versionSuffix.MatchString(t)
 }

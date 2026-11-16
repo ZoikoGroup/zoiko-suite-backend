@@ -29,8 +29,12 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	pool, err := pgxpool.New(context.Background(), dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
+	// Registered after pool.Close so it runs first (cleanups are LIFO): every event
+	// a test left in the outbox must satisfy the schema this service publishes.
+	verifyEventContracts(t, pool)
 
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS eventing_outbox;
 		DROP TABLE IF EXISTS commercial_object_links;
 		DROP TABLE IF EXISTS consent_records;
 		DROP TABLE IF EXISTS opportunity_stage_transitions;
@@ -73,6 +77,12 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 // real tenant explicitly instead of depending on the removed fallback.
 func ctx() context.Context { return middleware.WithTenant(context.Background(), "default") }
 
+// newStore builds the store under test with an event region, as production does;
+// without one every event-emitting write is refused.
+func newStore(pool *pgxpool.Pool) *store.PgStore {
+	return store.NewPgStore(pool, store.WithEventRegion("local"))
+}
+
 func newRelationshipForTest(t *testing.T, s *store.PgStore) *domain.Relationship {
 	t.Helper()
 	rel, err := s.CreateRelationship(ctx(), domain.CreateRelationshipParams{
@@ -84,7 +94,7 @@ func newRelationshipForTest(t *testing.T, s *store.PgStore) *domain.Relationship
 
 func TestPgStore_CreateRelationship_Unlinked(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 
 	rel := newRelationshipForTest(t, s)
 	require.Equal(t, domain.PartyLinkUnlinked, rel.PartyLinkStatus)
@@ -98,7 +108,7 @@ func TestPgStore_CreateRelationship_Unlinked(t *testing.T) {
 
 func TestPgStore_GetRelationship_UnknownRelationship_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	_, err := s.GetRelationship(ctx(), "rel-does-not-exist")
 	require.ErrorIs(t, err, domain.ErrRelationshipNotFound)
 }
@@ -109,7 +119,7 @@ func TestPgStore_GetRelationship_UnknownRelationship_ReturnsNotFound(t *testing.
 // it — never auto-promoted.
 func TestPgStore_CreateRelationship_WithCandidate_ThenConfirmPartyLink(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 
 	rel, err := s.CreateRelationship(ctx(), domain.CreateRelationshipParams{
 		TenantID: "default", LegalEntityID: "le-1", CandidateCounterpartyID: "cpty-candidate-1", CreatedByPrincipalID: "creator-1",
@@ -137,7 +147,7 @@ func TestPgStore_CreateRelationship_WithCandidate_ThenConfirmPartyLink(t *testin
 
 func TestPgStore_ConfirmPartyLink_RejectsUnlinkedRelationship(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s) // no candidate supplied — UNLINKED
 	_, err := s.ConfirmPartyLink(ctx(), domain.ConfirmPartyLinkParams{
 		RelationshipID: rel.RelationshipID, TenantID: "default", ActorPrincipalID: "reviewer-1", CounterpartyID: "cpty-x",
@@ -147,7 +157,7 @@ func TestPgStore_ConfirmPartyLink_RejectsUnlinkedRelationship(t *testing.T) {
 
 func TestPgStore_LogInteraction_ThenGetTimeline(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 
 	_, err := s.LogInteraction(ctx(), domain.LogInteractionParams{
@@ -168,7 +178,7 @@ func TestPgStore_LogInteraction_ThenGetTimeline(t *testing.T) {
 
 func TestPgStore_LogInteraction_UnknownRelationship_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	_, err := s.LogInteraction(ctx(), domain.LogInteractionParams{
 		RelationshipID: "rel-does-not-exist", TenantID: "default", InteractionType: "CALL", LoggedByPrincipalID: "rep-1",
 	})
@@ -179,7 +189,7 @@ func TestPgStore_LogInteraction_UnknownRelationship_ReturnsNotFound(t *testing.T
 // proof of the append-only trigger.
 func TestPgStore_Interactions_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	interaction, err := s.LogInteraction(ctx(), domain.LogInteractionParams{
 		RelationshipID: rel.RelationshipID, TenantID: "default", InteractionType: "CALL", LoggedByPrincipalID: "rep-1",
@@ -195,7 +205,7 @@ func TestPgStore_Interactions_AreAppendOnly(t *testing.T) {
 
 func TestPgStore_CreateOpportunity_LandsLeadWithHistory(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 
 	opp, err := s.CreateOpportunity(ctx(), domain.CreateOpportunityParams{
@@ -213,7 +223,7 @@ func TestPgStore_CreateOpportunity_LandsLeadWithHistory(t *testing.T) {
 
 func TestPgStore_CreateOpportunity_UnknownRelationship_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	_, err := s.CreateOpportunity(ctx(), domain.CreateOpportunityParams{
 		RelationshipID: "rel-does-not-exist", TenantID: "default", LegalEntityID: "le-1", Name: "X", CreatedByPrincipalID: "rep-1",
 	})
@@ -222,7 +232,7 @@ func TestPgStore_CreateOpportunity_UnknownRelationship_ReturnsNotFound(t *testin
 
 func TestPgStore_UpdateStage_ValidatesStageAndRecordsTransition(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	opp, err := s.CreateOpportunity(ctx(), domain.CreateOpportunityParams{
 		RelationshipID: rel.RelationshipID, TenantID: "default", LegalEntityID: "le-1", Name: "Acme deal", CreatedByPrincipalID: "rep-1",
@@ -247,7 +257,7 @@ func TestPgStore_UpdateStage_ValidatesStageAndRecordsTransition(t *testing.T) {
 // raw UPDATE or DELETE against opportunity_stage_transitions is refused.
 func TestPgStore_OpportunityStageTransitions_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	opp, err := s.CreateOpportunity(ctx(), domain.CreateOpportunityParams{
 		RelationshipID: rel.RelationshipID, TenantID: "default", LegalEntityID: "le-1", Name: "Acme deal", CreatedByPrincipalID: "rep-1",
@@ -267,7 +277,7 @@ func TestPgStore_OpportunityStageTransitions_AreAppendOnly(t *testing.T) {
 
 func TestPgStore_UpdateStage_RejectsWhenOpportunityAlreadyClosed(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	opp, err := s.CreateOpportunity(ctx(), domain.CreateOpportunityParams{
 		RelationshipID: rel.RelationshipID, TenantID: "default", LegalEntityID: "le-1", Name: "Acme deal", CreatedByPrincipalID: "rep-1",
@@ -285,7 +295,7 @@ func TestPgStore_UpdateStage_RejectsWhenOpportunityAlreadyClosed(t *testing.T) {
 
 func TestPgStore_CloseOpportunity_WonAndLost(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 
 	won, err := s.CreateOpportunity(ctx(), domain.CreateOpportunityParams{RelationshipID: rel.RelationshipID, TenantID: "default", LegalEntityID: "le-1", Name: "Won deal", CreatedByPrincipalID: "rep-1"})
@@ -309,7 +319,7 @@ func TestPgStore_CloseOpportunity_WonAndLost(t *testing.T) {
 
 func TestPgStore_ListPipeline_OnlyOpenForLegalEntity(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 
 	open1, err := s.CreateOpportunity(ctx(), domain.CreateOpportunityParams{RelationshipID: rel.RelationshipID, TenantID: "default", LegalEntityID: "le-pipeline", Name: "Open 1", CreatedByPrincipalID: "rep-1"})
@@ -334,7 +344,7 @@ func TestPgStore_ListPipeline_OnlyOpenForLegalEntity(t *testing.T) {
 
 func TestPgStore_RelationshipLifecycle_ActivateMarkDormantClose(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	require.Equal(t, domain.RelationshipProspect, rel.Status)
 
@@ -369,7 +379,7 @@ func TestPgStore_RelationshipLifecycle_ActivateMarkDormantClose(t *testing.T) {
 // document-vault-svc's SupersedeClassification.
 func TestPgStore_MergeCRMProfile_ReparentsChildrenThenRejectsDoubleMerge(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	source := newRelationshipForTest(t, s)
 	target := newRelationshipForTest(t, s)
 
@@ -416,7 +426,7 @@ func TestPgStore_MergeCRMProfile_ReparentsChildrenThenRejectsDoubleMerge(t *test
 
 func TestPgStore_MergeCRMProfile_RejectsMergingIntoSelf(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	_, err := s.MergeCRMProfile(ctx(), domain.MergeCRMProfileParams{SourceRelationshipID: rel.RelationshipID, TargetRelationshipID: rel.RelationshipID, TenantID: "default", ActorPrincipalID: "supervisor-1"})
 	require.ErrorIs(t, err, domain.ErrCannotMergeIntoSelf)
@@ -424,7 +434,7 @@ func TestPgStore_MergeCRMProfile_RejectsMergingIntoSelf(t *testing.T) {
 
 func TestPgStore_LinkCommercialObject_ThenGetLinkedFinancialObjects(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 
 	_, err := s.LinkCommercialObject(ctx(), domain.LinkCommercialObjectParams{RelationshipID: rel.RelationshipID, TenantID: "default", LinkedObjectType: "QUOTE", LinkedObjectID: "q-1", LinkedByPrincipalID: "rep-1"})
@@ -441,7 +451,7 @@ func TestPgStore_LinkCommercialObject_ThenGetLinkedFinancialObjects(t *testing.T
 // negative-controlled proof of the append-only trigger.
 func TestPgStore_CommercialObjectLinks_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	link, err := s.LinkCommercialObject(ctx(), domain.LinkCommercialObjectParams{RelationshipID: rel.RelationshipID, TenantID: "default", LinkedObjectType: "QUOTE", LinkedObjectID: "q-1", LinkedByPrincipalID: "rep-1"})
 	require.NoError(t, err)
@@ -455,7 +465,7 @@ func TestPgStore_CommercialObjectLinks_AreAppendOnly(t *testing.T) {
 
 func TestPgStore_RecordConsent_ThenGetConsentContext_ReturnsLatestPerType(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 
 	_, err := s.RecordConsent(ctx(), domain.RecordConsentParams{RelationshipID: rel.RelationshipID, TenantID: "default", ConsentType: "EMAIL_MARKETING", ConsentStatus: domain.ConsentGranted, Basis: "opt-in form", RecordedByPrincipalID: "rep-1"})
@@ -481,7 +491,7 @@ func TestPgStore_RecordConsent_ThenGetConsentContext_ReturnsLatestPerType(t *tes
 
 func TestPgStore_RecordConsent_InvalidStatus_Rejected(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	_, err := s.RecordConsent(ctx(), domain.RecordConsentParams{RelationshipID: rel.RelationshipID, TenantID: "default", ConsentType: "EMAIL", ConsentStatus: "NOT_A_REAL_STATUS", RecordedByPrincipalID: "rep-1"})
 	require.ErrorIs(t, err, domain.ErrInvalidConsentStatus)
@@ -491,7 +501,7 @@ func TestPgStore_RecordConsent_InvalidStatus_Rejected(t *testing.T) {
 // proof of the append-only trigger.
 func TestPgStore_ConsentRecords_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := newStore(pool)
 	rel := newRelationshipForTest(t, s)
 	consent, err := s.RecordConsent(ctx(), domain.RecordConsentParams{RelationshipID: rel.RelationshipID, TenantID: "default", ConsentType: "EMAIL", ConsentStatus: domain.ConsentGranted, RecordedByPrincipalID: "rep-1"})
 	require.NoError(t, err)
