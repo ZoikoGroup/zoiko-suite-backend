@@ -264,7 +264,7 @@ func (s *stubStore) FindAttestationByID(_ context.Context, _ string) (*domain.At
 	return s.attestation, s.attestationErr
 }
 
-func (s *stubStore) RevokeAttestation(_ context.Context, _, _ string) (*domain.Attestation, error) {
+func (s *stubStore) RevokeAttestation(_ context.Context, _, _ string, _ domain.EventMeta) (*domain.Attestation, error) {
 	return s.revoked, s.revokeErr
 }
 
@@ -344,6 +344,7 @@ func newRig(s *stubStore, c *stubCandidates, az *stubAuthz, opts ...rigOption) *
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
 	handler.RegisterListRoutes(r, h)
+	handler.RegisterOperationRoutes(r, h)
 	return &rig{store: s, cands: c, az: az, r: r}
 }
 

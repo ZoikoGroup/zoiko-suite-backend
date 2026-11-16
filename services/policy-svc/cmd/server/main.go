@@ -256,6 +256,7 @@ func main() {
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
 	handler.RegisterListRoutes(r, h)
+	handler.RegisterOperationRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

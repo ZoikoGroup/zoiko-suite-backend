@@ -181,6 +181,9 @@ func (h *Handler) DraftAccountingPolicy(w http.ResponseWriter, r *http.Request) 
 		case errors.Is(err, domain.ErrConflict):
 			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "accounting_policy_conflict",
 				"a policy already exists for this applicability with a different framework", nil)
+		case errors.Is(err, domain.ErrPolicyRetired):
+			writeError(w, r, http.StatusConflict, codePolicyRetired, "policy_retired",
+				"the accounting policy family for this applicability is retired and takes no new versions", nil)
 		default:
 			h.storeUnavailable(w, r, "DraftAccountingPolicy", err)
 		}

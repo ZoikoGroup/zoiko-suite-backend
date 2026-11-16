@@ -209,6 +209,42 @@ paths:
         '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /v1/policies/{policy_id}/retire:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+    post:
+      tags: [policies]
+      operationId: retirePolicyFamily
+      description: >-
+        Retires a policy family: no new versions, history kept. Refused (409 POLICY_IN_USE) while
+        a version is ACTIVE or SCHEDULED. Needs the family's record_version and a reason_code;
+        authorized as POLICY_VERSION_RETIRE (POLICY_VERSION_RETIRE_GLOBAL for a platform family).
+        Retiring a retired family answers it unchanged.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReasonRequest'}
+      responses:
+        '200':
+          description: The retired family; record_version is the ETag
+          headers:
+            ETag: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Policy'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policies/{policy_id}/versions:
     parameters:
       - $ref: '#/components/parameters/PolicyID'
@@ -895,6 +931,36 @@ paths:
         '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /v1/policy-evaluations/{evidence_id}/redeliver:
+    parameters:
+      - {name: evidence_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [evaluation]
+      operationId: redeliverPolicyEvidence
+      description: >-
+        Puts evidence the governance ledger refused for good (ledger_status FAILED) back on the
+        relay's queue, after an operator fixed the cause (POLICY_EVIDENCE_REDELIVER). Pending
+        evidence is left alone. The request is recorded as policy.evidence.redelivery_requested.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReasonRequest'}
+      responses:
+        '200':
+          description: The evaluation, ledger_status PENDING
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvaluateResponse'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policy-evaluations/{evidence_id}:
     parameters:
       - {name: evidence_id, in: path, required: true, schema: {type: string, format: uuid}}
@@ -1296,10 +1362,22 @@ components:
         policy_name: {type: string}
         policy_type: {type: string}
         tenant_id: {type: string, format: uuid, nullable: true}
-        policy_status: {type: string}
+        policy_status: {type: string, description: 'ACTIVE or RETIRED (final: a retired family takes no new versions).'}
         versioning_mode: {type: string}
         created_at: {type: string, format: date-time}
         created_by_principal_id: {type: string}
+        record_version: {type: integer, description: 'The ETag; send it as If-Match or expected_version to retire.'}
+        retired_by_principal_id: {type: string}
+        retired_at: {type: string, format: date-time}
+        retirement_reason: {type: string}
+
+    ReasonRequest:
+      type: object
+      required: [reason_code]
+      properties:
+        reason_code: {type: string}
+        reason: {type: string, description: 'Free text beside reason_code; together at most 2000 characters.'}
+        expected_version: {type: integer, description: 'The record_version, when If-Match is not sent.'}
 
     CreatePolicyVersionRequest:
       type: object

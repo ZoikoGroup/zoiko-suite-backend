@@ -34,6 +34,9 @@ type ControlTestDefinition struct {
 
 // CreateControlTestDefinitionParams holds input for creating a definition.
 type CreateControlTestDefinitionParams struct {
+	// Meta carries the request's correlation, causation and idempotency
+	// onto the event written with the record.
+	Meta                    EventMeta
 	ControlTestDefinitionID string
 	TenantID                string
 	ControlRef              string
@@ -74,6 +77,9 @@ type ControlTestExecution struct {
 
 // CreateControlTestExecutionParams holds input for recording an execution.
 type CreateControlTestExecutionParams struct {
+	// Meta carries the request's correlation, causation and idempotency
+	// onto the event written with the record.
+	Meta                    EventMeta
 	ControlTestExecutionID  string
 	TenantID                string
 	ControlTestDefinitionID string
@@ -126,6 +132,9 @@ type Attestation struct {
 
 // CreateAttestationParams holds input for creating an attestation.
 type CreateAttestationParams struct {
+	// Meta carries the request's correlation, causation and idempotency
+	// onto the event written with the record.
+	Meta                 EventMeta
 	AttestationID        string
 	TenantID             string
 	Statement            string

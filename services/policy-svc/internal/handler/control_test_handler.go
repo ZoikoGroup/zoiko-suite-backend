@@ -110,6 +110,7 @@ func (h *Handler) CreateControlTestDefinition(w http.ResponseWriter, r *http.Req
 		SampleApproach:          req.SampleApproach,
 		TestFrequency:           req.TestFrequency,
 		CreatedByPrincipalID:    principalID,
+		Meta:                    eventMeta(r, principalID),
 	}
 
 	d, created, err := h.store.CreateControlTestDefinition(r.Context(), params)
@@ -259,6 +260,7 @@ func (h *Handler) CreateControlTestExecution(w http.ResponseWriter, r *http.Requ
 		ExceptionsNoted:         req.ExceptionsNoted,
 		ReviewerPrincipalID:     req.ReviewerPrincipalID,
 		CreatedByPrincipalID:    principalID,
+		Meta:                    eventMeta(r, principalID),
 	}
 
 	e, err := h.store.CreateControlTestExecution(r.Context(), params)
@@ -432,6 +434,7 @@ func (h *Handler) CreateAttestation(w http.ResponseWriter, r *http.Request) {
 		EvidenceRefs:         req.EvidenceRefs,
 		ExpiresAt:            req.ExpiresAt,
 		CreatedByPrincipalID: principalID,
+		Meta:                 eventMeta(r, principalID),
 	}
 
 	a, err := h.store.CreateAttestation(r.Context(), params)
@@ -519,7 +522,7 @@ func (h *Handler) RevokeAttestation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a, err := h.store.RevokeAttestation(r.Context(), id, req.Reason)
+	a, err := h.store.RevokeAttestation(r.Context(), id, req.Reason, eventMeta(r, principalID))
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAttestationNotFound):

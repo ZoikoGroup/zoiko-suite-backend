@@ -90,6 +90,10 @@ const (
 	ActionPolicyRead     = "POLICY_READ"
 	ActionPolicyEvaluate = "POLICY_EVALUATE"
 
+	// ActionPolicyEvidenceRedeliver puts evidence the governance ledger
+	// refused back on the relay's queue: an operator's act, apart from reads.
+	ActionPolicyEvidenceRedeliver = "POLICY_EVIDENCE_REDELIVER"
+
 	ActionControlTestDefinitionCreate = "CONTROL_TEST_DEFINITION_CREATE"
 	ActionControlTestExecutionRecord  = "CONTROL_TEST_EXECUTION_RECORD"
 	ActionAttestationCreate           = "ATTESTATION_CREATE"

@@ -103,6 +103,7 @@ func (s *PgStore) domainError(op string, err error) error {
 		domain.ErrSupersessionRequired, domain.ErrInvalidSupersedes,
 		domain.ErrControlTestDefinitionNotFound, domain.ErrAttestationNotFound,
 		domain.ErrInvalidAttestationTransition,
+		domain.ErrPolicyRetired, domain.ErrPolicyInUse, domain.ErrEvidenceAlreadyRecorded,
 	} {
 		if errors.Is(err, known) {
 			return err
@@ -141,7 +142,10 @@ const policyColumns = `
 	versioning_mode,
 	created_at,
 	created_by_principal_id,
-	record_version`
+	record_version,
+	retired_by_principal_id,
+	retired_at,
+	retirement_reason`
 
 func scanPolicy(row pgx.Row) (*domain.Policy, error) {
 	p := &domain.Policy{}
@@ -156,8 +160,68 @@ func scanPolicy(row pgx.Row) (*domain.Policy, error) {
 		&p.CreatedAt,
 		&p.CreatedByPrincipalID,
 		&p.RecordVersion,
+		&p.RetiredByPrincipalID,
+		&p.RetiredAt,
+		&p.RetirementReason,
 	)
 	return p, err
+}
+
+// RetirePolicy retires a policy family: refused while a version of it is
+// ACTIVE or SCHEDULED (those are retired or superseded first, through their
+// own lifecycle), compare-and-set on record_version, evidenced on the row and
+// by policy.retired in the same transaction. Retiring a retired family is an
+// idempotent no-op.
+func (s *PgStore) RetirePolicy(ctx context.Context, params domain.RetirePolicyParams) (*domain.Policy, bool, error) {
+	var out *domain.Policy
+	var changed bool
+	err := s.withRLS(ctx, contextTenantID(ctx), func(tx pgx.Tx) error {
+		p, err := scanPolicy(tx.QueryRow(ctx, `SELECT `+policyColumns+` FROM policies WHERE policy_id = $1 FOR UPDATE;`, params.PolicyID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrPolicyNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if p.PolicyStatus == domain.PolicyStatusRetired {
+			out = p
+			return nil
+		}
+		if p.RecordVersion != params.ExpectedVersion {
+			return domain.ErrConcurrencyConflict
+		}
+		var governing bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM policy_versions
+			               WHERE policy_id = $1 AND version_status IN ('ACTIVE', 'SCHEDULED'));`,
+			params.PolicyID).Scan(&governing); err != nil {
+			return err
+		}
+		if governing {
+			return domain.ErrPolicyInUse
+		}
+		out, err = scanPolicy(tx.QueryRow(ctx, `
+			UPDATE policies
+			SET policy_status = 'RETIRED', retired_by_principal_id = $2, retired_at = $3,
+			    retirement_reason = $4, record_version = record_version + 1
+			WHERE policy_id = $1
+			RETURNING `+policyColumns+`;`, params.PolicyID, params.ActorID, s.now(), params.Reason))
+		if err != nil {
+			return err
+		}
+		changed = true
+		ev := policyEvent("policy.retired", out, params.Meta)
+		ev.ActorID = params.ActorID
+		ev.AggregateVersion = int(out.RecordVersion)
+		if ev.IdempotencyKey == "" {
+			ev.IdempotencyKey = "policy.retired:" + out.PolicyID
+		}
+		return s.enqueue(ctx, tx, ev)
+	})
+	if err != nil {
+		return nil, false, s.domainError("RetirePolicy", err)
+	}
+	return out, changed, nil
 }
 
 // FindPolicyByID looks up a policy family visible to the caller's tenant: a
@@ -402,6 +466,11 @@ func (s *PgStore) createVersionTx(ctx context.Context, tx pgx.Tx, params domain.
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
+		}
+		// A replay of a version drafted before retirement still answers
+		// above; a new one is refused.
+		if family.PolicyStatus == domain.PolicyStatusRetired {
+			return domain.ErrPolicyRetired
 		}
 
 		var next int

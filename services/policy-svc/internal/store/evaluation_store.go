@@ -170,6 +170,58 @@ func (s *PgStore) ClaimEvidence(ctx context.Context, limit int, lease time.Durat
 	return out, nil
 }
 
+// RedeliverEvidence puts evidence the ledger refused (FAILED) back on the
+// relay's queue, in the caller's tenant scope, and records who asked and why
+// as policy.evidence.redelivery_requested in the same transaction. Evidence
+// still pending is left alone (changed=false); evidence already recorded is
+// ErrEvidenceAlreadyRecorded.
+func (s *PgStore) RedeliverEvidence(ctx context.Context, p domain.EvidenceRedeliveryParams) (bool, error) {
+	var changed bool
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		var delivered, failed *time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT delivered_at, failed_at FROM policy_evidence_outbox
+			WHERE evaluation_id = $1 FOR UPDATE;`, p.EvaluationID).Scan(&delivered, &failed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrEvaluationNotFound
+		}
+		if err != nil {
+			return err
+		}
+		switch {
+		case delivered != nil:
+			return domain.ErrEvidenceAlreadyRecorded
+		case failed == nil:
+			return nil // still pending: the relay already has it
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE policy_evidence_outbox
+			SET failed_at = NULL, attempts = 0, next_attempt_at = $2,
+			    last_error = 'redelivery requested: ' || COALESCE(last_error, '')
+			WHERE evaluation_id = $1;`, p.EvaluationID, s.now()); err != nil {
+			return err
+		}
+		changed = true
+		key := p.Meta.IdempotencyKey
+		if key == "" {
+			key = "policy.evidence.redelivery_requested:" + p.EvaluationID + ":" + s.now().Format(time.RFC3339Nano)
+		}
+		tenant := p.TenantID
+		return s.enqueue(ctx, tx, OutboxEvent{
+			EventType: "policy.evidence.redelivery_requested", TenantID: &tenant, ActorID: p.ActorID,
+			CorrelationID: p.Meta.CorrelationID, CausationID: p.Meta.CausationID, IdempotencyKey: key,
+			JurisdictionContext: p.Meta.JurisdictionContext, AggregateID: p.EvaluationID, AggregateVersion: 1,
+			Payload: mustJSON(map[string]any{
+				"evidence_id": p.EvaluationID, "requested_by_principal_id": p.ActorID, "reason": p.Reason,
+			}),
+		})
+	})
+	if err != nil {
+		return false, s.domainError("RedeliverEvidence", err)
+	}
+	return changed, nil
+}
+
 // relayExec runs one statement against the evidence outbox as the relay.
 func (s *PgStore) relayExec(ctx context.Context, op, sql string, args ...any) error {
 	if err := s.withRelay(ctx, func(tx pgx.Tx) error {

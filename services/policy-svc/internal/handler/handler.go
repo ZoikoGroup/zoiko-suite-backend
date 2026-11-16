@@ -48,7 +48,7 @@ type PolicyStore interface {
 	ResolveControlEffectiveness(ctx context.Context, controlRef string) (*domain.ControlEffectiveness, error)
 	CreateAttestation(ctx context.Context, params domain.CreateAttestationParams) (*domain.Attestation, error)
 	FindAttestationByID(ctx context.Context, id string) (*domain.Attestation, error)
-	RevokeAttestation(ctx context.Context, attestationID, reason string) (*domain.Attestation, error)
+	RevokeAttestation(ctx context.Context, attestationID, reason string, meta domain.EventMeta) (*domain.Attestation, error)
 }
 
 // CandidateSource returns resolution candidates — the cache in production.
@@ -137,6 +137,9 @@ const (
 	codeNotFound            = "NOT_FOUND"
 	codeUnavailable         = "SERVICE_UNAVAILABLE"
 	codeNotImplemented      = "NOT_IMPLEMENTED"
+	codePolicyInUse         = "POLICY_IN_USE"
+	codePolicyRetired       = "POLICY_RETIRED"
+	codeEvidenceRecorded    = "EVIDENCE_ALREADY_RECORDED"
 )
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, code, legacy, message string, extra map[string]any) {
@@ -692,6 +695,9 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
 		case errors.Is(err, domain.ErrInvalidScope):
 			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_scope", "a version of a tenant-owned policy must be in its owner's scope", nil)
+		case errors.Is(err, domain.ErrPolicyRetired):
+			writeError(w, r, http.StatusConflict, codePolicyRetired, "policy_retired",
+				"the policy family is retired and takes no new versions", map[string]any{"policy_id": policyID})
 		case errors.Is(err, domain.ErrIdempotencyMismatch), errors.Is(err, domain.ErrConflict):
 			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "policy_version_conflict",
 				"this Idempotency-Key or policy_version_id was already used with different content", map[string]any{"policy_id": policyID})
