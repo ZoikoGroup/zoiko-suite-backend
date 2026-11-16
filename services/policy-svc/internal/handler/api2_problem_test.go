@@ -105,6 +105,7 @@ func TestOpenAPI_MatchesTheRouter(t *testing.T) {
 	h := handler.New(&stubStore{}, &stubCandidates{}, &stubAuthz{}, handler.Options{PlatformScopeID: testAuthzScopeID}, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
+	handler.RegisterListRoutes(r, h)
 	served := map[string]bool{"GET /healthz": true, "GET /readyz": true}
 	_ = chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		served[method+" "+strings.TrimSuffix(route, "/")] = true

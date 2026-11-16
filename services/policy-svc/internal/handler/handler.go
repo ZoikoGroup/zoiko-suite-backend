@@ -87,6 +87,9 @@ type Options struct {
 	ReadAuthz Mode
 	// Now is the clock; the store stamps lifecycle times from the same one.
 	Now func() time.Time
+	// Cursors signs every list's next_cursor (API-4). Nil gets a per-process
+	// random key, which is only right for tests and local runs.
+	Cursors *apicontract.CursorSigner
 }
 
 // Handler holds all HTTP handler methods.
@@ -95,6 +98,7 @@ type Handler struct {
 	candidates CandidateSource
 	authz      authz.Client
 	opts       Options
+	cursors    *apicontract.CursorSigner
 	log        *zap.Logger
 }
 
@@ -103,13 +107,16 @@ func New(st PolicyStore, candidates CandidateSource, authzClient authz.Client, o
 	if opts.Now == nil {
 		opts.Now = func() time.Time { return time.Now().UTC() }
 	}
+	if opts.Cursors == nil {
+		opts.Cursors = newRandomCursorSigner()
+	}
 	if opts.EvaluateAuthz == "" {
 		opts.EvaluateAuthz = ModeEnforce
 	}
 	if opts.ReadAuthz == "" {
 		opts.ReadAuthz = ModeEnforce
 	}
-	return &Handler{store: st, candidates: candidates, authz: authzClient, opts: opts, log: log}
+	return &Handler{store: st, candidates: candidates, authz: authzClient, opts: opts, cursors: opts.Cursors, log: log}
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -945,13 +952,14 @@ func (h *Handler) writeTransitionError(w http.ResponseWriter, r *http.Request, v
 // ── reads ────────────────────────────────────────────────────────────────────
 
 // ListVersionHistory handles GET /v1/policies/{policy_id}/versions: every
-// version visible to the caller's tenant, newest first.
+// version visible to the caller's tenant, newest first, paged (API-4).
 func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	policyID := chi.URLParam(r, "policy_id")
-	if _, ok := h.requireTenant(w, r); !ok {
+	if !requireUUID(w, r, "policy_id", policyID) {
 		return
 	}
-	if !requireUUID(w, r, "policy_id", policyID) {
+	lr, ok := h.beginList(w, r, nil)
+	if !ok {
 		return
 	}
 	if _, ok := h.gate(w, r, h.opts.ReadAuthz, authz.ActionPolicyRead, nil); !ok {
@@ -966,13 +974,10 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 		h.storeUnavailable(w, r, "ListVersionHistory", err)
 		return
 	}
-	if results == nil {
-		results = []*domain.PolicyVersion{}
-	}
 	// No ETag on a list: a list is not an If-Match target, and the first
 	// item's row_version (which this used) stayed the same when any other
 	// version moved, so a cache would keep serving the stale list.
-	writeJSON(w, http.StatusOK, results)
+	pageOf(h, w, r, lr, results)
 }
 
 // GetPolicyVersionByID handles GET /v1/policy-versions/{version_id} — the
@@ -1009,7 +1014,8 @@ func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
 	if !requireUUID(w, r, "version_id", versionID) {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	lr, ok := h.beginList(w, r, nil)
+	if !ok {
 		return
 	}
 	if _, ok := h.gate(w, r, h.opts.ReadAuthz, authz.ActionPolicyRead, nil); !ok {
@@ -1024,12 +1030,9 @@ func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
 		h.storeUnavailable(w, r, "ListTransitions", err)
 		return
 	}
-	if ts == nil {
-		ts = []*domain.VersionTransition{}
-	}
 	// No ETag on a list (see ListVersionHistory): a transition id is not a
 	// version of anything a caller could send back.
-	writeJSON(w, http.StatusOK, ts)
+	pageOf(h, w, r, lr, ts)
 }
 
 // ── plumbing ─────────────────────────────────────────────────────────────────

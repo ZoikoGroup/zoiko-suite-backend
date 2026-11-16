@@ -1,6 +1,9 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -88,6 +91,42 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// CursorSigningKey signs the next_cursor of every list (API-4), from
+	// CURSOR_SIGNING_KEY_HEX (at least 32 bytes), required outside local/dev.
+	// Local and dev generate one per process, which only means a cursor does
+	// not survive a restart.
+	CursorSigningKey []byte
+}
+
+// LocalEnv reports whether Env names a developer tier.
+func (c *Config) LocalEnv() bool {
+	switch strings.ToLower(c.Env) {
+	case "local", "dev", "development", "test":
+		return true
+	}
+	return false
+}
+
+func cursorKey(raw string, local bool) ([]byte, error) {
+	if raw == "" {
+		if !local {
+			return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is required outside local/dev")
+		}
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("generate cursor signing key: %w", err)
+		}
+		return key, nil
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is not hex: %w", err)
+	}
+	if len(key) < 32 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be at least 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -119,7 +158,7 @@ func (d DBConfig) DSN() string {
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
-	return &Config{
+	cfg := &Config{
 		Env: env("ENV", "local"),
 		// 8085, not 8084: 8080-8083 are taken (identity/tenant-entity/
 		// jurisdiction-rules/governance-decision-log). 8084 is reserved
@@ -160,7 +199,13 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "policy-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.policy.events"),
 		},
-	}, nil
+	}
+	key, err := cursorKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), cfg.LocalEnv())
+	if err != nil {
+		return nil, err
+	}
+	cfg.CursorSigningKey = key
+	return cfg, nil
 }
 
 func env(key, def string) string {

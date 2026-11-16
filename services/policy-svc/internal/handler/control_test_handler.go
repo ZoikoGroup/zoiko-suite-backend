@@ -287,10 +287,11 @@ func (h *Handler) ListControlTestExecutions(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	if !requireUUID(w, r, "control_test_definition_id", definitionID) {
 		return
 	}
-	if !requireUUID(w, r, "control_test_definition_id", definitionID) {
+	lr, ok := h.beginList(w, r, nil)
+	if !ok {
 		return
 	}
 	if !h.authorize(w, r, principalID, authz.ActionControlTestExecutionRead, nil) {
@@ -303,10 +304,7 @@ func (h *Handler) ListControlTestExecutions(w http.ResponseWriter, r *http.Reque
 		writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		return
 	}
-	if results == nil {
-		results = []*domain.ControlTestExecution{}
-	}
-	writeJSON(w, http.StatusOK, results)
+	pageOf(h, w, r, lr, results)
 }
 
 // GetControlEffectiveness handles GET /v1/controls/{control_ref}/effectiveness

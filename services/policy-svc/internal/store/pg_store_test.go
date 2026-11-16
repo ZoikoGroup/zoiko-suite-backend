@@ -791,6 +791,58 @@ func TestRelayTables_RLS(t *testing.T) {
 	}
 }
 
+// The registers and the summary read through the caller's tenant scope:
+// platform families and the tenant's own, never another tenant's.
+func TestRegisters_ScopedFilteredPagedAndCounted(t *testing.T) {
+	e := newEnv(t)
+	global := e.family(t, tenantA, nil, "REG-GLOBAL")
+	ownA := e.family(t, tenantA, sp(tenantA), "REG-A")
+	e.family(t, tenantB, sp(tenantB), "REG-B")
+	v := e.draft(t, tenantA, ownA, sp(tenantA), nil, e.clock.Add(-time.Hour), `{"threshold_amount": 10}`)
+	e.release(t, tenantA, v)
+	e.draft(t, tenantA, ownA, sp(tenantA), nil, e.clock.Add(time.Hour), `{"threshold_amount": 20}`)
+
+	all, err := e.s.ListPolicyFamilies(as(tenantA), domain.ListQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codes := map[string]bool{}
+	for _, p := range all {
+		codes[p.PolicyCode] = true
+	}
+	if len(all) != 2 || !codes["REG-GLOBAL"] || !codes["REG-A"] || codes["REG-B"] {
+		t.Fatalf("tenant A must see the platform family and its own only, got %v", codes)
+	}
+	globals, _ := e.s.ListPolicyFamilies(as(tenantA), domain.ListQuery{Limit: 10, Filters: map[string]string{"scope": domain.ScopeTypeGlobal}})
+	if len(globals) != 1 || globals[0].PolicyID != global.PolicyID {
+		t.Fatalf("scope=GLOBAL: %v", globals)
+	}
+	first, _ := e.s.ListPolicyFamilies(as(tenantA), domain.ListQuery{Limit: 1})
+	second, _ := e.s.ListPolicyFamilies(as(tenantA), domain.ListQuery{Limit: 1, Offset: 1})
+	if len(first) != 1 || len(second) != 1 || first[0].PolicyID == second[0].PolicyID {
+		t.Fatalf("offset paging must move through the register: %v / %v", first, second)
+	}
+
+	active, _ := e.s.ListPolicyVersions(as(tenantA), domain.ListQuery{Limit: 10, Filters: map[string]string{"version_status": domain.StatusActive}})
+	if len(active) != 1 || active[0].PolicyVersionID != v.PolicyVersionID {
+		t.Fatalf("version register filtered ACTIVE: %v", active)
+	}
+	if none, _ := e.s.ListPolicyVersions(as(tenantB), domain.ListQuery{Limit: 10}); len(none) != 0 {
+		t.Fatalf("tenant B must not see tenant A's versions: %v", none)
+	}
+
+	sum, err := e.s.PolicySummary(as(tenantA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.PolicyFamilies != 2 || sum.VersionsActive != 1 || sum.VersionsDraft != 1 || sum.Evaluations24h != 0 {
+		t.Fatalf("summary for tenant A: %+v", sum)
+	}
+	if sumB, _ := e.s.PolicySummary(as(tenantB)); sumB.VersionsActive != 0 || sumB.PolicyFamilies != 2 {
+		t.Fatalf("summary for tenant B counts only what B can see: %+v", sumB)
+	}
+}
+
 func TestControlTests_TenantIsolation(t *testing.T) {
 	e := newEnv(t)
 	def, created, err := e.s.CreateControlTestDefinition(as(tenantA), domain.CreateControlTestDefinitionParams{

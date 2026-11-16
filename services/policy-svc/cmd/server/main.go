@@ -239,10 +239,15 @@ func main() {
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 
+	cursorSigner, err := apicontract.NewCursorSigner(cfg.CursorSigningKey)
+	if err != nil {
+		log.Fatal("cursor signer", zap.Error(err))
+	}
 	h := handler.New(pgStore, resolutionCache, authzClient, handler.Options{
 		PlatformScopeID: cfg.AuthZPlatformScopeID,
 		EvaluateAuthz:   handler.ParseMode(cfg.EvaluateAuthz),
 		ReadAuthz:       handler.ParseMode(cfg.ReadAuthz),
+		Cursors:         cursorSigner,
 	}, log)
 	if handler.ParseMode(cfg.EvaluateAuthz) == handler.ModeWarn || handler.ParseMode(cfg.ReadAuthz) == handler.ModeWarn {
 		log.Warn("policy-svc authorization gates in WARN mode: refusals are logged, not enforced",
@@ -250,6 +255,7 @@ func main() {
 	}
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
+	handler.RegisterListRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

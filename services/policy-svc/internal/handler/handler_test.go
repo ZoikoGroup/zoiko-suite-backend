@@ -343,6 +343,7 @@ func newRig(s *stubStore, c *stubCandidates, az *stubAuthz, opts ...rigOption) *
 	h := handler.New(s, c, az, o, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
+	handler.RegisterListRoutes(r, h)
 	return &rig{store: s, cands: c, az: az, r: r}
 }
 
@@ -1081,8 +1082,8 @@ func TestListVersionHistory(t *testing.T) {
 	g := newRig(&stubStore{}, nil, nil)
 	w := g.do(http.MethodGet, "/v1/policies/"+policyID+"/versions", "")
 	expect(t, w, http.StatusOK, "")
-	if strings.TrimSpace(w.Body.String()) != "[]" {
-		t.Fatalf("an empty history is [], got %s", w.Body.String())
+	if strings.TrimSpace(w.Body.String()) != `{"items":[],"page_size":50}` {
+		t.Fatalf("an empty history is an empty page, got %s", w.Body.String())
 	}
 	g = newRig(&stubStore{historyErr: domain.ErrPolicyNotFound}, nil, nil)
 	expect(t, g.do(http.MethodGet, "/v1/policies/"+policyID+"/versions", ""), http.StatusNotFound, "NOT_FOUND")

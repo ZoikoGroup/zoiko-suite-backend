@@ -149,6 +149,21 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /v1/policies/summary:
+    get:
+      tags: [policies]
+      operationId: getPolicySummary
+      description: The console KPI row for the caller's tenant (POLICY_READ). Counts of rows, never estimates.
+      responses:
+        '200':
+          description: The counts
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PolicySummary'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policies/evaluate:
     post:
       tags: [evaluation]
@@ -221,14 +236,15 @@ paths:
     get:
       tags: [versions]
       operationId: listVersionHistory
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Every version visible to the caller's tenant, newest first
+          description: Every version visible to the caller's tenant, newest first, one page (API-4)
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: '#/components/schemas/PolicyVersion'}
+              schema: {$ref: '#/components/schemas/PolicyVersionPage'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -754,6 +770,77 @@ paths:
         '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /v1/policy-families:
+    get:
+      tags: [policies]
+      operationId: listPolicyFamilies
+      description: >-
+        The policy register: platform families and the caller tenant's own (POLICY_READ),
+        newest first. GET /v1/policies stays the applicability set for one policy_type.
+      parameters:
+        - {name: 'filter[policy_type]', in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: 'filter[scope]', in: query, required: false, schema: {type: string, enum: [TENANT, GLOBAL]}}
+        - {name: 'filter[policy_status]', in: query, required: false, schema: {type: string}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PolicyPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions:
+    get:
+      tags: [versions]
+      operationId: listPolicyVersions
+      description: The version register across every visible family (POLICY_READ), newest first.
+      parameters:
+        - {name: 'filter[policy_id]', in: query, required: false, schema: {type: string, format: uuid}}
+        - {name: 'filter[policy_type]', in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: 'filter[version_status]', in: query, required: false, schema: {type: string, enum: [DRAFT, REVIEW, APPROVED, SCHEDULED, ACTIVE, SUPERSEDED, SUSPENDED, RETIRED]}}
+        - {name: 'filter[legal_entity_id]', in: query, required: false, schema: {type: string, format: uuid}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PolicyVersionPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-evaluations:
+    get:
+      tags: [evaluation]
+      operationId: listPolicyEvaluations
+      description: The caller tenant's evaluation evidence (POLICY_READ), newest first.
+      parameters:
+        - {name: 'filter[policy_type]', in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: 'filter[result]', in: query, required: false, schema: {type: string}}
+        - {name: 'filter[legal_entity_id]', in: query, required: false, schema: {type: string, format: uuid}}
+        - {name: 'filter[decision_id]', in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: 'filter[policy_version_id]', in: query, required: false, schema: {type: string, format: uuid}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvaluationPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policy-versions/compare:
     get:
       tags: [versions]
@@ -793,14 +880,15 @@ paths:
     get:
       tags: [versions]
       operationId: listPolicyVersionTransitions
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Lifecycle transitions, oldest first
+          description: Lifecycle transitions, oldest first, one page (API-4)
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: '#/components/schemas/VersionTransition'}
+              schema: {$ref: '#/components/schemas/VersionTransitionPage'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -853,6 +941,25 @@ paths:
         '409': {$ref: '#/components/responses/Problem'}
         '413': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [controls]
+      operationId: listControlTestDefinitions
+      description: The caller tenant's control-test register (CONTROL_TEST_DEFINITION_READ), newest first.
+      parameters:
+        - {name: 'filter[control_ref]', in: query, required: false, schema: {type: string, maxLength: 128}}
+        - {name: 'filter[design_status]', in: query, required: false, schema: {type: string}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ControlTestDefinitionPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
 
   /v1/control-test-definitions/{id}:
     parameters:
@@ -901,14 +1008,15 @@ paths:
     get:
       tags: [controls]
       operationId: listControlTestExecutions
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Executions of this definition
+          description: Executions of this definition, latest period first, one page (API-4)
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: '#/components/schemas/ControlTestExecution'}
+              schema: {$ref: '#/components/schemas/ControlTestExecutionPage'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -953,6 +1061,26 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
         '413': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [attestations]
+      operationId: listAttestations
+      description: The caller tenant's attestation register (ATTESTATION_READ), newest first.
+      parameters:
+        - {name: 'filter[subject_ref]', in: query, required: false, schema: {type: string, maxLength: 255}}
+        - {name: 'filter[attestation_status]', in: query, required: false, schema: {type: string, enum: [ACTIVE, CHALLENGED, REVOKED]}}
+        - {name: 'filter[signer_principal_id]', in: query, required: false, schema: {type: string}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttestationPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
   /v1/attestations/{id}:
@@ -1025,6 +1153,8 @@ components:
     AccountingDomainOptional: {name: policy_domain, in: query, required: false, schema: {type: string, maxLength: 64}}
     BookID: {name: book_id, in: query, required: false, schema: {type: string, format: uuid}, description: 'The accounting book. Omit for a request that names none: only policies for every book apply.'}
     JurisdictionID: {name: jurisdiction_id, in: query, required: false, schema: {type: string, format: uuid}, description: 'Omit for a request that names none: only policies for every jurisdiction apply.'}
+    PageSize: {name: page_size, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+    Cursor: {name: cursor, in: query, required: false, schema: {type: string}, description: 'The next_cursor of the previous page. Bound to the tenant, the route and the filters: anything else is 400 invalid_cursor.'}
 
   requestBodies:
     Lifecycle:
@@ -1055,6 +1185,75 @@ components:
           schema: {$ref: '#/components/schemas/PolicyVersion'}
 
   schemas:
+    PageFields:
+      type: object
+      required: [items, page_size]
+      properties:
+        next_cursor: {type: string, description: 'Absent on the last page.'}
+        page_size: {type: integer}
+    PolicyPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/Policy'}}
+    PolicyVersionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/PolicyVersion'}}
+    VersionTransitionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/VersionTransition'}}
+    EvaluationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/Evaluation'}}
+    ControlTestDefinitionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/ControlTestDefinition'}}
+    ControlTestExecutionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/ControlTestExecution'}}
+    AttestationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/Attestation'}}
+    PolicySummary:
+      type: object
+      properties:
+        tenant_id: {type: string, format: uuid}
+        as_of: {type: string, format: date-time}
+        policy_families: {type: integer}
+        versions_draft: {type: integer}
+        versions_in_review: {type: integer}
+        versions_approved: {type: integer}
+        versions_scheduled: {type: integer}
+        versions_active: {type: integer}
+        versions_suspended: {type: integer}
+        suspensions_awaiting_review: {type: integer}
+        evaluations_24h: {type: integer}
+        evaluations_approval_required_24h: {type: integer}
+        evidence_pending: {type: integer}
+        evidence_failed: {type: integer}
+        control_test_definitions: {type: integer}
+        control_tests_failing: {type: integer, description: 'Definitions whose latest execution was not EFFECTIVE.'}
+        attestations_active: {type: integer}
+        attestations_revoked: {type: integer}
     Problem:
       type: object
       required: [type, title, status, code]
