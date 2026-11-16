@@ -8,12 +8,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/lifecycle"
+	"zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/outbox"
 )
 
@@ -120,7 +123,7 @@ type resetStore struct {
 	getReq    func(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error)
 	decideReq func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
 		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error)
-	createReq func(ctx context.Context, r domain.PasswordResetRequest, recs ...outbox.Record) error
+	createReq       func(ctx context.Context, r domain.PasswordResetRequest, recs ...outbox.Record) error
 	insertCredToken func(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error
 }
 
@@ -179,8 +182,12 @@ func newResetService(st *resetStore, notifier lifecycle.Notifier, metricsInc *in
 }
 
 func TestIC13_MetricAfterCommit(t *testing.T) {
-	// Metric must be incremented AFTER the store commit, not before.
-	var metricInc int
+	// Metric must be incremented AFTER the store commit, not before. DecideReset
+	// counts on metrics.Default().PasswordResets (identity_password_resets_total).
+	prev := metrics.Default()
+	m := metrics.New(prometheus.NewRegistry())
+	metrics.SetDefault(m)
+	t.Cleanup(func() { metrics.SetDefault(prev) })
 	st := &resetStore{}
 	st.getReq = func(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error) {
 		return &domain.PasswordResetRequest{
@@ -191,6 +198,8 @@ func TestIC13_MetricAfterCommit(t *testing.T) {
 	}
 	st.decideReq = func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
 		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
+		// Nothing is counted before the commit.
+		assert.Zero(t, counterValue(t, m.PasswordResets.WithLabelValues("APPROVE")), "metric incremented before commit")
 		// Simulate successful commit
 		return &domain.PasswordResetRequest{
 			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
@@ -198,12 +207,20 @@ func TestIC13_MetricAfterCommit(t *testing.T) {
 			Approvals: []domain.ResetApproval{{ApproverID: a.ApproverID, Decision: "APPROVE", At: time.Now()}},
 		}, nil
 	}
-	svc := newResetService(st, nil, &metricInc)
+	svc := newResetService(st, nil, nil)
 	admin := lifecycle.Actor{PrincipalID: "admin-1", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now(), CorrelationID: "corr-1"}
 
 	_, err := svc.DecideReset(context.Background(), admin, "req-1", "APPROVE", "reason")
 	require.NoError(t, err)
-	assert.Equal(t, 1, metricInc, "metric must be incremented after commit")
+	assert.Equal(t, 1.0, counterValue(t, m.PasswordResets.WithLabelValues("APPROVE")), "metric must be incremented after commit")
+}
+
+// counterValue reads a Prometheus counter's current value.
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var out dto.Metric
+	require.NoError(t, c.Write(&out))
+	return out.GetCounter().GetValue()
 }
 
 func TestIC13_StoreOutageMapsTo503(t *testing.T) {

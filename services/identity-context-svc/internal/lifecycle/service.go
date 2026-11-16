@@ -642,13 +642,24 @@ func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, dupli
 	}
 	m, created, err := s.store.MergeIdentities(ctx, a.TenantID, survivorID, duplicateID, reason, a.PrincipalID, a.CorrelationID,
 		func(m store.IdentityMerge) ([]outbox.Record, error) {
-			recs := []outbox.Record{}
-			// IC-14 (S1-14 merge route parity): emit the same three events as Merge (POST /v1/subjects/{id}/merge)
-			for _, et := range []string{events.EventSubjectMerged, events.EventPrincipalStatusChanged, events.EventSubjectDisabled} {
-				rec, err := events.Render(et, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,
-					map[string]any{"merge_id": m.MergeID, "tenant_id": m.TenantID, "survivor_id": m.SurvivorID,
-						"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": m.Reason, "link_outcomes": m.LinkOutcomes,
-						"merged_at": m.MergedAt, "correlation_id": a.CorrelationID})
+			// IC-14 (S1-14 merge route parity): emit the same three events as Merge (POST /v1/subjects/{id}/merge).
+			merged, err := events.Render(events.EventSubjectMerged, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,
+				map[string]any{"merge_id": m.MergeID, "tenant_id": m.TenantID, "survivor_id": m.SurvivorID,
+					"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": m.Reason, "link_outcomes": m.LinkOutcomes,
+					"merged_at": m.MergedAt, "correlation_id": a.CorrelationID})
+			if err != nil {
+				return nil, err
+			}
+			recs := []outbox.Record{merged}
+			// The status pair is about the duplicate, which is now disabled. authorization-svc projects
+			// principal.status.changed from principal_id and new_status and skips an event without them, so
+			// without these fields the duplicate would stay ACTIVE there.
+			status := map[string]any{"principal_id": m.DuplicateID, "tenant_id": m.TenantID,
+				"new_status": string(domain.PrincipalStatusDisabled), "merge_id": m.MergeID, "survivor_id": m.SurvivorID,
+				"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": "merged into " + m.SurvivorID + ": " + m.Reason,
+				"correlation_id": a.CorrelationID}
+			for _, et := range []string{events.EventPrincipalStatusChanged, events.EventSubjectDisabled} {
+				rec, err := events.Render(et, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.DuplicateID, status)
 				if err != nil {
 					return nil, err
 				}

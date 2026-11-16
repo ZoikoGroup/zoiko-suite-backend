@@ -85,6 +85,8 @@ channels:
           - $ref: "#/components/messages/MFAFactorEnrolled"
           - $ref: "#/components/messages/MFAFactorRevoked"
           - $ref: "#/components/messages/MFAFactorReset"
+          - $ref: "#/components/messages/PasswordResetRequested"
+          - $ref: "#/components/messages/PasswordResetDecided"
           - $ref: "#/components/messages/StepUpSucceeded"
           - $ref: "#/components/messages/StepUpFailed"
           - $ref: "#/components/messages/TenantContextCacheInvalidated"
@@ -533,6 +535,34 @@ components:
         correlation_id. One event for the TOTP factors and one (factor_type
         WEBAUTHN, reason) for the passkeys when either is retired. Also
         streamed to SIEM at high severity.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    PasswordResetRequested:
+      name: identity.password_reset.requested
+      title: An administrator asked for another principal's password to be reset
+      summary: |
+        IC-13. Written through the outbox with the request
+        (POST /v1/principals/{principalID}/password-resets); nothing is issued
+        until independent approval. Payload: request_id, principal_id (the
+        subject), requested_by, approvals_required.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    PasswordResetDecided:
+      name: identity.password_reset.decided
+      title: An approver decided a password reset request
+      summary: |
+        IC-13. One event for every decision
+        (POST /v1/password-resets/{resetID}/decide), written in the decision's
+        transaction. The approver is neither the requester nor the subject and
+        holds a recent step-up. Payload: request_id, principal_id (the
+        subject), decided_by, decision (APPROVE or REJECT), reason. Never the
+        reset link or its token.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
