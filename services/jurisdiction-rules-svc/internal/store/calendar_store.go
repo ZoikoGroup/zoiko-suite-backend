@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -349,7 +351,7 @@ func (s *PgStore) PublishCalendarVersion(ctx context.Context, code string, versi
 		return nil, false, domain.ErrNotIndependent
 	}
 	if len(cur.SourceIDs) == 0 {
-		return nil, false, domain.ErrSourceNotReady
+		return nil, false, fmt.Errorf("%w: the version cites no source; cite the reviewed source it was transcribed from", domain.ErrProvenanceIncomplete)
 	}
 	if n, err := s.unreadySources(ctx, s.db(ctx), "calendar_version_sources", "calendar_version_id", cur.CalendarVersionID); err != nil {
 		return nil, false, s.registryFail("PublishCalendarVersion sources", err, nil)
@@ -567,8 +569,18 @@ func (s *PgStore) PublishObligationRule(ctx context.Context, id, actor string) (
 	if cur.CreatedBy == actor {
 		return nil, false, domain.ErrNotIndependent
 	}
-	if cur.RegimeID == nil || cur.InterpretationID == nil || len(cur.SourceIDs) == 0 {
-		return nil, false, domain.ErrSourceNotReady
+	var missing []string
+	if cur.RegimeID == nil {
+		missing = append(missing, "regime")
+	}
+	if cur.InterpretationID == nil {
+		missing = append(missing, "interpretation")
+	}
+	if len(cur.SourceIDs) == 0 {
+		missing = append(missing, "sources")
+	}
+	if len(missing) > 0 {
+		return nil, false, fmt.Errorf("%w: the obligation rule names no %s", domain.ErrProvenanceIncomplete, strings.Join(missing, ", "))
 	}
 	var istatus string
 	if err := s.db(ctx).QueryRow(ctx, `SELECT status FROM interpretation_records WHERE interpretation_id::text=$1`, *cur.InterpretationID).Scan(&istatus); err != nil || istatus != "APPROVED" {

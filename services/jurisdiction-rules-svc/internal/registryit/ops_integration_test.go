@@ -290,6 +290,11 @@ func TestDeployment_RingOrderSoakAndHealthGates(t *testing.T) {
 	assert.GreaterOrEqual(t, len(rings["rings"].([]any)), 3)
 	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": ringCanary, "ordinal": 9})
 	mustStatus(t, 409, code, r)
+	// Another code on a taken order: named, with the ring that holds it.
+	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": "canary-two", "ordinal": 1})
+	mustStatus(t, 409, code, r)
+	assert.Equal(t, "ring_ordinal_taken", r["code"])
+	assert.Contains(t, r["detail"], "ordinal 1 is already ring "+ringCanary)
 	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": "Bad Code", "ordinal": 1})
 	mustStatus(t, 400, code, r)
 }

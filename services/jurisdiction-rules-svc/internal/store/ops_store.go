@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 )
@@ -221,6 +222,14 @@ func (s *PgStore) CreateRing(ctx context.Context, code string, ordinal, soak int
 		Scan(&r.RingCode, &r.Ordinal, &r.MinSoakSeconds, &r.Description, &r.CreatedAt, &r.CreatedBy)
 	if err == nil {
 		return &r, true, nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_deployment_ring_ordinal" {
+		var holder string
+		if qerr := s.db(ctx).QueryRow(ctx, `SELECT ring_code FROM deployment_rings WHERE ordinal=$1`, ordinal).Scan(&holder); qerr != nil {
+			return nil, false, s.registryFail("CreateRing ordinal holder", qerr, nil)
+		}
+		return nil, false, fmt.Errorf("%w: ordinal %d is already ring %s; rings are append-only, so use the next free ordinal", domain.ErrRingOrdinalTaken, ordinal, holder)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, s.registryFail("CreateRing", err, nil)

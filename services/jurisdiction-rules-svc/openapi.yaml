@@ -1891,7 +1891,7 @@ paths:
       - $ref: '#/components/parameters/Filter'
     get: { tags: [Rollout], summary: List regions, operationId: listRegions, responses: { "200": { description: Regions. } } }
   /v1/admin/deployment-rings:
-    post: { tags: [Admin, Rollout], summary: Define a rollout ring (append-only), description: "Action DEPLOYMENT_RING_CREATE. Body: ring_code, ordinal (>=1, unique), min_soak_seconds (time a version must have been active in THIS ring before the next), description?. Same code with different values is 409.", operationId: createRing, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "409": { description: Conflicting definition., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
+    post: { tags: [Admin, Rollout], summary: Define a rollout ring (append-only), description: "Action DEPLOYMENT_RING_CREATE. Body: ring_code, ordinal (>=1, unique), min_soak_seconds (time a version must have been active in THIS ring before the next), description?. Same code with different values is 409 conflict; a different code on an ordinal another ring holds is 409 ring_ordinal_taken, naming that ring.", operationId: createRing, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "409": { description: Conflicting definition., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/deployment-rings:
     parameters:
       - $ref: '#/components/parameters/PageSize'
@@ -2176,7 +2176,7 @@ paths:
       summary: Publish (freeze) a calendar version
       description: |
         Action REGULATORY_CALENDAR_VERSION_PUBLISH. The publisher must differ from the author (403 segregation_of_duties,
-        also a database check); the version must cite at least one reviewed, non-superseded source (409 source_not_ready).
+        also a database check); the version must cite at least one source (409 provenance_incomplete when it cites none), each reviewed and not superseded (409 source_not_ready).
         Emits jurisdiction.calendar.changed, business-calendar.updated and a holiday-occurrence.changed for each holiday it adds, removes or changes against the previous published version. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
       operationId: publishCalendarVersion
       security: [{ principalHeader: [] }]
@@ -2515,7 +2515,7 @@ paths:
   /v1/admin/obligation-rules/{obligation_rule_id}/publish:
     parameters:
       - $ref: '#/components/parameters/IfMatch'
-    post: { tags: [Admin, Obligations], summary: Publish (freeze) an obligation rule, description: "Action OBLIGATION_RULE_PUBLISH. Publisher must differ from the author (403). Needs regime, an APPROVED interpretation, reviewed non-superseded sources, and an existing calendar when one is named.", operationId: publishObligationRule, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready or interpretation_not_approved., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
+    post: { tags: [Admin, Obligations], summary: Publish (freeze) an obligation rule, description: "Action OBLIGATION_RULE_PUBLISH. Publisher must differ from the author (403). Needs regime, an APPROVED interpretation and sources (409 provenance_incomplete names what is missing), every source reviewed and not superseded (409 source_not_ready), and an existing calendar when one is named.", operationId: publishObligationRule, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready or interpretation_not_approved., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/obligation-calculations:calculate:
     post:
       tags: [Resolver]

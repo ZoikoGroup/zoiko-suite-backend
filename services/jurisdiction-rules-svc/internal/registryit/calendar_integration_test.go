@@ -195,7 +195,7 @@ func TestCalendarAndObligation_AuthoringIsSourcedIndependentAndImmutable(t *test
 	v2 := r["calendar_version_id"].(string)
 	code, r = e.do("POST", "/v1/admin/calendars/"+s.calCode+"/versions/2/publish", "cal-publisher", nil)
 	mustStatus(t, 409, code, r) // no sources yet
-	assert.Equal(t, "source_not_ready", r["code"])
+	assert.Equal(t, "provenance_incomplete", r["code"], "nothing cited is incomplete provenance, not an unready source")
 	code, r = e.do("PUT", "/v1/admin/calendars/"+s.calCode+"/versions/2/sources", "cal-author", map[string]any{"source_ids": []string{s.sourceID}})
 	mustStatus(t, 200, code, r)
 	code, r = e.do("POST", "/v1/admin/calendars/"+s.calCode+"/versions/2/publish", "cal-author", nil)
@@ -216,7 +216,8 @@ func TestCalendarAndObligation_AuthoringIsSourcedIndependentAndImmutable(t *test
 	id2 := r["obligation_rule_id"].(string)
 	code, r = e.do("POST", "/v1/admin/obligation-rules/"+id2+"/publish", "obl-publisher", nil)
 	mustStatus(t, 409, code, r) // no provenance
-	assert.Equal(t, "source_not_ready", r["code"])
+	assert.Equal(t, "provenance_incomplete", r["code"])
+	assert.Contains(t, r["detail"], "regime", "the detail names what is missing")
 	_, pending := e.do("POST", "/v1/admin/interpretations", "author", map[string]any{"jurisdiction_id": s.jur.JurisdictionID, "subject": "s", "decision": "d", "rationale": "r", "source_ids": []string{s.sourceID}})
 	code, r = e.do("PUT", "/v1/admin/obligation-rules/"+id2+"/provenance", "obl-author", map[string]any{
 		"regime_id": s.regimeID, "interpretation_id": pending["interpretation_id"], "source_ids": []string{s.sourceID}})

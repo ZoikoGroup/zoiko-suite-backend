@@ -102,6 +102,10 @@ func (h *Handler) writeOpsError(w http.ResponseWriter, r *http.Request, err erro
 		writeError(w, r, http.StatusNotFound, "notice_not_found", err.Error())
 	case errors.Is(err, domain.ErrNotAssignedReviewer):
 		writeError(w, r, http.StatusForbidden, "not_assigned_reviewer", err.Error())
+	case errors.Is(err, domain.ErrProvenanceIncomplete):
+		writeError(w, r, http.StatusConflict, "provenance_incomplete", err.Error())
+	case errors.Is(err, domain.ErrRingOrdinalTaken):
+		writeError(w, r, http.StatusConflict, "ring_ordinal_taken", err.Error())
 	default:
 		h.writeCertError(w, r, err, corr)
 	}
