@@ -317,6 +317,12 @@
         "command-rejected": {
           "$ref": "#/components/messages/period.command-rejected"
         },
+        "control-certified": {
+          "$ref": "#/components/messages/period.control-certified"
+        },
+        "control-failed": {
+          "$ref": "#/components/messages/period.control-failed"
+        },
         "hard-closed": {
           "$ref": "#/components/messages/period.hard-closed"
         },
@@ -1377,6 +1383,30 @@
         "x-zoiko-event-type": "com.zoikosuite.accounting.period.command-rejected",
         "x-zoiko-origin": "extension"
       },
+      "period.control-certified": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.control-certified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: control-certified.",
+        "title": "period control-certified",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.control-certified",
+        "x-zoiko-origin": "extension"
+      },
+      "period.control-failed": {
+        "contentType": "application/json",
+        "description": "Producer: Financial Close Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.period.control-failed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Period: control-failed.",
+        "title": "period control-failed",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.period.control-failed",
+        "x-zoiko-origin": "extension"
+      },
       "period.hard-closed": {
         "contentType": "application/json",
         "description": "Producer: Period Service. Primary consumers / intent: All posting domains/reporting. Family: Accounting Kernel. Origin: ZS-EVENT-001 section 19.",
@@ -2139,6 +2169,12 @@
         },
         {
           "$ref": "#/channels/period/messages/command-rejected"
+        },
+        {
+          "$ref": "#/channels/period/messages/control-certified"
+        },
+        {
+          "$ref": "#/channels/period/messages/control-failed"
         },
         {
           "$ref": "#/channels/period/messages/hard-closed"
