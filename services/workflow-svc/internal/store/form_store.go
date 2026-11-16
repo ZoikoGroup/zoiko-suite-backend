@@ -547,7 +547,7 @@ func (s *PgStore) GetValidationResult(ctx context.Context, tenantID, submissionI
 // reviewer/validator works through. Scoped to one form (not the whole
 // tenant) so authorization stays meaningful: a caller is authorized per
 // legal entity, and a form is the unit that carries one.
-// Uses cursor paging (API-4) with keyset pagination on (created_at DESC, form_submission_id DESC).
+// Uses cursor paging (API-4) with keyset pagination on (created_at DESC, submission_id DESC).
 func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
 	limit := params.Limit
 	if limit <= 0 {
@@ -561,7 +561,7 @@ func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID s
 	var cursorCondition string
 	var cursorArgs []any
 	if params.Cursor != nil && params.Cursor.StartedAt != "" && params.Cursor.InstanceID != "" {
-		cursorCondition = "AND (created_at, form_submission_id) < ($2, $3)"
+		cursorCondition = "AND (created_at, submission_id) < ($2, $3)"
 		cursorArgs = []any{params.Cursor.StartedAt, params.Cursor.InstanceID}
 	}
 
@@ -571,7 +571,7 @@ func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID s
 		WHERE form_id = $1
 		  AND status IN ('SUBMITTED', 'VALIDATING')
 		  %s
-		ORDER BY created_at DESC, form_submission_id DESC
+		ORDER BY created_at DESC, submission_id DESC
 		LIMIT $%d`,
 		formSubmissionColumns, cursorCondition, len(cursorArgs)+2)
 
