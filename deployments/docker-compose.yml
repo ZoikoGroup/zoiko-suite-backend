@@ -1320,6 +1320,18 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.policy.events"
+      # Peer listener (:8449): system callers with no person's envelope
+      # present their workload certificate instead of bare headers
+      # (governance-decision-log-svc's replay, notification-svc's legal-basis
+      # reads). Only these CNs are admitted.
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8449"
+      MTLS_ALLOWED_CLIENTS: "governance-decision-log-svc,notification-svc"
+      # PDC-05 activation gate: an evaluable version goes live only when
+      # certified against its family's test suite (or waived).
+      POLICY_CERTIFICATION_GATE: "${POLICY_CERTIFICATION_GATE:-enforce}"
+      # API-4 cursors; local only, any 32+ byte hex key in other tiers.
+      CURSOR_SIGNING_KEY_HEX: "${POLICY_CURSOR_SIGNING_KEY_HEX:-}"
     volumes:
       # Only this service's own bootstrap token (register M-01).
       - type: volume

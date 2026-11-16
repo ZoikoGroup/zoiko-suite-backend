@@ -393,9 +393,20 @@ func main() {
 	// S7-B2: with a document vault configured, the notice evidence package is declared as a record by this service.
 	// S7-C1: a party of the sender's own tenant can be addressed through its verified contact points.
 	// S7-C2: a regulated notice legal basis must be an active LEGAL_BASIS policy version in policy-svc.
-	if cfg.LegalBasisPolicyURL != "" {
+	switch {
+	case cfg.LegalBasisPolicyMTLSURL != "":
+		// A system read with no person's envelope: the workload certificate
+		// vouches for the principal at policy-svc's peer listener.
+		hc, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "notification-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision the client identity for policy-svc", zap.Error(err))
+		}
+		ncdSvc.SetLegalBasisVerifier(legalbasis.NewClientWithHTTPClient(cfg.LegalBasisPolicyMTLSURL, cfg.LegalBasisPrincipal, hc, log))
+		log.Info("notice legal basis is verified against policy-svc over mTLS", zap.String("url", cfg.LegalBasisPolicyMTLSURL))
+	case cfg.LegalBasisPolicyURL != "":
 		ncdSvc.SetLegalBasisVerifier(legalbasis.NewClient(cfg.LegalBasisPolicyURL, cfg.LegalBasisPrincipal, 3*time.Second, log))
-		log.Info("notice legal basis is verified against policy-svc", zap.String("url", cfg.LegalBasisPolicyURL))
+		log.Warn("notice legal basis is verified against policy-svc with bare identity headers; policy-svc refuses them once it enforces identity: set LEGAL_BASIS_POLICY_MTLS_URL",
+			zap.String("url", cfg.LegalBasisPolicyURL))
 	}
 	if cfg.PartyContactsURL != "" {
 		ncdSvc.SetPartyContacts(partycontacts.NewClient(cfg.PartyContactsURL, cfg.PartyContactsPrincipal, 3*time.Second, log))
