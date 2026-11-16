@@ -26,7 +26,7 @@ func (s *PgStore) GetJurisdictionAsOf(ctx context.Context, jurisdictionID string
 	var out domain.JurisdictionAsOf
 	var active bool
 	var jTo *time.Time
-	err := s.pool.QueryRow(ctx, `
+	err := s.db(ctx).QueryRow(ctx, `
 		SELECT v.jurisdiction_id, j.jurisdiction_code,
 		       v.jurisdiction_name, v.jurisdiction_type, v.parent_jurisdiction_id, v.authority_type,
 		       v.version_no, v.valid_from, v.valid_to,
@@ -84,7 +84,7 @@ func (s *PgStore) GetHierarchy(ctx context.Context, rootID string, at time.Time,
 		return nil, err
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db(ctx).Query(ctx, `
 		WITH RECURSIVE tree AS (
 			SELECT v.jurisdiction_id, j.jurisdiction_code, v.jurisdiction_name, v.jurisdiction_type,
 			       v.authority_type, v.parent_jurisdiction_id, 0 AS depth, ARRAY[v.jurisdiction_id] AS path

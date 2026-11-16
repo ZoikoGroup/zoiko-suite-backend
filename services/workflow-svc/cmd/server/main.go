@@ -31,6 +31,7 @@ import (
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/config"
@@ -186,8 +187,21 @@ func main() {
 	defer relayCancel()
 	kafkaRelay := outbox.NewRelay(pool, publisher.Deliverer(), outbox.DestinationKafka, 1500*time.Millisecond, 50, log)
 	go kafkaRelay.Start(relayCtx)
-	ledgerRelay := outbox.NewRelay(pool,
-		decisionlog.NewLedgerDeliverer(cfg.GovernanceDecisionLogServiceURL, cfg.LedgerPrincipalID),
+	// Over mTLS when configured: the relay presents workflow-svc's workload
+	// certificate to governance-decision-log-svc's peer listener, which admits
+	// it as a registered peer vouching for the ledger principal (X5).
+	ledgerDeliverer := decisionlog.NewLedgerDeliverer(cfg.GovernanceDecisionLogServiceURL, cfg.LedgerPrincipalID)
+	if cfg.GovernanceDecisionLogMTLSURL != "" {
+		ledgerIdentity := mtlsclient.Start(relayCtx, mtlsclient.Options{
+			ServiceName:        "workflow-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		ledgerDeliverer = decisionlog.NewLedgerDelivererWith(cfg.GovernanceDecisionLogMTLSURL, cfg.LedgerPrincipalID,
+			ledgerIdentity.HTTPClient(5*time.Second))
+		log.Info("ledger relay: governance ledger over mTLS", zap.String("url", cfg.GovernanceDecisionLogMTLSURL))
+	}
+	ledgerRelay := outbox.NewRelay(pool, ledgerDeliverer,
 		outbox.DestinationDecisionLog, 1500*time.Millisecond, 50, log)
 	go ledgerRelay.Start(relayCtx)
 

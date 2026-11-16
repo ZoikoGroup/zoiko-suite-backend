@@ -428,7 +428,7 @@ func TestPaymentTerm_EveryMethodGivesItsGoldenDueDate(t *testing.T) {
 	}
 }
 
-func TestPaymentTerm_DueDateInputRefusals(t *testing.T) {
+func TestREF10NP41_PaymentTerm_DueDateInputRefusals(t *testing.T) {
 	c := newCalFx(t)
 	term := c.newTerm(t)
 	body := c.rule(30, "NONE", "2026-01-01")
@@ -531,7 +531,7 @@ func TestPaymentTerm_ARetirementDoesNotRewriteHistory(t *testing.T) {
 
 // A calendar amended later does not change a due date: ask as it was known then,
 // or name the calendar version the first answer named.
-func TestPaymentTerm_ACalendarAmendmentDoesNotRewriteHistory(t *testing.T) {
+func TestREF10NP40_PaymentTerm_ACalendarAmendmentDoesNotRewriteHistory(t *testing.T) {
 	c := newCalFx(t)
 	cal1 := c.calendarReady(t)
 	term := c.newTerm(t)

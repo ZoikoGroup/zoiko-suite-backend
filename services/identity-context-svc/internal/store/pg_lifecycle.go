@@ -377,6 +377,10 @@ func (s *PgStore) GetResetRequest(ctx context.Context, tenantID, requestID strin
 // DecideResetRequest records one approver's decision under a row lock and
 // returns the updated request. issue runs (in the same transaction) when the
 // request reaches its approval count, to store the reset link.
+//
+// IC-13 (S1-13 K-7): Events are emitted for EVERY decision (APPROVE, REJECT,
+// expiry), not just when status changes from PENDING_APPROVAL. Expiry is
+// committed and event emitted before refusing.
 func (s *PgStore) DecideResetRequest(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
 	issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
 	var r domain.PasswordResetRequest
@@ -391,12 +395,25 @@ func (s *PgStore) DecideResetRequest(ctx context.Context, tenantID, requestID st
 			return err
 		}
 		_ = json.Unmarshal(approvals, &r.Approvals)
+		
+		// IC-13: Check expiry BEFORE processing the decision
+		if !time.Now().Before(r.ExpiresAt) {
+			if r.Status == "PENDING_APPROVAL" {
+				now := time.Now().UTC()
+				r.Status, r.DecidedAt = "EXPIRED", &now
+				// Emit expiry event
+				raw, _ := json.Marshal(r.Approvals)
+				if _, err := tx.Exec(ctx, `UPDATE password_reset_requests SET approvals = $2, status = $3, decided_at = $4
+					WHERE request_id = $1`, requestID, raw, r.Status, r.DecidedAt); err != nil {
+					return err
+				}
+				return s.enqueueAll(ctx, tx, recs)
+			}
+			return errors.New("reset request expired")
+		}
+		
 		if r.Status != "PENDING_APPROVAL" {
 			return fmt.Errorf("reset request is %s", r.Status)
-		}
-		if !time.Now().Before(r.ExpiresAt) {
-			_, _ = tx.Exec(ctx, `UPDATE password_reset_requests SET status = 'EXPIRED', decided_at = NOW() WHERE request_id = $1`, requestID)
-			return errors.New("reset request expired")
 		}
 		for _, prior := range r.Approvals {
 			if prior.ApproverID == a.ApproverID {
@@ -426,9 +443,7 @@ func (s *PgStore) DecideResetRequest(ctx context.Context, tenantID, requestID st
 			WHERE request_id = $1`, requestID, raw, r.Status, r.DecidedAt); err != nil {
 			return err
 		}
-		if r.Status == "PENDING_APPROVAL" {
-			return nil
-		}
+		// IC-13: Emit event for EVERY decision (APPROVE, REJECT, expiry), not just status change from PENDING_APPROVAL
 		return s.enqueueAll(ctx, tx, recs)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

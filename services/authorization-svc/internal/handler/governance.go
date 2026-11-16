@@ -337,7 +337,7 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 	if !ok {
 		return
 	}
-	expected, ok := optionalExpectedVersion(w, r, bodyVersion)
+	expected, ok := expectedVersion(w, r, bodyVersion)
 	if !ok {
 		return
 	}

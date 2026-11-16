@@ -22,6 +22,7 @@ type Admission struct {
 	Policy        admission.Policy
 	IPLimiter     *admission.Limiter // before authentication, keyed by hashed client address
 	TenantLimiter *admission.Limiter // after authentication, keyed by tenant
+	LoginLimiter  *admission.Limiter // stricter per-IP bucket for login routes (AU-04)
 	Gate          *admission.Gate
 	Recorder      *admission.Recorder
 }
@@ -63,7 +64,7 @@ func (h *Handler) requestContext(r *http.Request) *reqCtx {
 	return &reqCtx{
 		method:      originalMethod(r),
 		path:        admission.RoutePath(r.Header.Get("X-Forwarded-Uri")),
-		clientKey:   admission.ClientKey(clientHost(r)),
+		clientKey:   admission.ClientKey(h.clientHost(r)),
 		correlation: corr,
 	}
 }
@@ -82,6 +83,22 @@ func (h *Handler) admit(w http.ResponseWriter, r *http.Request, rc *reqCtx) (rel
 		return noop, false
 	}
 	release = h.adm.Gate.Release
+
+	// Login route rate limit (AU-04): stricter per-IP bucket for
+	// /v1/authenticate, /v1/authenticate/step-up, /v1/account/*,
+	// /oauth2/login*, /oauth2/token. Applied before the general IP limiter
+	// so login routes get their own quota.
+	if h.adm.LoginLimiter != nil && isLoginRoute(originalMethod(r), r.Header.Get("X-Forwarded-Uri")) {
+		if allowed, wait := h.adm.LoginLimiter.Allow(rc.clientKey); !allowed {
+			h.refuse(w, r, rc, refusal{
+				outcome: outcomeRateLimited, code: "rate_limited", status: http.StatusTooManyRequests,
+				detail: "login rate for this client exceeds its quota", retryable: true, retryAfter: ceilSeconds(wait),
+				event: "api_rate_limited", severity: siem.SeverityMedium,
+			})
+			release()
+			return noop, false
+		}
+	}
 
 	// Rate limit first: a flood of malformed or oversized requests must spend
 	// quota like any other, or the cheap checks below become the attack surface.
@@ -228,10 +245,26 @@ func (h *Handler) refuseAuth(w http.ResponseWriter, r *http.Request, rc *reqCtx,
 // connection's ephemeral port: keying a quota on that gave every new connection
 // its own bucket, so a client could never be limited. Found by running the real
 // image, not by a unit test (which always set X-Forwarded-For).
-func clientHost(r *http.Request) string {
-	addr := clientIP(r)
+func (h *Handler) clientHost(r *http.Request) string {
+	addr := h.clientIP(r)
 	if host, _, err := net.SplitHostPort(addr); err == nil {
 		return host
 	}
 	return strings.Trim(addr, "[]")
+}
+
+// isLoginRoute reports whether the request is a login or pre-session route
+// that should use the stricter login rate limit (AU-04).
+func isLoginRoute(method, uri string) bool {
+	switch {
+	case strings.HasPrefix(uri, "/v1/authenticate"):
+		return true
+	case strings.HasPrefix(uri, "/v1/account/"):
+		return true
+	case strings.HasPrefix(uri, "/oauth2/login"):
+		return true
+	case strings.HasPrefix(uri, "/oauth2/token"):
+		return true
+	}
+	return false
 }

@@ -36,7 +36,7 @@ func disp(decision, kind, evidence string, newDecision string) map[string]any {
 	return m
 }
 
-func TestRemediation_WithdrawalOpensACaseThatCannotCloseUntilEveryDecisionIsAnsweredFor(t *testing.T) {
+func TestJURNEG19_Remediation_WithdrawalOpensACaseThatCannotCloseUntilEveryDecisionIsAnsweredFor(t *testing.T) {
 	c := releasedPack(t, 0)
 	e := c.e
 
@@ -175,7 +175,7 @@ func versionCaseStatus(t *testing.T, caseID string) string {
 	return s
 }
 
-func TestRemediation_ManualCaseAndNothingToRemediate(t *testing.T) {
+func TestJURNEG30_Remediation_ManualCaseAndNothingToRemediate(t *testing.T) {
 	c := releasedPack(t, 0)
 	e := c.e
 	decideN(t, c, 2)

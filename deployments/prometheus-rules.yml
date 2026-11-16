@@ -1091,3 +1091,211 @@ groups:
         annotations:
           summary: "general-ledger-svc: p95 posting latency is above 2 seconds"
           description: "Posting is one transaction; a slow one usually means lock contention on a period seal or an overloaded database."
+
+  # ---------------------------------------------------------------------------
+  # evidence-requirements-svc (Governance Platform 7/7)
+  # ---------------------------------------------------------------------------
+  #
+  # An owner outage is answered 503 and nothing is recorded, so callers see a
+  # refusal, not a wrong answer -- but every gated finalization behind it stops.
+  # The outbox backlog is invisible to callers entirely: decisions are recorded,
+  # their events are not reaching Kafka.
+  #
+  # Runbook: services/evidence-requirements-svc/RUNBOOK.md
+  - name: evidence-requirements
+    rules:
+      - alert: EvidenceOwnerUnavailable
+        expr: increase(evidence_owner_unavailable_total{service="evidence-requirements-svc"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "evidence-requirements-svc: {{ $labels.owner }} cannot confirm artifacts; evaluations are refused (503)"
+          description: >-
+            Evaluations that assert an artifact owned by {{ $labels.owner }} are refused and nothing is recorded, so every
+            finalization gated on that evidence is blocked. Restore the owner; callers retry with the same Idempotency-Key.
+
+      - alert: EvidenceOutboxBacklog
+        expr: evidence_outbox_unpublished{service="evidence-requirements-svc"} > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "evidence-requirements-svc: {{ $value }} evidence events have not reached Kafka for 10m"
+          description: >-
+            Determinations are recorded but their evidence.requirement.* events are waiting in the outbox. Check Kafka and the
+            outbox worker's log (outbox: failed to publish). Rows are retried every 5 seconds; nothing is lost.
+
+  # authorization-svc (ZS-IAM-001 §26). Every metric below is emitted by
+  # internal/telemetry/authz.go; none of it is authority — alerts point at
+  # something to look at, the decision path never reads them.
+  - name: authorization-svc
+    rules:
+      - alert: AuthorizationDecisionRecordFailures
+        expr: increase(authorization_decision_record_failures_total{service="authorization-svc"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "authorization-svc: decisions refused because their artefact could not be written"
+          description: >-
+            No decision is answered without its access_decision_log row (503 instead), so every PEP calling it is failing
+            closed. Check Postgres write availability and the access_decision_log partitions (RUNBOOK §3.1, §10).
+
+      - alert: AuthorizationPDPLatencyHigh
+        expr: histogram_quantile(0.99, sum by (le) (rate(authorization_evaluation_seconds_bucket{service="authorization-svc"}[5m]))) > 0.25
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: p99 decision-pipeline time {{ $value | humanizeDuration }} for 10m"
+          description: >-
+            The pipeline itself (not the HTTP queue) is slow. Check the cache hit ratio, the watermark age and Postgres
+            latency; a CPU-starved replica shows this too (RUNBOOK §13).
+
+      - alert: AuthorizationCacheWatermarkStale
+        expr: authorization_watermark_age_seconds{service="authorization-svc"} > 3
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: version watermark {{ $value }}s old — the grant cache is bypassed"
+          description: >-
+            Past 3 s the cache stops serving (never serves stale grants), so every evaluation reads Postgres. Decisions stay
+            correct; latency and database load rise. Check authz_versions reads (RUNBOOK §8).
+
+      - alert: AuthorizationOutboxBacklog
+        expr: authorization_outbox_oldest_pending_seconds{service="authorization-svc"} > 120
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: oldest unpublished event is {{ $value | humanizeDuration }} old"
+          description: >-
+            Decisions and IAM changes are recorded, but their events (authorization.denied, iam.assignment.revoked, ...)
+            have not reached Kafka, so downstream caches and SIEM lag. Check Kafka and the relay log (RUNBOOK §4.1).
+
+      - alert: AuthorizationOutboxStuck
+        expr: authorization_outbox_stuck{service="authorization-svc"} > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: {{ $value }} outbox events failed 5+ publish attempts"
+          description: >-
+            There is no dead-letter; the relay keeps retrying. Read last_error on outbox_events for the stuck rows
+            (RUNBOOK §4.2).
+
+      - alert: AuthorizationProjectionLagHigh
+        expr: histogram_quantile(0.95, sum by (le, consumer) (rate(authorization_projection_lag_seconds_bucket{service="authorization-svc"}[10m]))) > 30
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "authorization-svc: {{ $labels.consumer }} projection p95 lag {{ $value | humanizeDuration }}"
+          description: >-
+            Suspensions, disables and delegation revocations reach the decision path more than 30 s late — the
+            revocation objective (IAM-8). Check the Kafka consumer groups authorization-svc-lifecycle /
+            authorization-svc-delegation-projector (RUNBOOK §7).
+
+      - alert: AuthorizationBreakGlassActive
+        expr: authorization_sessions{service="authorization-svc", kind="break_glass", state="ACTIVE"} > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "authorization-svc: {{ $value }} break-glass session(s) active"
+          description: >-
+            Emergency access is in force. Confirm the declared incident and the approvals; every break-glass session is
+            reviewed when it ends (ZS-IAM-001 §14).
+
+      - alert: AuthorizationSoDDenialSpike
+        expr: sum(increase(authorization_decisions_total{service="authorization-svc", layer="sod"}[15m])) > 20
+        for: 0m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "authorization-svc: {{ $value }} segregation-of-duties denials in 15m"
+          description: >-
+            Self-approval, own-object, cooling-window or static-conflict attempts above the usual rate (ZS-IAM-001 §26 SoD
+            alerts). Read the access-decision log for decision_basis LIKE 'sod:%' to see who and what.
+
+  # ---------------------------------------------------------------------------
+  # D2-2 governance-decision-log-svc — the governance evidence ledger
+  # ---------------------------------------------------------------------------
+  # Every decision commits with its outbox event; a stopped relay is invisible
+  # from the request path (writes keep answering 201) while the evidence
+  # stream to the estate stops. These alert on that, and on the ledger being
+  # unable to accept evidence at all.
+  - name: governance-decision-log
+    rules:
+      - alert: GovernanceLedgerRelayStalled
+        # The oldest unpublished event is the relay's lag. A broker restart
+        # produces a short spike, which the outbox makes harmless.
+        expr: outbox_oldest_pending_seconds{service="governance-decision-log-svc"} > 300
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "governance-decision-log-svc: oldest unpublished decision event is {{ $value | humanizeDuration }} old"
+          description: >-
+            governance.decision.recorded / .replayed events are durable in the outbox but not reaching Kafka.
+            Check KAFKA_BROKERS and the relay's last_error (GET /v1/decisions/{id}/evidence shows it per decision).
+            Never delete outbox rows to clear it.
+
+      - alert: GovernanceLedgerOutboxBacklog
+        expr: outbox_pending_events{service="governance-decision-log-svc"} > 1000
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "governance-decision-log-svc: {{ $value }} decision events waiting in the outbox"
+          description: >-
+            The relay is behind. Evidence is not lost, but downstream consumers (audit, evidence manifest) are stale.
+
+      - alert: GovernanceLedgerNotReady
+        expr: readiness_up{service="governance-decision-log-svc"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "governance-decision-log-svc cannot reach its database"
+          description: >-
+            Callers (policy-svc, workflow-svc) keep their decisions in their own outboxes and retry, but no governance
+            evidence is being recorded or read.
+
+      - alert: GovernanceLedgerWriteErrors
+        expr: sum(rate(http_requests_total{service="governance-decision-log-svc", route="/v1/decisions", method="POST", status_code=~"5.."}[5m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "governance-decision-log-svc is refusing decision writes with 5xx"
+          description: >-
+            503 means the store or authorization-svc is unavailable (fail closed). Writers retry; check readiness
+            and authorization-svc.
+
+      - alert: GovernanceLedgerChainBroken
+        # The scheduled sealer re-verifies each tenant's hash chain before it
+        # seals and refuses a broken one: a stored decision was altered behind
+        # the append-only triggers. Never "fixed" by re-sealing.
+        expr: increase(gdl_evidence_seal_total{service="governance-decision-log-svc", outcome="chain_broken"}[1h]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "governance-decision-log-svc: a tenant's evidence chain does not verify; scheduled sealing refused"
+          description: >-
+            GET /v1/evidence/chain/verify names the first broken link. Treat as a security incident: preserve the
+            database, compare against the last sealed package and the exported bundles.
+
+      - alert: GovernanceLedgerSealingFailing
+        expr: increase(gdl_evidence_seal_total{service="governance-decision-log-svc", outcome="error"}[2h]) > 0
+          and increase(gdl_evidence_seal_total{service="governance-decision-log-svc", outcome="sealed"}[2h]) == 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "governance-decision-log-svc: scheduled evidence sealing has failed for two hours"
+          description: >-
+            Decisions keep recording but are not being sealed into GOV-07 packages (EVIDENCE_SEAL_INTERVAL).
+            Check the store and the service log ("scheduled seal failed").

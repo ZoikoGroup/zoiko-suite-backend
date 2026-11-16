@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -100,7 +101,7 @@ func TestRollout_LaunchGateAndIndependence(t *testing.T) {
 	s.release(t)
 	jur := s.jur.JurisdictionCode
 
-	code, r := s.e.do("POST", "/v1/admin/rollouts", "platform", map[string]any{"family_ref": "zz." + strings.ToLower(s.packRef[len(s.packRef)-6:]), "display_name": "Test land", "layer": "COUNTRY",
+	code, r := s.e.do("POST", "/v1/admin/rollouts", "platform", map[string]any{"family_ref": "zz." + strings.ToLower(uuid.NewString()[:8]), "display_name": "Test land", "layer": "COUNTRY",
 		"jurisdiction_code": jur, "owner": "owner-1", "support_owner": "support-1", "scope_note": "integration test"})
 	mustStatus(t, 201, code, r)
 	id := r["rollout_id"].(string)

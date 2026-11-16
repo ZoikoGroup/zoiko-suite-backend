@@ -780,6 +780,35 @@ func TestFindRules_SupersededRuleReturnedForHistoricalQuery(t *testing.T) {
 	}
 }
 
+// TestGetRules_ScopeAllIsTheRegisterView: scope=all (and its paged form
+// filter[scope]=all) asks the store for every rule recorded here, DRAFT
+// included; any other scope is refused before the store is asked.
+func TestGetRules_ScopeAllIsTheRegisterView(t *testing.T) {
+	for _, q := range []string{"scope=all", "filter%5Bscope%5D=all&page_size=10"} {
+		st := &stubStore{}
+		rr := executeRequest(newTestRouter(st), httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/j-1/rules?"+q, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d — %s", q, rr.Code, rr.Body.String())
+		}
+		if !st.rulesParams.AllVersions {
+			t.Errorf("%s: the store was not asked for all versions", q)
+		}
+	}
+	st := &stubStore{}
+	rr := executeRequest(newTestRouter(st), httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/j-1/rules", nil))
+	if rr.Code != http.StatusOK || st.rulesParams.AllVersions {
+		t.Errorf("without scope: expected the point-in-time view, got code %d AllVersions=%v", rr.Code, st.rulesParams.AllVersions)
+	}
+	st = &stubStore{}
+	rr = executeRequest(newTestRouter(st), httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/j-1/rules?scope=drafts", nil))
+	if rr.Code != http.StatusBadRequest || decodeError(t, rr)["code"] != "invalid_scope" {
+		t.Errorf("scope=drafts: expected 400 invalid_scope, got %d", rr.Code)
+	}
+	if st.storeCalled {
+		t.Error("store was queried despite an invalid scope")
+	}
+}
+
 // TestGetRules_400_InvalidEffectiveAt verifies a malformed point-in-time is a
 // client error, and never silently treated as "now".
 func TestGetRules_400_InvalidEffectiveAt(t *testing.T) {

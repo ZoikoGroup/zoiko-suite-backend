@@ -3,14 +3,20 @@ package lifecycle_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/lifecycle"
+	"zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/outbox"
 )
 
@@ -108,4 +114,258 @@ func TestSetStatus_RefusesSelfDisableAndUnknownStatus(t *testing.T) {
 
 	assert.Zero(t, st.calls, "a refused change writes nothing")
 	assert.Empty(t, ended)
+}
+
+// ── IC-13: S1-13 (K-7) password-reset decisions ────────────────────────────────
+
+type resetStore struct {
+	lifecycle.Store
+	getReq    func(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error)
+	decideReq func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
+		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error)
+	createReq       func(ctx context.Context, r domain.PasswordResetRequest, recs ...outbox.Record) error
+	insertCredToken func(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error
+}
+
+func (s *resetStore) GetResetRequest(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error) {
+	if s.getReq != nil {
+		return s.getReq(ctx, tenantID, requestID)
+	}
+	return nil, nil
+}
+
+func (s *resetStore) DecideResetRequest(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
+	issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
+	if s.decideReq != nil {
+		return s.decideReq(ctx, tenantID, requestID, a, issue, recs...)
+	}
+	return nil, nil
+}
+
+func (s *resetStore) CreateResetRequest(ctx context.Context, r domain.PasswordResetRequest, recs ...outbox.Record) error {
+	if s.createReq != nil {
+		return s.createReq(ctx, r, recs...)
+	}
+	return nil
+}
+
+func (s *resetStore) InsertCredentialTokenTx(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error {
+	if s.insertCredToken != nil {
+		return s.insertCredToken(ctx, tx, t)
+	}
+	return nil
+}
+
+type fakeNotifier struct {
+	fail bool
+}
+
+func (f *fakeNotifier) Notify(ctx context.Context, n lifecycle.Notice) error {
+	if f.fail {
+		return errors.New("delivery failed")
+	}
+	return nil
+}
+
+func newResetService(st *resetStore, notifier lifecycle.Notifier, metricsInc *int) *lifecycle.Service {
+	return lifecycle.New(st, nil, lifecycle.Policy{MinLength: 12}, notifier, nil, lifecycle.Config{
+		ResetApprovals: 1,
+		ResetTTL:       time.Hour,
+		PublicAppURL:   "https://app.example.com",
+		ResetPath:      "/reset",
+	}, func(ctx context.Context, name, key string, max int, window time.Duration) bool {
+		if metricsInc != nil && name == "password_resets" {
+			*metricsInc++
+		}
+		return true
+	}, nil)
+}
+
+func TestIC13_MetricAfterCommit(t *testing.T) {
+	// Metric must be incremented AFTER the store commit, not before. DecideReset
+	// counts on metrics.Default().PasswordResets (identity_password_resets_total).
+	prev := metrics.Default()
+	m := metrics.New(prometheus.NewRegistry())
+	metrics.SetDefault(m)
+	t.Cleanup(func() { metrics.SetDefault(prev) })
+	st := &resetStore{}
+	st.getReq = func(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error) {
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: "PENDING_APPROVAL", ApprovalsRequired: 1,
+			Approvals: []domain.ResetApproval{},
+		}, nil
+	}
+	st.decideReq = func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
+		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
+		// Nothing is counted before the commit.
+		assert.Zero(t, counterValue(t, m.PasswordResets.WithLabelValues("APPROVE")), "metric incremented before commit")
+		// Simulate successful commit
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: "ISSUED", ApprovalsRequired: 1,
+			Approvals: []domain.ResetApproval{{ApproverID: a.ApproverID, Decision: "APPROVE", At: time.Now()}},
+		}, nil
+	}
+	svc := newResetService(st, nil, nil)
+	admin := lifecycle.Actor{PrincipalID: "admin-1", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now(), CorrelationID: "corr-1"}
+
+	_, err := svc.DecideReset(context.Background(), admin, "req-1", "APPROVE", "reason")
+	require.NoError(t, err)
+	assert.Equal(t, 1.0, counterValue(t, m.PasswordResets.WithLabelValues("APPROVE")), "metric must be incremented after commit")
+}
+
+// counterValue reads a Prometheus counter's current value.
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var out dto.Metric
+	require.NoError(t, c.Write(&out))
+	return out.GetCounter().GetValue()
+}
+
+func TestIC13_StoreOutageMapsTo503(t *testing.T) {
+	// Store outages must map to 503 (service unavailable), not 500 or 409.
+	st := &resetStore{}
+	st.getReq = func(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error) {
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: "PENDING_APPROVAL", ApprovalsRequired: 1,
+			Approvals: []domain.ResetApproval{},
+		}, nil
+	}
+	st.decideReq = func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
+		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
+		return nil, errors.New("database connection failed")
+	}
+	svc := newResetService(st, nil, nil)
+	admin := lifecycle.Actor{PrincipalID: "admin-1", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now(), CorrelationID: "corr-1"}
+
+	_, err := svc.DecideReset(context.Background(), admin, "req-1", "APPROVE", "reason")
+	require.Error(t, err)
+	// The error should indicate service unavailability
+	assert.Contains(t, err.Error(), "unavailable", "store outage must map to 503")
+}
+
+func TestIC13_ExpiryCommittedBeforeRefuse(t *testing.T) {
+	// When a reset request has expired, the expiry must be committed and an event
+	// emitted BEFORE refusing the decision.
+	var events []outbox.Record
+	st := &resetStore{}
+	st.getReq = func(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error) {
+		// Return an expired request
+		now := time.Now().UTC()
+		expired := now.Add(-time.Hour)
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: "PENDING_APPROVAL", ApprovalsRequired: 1,
+			CreatedAt: now.Add(-2 * time.Hour), ExpiresAt: expired,
+			Approvals: []domain.ResetApproval{},
+		}, nil
+	}
+	st.decideReq = func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
+		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
+		// The store should commit the expiry and return the updated request
+		// with status EXPIRED
+		for _, rec := range recs {
+			events = append(events, rec)
+		}
+		now := time.Now().UTC()
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: "EXPIRED", DecidedAt: &now,
+		}, errors.New("reset request expired")
+	}
+	svc := newResetService(st, nil, nil)
+	admin := lifecycle.Actor{PrincipalID: "admin-1", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now(), CorrelationID: "corr-1"}
+
+	_, err := svc.DecideReset(context.Background(), admin, "req-1", "APPROVE", "reason")
+	require.Error(t, err)
+	// An event should have been emitted for the expiry decision
+	require.NotEmpty(t, events, "expiry decision must emit an event")
+}
+
+func TestIC13_EventForEveryDecision(t *testing.T) {
+	// Both APPROVE and REJECT must emit events (not just when status changes from PENDING_APPROVAL).
+	st := &resetStore{}
+	var events []outbox.Record
+	st.getReq = func(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error) {
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: "PENDING_APPROVAL", ApprovalsRequired: 1,
+			Approvals: []domain.ResetApproval{},
+		}, nil
+	}
+	st.decideReq = func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
+		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
+		for _, rec := range recs {
+			events = append(events, rec)
+		}
+		now := time.Now().UTC()
+		status := "ISSUED"
+		if a.Decision == "REJECT" {
+			status = "REJECTED"
+		}
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: status, DecidedAt: &now,
+			Approvals: []domain.ResetApproval{{ApproverID: a.ApproverID, Decision: a.Decision, At: now}},
+		}, nil
+	}
+	svc := newResetService(st, nil, nil)
+	admin := lifecycle.Actor{PrincipalID: "admin-1", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now(), CorrelationID: "corr-1"}
+
+	// Test APPROVE
+	events = nil
+	_, err := svc.DecideReset(context.Background(), admin, "req-approve", "APPROVE", "reason")
+	require.NoError(t, err)
+	require.NotEmpty(t, events, "APPROVE must emit an event")
+
+	// Test REJECT
+	events = nil
+	_, err = svc.DecideReset(context.Background(), admin, "req-reject", "REJECT", "reason")
+	require.NoError(t, err)
+	require.NotEmpty(t, events, "REJECT must emit an event")
+}
+
+func TestIC13_LinkDeliveryFailureReturnsError(t *testing.T) {
+	// When link delivery fails, the service must return an error (502/503)
+	// or allow re-issue, not silently succeed.
+	st := &resetStore{}
+	var events []outbox.Record
+	st.getReq = func(ctx context.Context, tenantID, requestID string) (*domain.PasswordResetRequest, error) {
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: "PENDING_APPROVAL", ApprovalsRequired: 1,
+			Approvals: []domain.ResetApproval{},
+		}, nil
+	}
+	st.decideReq = func(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
+		issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
+		for _, rec := range recs {
+			events = append(events, rec)
+		}
+		// Call the issue function to set the issued token (simulating the store's behavior)
+		// The issue function captures the issued token in a closure variable in the service.
+		// We call it with nil tx since this is a unit test without a real transaction.
+		_ = issue(ctx, nil, &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+		})
+		now := time.Now().UTC()
+		return &domain.PasswordResetRequest{
+			RequestID: requestID, TenantID: tenantID, PrincipalID: "p-1",
+			Status: "ISSUED", DecidedAt: &now,
+			Approvals: []domain.ResetApproval{{ApproverID: a.ApproverID, Decision: "APPROVE", At: now}},
+		}, nil
+	}
+	// Allow the issue function to call InsertCredentialTokenTx with nil tx
+	st.insertCredToken = func(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error {
+		return nil // Accept nil tx for testing
+	}
+	notifier := &fakeNotifier{fail: true}
+	svc := newResetService(st, notifier, nil)
+	admin := lifecycle.Actor{PrincipalID: "admin-1", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now(), CorrelationID: "corr-1"}
+
+	_, err := svc.DecideReset(context.Background(), admin, "req-1", "APPROVE", "reason")
+	require.Error(t, err, "link delivery failure must return an error")
+	assert.Contains(t, err.Error(), "delivery", "error must indicate delivery failure")
 }

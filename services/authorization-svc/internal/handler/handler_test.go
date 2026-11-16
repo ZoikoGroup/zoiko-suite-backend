@@ -1156,6 +1156,7 @@ func TestRevokeRoleAssignment_Revoked(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/role-assignments/a-1/revoke", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
+	req.Header.Set("If-Match", "*")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

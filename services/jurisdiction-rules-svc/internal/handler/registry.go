@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -203,8 +204,23 @@ func (h *Handler) emitRegistry(r *http.Request, eventType, aggregateID, actor st
 		return
 	}
 	corr := r.Header.Get("X-Correlation-ID")
+	if v := h.eventAggregateVersion(r.Context()); v > 0 {
+		withVersion := make(map[string]any, len(payload)+1)
+		for k, x := range payload {
+			withVersion[k] = x
+		}
+		withVersion[events.AggregateVersionKey] = v
+		payload = withVersion
+	}
 	h.publish(eventType, corr, func() error {
-		return h.registryPub.PublishRegistryEvent(r.Context(), eventType, aggregateID, actor, corr, payload)
+		err := h.registryPub.PublishRegistryEvent(r.Context(), eventType, aggregateID, actor, corr, payload)
+		if err != nil {
+			// J-11: the change and its event commit together or not at all.
+			// Inside the request's unit of work this rolls the change back and
+			// the caller gets 503; it can retry with the same Idempotency-Key.
+			store.AbortUnit(r.Context(), fmt.Errorf("event %s not written: %w", eventType, err))
+		}
+		return err
 	})
 }
 
@@ -295,12 +311,16 @@ func (h *Handler) GetRegime(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListRegimes(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	xs, err := h.registry.ListRegimes(r.Context())
 	if err != nil {
 		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"regimes": xs})
+	finishListAs(h, w, r, p, "regimes", pageOf(p, xs))
 }
 
 // ── source register ─────────────────────────────────────────────────────────
@@ -367,17 +387,17 @@ func (h *Handler) GetSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListSources(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	limit, offset, ok := h.parsePaging(w, r, q)
+	p, ok := h.beginList(w, r, []string{"jurisdiction_id", "authority"},
+		map[string]string{"jurisdiction_id": "jurisdiction_id", "authority": "authority"})
 	if !ok {
 		return
 	}
-	xs, err := h.registry.ListSources(r.Context(), q.Get("jurisdiction_id"), q.Get("authority"), limit, offset)
+	xs, err := h.registry.ListSources(r.Context(), p.filter("jurisdiction_id"), p.filter("authority"), p.fetch(), p.offset)
 	if err != nil {
 		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sources": xs})
+	finishListAs(h, w, r, p, "sources", xs)
 }
 
 // ReviewSource records the independent source review (s8 "reviewed_by").
@@ -547,16 +567,16 @@ func (h *Handler) GetPack(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPacks(w http.ResponseWriter, r *http.Request) {
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, nil, nil)
 	if !ok {
 		return
 	}
-	xs, err := h.registry.ListPacks(r.Context(), limit, offset)
+	xs, err := h.registry.ListPacks(r.Context(), p.fetch(), p.offset)
 	if err != nil {
 		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"packs": xs})
+	finishListAs(h, w, r, p, "packs", xs)
 }
 
 // CreatePackVersion drafts a version from a manifest sent as the request body.
@@ -618,12 +638,16 @@ func (h *Handler) GetPackVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPackVersions(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	vs, err := h.registry.ListPackVersions(r.Context(), chi.URLParam(r, "pack_ref"))
 	if err != nil {
 		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"versions": vs})
+	finishListAs(h, w, r, p, "versions", pageOf(p, vs))
 }
 
 func (h *Handler) SubmitPackVersionForReview(w http.ResponseWriter, r *http.Request) {
@@ -695,4 +719,3 @@ func (h *Handler) GetRuleProvenance(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, p)
 }
-

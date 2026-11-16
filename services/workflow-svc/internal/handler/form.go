@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -569,19 +568,30 @@ func (h *Handler) ListPendingSubmissions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	limit, offset := 100, 0
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 500 {
-			limit = n
-		}
-	}
-	if raw := r.URL.Query().Get("offset"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
-			offset = n
-		}
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
 	}
 
-	pending, err := h.store.ListPendingSubmissions(r.Context(), tenantID, formID, limit, offset)
+	var cursor *domain.PaginationCursor
+	if cursorStr := r.URL.Query().Get("cursor"); cursorStr != "" {
+		c, err := domain.DecodePaginationCursor(cursorStr)
+		if err != nil {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_cursor",
+				"message": "cursor is not valid",
+			})
+			return
+		}
+		cursor = c
+	}
+
+	pending, nextCursor, err := h.store.ListPendingSubmissions(r.Context(), tenantID, formID, domain.ListPendingSubmissionsParams{
+		TenantID: tenantID,
+		FormID:   formID,
+		Limit:    limit,
+		Cursor:   cursor,
+	})
 	if err != nil {
 		h.writeFormErr(w, r, err)
 		return
@@ -589,7 +599,22 @@ func (h *Handler) ListPendingSubmissions(w http.ResponseWriter, r *http.Request)
 	if pending == nil {
 		pending = []*domain.FormSubmission{}
 	}
-	writeJSON(w, r, http.StatusOK, pending)
+
+	type listResponse struct {
+		Records    []*domain.FormSubmission `json:"records"`
+		NextCursor string                   `json:"next_cursor,omitempty"`
+	}
+
+	resp := listResponse{
+		Records: pending,
+	}
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			resp.NextCursor = encoded
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, resp)
 }
 
 func (h *Handler) writeFormErr(w http.ResponseWriter, r *http.Request, err error) {

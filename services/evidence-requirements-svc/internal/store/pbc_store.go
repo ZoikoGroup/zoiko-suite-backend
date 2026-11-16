@@ -12,7 +12,7 @@ import (
 )
 
 const evidenceRequestColumns = `request_id, tenant_id, legal_entity_id, requirement_id, title, description, assigned_to_principal_id,
-	due_at, status, created_by_principal_id, correlation_id, created_at`
+	due_at, status, created_by_principal_id, correlation_id, created_at, record_version`
 
 // storeWrap preserves the domain errors callers are allowed to branch on and
 // reclassifies raw driver failures as a store outage. In particular 22P02
@@ -30,6 +30,7 @@ func storeWrap(err error) error {
 		domain.ErrResponseNotFound,
 		domain.ErrSelfEvaluationNotAllowed,
 		domain.ErrArtifactNotScanned,
+		domain.ErrVersionMismatch,
 	} {
 		if errors.Is(err, sentinel) {
 			return err
@@ -48,7 +49,7 @@ func optionalUUIDEqual(a, b *string) bool {
 func scanEvidenceRequest(row pgx.Row) (*domain.EvidenceRequest, error) {
 	r := &domain.EvidenceRequest{}
 	err := row.Scan(&r.RequestID, &r.TenantID, &r.LegalEntityID, &r.RequirementID, &r.Title, &r.Description, &r.AssignedToPrincipalID,
-		&r.DueAt, &r.Status, &r.CreatedByPrincipalID, &r.CorrelationID, &r.CreatedAt)
+		&r.DueAt, &r.Status, &r.CreatedByPrincipalID, &r.CorrelationID, &r.CreatedAt, &r.RecordVersion)
 	if err == nil {
 		r.IsOverdue = r.DueAt.Before(time.Now().UTC()) && r.Status != domain.EvidenceRequestSatisfied && r.Status != domain.EvidenceRequestClosed
 	}
@@ -134,106 +135,102 @@ func (s *PgStore) GetResponseRequest(ctx context.Context, tenantID, responseID s
 	return out, nil
 }
 
-func (s *PgStore) ListOpenEvidenceRequests(ctx context.Context, tenantID, legalEntityID string) ([]*domain.EvidenceRequest, error) {
-	var out []*domain.EvidenceRequest
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		// An empty filter means "all entities in the tenant". Comparing an
-		// empty string against a uuid column used to raise 22P02 and surface
-		// as a 503 for the collection's default call.
-		rows, err := tx.Query(ctx, `SELECT `+evidenceRequestColumns+` FROM evidence_requests
-			WHERE tenant_id=$1 AND ($2='' OR legal_entity_id::text=$2)
-			  AND status NOT IN ('SATISFIED','CLOSED') ORDER BY due_at`,
-			tenantID, legalEntityID)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			r, err := scanEvidenceRequest(rows)
-			if err != nil {
-				return err
-			}
-			out = append(out, r)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, storeWrap(err)
-	}
-	return out, nil
-}
-
-func transitionEvidenceRequest(ctx context.Context, tx pgx.Tx, requestID, tenantID string, from []domain.EvidenceRequestStatus, to domain.EvidenceRequestStatus) (*domain.EvidenceRequest, error) {
+// mutateEvidenceRequest is the one conditional UPDATE behind every manager
+// command on a request (API-3). set is a SQL fragment whose placeholders start
+// at $5 (setArgs); cond, when not empty, is an extra predicate that may use
+// the same placeholders. The command applies only while the request is in one
+// of from (any status when from is empty) and, unless expectedVersion is 0
+// ("If-Match: *"), still at that record_version; record_version is bumped in
+// the same statement. When no row changes it says why, in the same
+// transaction: not found, a stale version (412), or a state that does not
+// permit the command (422). Stale is reported first: either way the caller's
+// read is out of date, and reading again is what they need to do.
+func mutateEvidenceRequest(ctx context.Context, tx pgx.Tx, requestID, tenantID string, expectedVersion int64,
+	from []domain.EvidenceRequestStatus, set, cond string, setArgs ...any) (*domain.EvidenceRequest, error) {
 	fromStrs := make([]string, len(from))
 	for i, f := range from {
 		fromStrs[i] = string(f)
 	}
-	row := tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 AND status = ANY($4) RETURNING `+evidenceRequestColumns,
-		string(to), requestID, tenantID, fromStrs)
-	out, err := scanEvidenceRequest(row)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		if chkErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2)`, requestID, tenantID).Scan(&exists); chkErr != nil {
-			return nil, chkErr
-		}
-		if !exists {
-			return nil, domain.ErrEvidenceRequestNotFound
-		}
-		return nil, domain.ErrEvidenceRequestInvalidState
+	where := `request_id = $1 AND tenant_id = $2
+		  AND ($3::bigint = 0 OR record_version = $3::bigint)
+		  AND (cardinality($4::text[]) = 0 OR status = ANY($4::text[]))`
+	if cond != "" {
+		where += " AND " + cond
 	}
-	return out, err
+	args := append([]any{requestID, tenantID, expectedVersion, fromStrs}, setArgs...)
+	out, err := scanEvidenceRequest(tx.QueryRow(ctx,
+		`UPDATE evidence_requests SET `+set+`, record_version = record_version + 1 WHERE `+where+` RETURNING `+evidenceRequestColumns,
+		args...))
+	if err == nil {
+		return out, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	var current int64
+	var status string
+	switch err := tx.QueryRow(ctx, `SELECT record_version, status FROM evidence_requests WHERE request_id = $1 AND tenant_id = $2`,
+		requestID, tenantID).Scan(&current, &status); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, domain.ErrEvidenceRequestNotFound
+	case err != nil:
+		return nil, err
+	}
+	if expectedVersion != 0 && current != expectedVersion {
+		return nil, &domain.StaleVersionError{Current: current}
+	}
+	return nil, domain.ErrEvidenceRequestInvalidState
+}
+
+// pbcResult maps a request command's error: the domain answers pass through,
+// pgx.ErrNoRows is a missing request, anything else is a store failure.
+func pbcResult(out *domain.EvidenceRequest, err error) (*domain.EvidenceRequest, error) {
+	switch {
+	case err == nil:
+		return out, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, domain.ErrEvidenceRequestNotFound
+	default:
+		return nil, storeWrap(err)
+	}
 }
 
 func (s *PgStore) SendEvidenceRequest(ctx context.Context, p domain.SendEvidenceRequestParams) (*domain.EvidenceRequest, error) {
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = transitionEvidenceRequest(ctx, tx, p.RequestID, p.TenantID, []domain.EvidenceRequestStatus{domain.EvidenceRequestDraft}, domain.EvidenceRequestSent)
+		out, err = mutateEvidenceRequest(ctx, tx, p.RequestID, p.TenantID, p.ExpectedVersion,
+			[]domain.EvidenceRequestStatus{domain.EvidenceRequestDraft}, "status = $5", "", string(domain.EvidenceRequestSent))
 		return err
 	})
-	if errors.Is(err, domain.ErrEvidenceRequestNotFound) || errors.Is(err, domain.ErrEvidenceRequestInvalidState) {
-		return nil, err
-	}
-	if err != nil {
-		return nil, storeWrap(err)
-	}
-	return out, nil
+	return pbcResult(out, err)
 }
 
 func (s *PgStore) ReassignEvidenceRequest(ctx context.Context, p domain.ReassignEvidenceRequestParams) (*domain.EvidenceRequest, error) {
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET assigned_to_principal_id=$1 WHERE request_id=$2 AND tenant_id=$3 RETURNING `+evidenceRequestColumns,
-			p.NewAssigneePrincipalID, p.RequestID, p.TenantID))
+		out, err = mutateEvidenceRequest(ctx, tx, p.RequestID, p.TenantID, p.ExpectedVersion,
+			nil, "assigned_to_principal_id = $5", "", p.NewAssigneePrincipalID)
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrEvidenceRequestNotFound
-	}
-	if err != nil {
-		return nil, storeWrap(err)
-	}
-	return out, nil
+	return pbcResult(out, err)
 }
 
 func (s *PgStore) ExtendDueDate(ctx context.Context, p domain.ExtendDueDateParams) (*domain.EvidenceRequest, error) {
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET due_at=$1 WHERE request_id=$2 AND tenant_id=$3 RETURNING `+evidenceRequestColumns,
-			p.NewDueAt, p.RequestID, p.TenantID))
+		out, err = mutateEvidenceRequest(ctx, tx, p.RequestID, p.TenantID, p.ExpectedVersion,
+			nil, "due_at = $5", "", p.NewDueAt)
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrEvidenceRequestNotFound
-	}
-	if err != nil {
-		return nil, storeWrap(err)
-	}
-	return out, nil
+	return pbcResult(out, err)
 }
 
+// ViewEvidenceRequest records that the assignee opened a SENT request. It is
+// the contributor's action, so it takes no If-Match; it moves the status, so
+// it bumps record_version.
 func (s *PgStore) ViewEvidenceRequest(ctx context.Context, p domain.ViewEvidenceRequestParams) (*domain.EvidenceRequest, error) {
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
@@ -245,16 +242,11 @@ func (s *PgStore) ViewEvidenceRequest(ctx context.Context, p domain.ViewEvidence
 			out = current
 			return nil // idempotent — already viewed or past it
 		}
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 RETURNING `+evidenceRequestColumns, domain.EvidenceRequestViewed, p.RequestID))
+		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1, record_version = record_version + 1
+			WHERE request_id=$2 AND tenant_id=$3 RETURNING `+evidenceRequestColumns, domain.EvidenceRequestViewed, p.RequestID, p.TenantID))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrEvidenceRequestNotFound
-	}
-	if err != nil {
-		return nil, storeWrap(err)
-	}
-	return out, nil
+	return pbcResult(out, err)
 }
 
 const responseColumns = `response_id, request_id, version, submitted_by_principal_id, artifact_document_id, malware_scan_status, created_at`
@@ -334,8 +326,12 @@ func (s *PgStore) SubmitResponse(ctx context.Context, p domain.SubmitResponsePar
 			return err
 		}
 
-		if _, err := tx.Exec(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND status NOT IN ($3,$4)`,
-			domain.EvidenceRequestResponseReceived, p.RequestID, domain.EvidenceRequestSatisfied, domain.EvidenceRequestClosed); err != nil {
+		// A new response moves the request to RESPONSE_RECEIVED and is a change
+		// to the aggregate, so it bumps record_version: a manager still holding
+		// the ETag from before the response is refused (412) and reads again.
+		if _, err := tx.Exec(ctx, `UPDATE evidence_requests SET status=$1, record_version = record_version + 1
+			WHERE request_id=$2 AND tenant_id=$3 AND status NOT IN ($4,$5)`,
+			domain.EvidenceRequestResponseReceived, p.RequestID, p.TenantID, domain.EvidenceRequestSatisfied, domain.EvidenceRequestClosed); err != nil {
 			return err
 		}
 		created = true
@@ -427,17 +423,12 @@ func (s *PgStore) RequestClarification(ctx context.Context, p domain.RequestClar
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 AND status=$4 RETURNING `+evidenceRequestColumns,
-			domain.EvidenceRequestClarificationRequired, p.RequestID, p.TenantID, domain.EvidenceRequestResponseReceived))
+		out, err = mutateEvidenceRequest(ctx, tx, p.RequestID, p.TenantID, p.ExpectedVersion,
+			[]domain.EvidenceRequestStatus{domain.EvidenceRequestResponseReceived}, "status = $5", "",
+			string(domain.EvidenceRequestClarificationRequired))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrEvidenceRequestInvalidState
-	}
-	if err != nil {
-		return nil, storeWrap(err)
-	}
-	return out, nil
+	return pbcResult(out, err)
 }
 
 // MarkSatisfied is the real, DB-enforced form of AUD-NEG-016 "PBC
@@ -470,47 +461,37 @@ func (s *PgStore) MarkSatisfied(ctx context.Context, p domain.MarkSatisfiedParam
 			return domain.ErrArtifactNotScanned
 		}
 
-		row := tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1
-			WHERE request_id=$2 AND tenant_id=$3 AND status IN ($4,$5)
-			AND NOT EXISTS (SELECT 1 FROM evidence_request_responses r WHERE r.request_id=$2 AND r.version=(SELECT MAX(version) FROM evidence_request_responses WHERE request_id=$2) AND r.submitted_by_principal_id=$6)
-			RETURNING `+evidenceRequestColumns,
-			domain.EvidenceRequestSatisfied, p.RequestID, p.TenantID, domain.EvidenceRequestResponseReceived, domain.EvidenceRequestUnderEvaluation, p.ActorPrincipalID)
-		out, err = scanEvidenceRequest(row)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrEvidenceRequestInvalidState
-		}
+		// The self-evaluation refusal is repeated inside the CAS so that a
+		// response submitted between the read above and this write cannot
+		// slip past it.
+		out, err = mutateEvidenceRequest(ctx, tx, p.RequestID, p.TenantID, p.ExpectedVersion,
+			[]domain.EvidenceRequestStatus{domain.EvidenceRequestResponseReceived, domain.EvidenceRequestUnderEvaluation},
+			"status = $5",
+			`NOT EXISTS (SELECT 1 FROM evidence_request_responses r WHERE r.request_id=$1
+			   AND r.version=(SELECT MAX(version) FROM evidence_request_responses WHERE request_id=$1)
+			   AND r.submitted_by_principal_id=$6)`,
+			string(domain.EvidenceRequestSatisfied), p.ActorPrincipalID)
 		return err
 	})
-	if errors.Is(err, domain.ErrEvidenceRequestNotFound) || errors.Is(err, domain.ErrEvidenceRequestInvalidState) ||
-		errors.Is(err, domain.ErrSelfEvaluationNotAllowed) || errors.Is(err, domain.ErrArtifactNotScanned) {
-		return nil, err
-	}
-	if err != nil {
-		return nil, storeWrap(err)
-	}
-	return out, nil
+	return pbcResult(out, err)
 }
 
+// CloseEvidenceRequest closes a request from any open status. Closing one
+// that is already closed, with a current If-Match, returns it unchanged
+// (idempotent); with a stale one it is 412 like any other command.
 func (s *PgStore) CloseEvidenceRequest(ctx context.Context, p domain.CloseEvidenceRequestParams) (*domain.EvidenceRequest, error) {
 	var out *domain.EvidenceRequest
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `UPDATE evidence_requests SET status=$1 WHERE request_id=$2 AND tenant_id=$3 AND status <> $1 RETURNING `+evidenceRequestColumns,
-			domain.EvidenceRequestClosed, p.RequestID, p.TenantID))
+		out, err = mutateEvidenceRequest(ctx, tx, p.RequestID, p.TenantID, p.ExpectedVersion,
+			[]domain.EvidenceRequestStatus{domain.EvidenceRequestDraft, domain.EvidenceRequestSent, domain.EvidenceRequestViewed,
+				domain.EvidenceRequestResponseReceived, domain.EvidenceRequestUnderEvaluation, domain.EvidenceRequestSatisfied,
+				domain.EvidenceRequestClarificationRequired},
+			"status = $5", "", string(domain.EvidenceRequestClosed))
+		if errors.Is(err, domain.ErrEvidenceRequestInvalidState) {
+			out, err = scanEvidenceRequest(tx.QueryRow(ctx, `SELECT `+evidenceRequestColumns+` FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2`, p.RequestID, p.TenantID))
+		}
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		checkErr := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-			return tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2)`, p.RequestID, p.TenantID).Scan(&exists)
-		})
-		if checkErr == nil && exists {
-			return s.GetEvidenceRequest(ctx, p.TenantID, p.RequestID) // already closed — idempotent
-		}
-		return nil, domain.ErrEvidenceRequestNotFound
-	}
-	if err != nil {
-		return nil, storeWrap(err)
-	}
-	return out, nil
+	return pbcResult(out, err)
 }

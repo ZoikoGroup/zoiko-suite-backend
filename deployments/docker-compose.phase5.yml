@@ -98,8 +98,9 @@ services:
 
   contract-lifecycle-svc:
     build:
-      context: ../services/contract-lifecycle-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope (D2-2.F07).
+      context: ..
+      dockerfile: services/contract-lifecycle-svc/Dockerfile
     container_name: contract-lifecycle-svc-p5
     ports:
       - "8119:8119"

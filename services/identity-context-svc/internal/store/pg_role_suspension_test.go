@@ -142,6 +142,33 @@ func TestPgStore_SuspensionIsTenantScopedAndToleratesUnknownAssignments(t *testi
 	require.Error(t, s.ResumeRoleAssignment(ctx, "t-1", "", time.Now()))
 }
 
+// IC-12: a suspension that arrives before its grant is held in
+// pending_role_assignment_suspensions until the grant is projected, so the
+// late grant does not frame the role and a resume still restores it. The hold
+// cannot be a stub projection row: an unprojected assignment has no principal,
+// and principal_id's foreign key rejects the insert.
+func TestPgStore_SuspensionBeforeGrantIsAppliedAndCleared(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	insertPrincipal(t, ctx, pool, "p-1", "t-1", "idp|one", "ACTIVE")
+
+	now := time.Now().UTC()
+	require.NoError(t, s.SuspendRoleAssignment(ctx, "t-1", "a-1", now))
+
+	projectAssignment(t, s, "t-1", "a-1", "p-1", "role-x")
+	require.Empty(t, framed(t, s, "p-1", "t-1"), "a grant for a suspended assignment must not frame the role")
+
+	var pending int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(*) FROM pending_role_assignment_suspensions
+		 WHERE tenant_id = 't-1' AND assignment_id = 'a-1'`).Scan(&pending))
+	require.Zero(t, pending, "the pending hold is cleared once the grant is projected")
+
+	require.NoError(t, s.ResumeRoleAssignment(ctx, "t-1", "a-1", now.Add(time.Minute)))
+	require.Equal(t, []string{"a-1"}, framed(t, s, "p-1", "t-1"))
+}
+
 // Migration 000016 refuses to drop the suspension columns while an assignment is
 // suspended (dropping them would start framing it again), and reverses cleanly
 // once nothing is.

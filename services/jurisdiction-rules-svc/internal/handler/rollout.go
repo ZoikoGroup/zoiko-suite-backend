@@ -119,21 +119,21 @@ func (h *Handler) ListRollouts(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.admin(w, r, "jurisdiction_rollout", "view"); !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, []string{"status"}, map[string]string{"status": "status"})
 	if !ok {
 		return
 	}
-	status := strings.ToUpper(r.URL.Query().Get("status"))
+	status := strings.ToUpper(p.filter("status"))
 	if status != "" && !domain.ValidRolloutStatus(status) {
 		writeError(w, r, http.StatusBadRequest, "invalid_status", "unknown rollout status")
 		return
 	}
-	out, err := h.registry.ListRollouts(r.Context(), status, limit, offset)
+	out, err := h.registry.ListRollouts(r.Context(), status, p.fetch(), p.offset)
 	if err != nil {
 		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"rollouts": out})
+	finishListAs(h, w, r, p, "rollouts", out)
 }
 
 // GetRollout returns a rollout with its checklist state, expert decisions, packs, history and what blocks each next step.

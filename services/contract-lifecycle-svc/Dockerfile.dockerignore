@@ -1,0 +1,12 @@
+# Used by BuildKit for builds with -f services/contract-lifecycle-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/contract-lifecycle-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/contract-lifecycle-svc/**/*.exe
+services/contract-lifecycle-svc/**/*_test.go
+services/contract-lifecycle-svc/deployments/
+services/identity-envelope/**/*_test.go

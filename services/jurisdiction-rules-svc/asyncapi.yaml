@@ -1,0 +1,457 @@
+asyncapi: "2.6.0"
+
+info:
+  title: Jurisdiction Rules Service — Event Contract
+  version: "1.2.0"
+  description: |
+    The published and consumed event surface of jurisdiction-rules-svc (D2-1):
+    Doc 03 s8.2, ZS-JUR-001 s26, REF-01 and REF-10.
+
+    ## Delivery semantics
+
+    Every published event is written to the transactional outbox in the same database
+    transaction as the change it announces (the request's unit of work, J-11): the two
+    commit together or neither does, and the API answers only after the commit. The outbox
+    relay claims rows with FOR UPDATE SKIP LOCKED under a transaction advisory lock (J-15),
+    so one replica publishes at a time and events of one aggregate leave in the order they
+    were written. Delivery is at-least-once: consumers deduplicate on event_id. An event
+    refused by the broker 10 times is parked and can be requeued by an operator
+    (POST /v1/admin/outbox/{id}/requeue, J-16).
+
+    ## Envelope
+
+    Every message is the envelope below. aggregate_version (J-12) is the aggregate's
+    row_version after the change (1 for a create), so a consumer can drop an older
+    event that arrives late. payload_hash is the sha256 of payload. The partition key
+    is the aggregate id. Jurisdiction and pack data are platform reference data: the
+    envelope carries no tenant.
+
+    ## Contract tests
+
+    internal/events/asyncapi_test.go fails when an event type the code can publish or
+    consume is missing here, or when this document lists one the code does not have.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: 127.0.0.1:9092
+    protocol: kafka
+  cluster:
+    url: kafka:9094
+    protocol: kafka
+
+channels:
+  zoiko.jurisdiction.events:
+    description: This service's topic (KAFKA_EVENTS_TOPIC). Everything it publishes goes here.
+    subscribe:
+      operationId: jurisdictionEvents
+      message:
+        oneOf:
+          - $ref: '#/components/messages/business_calendar_updated'
+          - $ref: '#/components/messages/einvoice_accepted'
+          - $ref: '#/components/messages/einvoice_rejected'
+          - $ref: '#/components/messages/einvoice_status_changed'
+          - $ref: '#/components/messages/einvoice_submitted'
+          - $ref: '#/components/messages/filing_accepted'
+          - $ref: '#/components/messages/filing_rejected'
+          - $ref: '#/components/messages/filing_status_changed'
+          - $ref: '#/components/messages/filing_submitted'
+          - $ref: '#/components/messages/holiday_occurrence_changed'
+          - $ref: '#/components/messages/jurisdiction_decision_resolved'
+          - $ref: '#/components/messages/jurisdiction_entity_applicability_backfilled'
+          - $ref: '#/components/messages/jurisdiction_outbox_event_requeued'
+          - $ref: '#/components/messages/jurisdiction_pack_certified'
+          - $ref: '#/components/messages/jurisdiction_pack_created'
+          - $ref: '#/components/messages/jurisdiction_pack_emergency_blocked'
+          - $ref: '#/components/messages/jurisdiction_pack_hotfix_declared'
+          - $ref: '#/components/messages/jurisdiction_pack_hotfix_retrospective_completed'
+          - $ref: '#/components/messages/jurisdiction_pack_promoted'
+          - $ref: '#/components/messages/jurisdiction_pack_released'
+          - $ref: '#/components/messages/jurisdiction_pack_reviewed'
+          - $ref: '#/components/messages/jurisdiction_pack_rolled_back'
+          - $ref: '#/components/messages/jurisdiction_pack_superseded'
+          - $ref: '#/components/messages/jurisdiction_pack_tests_run'
+          - $ref: '#/components/messages/jurisdiction_pack_unblocked'
+          - $ref: '#/components/messages/jurisdiction_pack_verification_failed'
+          - $ref: '#/components/messages/jurisdiction_pack_version_compiled'
+          - $ref: '#/components/messages/jurisdiction_pack_version_drafted'
+          - $ref: '#/components/messages/jurisdiction_pack_version_signed'
+          - $ref: '#/components/messages/jurisdiction_pack_version_submitted'
+          - $ref: '#/components/messages/jurisdiction_pack_withdrawn'
+          - $ref: '#/components/messages/jurisdiction_remediation_closed'
+          - $ref: '#/components/messages/jurisdiction_remediation_opened'
+          - $ref: '#/components/messages/jurisdiction_rollout_attested'
+          - $ref: '#/components/messages/jurisdiction_rollout_created'
+          - $ref: '#/components/messages/jurisdiction_rollout_expert_decided'
+          - $ref: '#/components/messages/jurisdiction_rollout_status_changed'
+          - $ref: '#/components/messages/jurisdiction_calendar_changed'
+          - $ref: '#/components/messages/jurisdiction_created'
+          - $ref: '#/components/messages/jurisdiction_deactivated'
+          - $ref: '#/components/messages/jurisdiction_hierarchy_changed'
+          - $ref: '#/components/messages/jurisdiction_rule_activated'
+          - $ref: '#/components/messages/jurisdiction_rule_updated'
+          - $ref: '#/components/messages/jurisdiction_support_changed'
+          - $ref: '#/components/messages/jurisdiction_updated'
+          - $ref: '#/components/messages/legal_drift_detected'
+          - $ref: '#/components/messages/pack_signing_key_registered'
+          - $ref: '#/components/messages/pack_signing_key_retired'
+          - $ref: '#/components/messages/pack_signing_key_revoked'
+          - $ref: '#/components/messages/payment_term_activated'
+          - $ref: '#/components/messages/payment_term_retired'
+          - $ref: '#/components/messages/payment_term_superseded'
+          - $ref: '#/components/messages/regulatory_calculation_completed'
+          - $ref: '#/components/messages/regulatory_calculation_failed'
+          - $ref: '#/components/messages/regulatory_interpretation_approved'
+          - $ref: '#/components/messages/regulatory_interpretation_recorded'
+          - $ref: '#/components/messages/regulatory_obligation_rule_published'
+          - $ref: '#/components/messages/regulatory_obligation_due_date_calculated'
+          - $ref: '#/components/messages/regulatory_regime_created'
+          - $ref: '#/components/messages/regulatory_rule_effective'
+          - $ref: '#/components/messages/regulatory_rule_expired'
+          - $ref: '#/components/messages/regulatory_rule_provenance_set'
+          - $ref: '#/components/messages/regulatory_rule_versioned'
+          - $ref: '#/components/messages/regulatory_source_change_captured'
+          - $ref: '#/components/messages/regulatory_source_change_closed'
+          - $ref: '#/components/messages/regulatory_source_change_review_started'
+          - $ref: '#/components/messages/regulatory_source_captured'
+          - $ref: '#/components/messages/regulatory_source_reviewed'
+          - $ref: '#/components/messages/regulatory_source_superseded'
+  zoiko.entity.events:
+    description: Consumed from tenant-entity-registry-svc.
+    publish:
+      operationId: consume_zoiko_entity_events
+      message:
+        oneOf:
+          - $ref: '#/components/messages/entity_created'
+          - $ref: '#/components/messages/entity_jurisdiction_changed'
+  KAFKA_REGULATORY_FEED_TOPIC:
+    description: Consumed from external-data-feed-svc (not yet published: tracker D2-1.F05).
+    publish:
+      operationId: consume_KAFKA_REGULATORY_FEED_TOPIC
+      message:
+        oneOf:
+          - $ref: '#/components/messages/regulatory_source_changed'
+
+components:
+  messages:
+    business_calendar_updated:
+      name: business-calendar.updated
+      summary: "REF-10 BusinessCalendarUpdated: a business calendar version was published."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    einvoice_accepted:
+      name: einvoice.accepted
+      summary: "s26 external compliance: an e-invoice was submitted, accepted (cleared), rejected or changed status (applied status reports only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    einvoice_rejected:
+      name: einvoice.rejected
+      summary: "s26 external compliance: an e-invoice was submitted, accepted (cleared), rejected or changed status (applied status reports only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    einvoice_status_changed:
+      name: einvoice.status-changed
+      summary: "s26 external compliance: an e-invoice was submitted, accepted (cleared), rejected or changed status (applied status reports only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    einvoice_submitted:
+      name: einvoice.submitted
+      summary: "s26 external compliance: an e-invoice was submitted, accepted (cleared), rejected or changed status (applied status reports only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    entity_created:
+      name: entity.created
+      summary: "A legal entity was created; its primary_jurisdiction_id becomes an ENTITY_PRIMARY applicability row (tenant-scoped, RLS)."
+      payload: { $ref: '#/components/schemas/ConsumedEnvelope' }
+    entity_jurisdiction_changed:
+      name: entity.jurisdiction.changed
+      summary: "A jurisdiction assignment was made or end-dated; upserted by assignment_id, guarded by object_version (a stale redelivery never wins)."
+      payload: { $ref: '#/components/schemas/ConsumedEnvelope' }
+    filing_accepted:
+      name: filing.accepted
+      summary: "s26 external compliance: a statutory filing was submitted, accepted, rejected or changed status (applied status reports only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    filing_rejected:
+      name: filing.rejected
+      summary: "s26 external compliance: a statutory filing was submitted, accepted, rejected or changed status (applied status reports only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    filing_status_changed:
+      name: filing.status-changed
+      summary: "s26 external compliance: a statutory filing was submitted, accepted, rejected or changed status (applied status reports only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    filing_submitted:
+      name: filing.submitted
+      summary: "s26 external compliance: a statutory filing was submitted, accepted, rejected or changed status (applied status reports only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    holiday_occurrence_changed:
+      name: holiday-occurrence.changed
+      summary: "REF-10 HolidayOccurrenceChanged: each holiday a published version adds, removes or changes."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_decision_resolved:
+      name: jurisdiction-decision.resolved
+      summary: "s26 runtime decisions: a jurisdiction determination (JUR-1) was made; the recorded request holds digests, never tenant or entity ids."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_entity_applicability_backfilled:
+      name: jurisdiction-entity-applicability.backfilled
+      summary: "J-10: an entity applicability backfill ran for a tenant (counts only)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_outbox_event_requeued:
+      name: jurisdiction-outbox.event-requeued
+      summary: "J-16: a parked outbox event was requeued (who, why, evidence)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_certified:
+      name: jurisdiction-pack.certified
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_created:
+      name: jurisdiction-pack.created
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_emergency_blocked:
+      name: jurisdiction-pack.emergency-blocked
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_hotfix_declared:
+      name: jurisdiction-pack.hotfix-declared
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_hotfix_retrospective_completed:
+      name: jurisdiction-pack.hotfix-retrospective-completed
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_promoted:
+      name: jurisdiction-pack.promoted
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_released:
+      name: jurisdiction-pack.released
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_reviewed:
+      name: jurisdiction-pack.reviewed
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_rolled_back:
+      name: jurisdiction-pack.rolled-back
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_superseded:
+      name: jurisdiction-pack.superseded
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_tests_run:
+      name: jurisdiction-pack.tests-run
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_unblocked:
+      name: jurisdiction-pack.unblocked
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_verification_failed:
+      name: jurisdiction-pack.verification-failed
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_version_compiled:
+      name: jurisdiction-pack.version-compiled
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_version_drafted:
+      name: jurisdiction-pack.version-drafted
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_version_signed:
+      name: jurisdiction-pack.version-signed
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_version_submitted:
+      name: jurisdiction-pack.version-submitted
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_pack_withdrawn:
+      name: jurisdiction-pack.withdrawn
+      summary: "ZS-JUR-001 s26 pack lifecycle: drafted, submitted, compiled, signed, tests run, reviewed, certified, released, promoted (deployed), withdrawn, rolled back, superseded, emergency-blocked/unblocked, hotfix declared and retrospective completed, and a runtime verification failure (JUR-NEG-04)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_remediation_closed:
+      name: jurisdiction-remediation.closed
+      summary: "s31 remediation case opened (automatically on withdrawal or rollback, or by hand) or closed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_remediation_opened:
+      name: jurisdiction-remediation.opened
+      summary: "s31 remediation case opened (automatically on withdrawal or rollback, or by hand) or closed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_rollout_attested:
+      name: jurisdiction-rollout.attested
+      summary: "ZS-JUR-001 s32 / wave 8 rollout governance: created, attested, expert-decided, status-changed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_rollout_created:
+      name: jurisdiction-rollout.created
+      summary: "ZS-JUR-001 s32 / wave 8 rollout governance: created, attested, expert-decided, status-changed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_rollout_expert_decided:
+      name: jurisdiction-rollout.expert-decided
+      summary: "ZS-JUR-001 s32 / wave 8 rollout governance: created, attested, expert-decided, status-changed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_rollout_status_changed:
+      name: jurisdiction-rollout.status-changed
+      summary: "ZS-JUR-001 s32 / wave 8 rollout governance: created, attested, expert-decided, status-changed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_calendar_changed:
+      name: jurisdiction.calendar.changed
+      summary: "Doc 03 s8.2: a regulatory calendar version was published."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_created:
+      name: jurisdiction.created
+      summary: "REF-01 jurisdiction registry: JurisdictionAdded (created), JurisdictionUpdated (updated: aliases, imported attribute changes), JurisdictionRetired (deactivated, with reason and evidence), JurisdictionHierarchyChanged, and the s26 support-changed when a rollout enters or leaves LAUNCHED."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_deactivated:
+      name: jurisdiction.deactivated
+      summary: "REF-01 jurisdiction registry: JurisdictionAdded (created), JurisdictionUpdated (updated: aliases, imported attribute changes), JurisdictionRetired (deactivated, with reason and evidence), JurisdictionHierarchyChanged, and the s26 support-changed when a rollout enters or leaves LAUNCHED."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_hierarchy_changed:
+      name: jurisdiction.hierarchy.changed
+      summary: "REF-01 jurisdiction registry: JurisdictionAdded (created), JurisdictionUpdated (updated: aliases, imported attribute changes), JurisdictionRetired (deactivated, with reason and evidence), JurisdictionHierarchyChanged, and the s26 support-changed when a rollout enters or leaves LAUNCHED."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_rule_activated:
+      name: jurisdiction.rule.activated
+      summary: "Doc 03 s8.2 rule lifecycle on the base registry: created/updated, activated (creator is never the activator)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_rule_updated:
+      name: jurisdiction.rule.updated
+      summary: "Doc 03 s8.2 rule lifecycle on the base registry: created/updated, activated (creator is never the activator)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_support_changed:
+      name: jurisdiction.support-changed
+      summary: "REF-01 jurisdiction registry: JurisdictionAdded (created), JurisdictionUpdated (updated: aliases, imported attribute changes), JurisdictionRetired (deactivated, with reason and evidence), JurisdictionHierarchyChanged, and the s26 support-changed when a rollout enters or leaves LAUNCHED."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    jurisdiction_updated:
+      name: jurisdiction.updated
+      summary: "REF-01 jurisdiction registry: JurisdictionAdded (created), JurisdictionUpdated (updated: aliases, imported attribute changes), JurisdictionRetired (deactivated, with reason and evidence), JurisdictionHierarchyChanged, and the s26 support-changed when a rollout enters or leaves LAUNCHED."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    legal_drift_detected:
+      name: legal.drift.detected
+      summary: "Doc 03 s8.2 legal drift: a rule's legal_drift_state changed (by hand, or from the regulatory feed)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    pack_signing_key_registered:
+      name: pack-signing-key.registered
+      summary: "Signing keys registered, retired (verify only) or revoked (never trusted again)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    pack_signing_key_retired:
+      name: pack-signing-key.retired
+      summary: "Signing keys registered, retired (verify only) or revoked (never trusted again)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    pack_signing_key_revoked:
+      name: pack-signing-key.revoked
+      summary: "Signing keys registered, retired (verify only) or revoked (never trusted again)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    payment_term_activated:
+      name: payment-term.activated
+      summary: "REF-10 PaymentTermActivated / PaymentTermSuperseded / retired."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    payment_term_retired:
+      name: payment-term.retired
+      summary: "REF-10 PaymentTermActivated / PaymentTermSuperseded / retired."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    payment_term_superseded:
+      name: payment-term.superseded
+      summary: "REF-10 PaymentTermActivated / PaymentTermSuperseded / retired."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_calculation_completed:
+      name: regulatory-calculation.completed
+      summary: "s26 runtime decisions: a regulatory calculation completed (exact amount from a released rule) or failed (refused; the reason is in the decision evidence). Carries identifiers and digests, never amounts."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_calculation_failed:
+      name: regulatory-calculation.failed
+      summary: "s26 runtime decisions: a regulatory calculation completed (exact amount from a released rule) or failed (refused; the reason is in the decision evidence). Carries identifiers and digests, never amounts."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_interpretation_approved:
+      name: regulatory-interpretation.approved
+      summary: "Interpretation records: recorded, approved by someone other than the author."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_interpretation_recorded:
+      name: regulatory-interpretation.recorded
+      summary: "Interpretation records: recorded, approved by someone other than the author."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_obligation_rule_published:
+      name: regulatory-obligation-rule.published
+      summary: "An obligation rule was published (maker-checker)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_obligation_due_date_calculated:
+      name: regulatory-obligation.due-date-calculated
+      summary: "s26 obligations: a due date was calculated (not on a replay or a refusal)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_regime_created:
+      name: regulatory-regime.created
+      summary: "A regulatory regime was created."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_rule_effective:
+      name: regulatory-rule.effective
+      summary: "s26 rule lifecycle: versioned (recorded), effective / expired (a rule in force reached the start or end of its interval; announced by the effectivity watcher when the instant passes), provenance-set."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_rule_expired:
+      name: regulatory-rule.expired
+      summary: "s26 rule lifecycle: versioned (recorded), effective / expired (a rule in force reached the start or end of its interval; announced by the effectivity watcher when the instant passes), provenance-set."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_rule_provenance_set:
+      name: regulatory-rule.provenance-set
+      summary: "s26 rule lifecycle: versioned (recorded), effective / expired (a rule in force reached the start or end of its interval; announced by the effectivity watcher when the instant passes), provenance-set."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_rule_versioned:
+      name: regulatory-rule.versioned
+      summary: "s26 rule lifecycle: versioned (recorded), effective / expired (a rule in force reached the start or end of its interval; announced by the effectivity watcher when the instant passes), provenance-set."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_source_change_captured:
+      name: regulatory-source-change.captured
+      summary: "s29/s31 source-change intake: captured, review started, closed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_source_change_closed:
+      name: regulatory-source-change.closed
+      summary: "s29/s31 source-change intake: captured, review started, closed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_source_change_review_started:
+      name: regulatory-source-change.review-started
+      summary: "s29/s31 source-change intake: captured, review started, closed."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_source_captured:
+      name: regulatory-source.captured
+      summary: "s8 source register: captured, independently reviewed, superseded (the original stays for reproducibility)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_source_reviewed:
+      name: regulatory-source.reviewed
+      summary: "s8 source register: captured, independently reviewed, superseded (the original stays for reproducibility)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_source_superseded:
+      name: regulatory-source.superseded
+      summary: "s8 source register: captured, independently reviewed, superseded (the original stays for reproducibility)."
+      payload: { $ref: '#/components/schemas/Envelope' }
+    regulatory_source_changed:
+      name: regulatory.source.changed
+      summary: "An authority changed a source a rule cites (payload: external_feed_reference, authority, change_summary, observed_at, source_url). Every ACTIVE rule citing the reference moves to legal_drift_state UNDER_REVIEW and legal.drift.detected is published, in one transaction with the de-duplication row."
+      payload: { $ref: '#/components/schemas/ConsumedEnvelope' }
+  schemas:
+    Envelope:
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, classification, payload_hash, payload]
+      properties:
+        event_id: { type: string, description: Deduplicate on this. }
+        event_type: { type: string }
+        event_version: { type: string, const: "1.0" }
+        emitted_at: { type: string, format: date-time }
+        schema_version: { type: string }
+        source_service: { type: string, const: jurisdiction-rules-svc }
+        jurisdiction_id: { type: string }
+        actor_id: { type: string, description: The verified principal or the workload that caused the event. }
+        correlation_id: { type: string }
+        request_id: { type: string }
+        aggregate_version: { type: integer, description: "The aggregate's row_version after the change; 1 for a create (J-12)." }
+        classification: { type: string, description: Data classification of the payload (INTERNAL by default). }
+        payload_hash: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
+        payload: { type: object, description: The event's facts; aggregate_id names the record. }
+    ConsumedEnvelope:
+      type: object
+      required: [event_id, event_type, payload]
+      properties:
+        event_id: { type: string }
+        event_type: { type: string }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        object_id: { type: string }
+        object_version: { type: integer }
+        effective_at: { type: string, format: date-time }
+        correlation_id: { type: string }
+        payload: { type: object }

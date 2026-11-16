@@ -118,6 +118,13 @@ func (s *PgStore) openRemediationTx(ctx context.Context, tx pgx.Tx, versionID, t
 		return nil, s.registryFail("openRemediation existing", err, nil)
 	}
 	where, args := scopeWhere(versionID, ring, region, since)
+	// A remediation case covers every tenant's decisions made with the version
+	// (s31): the operator's transaction reads across tenants for these
+	// statements only (000032).
+	if err := setCrossTenant(ctx, tx, true); err != nil {
+		return nil, s.registryFail("openRemediation scope", err, nil)
+	}
+	defer func() { _ = setCrossTenant(ctx, tx, false) }()
 	var n int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM rule_decision_evidence WHERE `+where, args...).Scan(&n); err != nil {
 		return nil, s.registryFail("openRemediation count", err, nil)
@@ -195,11 +202,11 @@ func (s *PgStore) remediationProgress(ctx context.Context, q querier, caseID str
 
 // GetRemediationCase reads one case with its progress.
 func (s *PgStore) GetRemediationCase(ctx context.Context, id string) (*RemediationCase, error) {
-	c, err := scanRemediation(s.pool.QueryRow(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE c.case_id::text=$1`, id))
+	c, err := scanRemediation(s.db(ctx).QueryRow(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE c.case_id::text=$1`, id))
 	if err != nil {
 		return nil, s.registryFail("GetRemediationCase", err, domain.ErrRemediationNotFound)
 	}
-	if c.Progress, err = s.remediationProgress(ctx, s.pool, id); err != nil {
+	if c.Progress, err = s.remediationProgress(ctx, s.db(ctx), id); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -207,8 +214,8 @@ func (s *PgStore) GetRemediationCase(ctx context.Context, id string) (*Remediati
 
 // ListRemediationCases lists cases, newest first, optionally by status (OPEN or CLOSED).
 func (s *PgStore) ListRemediationCases(ctx context.Context, status string, limit, offset int) ([]*RemediationCase, error) {
-	limit = pageLimit(limit, 50, 200)
-	rows, err := s.pool.Query(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE ($1='' OR c.status=$1) ORDER BY c.opened_at DESC, c.case_id LIMIT $2 OFFSET $3`, status, limit, offset)
+	limit = pageLimit(limit, 50, maxPage)
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+remediationCols+remediationFrom+` WHERE ($1='' OR c.status=$1) ORDER BY c.opened_at DESC, c.case_id LIMIT $2 OFFSET $3`, status, limit, offset)
 	if err != nil {
 		return nil, s.registryFail("ListRemediationCases", err, nil)
 	}
@@ -230,30 +237,38 @@ func (s *PgStore) ListRemediationDecisions(ctx context.Context, caseID string, p
 	if _, err := s.GetRemediationCase(ctx, caseID); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT e.decision_id::text, e.decision_kind, e.outcome, e.effective_at, e.created_at, e.requested_by, COALESCE(e.resolver_ring,''), COALESCE(e.resolver_region,''),
+	out := []*RemediationDecision{}
+	// The case's decisions belong to every tenant that used the version: an
+	// operator's read across tenants (000032), authorized by the handler.
+	err := s.scoped(ctx, TenantFrom(ctx), true, func(q Querier) error {
+		rows, err := q.Query(ctx, `SELECT e.decision_id::text, e.decision_kind, e.outcome, e.effective_at, e.created_at, e.requested_by, COALESCE(e.resolver_ring,''), COALESCE(e.resolver_region,''),
 			x.disposition, x.evidence_ref, x.note, x.new_decision_id::text, x.recorded_by, x.recorded_at
 		FROM remediation_case_decisions d JOIN rule_decision_evidence e ON e.decision_id = d.decision_id
 		LEFT JOIN remediation_dispositions x ON x.case_id = d.case_id AND x.decision_id = d.decision_id
 		WHERE d.case_id::text=$1 AND ($2 = FALSE OR x.disposition IS NULL) ORDER BY e.created_at, e.decision_id LIMIT $3 OFFSET $4`, caseID, pendingOnly, limit, offset)
+		if err != nil {
+			return s.registryFail("ListRemediationDecisions", err, nil)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d RemediationDecision
+			var disp, evid, by *string
+			var note, newID *string
+			var at *time.Time
+			if err := rows.Scan(&d.DecisionID, &d.DecisionKind, &d.Outcome, &d.EffectiveAt, &d.DecidedAt, &d.RequestedBy, &d.Ring, &d.Region, &disp, &evid, &note, &newID, &by, &at); err != nil {
+				return s.registryFail("ListRemediationDecisions scan", err, nil)
+			}
+			if disp != nil {
+				d.Disposition = &RemediationDisposition{Disposition: *disp, EvidenceRef: *evid, Note: note, NewDecisionID: newID, RecordedBy: *by, RecordedAt: *at}
+			}
+			out = append(out, &d)
+		}
+		return s.registryFail("ListRemediationDecisions rows", rows.Err(), nil)
+	})
 	if err != nil {
-		return nil, s.registryFail("ListRemediationDecisions", err, nil)
+		return nil, err
 	}
-	defer rows.Close()
-	out := []*RemediationDecision{}
-	for rows.Next() {
-		var d RemediationDecision
-		var disp, evid, by *string
-		var note, newID *string
-		var at *time.Time
-		if err := rows.Scan(&d.DecisionID, &d.DecisionKind, &d.Outcome, &d.EffectiveAt, &d.DecidedAt, &d.RequestedBy, &d.Ring, &d.Region, &disp, &evid, &note, &newID, &by, &at); err != nil {
-			return nil, s.registryFail("ListRemediationDecisions scan", err, nil)
-		}
-		if disp != nil {
-			d.Disposition = &RemediationDisposition{Disposition: *disp, EvidenceRef: *evid, Note: note, NewDecisionID: newID, RecordedBy: *by, RecordedAt: *at}
-		}
-		out = append(out, &d)
-	}
-	return out, s.registryFail("ListRemediationDecisions rows", rows.Err(), nil)
+	return out, nil
 }
 
 // RecordDispositionsResult counts what a batch did.

@@ -196,7 +196,8 @@ M=$(curl -s -m 20 $B/metrics)
 DOMAIN=$(echo "$M" | grep -c '^gateway_auth_')
 if [ "$DOMAIN" -ge 15 ]; then ok "domain metric series emitted ($DOMAIN)"; else bad "domain metrics ($DOMAIN, want >= 15)"; fi
 for fam in gateway_auth_verify_decisions_total gateway_auth_jwks_errors_total \
-           gateway_auth_tenant_context_total gateway_auth_carta_decisions_total; do
+           gateway_auth_tenant_context_total gateway_auth_carta_decisions_total \
+           gateway_auth_exchange_failures_total; do
   if echo "$M" | grep -q "^$fam"; then ok "  $fam"; else bad "  $fam missing"; fi
 done
 echo "$M" | grep -q '^readiness_up' && ok "  readiness_up gauge present" || bad "  readiness_up missing"
@@ -215,10 +216,38 @@ if [ "${MISMATCH%%.*}" -ge 1 ] 2>/dev/null; then ok "  spoofing attempts counted
 MISSING=0
 for o in allowed no_token invalid_token incomplete_claims tenant_hostname_mismatch \
          carta_blocked tenant_context_denied tenant_context_unresolved \
-         rate_limited overloaded request_too_large request_encoding_refused malformed_request version_unsupported; do
+         rate_limited overloaded request_too_large request_encoding_refused malformed_request version_unsupported \
+         session_revoked session_status_unavailable step_up_required carta_unavailable \
+         residency_denied residency_unresolved; do
   echo "$M" | grep -q "outcome=\"$o\"" || { MISSING=$((MISSING+1)); echo "        missing series: $o"; }
 done
 chk "outcome series absent before first occurrence" "$MISSING" "0"
+
+echo
+echo "-- 10b. GW-5 Per-service audience exchange --------------------------"
+# GW-5 / IAM-1 / AU-12: /verify exchanges the incoming zoiko-internal envelope
+# for the target service's audience when GATEWAY_AUDIENCE_ROUTES is configured.
+# The exchanged token is returned in X-Identity-Envelope, and the target
+# audience in X-Token-Audience. Both must be in authResponseHeaders.
+EXCH_METRIC=$(echo "$M" | grep '^gateway_auth_exchange_failures_total')
+if [ -n "$EXCH_METRIC" ]; then ok "  exchange failures metric present"; else bad "  exchange failures metric missing"; fi
+# Check that X-Identity-Envelope and X-Token-Audience are in authResponseHeaders
+COMPOSE="$SVC/../../deployments/docker-compose.yml"
+if [ -f "$COMPOSE" ]; then
+  ARH=$(grep -o 'authResponseHeaders=[^"]*' "$COMPOSE" | head -1 | cut -d= -f2)
+  if echo "$ARH" | grep -q "X-Identity-Envelope"; then ok "  X-Identity-Envelope in authResponseHeaders"; else bad "  X-Identity-Envelope missing from authResponseHeaders"; fi
+  if echo "$ARH" | grep -q "X-Token-Audience"; then ok "  X-Token-Audience in authResponseHeaders"; else bad "  X-Token-Audience missing from authResponseHeaders"; fi
+else
+  echo "  SKIP  compose file not found"
+fi
+# Check GTRM gatewayAuthResponseHeaders
+GTRM_EMIT="$SVC/../../deployments/gtrm/compiler/emit.go"
+if [ -f "$GTRM_EMIT" ]; then
+  if grep -q '"X-Identity-Envelope"' "$GTRM_EMIT"; then ok "  X-Identity-Envelope in GTRM gatewayAuthResponseHeaders"; else bad "  X-Identity-Envelope missing from GTRM gatewayAuthResponseHeaders"; fi
+  if grep -q '"X-Token-Audience"' "$GTRM_EMIT"; then ok "  X-Token-Audience in GTRM gatewayAuthResponseHeaders"; else bad "  X-Token-Audience missing from GTRM gatewayAuthResponseHeaders"; fi
+else
+  echo "  SKIP  GTRM emit.go not found"
+fi
 
 echo
 echo "-- 11. Prometheus is actually scraping it ----------------------------"
@@ -260,7 +289,7 @@ echo
 echo "-- 13. Published contract vs. the code -------------------------------"
 # A contract document that has drifted is worse than none: a client generated
 # from it fails at runtime against a service that is working correctly.
-for f in openapi.yaml RUNBOOK.md; do
+for f in openapi.yaml RUNBOOK.md SPEC_DEVIATIONS.md; do
   if [ -f "$SVC/$f" ]; then ok "$f present"; else bad "$f missing"; fi
 done
 # No asyncapi.yaml, and that is correct rather than missing: this service
@@ -332,7 +361,8 @@ if [ -f "$COMPOSE" ]; then
   if [ -n "$ARH" ]; then
     DROPPED=0
     for h in X-Principal-Id X-Tenant-Id X-Legal-Entity-Id X-Correlation-Id \
-             X-Jurisdiction-Context X-Timezone X-Residency-Policy-Id X-Tenant-Context-Stale; do
+             X-Jurisdiction-Context X-Timezone X-Residency-Policy-Id X-Tenant-Context-Stale \
+             X-Identity-Envelope X-Token-Audience; do
       case ",$ARH," in
         *",$h,"*) ;;
         *) DROPPED=$((DROPPED+1)); echo "        not forwarded: $h" ;;

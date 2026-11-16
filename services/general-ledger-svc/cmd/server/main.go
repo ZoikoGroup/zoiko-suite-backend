@@ -233,7 +233,7 @@ func main() {
 		log.Fatal("manual journal policy", zap.Error(err))
 	}
 	h := handler.New(pgStore, publisher, authzClient, closeClient, log).
-		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL)).
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL).WithLogger(log)).
 		WithJournalControls(pgStore, manualPolicy)
 	handler.RegisterRoutes(r, h)
 

@@ -42,7 +42,7 @@ func TestPgStore_Form_TenantIsolation(t *testing.T) {
 	if _, err := s.GetSubmissionVersion(ctxB, tenantB, accepted.SubmissionID); err == nil {
 		t.Fatal("GetSubmissionVersion as B must not return A's submission")
 	}
-	if list, err := s.ListPendingSubmissions(ctxB, tenantB, form.FormID, 100, 0); err != nil || len(list) != 0 {
+	if list, _, err := s.ListPendingSubmissions(ctxB, tenantB, form.FormID, domain.ListPendingSubmissionsParams{TenantID: tenantB, FormID: form.FormID, Limit: 100}); err != nil || len(list) != 0 {
 		t.Fatalf("ListPendingSubmissions as B: expected empty, got %d (err %v)", len(list), err)
 	}
 

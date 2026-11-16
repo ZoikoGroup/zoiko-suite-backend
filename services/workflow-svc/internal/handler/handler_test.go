@@ -218,8 +218,8 @@ func (s *stubStore) GetSubmissionVersion(_ context.Context, _, _ string) (*domai
 func (s *stubStore) GetValidationResult(_ context.Context, _, _ string) (*domain.ValidationResult, error) {
 	return s.validationResult, s.getValidationResultErr
 }
-func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, _, _ int) ([]*domain.FormSubmission, error) {
-	return s.pendingSubmissions, s.listPendingErr
+func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, _ domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
+	return s.pendingSubmissions, nil, s.listPendingErr
 }
 func (s *stubStore) EscalateToWorkflow(_ context.Context, _ domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error) {
 	return s.escalateToInstance, s.escalateToTransitioned, s.escalateToErr
@@ -227,8 +227,8 @@ func (s *stubStore) EscalateToWorkflow(_ context.Context, _ domain.EscalateToWor
 func (s *stubStore) RequestChanges(_ context.Context, _, _, _ string, _ *string, _ ...domain.LifecycleCommand) error {
 	return s.requestChangesErr
 }
-func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, _, _ int) ([]*domain.WorkflowInstance, error) {
-	return s.pendingInstances, s.listPendingApprovalsErr
+func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, _ domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
+	return s.pendingInstances, nil, s.listPendingApprovalsErr
 }
 func (s *stubStore) GetApprovalEvidence(_ context.Context, _ string) ([]*domain.WorkflowTransition, error) {
 	return s.approvalTransitions, s.approvalEvidenceErr

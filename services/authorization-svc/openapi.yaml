@@ -500,6 +500,8 @@ paths:
       summary: List the tenant's roles
       description: '`iam.role.read`. Tenant-scoped catalogue.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/LegalEntityHeader'
       responses:
@@ -649,6 +651,8 @@ paths:
       summary: List a role's permission bundles
       description: '`iam.role.read`. Includes retired bundles.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - name: role_id
           in: path
           required: true
@@ -802,6 +806,8 @@ paths:
         reconstructed from the append-only history (000038) rather than the
         current rows; a future `as_of` is `400 invalid_as_of`.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/LegalEntityHeader'
         - name: principal_id
@@ -844,7 +850,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
-        - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -883,7 +889,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
-        - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -916,7 +922,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
-        - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: true
         content:
@@ -1009,7 +1015,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
-        - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: true
         content:
@@ -1063,7 +1069,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
-        - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: false
         content:
@@ -1172,6 +1178,8 @@ paths:
       summary: List delegations
       description: '`iam.delegation.read`.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/LegalEntityHeader'
       responses:
@@ -1194,6 +1202,132 @@ paths:
     post:
       tags: [Delegations]
       summary: Revoke a delegation (R)
+      description: '`iam.delegation.revoke`. Delegator only.'
+      parameters:
+        - name: delegation_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Delegation revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delegation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  # ZS-IAM-001 §21 names for the delegation commands (tracker D2-5.F19).
+  # Aliases of /v1/admin/delegated-authorities: same handler, same checks,
+  # same responses. The colon form is the documented one; the slash form
+  # exists because some HTTP tooling percent-encodes a colon.
+  /v1/iam/delegations:
+    post:
+      tags: [Delegations]
+      summary: Grant delegated authority (ZS-IAM-001 §11) — ZS-IAM-001 §21 alias
+      description: |
+        `iam.delegation.grant`. The delegator must be the caller; no
+        self-delegation. `delegated_actions` may not name an `iam.*` or
+        protected platform action (`400 protected_privilege_not_delegable`),
+        and a full-authority delegation never confers them. `effective_to` is
+        required under `enforce`; under `warn` it defaults to 90 days.
+        `reason` (R) and `approval_reference` are recorded.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDelegationRequest'
+      responses:
+        '201':
+          description: Delegation granted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delegation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [Delegations]
+      summary: List delegations — ZS-IAM-001 §21 alias
+      description: '`iam.delegation.read`.'
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+      responses:
+        '200':
+          description: The tenant's delegations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delegations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Delegation' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/iam/delegations/{delegation_id}:revoke:
+    post:
+      tags: [Delegations]
+      summary: Revoke a delegation (R) — ZS-IAM-001 §21 alias
+      description: '`iam.delegation.revoke`. Delegator only.'
+      parameters:
+        - name: delegation_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Delegation revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delegation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/iam/delegations/{delegation_id}/revoke:
+    post:
+      tags: [Delegations]
+      summary: Revoke a delegation (R) — ZS-IAM-001 §21 alias
       description: '`iam.delegation.revoke`. Delegator only.'
       parameters:
         - name: delegation_id
@@ -1258,6 +1392,8 @@ paths:
       summary: List SoD rules
       description: '`iam.sod_rule.read`. Tenant and platform-wide rules.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1411,6 +1547,8 @@ paths:
       summary: List SoD exceptions
       description: '`iam.sod_rule.read`.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - name: principal_id
           in: query
           schema: { type: string }
@@ -1567,6 +1705,8 @@ paths:
       summary: List ABAC rules
       description: '`iam.policy.read`.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1701,6 +1841,8 @@ paths:
       summary: List workload bindings
       description: '`iam.workload.manage`. The tenant''s bindings, active and not.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1728,7 +1870,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
-        - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -1759,7 +1901,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
-        - $ref: '#/components/parameters/IfMatchOptional'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -1827,6 +1969,8 @@ paths:
       summary: List privileged sessions
       description: Registers need `iam.pam.manage`; your own sessions are readable without it, another principal's session by id is `404`.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1883,6 +2027,8 @@ paths:
       summary: List privileged sessions — /v1/admin spelling
       description: Identical to `GET /admin/v1/privileged-sessions`.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -2190,6 +2336,8 @@ paths:
       summary: List break-glass sessions
       description: Registers need the administering permission; your own are readable without it.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -2240,6 +2388,8 @@ paths:
       summary: List break-glass sessions — /v1/admin spelling
       description: Identical to `GET /admin/v1/break-glass-sessions`.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -2472,6 +2622,8 @@ paths:
       summary: List support sessions
       description: Registers need the administering permission; your own are readable without it.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -2905,6 +3057,9 @@ paths:
 
   /v1/admin/authority-limits:
     get:
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
       tags: [Authority Limits]
       summary: List approval and signing authority limits
       description: '`iam.policy.read`. Every version, newest first. `?status=` (PENDING_APPROVAL, ACTIVE, REJECTED, RETIRED, SUPERSEDED, or PENDING for anything awaiting a decision), `?principal_id=`, `?role_id=`, `?authority_type=` narrow it.'
@@ -3235,6 +3390,20 @@ components:
       schema: { type: integer }
       description: Age of the caller's last authentication; required for step-up-gated actions under `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up`.
 
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      description: 'API-4 cursor paging, opt-in. Sending page_size or cursor returns {"records": [...], "next_cursor": "..."} ordered by record id (next_cursor absent on the last page; "truncated": true when the store row cap was reached). Without either the register is returned as before.'
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+      description: The next_cursor of the previous page. Bound to the query it was issued for (path, tenant, filters); replayed on another query it is 400 invalid_cursor.
+
     IfMatch:
       name: If-Match
       in: header
@@ -3242,12 +3411,6 @@ components:
       schema: { type: string }
       description: 'The ETag ("v<version>") of the representation the change was made against (API-3). expected_version in the body is accepted in its place; * makes the change unconditional. Missing is 428 precondition_required; stale is 412 stale_version.'
 
-    IfMatchOptional:
-      name: If-Match
-      in: header
-      required: false
-      schema: { type: string }
-      description: 'The ETag ("v<version>") of the representation the change was made against (API-3). Honoured when sent — expected_version in the body is accepted in its place, * is unconditional, stale is 412 stale_version — but not yet required on these routes: the console and access-control-svc send none.'
 
   requestBodies:
     CommandBody:

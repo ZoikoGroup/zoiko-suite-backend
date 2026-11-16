@@ -37,4 +37,3 @@ func parseIfMatch(w http.ResponseWriter, r *http.Request) (*int64, bool) {
 	}
 	return &n, true
 }
-

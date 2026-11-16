@@ -115,8 +115,8 @@ func decodeError(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-			if body["code"] == "" {
-			t.Errorf("expected code field present, got code=%v", body["code"])
+	if body["code"] == "" {
+		t.Errorf("expected code field present, got code=%v", body["code"])
 	}
 	return body
 }
@@ -127,7 +127,7 @@ func decodeError(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
 func requireMissingField(t *testing.T, rr *httptest.ResponseRecorder, field string) {
 	t.Helper()
 	body := decodeError(t, rr)
-			if body["code"] != "missing_field" {
+	if body["code"] != "missing_field" {
 		t.Fatalf("expected code=missing_field, got %v", body)
 	}
 	errs, ok := body["errors"].([]any)

@@ -80,6 +80,13 @@ type HTTPClient struct {
 	cacheMu     sync.Mutex
 	cache       map[string]cachedDecision
 	cacheWrites int
+
+	// workload is the name on this service's client certificate when the
+	// client calls over mTLS. That hop's X-Workload-Id must name it: a
+	// forwarded caller's workload (policy-svc, admitted here as a peer) over
+	// this service's certificate is refused by authorization-svc as
+	// workload_identity_mismatch.
+	workload string
 }
 
 // NewHTTPClient constructs an HTTPClient bound to baseURL, e.g.
@@ -98,7 +105,7 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 // NewClientWithHTTPClient is NewHTTPClient but with a caller-supplied
 // *http.Client — used for the mTLS pilot, where the client's Transport
 // already carries this service's leaf certificate and trusts
-// authorization-svc's CA (see internal/mtls.NewClientHTTPClient).
+// authorization-svc's CA (see internal/mtls.Identity.HTTPClient).
 func NewClientWithHTTPClient(baseURL string, log *zap.Logger, httpClient *http.Client) *HTTPClient {
 	return &HTTPClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -106,6 +113,12 @@ func NewClientWithHTTPClient(baseURL string, log *zap.Logger, httpClient *http.C
 		http:    httpClient,
 		cache:   make(map[string]cachedDecision),
 	}
+}
+
+// WithWorkload names the workload on the client certificate (mTLS only).
+func (c *HTTPClient) WithWorkload(name string) *HTTPClient {
+	c.workload = name
+	return c
 }
 
 type authorizeRequest struct {
@@ -244,6 +257,9 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	// And the verified identity envelope, for authorization-svc's identity
 	// assertion check (AUTHZ_IDENTITY_ASSERTION).
 	idenv.Forward(ctx, req)
+	if c.workload != "" {
+		req.Header.Set("X-Workload-Id", c.workload)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

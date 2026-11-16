@@ -301,12 +301,12 @@ var (
 	// action into a tenant bundle.
 	ErrProtectedCatalogueUnavailable = errorString("protected-action catalogue unavailable")
 
-// ErrProvisioningForbidden is returned when authorization-svc's admin API
-// refuses the caller (403). It is a refusal, not an outage: the caller
-// lacks the iam.* grant authorization-svc requires for the write.
-ErrProvisioningForbidden = errorString("authorization-svc refused the provisioning call for this caller")
+	// ErrProvisioningForbidden is returned when authorization-svc's admin API
+	// refuses the caller (403). It is a refusal, not an outage: the caller
+	// lacks the iam.* grant authorization-svc requires for the write.
+	ErrProvisioningForbidden = errorString("authorization-svc refused the provisioning call for this caller")
 
-// ErrVersionConflict is returned when an update carries an expected_version
-// the object is no longer at — somebody else changed it since the caller read it.
-ErrVersionConflict = errorString("the object has changed since the expected version")
+	// ErrVersionConflict is returned when an update carries an expected_version
+	// the object is no longer at — somebody else changed it since the caller read it.
+	ErrVersionConflict = errorString("the object has changed since the expected version")
 )

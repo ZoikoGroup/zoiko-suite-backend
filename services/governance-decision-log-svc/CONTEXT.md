@@ -111,9 +111,20 @@ authorization-svc to confirm the caller may append to the ledger.
 
 ## Evidence obligations
 
-Append-only, immutable. No update, no delete. Must remain queryable
-indefinitely (or per an explicit retention policy, if one is ever
-defined) for audit, regulator, and legal-discovery scenarios.
+Append-only, immutable. No update, no delete. Must remain queryable for
+audit, regulator, and legal-discovery scenarios for as long as the
+retention class below requires.
+
+## Decisions recorded 11 Nov 2026 (D2-2.F11)
+
+| Question (register) | Decision | Where it lives |
+|---|---|---|
+| Retention class (D13) | **EV-REGULATED** (Event Catalogue section 16: elevated integrity, access and retention controls; legal hold overrides disposition) and record class **COMPLIANCE_EVIDENCE**. The duration is resolved by retention-registry-svc per jurisdiction and legal hold, never hard-coded here | `domain.RetentionClass` / `RecordClass`: `retention_class` + `record_class` on every decision read, on every event envelope, and on the export bundle (set when read; not part of the hashed canonical form) |
+| "audit" query dimension of Doc 03 section 8.7 (E3) | The **correlation id**: every decision made under one audited business trace | `GET /v1/decisions?correlation=<id>` (max 64), index `idx_governance_decisions_tenant_correlation` (000017) |
+| Is `decision_id` the GCP section 16 / GOV-07 `evidence_id`? (D11) | **Yes.** The decision row is the GOV-07 ledger leaf (`chain_seq`, `curr_hash`, Merkle leaf); there is no second identifier | openapi.yaml description |
+| Which GOV section owns GovernanceDecision (N4), and does GOV-07's hash chain apply here (D10)? | **GOV-07**, decided 23 Oct 2026 (implementation plan section 4: "GOV-07 Evidence ledger and verification: governance-decision-log-svc"); the chain is built (000016) | tracker Reference A3 |
+| `X-Purpose-Context` on reads or appends (D-06) | **Reads**, not appends | `internal/envelope/contract.go` (`PurposeContext: RequiredOnRead`) |
+| Event naming (D-07, group decision C3) | **Keep the Doc 03 wire names and publish the Event Catalogue canonical names alongside** (rule R9, deprecation window): `com.zoikosuite.governance.decision.recorded` / `.replayed` | `events.WithCanonicalAlias`; two outbox rows per event, same `payload_hash`, the alias carries `alias_of_event_id` |
 
 ## Idempotency
 
@@ -144,7 +155,7 @@ outbox RLS policy admits (000012), publishes the envelope byte for byte
 A broker outage delays events; it cannot lose them.
 
 Envelope: `event_id`, `event_type`, `event_version`, `emitted_at`,
-`schema_version` (1.1), `source_service`, `tenant_id`, `legal_entity_id`,
+`schema_version` (1.3), `source_service`, `tenant_id`, `legal_entity_id`,
 `actor_id`, `correlation_id`, `causation_id`, `workflow_instance_id`,
 `aggregate_type`, `aggregate_id`, `payload_hash`, `payload`. The payload no
 longer carries a `jurisdiction_context` filled with `rule_basis`; this service
@@ -159,6 +170,20 @@ broker, and what it did not mark published is relayed again.
 `ENV=production|staging` with no `KAFKA_BROKERS` refuses to start. Locally,
 `KAFKA_BROKERS=` runs without a relay and events wait in the outbox.
 
+Contracts: `schemas/governance.decision.recorded.v1.json` and
+`schemas/governance.decision.replayed.v1.json`, registered in
+schema-registry-svc under both names by
+`deployments/scripts/register-governance-decision-log-schemas.py` (idempotent);
+`TestR9_EmittedEnvelopesMatchTheRegisteredSchemas` keeps them true to the
+producer.
+
+Every event is queued twice in the same transaction (decision C3, rule R9):
+under its wire name and under its Event Catalogue canonical name
+(`com.zoikosuite.governance.decision.recorded` / `.replayed`). The alias has
+the same payload and `payload_hash`, its own `event_id`, and
+`alias_of_event_id` naming the wire event. Envelope `schema_version` is 1.3
+(adds `retention_class`, `alias_of_event_id`).
+
 ## Read authorization
 
 Every GET is authorized on `GOVERNANCE_DECISION_READ` on the legal entity the
@@ -166,9 +191,47 @@ data belongs to (the decision's, or the list's `entity` filter), with the
 platform scope (`AUTHZ_PLATFORM_SCOPE_ID`) as the tenant-wide reader tried
 second. An unfiltered list needs the platform grant. An authz outage is a 503,
 never a reason to fall back.
-`DECISION_LOG_READ_AUTHZ=warn` logs instead of refusing, as a migration path:
-compose sets it because contract-lifecycle-svc and decision-support-svc still
-read with no `X-Principal-Id`. The code default is `enforce`.
+`DECISION_LOG_READ_AUTHZ=warn` logs instead of refusing (a migration path
+only). The code default and the compose default are `enforce`.
+
+The three service readers (D2-2.F07, 11 Nov 2026) call the :8450 mTLS
+listener with their own workload certificates (`identity-envelope/mtlsclient`,
+each with its own bootstrap token) and are in `IDENTITY_PEERS`; every read
+carries the full input envelope with a purpose:
+
+| Reader | Principal it vouches for | Purpose |
+|---|---|---|
+| contract-lifecycle-svc (activation verifies its decision) | `svc-contract-lifecycle` (READ, authorization-svc 000042) | `contract_activation_verification` |
+| decision-support-svc (precedent sample) | `svc-decision-support` (READ, authorization-svc 000042) | `decision_support_precedent` |
+| evidence-manifest-svc (manifest snapshot) | the signed-in user (their own READ grant) | `evidence_manifest_assembly` |
+
+decision-support-svc and evidence-manifest-svc also decode the list as a page
+(`records`); evidence-manifest-svc follows `next_cursor` to the end of the
+range and fails closed rather than snapshotting a partial range.
+
+## Workload identity hardening (11 Nov 2026)
+
+- **Rotation.** The certificate from mtls-management-svc is held by
+  `mtls.RotatingIdentity`: the :8450 listener and the authorization-svc
+  client read it per handshake, and it is re-provisioned at two thirds of its
+  lifetime (retries back off from 1 to 15 minutes; the log escalates inside
+  the last day). It used to be frozen at boot, so day 91 broke every peer
+  write and every authorization check.
+- **Revocation.** `mtls.RevocationChecker` fetches mtls-management-svc's
+  CA-signed CRL (`MTLS_CRL_URL`, every `MTLS_CRL_REFRESH_SECONDS`, default 30),
+  refuses a CRL not signed by the listener's CA or older than the one held,
+  and refuses at the handshake any client certificate on it, and every client
+  certificate while no current CRL is held. `MTLS_REVOCATION_CHECK=off` is
+  accepted only with `ENV=local`.
+- **Scheduled sealing.** `internal/sealer` seals every tenant's unsealed
+  decisions each `EVIDENCE_SEAL_INTERVAL` (default `1h`; `0` = off) as
+  `EVIDENCE_SEAL_PRINCIPAL_ID` (`svc-governance-decision-log`). It lists work
+  across tenants under the read-only `app.evidence_sealer` marker (000017)
+  and seals each tenant through the ordinary tenant-scoped path: chain
+  re-verified first (a broken chain is refused and counted as
+  `gdl_evidence_seal_total{outcome="chain_broken"}`, alert
+  GovernanceLedgerChainBroken), advisory lock, Idempotency-Key derived from
+  the head seen, so replicas on the same tick make one package.
 
 ## Doctrine constraints that apply here
 
@@ -219,6 +282,14 @@ exactly — same `env()`/`envInt()` helpers, same `DBConfig.DSN()` shape):
 - `DB_HOST`, `DB_PORT` (5432), `DB_NAME` (default `governance_decision_log`),
   `DB_USER`, `DB_PASSWORD`, `DB_SSLMODE`
 - `ENV` (default `local`)
+- `IDENTITY_VERIFY` — compose runs `require` (`DECISION_LOG_IDENTITY_VERIFY`):
+  the console presents its signed envelope; policy-svc's and workflow-svc's
+  relays call :8450 with their certificates (identity-envelope/mtlsclient).
+- `MTLS_ENABLED` / `MTLS_PORT` (8450) / `MTLS_BOOTSTRAP_TOKEN_PATH` — the
+  inbound mTLS listener for peer workloads (X5); `IDENTITY_PEERS` (default
+  `policy-svc,workflow-svc`) names the certificates that may vouch for
+  X-Principal-Id; `AUTHZ_MTLS_ENABLED` / `AUTHZ_MTLS_URL` send authorization
+  checks to authorization-svc's :8449 with the same workload identity.
 
 pgxpool settings: same Tier 0 sizing as the other three services —
 `MaxConns=20, MinConns=2, MaxConnLifetime=30m, MaxConnIdleTime=5m,
@@ -317,10 +388,43 @@ live status.
 | `GET` | `/v1/decisions?actor=&entity=&action=&rule_basis=&from=&to=&limit=&offset=` | List/query decisions — all filters optional, compose with AND semantics |
 | `POST` | `/v1/decisions/{decision_id}/replay` | Re-evaluate against the exact policy version (APPROVAL_THRESHOLD only) |
 | `GET` | `/v1/decisions/{decision_id}/replay-manifests` | Replay history of one decision |
-
-The full contract, status codes and required headers are in `openapi.yaml`.
+| `GET` | `/v1/decisions/summary?days=\|from=&to=&entity=` | KPIs, breakdowns, daily trend, facets (console) |
+| `GET` | `/v1/decisions/{decision_id}/evidence` | One decision's chain link (re-computed), sealing package, events |
+| `GET` | `/v1/replay-manifests?mismatches=&limit=&offset=` | Tenant-wide replay history |
+| `GET` | `/v1/evidence/chain/verify` | Re-compute every link and every sealed package (G-07) |
+| `GET` | `/v1/evidence/chain/export` | Evidence bundle download (offline re-verifiable) |
+| `GET` | `/v1/evidence/packages` | Sealed packages, newest first |
+| `POST` | `/v1/evidence/packages/seal` | Seal the chain (`GOVERNANCE_EVIDENCE_SEAL`, Idempotency-Key) |
+| `GET` | `/v1/evidence/packages/{package_id}` | One package |
+| `GET` | `/v1/evidence/packages/{package_id}/verify` | Re-compute one package |
 | `GET` | `/healthz` | Liveness probe |
 | `GET` | `/readyz` | Readiness probe (DB connectivity) |
+
+The full contract, status codes and required headers are in `openapi.yaml`.
+
+### Evidence ledger (G-07, 000016)
+
+The database links every decision on insert (BEFORE INSERT trigger
+`gdl_chain_link`, per-tenant advisory lock): `chain_seq` 1..n in storage order,
+`prev_hash` (32 zero bytes for the first), `curr_hash = sha256(prev_hash ||
+gdl_canonical(row))`, where the canonical form is the row's jsonb text (v1).
+No caller can supply hashes. A sealed package (`evidence_packages`,
+append-only) records the RFC 6962 Merkle root over `curr_hash` of decisions
+1..to_seq and `package_hash = sha256(prev_package_hash || root || head ||
+uint64be(to_seq))`, so re-verification detects even a full rewrite of the
+chain. Changing `gdl_canonical` breaks every link: a new canonical form is a
+new version, never an edit.
+
+The register fields (title, summary, domain, priority, tags,
+related_obligation_id) are optional; `domain` is classified from `action_type`
+by `decision_domain_rules` when omitted, and the status category of an outcome
+comes from `decision_outcome_categories` (unmapped → OTHER). A follow-up (the
+resolution of a PENDING/ESCALATED decision) is a new decision naming the
+earlier one in `causation_id` — decisions are never edited.
+
+Local dependency E2E: `deployments/scripts/e2e-governance-decision-log-deps.py`
+(needs authorization, identity, tenant, policy-svc, kafka up and
+`seed-demo-rbac.ps1` run). Service audit: `scripts/audit.sh`.
 
 ### Running the server
 

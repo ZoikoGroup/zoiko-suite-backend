@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 )
@@ -178,7 +179,7 @@ func (s *PgStore) transition(ctx context.Context, tx pgx.Tx, v opsVersion, actio
 
 func (s *PgStore) CreateRegion(ctx context.Context, code string, description *string, actor string) (*Region, bool, error) {
 	var r Region
-	err := s.pool.QueryRow(ctx, `INSERT INTO deployment_regions (region_code, description, created_by_principal_id) VALUES ($1,$2,$3)
+	err := s.db(ctx).QueryRow(ctx, `INSERT INTO deployment_regions (region_code, description, created_by_principal_id) VALUES ($1,$2,$3)
 		ON CONFLICT (region_code) DO NOTHING RETURNING region_code, description, created_at, created_by_principal_id`, code, description, actor).
 		Scan(&r.RegionCode, &r.Description, &r.CreatedAt, &r.CreatedBy)
 	if err == nil {
@@ -187,7 +188,7 @@ func (s *PgStore) CreateRegion(ctx context.Context, code string, description *st
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, s.registryFail("CreateRegion", err, nil)
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT region_code, description, created_at, created_by_principal_id FROM deployment_regions WHERE region_code=$1`, code).
+	if err := s.db(ctx).QueryRow(ctx, `SELECT region_code, description, created_at, created_by_principal_id FROM deployment_regions WHERE region_code=$1`, code).
 		Scan(&r.RegionCode, &r.Description, &r.CreatedAt, &r.CreatedBy); err != nil {
 		return nil, false, s.registryFail("CreateRegion lookup", err, nil)
 	}
@@ -195,7 +196,7 @@ func (s *PgStore) CreateRegion(ctx context.Context, code string, description *st
 }
 
 func (s *PgStore) ListRegions(ctx context.Context) ([]*Region, error) {
-	rows, err := s.pool.Query(ctx, `SELECT region_code, description, created_at, created_by_principal_id FROM deployment_regions ORDER BY region_code`)
+	rows, err := s.db(ctx).Query(ctx, `SELECT region_code, description, created_at, created_by_principal_id FROM deployment_regions ORDER BY region_code`)
 	if err != nil {
 		return nil, s.registryFail("ListRegions", err, nil)
 	}
@@ -215,17 +216,25 @@ func (s *PgStore) ListRegions(ctx context.Context) ([]*Region, error) {
 // same attributes is a no-op, any difference is a conflict.
 func (s *PgStore) CreateRing(ctx context.Context, code string, ordinal, soak int, description *string, actor string) (*Ring, bool, error) {
 	var r Ring
-	err := s.pool.QueryRow(ctx, `INSERT INTO deployment_rings (ring_code, ordinal, min_soak_seconds, description, created_by_principal_id)
+	err := s.db(ctx).QueryRow(ctx, `INSERT INTO deployment_rings (ring_code, ordinal, min_soak_seconds, description, created_by_principal_id)
 		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (ring_code) DO NOTHING
 		RETURNING ring_code, ordinal, min_soak_seconds, description, created_at, created_by_principal_id`, code, ordinal, soak, description, actor).
 		Scan(&r.RingCode, &r.Ordinal, &r.MinSoakSeconds, &r.Description, &r.CreatedAt, &r.CreatedBy)
 	if err == nil {
 		return &r, true, nil
 	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_deployment_ring_ordinal" {
+		var holder string
+		if qerr := s.db(ctx).QueryRow(ctx, `SELECT ring_code FROM deployment_rings WHERE ordinal=$1`, ordinal).Scan(&holder); qerr != nil {
+			return nil, false, s.registryFail("CreateRing ordinal holder", qerr, nil)
+		}
+		return nil, false, fmt.Errorf("%w: ordinal %d is already ring %s; rings are append-only, so use the next free ordinal", domain.ErrRingOrdinalTaken, ordinal, holder)
+	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, s.registryFail("CreateRing", err, nil)
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT ring_code, ordinal, min_soak_seconds, description, created_at, created_by_principal_id FROM deployment_rings WHERE ring_code=$1`, code).
+	if err := s.db(ctx).QueryRow(ctx, `SELECT ring_code, ordinal, min_soak_seconds, description, created_at, created_by_principal_id FROM deployment_rings WHERE ring_code=$1`, code).
 		Scan(&r.RingCode, &r.Ordinal, &r.MinSoakSeconds, &r.Description, &r.CreatedAt, &r.CreatedBy); err != nil {
 		return nil, false, s.registryFail("CreateRing lookup", err, nil)
 	}
@@ -236,7 +245,7 @@ func (s *PgStore) CreateRing(ctx context.Context, code string, ordinal, soak int
 }
 
 func (s *PgStore) ListRings(ctx context.Context) ([]*Ring, error) {
-	rows, err := s.pool.Query(ctx, `SELECT ring_code, ordinal, min_soak_seconds, description, created_at, created_by_principal_id FROM deployment_rings ORDER BY ordinal`)
+	rows, err := s.db(ctx).Query(ctx, `SELECT ring_code, ordinal, min_soak_seconds, description, created_at, created_by_principal_id FROM deployment_rings ORDER BY ordinal`)
 	if err != nil {
 		return nil, s.registryFail("ListRings", err, nil)
 	}
@@ -699,10 +708,18 @@ func (s *PgStore) RollbackDeployment(ctx context.Context, ref, version, ring, re
 		return nil, &OpsBlocked{Reasons: reasons}
 	}
 
+	// The rollback reports how many decisions, of every tenant, the version
+	// made in this ring and region: an operator's count across tenants (000032).
 	var decisions int
+	if err := setCrossTenant(ctx, tx, true); err != nil {
+		return nil, s.registryFail("RollbackDeployment scope", err, nil)
+	}
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM rule_decision_evidence WHERE pack_version_id::text=$1 AND resolver_ring=$2 AND resolver_region=$3
 		AND created_at >= $4`, v.id, ring, region, cur.DeployedAt).Scan(&decisions); err != nil {
 		return nil, s.registryFail("RollbackDeployment decisions", err, nil)
+	}
+	if err := setCrossTenant(ctx, tx, false); err != nil {
+		return nil, s.registryFail("RollbackDeployment scope", err, nil)
 	}
 
 	if _, err := tx.Exec(ctx, `UPDATE pack_deployments SET status='ROLLED_BACK', rolled_back_at=NOW(), rolled_back_by=$2, rollback_reason=$3
@@ -755,7 +772,7 @@ func (s *PgStore) ListDeployments(ctx context.Context, ref, version string) ([]*
 	if _, err := s.GetPackVersion(ctx, ref, version); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+deploymentCols+deploymentFrom+` WHERE p.pack_ref=$1 AND v.version=$2 ORDER BY d.deployed_at, d.deployment_id`, ref, version)
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+deploymentCols+deploymentFrom+` WHERE p.pack_ref=$1 AND v.version=$2 ORDER BY d.deployed_at, d.deployment_id`, ref, version)
 	if err != nil {
 		return nil, s.registryFail("ListDeployments", err, nil)
 	}
@@ -825,7 +842,7 @@ func (s *PgStore) GetHotfix(ctx context.Context, ref, version string) (*Hotfix, 
 	if err != nil {
 		return nil, err
 	}
-	h, err := s.getHotfixTx(ctx, s.pool, v.PackVersionID)
+	h, err := s.getHotfixTx(ctx, s.db(ctx), v.PackVersionID)
 	if err != nil {
 		return nil, s.registryFail("GetHotfix", err, domain.ErrHotfixNotFound)
 	}
@@ -841,7 +858,7 @@ func (s *PgStore) CompleteRetrospective(ctx context.Context, ref, version, note,
 	if cur.RetroCompletedAt != nil {
 		return cur, false, nil
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE pack_hotfixes SET retro_completed_at=NOW(), retro_completed_by=$2, retro_note=$3
+	if _, err := s.db(ctx).Exec(ctx, `UPDATE pack_hotfixes SET retro_completed_at=NOW(), retro_completed_by=$2, retro_note=$3
 		WHERE pack_version_id IN (SELECT v.pack_version_id FROM jurisdiction_pack_versions v JOIN jurisdiction_packs p USING (pack_id)
 			WHERE p.pack_ref=$1 AND v.version=$4) AND retro_completed_at IS NULL`, ref, actor, note, version); err != nil {
 		return nil, false, s.registryFail("CompleteRetrospective", err, nil)
@@ -861,7 +878,7 @@ func (s *PgStore) RecordVerificationFailure(ctx context.Context, ref, version, r
 		return merr
 	}
 	raw := string(rawBytes)
-	_, err := s.pool.Exec(ctx, `INSERT INTO pack_verification_failures (pack_version_id, ring_code, region_code, reasons)
+	_, err := s.db(ctx).Exec(ctx, `INSERT INTO pack_verification_failures (pack_version_id, ring_code, region_code, reasons)
 		SELECT v.pack_version_id, $3, $4, $5::jsonb FROM jurisdiction_pack_versions v JOIN jurisdiction_packs p USING (pack_id)
 		WHERE p.pack_ref=$1 AND v.version=$2`, ref, version, nullIfEmpty(ring), nullIfEmpty(region), raw)
 	return s.registryFail("RecordVerificationFailure", err, nil)

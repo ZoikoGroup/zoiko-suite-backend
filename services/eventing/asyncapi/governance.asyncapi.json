@@ -9,6 +9,17 @@
         }
       }
     },
+    "decision": {
+      "address": "zoikosuite.governance.decision.v1",
+      "messages": {
+        "recorded": {
+          "$ref": "#/components/messages/decision.recorded"
+        },
+        "replayed": {
+          "$ref": "#/components/messages/decision.replayed"
+        }
+      }
+    },
     "delegation": {
       "address": "zoikosuite.governance.delegation.v1",
       "messages": {
@@ -96,6 +107,30 @@
         "title": "authorization-policy published",
         "x-zoiko-event-type": "com.zoikosuite.governance.authorization-policy.published",
         "x-zoiko-origin": "spec"
+      },
+      "decision.recorded": {
+        "contentType": "application/json",
+        "description": "Producer: Governance Decision Log Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Governance (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.governance.decision.recorded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Decision: recorded.",
+        "title": "decision recorded",
+        "x-zoiko-event-type": "com.zoikosuite.governance.decision.recorded",
+        "x-zoiko-origin": "extension"
+      },
+      "decision.replayed": {
+        "contentType": "application/json",
+        "description": "Producer: Governance Decision Log Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Governance (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.governance.decision.replayed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Decision: replayed.",
+        "title": "decision replayed",
+        "x-zoiko-event-type": "com.zoikosuite.governance.decision.replayed",
+        "x-zoiko-origin": "extension"
       },
       "delegation.granted": {
         "contentType": "application/json",
@@ -362,6 +397,22 @@
         }
       ],
       "summary": "Publish authorization-policy facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.decision": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/decision"
+      },
+      "description": "Producer(s): Governance Decision Log Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/decision/messages/recorded"
+        },
+        {
+          "$ref": "#/channels/decision/messages/replayed"
+        }
+      ],
+      "summary": "Publish decision facts after the authoritative commit (transactional outbox)."
     },
     "publish.delegation": {
       "action": "send",

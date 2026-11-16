@@ -110,7 +110,7 @@ func (s *PgStore) loadImportItems(ctx context.Context, q Querier, batchID string
 
 // GetJurisdictionImport returns a batch with its rows.
 func (s *PgStore) GetJurisdictionImport(ctx context.Context, batchID string) (*domain.ImportBatch, error) {
-	return s.getImport(ctx, s.pool, batchID, false)
+	return s.getImport(ctx, s.db(ctx), batchID, false)
 }
 
 func (s *PgStore) getImport(ctx context.Context, q Querier, batchID string, lock bool) (*domain.ImportBatch, error) {
@@ -137,10 +137,10 @@ func (s *PgStore) getImport(ctx context.Context, q Querier, batchID string, lock
 // ListJurisdictionImports lists batches, newest first, optionally of one status.
 // Rows are not included: read one batch for them.
 func (s *PgStore) ListJurisdictionImports(ctx context.Context, status string, limit int) ([]*domain.ImportBatch, error) {
-	if limit <= 0 || limit > 200 {
+	if limit <= 0 || limit > maxPage {
 		limit = 50
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+importBatchColumns+` FROM jurisdiction_import_batches
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+importBatchColumns+` FROM jurisdiction_import_batches
 		 WHERE ($1 = '' OR status = $1) ORDER BY proposed_at DESC, batch_id LIMIT $2`, status, limit)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)

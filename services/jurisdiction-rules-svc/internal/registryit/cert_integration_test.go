@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,7 +24,7 @@ import (
 func newEnvPolicy(signer domain.Signer, minReviews int) *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
-	r := chi.NewRouter()
+	r := newRouter()
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithCertificationPolicy(minReviews)
 	if signer != nil {
 		h.WithSigner(signer)
