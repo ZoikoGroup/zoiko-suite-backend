@@ -3,6 +3,7 @@ package handler_test
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -310,4 +311,25 @@ func TestAccountingImpact(t *testing.T) {
 	expect(t, g.do(http.MethodGet, "/v1/accounting-policies/versions/"+versionID+"/impact", ""), http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE")
 	g = newAcctRig(&acctStub{impact: &domain.AccountingImpact{}}, &stubAuthz{err: domain.ErrAuthorizationDenied})
 	expect(t, g.do(http.MethodGet, "/v1/accounting-policies/versions/"+versionID+"/impact", ""), http.StatusForbidden, "AUTHORIZATION_DENIED")
+}
+
+// REF-07 / API-3: an accounting command that decided on an older row_version
+// is 412 with the current ETag, by If-Match or expected_version, and never
+// reaches the store.
+func TestREF07_StaleVersionIs412(t *testing.T) {
+	st := acctVersionStub()
+	g := newAcctRig(st, nil)
+	for _, w := range []*httptest.ResponseRecorder{
+		g.do(http.MethodPost, versionURL+"approve", `{}`, header("If-Match", `"7"`)),
+		g.do(http.MethodPost, versionURL+"approve", `{"expected_version":7}`),
+	} {
+		p := expect(t, w, http.StatusPreconditionFailed, "stale_version")
+		if p["current_version"] != float64(1) || w.Header().Get("ETag") != `"v1"` {
+			t.Fatalf("stale: %v ETag %q", p, w.Header().Get("ETag"))
+		}
+	}
+	expect(t, g.do(http.MethodPost, versionURL+"approve", `{}`, header("If-Match", "*")), http.StatusBadRequest, "invalid_if_match")
+	if st.transitionCalls != 0 {
+		t.Fatal("a stale accounting command reached the store")
+	}
 }
