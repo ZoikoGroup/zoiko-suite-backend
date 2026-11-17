@@ -139,7 +139,7 @@ services:
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "6379:6379"
+      - "${REDIS_HOST_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -282,7 +282,7 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     ports:
-      - "3000:3000"
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
     depends_on:
       prometheus:
         condition: service_started
@@ -1767,8 +1767,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: document_vault
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_DOCUMENT_VAULT:-app_document_vault}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       STORAGE_DIR: "/data/documents"
       # Throwaway local-dev key — never used in staging/production, same
@@ -2132,8 +2132,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: purchase_request
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_PURCHASE_REQUEST:-app_purchase_request}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-request.events"
@@ -2337,8 +2337,8 @@ services:
     mem_limit: 128m
     cpus: "0.25"
     ports:
-      - "8025:8025" # web UI
-      - "1025:1025" # SMTP
+      - "${MAILPIT_UI_PORT:-8025}:8025" # web UI
+      - "${MAILPIT_SMTP_PORT:-1025}:1025" # SMTP
     environment:
       MP_MAX_MESSAGES: "5000"
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
@@ -2979,8 +2979,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: evidence_requirements
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_EVIDENCE_REQUIREMENTS:-app_evidence_requirements}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.evidence-requirements.events"

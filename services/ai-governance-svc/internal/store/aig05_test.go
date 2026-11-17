@@ -12,7 +12,7 @@ import (
 
 // ZS-SVC-X-001 §8 — AIG-05 (Evaluation, Monitoring, Incident & Change
 // Governance Service), against real Postgres as the NOSUPERUSER
-// NOBYPASSRLS app role. ai_model_releases/ai_evaluations/ai_incidents
+// NOBYPASSRLS app role. ai_model_releases/ai_evaluations/ai_incident_records
 // are all platform-wide (no tenant_id), so these tests use
 // context.Background() directly, same as the existing AIG-02 tests.
 
@@ -373,7 +373,7 @@ func TestAIG05_RawUpdate_ClosedIncident_RejectedByTrigger(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	_, err = admin.Exec(context.Background(), `UPDATE ai_incidents SET incident_state = 'OPEN' WHERE incident_id = $1`, in.IncidentID)
+	_, err = admin.Exec(context.Background(), `UPDATE ai_incident_records SET incident_state = 'OPEN' WHERE incident_id = $1`, in.IncidentID)
 	if err == nil {
 		t.Fatal("a CLOSED incident must be immutable at the database level")
 	}
