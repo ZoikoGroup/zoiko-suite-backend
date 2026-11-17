@@ -341,3 +341,22 @@ which blocked every later event; it now scans a nullable value.
 
 Open: the catalogue's section 19 entries `business.document.stored`, `versioned` and `classification-changed` (producer
 "Document Service", no deployed owner) overlap in meaning with the new types and need reconciling.
+
+### notification-svc (BIZ-03): four template events moved to the eventing outbox
+
+`template.created`, `template.version_approved`, `template.published` and `template.retired` are written to
+`eventing_outbox` (migration 000035) in the same transaction as the change, as
+`com.zoikosuite.business.template.{created,version-approved,published,retired}`, with payload schemas in
+`notification-svc/contracts/events` enforced by the store tests. The old event_type is kept as the envelope's legacy type.
+Catalogue: `created`, `version-approved` and `retired` are new extension entries (producer `Notification Service`);
+`published` was already a section 19 entry whose producer "Template Service" had no owner, so the producer mapping
+now resolves "Template Service" to `notification-svc` (the service that hosts BIZ-03).
+
+Not moved: `notification.*`, `communication.*` and `delivery.attempt.*` stay on the service's own `event_outbox`.
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a template write whose event
+cannot be built is rolled back, and a second relay delivers the eventing outbox (not started when no Kafka brokers are
+configured). The four event builders in `internal/events` were removed.
+
+Open: `eventing_outbox` has no row-level security (the shared library's table is cross-tenant by design, its relay drains
+every tenant), so the app role can read every tenant's envelopes; the service's legacy-RLS test excludes it explicitly.

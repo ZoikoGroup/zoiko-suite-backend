@@ -118,8 +118,17 @@
     "template": {
       "address": "zoikosuite.business.template.v1",
       "messages": {
+        "created": {
+          "$ref": "#/components/messages/template.created"
+        },
         "published": {
           "$ref": "#/components/messages/template.published"
+        },
+        "retired": {
+          "$ref": "#/components/messages/template.retired"
+        },
+        "version-approved": {
+          "$ref": "#/components/messages/template.version-approved"
         }
       }
     }
@@ -402,6 +411,18 @@
         "x-zoiko-event-type": "com.zoikosuite.business.task.created",
         "x-zoiko-origin": "spec"
       },
+      "template.created": {
+        "contentType": "application/json",
+        "description": "Producer: Notification Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.template.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Template: created.",
+        "title": "template created",
+        "x-zoiko-event-type": "com.zoikosuite.business.template.created",
+        "x-zoiko-origin": "extension"
+      },
       "template.published": {
         "contentType": "application/json",
         "description": "Producer: Template Service. Primary consumers / intent: Form/document generation. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
@@ -413,6 +434,30 @@
         "title": "template published",
         "x-zoiko-event-type": "com.zoikosuite.business.template.published",
         "x-zoiko-origin": "spec"
+      },
+      "template.retired": {
+        "contentType": "application/json",
+        "description": "Producer: Notification Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.template.retired",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Template: retired.",
+        "title": "template retired",
+        "x-zoiko-event-type": "com.zoikosuite.business.template.retired",
+        "x-zoiko-origin": "extension"
+      },
+      "template.version-approved": {
+        "contentType": "application/json",
+        "description": "Producer: Notification Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.template.version-approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Template: version-approved.",
+        "title": "template version-approved",
+        "x-zoiko-event-type": "com.zoikosuite.business.template.version-approved",
+        "x-zoiko-origin": "extension"
       }
     },
     "schemas": {
@@ -699,10 +744,19 @@
       "channel": {
         "$ref": "#/channels/template"
       },
-      "description": "Producer(s): Template Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "description": "Producer(s): Notification Service, Template Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
       "messages": [
         {
+          "$ref": "#/channels/template/messages/created"
+        },
+        {
           "$ref": "#/channels/template/messages/published"
+        },
+        {
+          "$ref": "#/channels/template/messages/retired"
+        },
+        {
+          "$ref": "#/channels/template/messages/version-approved"
         }
       ],
       "summary": "Publish template facts after the authoritative commit (transactional outbox)."

@@ -2365,6 +2365,7 @@ services:
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8133"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: notification
