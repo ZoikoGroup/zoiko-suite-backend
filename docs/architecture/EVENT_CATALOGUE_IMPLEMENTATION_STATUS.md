@@ -395,3 +395,17 @@ They were published by the handler after the commit through a Kafka writer that 
 Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a write whose event cannot be
 built is rolled back, a relay delivers the eventing outbox (not started with no brokers), and the Docker build context moved
 to `services/`.
+
+### exception-escalation-svc (BIZ-05): six task and case events moved to the eventing outbox
+
+`task.created`, `task.assigned`, `task.escalated`, `task.completed`, `task.reopened` and `case.closed` are written to the same
+`eventing_outbox` as the BIZ-08 deadline events, in the same transaction as the change, as
+`com.zoikosuite.business.task.{created,assigned,escalated,completed,reopened}` and `com.zoikosuite.business.case.closed`, with
+payload schemas in `exception-escalation-svc/contracts/events` enforced by the store tests. `task.created`, `task.completed` and
+`case.closed` already existed as section 19 entries with the unowned producers "Task Service" and "Case Service"; the producer
+mapping now resolves both to `exception-escalation-svc` (the service that hosts BIZ-05). `task.assigned`, `task.escalated` and
+`task.reopened` are new extension entries (producer `Exception Escalation Service`). The old event_type is kept as the envelope's
+legacy type.
+
+They were published by the handler after the commit with failures only logged. Not moved: the exception-case and audit-finding
+events. Open: the section 19 entry `business.case.opened` has no emitter.

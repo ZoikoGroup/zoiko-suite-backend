@@ -144,11 +144,20 @@
     "task": {
       "address": "zoikosuite.business.task.v1",
       "messages": {
+        "assigned": {
+          "$ref": "#/components/messages/task.assigned"
+        },
         "completed": {
           "$ref": "#/components/messages/task.completed"
         },
         "created": {
           "$ref": "#/components/messages/task.created"
+        },
+        "escalated": {
+          "$ref": "#/components/messages/task.escalated"
+        },
+        "reopened": {
+          "$ref": "#/components/messages/task.reopened"
         }
       }
     },
@@ -540,6 +549,18 @@
         "x-zoiko-event-type": "com.zoikosuite.business.relationship.created",
         "x-zoiko-origin": "extension"
       },
+      "task.assigned": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.task.assigned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: assigned.",
+        "title": "task assigned",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.assigned",
+        "x-zoiko-origin": "extension"
+      },
       "task.completed": {
         "contentType": "application/json",
         "description": "Producer: Task Service. Primary consumers / intent: Workflow/metrics. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
@@ -563,6 +584,30 @@
         "title": "task created",
         "x-zoiko-event-type": "com.zoikosuite.business.task.created",
         "x-zoiko-origin": "spec"
+      },
+      "task.escalated": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.task.escalated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: escalated.",
+        "title": "task escalated",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.escalated",
+        "x-zoiko-origin": "extension"
+      },
+      "task.reopened": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.task.reopened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: reopened.",
+        "title": "task reopened",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.reopened",
+        "x-zoiko-origin": "extension"
       },
       "template.created": {
         "contentType": "application/json",
@@ -940,13 +985,22 @@
       "channel": {
         "$ref": "#/channels/task"
       },
-      "description": "Producer(s): Task Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "description": "Producer(s): Exception Escalation Service, Task Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
       "messages": [
+        {
+          "$ref": "#/channels/task/messages/assigned"
+        },
         {
           "$ref": "#/channels/task/messages/completed"
         },
         {
           "$ref": "#/channels/task/messages/created"
+        },
+        {
+          "$ref": "#/channels/task/messages/escalated"
+        },
+        {
+          "$ref": "#/channels/task/messages/reopened"
         }
       ],
       "summary": "Publish task facts after the authoritative commit (transactional outbox)."

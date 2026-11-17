@@ -15,6 +15,9 @@ var serviceProducers = map[string]string{
 	"Payment Initiation Adapter": "payment-initiation-adapter-svc",
 	// BIZ-03 Template is hosted in notification-svc (its /v1/document-templates routes).
 	"Template Service": "notification-svc",
+	// BIZ-05 Task and Case are hosted in exception-escalation-svc.
+	"Task Service": "exception-escalation-svc",
+	"Case Service": "exception-escalation-svc",
 }
 
 // ambiguousProducers are written "<Name> Service" but name a capability that more
