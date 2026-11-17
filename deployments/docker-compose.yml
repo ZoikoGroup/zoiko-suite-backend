@@ -1323,13 +1323,19 @@ services:
       # Peer listener (:8449): system callers with no person's envelope
       # present their workload certificate instead of bare headers
       # (governance-decision-log-svc's replay, notification-svc's legal-basis
-      # reads). Only these CNs are admitted.
+      # reads, workflow-svc's signatory-decision reads). Only these CNs are
+      # admitted.
       MTLS_ENABLED: "true"
       MTLS_PORT: "8449"
-      MTLS_ALLOWED_CLIENTS: "governance-decision-log-svc,notification-svc"
+      MTLS_ALLOWED_CLIENTS: "governance-decision-log-svc,notification-svc,workflow-svc"
       # PDC-05 activation gate: an evaluable version goes live only when
       # certified against its family's test suite (or waived).
       POLICY_CERTIFICATION_GATE: "${POLICY_CERTIFICATION_GATE:-enforce}"
+      # ZS-GOV-INT-002 decision signing key (Ed25519 seed, 64 hex). Empty is
+      # accepted only with ENV=local: a per-process key, published at
+      # /v1/policy-decision-keys. Every other tier must set it.
+      POLICY_DECISION_SIGNING_KEY_HEX: "${POLICY_DECISION_SIGNING_KEY_HEX:-}"
+      POLICY_DECISION_SIGNING_KEY_ID: "${POLICY_DECISION_SIGNING_KEY_ID:-}"
       # API-4 cursors; local only, any 32+ byte hex key in other tiers.
       CURSOR_SIGNING_KEY_HEX: "${POLICY_CURSOR_SIGNING_KEY_HEX:-}"
     volumes:
@@ -1781,6 +1787,12 @@ services:
       # Without the grant every decision still commits, and its ledger record
       # waits durably in the outbox.
       WORKFLOW_LEDGER_PRINCIPAL_ID: "${WORKFLOW_LEDGER_PRINCIPAL_ID:-svc-workflow}"
+      # Signature workflows (ZS-GOV-INT-002 §4.2) are created only from a
+      # policy-svc SIGNATORY_MATRIX decision, read from policy-svc's :8449 peer
+      # listener with this service's certificate and verified against
+      # policy-svc's published decision keys.
+      POLICY_SERVICE_URL: "http://policy-svc:8085"
+      POLICY_SERVICE_MTLS_URL: "${WORKFLOW_POLICY_MTLS_URL:-https://policy-svc:8449}"
       # Reads need WORKFLOW_READ unless the caller is a participant (the
       # WORKFLOW_APPROVER / WORKFLOW_ADMINISTRATOR templates, access-control 000021).
       WORKFLOW_READ_AUTHZ: "${WORKFLOW_READ_AUTHZ:-enforce}"
