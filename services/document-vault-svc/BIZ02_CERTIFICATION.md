@@ -2,7 +2,7 @@
 
 **Service host:** document-vault-svc (BIZ-02 is implemented in the same service as BIZ-01; classification lives in its own table set, `record_classifications`, migration 000008)
 **Assessed against:** `ZoikoSuite_Business_Operations_Content_Services_Detailed_Service_Specifications_v1_0` (ZS-SVC-P-001) section 4
-**Status: NOT CERTIFIED.** Core contract implemented and now evidenced. One SoD defect found and fixed in this audit (restricted classes). The `RESTRICTED` status, downstream policy decision references, the event contract and live-stack checks remain open.
+**Status: NOT CERTIFIED.** Core contract implemented and now evidenced. One SoD defect found and fixed in this audit (restricted classes). The classification events are now on the shared eventing outbox. The `RESTRICTED` status, downstream policy decision references and live-stack checks remain open.
 
 A certificate listing only successes certifies nothing, so the last two sections say what was **not** verified.
 
@@ -15,7 +15,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Lifecycle Unclassified -> Candidate -> Confirmed -> Superseded/Restricted | Candidate, Confirmed, Superseded implemented, with database triggers limiting what may change on a row. Unclassified is the absence of a row. **`RESTRICTED` is defined as a status but no code ever sets it** (its own comment says "wired in a later wave"); restricted handling is by classification *value* only | `internal/domain/classification.go` |
 | Authorization / SoD | Steward actions `CLASSIFY_RECORD`, `CONFIRM_CLASSIFICATION`, `RECLASSIFY_RECORD`, `SUPERSEDE_CLASSIFICATION`. Human proposals need a different confirming principal (maker-checker, in the store). **Security/privacy owner for restricted classes was missing: fixed in this audit** (below) | handler, `internal/authz/client.go` |
 | Automated classification only within confidence policy | Every AI proposal lands CANDIDATE and needs a human confirm. The auto-confirm threshold is an explicit placeholder (`-1`, never met) because the policy owners (AI-02, DATA-GOV) do not exist. Conservative, but the confidence policy itself is not implemented | `AIConfidenceAutoConfirmThreshold` |
-| Events (4) | `classification.proposed`, `classification.confirmed`, `classification.reclassified`, `classification.superseded` are emitted via the service's old outbox. **Not canonical, not on the eventing outbox, no schemas or catalogue entries** (the catalogue has only `business.document.classification-changed`) | `internal/store/classification_store.go` |
+| Events (4) | `classification.proposed`, `confirmed`, `reclassified` and `superseded` are written to the shared eventing outbox in the same transaction as the change, as `com.zoikosuite.business.classification.proposed`, `confirmed`, `reclassified` and `superseded`, with payload schemas in `contracts/events` enforced by the store tests and catalogue entries (extension, producer Document Vault Service). The catalogue's section 19 entry `business.document.classification-changed` is still unowned and overlaps these | `internal/store/eventing_events.go`, `contracts/events` |
 | Failure: low-confidence/ambiguous stays candidate | Enforced: nothing auto-confirms | store |
 | Failure: policy engine failure blocks protected downstream actions rather than defaulting to public/internal | No policy engine is integrated, so this cannot occur. A document cannot be created without an explicit classification (invalid value 400, no silent default). `ExplainPolicyMapping` states honestly that no policy mapping is configured. Whether downstream protected actions (for example content download) consult the classification was not verified | handler, `ExplainPolicyMapping` |
 | Evidence: classifier/reviewer, confidence, rule/model version, source evidence, effective dates, downstream policy decision IDs | Proposer, confirmer, confidence, `rule_model_version`, `source_evidence`, `effective_at` and correlation id are recorded and append-only in history. **Downstream policy decision IDs are not recorded** (no policy engine) | `RecordClassification` |
@@ -67,7 +67,7 @@ Date: 2026-11-16. The Postgres container was disposable and has been removed.
 
 1. Register and grant `CONFIRM_RESTRICTED_CLASSIFICATION` in authorization-svc (deployment config).
 2. Decide and implement the `RESTRICTED` status transition (the constant exists; no code sets it) and whether it should replace `CONFIRMED` for restricted values.
-3. Move the four classification events to the shared eventing outbox with canonical names, payload schemas and catalogue entries, together with the BIZ-01 events (see `BIZ01_CERTIFICATION.md`).
+3. ~~Move the four classification events to the shared eventing outbox.~~ Done (see `BIZ01_CERTIFICATION.md`, "Event migration"). Still to do: reconcile with the catalogue's unowned `business.document.classification-changed`.
 4. Implement the confidence policy and policy-decision references once AI-02 and DATA-GOV exist, and record downstream policy decision IDs.
 5. Verify, and add a test, that protected downstream actions use the confirmed classification and never fall back to a default.
 6. Confirm with the spec owner whether proposing a `RESTRICTED` classification needs the security owner.

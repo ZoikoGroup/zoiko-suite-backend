@@ -2,7 +2,7 @@
 
 **Service host:** document-vault-svc (BIZ-01 and BIZ-02 are implemented in this one service; the DRC-02/03/04 records, retention and preservation work shares its tables)
 **Assessed against:** `ZoikoSuite_Business_Operations_Content_Services_Detailed_Service_Specifications_v1_0` (ZS-SVC-P-001) section 3
-**Status: NOT CERTIFIED.** The functional contract is the most complete of the BIZ services audited so far. Remaining gaps are the event contract (not on the shared eventing outbox, no catalogue entries or schemas), the spec's Draft and Disposed states, and live-stack checks.
+**Status: NOT CERTIFIED.** The functional contract is the most complete of the BIZ services audited so far. Five of the seven BIZ-01 events are now on the shared eventing outbox with schemas and catalogue entries; the two DRC section 9.3 events, the spec's Draft and Disposed states, and live-stack checks remain open.
 
 A certificate listing only successes certifies nothing, so the last two sections say what was **not** verified.
 
@@ -14,7 +14,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Queries: GetDocument, GetVersion, ListVersions, VerifyDigest, GetLinkedObjects, GetAsOfDocument | All implemented | `GET /v1/documents/{id}`, `/v1/document-versions/{id}`, `/versions`, `/verify-digest`, `/links`, `/as-of` |
 | Lifecycle Draft/Active -> Superseded/Declared Record -> Archived/Disposed | Active, Superseded, Declared Record (tracked separately), Archived implemented. **No Draft** (create ingests the first version) and **no Disposed**: disposition stops at `APPROVED_FOR_DISPOSITION` and nothing is deleted (README open decisions OD-S03, OD-S05) | `internal/store/pg_store.go` |
 | Authorization | Per-action, fail-closed: `DOCUMENT_CREATE`, `_READ`, `_DOWNLOAD`, `_VERSION_CREATE`, `_DECLARE_RECORD`, `_SUPERSEDE`, `_ARCHIVE`, `_REQUEST_DISPOSITION`, `_LINK`, `_ACCESS_LOG_READ`, plus `RECORD_*`, `RETENTION_*`, `LEGAL_HOLD_*` | handler |
-| Events (5) | Emitted, but under the service's own names: `document_created`, `document_version_committed`, `document.record_declared` (and `record.declared`), `document.superseded`, `document.archived`; also `document.disposition_requested`, `document.version_upload_quarantined` and `classification.*`. Mixed underscore/dot naming. **Not on the eventing outbox, not canonical, no schemas** | `internal/store/pg_store.go`, `internal/outbox` |
+| Events (5) | `document.record_declared`, `document.superseded`, `document.archived`, `document.disposition_requested` and `document.version_upload_quarantined` are written to the shared eventing outbox in the same transaction as the change, as `com.zoikosuite.business.document.record-declared`, `superseded`, `archived`, `disposition-requested` and `version-upload-quarantined`, with payload schemas in `contracts/events` enforced by the store tests and catalogue entries (extension, producer Document Vault Service). **`document_created` (the spec's DocumentUploaded) and `document_version_committed` (DocumentVersionCreated) stay on the older outbox**, because the DRC spec ZS-SVC-S-001 section 9.3 names them; moving them is an open decision between the two specs | `internal/store/eventing_events.go`, `contracts/events` |
 | Failure: malware/type/hash quarantines the upload | Enforced before anything is persisted; a quarantined new version records `document.version_upload_quarantined` and creates no version; content type is detected, not trusted from the caller | handler, `internal/scan`, `internal/contenttype` |
 | Failure: no phantom successful version | Reservation state machine (RESERVED/COMMITTED/FAILED/QUARANTINED) with a single transactional commit; a blob whose metadata row did not commit is removed. Versions and the access log are append-only by trigger (migration 000013) | `upload_reservations.go`, migration 000013 |
 | No destructive delete under hold/retention | No route deletes a document or version. The only `storage.Delete` removes an orphaned blob whose row never committed. `RequestDisposition` is refused while any record of the document is under an unreleased legal hold | `cleanupBlob`, `RequestDisposition` |
@@ -41,7 +41,13 @@ go test ./... -count=1           all packages pass with TEST_DATABASE_URL set to
 new test                         TestPgStore_Documents_TenantIsolation: passes; fails with RLS off
 ```
 
-Date: 2026-11-16. The Postgres container was disposable and has been removed. The only code change in this audit is the new test file.
+Date: 2026-11-16. The Postgres container was disposable and has been removed. The only code change in this audit was the new test file; the event migration and a relay fix follow below.
+
+## Event migration and a relay defect (after the audit)
+
+- The five events above now go through `insertDocumentOutboxEvent`, which routes them to `eventing_outbox` (migration 000017, equal to `outbox.SchemaSQL`). `EVENT_RESIDENCY_REGION` is now required, and a write whose event cannot be built is rolled back (tested). A second relay delivers the eventing outbox; it is not started when no Kafka brokers are configured, and its events stay queued. The Docker build context moved to `services/`.
+- **Defect found and fixed in the older relay:** tenant-level events (legal hold, export package) are stored with a NULL `legal_entity_id`, and the relay scanned that column into a plain string. The scan failed on every poll and, because the batch is ordered by time, blocked every later event. It now scans a nullable value. `TestOutboxRelay_DeliversEventsWithNoLegalEntity_AndDoesNotBlockLaterOnes` delivers nothing on the original code and both events on the fix.
+- Verified: full suite passes against Postgres 16, a deliberately broken schema fails the store test, the image builds and the container exits without the region and serves `/healthz` and `/readyz` with it. Not verified: delivery through a real Kafka broker to a consumer.
 
 ## NOT verified
 
@@ -54,7 +60,7 @@ Date: 2026-11-16. The Postgres container was disposable and has been removed. Th
 
 ## Open items to reach certification
 
-1. Move the document and classification events to the shared eventing outbox with canonical names (`com.zoikosuite.business.document.*`), payload schemas in `contracts/events` enforced by the store tests, and catalogue entries. The catalogue already lists `business.document.stored`, `versioned` and `classification-changed`, but its producer is the ambiguous "Document Service", so no deployed service owns them. The spec's names (DocumentUploaded, DocumentVersionCreated, RecordDeclared, DocumentSuperseded, DocumentArchived) need mapping to these.
+1. ~~Move the document events to the shared eventing outbox.~~ Done for five of the seven. Still to do: decide whether `document_created` and `document_version_committed` also move (DRC spec section 9.3 names them, ZS-EVENT-001 requires canonical names), and reconcile the catalogue's section 19 entries `business.document.stored`, `versioned` and `classification-changed` (producer the ambiguous "Document Service", no deployed owner) with the new `business.document.*` and `business.classification.*` types, which overlap them in meaning.
 2. Decide the Draft state and the Disposed state (needs the clarifications OD-S03, OD-S05 and a `DOCUMENT_UPDATE`/lock permission in the IAM taxonomy).
 3. Verify or add the purpose/classification check on retrieval of sensitive documents.
 4. Add an OpenAPI contract for the BIZ-01 routes (none exists in the service directory) and a route-drift test, as BIZ-04 and BIZ-07 have.

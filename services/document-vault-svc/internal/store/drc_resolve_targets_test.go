@@ -38,7 +38,7 @@ func resolve(t *testing.T, s *store.PgStore, ctx context.Context, holdID string,
 
 func TestResolveTargets_ActiveHold_AppliesTargetsAndRecordsASnapshot(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	seed := createTestRecord(t, s, "res-seed", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	a := createTestRecord(t, s, "res-a", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	b := createTestRecord(t, s, "res-b", string(domain.RecordClassLegalMatterRecord), "US-DE")
@@ -73,7 +73,7 @@ func TestResolveTargets_ActiveHold_AppliesTargetsAndRecordsASnapshot(t *testing.
 }
 
 func TestResolveTargets_DraftHold_QueuesTargetsUntilActivation(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	seed := createTestRecord(t, s, "res-d-seed", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	a := createTestRecord(t, s, "res-d-a", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	hold := newHold(t, s, seed, false)
@@ -94,7 +94,7 @@ func TestResolveTargets_DraftHold_QueuesTargetsUntilActivation(t *testing.T) {
 
 func TestResolveTargets_RepeatIsARefresh_NotADuplicate(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	seed := createTestRecord(t, s, "res-r-seed", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	a := createTestRecord(t, s, "res-r-a", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	hold := newHold(t, s, seed, true)
@@ -120,7 +120,7 @@ func TestResolveTargets_RepeatIsARefresh_NotADuplicate(t *testing.T) {
 
 func TestResolveTargets_PartialFailure_IsReported_NotHidden(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	seed := createTestRecord(t, s, "res-p-seed", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	good := createTestRecord(t, s, "res-p-good", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	hold := newHold(t, s, seed, true)
@@ -172,7 +172,7 @@ func TestResolveTargets_PartialFailure_IsReported_NotHidden(t *testing.T) {
 
 func TestResolveTargets_RefusalsChangeNothing(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	seed := createTestRecord(t, s, "res-x-seed", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	a := createTestRecord(t, s, "res-x-a", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	hold := newHold(t, s, seed, true)
@@ -199,7 +199,7 @@ func TestResolveTargets_RefusalsChangeNothing(t *testing.T) {
 
 func TestResolveTargets_SnapshotsAreImmutable(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	seed := createTestRecord(t, s, "res-i-seed", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	a := createTestRecord(t, s, "res-i-a", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	hold := newHold(t, s, seed, true)

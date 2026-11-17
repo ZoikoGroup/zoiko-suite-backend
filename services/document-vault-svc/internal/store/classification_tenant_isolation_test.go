@@ -19,7 +19,7 @@ import (
 func TestPgStore_Classification_TenantIsolation(t *testing.T) {
 	admin := requireTestDB(t)
 	app := appRolePool(t, admin)
-	s := store.New(app, zap.NewNop())
+	s := store.New(app, zap.NewNop(), store.WithEventRegion("local"))
 	ctxA, ctxB := tenantCtx(), otherTenantCtx()
 
 	doc, v1 := newDoc("cls-iso")

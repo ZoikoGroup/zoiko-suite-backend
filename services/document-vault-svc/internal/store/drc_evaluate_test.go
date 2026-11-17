@@ -62,7 +62,7 @@ func activateHold(t *testing.T, s *store.PgStore, recordID string) *domain.Legal
 // ── retention:evaluate ───────────────────────────────────────────────────────
 
 func TestEvaluateRetention_NoApplicableRule_IsNotDefaulted(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "eval-none", string(domain.RecordClassTaxReturnSupport), "ZZ-NONE")
 
 	evs, err := s.EvaluateRetention(tenantCtx(), []string{rec.RecordID})
@@ -78,7 +78,7 @@ func TestEvaluateRetention_NoApplicableRule_IsNotDefaulted(t *testing.T) {
 }
 
 func TestEvaluateRetention_OneRule_Resolves(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "eval-one", string(domain.RecordClassCorporateRecord), "US-DE")
 	rule := activeRuleWith(t, tenantCtx(), s, string(domain.RecordClassCorporateRecord), "US-DE", 365, domain.TriggerContractEnd, domain.DispositionArchive)
 
@@ -97,7 +97,7 @@ func TestEvaluateRetention_OneRule_Resolves(t *testing.T) {
 }
 
 func TestEvaluateRetention_IdenticalRules_ResolveWithEveryContributingRule(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "eval-same", string(domain.RecordClassLegalContract), "US-NY")
 	a := activeRuleWith(t, tenantCtx(), s, string(domain.RecordClassLegalContract), "US-NY", 730, domain.TriggerContractEnd, domain.DispositionReview)
 	b := activeRuleWith(t, tenantCtx(), s, string(domain.RecordClassLegalContract), "US-NY", 730, domain.TriggerContractEnd, domain.DispositionReview)
@@ -111,7 +111,7 @@ func TestEvaluateRetention_IdenticalRules_ResolveWithEveryContributingRule(t *te
 }
 
 func TestEvaluateRetention_DifferingRules_AreAConflict_AndNoWinnerIsChosen(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "eval-conflict", string(domain.RecordClassEmploymentRecord), "GB")
 	short := activeRuleWith(t, tenantCtx(), s, string(domain.RecordClassEmploymentRecord), "GB", 365, domain.TriggerEmploymentEnd, domain.DispositionDelete)
 	long := activeRuleWith(t, tenantCtx(), s, string(domain.RecordClassEmploymentRecord), "GB", 2190, domain.TriggerEmploymentEnd, domain.DispositionDelete)
@@ -134,7 +134,7 @@ func TestEvaluateRetention_DifferingRules_AreAConflict_AndNoWinnerIsChosen(t *te
 }
 
 func TestEvaluateRetention_OnlyActiveRulesApply(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "eval-draft", string(domain.RecordClassPayrollOutput), "US-CA")
 	// A DRAFT and an APPROVED-but-not-activated rule exist; neither applies.
 	_, err := s.CreateRetentionRuleVersion(tenantCtx(), domain.CreateRetentionRuleVersionParams{
@@ -155,7 +155,7 @@ func TestEvaluateRetention_OnlyActiveRulesApply(t *testing.T) {
 
 func TestEvaluateRetention_ReportsScheduleAndHold_AndMutatesNothing(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec, st := dueState(t, s, "eval-position", string(domain.RecordClassLegalMatterRecord), "US-TX")
 	hold := activateHold(t, s, rec.RecordID)
 
@@ -179,7 +179,7 @@ func TestEvaluateRetention_ReportsScheduleAndHold_AndMutatesNothing(t *testing.T
 }
 
 func TestEvaluateRetention_IsTenantScoped(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "eval-tenant", string(domain.RecordClassAccountingWorkpaper), "US-FL")
 	// Another tenant's ACTIVE rule for the same class and selector must not apply.
 	activeRuleWith(t, otherTenantCtx(), s, string(domain.RecordClassAccountingWorkpaper), "US-FL", 50, domain.TriggerDeclaredAt, domain.DispositionDelete)
@@ -205,7 +205,7 @@ func TestEvaluateRetention_IsTenantScoped(t *testing.T) {
 
 func TestDispositionCandidate_FromDue_MovesToReviewRequired_DeletesNothing(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec, st := dueState(t, s, "disp-ok", string(domain.RecordClassCorporateRecord), "US-DE")
 
 	got, err := s.CreateDispositionCandidate(tenantCtx(), domain.CreateDispositionCandidateParams{
@@ -223,7 +223,7 @@ func TestDispositionCandidate_FromDue_MovesToReviewRequired_DeletesNothing(t *te
 }
 
 func TestDispositionCandidate_RefusalsMutateNothing(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 
 	// Wrong expected state.
 	rec, st := dueState(t, s, "disp-mismatch", string(domain.RecordClassCorporateRecord), "US-DE")
@@ -253,7 +253,7 @@ func TestDispositionCandidate_RefusalsMutateNothing(t *testing.T) {
 }
 
 func TestDispositionCandidate_LegalHoldBlocks_NamingTheHold(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec, st := dueState(t, s, "disp-hold", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	hold := activateHold(t, s, rec.RecordID)
 
@@ -266,7 +266,7 @@ func TestDispositionCandidate_LegalHoldBlocks_NamingTheHold(t *testing.T) {
 }
 
 func TestDispositionCandidate_RepeatIsRefused_NotDuplicated(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec, _ := dueState(t, s, "disp-repeat", string(domain.RecordClassCorporateRecord), "US-DE")
 	p := domain.CreateDispositionCandidateParams{RecordID: rec.RecordID, ExpectedState: domain.RetentionDue, CreatedByPrincipalID: "operator-dave"}
 	_, err := s.CreateDispositionCandidate(tenantCtx(), p)
@@ -276,7 +276,7 @@ func TestDispositionCandidate_RepeatIsRefused_NotDuplicated(t *testing.T) {
 }
 
 func TestDispositionCandidate_IsTenantScoped(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec, _ := dueState(t, s, "disp-tenant", string(domain.RecordClassCorporateRecord), "US-DE")
 	_, err := s.CreateDispositionCandidate(otherTenantCtx(), domain.CreateDispositionCandidateParams{
 		RecordID: rec.RecordID, ExpectedState: domain.RetentionDue, CreatedByPrincipalID: "operator-dave"})
@@ -284,7 +284,7 @@ func TestDispositionCandidate_IsTenantScoped(t *testing.T) {
 }
 
 func TestDispositionApprove_RecordsTheApprovalRef_AndHoldStillBlocks(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec, st := dueState(t, s, "disp-approve", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	_, err := s.CreateDispositionCandidate(tenantCtx(), domain.CreateDispositionCandidateParams{
 		RecordID: rec.RecordID, ExpectedState: domain.RetentionDue, CreatedByPrincipalID: "operator-dave"})
@@ -315,7 +315,7 @@ func TestDispositionApprove_RecordsTheApprovalRef_AndHoldStillBlocks(t *testing.
 }
 
 func TestDispositionApprove_OldRouteStillWorksWithoutARef(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec, st := dueState(t, s, "disp-approve-old", string(domain.RecordClassCorporateRecord), "US-DE")
 	_, err := s.FlagForReview(tenantCtx(), domain.FlagForReviewParams{RetentionStateID: st.RetentionStateID, ReviewedByPrincipalID: "reviewer-eve", ReviewNotes: "ok"})
 	require.NoError(t, err)
@@ -326,7 +326,7 @@ func TestDispositionApprove_OldRouteStillWorksWithoutARef(t *testing.T) {
 }
 
 func TestDispositionApprove_IsTenantScoped(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec, st := dueState(t, s, "disp-approve-tenant", string(domain.RecordClassCorporateRecord), "US-DE")
 	_, err := s.CreateDispositionCandidate(tenantCtx(), domain.CreateDispositionCandidateParams{
 		RecordID: rec.RecordID, ExpectedState: domain.RetentionDue, CreatedByPrincipalID: "operator-dave"})

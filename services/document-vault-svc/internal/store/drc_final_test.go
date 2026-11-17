@@ -18,7 +18,7 @@ import (
 // retention_conflict_detected — real PostgreSQL.
 
 func TestRowVersion_StartsAtOne_AndIncrementsOnEveryChange(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := newEventDoc(nil, "rv-basic")
 	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "c"))
 
@@ -38,7 +38,7 @@ func TestRowVersion_StartsAtOne_AndIncrementsOnEveryChange(t *testing.T) {
 
 func TestRowVersion_CannotBeSetByAClient_AndConcurrentWritesDoNotLoseIncrements(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := newEventDoc(nil, "rv-conc")
 	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "c"))
 	ctx := context.Background()
@@ -66,7 +66,7 @@ func TestRowVersion_CannotBeSetByAClient_AndConcurrentWritesDoNotLoseIncrements(
 }
 
 func TestRowVersion_IsTenantScoped(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := newEventDoc(nil, "rv-tenant")
 	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "c"))
 	_, err := s.FindDocumentByID(otherTenantCtx(), doc.DocumentID)
@@ -98,7 +98,7 @@ func windowRule(t *testing.T, s *store.PgStore, class, jur string, days int, fro
 }
 
 func TestEvaluate_EffectiveWindow_DecidesApplicability(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "win-rec", string(domain.RecordClassCorporateRecord), "US-WIN")
 	t0 := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	t1 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -126,7 +126,7 @@ func TestEvaluate_EffectiveWindow_DecidesApplicability(t *testing.T) {
 
 func TestEffectiveWindow_Validation_AndImmutability(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	a := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	_, err := s.CreateRetentionRuleVersion(tenantCtx(), domain.CreateRetentionRuleVersionParams{
 		RecordClass: string(domain.RecordClassCorporateRecord), JurisdictionSelector: "US-V", TriggerType: string(domain.TriggerDeclaredAt),
@@ -148,7 +148,7 @@ func TestEffectiveWindow_Validation_AndImmutability(t *testing.T) {
 
 func TestEvaluate_Conflict_PublishesTheEventOncePerRuleSet(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "cf-rec", string(domain.RecordClassPayrollOutput), "US-CF")
 	r1 := windowRule(t, s, string(domain.RecordClassPayrollOutput), "US-CF", 100, nil, nil)
 	r2 := windowRule(t, s, string(domain.RecordClassPayrollOutput), "US-CF", 200, nil, nil)
@@ -185,7 +185,7 @@ func TestEvaluate_Conflict_PublishesTheEventOncePerRuleSet(t *testing.T) {
 
 func TestEvaluate_NoConflict_PublishesNoConflictEvent(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "cf-none", string(domain.RecordClassPayrollOutput), "US-OK")
 	windowRule(t, s, string(domain.RecordClassPayrollOutput), "US-OK", 100, nil, nil)
 	clearOutbox(t, pool)
@@ -198,7 +198,7 @@ func TestEvaluate_NoConflict_PublishesNoConflictEvent(t *testing.T) {
 
 func TestDeclareRecord_CrossTenantVersion_IsRefusedAndWritesNothing(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := newEventDoc(nil, "xt-declare")
 	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "c"))
 	clearOutbox(t, pool)
@@ -223,7 +223,7 @@ func TestDeclareRecord_CrossTenantVersion_IsRefusedAndWritesNothing(t *testing.T
 }
 
 func TestCurrentVersion_TracksTheNewestVersion(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc, v1 := newEventDoc(nil, "cv-track")
 	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v1, "c"))
 	v2 := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("cv2"), StorageKey: "key-cv2", SizeBytes: 3, ContentType: "application/pdf", CreatedByPrincipalID: "p"}

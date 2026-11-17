@@ -31,8 +31,7 @@ func classificationRows(t *testing.T, pool *pgxpool.Pool, docID string) int {
 func proposedEvents(t *testing.T, pool *pgxpool.Pool, docID string) int {
 	t.Helper()
 	var n int
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'classification.proposed'`, docID).Scan(&n))
+	n = eventingCount(t, pool, "com.zoikosuite.business.classification.proposed", docID)
 	return n
 }
 
@@ -60,7 +59,7 @@ func bulkParams(docIDs ...string) []domain.ClassifyRecordParams {
 
 func TestBulkClassifyRecords_AllValid_CommitsEveryProposalAndEvent(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	a, b, c := newDocForDeclareTest(t, s, "bulk-ok-a"), newDocForDeclareTest(t, s, "bulk-ok-b"), newDocForDeclareTest(t, s, "bulk-ok-c")
 	ids := []string{a.DocumentID, b.DocumentID, c.DocumentID}
 	before := snap(t, pool, ids...)
@@ -80,7 +79,7 @@ func TestBulkClassifyRecords_FailureAtFirstMiddleOrLast_LeavesNoRowsAndNoEvents(
 	for name, position := range map[string]int{"first": 0, "middle": 1, "last": 2} {
 		t.Run(name, func(t *testing.T) {
 			pool := requireTestDB(t)
-			s := store.New(pool, zap.NewNop())
+			s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 			a, b := newDocForDeclareTest(t, s, "bulk-pos-a-"+name), newDocForDeclareTest(t, s, "bulk-pos-b-"+name)
 			missing := uuid.NewString()
 			ids := []string{a.DocumentID, b.DocumentID}
@@ -104,7 +103,7 @@ func TestBulkClassifyRecords_FailureAtFirstMiddleOrLast_LeavesNoRowsAndNoEvents(
 // proposals were already inserted.
 func TestBulkClassifyRecords_RuleFailureMidBatch_RollsBackEarlierProposals(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	a, b, c := newDocForDeclareTest(t, s, "bulk-rule-a"), newDocForDeclareTest(t, s, "bulk-rule-b"), newDocForDeclareTest(t, s, "bulk-rule-c")
 	seeded, err := s.GetClassification(tenantCtx(), b.DocumentID)
 	require.NoError(t, err)
@@ -126,7 +125,7 @@ func TestBulkClassifyRecords_RuleFailureMidBatch_RollsBackEarlierProposals(t *te
 
 func TestBulkClassifyRecords_InvalidProposal_WritesNothing(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	a, b := newDocForDeclareTest(t, s, "bulk-inv-a"), newDocForDeclareTest(t, s, "bulk-inv-b")
 	ids := []string{a.DocumentID, b.DocumentID}
 	before := snap(t, pool, ids...)
@@ -143,7 +142,7 @@ func TestBulkClassifyRecords_InvalidProposal_WritesNothing(t *testing.T) {
 // ClassifyRecord (single) shares the same transactional body and is unchanged.
 func TestClassifyRecord_Single_StillWritesProposalAndEvent(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	a := newDocForDeclareTest(t, s, "single-classify")
 	before := snap(t, pool, a.DocumentID)
 

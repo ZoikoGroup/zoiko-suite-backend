@@ -20,7 +20,7 @@ import (
 func TestPgStore_Documents_TenantIsolation(t *testing.T) {
 	admin := requireTestDB(t)
 	app := appRolePool(t, admin)
-	s := store.New(app, zap.NewNop())
+	s := store.New(app, zap.NewNop(), store.WithEventRegion("local"))
 	ctxA, ctxB := tenantCtx(), otherTenantCtx()
 
 	docA, vA1 := newDoc("iso-a")

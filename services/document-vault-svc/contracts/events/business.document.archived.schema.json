@@ -1,0 +1,1 @@
+{"type":"object","description":"ZS-EVENT-001 payload of com.zoikosuite.business.document.archived (document-vault-svc, BIZ-01, schema 1.0.0): a document was moved to the archive.","properties":{"document_id":{"type":"string"},"tenant_id":{"type":"string"},"legal_entity_id":{"type":"string"}},"required":["document_id","tenant_id","legal_entity_id"]}

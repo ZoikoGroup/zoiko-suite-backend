@@ -28,7 +28,7 @@ func newDocumentForEvidenceTest(t *testing.T, s *store.PgStore, label string) (*
 // constraints, exercised together.
 func TestPgStore_RegisterEvidence_RequiresSourceAndMethod(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := newDocumentForEvidenceTest(t, s, "reqfields")
 
 	_, _, err := s.RegisterEvidence(tenantCtx(), domain.RegisterEvidenceParams{
@@ -57,7 +57,7 @@ func TestPgStore_RegisterEvidence_RequiresSourceAndMethod(t *testing.T) {
 // and no raw SQL UPDATE or DELETE — can remove it once recorded.
 func TestPgStore_EvidenceContradiction_NeverDeletable(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := newDocumentForEvidenceTest(t, s, "contradiction")
 
 	evidence, _, err := s.RegisterEvidence(tenantCtx(), domain.RegisterEvidenceParams{
@@ -92,7 +92,7 @@ func TestPgStore_EvidenceContradiction_NeverDeletable(t *testing.T) {
 // in-place content change.
 func TestPgStore_SupersedeEvidence_LinksForwardNeverOverwrites(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v1 := newDocumentForEvidenceTest(t, s, "supersede")
 
 	evidence, _, err := s.RegisterEvidence(tenantCtx(), domain.RegisterEvidenceParams{
