@@ -4732,8 +4732,8 @@ services:
   # never writes to the linked business object itself.
   comments-collaboration-svc:
     build:
-      context: ../services/comments-collaboration-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: comments-collaboration-svc/Dockerfile
     container_name: comments-collaboration-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4741,6 +4741,7 @@ services:
       - "8170:8170"
     environment:
       PORT: "8170"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/comments_collaboration?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.comments-collaboration.events"

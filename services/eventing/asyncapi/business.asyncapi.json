@@ -29,6 +29,20 @@
         }
       }
     },
+    "comment": {
+      "address": "zoikosuite.business.comment.v1",
+      "messages": {
+        "added": {
+          "$ref": "#/components/messages/comment.added"
+        },
+        "edited": {
+          "$ref": "#/components/messages/comment.edited"
+        },
+        "moderated": {
+          "$ref": "#/components/messages/comment.moderated"
+        }
+      }
+    },
     "deadline": {
       "address": "zoikosuite.business.deadline.v1",
       "messages": {
@@ -97,6 +111,14 @@
         }
       }
     },
+    "mention": {
+      "address": "zoikosuite.business.mention.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/mention.created"
+        }
+      }
+    },
     "opportunity": {
       "address": "zoikosuite.business.opportunity.v1",
       "messages": {
@@ -144,6 +166,14 @@
         },
         "version-approved": {
           "$ref": "#/components/messages/template.version-approved"
+        }
+      }
+    },
+    "thread": {
+      "address": "zoikosuite.business.thread.v1",
+      "messages": {
+        "resolved": {
+          "$ref": "#/components/messages/thread.resolved"
         }
       }
     }
@@ -220,6 +250,42 @@
         "summary": "Classification: superseded.",
         "title": "classification superseded",
         "x-zoiko-event-type": "com.zoikosuite.business.classification.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "comment.added": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.comment.added",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Comment: added.",
+        "title": "comment added",
+        "x-zoiko-event-type": "com.zoikosuite.business.comment.added",
+        "x-zoiko-origin": "extension"
+      },
+      "comment.edited": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.comment.edited",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Comment: edited.",
+        "title": "comment edited",
+        "x-zoiko-event-type": "com.zoikosuite.business.comment.edited",
+        "x-zoiko-origin": "extension"
+      },
+      "comment.moderated": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.comment.moderated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Comment: moderated.",
+        "title": "comment moderated",
+        "x-zoiko-event-type": "com.zoikosuite.business.comment.moderated",
         "x-zoiko-origin": "extension"
       },
       "deadline.became-due-soon": {
@@ -414,6 +480,18 @@
         "x-zoiko-event-type": "com.zoikosuite.business.interaction.logged",
         "x-zoiko-origin": "extension"
       },
+      "mention.created": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.mention.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Mention: created.",
+        "title": "mention created",
+        "x-zoiko-event-type": "com.zoikosuite.business.mention.created",
+        "x-zoiko-origin": "extension"
+      },
       "opportunity.created": {
         "contentType": "application/json",
         "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
@@ -532,6 +610,18 @@
         "summary": "Template: version-approved.",
         "title": "template version-approved",
         "x-zoiko-event-type": "com.zoikosuite.business.template.version-approved",
+        "x-zoiko-origin": "extension"
+      },
+      "thread.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.thread.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Thread: resolved.",
+        "title": "thread resolved",
+        "x-zoiko-event-type": "com.zoikosuite.business.thread.resolved",
         "x-zoiko-origin": "extension"
       }
     },
@@ -693,6 +783,25 @@
       ],
       "summary": "Publish classification facts after the authoritative commit (transactional outbox)."
     },
+    "publish.comment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/comment"
+      },
+      "description": "Producer(s): Comments Collaboration Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/comment/messages/added"
+        },
+        {
+          "$ref": "#/channels/comment/messages/edited"
+        },
+        {
+          "$ref": "#/channels/comment/messages/moderated"
+        }
+      ],
+      "summary": "Publish comment facts after the authoritative commit (transactional outbox)."
+    },
     "publish.deadline": {
       "action": "send",
       "channel": {
@@ -781,6 +890,19 @@
       ],
       "summary": "Publish interaction facts after the authoritative commit (transactional outbox)."
     },
+    "publish.mention": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/mention"
+      },
+      "description": "Producer(s): Comments Collaboration Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/mention/messages/created"
+        }
+      ],
+      "summary": "Publish mention facts after the authoritative commit (transactional outbox)."
+    },
     "publish.opportunity": {
       "action": "send",
       "channel": {
@@ -850,6 +972,19 @@
         }
       ],
       "summary": "Publish template facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.thread": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/thread"
+      },
+      "description": "Producer(s): Comments Collaboration Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/thread/messages/resolved"
+        }
+      ],
+      "summary": "Publish thread facts after the authoritative commit (transactional outbox)."
     }
   }
 }

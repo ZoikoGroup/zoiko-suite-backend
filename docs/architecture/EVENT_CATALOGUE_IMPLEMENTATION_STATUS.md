@@ -379,3 +379,19 @@ context moved to `services/`.
 
 Open: the catalogue's section 19 entry `business.deadline.due` (producer "Deadline Service", no deployed owner) overlaps
 `became-due-soon` and `became-overdue` and needs reconciling.
+
+### comments-collaboration-svc (BIZ-09): five events moved to the eventing outbox
+
+`comment.added`, `comment.edited`, `comment.moderated`, `mention.created` and `thread.resolved` are written to `eventing_outbox`
+(migration 000004) in the same transaction as the change, as `com.zoikosuite.business.comment.{added,edited,moderated}`,
+`com.zoikosuite.business.mention.created` and `com.zoikosuite.business.thread.resolved`, with payload schemas in
+`comments-collaboration-svc/contracts/events` enforced by the store tests and extension catalogue entries (producer
+`Comments Collaboration Service`). The old event_type is kept as the envelope's legacy type. Payloads carry identifiers
+only, never the comment body; the envelope classification follows the thread's.
+
+They were published by the handler after the commit through a Kafka writer that could not report failure. The old
+`internal/events` publisher was removed.
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a write whose event cannot be
+built is rolled back, a relay delivers the eventing outbox (not started with no brokers), and the Docker build context moved
+to `services/`.
