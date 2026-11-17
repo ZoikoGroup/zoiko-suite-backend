@@ -32,7 +32,7 @@ func seedIntent(t *testing.T, s *store.PgStore, tenant string) string {
 // Migration 000016 / INV-02: the two halves of a communication are joined on both
 // sides in one step, and can be read from either end.
 func TestLink_JoinsIntentAndNotificationBothWays(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-link")
 	intent := seedIntent(t, s, "tenant-link")
 	n := seedNotification(t, s, "tenant-link", "corr-link-1")
@@ -56,7 +56,7 @@ func TestLink_JoinsIntentAndNotificationBothWays(t *testing.T) {
 }
 
 func TestLink_IsOneToOneAndNeverRepointed(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-link")
 	i1, i2 := seedIntent(t, s, "tenant-link"), seedIntent(t, s, "tenant-link")
 	n1, n2 := seedNotification(t, s, "tenant-link", "corr-link-2a"), seedNotification(t, s, "tenant-link", "corr-link-2b")
@@ -81,7 +81,7 @@ func TestLink_IsOneToOneAndNeverRepointed(t *testing.T) {
 }
 
 func TestLink_RefusesMissingAndCrossTenantTargets(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	intent := seedIntent(t, s, "tenant-link-a")
 	n := seedNotification(t, s, "tenant-link-b", "corr-link-3")
 
@@ -103,7 +103,7 @@ func TestLink_RefusesMissingAndCrossTenantTargets(t *testing.T) {
 // The database enforces the same rules without the store.
 func TestLink_DatabaseRefusesWhatTheStoreWouldRefuse(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 	intentA := seedIntent(t, s, "tenant-db-a")
 	nB := seedNotification(t, s, "tenant-db-b", "corr-link-4")
@@ -132,7 +132,7 @@ func TestLink_DatabaseRefusesWhatTheStoreWouldRefuse(t *testing.T) {
 // notification and its link to the intent both survive.
 func TestLink_PurgingTheIntentLeavesTheNotification(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-link-purge")
 	intent := seedIntent(t, s, "tenant-link-purge")
 	n := seedNotification(t, s, "tenant-link-purge", "corr-link-7")

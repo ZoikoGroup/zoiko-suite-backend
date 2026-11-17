@@ -2,7 +2,7 @@
 
 **Service host:** notification-svc (`/v1/document-templates`; tables `template_definitions`, `template_versions`)
 **Assessed against:** `ZoikoSuite_Business_Operations_Content_Services_Detailed_Service_Specifications_v1_0` (ZS-SVC-P-001) section 5
-**Status: NOT CERTIFIED.** The command and query contract is implemented and tested. One gap found and fixed in this audit (undeclared variables could be published). Accessibility checks, canonical events and live-stack checks remain open.
+**Status: NOT CERTIFIED.** The command and query contract is implemented and tested. One gap found and fixed in this audit (undeclared variables could be published), and the four events are now on the shared eventing outbox. Accessibility checks and live-stack checks remain open.
 
 A certificate listing only successes certifies nothing, so the last two sections say what was **not** verified.
 
@@ -14,7 +14,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Queries: GetTemplate, GetPublishedVersion, RenderPreview, CompareVersions, ListLocales | All implemented | `GET /{id}`, `/{id}/published?locale=`, `POST /versions/{id}/preview`, `GET /{id}/compare`, `/{id}/locales` |
 | Lifecycle Draft -> Review -> Approved -> Published -> Retired/Superseded | Implemented on the version, per locale. Illegal edges are refused by a database trigger (migration 000017), not just code. Publishing supersedes the prior published version of the same locale in the same transaction | `internal/store/template_store.go`, migrations 000005/000017 |
 | Authorization / SoD | `TEMPLATE_MANAGE` for author actions and reads, `TEMPLATE_APPROVE` for approve, publish and retire. Maker-checker is enforced for **every** version (approver may not be the creator), in code and by a DB CHECK. Fetch, then authorize, then mutate; fail-closed | handler |
-| Events (4) | `template.created`, `template.version_approved`, `template.published`, `template.retired` are written to the service's own `event_outbox` in the same transaction as the change. **Not on the shared eventing outbox**, and only `business.template.published` has a catalogue entry (producer "Template Service", no owner) | `internal/events`, `internal/store/outbox.go` |
+| Events (4) | `template.created`, `template.version_approved`, `template.published` and `template.retired` are written to the shared eventing outbox in the same transaction as the change, as `com.zoikosuite.business.template.created`, `version-approved`, `published` and `retired`, with payload schemas in `contracts/events` enforced by the store tests and catalogue entries (the producer mapping now resolves "Template Service" to notification-svc). A write with no event region is rolled back (tested) | `internal/store/eventing_events.go`, `contracts/events` |
 | Failure: missing variable schema blocks publication | **Gap, fixed in this audit** (below) | `ValidateTemplate` |
 | Failure: protected text change after approval blocks publication | Content and terminal states are frozen by trigger; content hash is computed at creation | migrations 000005/000017, NP-05 tests |
 | Failure: inaccessible critical template blocks publication | **Not implemented.** `accessibility_metadata` is stored as free text and never evaluated | open item 2 |
@@ -49,6 +49,11 @@ new tests (template_biz03_test.go)
 
 Date: 2026-11-17. The Postgres container was disposable and has been removed.
 
+## Event migration (after the audit)
+
+- Migration 000035 equals `outbox.SchemaSQL` (a test fails if they drift). `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`); a second relay delivers `eventing_outbox` and is not started when no Kafka brokers are configured. The four old event builders were removed; the other events (`notification.*`, `communication.*`, `delivery.attempt.*`) stay on `event_outbox`.
+- Verified: full suite passes against Postgres 16, every store test validates the rows it leaves against `contracts/events`, the image builds, and the container refuses to start without the region. Not verified: a started container with a database, and delivery through a real Kafka broker.
+
 ## NOT verified
 
 - No Docker image build or docker-compose run of notification-svc.
@@ -60,7 +65,7 @@ Date: 2026-11-17. The Postgres container was disposable and has been removed.
 
 ## Open items to reach certification
 
-1. Move the four template events to the shared eventing outbox with canonical names and schemas, catalogue all four (only `business.template.published` exists, with an unowned producer), and decide how this relates to the service's own `event_outbox` CHECK on known event types.
+1. ~~Move the four template events to the shared eventing outbox.~~ Done (below). Still to do: `eventing_outbox` has no row-level security (the shared library's table is cross-tenant by design), so the service's legacy-RLS test excludes it; decide whether the app role should be kept from reading it.
 2. Define accessibility rules and which templates are critical; evaluate them at validation and record the result as evidence (spec: inaccessible critical template blocks publication).
 3. Decide "externally binding or regulatory" templates, if they need a stricter approval policy than the maker-checker applied to all versions.
 4. Record generated-artifact references (BIZ-04/BIZ-10 renders) against the published version.

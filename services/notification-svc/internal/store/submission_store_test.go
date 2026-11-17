@@ -18,7 +18,7 @@ import (
 // with an UNKNOWN attempt recorded and outcome_unknown enqueued.
 func TestSubmission_StrandedAfterSubmitBecomesUnknown(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-sub-stranded")
 
@@ -63,7 +63,7 @@ func TestSubmission_StrandedAfterSubmitBecomesUnknown(t *testing.T) {
 // Submitted and is revived as before.
 func TestSubmission_StrandedBeforeSubmitIsRevived(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-sub-never")
 	backdate := `UPDATE notifications SET created_at = now() - interval '1 hour' WHERE notification_id = $1`
@@ -91,7 +91,7 @@ func TestSubmission_StrandedBeforeSubmitIsRevived(t *testing.T) {
 // for a lost submission.
 func TestSubmission_ConclusionClearsTheMarker(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-sub-clear")
 	if err := s.BeginSubmission(ctx, n.NotificationID, "tenant-a", time.Now().UTC()); err != nil {

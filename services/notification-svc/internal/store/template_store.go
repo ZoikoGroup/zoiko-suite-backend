@@ -19,7 +19,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/notification-svc/internal/domain"
-	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
 
@@ -96,11 +95,13 @@ func (s *PgStore) CreateTemplate(ctx context.Context, p domain.CreateTemplatePar
 		if err := scanTemplateDefinition(row, &out); err != nil {
 			return err
 		}
-		ev, err := events.TemplateCreated(p.CorrelationID, out)
-		if err != nil {
-			return err
-		}
-		return enqueue(ctx, tx, tenantID, ev)
+		return s.enqueueTemplateEvent(ctx, tx, templateCreatedEvent, p.CorrelationID, out.TenantID, out.LegalEntityID, out.OwnerPrincipalID, out.TemplateID, map[string]any{
+			"template_id":        out.TemplateID,
+			"tenant_id":          out.TenantID,
+			"legal_entity_id":    out.LegalEntityID,
+			"name":               out.Name,
+			"owner_principal_id": out.OwnerPrincipalID,
+		})
 	})
 	if errors.Is(err, domain.ErrIntentNotFound) || errors.Is(err, domain.ErrIntentRetired) || errors.Is(err, domain.ErrIntentInvalid) {
 		return nil, err // the caller asked for something that cannot be: not an outage
@@ -354,11 +355,15 @@ func (s *PgStore) ApproveTemplate(ctx context.Context, p domain.ApproveVersionPa
 			}
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		ev, err := events.TemplateVersionApproved(p.CorrelationID, out)
-		if err != nil {
-			return err
-		}
-		return enqueue(ctx, tx, tenantID, ev)
+		return s.enqueueTemplateEvent(ctx, tx, templateVersionApprovedEvent, p.CorrelationID, out.TenantID, out.LegalEntityID, p.ApprovedByPrincipalID, out.TemplateID, map[string]any{
+			"version_id":               out.VersionID,
+			"template_id":              out.TemplateID,
+			"tenant_id":                out.TenantID,
+			"legal_entity_id":          out.LegalEntityID,
+			"locale":                   out.Locale,
+			"version_number":           out.VersionNumber,
+			"approved_by_principal_id": p.ApprovedByPrincipalID,
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -410,11 +415,15 @@ func (s *PgStore) PublishTemplate(ctx context.Context, p domain.PublishVersionPa
 		`, existing.TemplateID, existing.Locale, out.VersionID, out.VersionID); err != nil {
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		ev, err := events.TemplatePublished(p.CorrelationID, p.PublishedByPrincipalID, out)
-		if err != nil {
-			return err
-		}
-		return enqueue(ctx, tx, tenantID, ev)
+		return s.enqueueTemplateEvent(ctx, tx, templatePublishedEvent, p.CorrelationID, out.TenantID, out.LegalEntityID, p.PublishedByPrincipalID, out.TemplateID, map[string]any{
+			"version_id":      out.VersionID,
+			"template_id":     out.TemplateID,
+			"tenant_id":       out.TenantID,
+			"legal_entity_id": out.LegalEntityID,
+			"locale":          out.Locale,
+			"version_number":  out.VersionNumber,
+			"content_hash":    out.ContentHash,
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -483,11 +492,12 @@ func (s *PgStore) RetireTemplate(ctx context.Context, p domain.RetireTemplatePar
 		`, p.TemplateID); err != nil {
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		ev, err := events.TemplateRetired(p.CorrelationID, out)
-		if err != nil {
-			return err
-		}
-		return enqueue(ctx, tx, tenantID, ev)
+		return s.enqueueTemplateEvent(ctx, tx, templateRetiredEvent, p.CorrelationID, out.TenantID, out.LegalEntityID, p.RetiredByPrincipalID, out.TemplateID, map[string]any{
+			"template_id":             out.TemplateID,
+			"tenant_id":               out.TenantID,
+			"legal_entity_id":         out.LegalEntityID,
+			"retired_by_principal_id": p.RetiredByPrincipalID,
+		})
 	})
 	if err != nil {
 		return nil, err

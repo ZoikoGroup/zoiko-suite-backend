@@ -21,7 +21,7 @@ import (
 // a tenant filter in the query, so only the policy can hide another tenant's rows.
 func TestRLS_NewTablesAreEnforcedByTheDatabaseNotJustByTheQueries(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool).WithQuota(quota.Limits{TenantPerMinute: 100})
+	s := store.New(pool, store.WithEventRegion("local")).WithQuota(quota.Limits{TenantPerMinute: 100})
 	const a, b = "tenant-rls-a", "tenant-rls-b"
 	ctxA := tenantCtx(a)
 
@@ -100,7 +100,7 @@ func TestRLS_NewTablesAreEnforcedByTheDatabaseNotJustByTheQueries(t *testing.T) 
 // but can never be used to change one.
 func TestRLS_PlatformScopeCanReadOpenNoticesButNeverWriteThem(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	const a = "tenant-rls-hatch"
 	iv := regulatedIntentVersion(t, s, a, "legal.rls.hatch")
 	n, err := s.CreateNotice(tenantCtx(a), noticeParams(iv, domain.AckReceipt, time.Now().Add(time.Hour)))

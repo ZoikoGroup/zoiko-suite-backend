@@ -16,6 +16,11 @@ type Config struct {
 	Env  string
 	Port int
 
+	// EventResidencyRegion (EVENT_RESIDENCY_REGION, e.g. uk or eu-west) is stamped on every
+	// event written to the shared eventing outbox (the BIZ-03 template events). Required: an
+	// event with a guessed region is worse than a service that refuses to start.
+	EventResidencyRegion string
+
 	DB DBConfig
 
 	Kafka KafkaConfig
@@ -381,6 +386,11 @@ func Load() (*Config, error) {
 			Interval:  envDuration("NOTIFICATION_WEBHOOK_DLQ_INTERVAL", 1*time.Minute),
 			BatchSize: envInt("NOTIFICATION_WEBHOOK_DLQ_BATCH_SIZE", 50),
 		},
+	}
+
+	cfg.EventResidencyRegion = strings.TrimSpace(os.Getenv("EVENT_RESIDENCY_REGION"))
+	if cfg.EventResidencyRegion == "" {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required (the residency region stamped on every shared-outbox event)")
 	}
 
 	webhookOut, woErr := loadWebhookOut(cfg.Env == "production")

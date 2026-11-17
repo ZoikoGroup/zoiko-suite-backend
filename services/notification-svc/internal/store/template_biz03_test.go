@@ -17,7 +17,7 @@ import (
 // refuses it and the version stays DRAFT.
 func TestPgStore_ValidateTemplate_RefusesUndeclaredVariables(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-biz03-vars")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 
@@ -58,7 +58,7 @@ func TestPgStore_ValidateTemplate_RefusesUndeclaredVariables(t *testing.T) {
 // change tenant A's templates or versions, and a raw count under B's tenant context sees none.
 func TestPgStore_Templates_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	a, b := tenantCtx("tenant-biz03-a"), tenantCtx("tenant-biz03-b")
 
 	tmpl := newTestTemplate(t, s, a, "owner-a")

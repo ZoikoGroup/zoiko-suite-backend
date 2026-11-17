@@ -27,7 +27,7 @@ func boundTemplateDef(t *testing.T, s *store.PgStore, tenant, intentID string) (
 }
 
 func TestTemplateBinding_IsRefusedForAnIntentThatCannotGovern(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-bind"
 	good, _ := publishedIntentFor(t, s, tenant, "payroll.payslip_available")
 
@@ -61,7 +61,7 @@ func TestTemplateBinding_IsRefusedForAnIntentThatCannotGovern(t *testing.T) {
 
 func TestTemplateBinding_IsFixedAndTenantCheckedByTheDatabase(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	bg := context.Background()
 	a, _ := publishedIntentFor(t, s, "tenant-bind-db", "payroll.payslip_available")
 	b, _ := publishedIntentFor(t, s, "tenant-bind-db", "payroll.bonus_notice")
@@ -84,7 +84,7 @@ func TestTemplateBinding_IsFixedAndTenantCheckedByTheDatabase(t *testing.T) {
 
 // The wording must stay inside the contract that governs it.
 func TestTemplateBinding_WordingMustConformToTheContract(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-bind-conform"
 	ctx := tenantCtx(tenant)
 	i, _ := publishedIntentFor(t, s, tenant, "payroll.payslip_available")
@@ -123,7 +123,7 @@ func TestTemplateBinding_WordingMustConformToTheContract(t *testing.T) {
 
 // Wording cannot be authored against a contract that does not exist yet.
 func TestTemplateBinding_NeedsAnIntentVersionInForce(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-bind-early"
 	i := newIntent(t, s, tenant, "payroll.payslip_available") // identity only, nothing published
 	tmpl, err := boundTemplateDef(t, s, tenant, i.IntentID)
@@ -135,7 +135,7 @@ func TestTemplateBinding_NeedsAnIntentVersionInForce(t *testing.T) {
 // INV-04: the notification records the exact intent version, fixed for good, and its events say so.
 func TestNotification_IsPinnedToTheIntentVersion(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-pin"
 	ctx := tenantCtx(tenant)
 	_, v := publishedIntentFor(t, s, tenant, "payroll.payslip_available")

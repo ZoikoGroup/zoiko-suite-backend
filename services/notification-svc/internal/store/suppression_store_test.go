@@ -15,7 +15,7 @@ import (
 
 func TestSuppressionStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantA := "tenant-supp-a"
@@ -52,7 +52,7 @@ func TestSuppressionStore_RLS_TenantIsolation(t *testing.T) {
 
 func TestSuppressionStore_Precedence_S0_T0_IgnoreUnsubscribe(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-precedence-1"
@@ -113,7 +113,7 @@ func TestSuppressionStore_Precedence_S0_T0_IgnoreUnsubscribe(t *testing.T) {
 // it into a marketing-only row and security mail resumed to a dead address.
 func TestSuppressionStore_NeverWeakenedNeverDeleted(t *testing.T) {
 	pool, admin := openTestPools(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-supp-governance"

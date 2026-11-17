@@ -55,7 +55,7 @@ func (r *e2eResolver) ResolveEmail(_ context.Context, _, _, _ string) (string, e
 // Ingestion -> Policy Evaluation -> Render -> Dispatch -> Webhook Intake -> Ledger Outcome & Suppression.
 func TestE2E_DeliveryPipeline_CompleteFlow(t *testing.T) {
 	pool, admin := openTestPools(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 	log := zap.NewNop()
 

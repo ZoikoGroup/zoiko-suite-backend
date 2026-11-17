@@ -27,7 +27,7 @@ func sentDirect(t *testing.T, s *store.PgStore, tenant, corr, msgID string) *dom
 }
 
 func TestEvidence_ADirectSendsCallbacksBecomeNormalizedFacts(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	n := sentDirect(t, s, "tenant-ev", "corr-ev-1", "<ev-1@example.com>")
 	proc := webhook.NewProcessor(s, zap.NewNop())
 
@@ -63,7 +63,7 @@ func TestEvidence_ADirectSendsCallbacksBecomeNormalizedFacts(t *testing.T) {
 
 func TestEvidence_IsTenantIsolatedAndAppendOnly(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := sentDirect(t, s, "tenant-ev-a", "corr-ev-2", "<ev-2@example.com>")
 	proc := webhook.NewProcessor(s, zap.NewNop())
 	require.NoError(t, proc.ProcessRawPayload(context.Background(), "generic", []byte(
@@ -89,7 +89,7 @@ func TestEvidence_IsTenantIsolatedAndAppendOnly(t *testing.T) {
 }
 
 func TestEvidence_RefusesWhatItCannotAttach(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	base := domain.DeliveryEvidence{TenantID: "tenant-ev-c", AttemptID: uuid.NewString(), SourceEventID: "e", Provider: "generic",
 		Fact: domain.EvidenceBounced, Strength: domain.StrengthMailboxLevel, OccurredAt: time.Now().UTC()}
 

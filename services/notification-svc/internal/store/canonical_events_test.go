@@ -38,7 +38,7 @@ func countEvents(t *testing.T, pool *pgxpool.Pool, aggregate, eventType string) 
 // content, before any delivery is attempted.
 func TestEvents_CommunicationPreparedAtCreation(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := newNotification("tenant-ev27", "entity-1", "recipient-1", "corr-prep")
 	n.RenderedContentHash = "abc123"
 	n.IntentVersionID = ""
@@ -66,7 +66,7 @@ func TestEvents_CommunicationPreparedAtCreation(t *testing.T) {
 // communication.blocked: a withheld attempt announces itself with the stable reason code.
 func TestEvents_CommunicationBlockedCarriesTheStableCode(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := seedNotification(t, s, "tenant-ev27-b", "corr-blocked")
 	require.NoError(t, s.ScheduleRetry(tenantCtx("tenant-ev27-b"), n.NotificationID, "tenant-ev27-b", "NCD-012 QUIET_HOUR_DEFERRED: held",
 		time.Now().UTC(), time.Now().Add(time.Hour).UTC(),
@@ -88,7 +88,7 @@ func TestEvents_CommunicationBlockedCarriesTheStableCode(t *testing.T) {
 // delivery.evidence.recorded: each new fact announces itself once.
 func TestEvents_EvidenceRecordedOncePerFact(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := sentDirect(t, s, "tenant-ev27-c", "corr-evrec", "<evrec@example.com>")
 	proc := webhook.NewProcessor(s, zap.NewNop())
 	body := `{"event_id":"evrec-1","event_type":"DELIVERED","recipient_email":"recipient@example.com","provider_message_id":"<evrec@example.com>"}`
@@ -107,7 +107,7 @@ func TestEvents_EvidenceRecordedOncePerFact(t *testing.T) {
 // address, and not again for an unchanged repeat.
 func TestEvents_EndpointSuppressedIsHashedAndNotRepeated(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-ev27-d"
 	const address = "Someone.Private@Example.com"
 	sum := sha256.Sum256([]byte("someone.private@example.com"))
@@ -141,7 +141,7 @@ func toString(v any) string {
 // the deadline is near.
 func TestEvents_NoticeDeadlineAtRiskIsRaisedOnce(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-ev27-e"
 	ctx := tenantCtx(tenant)
 	iv := regulatedIntentVersion(t, s, tenant, "legal.atrisk")
