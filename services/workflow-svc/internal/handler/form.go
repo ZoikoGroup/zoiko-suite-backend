@@ -7,7 +7,6 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
-	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
 )
@@ -134,9 +133,6 @@ func (h *Handler) PublishForm(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.writeFormErr(w, r, err)
 		return
-	}
-	if err := h.publisher.PublishFormPublished(r.Context(), *published, actor, correlationID); err != nil {
-		h.log.Error("failed to publish form.published event", zap.Error(err))
 	}
 	writeJSON(w, r, http.StatusOK, published)
 }
@@ -286,9 +282,6 @@ func (h *Handler) SubmitForm(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, r, err)
 		return
 	}
-	if err := h.publisher.PublishFormEvent(r.Context(), "form.submission.received", *submitted, actor, correlationID); err != nil {
-		h.log.Error("failed to publish form.submission.received event", zap.Error(err))
-	}
 	writeJSON(w, r, http.StatusOK, submitted)
 }
 
@@ -328,13 +321,6 @@ func (h *Handler) ValidateSubmission(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.writeFormErr(w, r, err)
 		return
-	}
-	eventType := "form.submission.validated"
-	if validated.Status == domain.FormSubmissionRejected {
-		eventType = "form.submission.rejected"
-	}
-	if err := h.publisher.PublishFormEvent(r.Context(), eventType, *validated, actor, correlationID); err != nil {
-		h.log.Error("failed to publish form validation event", zap.Error(err))
 	}
 	writeJSON(w, r, http.StatusOK, validated)
 }
@@ -472,9 +458,6 @@ func (h *Handler) RouteToDomain(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.writeFormErr(w, r, err)
 		return
-	}
-	if err := h.publisher.PublishFormEvent(r.Context(), "form.submission.routed", *existing, actor, correlationID); err != nil {
-		h.log.Error("failed to publish form.submission.routed event", zap.Error(err))
 	}
 	writeJSON(w, r, http.StatusCreated, route)
 }

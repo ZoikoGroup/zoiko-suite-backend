@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	"zoiko.io/workflow-svc/internal/outbox"
 )
 
 const formDefinitionColumns = `form_id, tenant_id, legal_entity_id, name, business_purpose, target_domain, schema,
@@ -58,6 +59,31 @@ func scanFormSubmission(row pgx.Row) (*domain.FormSubmission, error) {
 		}
 	}
 	return s, nil
+}
+
+// enqueueFormEvent writes one BIZ-04 event to the outbox in the caller's transaction. These
+// events used to be published by the handler after the commit with a failure only logged,
+// so a broker problem lost them with no trace; they now commit atomically with the change,
+// like every other event this service emits, and the outbox relay delivers them.
+func enqueueFormEvent(ctx context.Context, tx pgx.Tx, eventType, aggregateType, aggregateID, tenantID, legalEntityID, actorID, correlationID string, payload map[string]any) error {
+	var corr *string
+	if correlationID != "" {
+		corr = &correlationID
+	}
+	payload["actor_principal_id"] = actorID
+	return outbox.Insert(ctx, tx, outbox.Event{AggregateType: aggregateType, AggregateID: aggregateID, EventType: eventType,
+		TenantID: tenantID, LegalEntityID: legalEntityID, ActorID: &actorID, CorrelationID: corr, Payload: payload})
+}
+
+func submissionEventPayload(s *domain.FormSubmission) map[string]any {
+	return map[string]any{
+		"submission_id":   s.SubmissionID,
+		"form_id":         s.FormID,
+		"tenant_id":       s.TenantID,
+		"legal_entity_id": s.LegalEntityID,
+		"form_version":    s.FormVersion,
+		"status":          s.Status,
+	}
 }
 
 func nullIfEmpty(s string) any {
@@ -147,7 +173,13 @@ func (s *PgStore) PublishForm(ctx context.Context, p domain.PublishFormParams) (
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormNotDraft
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueFormEvent(ctx, tx, "form.published", "form_definition", out.FormID, out.TenantID, out.LegalEntityID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+			"form_id": out.FormID, "tenant_id": out.TenantID, "legal_entity_id": out.LegalEntityID,
+			"name": out.Name, "target_domain": out.TargetDomain, "version": out.Version,
+		})
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrFormNotFound) || errors.Is(err, domain.ErrFormSelfPublish) || errors.Is(err, domain.ErrFormNotDraft) {
@@ -290,7 +322,10 @@ func (s *PgStore) SubmitForm(ctx context.Context, p domain.SubmitFormParams) (*d
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotDraft
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueFormEvent(ctx, tx, "form.submission.received", "form_submission", out.SubmissionID, out.TenantID, out.LegalEntityID, p.ActorPrincipalID, p.CorrelationID, submissionEventPayload(out))
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrFormSubmissionNotFound) || errors.Is(err, domain.ErrFormSubmissionNotDraft) {
@@ -358,7 +393,14 @@ func (s *PgStore) ValidateSubmission(ctx context.Context, p domain.ValidateSubmi
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotSubmitted
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		eventType := "form.submission.validated"
+		if newStatus == domain.FormSubmissionRejected {
+			eventType = "form.submission.rejected"
+		}
+		return enqueueFormEvent(ctx, tx, eventType, "form_submission", out.SubmissionID, out.TenantID, out.LegalEntityID, p.ActorPrincipalID, p.CorrelationID, submissionEventPayload(out))
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrFormSubmissionNotFound) || errors.Is(err, domain.ErrFormSubmissionNotSubmitted) {
@@ -479,11 +521,12 @@ func (s *PgStore) RouteToDomain(ctx context.Context, p domain.RouteToDomainParam
 		// than trusted from the request, so a route can never claim to
 		// have gone somewhere other than where its form was actually
 		// defined to go.
-		var status, targetDomain string
+		var status, targetDomain, formID, legalEntityID string
+		var formVersion int
 		if err := tx.QueryRow(ctx, `
-			SELECT fs.status, fd.target_domain
+			SELECT fs.status, fd.target_domain, fs.form_id, fs.legal_entity_id, fs.form_version
 			FROM form_submissions fs JOIN form_definitions fd ON fd.form_id = fs.form_id
-			WHERE fs.submission_id=$1 AND fs.tenant_id=$2`, p.SubmissionID, p.TenantID).Scan(&status, &targetDomain); err != nil {
+			WHERE fs.submission_id=$1 AND fs.tenant_id=$2`, p.SubmissionID, p.TenantID).Scan(&status, &targetDomain, &formID, &legalEntityID, &formVersion); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrFormSubmissionNotFound
 			}
@@ -499,7 +542,13 @@ func (s *PgStore) RouteToDomain(ctx context.Context, p domain.RouteToDomainParam
 			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+formSubmissionRouteColumns,
 			uuid.NewString(), p.SubmissionID, p.TenantID, targetDomain, nullIfEmpty(p.CommandReference), nullIfEmpty(p.ResultReference),
 			p.Outcome, nullIfEmpty(p.FailureReason), p.ActorPrincipalID, nullIfEmpty(p.CorrelationID)))
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueFormEvent(ctx, tx, "form.submission.routed", "form_submission", p.SubmissionID, p.TenantID, legalEntityID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+			"submission_id": p.SubmissionID, "form_id": formID, "tenant_id": p.TenantID, "legal_entity_id": legalEntityID,
+			"form_version": formVersion, "status": status, "route_id": out.RouteID, "target_domain": targetDomain, "outcome": p.Outcome,
+		})
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrFormSubmissionNotFound) || errors.Is(err, domain.ErrFormSubmissionNotAccepted) {

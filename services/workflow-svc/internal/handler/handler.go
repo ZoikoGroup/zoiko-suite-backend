@@ -142,9 +142,8 @@ type EventPublisher interface {
 	PublishWorkflowInvalidated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishAuditEngagementEvent(ctx context.Context, eventType string, engagement domain.AuditEngagement, actorID, correlationID string) error
 
-	// BIZ-04 Form — see internal/events/publisher.go's own doc comments.
-	PublishFormPublished(ctx context.Context, f domain.FormDefinition, actorID, correlationID string) error
-	PublishFormEvent(ctx context.Context, eventType string, s domain.FormSubmission, actorID, correlationID string) error
+	// The BIZ-04 form events are not published here: the store writes them to the outbox in
+	// the same transaction as the change.
 }
 
 // DocumentVaultClient verifies evidence references without making workflow-svc
