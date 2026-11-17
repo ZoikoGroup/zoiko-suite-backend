@@ -409,3 +409,19 @@ legacy type.
 
 They were published by the handler after the commit with failures only logged. Not moved: the exception-case and audit-finding
 events. Open: the section 19 entry `business.case.opened` has no emitter.
+
+### inventory-management-svc (BIZ-07): five offering events moved to the eventing outbox
+
+`catalog.offering.created`, `activated`, `suspended`, `retired` and `catalog.offering_version.superseded` are written to
+`eventing_outbox` (migration 000014) in the same transaction as the change, as `com.zoikosuite.business.offering.{created,activated,
+suspended,retired}` and `com.zoikosuite.business.offering-version.superseded`, with payload schemas in
+`inventory-management-svc/contracts/events` enforced by the store tests and extension catalogue entries (producer
+`Inventory Management Service`). The old event_type is kept as the envelope's legacy type. The hand-written
+`asyncapi.biz07.yaml` and its drift test were removed (pre-standard names); the generated shared AsyncAPI is the contract.
+
+They were published by the handler after the commit through a Kafka writer that could not report failure. Not moved: the
+service's other events (items, locations, movements, valuation, stock counts, accounting events).
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a write whose event cannot be
+built is rolled back, a relay delivers the eventing outbox (not started with no brokers), and the Docker build context moved
+to `services/`.

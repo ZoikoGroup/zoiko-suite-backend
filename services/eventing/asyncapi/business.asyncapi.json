@@ -119,6 +119,31 @@
         }
       }
     },
+    "offering": {
+      "address": "zoikosuite.business.offering.v1",
+      "messages": {
+        "activated": {
+          "$ref": "#/components/messages/offering.activated"
+        },
+        "created": {
+          "$ref": "#/components/messages/offering.created"
+        },
+        "retired": {
+          "$ref": "#/components/messages/offering.retired"
+        },
+        "suspended": {
+          "$ref": "#/components/messages/offering.suspended"
+        }
+      }
+    },
+    "offering-version": {
+      "address": "zoikosuite.business.offering-version.v1",
+      "messages": {
+        "superseded": {
+          "$ref": "#/components/messages/offering-version.superseded"
+        }
+      }
+    },
     "opportunity": {
       "address": "zoikosuite.business.opportunity.v1",
       "messages": {
@@ -499,6 +524,66 @@
         "summary": "Mention: created.",
         "title": "mention created",
         "x-zoiko-event-type": "com.zoikosuite.business.mention.created",
+        "x-zoiko-origin": "extension"
+      },
+      "offering-version.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering-version.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering Version: superseded.",
+        "title": "offering-version superseded",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering-version.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "offering.activated": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering.activated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering: activated.",
+        "title": "offering activated",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering.activated",
+        "x-zoiko-origin": "extension"
+      },
+      "offering.created": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering: created.",
+        "title": "offering created",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering.created",
+        "x-zoiko-origin": "extension"
+      },
+      "offering.retired": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering.retired",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering: retired.",
+        "title": "offering retired",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering.retired",
+        "x-zoiko-origin": "extension"
+      },
+      "offering.suspended": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering.suspended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering: suspended.",
+        "title": "offering suspended",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering.suspended",
         "x-zoiko-origin": "extension"
       },
       "opportunity.created": {
@@ -947,6 +1032,41 @@
         }
       ],
       "summary": "Publish mention facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.offering": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/offering"
+      },
+      "description": "Producer(s): Inventory Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/offering/messages/activated"
+        },
+        {
+          "$ref": "#/channels/offering/messages/created"
+        },
+        {
+          "$ref": "#/channels/offering/messages/retired"
+        },
+        {
+          "$ref": "#/channels/offering/messages/suspended"
+        }
+      ],
+      "summary": "Publish offering facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.offering-version": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/offering-version"
+      },
+      "description": "Producer(s): Inventory Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/offering-version/messages/superseded"
+        }
+      ],
+      "summary": "Publish offering-version facts after the authoritative commit (transactional outbox)."
     },
     "publish.opportunity": {
       "action": "send",

@@ -3493,8 +3493,8 @@ services:
 
   inventory-management-svc:
     build:
-      context: ../services/inventory-management-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: inventory-management-svc/Dockerfile
     container_name: inventory-management-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -3505,6 +3505,7 @@ services:
       LEDGER_KERNEL_BOOK_ID: "${LEDGER_KERNEL_BOOK_ID:-}"
       LEDGER_KERNEL_CURRENCY: "${LEDGER_KERNEL_CURRENCY:-}"
       PORT: "8168"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: inventory_management
