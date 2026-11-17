@@ -173,6 +173,12 @@ func (s *PgStore) CloseCase(ctx context.Context, p domain.CloseCaseParams) (*dom
 			return nil, err
 		}
 	}
+	if err := s.enqueueWorkEvent(ctx, tx, caseClosedEvent, p.CorrelationID, p.ActorPrincipalID, c.TenantID, c.LegalEntityID, c.CaseID, map[string]any{
+		"case_id": c.CaseID, "tenant_id": c.TenantID, "legal_entity_id": c.LegalEntityID, "case_type": c.CaseType,
+		"closed_by": p.ActorPrincipalID, "closure_reason": p.ClosureReason, "closed_task_count": len(completedTaskIDs),
+	}); err != nil {
+		return nil, err
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -237,6 +243,9 @@ func (s *PgStore) CreateTask(ctx context.Context, p domain.CreateTaskParams) (*d
 	if err := recordTaskTransition(ctx, tx, taskID, p.TenantID, "", string(domain.TaskStatusNew), p.CreatedByPrincipalID, "task created"); err != nil {
 		return nil, err
 	}
+	if err := s.enqueueWorkEvent(ctx, tx, taskCreatedEvent, p.CorrelationID, p.CreatedByPrincipalID, t.TenantID, t.LegalEntityID, t.TaskID, taskEventData(t)); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -291,6 +300,9 @@ func (s *PgStore) AssignTask(ctx context.Context, p domain.AssignTaskParams) (*d
 		return nil, err
 	}
 	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusAssigned), p.ActorPrincipalID, "assigned"); err != nil {
+		return nil, err
+	}
+	if err := s.enqueueWorkEvent(ctx, tx, taskAssignedEvent, p.CorrelationID, p.ActorPrincipalID, t.TenantID, t.LegalEntityID, t.TaskID, taskEventData(t)); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -430,6 +442,12 @@ func (s *PgStore) EscalateTask(ctx context.Context, p domain.EscalateTaskParams)
 	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusEscalated), p.ActorPrincipalID, p.Reason); err != nil {
 		return nil, err
 	}
+	esc := taskEventData(t)
+	esc["escalated_to_role"] = t.EscalatedToRole
+	esc["reason"] = p.Reason
+	if err := s.enqueueWorkEvent(ctx, tx, taskEscalatedEvent, p.CorrelationID, p.ActorPrincipalID, t.TenantID, t.LegalEntityID, t.TaskID, esc); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -471,6 +489,14 @@ func (s *PgStore) CompleteTask(ctx context.Context, p domain.CompleteTaskParams)
 	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusCompleted), p.ActorPrincipalID, p.CompletionNotes); err != nil {
 		return nil, err
 	}
+	done := taskEventData(t)
+	done["completed_by"] = p.ActorPrincipalID
+	if t.CompletedAt != nil {
+		done["completed_at"] = t.CompletedAt.UTC().Format(time.RFC3339)
+	}
+	if err := s.enqueueWorkEvent(ctx, tx, taskCompletedEvent, p.CorrelationID, p.ActorPrincipalID, t.TenantID, t.LegalEntityID, t.TaskID, done); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -508,6 +534,12 @@ func (s *PgStore) ReopenTask(ctx context.Context, p domain.ReopenTaskParams) (*d
 		return nil, err
 	}
 	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusInProgress), p.ActorPrincipalID, p.Reason); err != nil {
+		return nil, err
+	}
+	reopened := taskEventData(t)
+	reopened["reopened_count"] = t.ReopenedCount
+	reopened["reason"] = p.Reason
+	if err := s.enqueueWorkEvent(ctx, tx, taskReopenedEvent, p.CorrelationID, p.ActorPrincipalID, t.TenantID, t.LegalEntityID, t.TaskID, reopened); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

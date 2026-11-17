@@ -150,6 +150,8 @@ type CreateCaseParams struct {
 
 type CloseCaseParams struct {
 	CaseID, TenantID, ActorPrincipalID, ClosureReason string
+	// CorrelationID is carried onto the case.closed event.
+	CorrelationID string
 }
 
 type CreateTaskParams struct {
@@ -163,11 +165,15 @@ type CreateTaskParams struct {
 	SLADeadline                      *time.Time
 	AssignedToRole, AssignedToUser   string
 	CreatedByPrincipalID             string
+	// CorrelationID is carried onto the task.created event.
+	CorrelationID string
 }
 
 type AssignTaskParams struct {
 	TaskID, TenantID, ActorPrincipalID string
 	AssignedToRole, AssignedToUser     string
+	// CorrelationID is carried onto the task.assigned event.
+	CorrelationID string
 }
 
 type StartTaskParams struct {
@@ -180,14 +186,20 @@ type BlockTaskParams struct {
 
 type EscalateTaskParams struct {
 	TaskID, TenantID, ActorPrincipalID, EscalatedToRole, Reason string
+	// CorrelationID is carried onto the task.escalated event.
+	CorrelationID string
 }
 
 type CompleteTaskParams struct {
 	TaskID, TenantID, ActorPrincipalID, CompletionNotes string
+	// CorrelationID is carried onto the task.completed event.
+	CorrelationID string
 }
 
 type ReopenTaskParams struct {
 	TaskID, TenantID, ActorPrincipalID, Reason string
+	// CorrelationID is carried onto the task.reopened event.
+	CorrelationID string
 }
 
 type CancelTaskParams struct {
