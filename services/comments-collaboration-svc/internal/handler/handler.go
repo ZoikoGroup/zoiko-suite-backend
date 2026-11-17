@@ -74,6 +74,10 @@ const (
 	actionCommentManage         = "COMMENT_MANAGE"
 	actionCommentRead           = "COMMENT_READ"
 	actionCommentReadRestricted = "COMMENT_READ_RESTRICTED"
+	// actionCommentModerate is moderation, kept apart from ordinary participation
+	// (COMMENT_MANAGE) so that moderation authority is not business authority (BIZ-09:
+	// "moderation separate from business authority").
+	actionCommentModerate = "COMMENT_MODERATE"
 )
 
 type Handler struct {
@@ -204,13 +208,19 @@ func (h *Handler) EditComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	_, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
+	existing, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, thread.LegalEntityID, actionCommentManage); err != nil {
+	if err := h.checkWrite(r.Context(), principalID, thread, actionCommentManage); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	// A comment is attributable: only its author edits it. Anyone else's change is a
+	// moderation, which has its own command, reason and trail.
+	if existing.CreatedBy != principalID {
+		writeError(w, http.StatusForbidden, "only the author may edit a comment")
 		return
 	}
 
@@ -227,6 +237,20 @@ func (h *Handler) EditComment(w http.ResponseWriter, r *http.Request) {
 	}
 	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, comment)
+}
+
+// checkWrite authorizes a write on a thread: the given action on the thread's legal entity,
+// and, for a restricted thread, COMMENT_READ_RESTRICTED as well. Before this the write
+// commands (edit, delete, react, mention, moderate, resolve, attach) needed only
+// COMMENT_MANAGE, so a principal who could not read a restricted thread could still change it.
+func (h *Handler) checkWrite(ctx context.Context, principalID string, t *domain.CommentThread, action string) error {
+	if err := h.authz.CheckAllowed(ctx, principalID, t.LegalEntityID, action); err != nil {
+		return err
+	}
+	if t.Restricted {
+		return h.authz.CheckAllowed(ctx, principalID, t.LegalEntityID, actionCommentReadRestricted)
+	}
+	return nil
 }
 
 // authorizeRead gates every read on the thread's own legal entity: an
@@ -388,12 +412,18 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	_, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
+	existing, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, thread.LegalEntityID, actionCommentManage); err != nil {
+	// The author may delete their own comment; deleting someone else's is moderation and
+	// needs the moderation action.
+	deleteAction := actionCommentManage
+	if existing.CreatedBy != principalID {
+		deleteAction = actionCommentModerate
+	}
+	if err := h.checkWrite(r.Context(), principalID, thread, deleteAction); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -466,7 +496,7 @@ func (h *Handler) Mention(w http.ResponseWriter, r *http.Request) {
 		h.writeCommentErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, thread.LegalEntityID, actionCommentManage); err != nil {
+	if err := h.checkWrite(r.Context(), principalID, thread, actionCommentManage); err != nil {
 		if errors.Is(err, authz.ErrAuthzServiceUnavailable) {
 			h.writeAuthzErr(w, err)
 			return
@@ -562,7 +592,7 @@ func (h *Handler) React(w http.ResponseWriter, r *http.Request) {
 		h.writeCommentErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, thread.LegalEntityID, actionCommentManage); err != nil {
+	if err := h.checkWrite(r.Context(), principalID, thread, actionCommentManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -605,13 +635,19 @@ func (h *Handler) Moderate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	_, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
+	existing, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, thread.LegalEntityID, actionCommentManage); err != nil {
+	if err := h.checkWrite(r.Context(), principalID, thread, actionCommentModerate); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	// A moderator does not moderate their own comment: the moderation trail is the
+	// check on the author, so it cannot be the author.
+	if existing.CreatedBy == principalID {
+		writeError(w, http.StatusForbidden, "a moderator cannot moderate their own comment")
 		return
 	}
 	idem := newIdem(r, principalID, "Moderate", commentID, req)
@@ -678,7 +714,7 @@ func (h *Handler) ResolveThread(w http.ResponseWriter, r *http.Request) {
 		h.writeCommentErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, current.LegalEntityID, actionCommentManage); err != nil {
+	if err := h.checkWrite(r.Context(), principalID, current, actionCommentManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -726,7 +762,7 @@ func (h *Handler) AttachReference(w http.ResponseWriter, r *http.Request) {
 		h.writeCommentErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, thread.LegalEntityID, actionCommentManage); err != nil {
+	if err := h.checkWrite(r.Context(), principalID, thread, actionCommentManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}

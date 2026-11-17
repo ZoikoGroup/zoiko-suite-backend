@@ -349,7 +349,8 @@ func (s *PgStore) ListComments(ctx context.Context, tenantID, threadID string) (
 	rows, err := tx.Query(ctx, `
 		SELECT c.comment_id, c.thread_id, c.tenant_id, c.parent_comment_id, c.current_version_id, c.status,
 			c.created_by, c.created_at, c.updated_at, c.moderated_at, c.moderated_by_principal_id, c.moderation_reason,
-			c.deleted_at, c.deleted_by_principal_id, c.deletion_reason, c.classification, v.body
+			c.deleted_at, c.deleted_by_principal_id, c.deletion_reason, c.classification,
+			CASE WHEN c.status = 'DELETED_REDACTED' THEN '' ELSE v.body END
 		FROM comments c
 		JOIN comment_versions v ON v.version_id = c.current_version_id AND v.tenant_id = c.tenant_id
 		WHERE c.tenant_id=$1 AND c.thread_id=$2
