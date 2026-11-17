@@ -43,6 +43,13 @@ type Config struct {
 	// ledger deliverer writes as. Empty leaves decision_log events pending.
 	LedgerPrincipalID string
 
+	// PolicyServiceURL is policy-svc, which issues the signatory decisions a
+	// signature workflow is created from (ZS-GOV-INT-002 §4.2).
+	// PolicyServiceMTLSURL, when set (https://policy-svc:8449), sends those
+	// reads to policy-svc's peer listener with workflow-svc's own certificate.
+	PolicyServiceURL     string
+	PolicyServiceMTLSURL string
+
 	// RegistryServiceURL is tenant-entity-registry-svc, the owner of the
 	// legal-entity fact a workflow binds to. Empty disables the check (local
 	// only); the handler then admits any entity in the caller's tenant.
@@ -116,6 +123,8 @@ func Load() (*Config, error) {
 		MTLSManagementServiceURL:        env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		MTLSBootstrapTokenPath:          env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
 		LedgerPrincipalID:               env("WORKFLOW_LEDGER_PRINCIPAL_ID", ""),
+		PolicyServiceURL:                env("POLICY_SERVICE_URL", "http://policy-svc:8085"),
+		PolicyServiceMTLSURL:            env("POLICY_SERVICE_MTLS_URL", ""),
 		ReadAuthzMode:                   env("WORKFLOW_READ_AUTHZ", "enforce"),
 		RegistryServiceURL:              env("TENANT_ENTITY_REGISTRY_SERVICE_URL", "http://tenant-entity-registry-svc:8081"),
 		ConsumerGroupID:                 env("KAFKA_CONSUMER_GROUP_ID", "workflow-svc-recheck"),

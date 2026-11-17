@@ -46,6 +46,7 @@ import (
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 	"zoiko.io/workflow-svc/internal/outbox"
 	"zoiko.io/workflow-svc/internal/registry"
+	"zoiko.io/workflow-svc/internal/signatory"
 	"zoiko.io/workflow-svc/internal/store"
 	"zoiko.io/workflow-svc/internal/telemetry"
 	"zoiko.io/workflow-svc/internal/timers"
@@ -177,6 +178,19 @@ func main() {
 	// evidence state; without this wiring the check was skipped silently and
 	// a contradictory workpaper could be marked prepared.
 	h = h.WithEvidenceClient(evidence.NewHTTPClient(cfg.DocumentVaultServiceURL, log))
+	// Signature workflows are created only from a verified policy-svc
+	// signatory decision (ZS-GOV-INT-002 §4.2); over mTLS when configured.
+	signatoryVerifier := signatory.NewHTTPVerifier(cfg.PolicyServiceURL, nil)
+	if cfg.PolicyServiceMTLSURL != "" {
+		policyIdentity := mtlsclient.Start(context.Background(), mtlsclient.Options{
+			ServiceName:        "workflow-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		signatoryVerifier = signatory.NewHTTPVerifier(cfg.PolicyServiceMTLSURL, policyIdentity.HTTPClient(5*time.Second))
+		log.Info("signatory decisions: policy-svc over mTLS", zap.String("url", cfg.PolicyServiceMTLSURL))
+	}
+	h = h.WithSignatoryVerifier(signatoryVerifier)
 	handler.RegisterRoutes(r, h)
 
 	// Outbox relays (ZS-STATE-001 Invariant I-13 / doc7 item 32):

@@ -459,6 +459,17 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 		stages = append(stages, st)
 	}
 
+	if b := params.Signatory; b != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO workflow_signatory_bindings (workflow_instance_id, tenant_id, signatory_decision_id,
+				signatory_policy_version_id, signatory_rule_id, document_hash, requirement)
+			VALUES ($1, $2, $3, $4, $5, $6, $7);`,
+			params.WorkflowInstanceID, params.TenantID, b.DecisionID, b.PolicyVersionID, b.RuleID, b.DocumentHash, []byte(b.Requirement)); err != nil {
+			s.log.Error("pg CreateWorkflow: insert signatory binding failed", zap.Error(err))
+			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+	}
+
 	var correlationID *string
 	if params.CorrelationID != "" {
 		correlationID = &params.CorrelationID

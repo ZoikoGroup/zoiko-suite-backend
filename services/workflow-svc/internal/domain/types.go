@@ -210,6 +210,10 @@ type CreateWorkflowParams struct {
 	// DueAt is when the whole approval expires (R-001 Expire): past it, a
 	// PENDING or ESCALATED instance becomes EXPIRED. nil = no expiry.
 	DueAt *time.Time
+	// Signatory, when set, binds the workflow to a verified policy-svc
+	// SIGNATORY_MATRIX decision (ZS-GOV-INT-002 §4.2); it is stored in the
+	// same transaction as the instance.
+	Signatory *SignatoryBinding
 }
 
 // SubmitActionParams holds input for approving or rejecting the current stage.

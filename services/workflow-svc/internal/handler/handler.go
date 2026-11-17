@@ -26,6 +26,7 @@ import (
 	"zoiko.io/workflow-svc/internal/evidence"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 	"zoiko.io/workflow-svc/internal/registry"
+	"zoiko.io/workflow-svc/internal/signatory"
 	"zoiko.io/workflow-svc/internal/store"
 )
 
@@ -170,6 +171,8 @@ type Handler struct {
 	evidence  EvidenceClient
 	registry  registry.Checker
 	readAuthz string
+	// signatory verifies policy-svc signatory decisions (ZS-GOV-INT-002 §4.2).
+	signatory signatory.Verifier
 	log       *zap.Logger
 }
 
@@ -491,6 +494,10 @@ type createWorkflowRequest struct {
 	WorkflowDefinitionID      string                            `json:"workflow_definition_id,omitempty"`
 	WorkflowDefinitionVersion int                               `json:"workflow_definition_version,omitempty"`
 	Stages                    []domain.CreateWorkflowStageInput `json:"stages"`
+	// SignatoryDecisionID names a policy-svc SIGNATORY_MATRIX decision
+	// (SIGNATURE_REQUIRED) this workflow collects the signatures for. It is
+	// fetched from policy-svc and verified, never taken on the caller's word.
+	SignatoryDecisionID string `json:"signatory_decision_id,omitempty"`
 }
 
 func (req createWorkflowRequest) missingField() string {
@@ -509,6 +516,9 @@ func (req createWorkflowRequest) missingField() string {
 type workflowResponse struct {
 	*domain.WorkflowInstance
 	Stages []*domain.WorkflowStage `json:"stages"`
+	// SignatoryBinding is the policy-svc decision a signature workflow was
+	// created from; absent for every other workflow.
+	SignatoryBinding *domain.SignatoryBinding `json:"signatory_binding,omitempty"`
 	// DecisionID is the governance-ledger record written with a decision
 	// (row 39: evidence_id returned). It is empty on an idempotent replay that
 	// made no new transition.
@@ -789,6 +799,14 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	var binding *domain.SignatoryBinding
+	if req.SignatoryDecisionID != "" {
+		b, ok := h.bindSignatoryDecision(w, r, &req, principalID, correlationID)
+		if !ok {
+			return
+		}
+		binding = b
+	}
 	instance, stages, created, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		// initiated_by is always the verified caller, never the request
 		// body �?" see requirePrincipal's doc comment.
@@ -801,6 +819,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		WorkflowDefinitionID:      req.WorkflowDefinitionID,
 		WorkflowDefinitionVersion: req.WorkflowDefinitionVersion,
 		DueAt:                     instanceDueAt,
+		Signatory:                 binding,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoStages) {
@@ -870,7 +889,13 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "GetWorkflow")
 		return
 	}
-	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: stages}, instance.RowVersion)
+	resp := workflowResponse{WorkflowInstance: instance, Stages: stages}
+	if ss, ok := h.signatoryStore(); ok {
+		if b, err := ss.FindSignatoryBinding(r.Context(), instance.WorkflowInstanceID); err == nil {
+			resp.SignatoryBinding = b
+		}
+	}
+	writeJSONWithETag(w, r, http.StatusOK, resp, instance.RowVersion)
 }
 
 // ── GET /v1/workflows/{id}/next-approver ─────────────────────────────────────
@@ -927,6 +952,9 @@ type submitQuorumVoteRequest struct {
 	Action      string  `json:"action"`
 	Rationale   *string `json:"rationale,omitempty"`
 	CausationID *string `json:"causation_id,omitempty"`
+	// DocumentHash is the document signed; on a signature-bound workflow an
+	// APPROVE must name exactly the bound hash.
+	DocumentHash string `json:"document_hash,omitempty"`
 }
 
 // SubmitAction handles POST /v1/workflows/{workflow_instance_id}/actions.
@@ -1199,10 +1227,41 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A signature on a signature-bound workflow: Authorization says, now,
+	// which accepted offices the signer holds (Doc 02 §4.2).
+	var offices []string
+	if ss, ok := h.signatoryStore(); ok && req.Action == "APPROVE" {
+		binding, err := ss.FindSignatoryBinding(r.Context(), workflowInstanceID)
+		if err != nil {
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if binding != nil {
+			requirement, err := domain.ParseSignatureRequirement(binding.Requirement)
+			if err != nil {
+				writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+			offices, err = h.signerOffices(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy, requirement)
+			if err != nil {
+				h.log.Error("SubmitQuorumVote: authorization-svc unavailable for signer offices — failing closed",
+					zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+				return
+			}
+			if len(offices) == 0 {
+				writeJSON(w, r, http.StatusForbidden, map[string]any{"error": "signer_not_eligible",
+					"message": domain.ErrSignerNotEligible.Error(), "accepted_offices": requirement.AcceptedOffices()})
+				return
+			}
+		}
+	}
+
 	meta := commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
 	instance, stage, transitioned, err := h.store.SubmitQuorumVote(r.Context(), domain.SubmitQuorumVoteParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
 		Rationale: req.Rationale, CausationID: req.CausationID, Authority: authority, Meta: meta,
+		SignerOffices: offices, DocumentHash: strings.TrimSpace(req.DocumentHash),
 	})
 	if err != nil {
 		switch {
@@ -1212,6 +1271,13 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "not_quorum_stage"})
 		case errors.Is(err, domain.ErrNotEligibleQuorumApprover):
 			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "not_eligible_quorum_approver"})
+		case errors.Is(err, domain.ErrSignatureDocumentChanged):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "signature_document_changed",
+				"reason_code": "SIGNATURE_DOCUMENT_CHANGED", "message": err.Error()})
+		case errors.Is(err, domain.ErrSignatureOutOfOrder):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "signature_out_of_order", "message": err.Error()})
+		case errors.Is(err, domain.ErrSignerNotEligible):
+			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "signer_not_eligible", "message": err.Error()})
 		case errors.Is(err, domain.ErrInvalidTransition):
 			writeJSON(w, r, http.StatusConflict, map[string]any{
 				"error":           "invalid_transition",
@@ -1694,6 +1760,9 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 type verifyReleaseRequest struct {
 	ExpectedSubjectVersion    *int   `json:"expected_subject_version,omitempty"`
 	CurrentSubjectFingerprint string `json:"current_subject_fingerprint"`
+	// CurrentSignatoryDecisionID is a fresh policy-svc decision for the same
+	// resource and document; required to release a signature-bound workflow.
+	CurrentSignatoryDecisionID string `json:"current_signatory_decision_id,omitempty"`
 }
 
 // VerifyRelease handles POST /v1/workflows/{workflow_instance_id}/verify-release.
@@ -1786,6 +1855,26 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "VerifyRelease")
 		return
+	}
+
+	// A signature-bound workflow is released only if the signature
+	// requirement in force NOW is still met by the signatures given
+	// (Doc 02 §8.4: none waived because an earlier decision said PERMIT).
+	if ss, ok := h.signatoryStore(); ok && res.CanRelease {
+		binding, err := ss.FindSignatoryBinding(r.Context(), workflowInstanceID)
+		if err != nil {
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if binding != nil {
+			reason, ok := h.signatureReleaseCheck(w, r, instanceForAuthz, binding, strings.TrimSpace(req.CurrentSignatoryDecisionID), principalID, correlationID)
+			if !ok {
+				return
+			}
+			if reason != "" {
+				res.CanRelease, res.Status, res.Reason = false, "INVALID", &reason
+			}
+		}
 	}
 
 	if !res.CanRelease {

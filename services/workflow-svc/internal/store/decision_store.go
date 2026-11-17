@@ -258,12 +258,49 @@ func (s *PgStore) SubmitQuorumVote(ctx context.Context, params domain.SubmitQuor
 	if params.Action == "REJECT" {
 		wantDecision = domain.QuorumDecisionReject
 	}
+
+	// A signature-bound workflow (ZS-GOV-INT-002 §4.2): a signature is on the
+	// bound document, in the required order, by a signer Authorization has
+	// confirmed holds an accepted office.
+	binding, err := signatoryBindingTx(ctx, tx, cur.WorkflowInstanceID)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	var requirement *domain.SignatureRequirement
+	var priorSigners []domain.Signer
+	if binding != nil {
+		if requirement, err = domain.ParseSignatureRequirement(binding.Requirement); err != nil {
+			return nil, nil, false, fmt.Errorf("%w: signatory requirement unreadable: %v", domain.ErrStoreUnavailable, err)
+		}
+		if wantDecision == domain.QuorumDecisionApprove {
+			if params.DocumentHash != binding.DocumentHash {
+				return nil, nil, false, domain.ErrSignatureDocumentChanged
+			}
+			if len(params.SignerOffices) == 0 {
+				return nil, nil, false, domain.ErrSignerNotEligible
+			}
+			if priorSigners, err = signersTx(ctx, tx, st.WorkflowStageID, cur.ReviewCycle); err != nil {
+				return nil, nil, false, err
+			}
+			if next := requirement.NextInOrder(priorSigners); next != "" && !containsString(params.SignerOffices, next) {
+				return nil, nil, false, fmt.Errorf("%w: the next signature must be by the %s", domain.ErrSignatureOutOfOrder, next)
+			}
+		}
+	}
+	offices := params.SignerOffices
+	if offices == nil || wantDecision != domain.QuorumDecisionApprove {
+		offices = []string{}
+	}
+	var docHash *string
+	if params.DocumentHash != "" {
+		docHash = &params.DocumentHash
+	}
 	var inserted string
 	insertErr := tx.QueryRow(ctx, `
-		INSERT INTO workflow_stage_quorum_decisions (workflow_stage_id, approver_principal_id, decision, rationale, review_cycle)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO workflow_stage_quorum_decisions (workflow_stage_id, approver_principal_id, decision, rationale, review_cycle, signer_offices, document_hash)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (workflow_stage_id, approver_principal_id, review_cycle) DO NOTHING
-		RETURNING decision`, st.WorkflowStageID, params.ActorPrincipalID, wantDecision, params.Rationale, cur.ReviewCycle).Scan(&inserted)
+		RETURNING decision`, st.WorkflowStageID, params.ActorPrincipalID, wantDecision, params.Rationale, cur.ReviewCycle, offices, docHash).Scan(&inserted)
 	if insertErr != nil {
 		if !errors.Is(insertErr, pgx.ErrNoRows) {
 			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, insertErr)
@@ -295,6 +332,29 @@ func (s *PgStore) SubmitQuorumVote(ctx context.Context, params domain.SubmitQuor
 		wantDecision, params.ActorPrincipalID, tally.approvals, required, tally.votesCast, tally.poolSize)
 	quorum := map[string]any{"approvals": tally.approvals, "rejections": tally.rejections, "required": required,
 		"votes_cast": tally.votesCast, "pool_size": tally.poolSize, "vote": wantDecision}
+
+	if requirement != nil {
+		quorum["signatory_decision_id"] = binding.DecisionID
+		quorum["document_hash"] = binding.DocumentHash
+		quorum["signer_offices"] = offices
+		// Enough signatures is not enough: the required offices must be filled
+		// by distinct signers (one person holding two offices fills one seat).
+		if resolved && outcome == "APPROVED" {
+			signers, err := signersTx(ctx, tx, st.WorkflowStageID, cur.ReviewCycle)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if !requirement.OfficesFilled(signers) {
+				if tally.votesCast >= tally.poolSize {
+					outcome = "REJECTED"
+					voteRationale += "; the required offices cannot be filled by distinct signers"
+				} else {
+					resolved = false
+					voteRationale += "; required offices not yet filled by distinct signers"
+				}
+			}
+		}
+	}
 
 	if !resolved {
 		// The vote is a decision in its own right: it gets a transition and a
@@ -649,4 +709,97 @@ func writeLedgerTx(ctx context.Context, tx pgx.Tx, inst *domain.WorkflowInstance
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return nil
+}
+
+// signatoryBindingTx is the workflow's signatory binding, nil when it has none.
+func signatoryBindingTx(ctx context.Context, tx pgx.Tx, instanceID string) (*domain.SignatoryBinding, error) {
+	b := &domain.SignatoryBinding{}
+	var req []byte
+	err := tx.QueryRow(ctx, `
+		SELECT workflow_instance_id, tenant_id, signatory_decision_id, signatory_policy_version_id, signatory_rule_id,
+		       document_hash, requirement, bound_at
+		FROM workflow_signatory_bindings WHERE workflow_instance_id = $1`, instanceID).
+		Scan(&b.WorkflowInstanceID, &b.TenantID, &b.DecisionID, &b.PolicyVersionID, &b.RuleID, &b.DocumentHash, &req, &b.BoundAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	b.Requirement = req
+	return b, nil
+}
+
+// signersTx lists the APPROVE votes (signatures) of a stage's review cycle in
+// the order they were given, with the offices each signer was confirmed for.
+func signersTx(ctx context.Context, tx pgx.Tx, stageID string, cycle int) ([]domain.Signer, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT approver_principal_id, signer_offices FROM workflow_stage_quorum_decisions
+		WHERE workflow_stage_id = $1 AND review_cycle = $2 AND decision = 'APPROVE'
+		ORDER BY acted_at, workflow_stage_quorum_decision_id`, stageID, cycle)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	var out []domain.Signer
+	for rows.Next() {
+		var sgn domain.Signer
+		if err := rows.Scan(&sgn.PrincipalID, &sgn.Offices); err != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		out = append(out, sgn)
+	}
+	return out, rows.Err()
+}
+
+func containsString(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// FindSignatoryBinding returns the workflow's signatory binding, nil when the
+// workflow was not created from a signatory decision.
+func (s *PgStore) FindSignatoryBinding(ctx context.Context, workflowInstanceID string) (*domain.SignatoryBinding, error) {
+	tx, err := s.beginTenantTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	return signatoryBindingTx(ctx, tx, workflowInstanceID)
+}
+
+// SignaturesFor lists the signatures (APPROVE votes on the QUORUM stage, in
+// the current review cycle) given on a workflow, in order, with the offices
+// each signer was confirmed for when signing.
+func (s *PgStore) SignaturesFor(ctx context.Context, workflowInstanceID string) ([]domain.Signer, error) {
+	tx, err := s.beginTenantTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := tx.Query(ctx, `
+		SELECT d.approver_principal_id, d.signer_offices
+		FROM workflow_stage_quorum_decisions d
+		JOIN workflow_stages st ON st.workflow_stage_id = d.workflow_stage_id
+		JOIN workflow_instances wi ON wi.workflow_instance_id = st.workflow_instance_id
+		WHERE st.workflow_instance_id = $1 AND st.stage_type = 'QUORUM'
+		  AND d.decision = 'APPROVE' AND d.review_cycle = wi.review_cycle
+		ORDER BY d.acted_at, d.workflow_stage_quorum_decision_id`, workflowInstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	var out []domain.Signer
+	for rows.Next() {
+		var sgn domain.Signer
+		if err := rows.Scan(&sgn.PrincipalID, &sgn.Offices); err != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		out = append(out, sgn)
+	}
+	return out, rows.Err()
 }

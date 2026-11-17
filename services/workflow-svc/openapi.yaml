@@ -309,6 +309,7 @@ paths:
               properties:
                 expected_subject_version: {type: integer, minimum: 0}
                 current_subject_fingerprint: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+                current_signatory_decision_id: {type: string, format: uuid, description: Signature workflows only. A fresh policy-svc decision}
       responses:
         '200': {$ref: '#/components/responses/ReleaseVerification'}
         '409': {$ref: '#/components/responses/ReleaseVerification'}
@@ -455,6 +456,7 @@ components:
               action: {type: string, enum: [APPROVE, REJECT]}
               rationale: {type: string, description: Required for REJECT}
               causation_id: {type: string}
+              document_hash: {type: string, pattern: '^sha256:[0-9a-f]{64}$', description: Signature workflows only. Must equal the bound document hash}
   responses:
     Problem:
       description: RFC 9457 problem document
@@ -542,6 +544,18 @@ components:
         workflow_definition_id: {type: string, format: uuid}
         workflow_definition_version: {type: integer}
         stages: {type: array, items: {$ref: '#/components/schemas/StageInput'}, description: Required unless workflow_definition_id supplies the route}
+        signatory_decision_id: {type: string, format: uuid, description: A policy-svc SIGNATURE_REQUIRED decision; makes this a signature workflow}
+    SignatoryBinding:
+      type: object
+      properties:
+        workflow_instance_id: {type: string}
+        tenant_id: {type: string}
+        signatory_decision_id: {type: string}
+        signatory_policy_version_id: {type: string}
+        signatory_rule_id: {type: string}
+        document_hash: {type: string}
+        requirement: {type: object, additionalProperties: true, description: The SIGNATURE_QUORUM required action as verified}
+        bound_at: {type: string, format: date-time}
     WorkflowInstance:
       type: object
       properties:
@@ -586,6 +600,7 @@ components:
           properties:
             stages: {type: array, items: {$ref: '#/components/schemas/WorkflowStage'}}
             decision_id: {type: string, description: The governance-ledger record of this decision}
+            signatory_binding: {$ref: '#/components/schemas/SignatoryBinding'}
     WorkflowTransition:
       type: object
       properties:

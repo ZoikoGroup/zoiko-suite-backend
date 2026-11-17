@@ -46,6 +46,11 @@ type SubmitQuorumVoteParams struct {
 
 	Authority ActionAuthority
 	Meta      CommandMeta
+
+	// SignerOffices are the offices Authorization confirmed the signer holds
+	// (a signature-bound workflow only); DocumentHash is the document signed.
+	SignerOffices []string
+	DocumentHash  string
 }
 
 // QuorumStageStatus evaluates a QUORUM stage's current vote tally
