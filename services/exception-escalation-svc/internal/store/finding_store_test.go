@@ -31,6 +31,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS deadline_due_history;
 		DROP TABLE IF EXISTS deadline_escalations;
 		DROP TABLE IF EXISTS deadlines;
 		DROP TABLE IF EXISTS task_transitions;

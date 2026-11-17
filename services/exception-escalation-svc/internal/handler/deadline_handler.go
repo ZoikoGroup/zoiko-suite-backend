@@ -169,16 +169,39 @@ func (h *deadlineHandler) MirrorAuthoritativeDeadline(w http.ResponseWriter, r *
 
 // GetDeadline — BIZ-08's own GetDeadline query.
 func (h *deadlineHandler) GetDeadline(w http.ResponseWriter, r *http.Request) {
-	d, err := h.store.GetDeadline(r.Context(), chi.URLParam(r, "deadline_id"))
-	if err != nil {
-		h.writeDeadlineErr(w, err)
+	d, ok := h.authorizeRead(w, r)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
 }
 
+// authorizeRead loads the deadline and requires DEADLINE_MANAGE on its legal entity, the
+// same action the list queries already require. The read endpoints had no authorization
+// check at all: any caller in the tenant could read any deadline, its source lock and its
+// calculation. Fetch, then authorize, then return.
+func (h *deadlineHandler) authorizeRead(w http.ResponseWriter, r *http.Request) (*domain.Deadline, bool) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, false
+	}
+	d, err := h.store.GetDeadline(r.Context(), chi.URLParam(r, "deadline_id"))
+	if err != nil {
+		h.writeDeadlineErr(w, err)
+		return nil, false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, d.LegalEntityID, actionDeadlineManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return nil, false
+	}
+	return d, true
+}
+
 // GetSourceDeadline — BIZ-08's own GetSourceDeadline query.
 func (h *deadlineHandler) GetSourceDeadline(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeRead(w, r); !ok {
+		return
+	}
 	info, err := h.store.GetSourceDeadline(r.Context(), middleware.GetTenantID(r.Context()), chi.URLParam(r, "deadline_id"))
 	if err != nil {
 		h.writeDeadlineErr(w, err)
@@ -262,6 +285,7 @@ type recalculateRequest struct {
 	DueAt      time.Time `json:"due_at"`
 	CalcRule   string    `json:"calc_rule,omitempty"`
 	CalcInputs string    `json:"calc_inputs,omitempty"`
+	Reason     string    `json:"reason"`
 }
 
 // Recalculate — BIZ-08's own Recalculate command. Refused outright on a
@@ -282,6 +306,10 @@ func (h *deadlineHandler) Recalculate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "due_at is required")
 		return
 	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrDeadlineReasonRequired.Error())
+		return
+	}
 	current, err := h.store.GetDeadline(r.Context(), deadlineID)
 	if err != nil {
 		h.writeDeadlineErr(w, err)
@@ -293,7 +321,7 @@ func (h *deadlineHandler) Recalculate(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := h.store.Recalculate(r.Context(), domain.RecalculateParams{
 		DeadlineID: deadlineID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID,
-		DueAt: req.DueAt, CalcRule: req.CalcRule, CalcInputs: req.CalcInputs,
+		DueAt: req.DueAt, CalcRule: req.CalcRule, CalcInputs: req.CalcInputs, Reason: req.Reason,
 	})
 	if err != nil {
 		h.writeDeadlineErr(w, err)
@@ -501,6 +529,9 @@ func (h *deadlineHandler) ListOverdue(w http.ResponseWriter, r *http.Request) {
 
 // ExplainCalculation — BIZ-08's own ExplainCalculation query.
 func (h *deadlineHandler) ExplainCalculation(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authorizeRead(w, r); !ok {
+		return
+	}
 	res, err := h.store.ExplainCalculation(r.Context(), middleware.GetTenantID(r.Context()), chi.URLParam(r, "deadline_id"))
 	if err != nil {
 		h.writeDeadlineErr(w, err)
@@ -515,6 +546,8 @@ func (h *deadlineHandler) writeDeadlineErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "deadline not found")
 	case errors.Is(err, domain.ErrDeadlineInvalidState):
 		writeError(w, http.StatusConflict, "deadline is not in a state that permits this action")
+	case errors.Is(err, domain.ErrDeadlineReasonRequired):
+		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, domain.ErrDeadlineSourceRequired):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, domain.ErrDeadlineSourceConflict):

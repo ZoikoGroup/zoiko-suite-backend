@@ -233,7 +233,7 @@ func TestPgStore_Recalculate_MovesDueAtAndResetsNotifications(t *testing.T) {
 	newDue := due.Add(200 * time.Hour) // outside the due-soon window
 	recalced, err := s.Recalculate(ctx(), domain.RecalculateParams{
 		DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "creator-1",
-		DueAt: newDue, CalcRule: "revised rule",
+		DueAt: newDue, CalcRule: "revised rule", Reason: "customer extension",
 	})
 	require.NoError(t, err)
 	require.WithinDuration(t, newDue, recalced.DueAt, time.Second)
@@ -258,7 +258,7 @@ func TestPgStore_Recalculate_RefusedOnMirroredDeadline(t *testing.T) {
 
 	_, err = s.Recalculate(ctx(), domain.RecalculateParams{
 		DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "creator-1",
-		DueAt: time.Now().UTC().Add(96 * time.Hour),
+		DueAt: time.Now().UTC().Add(96 * time.Hour), Reason: "x",
 	})
 	require.ErrorIs(t, err, domain.ErrCannotRecalculateMirroredDeadline)
 }

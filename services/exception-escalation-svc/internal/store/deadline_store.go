@@ -131,21 +131,22 @@ func (s *PgStore) MirrorAuthoritativeDeadline(ctx context.Context, p domain.Mirr
 	}
 
 	if hasExisting {
-		if existing.Status != domain.DeadlineStatusScheduled {
-			// A human already acted on the prior mirror locally
-			// (completed/waived/cancelled) — silently moving its due
-			// date out from under that action would rewrite what was
-			// actually decided against. Refuse instead.
-			return nil, "", domain.ErrDeadlineSourceConflict
-		}
 		if existing.SourceVersion == p.SourceVersion {
-			// Same version already mirrored and untouched — nothing to
-			// do; return the existing row rather than creating a
-			// pointless duplicate.
+			// Same version already mirrored — a replay. Nothing to do whatever
+			// has happened to the row locally (a completed mirror replayed with
+			// the same version is not a conflict); return the existing row
+			// rather than creating a pointless duplicate.
 			if err := tx.Commit(ctx); err != nil {
 				return nil, "", err
 			}
 			return existing, "", nil
+		}
+		if existing.Status != domain.DeadlineStatusScheduled {
+			// A human already acted on the prior mirror locally
+			// (completed/waived/cancelled) and the source has since changed —
+			// silently moving its due date out from under that action would
+			// rewrite what was actually decided against. Refuse instead.
+			return nil, "", domain.ErrDeadlineSourceConflict
 		}
 	}
 
@@ -298,6 +299,9 @@ func (s *PgStore) CompleteDeadline(ctx context.Context, p domain.CompleteDeadlin
 // own doc comment. Resets the notification-tracking columns since the
 // due date materially changed.
 func (s *PgStore) Recalculate(ctx context.Context, p domain.RecalculateParams) (*domain.Deadline, error) {
+	if p.Reason == "" {
+		return nil, domain.ErrDeadlineReasonRequired
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -318,6 +322,13 @@ func (s *PgStore) Recalculate(ctx context.Context, p domain.RecalculateParams) (
 	}
 	if current.Status != domain.DeadlineStatusScheduled {
 		return nil, domain.ErrDeadlineInvalidState
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO deadline_due_history (change_id, deadline_id, tenant_id, previous_due_at, new_due_at,
+			previous_calc_rule, new_calc_rule, reason, changed_by)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		"deadlinechg-"+uuid.New().String(), p.DeadlineID, p.TenantID, current.DueAt, p.DueAt,
+		current.CalcRule, p.CalcRule, p.Reason, p.ActorPrincipalID); err != nil {
+		return nil, fmt.Errorf("record due-date change: %w", err)
 	}
 	d, err := scanDeadline(tx.QueryRow(ctx, `
 		UPDATE deadlines SET due_at=$3, calc_rule=$4, calc_inputs=$5,
@@ -573,5 +584,38 @@ func (s *PgStore) ExplainCalculation(ctx context.Context, tenantID, deadlineID s
 		res.CalcRule, res.CalcInputs = d.CalcRule, d.CalcInputs
 		res.Note = "this deadline is calculated and owned by BIZ-08 directly."
 	}
+	changes, err := s.dueChanges(ctx, d.DeadlineID)
+	if err != nil {
+		return nil, err
+	}
+	res.Changes = changes
 	return res, nil
+}
+
+// dueChanges returns a deadline's manual recalculation history, oldest first.
+func (s *PgStore) dueChanges(ctx context.Context, deadlineID string) ([]domain.DueChange, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.deadlineSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT change_id, previous_due_at, new_due_at, previous_calc_rule, new_calc_rule, reason, changed_by, changed_at
+		FROM deadline_due_history WHERE deadline_id=$1 AND tenant_id=$2 ORDER BY changed_at, change_id`,
+		deadlineID, middleware.GetTenantID(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.DueChange
+	for rows.Next() {
+		var c domain.DueChange
+		if err := rows.Scan(&c.ChangeID, &c.PreviousDueAt, &c.NewDueAt, &c.PreviousRule, &c.NewRule, &c.Reason, &c.ChangedBy, &c.ChangedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
