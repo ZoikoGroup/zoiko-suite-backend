@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -14,20 +15,23 @@ import (
 const evaluationColumns = `
 	e.evaluation_id, e.tenant_id, e.decision_id, e.legal_entity_id, e.policy_type,
 	COALESCE(e.requested_by_principal_id, ''), e.input_fingerprint, e.action_context,
-	e.as_of, e.known_at, e.result, e.outcome, e.policy_id, e.policy_version_id,
-	e.policy_code, e.artifact_digest, e.rule_basis, e.selected_rule_ids,
+	e.as_of, e.known_at, e.result, e.outcome, COALESCE(e.policy_id::text, ''), COALESCE(e.policy_version_id::text, ''),
+	COALESCE(e.policy_code, ''), COALESCE(e.artifact_digest, ''), e.rule_basis, e.selected_rule_ids,
 	e.evaluator_version, e.correlation_id, COALESCE(e.causation_id, ''),
 	COALESCE(e.request_id, ''), e.evaluated_at,
 	CASE
 		WHEN o.delivered_at IS NOT NULL THEN 'RECORDED'
 		WHEN o.failed_at IS NOT NULL THEN 'FAILED'
 		ELSE 'PENDING'
-	END
+	END,
+	COALESCE(e.contract_version, ''), COALESCE(e.decision_outcome, ''), e.reason_codes, e.valid_until,
+	e.decision_envelope
 	FROM policy_evaluations e
 	LEFT JOIN policy_evidence_outbox o ON o.evaluation_id = e.evaluation_id`
 
 func scanEvaluation(row pgx.Row) (*domain.Evaluation, error) {
 	e := &domain.Evaluation{}
+	var envelope *string
 	err := row.Scan(
 		&e.EvaluationID, &e.TenantID, &e.DecisionID, &e.LegalEntityID, &e.PolicyType,
 		&e.RequestedByPrincipalID, &e.InputFingerprint, &e.ActionContext,
@@ -35,7 +39,12 @@ func scanEvaluation(row pgx.Row) (*domain.Evaluation, error) {
 		&e.PolicyCode, &e.ArtifactDigest, &e.RuleBasis, &e.SelectedRuleIDs,
 		&e.EvaluatorVersion, &e.CorrelationID, &e.CausationID,
 		&e.RequestID, &e.EvaluatedAt, &e.LedgerStatus,
+		&e.ContractVersion, &e.DecisionOutcome, &e.ReasonCodes, &e.ValidUntil,
+		&envelope,
 	)
+	if envelope != nil && *envelope != "" {
+		e.DecisionEnvelope = json.RawMessage(*envelope)
+	}
 	return e, err
 }
 
@@ -54,22 +63,40 @@ func (s *PgStore) SaveEvaluation(ctx context.Context, ev *domain.Evaluation) (*d
 		if len(action) == 0 {
 			action = []byte(`{}`)
 		}
+		evaluatedAt := ev.EvaluatedAt
+		if evaluatedAt.IsZero() {
+			evaluatedAt = s.now()
+		}
+		reasons := ev.ReasonCodes
+		if reasons == nil {
+			reasons = []string{}
+		}
+		// Stored as text, byte for byte: the signed envelope a replay serves
+		// must be the one first answered.
+		var envelope *string
+		if len(ev.DecisionEnvelope) > 0 {
+			text := string(ev.DecisionEnvelope)
+			envelope = &text
+		}
 		var id string
 		err := tx.QueryRow(ctx, `
 			INSERT INTO policy_evaluations (
+				evaluation_id,
 				tenant_id, decision_id, legal_entity_id, policy_type, requested_by_principal_id,
 				input_fingerprint, action_context, as_of, known_at, result, outcome,
 				policy_id, policy_version_id, policy_code, artifact_digest, rule_basis,
 				selected_rule_ids, evaluator_version, correlation_id, causation_id, request_id,
-				evaluated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+				evaluated_at, contract_version, decision_outcome, reason_codes, valid_until, decision_envelope
+			) VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+				$13::uuid, $14::uuid, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 			ON CONFLICT (tenant_id, decision_id) DO NOTHING
 			RETURNING evaluation_id;`,
+			nullableString(ev.EvaluationID),
 			ev.TenantID, ev.DecisionID, ev.LegalEntityID, ev.PolicyType, nullableString(ev.RequestedByPrincipalID),
 			ev.InputFingerprint, action, ev.AsOf, ev.KnownAt, ev.Result, ev.Outcome,
-			ev.PolicyID, ev.PolicyVersionID, ev.PolicyCode, ev.ArtifactDigest, ev.RuleBasis,
+			nullableString(ev.PolicyID), nullableString(ev.PolicyVersionID), nullableString(ev.PolicyCode), nullableString(ev.ArtifactDigest), ev.RuleBasis,
 			ev.SelectedRuleIDs, ev.EvaluatorVersion, ev.CorrelationID, nullableString(ev.CausationID), nullableString(ev.RequestID),
-			s.now(),
+			evaluatedAt, nullableString(ev.ContractVersion), nullableString(ev.DecisionOutcome), reasons, ev.ValidUntil, envelope,
 		).Scan(&id)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):

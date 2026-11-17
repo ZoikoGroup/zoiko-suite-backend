@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/domain"
+	"zoiko.io/policy-svc/internal/signatory"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 )
 
@@ -915,6 +916,15 @@ func (s *PgStore) guardActivation(ctx context.Context, tx pgx.Tx, v *domain.Poli
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1));`, "policy-svc:policy_type:"+policyType); err != nil {
 		return err
 	}
+	if policyType == signatory.PolicyType {
+		// Several signatory matrices share a scope (the ordinary one and
+		// instrument-specific high-risk ones); only matrices that would govern
+		// the same instrument in the same risk regime conflict.
+		if err := s.guardSignatoryOverlap(ctx, tx, v); err != nil {
+			return err
+		}
+		return s.guardPendingSchedule(ctx, tx, v)
+	}
 	var conflicting string
 	err = tx.QueryRow(ctx, `
 		SELECT pv.policy_version_id
@@ -1028,6 +1038,9 @@ func (s *PgStore) activateNow(ctx context.Context, tx pgx.Tx, v *domain.PolicyVe
 	if err := s.enqueueAccounting(ctx, tx, domain.EventAccountingPolicyActivated, next, actor, meta, map[string]any{
 		"superseded_version_ids": versionIDs(superseded),
 	}); err != nil {
+		return nil, err
+	}
+	if err := s.enqueueSignatoryPublished(ctx, tx, next, actor, meta, versionIDs(superseded)); err != nil {
 		return nil, err
 	}
 	active := domain.StatusActive

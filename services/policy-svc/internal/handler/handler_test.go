@@ -162,7 +162,9 @@ func (s *stubStore) SaveEvaluation(_ context.Context, ev *domain.Evaluation) (*d
 		return nil, false, s.saveErr
 	}
 	cp := *ev
-	cp.EvaluationID = evidenceID
+	if cp.EvaluationID == "" {
+		cp.EvaluationID = evidenceID
+	}
 	cp.LedgerStatus = domain.LedgerPending
 	s.saved = &cp
 	return &cp, true, nil
@@ -333,7 +335,7 @@ func newRig(s *stubStore, c *stubCandidates, az *stubAuthz, opts ...rigOption) *
 	if az == nil {
 		az = &stubAuthz{}
 	}
-	o := handler.Options{PlatformScopeID: testAuthzScopeID, Now: func() time.Time { return fixedNow }}
+	o := handler.Options{PlatformScopeID: testAuthzScopeID, Now: func() time.Time { return fixedNow }, DecisionSigner: testSigner}
 	for _, f := range opts {
 		f(&o)
 	}
@@ -346,6 +348,8 @@ func newRig(s *stubStore, c *stubCandidates, az *stubAuthz, opts ...rigOption) *
 	handler.RegisterListRoutes(r, h)
 	handler.RegisterOperationRoutes(r, h)
 	handler.RegisterCertificationRoutes(r, h)
+	handler.RegisterSignatoryRoutes(r, h)
+	handler.RegisterPolicyTypeRoutes(r, h)
 	return &rig{store: s, cands: c, az: az, r: r}
 }
 

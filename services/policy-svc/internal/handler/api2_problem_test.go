@@ -108,6 +108,8 @@ func TestOpenAPI_MatchesTheRouter(t *testing.T) {
 	handler.RegisterListRoutes(r, h)
 	handler.RegisterOperationRoutes(r, h)
 	handler.RegisterCertificationRoutes(r, h)
+	handler.RegisterSignatoryRoutes(r, h)
+	handler.RegisterPolicyTypeRoutes(r, h)
 	served := map[string]bool{"GET /healthz": true, "GET /readyz": true}
 	_ = chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		served[method+" "+strings.TrimSuffix(route, "/")] = true

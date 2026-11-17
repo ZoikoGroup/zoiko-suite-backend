@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/govdecision"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/domain"
 	"zoiko.io/policy-svc/internal/envelope"
 	"zoiko.io/policy-svc/internal/evaluator"
+	"zoiko.io/policy-svc/internal/policytype"
 	"zoiko.io/policy-svc/internal/resolve"
 	"zoiko.io/policy-svc/internal/store"
 )
@@ -69,6 +71,14 @@ type evaluateResponse struct {
 	// Replayed is true when this answer is the stored result of an earlier
 	// request with the same decision_id.
 	Replayed bool `json:"replayed"`
+
+	// The ZS-GOV-INT-002 view of the same decision, added beside the
+	// existing fields: the shared outcome (WITHIN_THRESHOLD is PERMIT,
+	// APPROVAL_REQUIRED stays APPROVAL_REQUIRED), who decided, and why.
+	ContractVersion string   `json:"contract_version"`
+	Outcome         string   `json:"outcome"`
+	OwningService   string   `json:"owning_service"`
+	ReasonCodes     []string `json:"reason_codes"`
 }
 
 func responseFor(ev *domain.Evaluation, replayed bool) evaluateResponse {
@@ -88,7 +98,59 @@ func responseFor(ev *domain.Evaluation, replayed bool) evaluateResponse {
 		KnownAt:          ev.KnownAt,
 		LedgerStatus:     ev.LedgerStatus,
 		Replayed:         replayed,
+		ContractVersion:  govdecision.ContractVersion,
+		Outcome:          contractOutcome(ev.Result),
+		OwningService:    OwningService,
+		ReasonCodes:      thresholdReasons(ev.Result),
 	}
+}
+
+// contractOutcome maps an APPROVAL_THRESHOLD result onto the shared outcome
+// vocabulary. Anything unrecognised is ERROR, never PERMIT.
+func contractOutcome(result string) string {
+	switch result {
+	case evaluator.ResultWithinThreshold:
+		return govdecision.Permit
+	case evaluator.ResultApprovalRequired:
+		return govdecision.ApprovalRequired
+	}
+	return govdecision.Normalize(result)
+}
+
+func thresholdReasons(result string) []string {
+	switch result {
+	case evaluator.ResultWithinThreshold:
+		return []string{govdecision.ReasonWithinApprovalThreshold}
+	case evaluator.ResultApprovalRequired:
+		return []string{govdecision.ReasonApprovalThresholdExceeded}
+	}
+	return []string{govdecision.ReasonContractInvalid}
+}
+
+// refuseUnevaluable answers a family this route does not evaluate: 501 with
+// the shared NOT_IMPLEMENTED outcome and the service and route that do decide
+// it. It never falls back to approval thresholds and never permits (Doc 01
+// §12, P0-01). It runs before resolution, so a configured reference version
+// changes nothing: the answer is the same with or without one.
+func (h *Handler) refuseUnevaluable(w http.ResponseWriter, r *http.Request, policyType string) {
+	info, known := policytype.Lookup(policyType)
+	extra := map[string]any{
+		"policy_type":  policyType,
+		"outcome":      govdecision.NotImplemented,
+		"reason_codes": []string{govdecision.ReasonEvaluatorNotImplemented},
+	}
+	reason := "policy_type_not_implemented"
+	switch {
+	case known && info.Mode == policytype.ModeReferenceOnly:
+		extra["reason_codes"] = []string{govdecision.ReasonOwnedByDomainService}
+		extra["owning_service"], extra["decision_route"] = info.OwningService, info.DecisionRoute
+		reason = "policy_type_owned_by_domain_service"
+	case known:
+		extra["owning_service"], extra["decision_route"] = info.OwningService, info.DecisionRoute
+		reason = "policy_type_decided_on_another_route"
+	}
+	h.observeDecision(policyType, govdecision.NotImplemented)
+	writeError(w, r, http.StatusNotImplemented, codeNotImplemented, reason, "", extra)
 }
 
 // Evaluate handles POST /v1/policies/evaluate — "evaluate policy against
@@ -152,6 +214,13 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Only APPROVAL_THRESHOLD is evaluated on this route. SIGNATORY_MATRIX
+	// has its own contract route; spend, SoD and legal basis are decided by
+	// their owning services.
+	if req.PolicyType != policyTypeApprovalThreshold {
+		h.refuseUnevaluable(w, r, req.PolicyType)
+		return
+	}
 
 	now := h.opts.Now().UTC()
 	asOf, knownAt, ok := resolve.Times(req.AsOf, req.KnownAt, now)
@@ -187,8 +256,10 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		// Nothing governs. This service does not guess fail-open or
 		// fail-closed for the caller; nothing was evaluated, so nothing is
 		// recorded as a decision.
+		h.observeDecision(req.PolicyType, govdecision.NotConfigured)
 		writeError(w, r, http.StatusNotFound, codePolicyNotEffective, "no_applicable_policy", "",
-			map[string]any{"policy_type": req.PolicyType, "as_of": asOf, "known_at": knownAt})
+			map[string]any{"policy_type": req.PolicyType, "as_of": asOf, "known_at": knownAt,
+				"outcome": govdecision.NotConfigured, "reason_codes": []string{govdecision.ReasonConfigPolicyMissing}})
 		return
 	case resolve.Conflicted:
 		h.reportConflict(w, r, req, tenantID, legalEntityID, principalID, res)
@@ -255,6 +326,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		h.answerReplay(w, r, saved, fp)
 		return
 	}
+	h.observeDecision(req.PolicyType, contractOutcome(saved.Result))
 	writeJSON(w, http.StatusOK, responseFor(saved, false))
 }
 
@@ -302,9 +374,11 @@ func (h *Handler) reportConflict(w http.ResponseWriter, r *http.Request, req eva
 	h.log.Warn("Evaluate: conflicting policies at the same specificity",
 		zap.String("policy_type", req.PolicyType), zap.Strings("policy_version_ids", ids),
 		zap.String("correlation_id", meta.CorrelationID))
+	h.observeDecision(req.PolicyType, govdecision.NotConfigured)
 	writeError(w, r, http.StatusConflict, codePolicyConflicted, "conflicting_policies",
 		"multiple distinct policies govern the same scope; none was applied",
-		map[string]any{"policy_type": req.PolicyType, "candidate_version_ids": ids})
+		map[string]any{"policy_type": req.PolicyType, "candidate_version_ids": ids,
+			"outcome": govdecision.NotConfigured, "reason_codes": []string{govdecision.ReasonConfigRuleOverlap}})
 }
 
 // inputFingerprint is a hash of the request as the caller expressed it —
@@ -377,8 +451,7 @@ func (h *Handler) writeEvaluationError(w http.ResponseWriter, r *http.Request, p
 		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_action_context",
 			in.Field+" "+in.Detail, map[string]any{"field": in.Field})
 	case errors.Is(err, evaluator.ErrNotImplemented):
-		writeError(w, r, http.StatusNotImplemented, codeNotImplemented, "policy_type_not_implemented", "",
-			map[string]any{"policy_type": policyType})
+		h.refuseUnevaluable(w, r, policyType)
 	default:
 		h.log.Error("Evaluate: policy version cannot be evaluated",
 			zap.String("policy_version_id", versionID), zap.Error(err))

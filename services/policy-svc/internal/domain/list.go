@@ -46,3 +46,38 @@ type PolicySummary struct {
 	AttestationsActive     int64 `json:"attestations_active"`
 	AttestationsRevoked    int64 `json:"attestations_revoked"`
 }
+
+// FamilyStatus is the registry status card of one policy family for the
+// caller's tenant (ZS-GOV-POL-001 §9): how many families and versions exist,
+// which versions govern now or are scheduled to, with their effective dates,
+// approval and activation trail, and the decisions of the last 24 hours by
+// outcome.
+type FamilyStatus struct {
+	PolicyType        string             `json:"policy_type"`
+	Families          int64              `json:"families"`
+	VersionsByStatus  map[string]int64   `json:"versions_by_status"`
+	GoverningVersions []GoverningVersion `json:"governing_versions"`
+	Decisions24h      map[string]int64   `json:"decisions_24h"`
+}
+
+// GoverningVersion is an ACTIVE or SCHEDULED version and who put it there.
+type GoverningVersion struct {
+	PolicyID               string     `json:"policy_id"`
+	PolicyCode             string     `json:"policy_code"`
+	PolicyVersionID        string     `json:"policy_version_id"`
+	VersionNumber          int        `json:"version_number"`
+	VersionStatus          string     `json:"version_status"`
+	ScopeType              string     `json:"scope_type"`
+	TenantID               *string    `json:"tenant_id"`
+	LegalEntityID          *string    `json:"legal_entity_id"`
+	EffectiveFrom          time.Time  `json:"effective_from"`
+	EffectiveTo            *time.Time `json:"effective_to"`
+	ArtifactDigest         string     `json:"artifact_digest"`
+	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
+	SubmittedByPrincipalID *string    `json:"submitted_by_principal_id,omitempty"`
+	ApprovedByPrincipalID  *string    `json:"approved_by_principal_id,omitempty"`
+	ApprovedAt             *time.Time `json:"approved_at,omitempty"`
+	ApprovalReference      *string    `json:"approval_reference,omitempty"`
+	ActivatedByPrincipalID *string    `json:"activated_by_principal_id,omitempty"`
+	ActivatedAt            *time.Time `json:"activated_at,omitempty"`
+}

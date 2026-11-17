@@ -361,6 +361,17 @@ type Evaluation struct {
 	// LedgerStatus is PENDING until governance-decision-log-svc has the
 	// record, then RECORDED; FAILED if that service refused it for good.
 	LedgerStatus string `json:"ledger_status"`
+
+	// ZS-GOV-INT-002 canonical decision (migration 000013): the contract
+	// version, the outcome of the shared vocabulary, its reason codes and
+	// validity, and the signed envelope exactly as it was answered. Absent on
+	// evaluations recorded before the contract (and on the legacy evaluate
+	// route's rows, which carry the outcome only).
+	ContractVersion  string          `json:"contract_version,omitempty"`
+	DecisionOutcome  string          `json:"decision_outcome,omitempty"`
+	ReasonCodes      []string        `json:"reason_codes,omitempty"`
+	ValidUntil       *time.Time      `json:"valid_until,omitempty"`
+	DecisionEnvelope json.RawMessage `json:"decision_envelope,omitempty"`
 }
 
 // Ledger delivery states reported on an Evaluation.

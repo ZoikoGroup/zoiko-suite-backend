@@ -34,6 +34,7 @@ tags:
   - name: versions
   - name: resolution
   - name: evaluation
+  - name: decisions
   - name: controls
   - name: attestations
   - name: health
@@ -189,6 +190,82 @@ paths:
         '413': {$ref: '#/components/responses/Problem'}
         '500': {$ref: '#/components/responses/Problem'}
         '501': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /internal/v1/policy/signatory-matrix/resolve:
+    post:
+      tags: [decisions]
+      operationId: resolveSignatoryMatrix
+      x-spec-operation: ZS-GOV-INT-002 §4 signatory-matrix resolution
+      description: "Resolves the signer requirement for one instrument. Answers 200 with a signed decision: SIGNATURE_REQUIRED, PERMIT (exemption) or NOT_CONFIGURED. POLICY_EVALUATE."
+      parameters:
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SignatoryResolveRequest'}
+      responses:
+        '200':
+          description: The signed decision, stored as evidence and relayed to the governance ledger
+          headers:
+            X-Decision-Replayed: {schema: {type: string}, description: 'true when this is the stored decision of an earlier request with the same request_id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Decision'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '500': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /internal/v1/policy/decisions/{decision_id}:
+    parameters:
+      - {name: decision_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [decisions]
+      operationId: getDecision
+      description: "The signed decision as answered. POLICY_READ."
+      responses:
+        '200':
+          description: The signed decision
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Decision'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-decision-keys:
+    get:
+      tags: [decisions]
+      operationId: getDecisionKeys
+      description: The Ed25519 public keys (JWKS, RFC 8037) that verify this service's decisions.
+      responses:
+        '200':
+          description: The key set
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DecisionKeys'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-types:
+    get:
+      tags: [decisions]
+      operationId: listPolicyTypes
+      description: "One status card per policy family for the caller's tenant. POLICY_READ."
+      responses:
+        '200':
+          description: The family catalogue with status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PolicyTypes'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
   /v1/policies/{policy_id}:
@@ -1973,6 +2050,175 @@ components:
         known_at: {type: string, format: date-time}
         ledger_status: {type: string}
         replayed: {type: boolean}
+        contract_version: {type: string, description: 'ZS-GOV-INT-002 contract version (1.0)'}
+        outcome: {type: string, enum: [PERMIT, APPROVAL_REQUIRED, ERROR], description: 'The shared outcome of result: WITHIN_THRESHOLD is PERMIT'}
+        owning_service: {type: string}
+        reason_codes: {type: array, items: {type: string}}
+
+    Money:
+      type: object
+      required: [amount, currency, basis]
+      properties:
+        amount: {type: string, pattern: '^[0-9]+(\.[0-9]+)?$', description: 'Exact decimal as a string; never a JSON number'}
+        currency: {type: string, pattern: '^[A-Z]{3}$'}
+        basis: {type: string, enum: [GROSS, NET]}
+
+    DecisionResource:
+      type: object
+      required: [type, id, version]
+      properties:
+        type: {type: string, maxLength: 64}
+        id: {type: string, maxLength: 128}
+        version: {type: string, maxLength: 64}
+
+    SignatoryResolveRequest:
+      type: object
+      additionalProperties: false
+      required: [contract_version, request_id, correlation_id, tenant_id, legal_entity_id, action, resource, money, instrument_type, jurisdiction, document_hash, evaluated_for_at]
+      properties:
+        contract_version: {type: string, example: '1.0'}
+        request_id: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$', description: 'Identifies this evaluation attempt; the replay key'}
+        correlation_id: {type: string, maxLength: 128}
+        tenant_id: {type: string, format: uuid, description: 'Must equal the verified tenant (403 otherwise)'}
+        legal_entity_id: {type: string, format: uuid, description: 'Must equal X-Legal-Entity-Id when sent (403 otherwise)'}
+        actor_principal_id: {type: string, description: 'Must equal the verified X-Principal-Id; defaults to it'}
+        action: {type: string, pattern: '^[A-Z][A-Z0-9_]{2,63}$', example: SIGN_CONTRACT}
+        resource: {$ref: '#/components/schemas/DecisionResource'}
+        money: {$ref: '#/components/schemas/Money'}
+        instrument_type: {type: string, pattern: '^[A-Z][A-Z0-9_]{1,63}$', example: SUPPLIER_CONTRACT}
+        jurisdiction: {type: string, example: GB}
+        document_hash: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        evaluated_for_at: {type: string, format: date-time}
+        term_months: {type: integer, minimum: 0, maximum: 1200}
+        options_amount: {type: string, description: 'Option value counted toward the committed value (same currency as money)'}
+        converted:
+          type: object
+          description: The committed value in the matrix currency, valued by the FX owner (Spend Controls). Never defaulted.
+          required: [amount, currency, fx_snapshot_ref]
+          properties:
+            amount: {type: string}
+            currency: {type: string}
+            fx_snapshot_ref: {type: string}
+        related_commitments:
+          type: array
+          maxItems: 100
+          description: Agreements and amendments of the same series, aggregated so a commitment cannot be split under a band
+          items:
+            type: object
+            required: [resource_id, amount, currency]
+            properties:
+              resource_id: {type: string}
+              amount: {type: string}
+              currency: {type: string}
+        risk_flags: {type: array, items: {type: string, pattern: '^[A-Z][A-Z0-9_]{1,63}$'}, description: 'RELATED_PARTY or HIGH_RISK make any instrument high-risk'}
+        context: {type: object, additionalProperties: true}
+
+    RequiredAction:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string, enum: [APPROVAL, SIGNATURE_QUORUM, SIGNER_ELIGIBILITY, LEGAL_REVIEW, RELEASE_AUTHORIZATION, REVIEW]}
+        owner: {type: string}
+        office: {type: string}
+        min_distinct_signers: {type: integer}
+        required_offices:
+          type: array
+          items:
+            type: object
+            properties:
+              office: {type: string}
+              min_count: {type: integer}
+        eligible_offices: {type: array, items: {type: string}}
+        sequencing: {type: string, enum: [PARALLEL, SEQUENTIAL]}
+        order: {type: array, items: {type: string}}
+        constraints: {type: array, items: {type: string}}
+        document_hash: {type: string}
+        detail: {type: string}
+
+    Decision:
+      type: object
+      description: ZS-GOV-INT-002 decision. integrity is an Ed25519 signature over the other members.
+      required: [contract_version, decision_id, outcome, owning_service, rule_id, tenant_id, legal_entity_id, action, resource, evaluated_at, valid_until, input_fingerprint, reason_codes, required_actions, evidence_ref, integrity]
+      properties:
+        contract_version: {type: string}
+        decision_id: {type: string, format: uuid}
+        request_id: {type: string}
+        correlation_id: {type: string}
+        outcome: {type: string, enum: [PERMIT, APPROVAL_REQUIRED, SIGNATURE_REQUIRED, REVIEW_REQUIRED, DENY, NOT_CONFIGURED, NOT_IMPLEMENTED, ERROR]}
+        owning_service: {type: string}
+        policy_family: {type: string}
+        rule_id: {type: string}
+        policy_version: {type: string, description: 'The version number; empty when no rule produced the decision'}
+        policy_id: {type: string}
+        policy_code: {type: string}
+        policy_version_id: {type: string}
+        tenant_id: {type: string}
+        legal_entity_id: {type: string}
+        actor_principal_id: {type: string}
+        action: {type: string}
+        resource: {$ref: '#/components/schemas/DecisionResource'}
+        evaluated_at: {type: string, format: date-time}
+        valid_until: {type: string, format: date-time}
+        input_fingerprint: {type: string}
+        reason_codes: {type: array, items: {type: string}}
+        required_actions: {type: array, items: {$ref: '#/components/schemas/RequiredAction'}}
+        evidence_ref: {type: string}
+        upstream_refs: {type: array, items: {type: string}}
+        detail: {type: object, additionalProperties: true}
+        integrity:
+          type: object
+          properties:
+            alg: {type: string, enum: [EdDSA]}
+            kid: {type: string}
+            value: {type: string, description: base64url signature}
+
+    DecisionKeys:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            properties:
+              kty: {type: string}
+              crv: {type: string}
+              x: {type: string}
+              kid: {type: string}
+              alg: {type: string}
+              use: {type: string}
+
+    PolicyTypes:
+      type: object
+      properties:
+        tenant_id: {type: string}
+        as_of: {type: string, format: date-time}
+        contract_version: {type: string}
+        reason_codes_version: {type: string}
+        outcomes: {type: array, items: {type: string}}
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              policy_type: {type: string}
+              owning_service: {type: string}
+              evaluation_mode: {type: string, enum: [EVALUATED_HERE, RESOLVED_HERE, REFERENCE_ONLY, UNSUPPORTED]}
+              decision_route: {type: string}
+              enforced_by: {type: array, items: {type: string}}
+              evaluable_here: {type: boolean}
+              description: {type: string}
+              spec: {type: string}
+              display_state: {type: string, enum: [EVALUABLE, CONFIGURATION_REQUIRED, DECIDED_BY_OWNING_SERVICE, NOT_IMPLEMENTED]}
+              blocking: {type: boolean}
+              message: {type: string}
+              status:
+                type: object
+                properties:
+                  policy_type: {type: string}
+                  families: {type: integer}
+                  versions_by_status: {type: object, additionalProperties: {type: integer}}
+                  governing_versions: {type: array, items: {type: object, additionalProperties: true}}
+                  decisions_24h: {type: object, additionalProperties: {type: integer}}
 
     Evaluation:
       type: object

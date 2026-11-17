@@ -14,11 +14,14 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/govdecision"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/domain"
 	"zoiko.io/policy-svc/internal/envelope"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
+	"zoiko.io/policy-svc/internal/policytype"
+	"zoiko.io/policy-svc/internal/signatory"
 	"zoiko.io/policy-svc/internal/store"
 )
 
@@ -90,6 +93,11 @@ type Options struct {
 	// Cursors signs every list's next_cursor (API-4). Nil gets a per-process
 	// random key, which is only right for tests and local runs.
 	Cursors *apicontract.CursorSigner
+	// DecisionSigner signs every canonical decision (ZS-GOV-INT-002 §2.2
+	// integrity assertion). Nil disables the signatory routes (503).
+	DecisionSigner *govdecision.Signer
+	// Decisions counts decisions by family and outcome; nil counts nothing.
+	Decisions DecisionObserver
 }
 
 // Handler holds all HTTP handler methods.
@@ -163,7 +171,9 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, legacy
 		Status:    status,
 		Code:      code,
 		Detail:    detail,
-		Retryable: status >= 500,
+		// A missing capability (501) or a payload integrity fault does not
+		// heal on retry; only an outage might.
+		Retryable: status >= 500 && status != http.StatusNotImplemented && code != codeEvidenceIntegrity,
 		Extra:     extra,
 	})
 }
@@ -552,6 +562,27 @@ type createPolicyVersionRequest struct {
 // evaluator will need (V-001 §10.1 step 2), so a version that could never be
 // evaluated is refused at authoring time, not at the first evaluation.
 func validateRulePayload(w http.ResponseWriter, r *http.Request, policyType string, payload json.RawMessage) bool {
+	switch {
+	case policyType == signatory.PolicyType:
+		// Bands, offices, sequencing and exemptions are checked whole: a
+		// matrix that could resolve ambiguously never reaches review.
+		if _, err := signatory.ParseMatrix(payload); err != nil {
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", err.Error(),
+				map[string]any{"field": "rule_payload", "policy_type": policyType})
+			return false
+		}
+		return true
+	case policytype.ReferenceOnly(policyType):
+		// A family another service decides holds a reference to that
+		// service's published rule set, never rule content of its own.
+		if err := policytype.ValidateReference(policyType, payload); err != nil {
+			info, _ := policytype.Lookup(policyType)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", err.Error(),
+				map[string]any{"field": "rule_payload", "policy_type": policyType, "owning_service": info.OwningService})
+			return false
+		}
+		return true
+	}
 	if len(payload) == 0 {
 		if policyType == policyTypeApprovalThreshold {
 			missingField(w, r, "rule_payload.threshold_amount")

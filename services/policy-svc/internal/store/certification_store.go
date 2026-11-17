@@ -255,10 +255,8 @@ func staticFindings(v *domain.PolicyVersion, policyType string, cases []*domain.
 	if v.ArtifactDigest != "sha256:"+hex.EncodeToString(sum[:]) {
 		out = append(out, "artifact_digest does not match the stored payload")
 	}
-	if policyType == evaluator.TypeApprovalThreshold {
-		if amt, ok, err := evaluator.ExactAmount(v.RulePayload, "threshold_amount"); err != nil || !ok || amt.Sign() < 0 {
-			out = append(out, "rule_payload.threshold_amount is missing, not an exact number, or negative")
-		}
+	if err := evaluator.ValidatePayload(policyType, v.RulePayload); err != nil {
+		out = append(out, err.Error())
 	}
 	if v.EffectiveTo != nil && !v.EffectiveTo.After(v.EffectiveFrom) {
 		out = append(out, "effective_to is not after effective_from")

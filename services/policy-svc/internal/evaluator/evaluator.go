@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+
+	"zoiko.io/policy-svc/internal/signatory"
 )
 
 // Version names an evaluator and its contract version; it is stored with
@@ -18,6 +20,8 @@ import (
 const (
 	TypeApprovalThreshold    = "APPROVAL_THRESHOLD"
 	VersionApprovalThreshold = "policy-svc/APPROVAL_THRESHOLD@1"
+	TypeSignatoryMatrix      = signatory.PolicyType
+	VersionSignatoryMatrix   = signatory.EvaluatorVersion
 )
 
 // Results of APPROVAL_THRESHOLD.
@@ -49,17 +53,43 @@ type Outcome struct {
 	Result           string
 	SelectedRuleIDs  []string
 	EvaluatorVersion string
+	// Signatory is the full resolution of a SIGNATORY_MATRIX evaluation
+	// (required actions, reasons, band); nil for other types.
+	Signatory *signatory.Result
 }
 
-// Supports reports whether policyType has an evaluator.
-func Supports(policyType string) bool { return policyType == TypeApprovalThreshold }
+// Supports reports whether policyType has an evaluator. Spend controls,
+// segregation of duties and legal basis never do: their owning services
+// decide them (ZS-GOV-POL-001 PD-01, PD-03).
+func Supports(policyType string) bool {
+	return policyType == TypeApprovalThreshold || policyType == TypeSignatoryMatrix
+}
 
 // VersionOf returns the evaluator version of a supported type, "" otherwise.
 func VersionOf(policyType string) string {
-	if policyType == TypeApprovalThreshold {
+	switch policyType {
+	case TypeApprovalThreshold:
 		return VersionApprovalThreshold
+	case TypeSignatoryMatrix:
+		return VersionSignatoryMatrix
 	}
 	return ""
+}
+
+// ValidatePayload reports why a stored payload cannot be evaluated, nil when
+// it can (or when the type has no evaluator to check it against).
+func ValidatePayload(policyType string, payload json.RawMessage) error {
+	switch policyType {
+	case TypeApprovalThreshold:
+		if amt, ok, err := ExactAmount(payload, "threshold_amount"); err != nil || !ok || amt.Sign() < 0 {
+			return fmt.Errorf("%w: rule_payload.threshold_amount is missing, not an exact number, or negative", ErrInvalidPayload)
+		}
+	case TypeSignatoryMatrix:
+		if _, err := signatory.ParseMatrix(payload); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidPayload, err)
+		}
+	}
+	return nil
 }
 
 // Evaluate decides actionContext under a version's payload. versionID only
@@ -68,9 +98,31 @@ func Evaluate(policyType, versionID string, payload, actionContext json.RawMessa
 	switch policyType {
 	case TypeApprovalThreshold:
 		return approvalThreshold(versionID, payload, actionContext)
+	case TypeSignatoryMatrix:
+		return signatoryMatrix(versionID, payload, actionContext)
 	default:
 		return Outcome{}, ErrNotImplemented
 	}
+}
+
+// signatoryMatrix resolves the signer requirement. Its result is the Doc 02
+// outcome itself: SIGNATURE_REQUIRED, PERMIT (explicit exemption only) or
+// NOT_CONFIGURED.
+func signatoryMatrix(versionID string, payload, actionContext json.RawMessage) (Outcome, error) {
+	m, err := signatory.ParseMatrix(payload)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("%w: %v", ErrInvalidPayload, err)
+	}
+	in, err := signatory.ParseInput(actionContext)
+	if err != nil {
+		var ie *signatory.InputError
+		if errors.As(err, &ie) {
+			return Outcome{}, &InputError{Field: ie.Field, Reason: ie.Reason, Detail: ie.Detail}
+		}
+		return Outcome{}, &InputError{Field: "action_context", Reason: "invalid", Detail: err.Error()}
+	}
+	res := signatory.Evaluate(versionID, m, in)
+	return Outcome{Result: res.Outcome, SelectedRuleIDs: res.RuleIDs, EvaluatorVersion: VersionSignatoryMatrix, Signatory: &res}, nil
 }
 
 // approvalThreshold: amount > threshold_amount is APPROVAL_REQUIRED, otherwise

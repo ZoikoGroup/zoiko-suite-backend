@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/govdecision"
 	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/policy-svc/internal/authz"
@@ -224,7 +225,9 @@ func main() {
 	// Idempotency-Key would be a second key for the same thing.
 	envelopePolicy := svcenvelope.ServicePolicy()
 	envelopePolicy.MaterialWrite = func(req *http.Request) bool {
-		if req.URL.Path == "/v1/policies/evaluate" && req.Method == http.MethodPost {
+		if req.Method == http.MethodPost && (req.URL.Path == "/v1/policies/evaluate" || req.URL.Path == handler.SignatoryResolvePath) {
+			// Evaluations, not mutations: decision_id / request_id is their
+			// replay key, and the evidence they write is their own.
 			return false
 		}
 		switch req.Method {
@@ -246,11 +249,17 @@ func main() {
 	if err != nil {
 		log.Fatal("cursor signer", zap.Error(err))
 	}
+	decisionSigner, err := newDecisionSigner(cfg, log)
+	if err != nil {
+		log.Fatal("decision signer", zap.Error(err))
+	}
 	h := handler.New(pgStore, resolutionCache, authzClient, handler.Options{
 		PlatformScopeID: cfg.AuthZPlatformScopeID,
 		EvaluateAuthz:   handler.ParseMode(cfg.EvaluateAuthz),
 		ReadAuthz:       handler.ParseMode(cfg.ReadAuthz),
 		Cursors:         cursorSigner,
+		DecisionSigner:  decisionSigner,
+		Decisions:       metrics,
 	}, log)
 	if handler.ParseMode(cfg.EvaluateAuthz) == handler.ModeWarn || handler.ParseMode(cfg.ReadAuthz) == handler.ModeWarn {
 		log.Warn("policy-svc authorization gates in WARN mode: refusals are logged, not enforced",
@@ -261,6 +270,8 @@ func main() {
 	handler.RegisterListRoutes(r, h)
 	handler.RegisterOperationRoutes(r, h)
 	handler.RegisterCertificationRoutes(r, h)
+	handler.RegisterSignatoryRoutes(r, h)
+	handler.RegisterPolicyTypeRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
@@ -334,6 +345,20 @@ func main() {
 
 // watchBacklogs exports both outboxes' backlogs every 30 seconds. Returns a
 // stop function.
+// newDecisionSigner builds the signer of canonical decisions from the
+// configured seed, or a random one in a developer tier without a seed.
+func newDecisionSigner(cfg *config.Config, log *zap.Logger) (*govdecision.Signer, error) {
+	if len(cfg.DecisionSigningSeed) == 0 {
+		log.Warn("POLICY_DECISION_SIGNING_KEY_HEX not set: decisions are signed with a per-process random key (local/dev only)")
+		return govdecision.NewRandomSigner()
+	}
+	s, err := govdecision.NewSigner(cfg.DecisionSigningSeed, cfg.DecisionSigningKeyID)
+	if err == nil {
+		log.Info("decision signing key loaded", zap.String("kid", s.KeyID))
+	}
+	return s, err
+}
+
 func watchBacklogs(st *store.PgStore, m *telemetry.Metrics, log *zap.Logger) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})

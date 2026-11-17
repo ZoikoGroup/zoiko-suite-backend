@@ -62,6 +62,8 @@ channels:
           - $ref: '#/components/messages/policy.rule.retired'
           - $ref: '#/components/messages/policy.applicability.conflicted'
           - $ref: '#/components/messages/policy.evidence.redelivery_requested'
+          # ── ZS-GOV-INT-002 §10.2 signatory matrix ──────────────────────────
+          - $ref: '#/components/messages/policy.signatory_matrix.published'
           # ── REF-07 accounting policy ───────────────────────────────────────
           - $ref: '#/components/messages/accounting.policy.approved'
           - $ref: '#/components/messages/accounting.policy.activated'
@@ -150,6 +152,7 @@ components:
     policy.rule.retired: {name: policy.rule.retired, summary: A version stopped governing (superseded or retired; previous_status says which), payload: {$ref: '#/components/schemas/Envelope'}}
     policy.applicability.conflicted: {name: policy.applicability.conflicted, summary: An evaluation found equally specific policies; none was applied (V-001 §20.1), payload: {$ref: '#/components/schemas/Envelope'}}
     policy.evidence.redelivery_requested: {name: policy.evidence.redelivery_requested, summary: An operator re-queued evidence the governance ledger refused, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.signatory_matrix.published: {name: policy.signatory_matrix.published, summary: A SIGNATORY_MATRIX version now governs, payload: {$ref: '#/components/schemas/Envelope'}}
     accounting.policy.approved: {name: accounting.policy.approved, summary: REF-07 accounting policy version approved, payload: {$ref: '#/components/schemas/Envelope'}}
     accounting.policy.activated: {name: accounting.policy.activated, summary: REF-07 accounting policy version activated, payload: {$ref: '#/components/schemas/Envelope'}}
     accounting.policy.superseded: {name: accounting.policy.superseded, summary: REF-07 accounting policy version superseded by a named successor, payload: {$ref: '#/components/schemas/Envelope'}}
