@@ -125,6 +125,8 @@ type CreateDeadlineParams struct {
 	OwnerPrincipalID                 string
 	CalcRule, CalcInputs             string
 	CreatedByPrincipalID             string
+	// CorrelationID is carried onto the deadline.created event.
+	CorrelationID string
 }
 
 // MirrorAuthoritativeDeadlineParams — BIZ-08's own
@@ -144,6 +146,8 @@ type MirrorAuthoritativeDeadlineParams struct {
 	OwnerPrincipalID                     string
 	SourceType, SourceRef, SourceVersion string
 	CreatedByPrincipalID                 string
+	// CorrelationID is carried onto the deadline.created and deadline.superseded events.
+	CorrelationID string
 }
 
 type AssignOwnerParams struct {
@@ -152,6 +156,8 @@ type AssignOwnerParams struct {
 
 type CompleteDeadlineParams struct {
 	DeadlineID, TenantID, ActorPrincipalID string
+	// CorrelationID is carried onto the deadline.completed event.
+	CorrelationID string
 }
 
 // RecalculateParams — BIZ-08's own Recalculate command. Only ever valid
@@ -201,11 +207,16 @@ type EscalateParams struct {
 // ListUpcomingParams filters ListUpcoming's read.
 type ListUpcomingParams struct {
 	TenantID, LegalEntityID, OwnerPrincipalID string
+	// ActorPrincipalID and CorrelationID are carried onto the deadline.due_soon events the
+	// read emits for deadlines it is the first to see cross the threshold.
+	ActorPrincipalID, CorrelationID string
 }
 
 // ListOverdueParams filters ListOverdue's read.
 type ListOverdueParams struct {
 	TenantID, LegalEntityID, OwnerPrincipalID string
+	// ActorPrincipalID and CorrelationID are carried onto the deadline.overdue events.
+	ActorPrincipalID, CorrelationID string
 }
 
 // ExplainCalculationResult is ExplainCalculation's own result — the

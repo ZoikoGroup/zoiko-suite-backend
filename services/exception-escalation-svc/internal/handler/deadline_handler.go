@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/exception-escalation-svc/internal/domain"
-	"zoiko.io/exception-escalation-svc/internal/events"
 	"zoiko.io/exception-escalation-svc/internal/middleware"
 	"zoiko.io/exception-escalation-svc/internal/store"
 )
@@ -86,17 +85,11 @@ func (h *deadlineHandler) CreateDeadline(w http.ResponseWriter, r *http.Request)
 		TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: req.LegalEntityID, Title: req.Title,
 		LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID, DueAt: req.DueAt,
 		OwnerPrincipalID: req.OwnerPrincipalID, CalcRule: req.CalcRule, CalcInputs: req.CalcInputs,
-		CreatedByPrincipalID: principalID,
+		CreatedByPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeDeadlineErr(w, err)
 		return
-	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "deadline.created", CaseID: d.DeadlineID, TenantID: d.TenantID, LegalEntityID: d.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
-	}); err != nil {
-		h.logger.Warn("failed to publish deadline.created event", zap.Error(err))
 	}
 	writeJSON(w, http.StatusCreated, d)
 }
@@ -139,30 +132,15 @@ func (h *deadlineHandler) MirrorAuthoritativeDeadline(w http.ResponseWriter, r *
 		return
 	}
 
-	d, supersededDeadlineID, err := h.store.MirrorAuthoritativeDeadline(r.Context(), domain.MirrorAuthoritativeDeadlineParams{
+	d, _, err := h.store.MirrorAuthoritativeDeadline(r.Context(), domain.MirrorAuthoritativeDeadlineParams{
 		TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: req.LegalEntityID, Title: req.Title,
 		LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID, DueAt: req.DueAt,
 		OwnerPrincipalID: req.OwnerPrincipalID, SourceType: req.SourceType, SourceRef: req.SourceRef, SourceVersion: req.SourceVersion,
-		CreatedByPrincipalID: principalID,
+		CreatedByPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeDeadlineErr(w, err)
 		return
-	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "deadline.created", CaseID: d.DeadlineID, TenantID: d.TenantID, LegalEntityID: d.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
-	}); err != nil {
-		h.logger.Warn("failed to publish deadline.created event", zap.Error(err))
-	}
-	if supersededDeadlineID != "" {
-		if err := h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "deadline.superseded", CaseID: supersededDeadlineID, TenantID: d.TenantID, LegalEntityID: d.LegalEntityID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-			Payload: map[string]string{"deadline_id": supersededDeadlineID, "superseded_by_deadline_id": d.DeadlineID},
-		}); err != nil {
-			h.logger.Warn("failed to publish deadline.superseded event", zap.Error(err))
-		}
 	}
 	writeJSON(w, http.StatusCreated, d)
 }
@@ -267,16 +245,11 @@ func (h *deadlineHandler) CompleteDeadline(w http.ResponseWriter, r *http.Reques
 	}
 	d, err := h.store.CompleteDeadline(r.Context(), domain.CompleteDeadlineParams{
 		DeadlineID: deadlineID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeDeadlineErr(w, err)
 		return
-	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "deadline.completed", CaseID: d.DeadlineID, TenantID: d.TenantID, LegalEntityID: d.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
-	}); err != nil {
-		h.logger.Warn("failed to publish deadline.completed event", zap.Error(err))
 	}
 	writeJSON(w, http.StatusOK, d)
 }
@@ -468,20 +441,13 @@ func (h *deadlineHandler) ListUpcoming(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	deadlines, justNotifiedIDs, err := h.store.ListUpcoming(r.Context(), domain.ListUpcomingParams{
+	deadlines, _, err := h.store.ListUpcoming(r.Context(), domain.ListUpcomingParams{
 		TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID, OwnerPrincipalID: r.URL.Query().Get("owner_principal_id"),
+		ActorPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeDeadlineErr(w, err)
 		return
-	}
-	for _, id := range justNotifiedIDs {
-		if err := h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "deadline.due_soon", CaseID: id, TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: map[string]string{"deadline_id": id},
-		}); err != nil {
-			h.logger.Warn("failed to publish deadline.due_soon event", zap.Error(err))
-		}
 	}
 	if deadlines == nil {
 		deadlines = []domain.Deadline{}
@@ -506,20 +472,13 @@ func (h *deadlineHandler) ListOverdue(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	deadlines, justNotifiedIDs, err := h.store.ListOverdue(r.Context(), domain.ListOverdueParams{
+	deadlines, _, err := h.store.ListOverdue(r.Context(), domain.ListOverdueParams{
 		TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID, OwnerPrincipalID: r.URL.Query().Get("owner_principal_id"),
+		ActorPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeDeadlineErr(w, err)
 		return
-	}
-	for _, id := range justNotifiedIDs {
-		if err := h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "deadline.overdue", CaseID: id, TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: map[string]string{"deadline_id": id},
-		}); err != nil {
-			h.logger.Warn("failed to publish deadline.overdue event", zap.Error(err))
-		}
 	}
 	if deadlines == nil {
 		deadlines = []domain.Deadline{}

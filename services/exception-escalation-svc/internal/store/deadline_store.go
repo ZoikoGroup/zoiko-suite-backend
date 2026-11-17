@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -95,6 +96,9 @@ func (s *PgStore) CreateDeadline(ctx context.Context, p domain.CreateDeadlinePar
 	if err != nil {
 		return nil, fmt.Errorf("insert deadline: %w", err)
 	}
+	if err := s.enqueueDeadlineEvent(ctx, tx, deadlineCreatedEvent, p.CorrelationID, p.CreatedByPrincipalID, d.TenantID, d.LegalEntityID, d.DeadlineID, deadlineEventData(d)); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -166,6 +170,12 @@ func (s *PgStore) MirrorAuthoritativeDeadline(ctx context.Context, p domain.Mirr
 			return nil, "", err
 		}
 		supersededID = existing.DeadlineID
+		sup := deadlineEventData(existing)
+		sup["status"] = string(domain.DeadlineStatusSuperseded)
+		sup["superseded_by_deadline_id"] = deadlineID
+		if err := s.enqueueDeadlineEvent(ctx, tx, deadlineSupersededEvent, p.CorrelationID, p.CreatedByPrincipalID, existing.TenantID, existing.LegalEntityID, existing.DeadlineID, sup); err != nil {
+			return nil, "", err
+		}
 	}
 
 	row := tx.QueryRow(ctx, `INSERT INTO deadlines (
@@ -177,6 +187,9 @@ func (s *PgStore) MirrorAuthoritativeDeadline(ctx context.Context, p domain.Mirr
 	d, err := scanDeadline(row)
 	if err != nil {
 		return nil, "", fmt.Errorf("insert deadline: %w", err)
+	}
+	if err := s.enqueueDeadlineEvent(ctx, tx, deadlineCreatedEvent, p.CorrelationID, p.CreatedByPrincipalID, d.TenantID, d.LegalEntityID, d.DeadlineID, deadlineEventData(d)); err != nil {
+		return nil, "", err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -285,6 +298,14 @@ func (s *PgStore) CompleteDeadline(ctx context.Context, p domain.CompleteDeadlin
 		WHERE deadline_id=$1 AND tenant_id=$2 RETURNING `+deadlineColumns,
 		p.DeadlineID, p.TenantID, p.ActorPrincipalID))
 	if err != nil {
+		return nil, err
+	}
+	done := deadlineEventData(d)
+	if d.CompletedAt != nil {
+		done["completed_at"] = d.CompletedAt.UTC().Format(time.RFC3339)
+	}
+	done["completed_by_principal_id"] = p.ActorPrincipalID
+	if err := s.enqueueDeadlineEvent(ctx, tx, deadlineCompletedEvent, p.CorrelationID, p.ActorPrincipalID, d.TenantID, d.LegalEntityID, d.DeadlineID, done); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -504,6 +525,10 @@ func (s *PgStore) ListUpcoming(ctx context.Context, p domain.ListUpcomingParams)
 		if _, err := tx.Exec(ctx, `UPDATE deadlines SET due_soon_notified_at=now() WHERE deadline_id=$1 AND tenant_id=$2`, out[i].DeadlineID, p.TenantID); err != nil {
 			return nil, nil, err
 		}
+		// The event is committed with the stamp: a failed publish can no longer lose it.
+		if err := s.enqueueDeadlineEvent(ctx, tx, deadlineDueSoonEvent, p.CorrelationID, p.ActorPrincipalID, out[i].TenantID, out[i].LegalEntityID, out[i].DeadlineID, deadlineEventData(&out[i])); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, err
@@ -562,6 +587,9 @@ func (s *PgStore) ListOverdue(ctx context.Context, p domain.ListOverdueParams) (
 			continue
 		}
 		if _, err := tx.Exec(ctx, `UPDATE deadlines SET overdue_notified_at=now() WHERE deadline_id=$1 AND tenant_id=$2`, out[i].DeadlineID, p.TenantID); err != nil {
+			return nil, nil, err
+		}
+		if err := s.enqueueDeadlineEvent(ctx, tx, deadlineOverdueEvent, p.CorrelationID, p.ActorPrincipalID, out[i].TenantID, out[i].LegalEntityID, out[i].DeadlineID, deadlineEventData(&out[i])); err != nil {
 			return nil, nil, err
 		}
 	}

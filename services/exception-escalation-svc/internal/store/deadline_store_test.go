@@ -12,7 +12,7 @@ import (
 
 func TestPgStore_CreateDeadline_LandsScheduled(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	due := time.Now().UTC().Add(72 * time.Hour)
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
@@ -32,14 +32,14 @@ func TestPgStore_CreateDeadline_LandsScheduled(t *testing.T) {
 
 func TestPgStore_GetDeadline_UnknownDeadline_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	_, err := s.GetDeadline(ctx(), "deadline-does-not-exist")
 	require.ErrorIs(t, err, domain.ErrDeadlineNotFound)
 }
 
 func TestPgStore_MirrorAuthoritativeDeadline_RequiresSourceFields(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	_, _, err := s.MirrorAuthoritativeDeadline(ctx(), domain.MirrorAuthoritativeDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "GST return", DueAt: time.Now().UTC().Add(24 * time.Hour),
 		CreatedByPrincipalID: "creator-1",
@@ -49,7 +49,7 @@ func TestPgStore_MirrorAuthoritativeDeadline_RequiresSourceFields(t *testing.T) 
 
 func TestPgStore_MirrorAuthoritativeDeadline_ThenGetSourceDeadline(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	due := time.Now().UTC().Add(48 * time.Hour)
 	d, superseded, err := s.MirrorAuthoritativeDeadline(ctx(), domain.MirrorAuthoritativeDeadlineParams{
@@ -75,7 +75,7 @@ func TestPgStore_MirrorAuthoritativeDeadline_ThenGetSourceDeadline(t *testing.T)
 // marks the prior one SUPERSEDED, rather than mutating due_at in place.
 func TestPgStore_MirrorAuthoritativeDeadline_ReMirrorSupersedesUntouchedRow(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	due1 := time.Now().UTC().Add(48 * time.Hour)
 	first, _, err := s.MirrorAuthoritativeDeadline(ctx(), domain.MirrorAuthoritativeDeadlineParams{
@@ -111,7 +111,7 @@ func TestPgStore_MirrorAuthoritativeDeadline_ReMirrorSupersedesUntouchedRow(t *t
 // acted on.
 func TestPgStore_MirrorAuthoritativeDeadline_ConflictsWithLocallyCompletedRow(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	due := time.Now().UTC().Add(48 * time.Hour)
 	first, _, err := s.MirrorAuthoritativeDeadline(ctx(), domain.MirrorAuthoritativeDeadlineParams{
@@ -137,7 +137,7 @@ func TestPgStore_MirrorAuthoritativeDeadline_ConflictsWithLocallyCompletedRow(t 
 
 func TestPgStore_MirrorAuthoritativeDeadline_SameVersionReturnsExistingRow(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	due := time.Now().UTC().Add(48 * time.Hour)
 	first, _, err := s.MirrorAuthoritativeDeadline(ctx(), domain.MirrorAuthoritativeDeadlineParams{
@@ -157,7 +157,7 @@ func TestPgStore_MirrorAuthoritativeDeadline_SameVersionReturnsExistingRow(t *te
 
 func TestPgStore_AssignOwner_ThenComplete_ThenRejectsDoubleComplete(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Vendor onboarding checklist",
@@ -191,7 +191,7 @@ func TestPgStore_AssignOwner_ThenComplete_ThenRejectsDoubleComplete(t *testing.T
 // and then tampered with under the same RLS-visible tenant.
 func TestPgStore_DeadlineEscalations_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Vendor onboarding checklist",
@@ -216,7 +216,7 @@ func TestPgStore_DeadlineEscalations_AreAppendOnly(t *testing.T) {
 
 func TestPgStore_Recalculate_MovesDueAtAndResetsNotifications(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	due := time.Now().UTC().Add(1 * time.Hour) // within the due-soon window
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
@@ -247,7 +247,7 @@ func TestPgStore_Recalculate_MovesDueAtAndResetsNotifications(t *testing.T) {
 // source."
 func TestPgStore_Recalculate_RefusedOnMirroredDeadline(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, _, err := s.MirrorAuthoritativeDeadline(ctx(), domain.MirrorAuthoritativeDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "GST return due",
@@ -265,7 +265,7 @@ func TestPgStore_Recalculate_RefusedOnMirroredDeadline(t *testing.T) {
 
 func TestPgStore_Waive_ThenRejectsSecondWaive(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Optional internal review",
@@ -284,7 +284,7 @@ func TestPgStore_Waive_ThenRejectsSecondWaive(t *testing.T) {
 
 func TestPgStore_CancelDeadline_ThenRejectsCancelOfTerminalDeadline(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Draft process improvement",
@@ -302,7 +302,7 @@ func TestPgStore_CancelDeadline_ThenRejectsCancelOfTerminalDeadline(t *testing.T
 
 func TestPgStore_Escalate_RecordsEvidenceWithoutChangingStatus(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Vendor SLA review",
@@ -325,7 +325,7 @@ func TestPgStore_Escalate_RecordsEvidenceWithoutChangingStatus(t *testing.T) {
 
 func TestPgStore_Escalate_RefusedOnTerminalDeadline(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Vendor SLA review",
@@ -346,7 +346,7 @@ func TestPgStore_Escalate_RefusedOnTerminalDeadline(t *testing.T) {
 // ever reported in justNotifiedIDs on the call that first observes it.
 func TestPgStore_ListUpcoming_NotifiesOnceThenNotAgain(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Close monthly books",
@@ -369,7 +369,7 @@ func TestPgStore_ListUpcoming_NotifiesOnceThenNotAgain(t *testing.T) {
 // negative-controlled sibling for overdue_notified_at.
 func TestPgStore_ListOverdue_NotifiesOnceThenNotAgain(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Expired filing checklist",
@@ -390,7 +390,7 @@ func TestPgStore_ListOverdue_NotifiesOnceThenNotAgain(t *testing.T) {
 
 func TestPgStore_ExplainCalculation_OwnVsMirrored(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	own, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Close monthly books",

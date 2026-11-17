@@ -2,7 +2,7 @@
 
 **Service host:** exception-escalation-svc (BIZ-08 is bolted onto this service, beside the exception cases, audit findings and BIZ-05 tasks; tables `deadlines`, `deadline_escalations`, `deadline_due_history`)
 **Assessed against:** `ZoikoSuite_Business_Operations_Content_Services_Detailed_Service_Specifications_v1_0` (ZS-SVC-P-001) section 10
-**Status: NOT CERTIFIED.** The command and query set is implemented. Three defects were found and fixed in this audit. The spec's calendar/timezone inputs, supervisor separation of duties, exception-on-source-conflict and reliable event delivery are open, and the spec says calendar/timezone ambiguity alone blocks certification.
+**Status: NOT CERTIFIED.** The command and query set is implemented. Three defects were found and fixed in this audit, and the five events now go through the shared eventing outbox. The spec's calendar/timezone inputs, supervisor separation of duties and exception-on-source-conflict are open, and the spec says calendar/timezone ambiguity alone blocks certification.
 
 A certificate listing only successes certifies nothing, so the last two sections say what was **not** verified.
 
@@ -16,7 +16,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Authorization / SoD | `DEADLINE_CREATE` for create and mirror, `DEADLINE_MANAGE` for everything else. Fail-closed. **No owner-plus-supervisor separation**: any holder of `DEADLINE_MANAGE` can complete, waive or cancel any deadline in the entity, including their own | handler |
 | Manual override needs reason/authority | Waive and Cancel already required a reason. **Recalculate did not: fixed in this audit** (below). The "authority" part is only the `DEADLINE_MANAGE` action | handler, store |
 | Mirrored statutory/legal dates cannot be silently overridden | Enforced: Recalculate refuses a mirrored deadline; a re-mirror with a changed source version over a row a human already completed, waived or cancelled is refused with `DEADLINE_SOURCE_CONFLICT`; an untouched row is superseded cleanly. A partial unique index allows one live row per source | store, migration 000004 |
-| Events (5) | `deadline.created`, `deadline.due_soon`, `deadline.overdue`, `deadline.completed`, `deadline.superseded` are published by the handler **after** the commit and a failure is only logged. Not on the shared eventing outbox, no schemas, no catalogue entries. See open item 1 | handler, `internal/events` |
+| Events (5) | `deadline.created`, `deadline.superseded`, `deadline.completed`, `deadline.due_soon` and `deadline.overdue` are written to the shared eventing outbox in the same transaction as the change (and, for due-soon and overdue, as the notified stamp), as `com.zoikosuite.business.deadline.created`, `superseded`, `completed`, `became-due-soon` and `became-overdue`, with payload schemas in `contracts/events` enforced by the store tests and extension catalogue entries (producer Exception Escalation Service). The catalogue's section 19 entry `business.deadline.due` (producer "Deadline Service", no deployed owner) overlaps the last two and is unreconciled | `internal/store/eventing_events.go`, `contracts/events` |
 | Failure: calendar/timezone/rule ambiguity blocks certification | **Not implemented.** No timezone, business calendar, deadline rule/profile or escalation plan is stored or evaluated; `due_at` is supplied by the caller and `calc_rule` is free text | — |
 | Failure: authoritative source conflict creates an exception | **Not implemented.** The conflict is refused (409) but no exception case is created, although this service owns exception cases | `MirrorAuthoritativeDeadline` |
 | Evidence: source trigger/version, rule, calendar, timezone, calculation, overrides, escalation, completion | Source ref and version, rule and inputs (at creation), escalation rows (append-only), completion and waiver actors and times are recorded. **Overrides were not kept: fixed in this audit.** Calendar and timezone are not recorded | tables |
@@ -55,18 +55,24 @@ new tests
 
 Date: 2026-11-17. The Postgres container was disposable and has been removed.
 
+## Event migration (after the audit)
+
+- The handler used to publish these events after the commit and only log a failure; for due-soon and overdue the notified timestamp was committed first, so a failed publish was never retried. They are now enqueued in the same transaction (migration 000007 equals `outbox.SchemaSQL`, checked by a test). A failed enqueue rolls the change and the stamp back (tested).
+- `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a relay delivers `eventing_outbox` and is not started when there is no database or no Kafka brokers, and the Docker build context moved to `services/` (Dockerfile, `Dockerfile.dockerignore`, `docker-compose.phase5.yml`). The service's other events (exception cases, findings, tasks) still use the direct publisher and are untouched.
+- Verified: full suite passes against Postgres 16, a deliberately broken schema fails the store test, the image builds and the container refuses to start without the region. Not verified: a started container with a database, and delivery through a real Kafka broker.
+
 ## NOT verified
 
 - No Docker image build or container run, and the docker-compose stack was not run.
 - Real authorization-svc decisions for `DEADLINE_CREATE` and `DEADLINE_MANAGE` (tests use a stub), and that the actions are registered there.
 - The rest of the store suite runs as the connecting superuser; only the new isolation test uses a non-superuser role.
-- No event was delivered through Kafka; event delivery is not reliable (open item 1).
+- No event was delivered through Kafka.
 - `ListUpcoming` and `ListOverdue` take row locks and stamp the "notified" timestamp on a read. Concurrent reads were not tested.
 - Whether anything consumes the deadline events (BIZ-05 tasks, BIZ-10 notifications): no link was found.
 
 ## Open items to reach certification
 
-1. **Events can be lost.** They are published after the commit and a failure is only logged. For `due_soon` and `overdue` the "notified" timestamp is committed by the read first, so a failed publish is never retried. Move the five events to the shared eventing outbox (in the same transaction as the change and the stamp), with canonical names, schemas and catalogue entries, as done for BIZ-01, BIZ-02, BIZ-03 and BIZ-06. `DeadlineSuperseded` and the other publishes use a fixed `deadline.*` naming outside the catalogue.
+1. ~~Events can be lost: move the five events to the shared eventing outbox.~~ Done (see "Event migration"). Still to do: reconcile the catalogue's unowned `business.deadline.due` with `became-due-soon` and `became-overdue`.
 2. Store and evaluate the spec's required inputs: timezone, business calendar (REF-10), deadline rule/profile and escalation plan; record them as evidence. Without them due-date calculation is caller-supplied and the calendar/timezone ambiguity the spec says blocks certification cannot be ruled out.
 3. On `DEADLINE_SOURCE_CONFLICT`, create an exception case in this service instead of only refusing.
 4. Owner plus supervisor separation of duties: decide who may waive or cancel (not the owner), and add the check.

@@ -19,7 +19,7 @@ import (
 // in place and the old value was gone.
 func TestPgStore_Recalculate_RequiresReasonAndKeepsHistory(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	due := time.Now().UTC().Add(100 * time.Hour)
 	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "Quarterly review", DueAt: due,
@@ -62,7 +62,7 @@ func TestPgStore_Recalculate_RequiresReasonAndKeepsHistory(t *testing.T) {
 // completed the local row; only a CHANGED source version over an acted-on row is a conflict.
 func TestPgStore_MirrorAuthoritativeDeadline_ReplayAfterCompletionIsNotAConflict(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	due := time.Now().UTC().Add(48 * time.Hour)
 	p := domain.MirrorAuthoritativeDeadlineParams{
 		TenantID: "default", LegalEntityID: "le-1", Title: "VAT return", DueAt: due,
@@ -90,7 +90,7 @@ func TestPgStore_MirrorAuthoritativeDeadline_ReplayAfterCompletionIsNotAConflict
 func TestPgStore_Deadline_TenantIsolation(t *testing.T) {
 	admin := requireTestDB(t)
 	app := nonSuperuserPool(t, admin)
-	s := store.NewPgStore(app)
+	s := store.NewPgStore(app, store.WithEventRegion("local"))
 	ctxA := ctx()
 	ctxB := middleware.WithTenant(context.Background(), "tenant-b")
 

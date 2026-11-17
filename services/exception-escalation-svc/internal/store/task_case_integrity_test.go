@@ -21,7 +21,7 @@ func newTaskParams(entity, caseID, linked string) domain.CreateTaskParams {
 // A task may only join an existing, OPEN case of its own legal entity (and tenant).
 func TestPgStore_CreateTask_CaseMustExistBeOpenAndMatchEntity(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	_, err := s.CreateTask(ctx(), newTaskParams("le-1", "case-does-not-exist", "ci-1"))
 	require.ErrorIs(t, err, domain.ErrCaseNotFound)
@@ -52,7 +52,7 @@ func TestPgStore_CreateTask_CaseMustExistBeOpenAndMatchEntity(t *testing.T) {
 // open again.
 func TestPgStore_ReopenTask_FromClosed_ClearsClosedFields(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c, err := s.CreateCase(ctx(), domain.CreateCaseParams{TenantID: "default", LegalEntityID: "le-1", CaseType: "REVIEW", CreatedByPrincipalID: "owner-1"})
 	require.NoError(t, err)
@@ -84,7 +84,7 @@ func TestPgStore_ReopenTask_FromClosed_ClearsClosedFields(t *testing.T) {
 // tenant A's case and task, and nothing it attempts changes A's data.
 func TestPgStore_Task_TenantIsolation(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	ctxB := middleware.WithTenant(context.Background(), "tenant-b")
 
 	c, err := s.CreateCase(ctx(), domain.CreateCaseParams{TenantID: "default", LegalEntityID: "le-iso", CaseType: "REVIEW", CreatedByPrincipalID: "owner-1"})
