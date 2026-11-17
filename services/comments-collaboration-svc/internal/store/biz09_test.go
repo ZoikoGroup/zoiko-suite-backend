@@ -14,7 +14,7 @@ import (
 // body. The original text stays in the append-only history (the evidence), and the comment
 // row records who deleted it and why.
 func TestPgStore_ListComments_RedactsADeletedCommentsBody(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	c, thread, err := s.AddComment(ctx(), addParams("default", "doc-redact", "secret text", nil))
 	require.NoError(t, err)
 	keep, _, err := s.AddComment(ctx(), addParams("default", "doc-redact", "visible text", nil))
@@ -48,7 +48,7 @@ func TestPgStore_ListComments_RedactsADeletedCommentsBody(t *testing.T) {
 // and comment, A's data is unchanged, and a raw count under B's context sees no rows.
 func TestPgStore_Writes_AreTenantIsolated(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.NewPgStore(requireRLSPool(t, admin))
+	s := store.NewPgStore(requireRLSPool(t, admin), store.WithEventRegion("local"))
 	c, thread, err := s.AddComment(ctx(), addParams("default", "doc-iso", "mine", nil))
 	require.NoError(t, err)
 	other := ctxFor("other-tenant")

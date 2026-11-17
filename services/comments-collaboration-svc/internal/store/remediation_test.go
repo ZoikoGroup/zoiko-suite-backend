@@ -60,7 +60,7 @@ func addParams(tenant, object, body string, i *domain.Idempotency) domain.AddCom
 // ── restricted flag ──────────────────────────────────────────────────────────
 
 func TestPgStore_Restricted_IsThreadLevel_MismatchRefused(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 
 	p := addParams("default", "doc-r1", "secret", nil)
 	p.Restricted = true
@@ -97,7 +97,7 @@ func TestPgStore_Restricted_IsThreadLevel_MismatchRefused(t *testing.T) {
 
 func TestPgStore_Reads_AreTenantIsolated(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.NewPgStore(requireRLSPool(t, admin))
+	s := store.NewPgStore(requireRLSPool(t, admin), store.WithEventRegion("local"))
 	comment, thread, err := s.AddComment(ctx(), addParams("default", "doc-x", "mine", nil))
 	require.NoError(t, err)
 
@@ -121,7 +121,7 @@ func TestPgStore_Reads_AreTenantIsolated(t *testing.T) {
 // ── idempotency ──────────────────────────────────────────────────────────────
 
 func TestPgStore_Idempotency_FirstThenExactReplay(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 
 	i1 := idem("p1", "AddComment", "key-1", "h1")
 	c1, th1, err := s.AddComment(ctx(), addParams("default", "doc-i1", "once", i1))
@@ -142,7 +142,7 @@ func TestPgStore_Idempotency_FirstThenExactReplay(t *testing.T) {
 }
 
 func TestPgStore_Idempotency_SameKeyDifferentRequest_Conflicts(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	_, th, err := s.AddComment(ctx(), addParams("default", "doc-i2", "a", idem("p1", "AddComment", "k", "hash-a")))
 	require.NoError(t, err)
 
@@ -155,7 +155,7 @@ func TestPgStore_Idempotency_SameKeyDifferentRequest_Conflicts(t *testing.T) {
 }
 
 func TestPgStore_Idempotency_ConcurrentReplay_CreatesExactlyOne(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 
 	const n = 12
 	ids := make([]string, n)
@@ -188,7 +188,7 @@ func TestPgStore_Idempotency_ConcurrentReplay_CreatesExactlyOne(t *testing.T) {
 }
 
 func TestPgStore_Idempotency_ScopedByTenantAndPrincipal(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 
 	a, _, err := s.AddComment(ctx(), addParams("default", "doc-s", "x", idem("p1", "AddComment", "shared", "h")))
 	require.NoError(t, err)
@@ -216,7 +216,7 @@ func TestPgStore_Idempotency_ScopedByTenantAndPrincipal(t *testing.T) {
 }
 
 func TestPgStore_Idempotency_OtherWrites_ReplayWithoutDuplicates(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	comment, thread, err := s.AddComment(ctx(), addParams("default", "doc-w", "base", nil))
 	require.NoError(t, err)
 
@@ -288,7 +288,7 @@ func TestPgStore_Idempotency_OtherWrites_ReplayWithoutDuplicates(t *testing.T) {
 }
 
 func TestPgStore_Idempotency_FailedMutationReleasesTheKey(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	// Edit of an unknown comment fails and rolls back the claim; the key is
 	// not burned and a later valid use of it succeeds.
 	_, err := s.EditComment(ctx(), domain.EditCommentParams{CommentID: "nope", TenantID: "default", ActorPrincipalID: "p1", Body: "x", Idem: idem("p1", "EditComment", "burn", "h")})
@@ -308,7 +308,7 @@ func TestPgStore_IdempotencyKeys_ForceRLS(t *testing.T) {
 	require.True(t, forced)
 
 	rls := requireRLSPool(t, pool)
-	s := store.NewPgStore(rls)
+	s := store.NewPgStore(rls, store.WithEventRegion("local"))
 	_, _, err := s.AddComment(ctx(), addParams("default", "doc-rls", "x", idem("p1", "AddComment", "rls", "h")))
 	require.NoError(t, err)
 	// As a non-superuser with no tenant set, FORCE RLS shows no rows; with

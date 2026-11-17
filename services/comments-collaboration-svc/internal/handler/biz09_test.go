@@ -21,7 +21,7 @@ func TestEdit_OnlyTheAuthorMayEdit(t *testing.T) {
 	if w := do(r, http.MethodPost, "/v1/comments/comment-1/edit", map[string]string{"body": "rewritten"}, "someone-else", nil); w.Code != http.StatusForbidden {
 		t.Fatalf("a non-author edit must be 403, got %d: %s", w.Code, w.Body.String())
 	}
-	if st.comments["comment-1"].CurrentBody != "hello" || pub.calls != 0 {
+	if st.comments["comment-1"].CurrentBody != "hello" || pub.n() != 0 {
 		t.Fatal("a refused edit must change nothing and publish nothing")
 	}
 	if w := do(r, http.MethodPost, "/v1/comments/comment-1/edit", map[string]string{"body": "mine"}, "author-1", nil); w.Code != http.StatusOK {
@@ -71,7 +71,7 @@ func TestModerate_UsesTheModerationActionAndRefusesSelfModeration(t *testing.T) 
 	if w := do(r, http.MethodPost, "/v1/comments/comment-1/moderate", body, "mod-1", nil); w.Code != http.StatusForbidden {
 		t.Fatalf("COMMENT_MANAGE alone must not allow moderation, got %d", w.Code)
 	}
-	if len(st.trail["comment-1"]) != 0 || pub.calls != 0 {
+	if len(st.trail["comment-1"]) != 0 || pub.n() != 0 {
 		t.Fatal("a refused moderation must leave no trail and publish nothing")
 	}
 
@@ -115,7 +115,7 @@ func TestRestrictedThread_WritesRequireRestrictedRead(t *testing.T) {
 		if w.Code != http.StatusForbidden {
 			t.Errorf("%s on a restricted thread without COMMENT_READ_RESTRICTED: got %d, want 403", c.name, w.Code)
 		}
-		if pub.calls != 0 || st.comments["comment-1"].Status != "ACTIVE" || st.threads["thread-1"].Status != "ACTIVE" {
+		if pub.n() != 0 || st.comments["comment-1"].Status != "ACTIVE" || st.threads["thread-1"].Status != "ACTIVE" {
 			t.Errorf("%s: a refused write changed state or published", c.name)
 		}
 		found := false

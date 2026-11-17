@@ -182,6 +182,8 @@ type AddCommentParams struct {
 	Body                 string
 	CreatedByPrincipalID string
 	Idem                 *Idempotency
+	// CorrelationID is carried onto the comment.added event.
+	CorrelationID string
 }
 
 // EditCommentParams — BIZ-09's own EditComment command. Never mutates an
@@ -189,6 +191,8 @@ type AddCommentParams struct {
 type EditCommentParams struct {
 	CommentID, TenantID, ActorPrincipalID, Body string
 	Idem                                        *Idempotency
+	// CorrelationID is carried onto the comment.edited event.
+	CorrelationID string
 }
 
 // DeleteCommentParams — BIZ-09's own DeleteComment command. Never a hard
@@ -209,6 +213,9 @@ type MentionParams struct {
 	CommentID, TenantID, MentionedPrincipalID string
 	VisibilityGranted                         bool
 	Idem                                      *Idempotency
+	// ActorPrincipalID is the principal who made the mention (the event's actor);
+	// CorrelationID is carried onto the mention.created event.
+	ActorPrincipalID, CorrelationID string
 }
 
 type ReactParams struct {
@@ -222,12 +229,16 @@ type ReactParams struct {
 type ModerateParams struct {
 	CommentID, TenantID, ModeratorPrincipalID, Action, Reason string
 	Idem                                                      *Idempotency
+	// CorrelationID is carried onto the comment.moderated event.
+	CorrelationID string
 }
 
 // ResolveThreadParams — BIZ-09's own ResolveThread command.
 type ResolveThreadParams struct {
 	ThreadID, TenantID, ActorPrincipalID, ResolutionNote string
 	Idem                                                 *Idempotency
+	// CorrelationID is carried onto the thread.resolved event.
+	CorrelationID string
 }
 
 // AttachReferenceParams — BIZ-09's own AttachReference command. Never

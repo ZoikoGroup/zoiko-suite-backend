@@ -26,6 +26,11 @@ type stubStore struct {
 	trail     map[string][]domain.ModerationEntry
 	reactions map[string]bool // "comment|principal|type" -> exists
 
+	// events counts the events the real store writes in the same transaction as each
+	// AddComment, EditComment, Moderate, Mention and ResolveThread, so a test can show a
+	// refused request announced nothing.
+	events int
+
 	addCommentErr  error
 	editCommentErr error
 }
@@ -55,6 +60,7 @@ func (s *stubStore) AddComment(_ context.Context, p domain.AddCommentParams) (*d
 	}
 	s.threads[t.ThreadID] = t
 	s.comments[c.CommentID] = c
+	s.events++
 	return c, t, nil
 }
 
@@ -68,6 +74,7 @@ func (s *stubStore) EditComment(_ context.Context, p domain.EditCommentParams) (
 	}
 	c.Status = domain.CommentStatusEdited
 	c.CurrentBody = p.Body
+	s.events++
 	return c, nil
 }
 
@@ -114,6 +121,7 @@ func (s *stubStore) DeleteComment(_ context.Context, p domain.DeleteCommentParam
 func (s *stubStore) Mention(_ context.Context, p domain.MentionParams) (*domain.Mention, error) {
 	m := &domain.Mention{MentionID: "mention-1", CommentID: p.CommentID, TenantID: p.TenantID, MentionedPrincipalID: p.MentionedPrincipalID, VisibilityGranted: p.VisibilityGranted}
 	s.mentions[p.CommentID] = append(s.mentions[p.CommentID], *m)
+	s.events++
 	return m, nil
 }
 
@@ -134,6 +142,7 @@ func (s *stubStore) Moderate(_ context.Context, p domain.ModerateParams) (*domai
 	}
 	c.Status = domain.CommentStatusModerated
 	c.ModerationReason = p.Reason
+	s.events++
 	s.trail[p.CommentID] = append(s.trail[p.CommentID], domain.ModerationEntry{ModerationID: "modtrail-1", CommentID: p.CommentID, ModeratorPrincipalID: p.ModeratorPrincipalID, Action: p.Action, Reason: p.Reason})
 	return c, nil
 }
@@ -145,6 +154,7 @@ func (s *stubStore) ResolveThread(_ context.Context, p domain.ResolveThreadParam
 	}
 	t.Status = domain.ThreadStatusResolved
 	t.ResolutionNote = p.ResolutionNote
+	s.events++
 	return t, nil
 }
 
@@ -161,24 +171,6 @@ func (s *stubStore) GetMentions(_ context.Context, _, commentID string) ([]domai
 
 func (s *stubStore) GetModerationTrail(_ context.Context, _, commentID string) ([]domain.ModerationEntry, error) {
 	return s.trail[commentID], nil
-}
-
-type stubPublisher struct{ calls int }
-
-func (p *stubPublisher) PublishCommentAdded(_ context.Context, _, _, _, _ string, _ domain.Comment, _ domain.CommentThread) {
-	p.calls++
-}
-func (p *stubPublisher) PublishCommentEdited(_ context.Context, _, _, _, _ string, _ domain.Comment) {
-	p.calls++
-}
-func (p *stubPublisher) PublishCommentModerated(_ context.Context, _, _, _, _ string, _ domain.Comment) {
-	p.calls++
-}
-func (p *stubPublisher) PublishMentionCreated(_ context.Context, _, _, _, _ string, _ domain.Mention) {
-	p.calls++
-}
-func (p *stubPublisher) PublishThreadResolved(_ context.Context, _, _, _, _ string, _ domain.CommentThread) {
-	p.calls++
 }
 
 type stubRetention struct {
@@ -208,8 +200,8 @@ func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, actionType string) err
 	return nil
 }
 
-func newTestHandler(st *stubStore, pub *stubPublisher, az *stubAuthZ) (*handler.Handler, *chi.Mux) {
-	h := handler.New(st, pub, az, zap.NewNop()).WithRetentionClient(&stubRetention{})
+func newTestHandler(st *stubStore, az *stubAuthZ) (*handler.Handler, *chi.Mux) {
+	h := handler.New(st, az, zap.NewNop()).WithRetentionClient(&stubRetention{})
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 	return h, r
@@ -222,8 +214,8 @@ func withTenant(req *http.Request) *http.Request {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 func TestAddComment_HappyPath(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
-	_, r := newTestHandler(st, pub, az)
+	st, az := newStubStore(), &stubAuthZ{}
+	_, r := newTestHandler(st, az)
 
 	body, _ := json.Marshal(map[string]any{
 		"legal_entity_id": "le-1", "linked_object_type": "DOCUMENT", "linked_object_id": "doc-1", "body": "hello",
@@ -236,14 +228,14 @@ func TestAddComment_HappyPath(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
-	if pub.calls != 1 {
-		t.Fatalf("expected 1 published event, got %d", pub.calls)
+	if st.events != 1 {
+		t.Fatalf("expected 1 published event, got %d", st.events)
 	}
 }
 
 func TestAddComment_MissingPrincipal_Returns401(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
-	_, r := newTestHandler(st, pub, az)
+	st, az := newStubStore(), &stubAuthZ{}
+	_, r := newTestHandler(st, az)
 
 	body, _ := json.Marshal(map[string]any{
 		"legal_entity_id": "le-1", "linked_object_type": "DOCUMENT", "linked_object_id": "doc-1", "body": "hello",
@@ -258,8 +250,8 @@ func TestAddComment_MissingPrincipal_Returns401(t *testing.T) {
 }
 
 func TestAddComment_MissingFields_Returns400(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
-	_, r := newTestHandler(st, pub, az)
+	st, az := newStubStore(), &stubAuthZ{}
+	_, r := newTestHandler(st, az)
 
 	body, _ := json.Marshal(map[string]any{"legal_entity_id": "le-1"})
 	req := withTenant(httptest.NewRequest(http.MethodPost, "/v1/threads/comments", bytes.NewReader(body)))
@@ -276,8 +268,8 @@ func TestAddComment_MissingFields_Returns400(t *testing.T) {
 // fetch/authorize-before-mutate: a denied AddComment must never reach the
 // store or publish an event.
 func TestAddComment_AuthzDenied_Returns403_NeverPublishes(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{denyAction: "COMMENT_CREATE"}
-	_, r := newTestHandler(st, pub, az)
+	st, az := newStubStore(), &stubAuthZ{denyAction: "COMMENT_CREATE"}
+	_, r := newTestHandler(st, az)
 
 	body, _ := json.Marshal(map[string]any{
 		"legal_entity_id": "le-1", "linked_object_type": "DOCUMENT", "linked_object_id": "doc-1", "body": "hello",
@@ -293,8 +285,8 @@ func TestAddComment_AuthzDenied_Returns403_NeverPublishes(t *testing.T) {
 	if len(st.comments) != 0 {
 		t.Fatalf("expected the store to never be called, got %d comments", len(st.comments))
 	}
-	if pub.calls != 0 {
-		t.Fatalf("expected no event published on denial, got %d", pub.calls)
+	if st.events != 0 {
+		t.Fatalf("expected no event published on denial, got %d", st.events)
 	}
 }
 
@@ -302,8 +294,8 @@ func TestAddComment_AuthzDenied_Returns403_NeverPublishes(t *testing.T) {
 // fetches the comment's parent thread first (for its legal_entity_id)
 // before checking authorization — fetch-then-authorize-then-mutate.
 func TestEditComment_AuthzDenied_Returns403(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{denyAction: "COMMENT_MANAGE"}
-	_, r := newTestHandler(st, pub, az)
+	st, az := newStubStore(), &stubAuthZ{denyAction: "COMMENT_MANAGE"}
+	_, r := newTestHandler(st, az)
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "original", CreatedByPrincipalID: "reviewer-1",
@@ -324,8 +316,8 @@ func TestEditComment_AuthzDenied_Returns403(t *testing.T) {
 }
 
 func TestGetThread_UnknownThread_Returns404(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
-	_, r := newTestHandler(st, pub, az)
+	st, az := newStubStore(), &stubAuthZ{}
+	_, r := newTestHandler(st, az)
 
 	req := withTenant(httptest.NewRequest(http.MethodGet, "/v1/threads/thread-missing", nil))
 	req.Header.Set("X-Principal-Id", "reviewer-1")
@@ -338,12 +330,12 @@ func TestGetThread_UnknownThread_Returns404(t *testing.T) {
 }
 
 func TestGetCommentHistory_ReturnsEmptyArrayNotNull(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	_, r := newTestHandler(st, pub, az)
+	_, r := newTestHandler(st, az)
 
 	req := withTenant(httptest.NewRequest(http.MethodGet, "/v1/comments/comment-1/history", nil))
 	req.Header.Set("X-Principal-Id", "reviewer-1")
@@ -367,12 +359,12 @@ func TestGetCommentHistory_ReturnsEmptyArrayNotNull(t *testing.T) {
 // registered ObjectVisibilityChecker must refuse every mention against
 // it, not silently allow one.
 func TestMention_NoVisibilityCheckerRegistered_Returns403(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	_, r := newTestHandler(st, pub, az)
+	_, r := newTestHandler(st, az)
 
 	body, _ := json.Marshal(map[string]any{"mentioned_principal_id": "sarah"})
 	req := withTenant(httptest.NewRequest(http.MethodPost, "/v1/comments/comment-1/mention", bytes.NewReader(body)))
@@ -391,12 +383,13 @@ func TestMention_NoVisibilityCheckerRegistered_Returns403(t *testing.T) {
 // TestMention_VisibilityDenied_Returns403 proves a registered checker
 // that denies access also refuses the mention (T29).
 func TestMention_VisibilityDenied_Returns403(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	h := handler.New(st, pub, az, zap.NewNop()).WithRetentionClient(&stubRetention{}).WithVisibilityChecker("DOCUMENT", &stubVisibilityChecker{canView: false})
+	st.events = 0 // the seed above is set-up, not a request under test
+	h := handler.New(st, az, zap.NewNop()).WithRetentionClient(&stubRetention{}).WithVisibilityChecker("DOCUMENT", &stubVisibilityChecker{canView: false})
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -409,20 +402,20 @@ func TestMention_VisibilityDenied_Returns403(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
 	}
-	if pub.calls != 0 {
-		t.Fatalf("expected no MentionCreated published on denial, got %d calls", pub.calls)
+	if st.events != 0 {
+		t.Fatalf("expected no MentionCreated published on denial, got %d calls", st.events)
 	}
 }
 
 // TestMention_VisibilityGranted_Succeeds proves the happy path through a
 // registered, granting checker.
 func TestMention_VisibilityGranted_Succeeds(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	h := handler.New(st, pub, az, zap.NewNop()).WithRetentionClient(&stubRetention{}).WithVisibilityChecker("DOCUMENT", &stubVisibilityChecker{canView: true})
+	h := handler.New(st, az, zap.NewNop()).WithRetentionClient(&stubRetention{}).WithVisibilityChecker("DOCUMENT", &stubVisibilityChecker{canView: true})
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -443,12 +436,12 @@ func TestMention_VisibilityGranted_Succeeds(t *testing.T) {
 // TestDeleteComment_RetentionHold_Returns409 proves DeleteComment
 // refuses when retention-registry-svc reports a hold (T28).
 func TestDeleteComment_RetentionHold_Returns409(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	h := handler.New(st, pub, az, zap.NewNop()).WithRetentionClient(&stubRetention{blocked: true})
+	h := handler.New(st, az, zap.NewNop()).WithRetentionClient(&stubRetention{blocked: true})
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -470,12 +463,12 @@ func TestDeleteComment_RetentionHold_Returns409(t *testing.T) {
 // unreachable retention-registry-svc blocks the delete rather than
 // assuming "no hold."
 func TestDeleteComment_RetentionServiceUnreachable_FailsClosed(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	h := handler.New(st, pub, az, zap.NewNop()).WithRetentionClient(&stubRetention{err: domain.ErrRetentionServiceUnavailable})
+	h := handler.New(st, az, zap.NewNop()).WithRetentionClient(&stubRetention{err: domain.ErrRetentionServiceUnavailable})
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -493,12 +486,12 @@ func TestDeleteComment_RetentionServiceUnreachable_FailsClosed(t *testing.T) {
 // TestModerate_MissingReason_Returns400 is the negative control for the
 // doc's own T46: moderation always requires a reason.
 func TestModerate_MissingReason_Returns400(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	_, r := newTestHandler(st, pub, az)
+	_, r := newTestHandler(st, az)
 
 	body, _ := json.Marshal(map[string]any{"action": "REDACT"})
 	req := withTenant(httptest.NewRequest(http.MethodPost, "/v1/comments/comment-1/moderate", bytes.NewReader(body)))
@@ -513,12 +506,12 @@ func TestModerate_MissingReason_Returns400(t *testing.T) {
 
 // TestReact_TogglesOnAndOff proves React is a real toggle.
 func TestReact_TogglesOnAndOff(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	_, r := newTestHandler(st, pub, az)
+	_, r := newTestHandler(st, az)
 
 	body, _ := json.Marshal(map[string]any{"reaction_type": "THUMBS_UP"})
 	req1 := withTenant(httptest.NewRequest(http.MethodPost, "/v1/comments/comment-1/react", bytes.NewReader(body)))
@@ -545,12 +538,12 @@ func TestReact_TogglesOnAndOff(t *testing.T) {
 // TestResolveThread_ThenAddComment_Reopens proves the full round trip
 // through the handler layer, not just the store.
 func TestResolveThread_ThenAddComment_Succeeds(t *testing.T) {
-	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	st, az := newStubStore(), &stubAuthZ{}
 	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
-	_, r := newTestHandler(st, pub, az)
+	_, r := newTestHandler(st, az)
 
 	req := withTenant(httptest.NewRequest(http.MethodPost, "/v1/threads/thread-1/resolve", bytes.NewReader([]byte(`{}`))))
 	req.Header.Set("X-Principal-Id", "reviewer-1")

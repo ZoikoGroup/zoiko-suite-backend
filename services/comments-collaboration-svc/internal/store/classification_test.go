@@ -18,7 +18,7 @@ func clsParams(tenant, object, classification string) domain.AddCommentParams {
 }
 
 func TestPgStore_Classification_AcceptedPersistedAndReturned(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	for i, tier := range []string{"PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"} {
 		obj := "doc-tier-" + tier
 		comment, thread, err := s.AddComment(ctx(), clsParams("default", obj, tier))
@@ -40,7 +40,7 @@ func TestPgStore_Classification_AcceptedPersistedAndReturned(t *testing.T) {
 }
 
 func TestPgStore_Classification_RequiredToCreateAThread(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	_, _, err := s.AddComment(ctx(), clsParams("default", "doc-nocls", ""))
 	require.ErrorIs(t, err, domain.ErrClassificationRequired)
 
@@ -54,7 +54,7 @@ func TestPgStore_Classification_RequiredToCreateAThread(t *testing.T) {
 }
 
 func TestPgStore_Classification_InvalidValueRefused(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	for _, bad := range []string{"SECRET", "internal", "TOP-SECRET", " INTERNAL"} {
 		_, _, err := s.AddComment(ctx(), clsParams("default", "doc-bad", bad))
 		require.ErrorIs(t, err, domain.ErrClassificationInvalid, bad)
@@ -62,7 +62,7 @@ func TestPgStore_Classification_InvalidValueRefused(t *testing.T) {
 }
 
 func TestPgStore_Classification_InheritedByLaterComments(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	_, thread, err := s.AddComment(ctx(), clsParams("default", "doc-inh", "CONFIDENTIAL"))
 	require.NoError(t, err)
 
@@ -90,7 +90,7 @@ func TestPgStore_Classification_InheritedByLaterComments(t *testing.T) {
 }
 
 func TestPgStore_Classification_SurvivesEditModerateAndDelete(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	c, _, err := s.AddComment(ctx(), clsParams("default", "doc-life", "RESTRICTED"))
 	require.NoError(t, err)
 
@@ -111,7 +111,7 @@ func TestPgStore_Classification_SurvivesEditModerateAndDelete(t *testing.T) {
 }
 
 func TestPgStore_Classification_IdempotentReplayReturnsIt(t *testing.T) {
-	s := store.NewPgStore(requireTestDB(t))
+	s := store.NewPgStore(requireTestDB(t), store.WithEventRegion("local"))
 	p := clsParams("default", "doc-idem-cls", "INTERNAL")
 	p.Idem = idem("p1", "AddComment", "cls-key", "h")
 	first, _, err := s.AddComment(ctx(), p)
@@ -129,7 +129,7 @@ func TestPgStore_Classification_IdempotentReplayReturnsIt(t *testing.T) {
 
 func TestPgStore_Classification_IsTenantScoped(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.NewPgStore(requireRLSPool(t, admin))
+	s := store.NewPgStore(requireRLSPool(t, admin), store.WithEventRegion("local"))
 
 	// The same linked object in two tenants has two independent threads, each
 	// with its own classification.
@@ -152,7 +152,7 @@ func TestPgStore_Classification_IsTenantScoped(t *testing.T) {
 
 func TestPgStore_Classification_LegacyThreadsAreNotFabricated(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	// A thread written before classification existed: no value recorded.
 	conn, err := pool.Acquire(context.Background())

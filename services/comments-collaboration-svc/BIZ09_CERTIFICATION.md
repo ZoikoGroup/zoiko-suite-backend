@@ -2,7 +2,7 @@
 
 **Service host:** comments-collaboration-svc (its own service; tables `comment_threads`, `comments`, `comment_versions`, `mentions`, `reactions`, `comment_attachments`, `moderation_trail`, `idempotency_keys`)
 **Assessed against:** `ZoikoSuite_Business_Operations_Content_Services_Detailed_Service_Specifications_v1_0` (ZS-SVC-P-001) section 11
-**Status: NOT CERTIFIED.** The command and query set is implemented, with earlier remediation already in place (read authorization, restricted threads on reads, classification, idempotency, uniform mention refusal, retention-hold check). Four defects were found and fixed in this audit, all in who may do what. Events are not on the shared outbox, and several spec rows are open.
+**Status: NOT CERTIFIED.** The command and query set is implemented, with earlier remediation already in place (read authorization, restricted threads on reads, classification, idempotency, uniform mention refusal, retention-hold check). Four defects were found and fixed in this audit, all in who may do what. The five events are now on the shared eventing outbox. Several spec rows remain open.
 
 A certificate listing only successes certifies nothing, so the last two sections say what was **not** verified.
 
@@ -15,7 +15,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Lifecycle Active / Edited / Resolved / Moderated / Deleted-Redacted; original history preserved | Comment: ACTIVE, EDITED, MODERATED, DELETED_REDACTED. Thread: ACTIVE, RESOLVED. Versions, mentions, attachments and the moderation trail are append-only by trigger. **Deleted comments are now redacted from the ordinary read** (below) | `internal/store/pg_store.go`, migration 000001 |
 | Authorization / SoD | `COMMENT_CREATE`, `COMMENT_MANAGE`, `COMMENT_READ`, `COMMENT_READ_RESTRICTED`, and **`COMMENT_MODERATE` (new)**. Fixed in this audit: author-only edit, moderation apart from participation, no self-moderation, restricted threads for writes (below) | handler |
 | Restricted threads need purpose and membership controls | Restricted is a thread-level flag fixed at creation; it requires `COMMENT_READ_RESTRICTED` to read and, now, to write. **No purpose or membership list exists**: the control is a single entity-scoped action, not per-thread membership | handler |
-| Events (5) | `CommentAdded`, `CommentEdited`, `CommentModerated`, `MentionCreated`, `ThreadResolved` are published by the handler **after** the commit through a Kafka writer, with the publisher interface returning nothing, so a failure cannot even be reported. Not on the shared eventing outbox, no schemas, no catalogue entries. See open item 1 | `internal/events` |
+| Events (5) | `CommentAdded`, `CommentEdited`, `CommentModerated`, `MentionCreated` and `ThreadResolved` are written to the shared eventing outbox in the same transaction as the change, as `com.zoikosuite.business.comment.added`, `comment.edited`, `comment.moderated`, `mention.created` and `thread.resolved`, with payload schemas in `contracts/events` enforced by the store tests and extension catalogue entries (producer Comments Collaboration Service). Payloads carry identifiers only, never the comment body. An idempotent replay writes no second event | `internal/store/eventing_events.go`, `contracts/events` |
 | Failure: unauthorized mention must not disclose object existence | Enforced: every refusal (unknown comment, not authorized, no visibility checker, mentioned principal cannot see the object) returns the same 403 body, and no row is written. With no checker registered for an object type every mention is refused | `Mention`, `TestMention_AllRefusalsAreIndistinguishable` |
 | Failure: delete under hold/retention becomes restricted/redacted, not destruction | Delete never destroys (the comment moves to DELETED_REDACTED, the history is kept). Under a legal hold the delete is **refused outright (409)** rather than turned into restricted treatment; retention-registry-svc being unreachable also refuses (503) | `DeleteComment` |
 | Evidence: author, timestamps, original/revised content, object link, mentions, attachments, moderation reason, retention status | Author, timestamps, every version, object link, mentions, attachments, moderation reason and classification are recorded. **Retention status is not recorded** on the comment, only checked at delete time | tables |
@@ -57,18 +57,24 @@ new tests
 
 Date: 2026-11-17. The Postgres container was disposable and has been removed.
 
+## Event migration (after the audit)
+
+- The handler used to publish these events after the commit through a Kafka writer that could not report failure, so a broker problem lost the event silently. They are now enqueued in the same transaction (migration 000004 equals `outbox.SchemaSQL`, checked by a test); a failed enqueue rolls the change back (tested), and a replay returns before any event is written. The old `internal/events` publisher and the handler's publisher dependency were removed; the handler tests now count the events the store writes.
+- `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a relay delivers `eventing_outbox` and is not started when there is no database or no Kafka brokers, and the Docker build context moved to `services/` (Dockerfile, `Dockerfile.dockerignore`, `docker-compose.yml`). The envelope's classification follows the thread's (a thread with none recorded is treated as confidential).
+- Verified: full suite passes against Postgres 16, a deliberately broken schema fails the store test, the image builds and the container refuses to start without the region. Not verified: a started container with a database, and delivery through a real Kafka broker.
+
 ## NOT verified
 
 - No Docker image build or container run, and the docker-compose stack was not run.
 - Real authorization-svc decisions for any `COMMENT_*` action (tests use stubs), and that the actions, including the new one, are registered there.
 - Real retention-registry-svc and real object-visibility checkers: no checker is registered in the service's `main`, so by design every mention is refused in a real deployment until a domain service registers one. This was not checked in the running service.
-- No event was delivered through Kafka; event delivery is not reliable (open item 1).
+- No event was delivered through Kafka.
 - A MODERATED comment's body is still returned by the ordinary read: the moderation `action` is free text with no vocabulary, so what a moderation does to visibility is undefined. Only DELETED_REDACTED is redacted.
 - `GetCommentHistory` returns every original version, including a deleted comment's, to any holder of the read action on the thread. Whether that needs a stronger action was not decided.
 
 ## Open items to reach certification
 
-1. Events can be lost: they are published after the commit by a publisher that cannot report failure. Move the five events to the shared eventing outbox in the same transaction, with canonical names, schemas and catalogue entries, as done for BIZ-01, 02, 03, 06 and 08.
+1. ~~Events can be lost: move the five events to the shared eventing outbox.~~ Done (see "Event migration").
 2. Register and grant `COMMENT_MODERATE` (and verify the other `COMMENT_*` actions) in authorization-svc; run the service in the compose stack.
 3. Define what a moderation does (an action vocabulary, and whether a MODERATED body is hidden), and who may read a deleted or moderated comment's original history.
 4. Restricted threads: purpose and membership controls beyond a single entity-scoped action, if the spec means per-thread membership.

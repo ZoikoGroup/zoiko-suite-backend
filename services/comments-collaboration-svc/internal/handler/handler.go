@@ -19,20 +19,6 @@ import (
 	"zoiko.io/comments-collaboration-svc/internal/store"
 )
 
-// Publisher is the event-publishing contract the handler depends on —
-// the spec's own named Events: "CommentAdded; CommentEdited;
-// CommentModerated; MentionCreated; ThreadResolved." All five are
-// implemented as of Wave 2. There is no "CommentDeleted" event — the
-// doc's own event catalogue never names one; see
-// domain.DeleteCommentParams's own doc comment.
-type Publisher interface {
-	PublishCommentAdded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, c domain.Comment, t domain.CommentThread)
-	PublishCommentEdited(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, c domain.Comment)
-	PublishCommentModerated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, c domain.Comment)
-	PublishMentionCreated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, m domain.Mention)
-	PublishThreadResolved(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, t domain.CommentThread)
-}
-
 // AuthZClient is the authorization contract the handler depends on.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
@@ -82,15 +68,14 @@ const (
 
 type Handler struct {
 	store              store.Store
-	publisher          Publisher
 	authz              AuthZClient
 	logger             *zap.Logger
 	retention          RetentionClient
 	visibilityCheckers map[string]ObjectVisibilityChecker
 }
 
-func New(st store.Store, pub Publisher, az AuthZClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger, visibilityCheckers: map[string]ObjectVisibilityChecker{}}
+func New(st store.Store, az AuthZClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger, visibilityCheckers: map[string]ObjectVisibilityChecker{}}
 }
 
 // WithRetentionClient sets DeleteComment's own real dependency on
@@ -173,13 +158,11 @@ func (h *Handler) AddComment(w http.ResponseWriter, r *http.Request) {
 		TenantID: svcmiddleware.TenantFromContext(r.Context()), LegalEntityID: req.LegalEntityID,
 		LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID, Restricted: req.Restricted, Classification: req.Classification,
 		ParentCommentID: req.ParentCommentID, Body: req.Body, CreatedByPrincipalID: principalID, Idem: idem,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
-	}
-	if !idem.IsReplay() {
-		h.publisher.PublishCommentAdded(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, thread.TenantID, thread.LegalEntityID, *comment, *thread)
 	}
 	markReplay(w, idem)
 	writeJSON(w, http.StatusCreated, map[string]any{"comment": comment, "thread": thread})
@@ -227,13 +210,11 @@ func (h *Handler) EditComment(w http.ResponseWriter, r *http.Request) {
 	idem := newIdem(r, principalID, "EditComment", commentID, req)
 	comment, err := h.store.EditComment(r.Context(), domain.EditCommentParams{
 		CommentID: commentID, TenantID: tenantID, ActorPrincipalID: principalID, Body: req.Body, Idem: idem,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
-	}
-	if !idem.IsReplay() {
-		h.publisher.PublishCommentEdited(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *comment)
 	}
 	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, comment)
@@ -526,13 +507,11 @@ func (h *Handler) Mention(w http.ResponseWriter, r *http.Request) {
 	idem := newIdem(r, principalID, "Mention", commentID, req)
 	mention, err := h.store.Mention(r.Context(), domain.MentionParams{
 		CommentID: commentID, TenantID: tenantID, MentionedPrincipalID: req.MentionedPrincipalID, VisibilityGranted: true, Idem: idem,
+		ActorPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
-	}
-	if !idem.IsReplay() {
-		h.publisher.PublishMentionCreated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *mention)
 	}
 	markReplay(w, idem)
 	writeJSON(w, http.StatusCreated, mention)
@@ -653,13 +632,11 @@ func (h *Handler) Moderate(w http.ResponseWriter, r *http.Request) {
 	idem := newIdem(r, principalID, "Moderate", commentID, req)
 	comment, err := h.store.Moderate(r.Context(), domain.ModerateParams{
 		CommentID: commentID, TenantID: tenantID, ModeratorPrincipalID: principalID, Action: req.Action, Reason: req.Reason, Idem: idem,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
-	}
-	if !idem.IsReplay() {
-		h.publisher.PublishCommentModerated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *comment)
 	}
 	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, comment)
@@ -721,13 +698,11 @@ func (h *Handler) ResolveThread(w http.ResponseWriter, r *http.Request) {
 	idem := newIdem(r, principalID, "ResolveThread", threadID, req)
 	thread, err := h.store.ResolveThread(r.Context(), domain.ResolveThreadParams{
 		ThreadID: threadID, TenantID: tenantID, ActorPrincipalID: principalID, ResolutionNote: req.ResolutionNote, Idem: idem,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
-	}
-	if !idem.IsReplay() {
-		h.publisher.PublishThreadResolved(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *thread)
 	}
 	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, thread)
