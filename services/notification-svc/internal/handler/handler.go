@@ -1692,6 +1692,11 @@ func (h *Handler) handleTemplateError(w http.ResponseWriter, r *http.Request, er
 			writeError(w, r, http.StatusBadRequest, "missing_variables", missing.Error())
 			return
 		}
+		var undeclared domain.ErrTemplateVariablesUndeclared
+		if errors.As(err, &undeclared) {
+			writeError(w, r, http.StatusBadRequest, "template_variable_invalid", undeclared.Error())
+			return
+		}
 		var unexpected domain.ErrTemplateVariablesUnexpected
 		if errors.As(err, &unexpected) {
 			writeError(w, r, http.StatusBadRequest, "unexpected_variables", unexpected.Error())

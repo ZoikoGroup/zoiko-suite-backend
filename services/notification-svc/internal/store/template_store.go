@@ -13,6 +13,8 @@ import (
 	"fmt"
 	htmltemplate "html/template"
 	"sort"
+	texttemplate "text/template"
+	"text/template/parse"
 
 	"github.com/jackc/pgx/v5"
 
@@ -266,6 +268,11 @@ func (s *PgStore) ValidateTemplate(ctx context.Context, versionID string) (*doma
 		}
 		if err := validateTemplateContent(existing.Content); err != nil {
 			return err
+		}
+		// Spec BIZ-03: a missing variable schema blocks publication. Every variable the wording
+		// uses must be declared, or it would render as blank text at send time.
+		if undeclared := undeclaredVariables(existing.Content, existing.VariableSchema); len(undeclared) > 0 {
+			return domain.ErrTemplateVariablesUndeclared{VersionID: versionID, Undeclared: undeclared}
 		}
 		if existing.Subject != nil {
 			if err := domain.CheckSubjectVariables(*existing.Subject, existing.SubjectVariables, existing.VariableSchema); err != nil {
@@ -679,6 +686,74 @@ func (s *PgStore) templateExists(ctx context.Context, tx pgx.Tx, tenantID, templ
 		return false, fmt.Errorf("template store unavailable: %w", err)
 	}
 	return exists, nil
+}
+
+// undeclaredVariables returns, sorted, the variables the content references (as {{.name}})
+// that the variable schema does not declare. Content that does not parse returns nil: the
+// parse gate reports that separately.
+func undeclaredVariables(content string, schema []string) []string {
+	t, err := texttemplate.New("vars").Parse(content)
+	if err != nil || t.Tree == nil || t.Tree.Root == nil {
+		return nil
+	}
+	declared := make(map[string]bool, len(schema))
+	for _, k := range schema {
+		declared[k] = true
+	}
+	used := map[string]bool{}
+	collectFields(t.Tree.Root, used)
+	var out []string
+	for k := range used {
+		if !declared[k] {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func collectFields(n parse.Node, used map[string]bool) {
+	switch x := n.(type) {
+	case nil:
+	case *parse.ListNode:
+		if x != nil {
+			for _, c := range x.Nodes {
+				collectFields(c, used)
+			}
+		}
+	case *parse.ActionNode:
+		collectFields(x.Pipe, used)
+	case *parse.PipeNode:
+		if x != nil {
+			for _, c := range x.Cmds {
+				collectFields(c, used)
+			}
+		}
+	case *parse.CommandNode:
+		for _, a := range x.Args {
+			collectFields(a, used)
+		}
+	case *parse.FieldNode:
+		if len(x.Ident) > 0 {
+			used[x.Ident[0]] = true
+		}
+	case *parse.ChainNode:
+		collectFields(x.Node, used)
+	case *parse.IfNode:
+		collectBranch(&x.BranchNode, used)
+	case *parse.RangeNode:
+		collectBranch(&x.BranchNode, used)
+	case *parse.WithNode:
+		collectBranch(&x.BranchNode, used)
+	case *parse.TemplateNode:
+		collectFields(x.Pipe, used)
+	}
+}
+
+func collectBranch(b *parse.BranchNode, used map[string]bool) {
+	collectFields(b.Pipe, used)
+	collectFields(b.List, used)
+	collectFields(b.ElseList, used)
 }
 
 // validateTemplateContent proves the content is at least syntactically
