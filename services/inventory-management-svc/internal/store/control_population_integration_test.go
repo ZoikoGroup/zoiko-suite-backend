@@ -171,7 +171,7 @@ func cpQuery(tenant, entity, count, side string, limit int, after string) domain
 
 func cpFetch(t *testing.T, q domain.StockCountLinesQuery) *domain.ControlPopulationPage {
 	t.Helper()
-	page, err := store.New(cpPool).ControlPopulationStockCountLines(context.Background(), q)
+	page, err := store.New(cpPool, store.WithEventRegion("local")).ControlPopulationStockCountLines(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ControlPopulationStockCountLines: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestControlPop_TenantAndEntityIsolation(t *testing.T) {
 	count := cpCount(t, tenant, entity, "2026-09-15T00:00:00Z")
 	cpLine(t, tenant, count, item, loc, "1", "1", "COUNTED")
 
-	s := store.New(cpPool)
+	s := store.New(cpPool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	// Another tenant asking for this tenant's count -> not found (even with the right entity).

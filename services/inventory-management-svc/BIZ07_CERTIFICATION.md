@@ -14,7 +14,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 | Queries: GetOffering, GetVersionAsOf, SearchCatalog, ListVariants, GetMappings | Implemented | same |
 | Lifecycle Draft -> Approved -> Active -> Suspended/Retired -> Superseded | Implemented; activation supersedes prior ACTIVE in one transaction | `internal/store/catalog_store.go` |
 | Authorization / SoD | Distinct actions: `CATALOG_READ`, `CATALOG_MANAGE`, `CATALOG_APPROVE`, `CATALOG_MAPPING_LINK` | handler |
-| Events (5) | Published; contract in `asyncapi.biz07.yaml` | `internal/events/publisher.go` |
+| Events (5) | `OfferingCreated`, `OfferingActivated`, `OfferingSuspended`, `OfferingRetired` and `OfferingVersionSuperseded` are written to the shared eventing outbox in the same transaction as the change (an activation and the supersession it causes commit together), as `com.zoikosuite.business.offering.created`, `activated`, `suspended`, `retired` and `com.zoikosuite.business.offering-version.superseded`, with payload schemas in `contracts/events` enforced by the store tests and extension catalogue entries (producer Inventory Management Service). The hand-written `asyncapi.biz07.yaml` and its drift test were removed: they described the pre-standard names, and the contract is now the schemas plus the generated shared AsyncAPI | `internal/store/eventing_events.go`, `contracts/events` |
 | API contract | `openapi.biz07.yaml` | this directory |
 | Failure: missing required mapping blocks use | Enforced at activation (TAX + ACCOUNTING required) in the handler and by a database trigger (migration 000013) | `ActivateOffering` |
 | Failure: historical transactions pin the version | Data layer supports it (immutable versions, `version-as-of`). `GET ./versions/{versionID}/usability` lets a consumer check a version before pinning it. accounts-receivable-svc now calls it at quote and sales-order approval when `catalog_version_ref` is `catalog:<offering_id>:<version_id>`; opaque refs are untouched. AP and inventory consumers do not yet | migration 000006, `catalog.go`, AR `internal/catalogref` |
@@ -46,6 +46,13 @@ container smoke run              starts, connects to Postgres, /healthz and /rea
 
 Date: 2026-11-10. The Postgres container was disposable and has been removed.
 
+## Event migration (after the audit)
+
+- The handler used to publish the five offering events after the commit through a Kafka writer that could not report failure, so a broker problem lost them silently. They are now enqueued in the same transaction (migration 000014 equals `outbox.SchemaSQL`, checked by a test); a failed enqueue rolls the change back (tested), and a refused transition writes no event. The handler no longer publishes them; the request's correlation id reaches the store through the request context.
+- `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a relay delivers `eventing_outbox` and is not started when no Kafka brokers are configured, and the Docker build context moved to `services/` (Dockerfile, `Dockerfile.dockerignore`, `docker-compose.yml`).
+- Only the five BIZ-07 events moved. The service's other events (items, locations, movements, valuation, stock counts, accounting events: about thirty) still use the direct publisher and its old names.
+- Verified: full suite passes against Postgres 16, a deliberately broken schema fails the store test, the image builds and the container refuses to start without the region. Not verified: a started container with a database, and delivery through a real Kafka broker.
+
 ## NOT verified
 
 - Only the 13 catalog store tests were run as the non-superuser role; the rest of the store suite and the cross-service flows were not.
@@ -62,7 +69,7 @@ Date: 2026-11-10. The Postgres container was disposable and has been removed.
 4. ~~Move the mapping-required rule into the database (trigger).~~ Done: migration 000013; tested via the store and a raw UPDATE.
 5. ~~Validate `catalog_version_ref` in AR quotes/sales orders against an ACTIVE catalog version.~~ Done for AR quotes (ar02) and orders (ar03), opt-in by the `catalog:` ref format, fail-closed. Not done: AP, and the authorization-svc grant of `CATALOG_READ` to `system:ar-catalog` (deployment config, unverified).
 6. Replace free-text `unit` with REF-09 validation once REF-09 exists.
-7. ~~Add an event-name contract test for `asyncapi.biz07.yaml`.~~ Done: `internal/events/catalog_contract_test.go` (verified to fail on a renamed event).
+7. ~~Add an event-name contract test for `asyncapi.biz07.yaml`.~~ Superseded by the event migration below: `asyncapi.biz07.yaml` was removed and `TestCatalogEvents_ContractsAreTheFiveSpecEvents` plus the per-row schema check replace it.
 8. Confirm the TAX + ACCOUNTING required-mapping set with the spec owner (the spec does not enumerate it).
 
 ## AR consumer (accounts-receivable-svc) — added after the sections above

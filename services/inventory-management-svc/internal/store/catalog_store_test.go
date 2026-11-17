@@ -30,7 +30,7 @@ func newTestOffering(tenantID, legalEntityID, skuCode string) (*domain.Offering,
 
 func TestPgStore_CreateOffering_ThenGetOffering(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -67,7 +67,7 @@ func TestPgStore_CreateOffering_ThenGetOffering(t *testing.T) {
 
 func TestPgStore_CreateOffering_DuplicateSKU_Rejected(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -83,7 +83,7 @@ func TestPgStore_CreateOffering_DuplicateSKU_Rejected(t *testing.T) {
 
 func TestPgStore_CreateVersion_ThenApproveActivate_SupersedesPrior(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -152,7 +152,7 @@ func TestPgStore_CreateVersion_ThenApproveActivate_SupersedesPrior(t *testing.T)
 // on the very same row are legitimately mutable.
 func TestPgStore_OfferingVersionContent_IsImmutable(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -168,7 +168,7 @@ func TestPgStore_OfferingVersionContent_IsImmutable(t *testing.T) {
 
 func TestPgStore_ActivateOfferingVersion_RequiresApproved(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -183,7 +183,7 @@ func TestPgStore_ActivateOfferingVersion_RequiresApproved(t *testing.T) {
 
 func TestPgStore_SuspendThenRetireOfferingVersion(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -221,7 +221,7 @@ func TestPgStore_SuspendThenRetireOfferingVersion(t *testing.T) {
 
 func TestPgStore_GetVersionAsOf_PinsHistoricalVersion(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -283,7 +283,7 @@ func TestPgStore_GetVersionAsOf_PinsHistoricalVersion(t *testing.T) {
 // named stable error.
 func TestPgStore_GetVersionAsOf_NoVersionActive_ReturnsCatalogVersionInvalid(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -298,7 +298,7 @@ func TestPgStore_GetVersionAsOf_NoVersionActive_ReturnsCatalogVersionInvalid(t *
 
 func TestPgStore_SearchCatalog_FiltersByLegalEntityAndCategory(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID, otherEntity := uuid.New().String(), uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -338,7 +338,7 @@ func TestPgStore_SearchCatalog_FiltersByLegalEntityAndCategory(t *testing.T) {
 
 func TestPgStore_LinkMapping_ThenGetMappings(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -367,7 +367,7 @@ func TestPgStore_LinkMapping_ThenGetMappings(t *testing.T) {
 // transaction referenced a version must never silently change.
 func TestPgStore_CatalogMappings_AreAppendOnly(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -389,7 +389,7 @@ func TestPgStore_CatalogMappings_AreAppendOnly(t *testing.T) {
 
 func TestPgStore_LinkMapping_UnknownVersion_ReturnsNotFound(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 

@@ -216,11 +216,6 @@ type Publisher interface {
 	// BIZ-07 (Product & Service Catalog) — the spec's own named Events:
 	// "OfferingCreated; OfferingActivated; OfferingSuspended;
 	// OfferingRetired; OfferingVersionSuperseded."
-	PublishOfferingCreated(ctx context.Context, correlationID, actorID string, o domain.Offering, v domain.OfferingVersion)
-	PublishOfferingActivated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
-	PublishOfferingSuspended(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
-	PublishOfferingRetired(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
-	PublishOfferingVersionSuperseded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, offeringID, versionID string)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
