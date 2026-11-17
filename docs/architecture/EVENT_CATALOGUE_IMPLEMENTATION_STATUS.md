@@ -360,3 +360,22 @@ configured). The four event builders in `internal/events` were removed.
 
 Open: `eventing_outbox` has no row-level security (the shared library's table is cross-tenant by design, its relay drains
 every tenant), so the app role can read every tenant's envelopes; the service's legacy-RLS test excludes it explicitly.
+
+### exception-escalation-svc (BIZ-08): five deadline events moved to the eventing outbox
+
+`deadline.created`, `deadline.superseded`, `deadline.completed`, `deadline.due_soon` and `deadline.overdue` are written to
+`eventing_outbox` (migration 000007) in the same transaction as the change, as
+`com.zoikosuite.business.deadline.{created,superseded,completed,became-due-soon,became-overdue}`, with payload schemas in
+`exception-escalation-svc/contracts/events` enforced by the store tests and extension catalogue entries (producer
+`Exception Escalation Service`). The old event_type is kept as the envelope's legacy type. The two threshold events are named
+with `became-` because the catalogue lint requires past-tense facts.
+
+They were published by the handler after the commit with failures only logged; for due-soon and overdue the notified stamp was
+committed first, so a failed publish was never retried. Not moved: the exception-case, finding and task events.
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (phase5 compose sets it, default `local`), a write whose event
+cannot be built is rolled back, a relay delivers the eventing outbox (not started with no brokers), and the Docker build
+context moved to `services/`.
+
+Open: the catalogue's section 19 entry `business.deadline.due` (producer "Deadline Service", no deployed owner) overlaps
+`became-due-soon` and `became-overdue` and needs reconciling.

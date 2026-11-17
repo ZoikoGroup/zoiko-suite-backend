@@ -32,8 +32,23 @@
     "deadline": {
       "address": "zoikosuite.business.deadline.v1",
       "messages": {
+        "became-due-soon": {
+          "$ref": "#/components/messages/deadline.became-due-soon"
+        },
+        "became-overdue": {
+          "$ref": "#/components/messages/deadline.became-overdue"
+        },
+        "completed": {
+          "$ref": "#/components/messages/deadline.completed"
+        },
+        "created": {
+          "$ref": "#/components/messages/deadline.created"
+        },
         "due": {
           "$ref": "#/components/messages/deadline.due"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/deadline.superseded"
         }
       }
     },
@@ -207,6 +222,54 @@
         "x-zoiko-event-type": "com.zoikosuite.business.classification.superseded",
         "x-zoiko-origin": "extension"
       },
+      "deadline.became-due-soon": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.became-due-soon",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: became-due-soon.",
+        "title": "deadline became-due-soon",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.became-due-soon",
+        "x-zoiko-origin": "extension"
+      },
+      "deadline.became-overdue": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.became-overdue",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: became-overdue.",
+        "title": "deadline became-overdue",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.became-overdue",
+        "x-zoiko-origin": "extension"
+      },
+      "deadline.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: completed.",
+        "title": "deadline completed",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.completed",
+        "x-zoiko-origin": "extension"
+      },
+      "deadline.created": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: created.",
+        "title": "deadline created",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.created",
+        "x-zoiko-origin": "extension"
+      },
       "deadline.due": {
         "contentType": "application/json",
         "description": "Producer: Deadline Service. Primary consumers / intent: Task/escalation. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
@@ -218,6 +281,18 @@
         "title": "deadline due",
         "x-zoiko-event-type": "com.zoikosuite.business.deadline.due",
         "x-zoiko-origin": "spec"
+      },
+      "deadline.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: superseded.",
+        "title": "deadline superseded",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.superseded",
+        "x-zoiko-origin": "extension"
       },
       "document.archived": {
         "contentType": "application/json",
@@ -623,10 +698,25 @@
       "channel": {
         "$ref": "#/channels/deadline"
       },
-      "description": "Producer(s): Deadline Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "description": "Producer(s): Deadline Service, Exception Escalation Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
       "messages": [
         {
+          "$ref": "#/channels/deadline/messages/became-due-soon"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/became-overdue"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/completed"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/created"
+        },
+        {
           "$ref": "#/channels/deadline/messages/due"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/superseded"
         }
       ],
       "summary": "Publish deadline facts after the authoritative commit (transactional outbox)."
