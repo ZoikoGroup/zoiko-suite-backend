@@ -1754,8 +1754,9 @@ services:
   # backend; document_vault_storage is where the encrypted blobs live.
   document-vault-svc:
     build:
-      context: ../services/document-vault-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing - see the Dockerfile.
+      context: ../services
+      dockerfile: document-vault-svc/Dockerfile
     container_name: document-vault-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1786,6 +1787,7 @@ services:
       # Message both carrying a Topic), the transactional outbox had never
       # actually delivered a single event to Kafka.
       KAFKA_BROKERS: "kafka:9094"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
     volumes:
       - document_vault_storage:/data/documents
     depends_on:

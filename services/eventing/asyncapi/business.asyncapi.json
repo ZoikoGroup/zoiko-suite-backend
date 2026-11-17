@@ -12,6 +12,23 @@
         }
       }
     },
+    "classification": {
+      "address": "zoikosuite.business.classification.v1",
+      "messages": {
+        "confirmed": {
+          "$ref": "#/components/messages/classification.confirmed"
+        },
+        "proposed": {
+          "$ref": "#/components/messages/classification.proposed"
+        },
+        "reclassified": {
+          "$ref": "#/components/messages/classification.reclassified"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/classification.superseded"
+        }
+      }
+    },
     "deadline": {
       "address": "zoikosuite.business.deadline.v1",
       "messages": {
@@ -23,11 +40,26 @@
     "document": {
       "address": "zoikosuite.business.document.v1",
       "messages": {
+        "archived": {
+          "$ref": "#/components/messages/document.archived"
+        },
         "classification-changed": {
           "$ref": "#/components/messages/document.classification-changed"
         },
+        "disposition-requested": {
+          "$ref": "#/components/messages/document.disposition-requested"
+        },
+        "record-declared": {
+          "$ref": "#/components/messages/document.record-declared"
+        },
         "stored": {
           "$ref": "#/components/messages/document.stored"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/document.superseded"
+        },
+        "version-upload-quarantined": {
+          "$ref": "#/components/messages/document.version-upload-quarantined"
         },
         "versioned": {
           "$ref": "#/components/messages/document.versioned"
@@ -118,6 +150,54 @@
         "x-zoiko-event-type": "com.zoikosuite.business.case.opened",
         "x-zoiko-origin": "spec"
       },
+      "classification.confirmed": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.classification.confirmed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Classification: confirmed.",
+        "title": "classification confirmed",
+        "x-zoiko-event-type": "com.zoikosuite.business.classification.confirmed",
+        "x-zoiko-origin": "extension"
+      },
+      "classification.proposed": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.classification.proposed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Classification: proposed.",
+        "title": "classification proposed",
+        "x-zoiko-event-type": "com.zoikosuite.business.classification.proposed",
+        "x-zoiko-origin": "extension"
+      },
+      "classification.reclassified": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.classification.reclassified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Classification: reclassified.",
+        "title": "classification reclassified",
+        "x-zoiko-event-type": "com.zoikosuite.business.classification.reclassified",
+        "x-zoiko-origin": "extension"
+      },
+      "classification.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.classification.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Classification: superseded.",
+        "title": "classification superseded",
+        "x-zoiko-event-type": "com.zoikosuite.business.classification.superseded",
+        "x-zoiko-origin": "extension"
+      },
       "deadline.due": {
         "contentType": "application/json",
         "description": "Producer: Deadline Service. Primary consumers / intent: Task/escalation. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
@@ -129,6 +209,18 @@
         "title": "deadline due",
         "x-zoiko-event-type": "com.zoikosuite.business.deadline.due",
         "x-zoiko-origin": "spec"
+      },
+      "document.archived": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.archived",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: archived.",
+        "title": "document archived",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.archived",
+        "x-zoiko-origin": "extension"
       },
       "document.classification-changed": {
         "contentType": "application/json",
@@ -142,6 +234,30 @@
         "x-zoiko-event-type": "com.zoikosuite.business.document.classification-changed",
         "x-zoiko-origin": "spec"
       },
+      "document.disposition-requested": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.disposition-requested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: disposition-requested.",
+        "title": "document disposition-requested",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.disposition-requested",
+        "x-zoiko-origin": "extension"
+      },
+      "document.record-declared": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.record-declared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: record-declared.",
+        "title": "document record-declared",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.record-declared",
+        "x-zoiko-origin": "extension"
+      },
       "document.stored": {
         "contentType": "application/json",
         "description": "Producer: Document Service. Primary consumers / intent: Linked domain/evidence. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
@@ -153,6 +269,30 @@
         "title": "document stored",
         "x-zoiko-event-type": "com.zoikosuite.business.document.stored",
         "x-zoiko-origin": "spec"
+      },
+      "document.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: superseded.",
+        "title": "document superseded",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "document.version-upload-quarantined": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.version-upload-quarantined",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: version-upload-quarantined.",
+        "title": "document version-upload-quarantined",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.version-upload-quarantined",
+        "x-zoiko-origin": "extension"
       },
       "document.versioned": {
         "contentType": "application/json",
@@ -411,6 +551,28 @@
       ],
       "summary": "Publish case facts after the authoritative commit (transactional outbox)."
     },
+    "publish.classification": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/classification"
+      },
+      "description": "Producer(s): Document Vault Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/classification/messages/confirmed"
+        },
+        {
+          "$ref": "#/channels/classification/messages/proposed"
+        },
+        {
+          "$ref": "#/channels/classification/messages/reclassified"
+        },
+        {
+          "$ref": "#/channels/classification/messages/superseded"
+        }
+      ],
+      "summary": "Publish classification facts after the authoritative commit (transactional outbox)."
+    },
     "publish.deadline": {
       "action": "send",
       "channel": {
@@ -429,13 +591,28 @@
       "channel": {
         "$ref": "#/channels/document"
       },
-      "description": "Producer(s): Document Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "description": "Producer(s): Document Service, Document Vault Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
       "messages": [
+        {
+          "$ref": "#/channels/document/messages/archived"
+        },
         {
           "$ref": "#/channels/document/messages/classification-changed"
         },
         {
+          "$ref": "#/channels/document/messages/disposition-requested"
+        },
+        {
+          "$ref": "#/channels/document/messages/record-declared"
+        },
+        {
           "$ref": "#/channels/document/messages/stored"
+        },
+        {
+          "$ref": "#/channels/document/messages/superseded"
+        },
+        {
+          "$ref": "#/channels/document/messages/version-upload-quarantined"
         },
         {
           "$ref": "#/channels/document/messages/versioned"

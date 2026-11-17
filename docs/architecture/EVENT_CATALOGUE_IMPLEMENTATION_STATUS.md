@@ -320,3 +320,24 @@ Behaviour changes to know about:
 - Not migrated: the existing counterparty events (`counterparty.*`) still use the old direct publisher,
   and `CloseOpportunity` still emits no event (it changes the stage to CLOSED_WON/LOST but never
   published `opportunity.stage_changed`; left as it was).
+
+### document-vault-svc (BIZ-01 / BIZ-02): nine events moved to the eventing outbox
+
+Nine events are written to `eventing_outbox` (migration 000017) in the same transaction as the change, as
+`com.zoikosuite.business.document.{record-declared,superseded,archived,disposition-requested,version-upload-quarantined}`
+and `com.zoikosuite.business.classification.{proposed,confirmed,reclassified,superseded}`, with payload schemas in
+`document-vault-svc/contracts/events` enforced by the store tests and extension catalogue entries (producer
+`Document Vault Service`). The old event_type is kept as the envelope's legacy type.
+
+Deliberately not moved: `document_created` and `document_version_committed` (named by ZS-SVC-S-001 section 9.3, so renaming
+them needs a decision between two specs), and the DRC retention, legal-hold and preservation events.
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a write whose event
+cannot be built is rolled back, a second relay delivers the eventing outbox (not started when no Kafka brokers are
+configured), and the Docker build context moved to `services/`.
+
+Also fixed: the older relay failed every poll on a row with a NULL `legal_entity_id` (legal holds, export packages),
+which blocked every later event; it now scans a nullable value.
+
+Open: the catalogue's section 19 entries `business.document.stored`, `versioned` and `classification-changed` (producer
+"Document Service", no deployed owner) overlap in meaning with the new types and need reconciling.
