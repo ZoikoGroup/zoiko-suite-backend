@@ -26,7 +26,7 @@ The spec requires a "security/privacy owner for restricted classes". Confirming 
 
 Fix: a new action, `CONFIRM_RESTRICTED_CLASSIFICATION`, is now required **in addition to** the ordinary one when confirming a `RESTRICTED` classification, and when superseding a classification that is `RESTRICTED` or whose replacement is `RESTRICTED` (moving a document into or out of `RESTRICTED`). It fails closed (403 denied, 503 authz unavailable) and a refused confirm leaves the proposal a CANDIDATE. Proposing (ClassifyRecord, Reclassify, BulkClassify) is unchanged; the gate is on confirmation.
 
-**The new action is not registered or granted in authorization-svc.** Until it is, confirming or superseding any RESTRICTED classification returns 403 or 503 in a real deployment.
+**The new action is registered in access-control-svc (migration 000058, HIGH) but no role template or bundle grants it yet.** Until a role is given it, confirming or superseding any RESTRICTED classification returns 403 in a real deployment; who holds it is a role-design decision.
 
 ## Implementation gate (spec: "must pass ... before production certification")
 
@@ -65,7 +65,7 @@ Date: 2026-11-16. The Postgres container was disposable and has been removed.
 
 ## Open items to reach certification
 
-1. Register and grant `CONFIRM_RESTRICTED_CLASSIFICATION` in authorization-svc (deployment config).
+1. ~~Register `CONFIRM_RESTRICTED_CLASSIFICATION`.~~ Registered (access-control-svc migration 000058). Still to do: grant it to the security/privacy owner role.
 2. Decide and implement the `RESTRICTED` status transition (the constant exists; no code sets it) and whether it should replace `CONFIRMED` for restricted values.
 3. ~~Move the four classification events to the shared eventing outbox.~~ Done (see `BIZ01_CERTIFICATION.md`, "Event migration"). Still to do: reconcile with the catalogue's unowned `business.document.classification-changed`.
 4. Implement the confidence policy and policy-decision references once AI-02 and DATA-GOV exist, and record downstream policy decision IDs.

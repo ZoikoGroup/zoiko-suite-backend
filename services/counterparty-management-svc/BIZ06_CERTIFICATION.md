@@ -56,14 +56,14 @@ After the outbox adoption: full suite passes against Postgres 16 (store now 26 t
 - Only the isolation test uses the non-superuser role; the other 22 store tests ran as the superuser. The isolation test was not mutation-checked (RLS disabled to confirm the probe fails).
 - The docker image was built and smoke-run before the handler change, not rebuilt after it.
 - The smoke run proves unauthenticated requests are rejected; it does not exercise the authenticated read-authorization defect above.
-- Write handlers other than CreateRelationship have no handler tests; authz-svc has not been checked for the new `CRM_READ` / `CRM_CONSENT_READ` actions.
+- Write handlers other than CreateRelationship have no handler tests. `CRM_READ` and `CRM_CONSENT_READ` are registered in access-control-svc (migration 000057); no role template or bundle grants them yet (a role-design decision), and real authorization-svc decisions were not checked.
 - There is no `openapi.biz06.yaml` (HTTP API contract). `CloseOpportunity` still emits no event although it changes the stage. The new outbox path was exercised against Postgres and a container, but not end to end through Kafka to a real consumer; the relay started in the smoke run with no reachable broker, so delivery was not observed.
 - Dependencies ORG-07, BIZ-09/10 and AR/LEG/COM links were not checked end to end. `ConfirmPartyLink` does not verify the counterparty exists in this audit.
 - The docker-compose stack was not run.
 
 ## Open items to reach certification
 
-1. ~~Add authorization to the five read handlers.~~ Done. Still to do: register and grant `CRM_READ` / `CRM_CONSENT_READ` in authorization-svc.
+1. ~~Add authorization to the five read handlers.~~ Done. ~~Register `CRM_READ` / `CRM_CONSENT_READ`.~~ Registered (access-control-svc migration 000057). Still to do: grant them to the roles that need them.
 2. ~~Add CRM handler tests.~~ Done for reads and CreateRelationship; extend to the other writes.
 3. ~~Add a cross-tenant negative test including a non-superuser RLS probe.~~ Done.
 4. ~~Run the CRM store suite on Postgres and record the result.~~ Done, 23/23 (isolation test as non-superuser).

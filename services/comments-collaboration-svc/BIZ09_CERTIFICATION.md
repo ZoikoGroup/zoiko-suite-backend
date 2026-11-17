@@ -27,7 +27,7 @@ A certificate listing only successes certifies nothing, so the last two sections
 3. **Restricted threads could be changed by principals who could not read them.** Reads required `COMMENT_READ_RESTRICTED` on a restricted thread, but edit, delete, react, mention, moderate, resolve and attach did not. A new `checkWrite` requires `COMMENT_READ_RESTRICTED` in addition to the command's own action for those writes. Mention keeps its uniform refusal body.
 4. **A deleted comment's body was still returned by `ListComments`.** DELETED_REDACTED was a status only. The ordinary read now returns an empty body for a deleted comment; the deletion reason, actor and time are still shown, and the original text stays in the append-only history.
 
-**The new action `COMMENT_MODERATE` is not registered or granted in authorization-svc.** Until it is, moderating and deleting another principal's comment returns 403 (or 503) in a real deployment, and so does any `COMMENT_MANAGE`-only moderator who relied on the old behaviour.
+**The new action `COMMENT_MODERATE` is registered in access-control-svc (migration 000059, STANDARD) but no role template or bundle grants it yet.** Until a role is given it, moderating and deleting another principal's comment returns 403 in a real deployment, and so does any `COMMENT_MANAGE`-only moderator who relied on the old behaviour; who holds it is a role-design decision.
 
 ## Implementation gate (spec: "must pass ... before production certification")
 
@@ -75,7 +75,7 @@ Date: 2026-11-17. The Postgres container was disposable and has been removed.
 ## Open items to reach certification
 
 1. ~~Events can be lost: move the five events to the shared eventing outbox.~~ Done (see "Event migration").
-2. Register and grant `COMMENT_MODERATE` (and verify the other `COMMENT_*` actions) in authorization-svc; run the service in the compose stack.
+2. ~~Register `COMMENT_MODERATE`.~~ Registered (access-control-svc migration 000059). Still to do: grant it to the moderator role, verify the other `COMMENT_*` actions against the real service, and run the service in the compose stack.
 3. Define what a moderation does (an action vocabulary, and whether a MODERATED body is hidden), and who may read a deleted or moderated comment's original history.
 4. Restricted threads: purpose and membership controls beyond a single entity-scoped action, if the spec means per-thread membership.
 5. Delete under a hold: decide between refusing (current) and the spec's restricted/redacted treatment, and record retention status as evidence.
