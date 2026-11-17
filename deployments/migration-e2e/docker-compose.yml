@@ -1,0 +1,165 @@
+# Minimal slice for proving migration-integrity-svc <-> general-ledger-svc
+# end to end: ONLY this service, general-ledger-svc, their Postgres, and
+# authorization-svc. Not part of the main deployments/docker-compose.yml
+# (migration-integrity-svc isn't wired into that file at all yet, and this
+# task's instructions are explicit: never boot the whole stack). Kafka is
+# deliberately absent -- kafkaout.New's writer connects lazily (see
+# services/eventing/kafkaout/kafkaout.go), so KAFKA_BROKERS pointing at
+# nothing non-fatally queues events in each service's own outbox table
+# instead of publishing them; that's an accepted gap for this proof, not a
+# missing requirement (the task asks for real Postgres + real HTTP calls,
+# not a full event bus).
+#
+# Run from deployments/migration-e2e/:
+#   docker compose up -d --build
+#   docker compose down -v
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mige2e-postgres
+    mem_limit: 512m
+    cpus: "1.0"
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+      - ../../services/migration-integrity-svc/deployments/migrations:/migrations/migration-integrity:ro
+      - ../../services/general-ledger-svc/deployments/migrations:/migrations/general-ledger:ro
+      - ../../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  authorization-svc:
+    build:
+      context: ../../
+      dockerfile: services/authorization-svc/Dockerfile
+    container_name: mige2e-authorization-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "18089:8089"
+    environment:
+      PORT: "8089"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: authorization_svc
+      DB_USER: app_authorization
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "authorization-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.authorization.events"
+      KAFKA_DELEGATION_TOPIC: ""
+      AUTHZ_IDENTITY_ASSERTION: "off"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8089/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: on-failure
+
+  # general-ledger-svc's migration kernel's period gate calls
+  # financial-close-svc's GET /v1/close/periods/status synchronously and
+  # fails closed if it is unreachable (services/general-ledger-svc/internal
+  # /close/client.go) -- there is no PERIOD_GATE_MODE that skips this call,
+  # that env var governs a separate, additional shadow gate. Booting the
+  # real financial-close-svc (plus ITS Postgres and dependencies) would
+  # break the "only the few containers this task needs" constraint, so this
+  # uses general-ledger-svc's own officially-sanctioned local-dev stand-in
+  # (services/general-ledger-svc/deployments/fake-svcs: "a minimal
+  # two-in-one stand-in, used solely by the limited, self-contained local
+  # compose for general-ledger-svc") for ONLY the close-period-status and
+  # currency-precision reads. Authorization stays real: AUTHZ_SERVICE_URL
+  # below points at the genuine authorization-svc container, not this
+  # shim's own (unused) /v1/authorize route.
+  fake-close-svc:
+    build:
+      context: ../../services/general-ledger-svc/deployments/fake-svcs
+      dockerfile: Dockerfile
+    container_name: mige2e-fake-close-svc
+    mem_limit: 64m
+    cpus: "0.25"
+
+  general-ledger-svc:
+    build:
+      context: ../../services
+      dockerfile: general-ledger-svc/Dockerfile
+    container_name: mige2e-general-ledger-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "18098:8098"
+    environment:
+      PORT: "8098"
+      PERIOD_GATE_MODE: "off"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: general_ledger
+      DB_USER: app_general_ledger
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.general-ledger.events"
+      EVENT_RESIDENCY_REGION: "local"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      CLOSE_SERVICE_URL: "http://fake-close-svc:8104"
+      CURRENCY_REGISTRY_URL: "http://fake-close-svc:8104"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      fake-close-svc:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8098/readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: on-failure
+
+  migration-integrity-svc:
+    build:
+      context: ../../services
+      dockerfile: migration-integrity-svc/Dockerfile
+    container_name: mige2e-migration-integrity-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "18139:8139"
+    environment:
+      PORT: "8139"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/migration_integrity?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.migration-integrity.events"
+      EVENT_RESIDENCY_REGION: "local"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      GL_SERVICE_URL: "http://general-ledger-svc:8098"
+      INTEGRITY_SCORE_THRESHOLD: "95"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: on-failure
