@@ -150,6 +150,25 @@ var registeredActionMigrations = []struct {
 		"PARTY_CONTACT_RETIRE": "STANDARD",
 		"PARTY_CONTACT_READ":   "STANDARD",
 	}},
+	{"000057_register_policy_evidence_redeliver", "policy-svc", map[string]string{
+		"POLICY_EVIDENCE_REDELIVER": "HIGH",
+	}},
+	{"000058_register_policy_certification_actions", "policy-svc", map[string]string{
+		"POLICY_TEST_MANAGE":    "HIGH",
+		"POLICY_TEST_RUN":       "HIGH",
+		"POLICY_WAIVER_REQUEST": "STANDARD",
+		"POLICY_WAIVER_APPROVE": "HIGH",
+		"POLICY_SIMULATE":       "STANDARD",
+	}},
+	{"000060_register_signatory_office_actions", "workflow-svc", map[string]string{
+		"SIGNATORY_SIGN_AS_DIRECTOR":          "HIGH",
+		"SIGNATORY_SIGN_AS_CFO":               "HIGH",
+		"SIGNATORY_SIGN_AS_CEO":               "HIGH",
+		"SIGNATORY_SIGN_AS_FINANCE_SIGNER":    "HIGH",
+		"SIGNATORY_SIGN_AS_COMPANY_SECRETARY": "HIGH",
+		"SIGNATORY_SIGN_AS_GENERAL_COUNSEL":   "HIGH",
+		"SIGNATORY_SIGN_AS_TREASURER":         "HIGH",
+	}},
 }
 
 // templatePublishers are the migrations, in this list, that publish role
