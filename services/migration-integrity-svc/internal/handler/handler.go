@@ -14,6 +14,7 @@ import (
 	"zoiko.io/migration-integrity-svc/internal/authz"
 	"zoiko.io/migration-integrity-svc/internal/domain"
 	svcenvelope "zoiko.io/migration-integrity-svc/internal/envelope"
+	"zoiko.io/migration-integrity-svc/internal/glclient"
 	"zoiko.io/migration-integrity-svc/internal/health"
 	"zoiko.io/migration-integrity-svc/internal/middleware"
 	"zoiko.io/migration-integrity-svc/internal/store"
@@ -26,6 +27,17 @@ const (
 	ActionMigrationJobArchive  = "MIGRATION_JOB_ARCHIVE"
 	ActionMigrationJobView     = "MIGRATION_JOB_VIEW"
 	ActionAuditEntryRemediate  = "AUDIT_ENTRY_REMEDIATE"
+
+	// Control-plane actions (batch ref / crosswalk / certificate). Separate
+	// from the field-level actions above because promoting a batch into
+	// general-ledger-svc and issuing a certificate are materially bigger
+	// authorities than running or reading a validation job.
+	ActionMigrationBatchPromote   = "MIGRATION_BATCH_PROMOTE"
+	ActionMigrationBatchView      = "MIGRATION_BATCH_VIEW"
+	ActionMigrationCrosswalkWrite = "MIGRATION_CROSSWALK_WRITE"
+	ActionMigrationCrosswalkView  = "MIGRATION_CROSSWALK_VIEW"
+	ActionMigrationCertificateIssue = "MIGRATION_CERTIFICATE_ISSUE"
+	ActionMigrationCertificateView  = "MIGRATION_CERTIFICATE_VIEW"
 )
 
 type Handler struct {
@@ -33,6 +45,13 @@ type Handler struct {
 	authz                   *authz.Client
 	logger                  *zap.Logger
 	integrityScoreThreshold float64
+
+	// cp/gl are set by WithControlPlane. Left nil, the control-plane routes
+	// (promote/crosswalk/certificate) answer 501 rather than panic -- the
+	// same "not configured" shape general-ledger-svc's own kernel handler
+	// uses for a repo that does not implement MigrationRepo.
+	cp store.ControlPlaneStore
+	gl *glclient.Client
 }
 
 // NewHandler wires the handler. integrityScoreThreshold is the service-level
@@ -42,6 +61,15 @@ type Handler struct {
 // (SPEC_DEVIATIONS A11).
 func NewHandler(s store.Store, a *authz.Client, l *zap.Logger, integrityScoreThreshold float64) *Handler {
 	return &Handler{store: s, authz: a, logger: l, integrityScoreThreshold: integrityScoreThreshold}
+}
+
+// WithControlPlane wires the batch-ref/crosswalk/certificate store and the
+// general-ledger-svc client. Mirrors general-ledger-svc handler's own
+// With*(...) *Handler chaining style (see handler.New(...).WithEvidenceGate(...)).
+func (h *Handler) WithControlPlane(cp store.ControlPlaneStore, gl *glclient.Client) *Handler {
+	h.cp = cp
+	h.gl = gl
+	return h
 }
 
 func NewRouter(h *Handler) http.Handler {
@@ -75,6 +103,16 @@ func NewRouter(h *Handler) http.Handler {
 		r.Get("/{id}", h.GetJobByID)
 		r.Post("/{id}/audit/{entryId}/remediate", h.RemediateEntry)
 		r.Delete("/{id}", h.ArchiveJob)
+
+		// Control plane: ties a validated job to a real general-ledger-svc
+		// batch, the permanent legacy<->canonical identity crosswalk, and
+		// the certificate issued once GL's own Post+Reconcile succeed.
+		r.Post("/crosswalk", h.UpsertCrosswalk)
+		r.Get("/crosswalk", h.GetCrosswalkEntry)
+		r.Post("/{id}/promote", h.PromoteBatch)
+		r.Get("/{id}/batch-ref", h.GetBatchRef)
+		r.Post("/{id}/certificate", h.IssueCertificate)
+		r.Get("/{id}/certificate", h.GetCertificate)
 	})
 
 	return r

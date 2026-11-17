@@ -24,6 +24,11 @@ type Config struct {
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
 
+	// GeneralLedgerURL is general-ledger-svc, the real posting/control plane
+	// a validated batch is promoted into (Stage/Approve/Post/Reconcile on
+	// its existing kernel migration-batch API). GL_SERVICE_URL.
+	GeneralLedgerURL string
+
 	// EventResidencyRegion is the residencyregion every event this service
 	// emits carries (ZS-EVENT-001 §4: required, "authoritative regional
 	// data-bearing context"). Deliberately NO default: a wrong region silently
@@ -69,6 +74,7 @@ func Load() (*Config, error) {
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: getEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		GeneralLedgerURL:         getEnv("GL_SERVICE_URL", "http://general-ledger-svc:8098"),
 	}, nil
 }
 

@@ -230,3 +230,104 @@ service. One scoring defect was fixed in this pass (B1).
   single blank `ref` now fails a run that would otherwise pass, and the
   owner-only rule for MQ0 means a delegate cannot resolve one on the
   owner's behalf.
+
+## C. Wiring this service into the platform as a real control plane
+
+Until this pass, `migration-integrity-svc` did exactly one thing --
+`POST /validate`'s six field-level checks -- and nothing in the platform
+called it, nor did it call anything else. It had no concept of a migration
+program, batch, identity crosswalk or certificate, despite being governed by
+the full `ZS-MIG-001` doctrine. This pass adds the three objects the spec's
+§4 Canonical Migration Object Model and §3 Doctrine describe above the
+field-level engine, and wires a real call path into
+`general-ledger-svc`, which already has the one real, working posting/
+cutover lifecycle (`internal/kernel/migration.go` there: Stage -> Preview ->
+Approve -> Post -> Reconcile, posted as a real OPENING journal through the
+ordinary chart-of-accounts/dimension rules).
+
+- **C1. `MigrationBatchRef`** (`migration_batch_refs`, migration `000006`).
+  A thin reference row tying one validation job (`migration_jobs.id`) to the
+  real batch general-ledger-svc executes (`gl_batch_id`, `gl_journal_id`,
+  `gl_journal_number`, all copied back from GL's own responses, never minted
+  here). It is deliberately NOT a copy of general-ledger-svc's
+  `MigrationBatch`: it holds no lines, no account mapping, no posting state
+  machine -- those stay in general-ledger-svc, which owns financial
+  integrity for the posting itself. This is the "program/tracking layer" the
+  task asked for, not a second "posting layer".
+
+- **C2. `IdentityCrosswalk`** (`migration_identity_crosswalk`, migration
+  `000007`). A permanent `(tenant, source_system, source_type, source_id) ->
+  canonical_id` mapping with match evidence (`match_method`,
+  `match_evidence`, `matched_by`), kept forever rather than scoped to one
+  job, per MIG-INV-14 ("legacy and canonical identifiers remain mutually
+  discoverable"). A later extract that reuses a legacy key reuses its
+  existing canonical_id; a conflicting canonical_id for an already-mapped
+  source identifier is refused (`store.ErrCrosswalkConflict`), not silently
+  overwritten -- a legacy key changing identity is a fact that needs its own
+  evidenced decision.
+
+- **C3. `MigrationCertificate`** (`migration_certificates`, migration
+  `000008`). Issued by `POST /v1/migrations/{id}/certificate` only after (a)
+  the job carries no unresolved MQ0/MQ1 audit entries and (b)
+  general-ledger-svc's own `GET /v1/migration-batches/{id}/evidence` is read
+  **fresh, at issuance time** and reports `Reconciliation.Status == MATCHED`
+  with `evidence_verified == true`. The certificate's `gl_journal_id` /
+  `gl_journal_number` / `gl_evidence_hash` are copied from that read, not
+  computed or asserted independently -- the claim is backed by GL's
+  evidence, never this service's own say-so. A `CHECK` constraint
+  (`gl_reconciliation_status = 'MATCHED'`) backstops this at the schema
+  level.
+
+- **C4. The actual call**: `POST /v1/migrations/{id}/promote`
+  (`internal/handler/control_plane.go`) drives general-ledger-svc's
+  *existing, unmodified* kernel migration endpoints as an HTTP client
+  (`internal/glclient`) in the order Stage -> Validate -> Approve -> Post ->
+  Reconcile, carrying the same tenant/principal/legal-entity/correlation
+  envelope headers and an `Idempotency-Key` derived from the batch ref's own
+  id (so a retried promotion step replays general-ledger-svc's own
+  idempotent response instead of creating a second batch or journal).
+  Preconditions enforced before any GL call is made: the job has no
+  unresolved MQ0/MQ1 blockers, and every line's `source_ref` already has a
+  resolved crosswalk entry. The preparer (who stages in GL) and the
+  promoting principal (who approves) are required to differ, matching
+  general-ledger-svc's own self-approval rule (`ErrSelfApproval`) rather
+  than discovering it as an opaque 4xx mid-sequence.
+
+- **C5. Authorization actions added**: `MIGRATION_BATCH_PROMOTE`,
+  `MIGRATION_BATCH_VIEW`, `MIGRATION_CROSSWALK_WRITE`,
+  `MIGRATION_CROSSWALK_VIEW`, `MIGRATION_CERTIFICATE_ISSUE`,
+  `MIGRATION_CERTIFICATE_VIEW` -- checked the same fail-closed way as the
+  existing `MIGRATION_JOB_*` actions (`internal/authz.Client.CheckAllowed`
+  against authorization-svc, scoped per legal entity except the crosswalk
+  actions, which are tenant-scoped because a crosswalk entry is not
+  attached to one legal entity).
+
+- **C6. `financial-close-svc`'s separate `MigrationBatch` (capability
+  `ACC-17`) is redundant with general-ledger-svc's and should be retired —
+  recommended, not done here.** `financial-close-svc` has its own
+  `domain.MigrationBatch` and its own migration-batch lifecycle, entirely
+  independent of `general-ledger-svc/internal/kernel/migration.go`. Both
+  claim to be the migration-batch posting authority for opening balances;
+  only one (general-ledger-svc's) actually posts through the real
+  chart-of-accounts/dimension/period-gate rules and freezes real reconciled
+  evidence. This service was wired to general-ledger-svc's version
+  specifically because it is the one with working Stage/Preview/Approve/
+  Post/Reconcile semantics against the real ledger. `financial-close-svc`'s
+  version was deliberately left untouched for this task (out of scope,
+  explicitly) -- but its existence as a second, competing migration-batch
+  concept is a real architectural redundancy, and retiring it (or
+  re-pointing `ACC-17` at general-ledger-svc's batches) is recommended
+  future cleanup, not something this pass should decide unilaterally.
+
+- **C7. What is intentionally NOT done here.** This service's generic
+  `POST /validate` (field-level record checks: schema, referential,
+  identity, duplicate, range, format) and `POST /{id}/promote`'s
+  GL-shaped batch content (account codes, debit/credit, cutover window) are
+  two different inputs with no automatic mapping between them --
+  `ValidateMigrationRequest.Records` are opaque `{ref, fields}` pairs with
+  no notion of an account code or a ledger side. Deriving GL posting lines
+  from validated records automatically (rather than the caller supplying
+  both, as `PromoteBatchRequest` does) would require a mapping/transform
+  layer this service does not have and this task did not add; see the
+  worked example below for how the two are joined by hand via the
+  crosswalk's `source_ref`.
