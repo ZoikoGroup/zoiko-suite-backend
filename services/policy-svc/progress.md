@@ -1,5 +1,14 @@
 # Policy Service — Progress & Phase Plan
 
+## P-01 closed — 17 November 2026
+
+| Row | Status | Evidence |
+|---|---|---|
+| F08 | built | `internal/signatory`, `internal/policytype`, `TestSignatoryResolve_*`, `TestSignatoryMatrix_*` |
+| F14 | live E2E passing | `deployments/scripts/e2e-policy-deps.py` (111 checks) |
+
+Open: POL-3 (identity enforce), evaluate status codes (SPEC_DEVIATIONS), EST-9 grants.
+
 ## Completion pass — 16 November 2026 (current status; supersedes everything below)
 
 Tracker: `docs/audit_files/DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md` §D2-3. Branch

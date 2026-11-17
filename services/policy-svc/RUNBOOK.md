@@ -28,8 +28,12 @@ PDC-05 certification.
 | `GOVERNANCE_DECISION_LOG_MTLS_URL` | — | relay over mTLS (recommended) |
 | `MTLS_ENABLED`, `MTLS_PORT`, `MTLS_ALLOWED_CLIENTS` | false, 8449, any | peer listener for system callers |
 | `CURSOR_SIGNING_KEY_HEX` | random in local/dev | ≥32-byte hex; required outside local/dev (API-4 cursors) |
-| `EVENT_RESIDENCY_REGION` | — | stamped on every event |
-| `POLICY_SCHEDULER_INTERVAL`, `POLICY_EVIDENCE_RELAY_INTERVAL` | 15s, 2s | background workers |
+| `POLICY_DECISION_SIGNING_KEY_HEX` | random in local/dev | Ed25519 seed (64 hex) for decision signatures; required outside local/dev |
+
+## Signatory decisions
+
+- Watch `policy_decisions_total{outcome="NOT_CONFIGURED"|"NOT_IMPLEMENTED"}`.
+- `GET /v1/policy-types` shows each family's active versions and recent outcomes.
 
 ## Deploy
 

@@ -4,17 +4,25 @@ Each entry names the spec clause, what is built instead, why, and what would clo
 Specs: Doc 03 §8.1, GOV-05, ZS-SVC-V-001 (PDC-01…05), REF-07, ZS-API-001 (API-2…API-5),
 GCP §16.
 
-## P-01: SPEND_CONTROL, SIGNATORY_MATRIX, SOD_RULE and LEGAL_BASIS have no evaluator
+## P-01: closed 17 Nov 2026 (ZS-GOV-POL-001, ZS-GOV-INT-002)
 
-Doc 03 §8.1 names these policy types, but no document defines their payload or how they
-decide. `POST /v1/policies/evaluate` answers `501 NOT_IMPLEMENTED` for them, rather than
-inventing a rule. Versions of these types can still be drafted, approved and activated: the
-certification gate treats them as `EXEMPT_NO_EVALUATOR`, because there is nothing to test, and
-notification-svc reads LEGAL_BASIS versions by id. The business rules have been requested from
-the business owners. Doc 03 also places spend evaluation in the Spend Controls Service (§12.12)
-and SoD evaluation in authorization-svc, and the business owners must confirm that split.
-**Closes when:** the rules are supplied; each type then gets an evaluator in
-`internal/evaluator` and a payload check in `validateRulePayload` (POL-2).
+SIGNATORY_MATRIX is evaluated here (`POST /internal/v1/policy/signatory-matrix/resolve`).
+SPEND_CONTROL, SOD_RULE and LEGAL_BASIS are decided by spend-controls-svc, authorization-svc and
+privacy-decision-svc; their versions here are references, and evaluate answers 501 NOT_IMPLEMENTED.
+
+## Evaluate keeps 404 / 409 / 501 (Doc 02 §9 wants 200)
+
+Its callers fail closed on these codes. The bodies carry `outcome` and `reason_codes`.
+**Closes when:** the callers read `outcome`.
+
+## Signer offices
+
+Only the offices in access-control 000060 can sign (`SIGNATORY_SIGN_AS_<OFFICE>`). Any other
+office in a matrix cannot be signed until it is registered.
+
+## Decision signing key
+
+`POLICY_DECISION_SIGNING_KEY_HEX` is required outside local/dev. Locally a random key is used.
 
 ## GET /v1/policies and GET /v1/accounting-policies are not paged (API-4)
 
@@ -40,7 +48,7 @@ PDC-I-24 requires certified tests before activation. A type with no evaluator ha
 could run, so the gate reports `EXEMPT_NO_EVALUATOR` for it:
 - REF-07 accounting policies, which are resolved rather than evaluated; draft-time validation
   covers them (impact analysis, pinned rule mappings);
-- the P-01 types.
+- SPEND_CONTROL, SOD_RULE and LEGAL_BASIS (their owners evaluate them).
 
 Versions that were ACTIVE before migration 000012 are grandfathered. The gate applies at their
 successors' activation. `POLICY_CERTIFICATION_GATE=warn|off` exists only for migration windows.
