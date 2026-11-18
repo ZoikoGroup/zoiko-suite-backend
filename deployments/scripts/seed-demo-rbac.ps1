@@ -850,7 +850,14 @@ $BUNDLES = @(
             "iam.authority_limit.approve",
             # Workload bindings (§16): the register read and its writes share
             # one action.
-            "iam.workload.manage"
+            "iam.workload.manage",
+            # ORG-06 SuspendAssignment (authorization-svc 000037, access-control
+            # 000036): the console's Role grants drawer suspends and resumes a
+            # grant. access-control creates no production template for these
+            # (a Security role-design decision), so only the demo operators
+            # hold them; the service still refuses a holder resuming their own.
+            "iam.assignment.suspend",
+            "iam.assignment.resume"
         )
     },
     @{
@@ -1079,6 +1086,43 @@ function New-AuthzEnvelope {
     return $headers
 }
 
+# authorization-svc stores the same grant twice when asked twice: nothing makes a
+# role assignment unique, and the "409|23505|duplicate" catches below never fire.
+# Every re-run of this script used to add another copy of each demo grant. On
+# 18 Nov 2026 the demo admin held CONSOLE_DEMO_OPERATOR 34 times, and the
+# identity envelope listing them all pushed the console's session cookie past
+# the browser's 4096-byte limit, so the admin could no longer sign in. So a
+# grant is made only when the principal does not already hold the role, live
+# and approved, on that scope.
+function Test-Assigned {
+    param(
+        [Parameter(Mandatory)] [string] $PrincipalId,
+        [Parameter(Mandatory)] [string] $RoleId,
+        [Parameter(Mandatory)] [string] $Scope
+    )
+    $path = "/v1/admin/role-assignments"
+    $headers = New-AuthzEnvelope -Path $path -Actor $SEED_ADMIN_ID
+    $headers.Remove("Idempotency-Key")
+    try {
+        $response = Invoke-WebRequest -Uri "$AUTHZ$path`?principal_id=$PrincipalId&role_id=$RoleId" -Method GET `
+            -Headers $headers -UseBasicParsing -TimeoutSec 10
+    } catch {
+        # Unreadable (the IAM bootstrap has not run yet): make the grant, as before.
+        return $false
+    }
+    # Windows PowerShell 5.1 emits a JSON array as ONE object down the pipeline,
+    # so assign it first; foreach then walks the elements.
+    $rows = ConvertFrom-Json $response.Content
+    foreach ($a in $rows) {
+        $approved = (-not $a.approval_status) -or ($a.approval_status -eq "APPROVED")
+        $live = (-not $a.effective_to) -or ([datetime] $a.effective_to -gt (Get-Date))
+        if ($a.role_id -eq $RoleId -and $a.legal_entity_id -eq $Scope -and $approved -and $live -and -not $a.suspended_at) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Invoke-Authz {
     param(
         [Parameter(Mandatory)] [string] $Path,
@@ -1089,6 +1133,10 @@ function Invoke-Authz {
         # privilege").
         [string] $Actor = $PRINCIPAL_ID
     )
+    if ($Path -eq "/v1/admin/role-assignments" -and
+        (Test-Assigned -PrincipalId $Body.principal_id -RoleId $Body.role_id -Scope $Body.legal_entity_id)) {
+        return @{ status = 200; body = @{ principal_role_assignment_id = "(already held, not granted again)" } }
+    }
     $json = $Body | ConvertTo-Json -Compress -Depth 5
     $headers = New-AuthzEnvelope -Path $Path -Actor $Actor
     # The legal entity mirrors the body's own scope when the call carries one
