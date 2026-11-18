@@ -188,12 +188,26 @@ func (h *Handler) PromoteBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ProgramID, when given, names a program by its business program_id
+	// (CreateProgramRequest.ProgramID), the same way GetCrosswalkEntry etc.
+	// take caller-facing identifiers rather than internal uuids. Resolved to
+	// the program's internal id before being recorded on the batch ref.
+	var programInternalID string
+	if strings.TrimSpace(req.ProgramID) != "" {
+		program, err := h.cp.GetProgramByBusinessID(r.Context(), tenantID, strings.TrimSpace(req.ProgramID))
+		if err != nil {
+			h.errJSON(w, http.StatusNotFound, "program_id does not name a migration program in this tenant")
+			return
+		}
+		programInternalID = program.ID
+	}
+
 	var ref *domain.MigrationBatchRef
 	if existingRef != nil {
 		ref, err = h.cp.ResetBatchRefForRetry(r.Context(), tenantID, existingRef.ID, req.BatchCode, req.BookID, principalID, r.Header.Get("X-Correlation-ID"))
 	} else {
 		ref, err = h.cp.CreateBatchRef(r.Context(), tenantID, &domain.MigrationBatchRef{
-			LegalEntityID: job.LegalEntityID, JobID: jobID, BatchCode: req.BatchCode, GLBookID: req.BookID,
+			LegalEntityID: job.LegalEntityID, ProgramID: programInternalID, JobID: jobID, BatchCode: req.BatchCode, GLBookID: req.BookID,
 		}, principalID, r.Header.Get("X-Correlation-ID"))
 	}
 	if err != nil {
@@ -415,6 +429,239 @@ func (h *Handler) IssueCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.okJSON(w, http.StatusCreated, cert)
+}
+
+// ─── Migration Program ──────────────────────────────────────────────────────
+
+// CreateProgram handles POST /v1/migrations/programs. Authorized at the
+// platform/tenant scope, like the crosswalk actions: a program is not
+// attached to one legal entity.
+func (h *Handler) CreateProgram(w http.ResponseWriter, r *http.Request) {
+	if h.notConfigured(w) {
+		return
+	}
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.checkAllowed(w, r, principalID, tenantID, ActionMigrationProgramWrite) {
+		return
+	}
+
+	var req domain.CreateProgramRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.errJSON(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Idempotent replay: a program_id already registered for this tenant
+	// returns the existing program rather than a 409 or a duplicate --
+	// matching the batch-ref/certificate idempotent-replay shape elsewhere
+	// in this handler.
+	if existing, err := h.cp.GetProgramByBusinessID(r.Context(), tenantID, strings.TrimSpace(req.ProgramID)); err == nil {
+		w.Header().Set("Idempotent-Replay", "true")
+		h.okJSON(w, http.StatusOK, existing)
+		return
+	}
+
+	p, err := h.cp.CreateProgram(r.Context(), tenantID, &domain.MigrationProgram{
+		ProgramID: strings.TrimSpace(req.ProgramID), SourceEstate: req.SourceEstate, TargetScope: req.TargetScope,
+		OwnerPrincipalID: req.OwnerPrincipalID, CutoverStrategy: strings.ToUpper(strings.TrimSpace(req.CutoverStrategy)),
+		CreatedBy: principalID,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.logger.Error("failed to create migration program", zap.Error(err))
+		h.errJSON(w, http.StatusInternalServerError, "failed to create migration program")
+		return
+	}
+	h.okJSON(w, http.StatusCreated, p)
+}
+
+// GetProgram handles GET /v1/migrations/programs/{id}, returning the
+// program plus a live summary of the batches that name it ("how many
+// batches, what's the overall status").
+func (h *Handler) GetProgram(w http.ResponseWriter, r *http.Request) {
+	if h.notConfigured(w) {
+		return
+	}
+	tenantID := middleware.GetTenantID(r.Context())
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.checkAllowed(w, r, principalID, tenantID, ActionMigrationProgramView) {
+		return
+	}
+
+	p, err := h.cp.GetProgramByID(r.Context(), tenantID, id)
+	if err != nil {
+		h.errJSON(w, http.StatusNotFound, "migration program not found")
+		return
+	}
+	summary, err := h.cp.GetProgramBatchSummary(r.Context(), tenantID, p.ID)
+	if err != nil {
+		h.logger.Error("failed to summarize program batches", zap.Error(err))
+		h.errJSON(w, http.StatusInternalServerError, "failed to summarize program batches")
+		return
+	}
+	h.okJSON(w, http.StatusOK, domain.MigrationProgramView{MigrationProgram: *p, Batches: *summary})
+}
+
+// UpdateProgramStatus handles POST /v1/migrations/programs/{id}/status. The
+// transition is validated against the program's current status
+// (domain.NextProgramStatus): OPEN -> IN_PROGRESS -> COMPLETE, linear and
+// forward-only, no skipping and no reopening a COMPLETE program from here.
+func (h *Handler) UpdateProgramStatus(w http.ResponseWriter, r *http.Request) {
+	if h.notConfigured(w) {
+		return
+	}
+	tenantID := middleware.GetTenantID(r.Context())
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.checkAllowed(w, r, principalID, tenantID, ActionMigrationProgramWrite) {
+		return
+	}
+
+	var req domain.UpdateProgramStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.errJSON(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	p, err := h.cp.GetProgramByID(r.Context(), tenantID, id)
+	if err != nil {
+		h.errJSON(w, http.StatusNotFound, "migration program not found")
+		return
+	}
+	requested := domain.ProgramStatus(strings.ToUpper(strings.TrimSpace(req.Status)))
+	next, err := domain.NextProgramStatus(p.Status, requested)
+	if err != nil {
+		h.errJSON(w, http.StatusConflict, err.Error())
+		return
+	}
+
+	updated, err := h.cp.UpdateProgramStatus(r.Context(), tenantID, id, next, principalID, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.logger.Error("failed to update migration program status", zap.Error(err))
+		h.errJSON(w, http.StatusInternalServerError, "failed to update migration program status")
+		return
+	}
+	h.okJSON(w, http.StatusOK, updated)
+}
+
+// ─── Source Extract ─────────────────────────────────────────────────────────
+
+// RegisterExtract handles POST /v1/migrations/extracts. There is no update
+// route: MIG-INV-03 makes an extract immutable once landed, and a
+// correction is a new version registered through this same endpoint (see
+// store.CreateExtract).
+func (h *Handler) RegisterExtract(w http.ResponseWriter, r *http.Request) {
+	if h.notConfigured(w) {
+		return
+	}
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.RegisterExtractRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.errJSON(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.checkAllowed(w, r, principalID, req.LegalEntityID, ActionMigrationExtractWrite) {
+		return
+	}
+
+	if strings.TrimSpace(req.ProgramID) != "" {
+		if _, err := h.cp.GetProgramByID(r.Context(), tenantID, strings.TrimSpace(req.ProgramID)); err != nil {
+			h.errJSON(w, http.StatusNotFound, "program_id does not name a migration program in this tenant")
+			return
+		}
+	}
+
+	e, err := h.cp.CreateExtract(r.Context(), tenantID, &domain.SourceExtract{
+		ExtractID: strings.TrimSpace(req.ExtractID), LegalEntityID: req.LegalEntityID, ProgramID: strings.TrimSpace(req.ProgramID),
+		SourceWatermark: req.SourceWatermark, GeneratedAt: req.GeneratedAt, ManifestHash: req.ManifestHash,
+		RecordCount: req.RecordCount, Files: req.Files, AmountControls: req.AmountControls,
+	}, principalID, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.logger.Error("failed to register source extract", zap.Error(err))
+		h.errJSON(w, http.StatusInternalServerError, "failed to register source extract")
+		return
+	}
+	h.okJSON(w, http.StatusCreated, e)
+}
+
+// GetExtract handles GET /v1/migrations/extracts/{id} (internal id).
+func (h *Handler) GetExtract(w http.ResponseWriter, r *http.Request) {
+	if h.notConfigured(w) {
+		return
+	}
+	tenantID := middleware.GetTenantID(r.Context())
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	e, err := h.cp.GetExtractByID(r.Context(), tenantID, id)
+	if err != nil {
+		h.errJSON(w, http.StatusNotFound, "source extract not found")
+		return
+	}
+	if !h.checkAllowed(w, r, principalID, e.LegalEntityID, ActionMigrationExtractView) {
+		return
+	}
+	h.okJSON(w, http.StatusOK, e)
+}
+
+// ListExtractVersions handles GET /v1/migrations/extracts?extract_id=&legal_entity_id=,
+// returning every version of one business extract_id in ascending version
+// order -- the visible proof that a "correction" is a new row, never a
+// rewrite of an old one.
+func (h *Handler) ListExtractVersions(w http.ResponseWriter, r *http.Request) {
+	if h.notConfigured(w) {
+		return
+	}
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	extractID := r.URL.Query().Get("extract_id")
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if extractID == "" || legalEntityID == "" {
+		h.errJSON(w, http.StatusBadRequest, "extract_id and legal_entity_id are both required")
+		return
+	}
+	if !h.checkAllowed(w, r, principalID, legalEntityID, ActionMigrationExtractView) {
+		return
+	}
+	versions, err := h.cp.ListExtractVersions(r.Context(), tenantID, extractID)
+	if err != nil {
+		h.logger.Error("failed to list extract versions", zap.Error(err))
+		h.errJSON(w, http.StatusInternalServerError, "failed to list extract versions")
+		return
+	}
+	h.okJSON(w, http.StatusOK, map[string]any{"data": versions, "count": len(versions)})
 }
 
 func (h *Handler) GetCertificate(w http.ResponseWriter, r *http.Request) {

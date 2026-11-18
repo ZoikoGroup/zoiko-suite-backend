@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -38,6 +39,17 @@ const (
 	ActionMigrationCrosswalkView  = "MIGRATION_CROSSWALK_VIEW"
 	ActionMigrationCertificateIssue = "MIGRATION_CERTIFICATE_ISSUE"
 	ActionMigrationCertificateView  = "MIGRATION_CERTIFICATE_VIEW"
+
+	// Program and source-extract actions. Program actions are tenant-scoped
+	// (checked against the tenant, same as MIGRATION_CROSSWALK_*: a program
+	// is not attached to one legal entity -- the batches it aggregates each
+	// have their own). Extract actions are per-legal-entity, matching
+	// batch-ref/job scoping, since an extract names exactly one
+	// legal_entity_id.
+	ActionMigrationProgramWrite  = "MIGRATION_PROGRAM_WRITE"
+	ActionMigrationProgramView   = "MIGRATION_PROGRAM_VIEW"
+	ActionMigrationExtractWrite  = "MIGRATION_EXTRACT_REGISTER"
+	ActionMigrationExtractView   = "MIGRATION_EXTRACT_VIEW"
 )
 
 type Handler struct {
@@ -113,6 +125,19 @@ func NewRouter(h *Handler) http.Handler {
 		r.Get("/{id}/batch-ref", h.GetBatchRef)
 		r.Post("/{id}/certificate", h.IssueCertificate)
 		r.Get("/{id}/certificate", h.GetCertificate)
+
+		// MigrationProgram: the top-level tracking object a batch/extract
+		// may optionally belong to.
+		r.Post("/programs", h.CreateProgram)
+		r.Get("/programs/{id}", h.GetProgram)
+		r.Post("/programs/{id}/status", h.UpdateProgramStatus)
+
+		// SourceExtract: immutable, versioned landing of source data. No
+		// update route exists anywhere for it -- a correction is a new
+		// version, registered via the same POST.
+		r.Post("/extracts", h.RegisterExtract)
+		r.Get("/extracts/{id}", h.GetExtract)
+		r.Get("/extracts", h.ListExtractVersions)
 	})
 
 	return r
@@ -142,6 +167,40 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SourceExtractID, when given, binds this run to a registered, immutable
+	// SourceExtract (MIG-INV-03) instead of validating raw records with no
+	// frozen record of what was submitted. Backward compatible: a request
+	// that omits it validates exactly as this endpoint behaved before
+	// SourceExtract existed.
+	var extract *domain.SourceExtract
+	if strings.TrimSpace(req.SourceExtractID) != "" {
+		if h.cp == nil {
+			h.errJSON(w, http.StatusNotImplemented, "source_extract_id was given but the migration control plane is not configured on this instance")
+			return
+		}
+		var err error
+		extract, err = h.cp.GetExtractByID(r.Context(), tenantID, strings.TrimSpace(req.SourceExtractID))
+		if err != nil {
+			h.errJSON(w, http.StatusNotFound, "source_extract_id does not name a registered source extract in this tenant")
+			return
+		}
+		if extract.LegalEntityID != req.LegalEntityID {
+			h.errJSON(w, http.StatusConflict, "the source extract was registered for a different legal_entity_id")
+			return
+		}
+		// The frozen extract and what is being validated against it must be
+		// the same population: a mismatch means either a different
+		// submission is silently standing in for this extract, or the
+		// extract header itself does not describe what was actually landed
+		// -- either way, validating it as that extract would be wrong.
+		if extract.RecordCount != len(req.Records) {
+			h.errJSON(w, http.StatusConflict, fmt.Sprintf(
+				"record count mismatch: extract %s v%d declares %d records, but %d were submitted for validation",
+				extract.ExtractID, extract.Version, extract.RecordCount, len(req.Records)))
+			return
+		}
+	}
+
 	jobID := uuid.New().String()
 	now := time.Now()
 
@@ -167,6 +226,10 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 		Status:                  status,
 		StartedAt:               &now,
 		CompletedAt:             &now,
+	}
+	if extract != nil {
+		job.SourceExtractID = extract.ID
+		job.SourceExtractVersion = extract.Version
 	}
 
 	if err := h.store.CreateJob(r.Context(), tenantID, job, checks, entries, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
