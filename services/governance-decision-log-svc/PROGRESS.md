@@ -431,6 +431,19 @@ panes, verify, seal, package verify, both downloads, full record).
   identity-envelope, governance-decision-log-svc incl. DB, policy-svc,
   workflow-svc, access-control-svc).
 
+### 2026-11-18 — 000019: one lineage for the TRUNCATE guards
+
+`migrate.py status` reported 000007 and 000011 as edited after applying. Both were
+rewritten in place on 12 Oct. 000007's edit only made the backfill re-runnable (the
+dev DB holds the column and no unbackfilled row). 000011's edit renamed the guard:
+databases migrated before 12 Oct have `block_truncate()` on four tables (it also
+refused TRUNCATE on `idempotency_keys` and `outbox`), fresh ones `reject_truncate()`
+on two, and 000011's down could not remove the old triggers. 000019 converges an
+old-lineage database and is a no-op on a fresh one (both proven on scratch
+databases; 000011's down then removes everything). Applied live (19/19); the two
+checksums re-recorded with the reconciliation as their method. Suite 215 / 0 / 0
+(store on Postgres, `REQUIRE_DB_TESTS=1`).
+
 ## Next steps
 
 - [x] Commit: `c7d00cce` (11 Nov 2026). The PR to `main` is the estate's
