@@ -14,12 +14,14 @@ import (
 )
 
 type Store interface {
-	CreateException(ctx context.Context, c *domain.ExceptionCase) error
-	GetExceptionByID(ctx context.Context, id string) (*domain.ExceptionCase, error)
-	ListExceptions(ctx context.Context, legalEntityID, caseStatus, severityLevel, exceptionType string) ([]domain.ExceptionCase, error)
-	EscalateException(ctx context.Context, id string, req *domain.EscalateCaseRequest) (*domain.EscalationRecord, *domain.ExceptionCase, error)
-	ResolveException(ctx context.Context, id string, req *domain.ResolveCaseRequest) (*domain.ExceptionCase, error)
-	ListEscalations(ctx context.Context, role, status string) ([]domain.EscalationRecord, error)
+	CreateExceptionCase(ctx context.Context, params domain.CreateExceptionCaseParams) (*domain.ExceptionCase, error)
+	FindExceptionCaseByID(ctx context.Context, exceptionCaseID string) (*domain.ExceptionCase, error)
+	ListExceptionCases(ctx context.Context, filter domain.ListExceptionCasesFilter) ([]*domain.ExceptionCase, error)
+	UpdateExceptionCaseStatus(ctx context.Context, exceptionCaseID string, params domain.UpdateExceptionCaseStatusParams, actorID, correlationID string) (*domain.ExceptionCase, error)
+
+	CreateEscalationRecord(ctx context.Context, params domain.CreateEscalationRecordParams) (*domain.EscalationRecord, error)
+	FindEscalationRecordByID(ctx context.Context, escalationRecordID string) (*domain.EscalationRecord, error)
+	ListEscalationRecords(ctx context.Context, filter domain.ListEscalationRecordsFilter) ([]*domain.EscalationRecord, error)
 }
 
 type PgStore struct {
@@ -39,69 +41,84 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	return err
 }
 
-func (s *PgStore) CreateException(ctx context.Context, c *domain.ExceptionCase) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := s.setRLS(ctx, tx); err != nil {
-		return err
-	}
+const exceptionCaseColumns = `
+	exception_case_id,
+	tenant_id,
+	legal_entity_id,
+	exception_type,
+	severity_level,
+	linked_object_type,
+	linked_object_id,
+	case_status,
+	escalated_at,
+	created_at,
+	created_by_principal_id,
+	updated_at,
+	version`
 
-	if c.ExceptionCaseID == "" {
-		c.ExceptionCaseID = "excase-" + uuid.New().String()
-	}
-	c.TenantID = middleware.GetTenantID(ctx)
-	now := time.Now().UTC()
-	c.CreatedAt = now
-	c.UpdatedAt = now
-	if c.CaseStatus == "" {
-		c.CaseStatus = domain.CaseOpen
-	}
-	if c.SeverityLevel == "" {
-		c.SeverityLevel = domain.SeverityMedium
-	}
-
-	_, err = tx.Exec(ctx, `
-		INSERT INTO exception_cases
-			(exception_case_id, tenant_id, legal_entity_id, jurisdiction_id, exception_type,
-			 severity_level, linked_object_type, linked_object_id, description, case_status,
-			 assigned_to_role, assigned_to_user, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-		c.ExceptionCaseID, c.TenantID, c.LegalEntityID, c.JurisdictionID, c.ExceptionType,
-		string(c.SeverityLevel), c.LinkedObjectType, c.LinkedObjectID, c.Description, string(c.CaseStatus),
-		c.AssignedToRole, c.AssignedToUser, c.CreatedBy, c.CreatedAt, c.UpdatedAt,
+func scanExceptionCase(row pgx.Row) (*domain.ExceptionCase, error) {
+	ec := &domain.ExceptionCase{}
+	err := row.Scan(
+		&ec.ExceptionCaseID,
+		&ec.TenantID,
+		&ec.LegalEntityID,
+		&ec.ExceptionType,
+		&ec.SeverityLevel,
+		&ec.LinkedObjectType,
+		&ec.LinkedObjectID,
+		&ec.CaseStatus,
+		&ec.EscalatedAt,
+		&ec.CreatedAt,
+		&ec.CreatedByPrincipalID,
+		&ec.UpdatedAt,
+		&ec.Version,
 	)
-	if err != nil {
-		return fmt.Errorf("insert exception case: %w", err)
-	}
-	return tx.Commit(ctx)
+	return ec, err
 }
 
-func (s *PgStore) GetExceptionByID(ctx context.Context, id string) (*domain.ExceptionCase, error) {
+func (s *PgStore) CreateExceptionCase(ctx context.Context, params domain.CreateExceptionCaseParams) (*domain.ExceptionCase, error) {
+	exceptionCaseID := params.ExceptionCaseID
+	if exceptionCaseID == "" {
+		exceptionCaseID = uuid.New().String()
+	}
+
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO exception_cases (
+			exception_case_id, tenant_id, legal_entity_id, exception_type,
+			severity_level, linked_object_type, linked_object_id, case_status,
+			created_by_principal_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN', $8)`,
+		exceptionCaseID, params.TenantID, params.LegalEntityID, params.ExceptionType,
+		params.SeverityLevel, params.LinkedObjectType, params.LinkedObjectID,
+		params.CreatedByPrincipalID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert exception case: %w", err)
+	}
+
+	return s.FindExceptionCaseByID(ctx, exceptionCaseID)
+}
+
+func (s *PgStore) FindExceptionCaseByID(ctx context.Context, exceptionCaseID string) (*domain.ExceptionCase, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
 	}
 
-	var c domain.ExceptionCase
-	var sevStr, statStr string
+	var ec *domain.ExceptionCase
 	err = tx.QueryRow(ctx, `
-		SELECT exception_case_id, tenant_id, legal_entity_id, jurisdiction_id, exception_type,
-		       severity_level, linked_object_type, linked_object_id, description, case_status,
-		       assigned_to_role, assigned_to_user, escalated_at, closed_at, closed_by,
-		       closure_reason, created_by, created_at, updated_at
-		FROM exception_cases WHERE exception_case_id = $1`, id,
+		SELECT `+exceptionCaseColumns+`
+		FROM exception_cases WHERE exception_case_id = $1 AND tenant_id = $2`,
+		exceptionCaseID, middleware.GetTenantID(ctx),
 	).Scan(
-		&c.ExceptionCaseID, &c.TenantID, &c.LegalEntityID, &c.JurisdictionID, &c.ExceptionType,
-		&sevStr, &c.LinkedObjectType, &c.LinkedObjectID, &c.Description, &statStr,
-		&c.AssignedToRole, &c.AssignedToUser, &c.EscalatedAt, &c.ClosedAt, &c.ClosedBy,
-		&c.ClosureReason, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
+		&ec.ExceptionCaseID, &ec.TenantID, &ec.LegalEntityID, &ec.ExceptionType,
+		&ec.SeverityLevel, &ec.LinkedObjectType, &ec.LinkedObjectID, &ec.CaseStatus,
+		&ec.EscalatedAt, &ec.CreatedAt, &ec.CreatedByPrincipalID, &ec.UpdatedAt, &ec.Version,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -109,235 +126,248 @@ func (s *PgStore) GetExceptionByID(ctx context.Context, id string) (*domain.Exce
 		}
 		return nil, err
 	}
-	c.SeverityLevel = domain.SeverityLevel(sevStr)
-	c.CaseStatus = domain.CaseStatus(statStr)
+	_ = tx.Commit(ctx)
+	return ec, nil
+}
 
-	// Fetch escalations
-	rows, err := tx.Query(ctx, `
-		SELECT escalation_record_id, tenant_id, exception_case_id, escalated_to_role,
-		       escalated_to_user, escalation_reason, escalation_status, escalated_by,
-		       escalated_at, resolved_at, response_notes, created_at, updated_at
-		FROM escalation_records WHERE exception_case_id = $1 ORDER BY escalated_at ASC`, id,
-	)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var e domain.EscalationRecord
-			var escStatStr string
-			if err := rows.Scan(
-				&e.EscalationRecordID, &e.TenantID, &e.ExceptionCaseID, &e.EscalatedToRole,
-				&e.EscalatedToUser, &e.EscalationReason, &escStatStr, &e.EscalatedBy,
-				&e.EscalatedAt, &e.ResolvedAt, &e.ResponseNotes, &e.CreatedAt, &e.UpdatedAt,
-			); err == nil {
-				e.EscalationStatus = domain.EscalationStatus(escStatStr)
-				c.Escalations = append(c.Escalations, e)
-			}
+func (s *PgStore) ListExceptionCases(ctx context.Context, filter domain.ListExceptionCasesFilter) ([]*domain.ExceptionCase, error) {
+	tenantID := middleware.GetTenantID(ctx)
+	if filter.TenantID != "" && filter.TenantID != tenantID {
+		return nil, domain.ErrTenantMissing
+	}
+
+	query := `SELECT ` + exceptionCaseColumns + ` FROM exception_cases WHERE tenant_id = $1`
+	args := []any{tenantID}
+	argIdx := 1
+
+	addFilter := func(col, val string) {
+		if val != "" {
+			argIdx++
+			query += fmt.Sprintf(" AND %s = $%d", col, argIdx)
+			args = append(args, val)
 		}
 	}
 
-	_ = tx.Commit(ctx)
-	return &c, nil
-}
+	addFilter("legal_entity_id", filter.LegalEntityID)
+	addFilter("exception_type", string(filter.ExceptionType))
+	addFilter("case_status", string(filter.CaseStatus))
+	addFilter("severity_level", string(filter.SeverityLevel))
 
-func (s *PgStore) ListExceptions(ctx context.Context, legalEntityID, caseStatus, severityLevel, exceptionType string) ([]domain.ExceptionCase, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := s.setRLS(ctx, tx); err != nil {
-		return nil, err
-	}
+	query += " ORDER BY created_at DESC, exception_case_id DESC"
 
-	rows, err := tx.Query(ctx, `
-		SELECT exception_case_id, tenant_id, legal_entity_id, jurisdiction_id, exception_type,
-		       severity_level, linked_object_type, linked_object_id, description, case_status,
-		       assigned_to_role, assigned_to_user, escalated_at, closed_at, closed_by,
-		       closure_reason, created_by, created_at, updated_at
-		FROM exception_cases
-		WHERE ($1 = '' OR legal_entity_id = $1)
-		  AND ($2 = '' OR case_status = $2)
-		  AND ($3 = '' OR severity_level = $3)
-		  AND ($4 = '' OR exception_type = $4)
-		ORDER BY created_at DESC`,
-		legalEntityID, caseStatus, severityLevel, exceptionType,
-	)
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	argIdx++
+	query += fmt.Sprintf(" LIMIT $%d", argIdx)
+	args = append(args, limit)
+
+	argIdx++
+	query += fmt.Sprintf(" OFFSET $%d", argIdx)
+	args = append(args, filter.Offset)
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var out []domain.ExceptionCase
+	var results []*domain.ExceptionCase
 	for rows.Next() {
-		var c domain.ExceptionCase
-		var sevStr, statStr string
-		if err := rows.Scan(
-			&c.ExceptionCaseID, &c.TenantID, &c.LegalEntityID, &c.JurisdictionID, &c.ExceptionType,
-			&sevStr, &c.LinkedObjectType, &c.LinkedObjectID, &c.Description, &statStr,
-			&c.AssignedToRole, &c.AssignedToUser, &c.EscalatedAt, &c.ClosedAt, &c.ClosedBy,
-			&c.ClosureReason, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
-		); err != nil {
+		ec, err := scanExceptionCase(rows)
+		if err != nil {
 			return nil, err
 		}
-		c.SeverityLevel = domain.SeverityLevel(sevStr)
-		c.CaseStatus = domain.CaseStatus(statStr)
-		out = append(out, c)
+		results = append(results, ec)
+	}
+	return results, rows.Err()
+}
+
+func (s *PgStore) UpdateExceptionCaseStatus(ctx context.Context, exceptionCaseID string, params domain.UpdateExceptionCaseStatusParams, actorID, correlationID string) (*domain.ExceptionCase, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := s.setRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+
+	var currentVersion int
+	var escalatedAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT version, escalated_at FROM exception_cases
+		WHERE exception_case_id = $1 AND tenant_id = $2 FOR UPDATE`,
+		exceptionCaseID, middleware.GetTenantID(ctx),
+	).Scan(&currentVersion, &escalatedAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrExceptionCaseNotFound
+		}
+		return nil, err
+	}
+
+	if params.ExpectedVersion > 0 && currentVersion != params.ExpectedVersion {
+		return nil, domain.ErrVersionMismatch
+	}
+
+	newEscalatedAt := escalatedAt
+	if params.CaseStatus == domain.CaseStatusEscalated && escalatedAt == nil {
+		now := time.Now().UTC()
+		newEscalatedAt = &now
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE exception_cases
+		SET case_status = $1,
+		    escalated_at = $2,
+		    updated_at = NOW(),
+		    version = version + 1
+		WHERE exception_case_id = $3 AND tenant_id = $4`,
+		params.CaseStatus, newEscalatedAt, exceptionCaseID, middleware.GetTenantID(ctx),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("update exception case status: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	return s.FindExceptionCaseByID(ctx, exceptionCaseID)
+}
+
+const escalationRecordColumns = `
+	escalation_record_id,
+	exception_case_id,
+	escalated_to_role,
+	escalation_reason,
+	escalation_status,
+	escalated_at,
+	created_at,
+	created_by_principal_id`
+
+func scanEscalationRecord(row pgx.Row) (*domain.EscalationRecord, error) {
+	er := &domain.EscalationRecord{}
+	err := row.Scan(
+		&er.EscalationRecordID,
+		&er.ExceptionCaseID,
+		&er.EscalatedToRole,
+		&er.EscalationReason,
+		&er.EscalationStatus,
+		&er.EscalatedAt,
+		&er.CreatedAt,
+		&er.CreatedByPrincipalID,
+	)
+	return er, err
+}
+
+func (s *PgStore) CreateEscalationRecord(ctx context.Context, params domain.CreateEscalationRecordParams) (*domain.EscalationRecord, error) {
+	escalationRecordID := params.EscalationRecordID
+	if escalationRecordID == "" {
+		escalationRecordID = uuid.New().String()
+	}
+
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO escalation_records (
+			escalation_record_id, exception_case_id, escalated_to_role, escalation_reason,
+			escalation_status, escalated_at, created_by_principal_id
+		) VALUES ($1, $2, $3, $4, 'PENDING', NOW(), $5)`,
+		escalationRecordID, params.ExceptionCaseID, params.EscalatedToRole,
+		params.EscalationReason, params.CreatedByPrincipalID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert escalation record: %w", err)
+	}
+
+	return s.FindEscalationRecordByID(ctx, escalationRecordID)
+}
+
+func (s *PgStore) FindEscalationRecordByID(ctx context.Context, escalationRecordID string) (*domain.EscalationRecord, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := s.setRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+
+	var er *domain.EscalationRecord
+	err = tx.QueryRow(ctx, `
+		SELECT `+escalationRecordColumns+`
+		FROM escalation_records WHERE escalation_record_id = $1 AND tenant_id = $2`,
+		escalationRecordID, middleware.GetTenantID(ctx),
+	).Scan(
+		&er.EscalationRecordID, &er.ExceptionCaseID, &er.EscalatedToRole,
+		&er.EscalationReason, &er.EscalationStatus, &er.EscalatedAt,
+		&er.CreatedAt, &er.CreatedByPrincipalID,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrEscalationRecordNotFound
+		}
+		return nil, err
 	}
 	_ = tx.Commit(ctx)
-	return out, nil
+	return er, nil
 }
 
-func (s *PgStore) EscalateException(ctx context.Context, id string, req *domain.EscalateCaseRequest) (*domain.EscalationRecord, *domain.ExceptionCase, error) {
-	c, err := s.GetExceptionByID(ctx, id)
-	if err != nil {
-		return nil, nil, err
-	}
-	if c.CaseStatus == domain.CaseClosed || c.CaseStatus == domain.CaseResolved {
-		return nil, nil, domain.ErrCaseAlreadyClosed
+func (s *PgStore) ListEscalationRecords(ctx context.Context, filter domain.ListEscalationRecordsFilter) ([]*domain.EscalationRecord, error) {
+	tenantID := middleware.GetTenantID(ctx)
+
+	query := `SELECT ` + escalationRecordColumns + ` FROM escalation_records WHERE tenant_id = $1`
+	args := []any{tenantID}
+	argIdx := 1
+
+	addFilter := func(col, val string) {
+		if val != "" {
+			argIdx++
+			query += fmt.Sprintf(" AND %s = $%d", col, argIdx)
+			args = append(args, val)
+		}
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := s.setRLS(ctx, tx); err != nil {
-		return nil, nil, err
-	}
+	addFilter("exception_case_id", filter.ExceptionCaseID)
+	addFilter("escalated_to_role", filter.EscalatedToRole)
+	addFilter("escalation_status", string(filter.EscalationStatus))
 
-	now := time.Now().UTC()
-	escRecord := domain.EscalationRecord{
-		EscalationRecordID: "escrec-" + uuid.New().String(),
-		TenantID:           middleware.GetTenantID(ctx),
-		ExceptionCaseID:    id,
-		EscalatedToRole:    req.EscalatedToRole,
-		EscalatedToUser:    req.EscalatedToUser,
-		EscalationReason:   req.EscalationReason,
-		EscalationStatus:   domain.EscalationPending,
-		EscalatedBy:        req.EscalatedBy,
-		EscalatedAt:        now,
-		CreatedAt:          now,
-		UpdatedAt:          now,
-	}
+	query += " ORDER BY escalated_at DESC, escalation_record_id DESC"
 
-	_, err = tx.Exec(ctx, `
-		INSERT INTO escalation_records
-			(escalation_record_id, tenant_id, exception_case_id, escalated_to_role,
-			 escalated_to_user, escalation_reason, escalation_status, escalated_by,
-			 escalated_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-		escRecord.EscalationRecordID, escRecord.TenantID, escRecord.ExceptionCaseID,
-		escRecord.EscalatedToRole, escRecord.EscalatedToUser, escRecord.EscalationReason,
-		string(escRecord.EscalationStatus), escRecord.EscalatedBy, escRecord.EscalatedAt,
-		escRecord.CreatedAt, escRecord.UpdatedAt,
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("insert escalation record: %w", err)
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
 	}
+	if limit > 200 {
+		limit = 200
+	}
+	argIdx++
+	query += fmt.Sprintf(" LIMIT $%d", argIdx)
+	args = append(args, limit)
 
-	c.CaseStatus = domain.CaseEscalated
-	c.EscalatedAt = &now
-	c.AssignedToRole = req.EscalatedToRole
-	if req.EscalatedToUser != "" {
-		c.AssignedToUser = req.EscalatedToUser
-	}
-	c.UpdatedAt = now
+	argIdx++
+	query += fmt.Sprintf(" OFFSET $%d", argIdx)
+	args = append(args, filter.Offset)
 
-	_, err = tx.Exec(ctx, `
-		UPDATE exception_cases
-		SET case_status=$1, escalated_at=$2, assigned_to_role=$3, assigned_to_user=$4, updated_at=$5
-		WHERE exception_case_id=$6`,
-		string(c.CaseStatus), c.EscalatedAt, c.AssignedToRole, c.AssignedToUser, c.UpdatedAt, id,
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("update exception case on escalation: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, nil, err
-	}
-	return &escRecord, c, nil
-}
-
-func (s *PgStore) ResolveException(ctx context.Context, id string, req *domain.ResolveCaseRequest) (*domain.ExceptionCase, error) {
-	c, err := s.GetExceptionByID(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if c.CaseStatus == domain.CaseClosed || c.CaseStatus == domain.CaseResolved {
-		return nil, domain.ErrCaseAlreadyClosed
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := s.setRLS(ctx, tx); err != nil {
-		return nil, err
-	}
-
-	now := time.Now().UTC()
-	c.CaseStatus = domain.CaseClosed
-	c.ClosedAt = &now
-	c.ClosedBy = req.ClosedBy
-	c.ClosureReason = req.ClosureReason
-	c.UpdatedAt = now
-
-	_, err = tx.Exec(ctx, `
-		UPDATE exception_cases
-		SET case_status=$1, closed_at=$2, closed_by=$3, closure_reason=$4, updated_at=$5
-		WHERE exception_case_id=$6`,
-		string(c.CaseStatus), c.ClosedAt, c.ClosedBy, c.ClosureReason, c.UpdatedAt, id,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("resolve exception case: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return c, nil
-}
-
-func (s *PgStore) ListEscalations(ctx context.Context, role, status string) ([]domain.EscalationRecord, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := s.setRLS(ctx, tx); err != nil {
-		return nil, err
-	}
-
-	rows, err := tx.Query(ctx, `
-		SELECT escalation_record_id, tenant_id, exception_case_id, escalated_to_role,
-		       escalated_to_user, escalation_reason, escalation_status, escalated_by,
-		       escalated_at, resolved_at, response_notes, created_at, updated_at
-		FROM escalation_records
-		WHERE ($1 = '' OR escalated_to_role = $1)
-		  AND ($2 = '' OR escalation_status = $2)
-		ORDER BY escalated_at DESC`,
-		role, status,
-	)
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var out []domain.EscalationRecord
+	var results []*domain.EscalationRecord
 	for rows.Next() {
-		var e domain.EscalationRecord
-		var statStr string
-		if err := rows.Scan(
-			&e.EscalationRecordID, &e.TenantID, &e.ExceptionCaseID, &e.EscalatedToRole,
-			&e.EscalatedToUser, &e.EscalationReason, &statStr, &e.EscalatedBy,
-			&e.EscalatedAt, &e.ResolvedAt, &e.ResponseNotes, &e.CreatedAt, &e.UpdatedAt,
-		); err != nil {
+		er, err := scanEscalationRecord(rows)
+		if err != nil {
 			return nil, err
 		}
-		e.EscalationStatus = domain.EscalationStatus(statStr)
-		out = append(out, e)
+		results = append(results, er)
 	}
-	_ = tx.Commit(ctx)
-	return out, nil
+	return results, rows.Err()
 }

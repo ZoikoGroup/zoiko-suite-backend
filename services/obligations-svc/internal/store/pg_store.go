@@ -238,6 +238,23 @@ type Store interface {
 	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, bool, error)
 	ListApplicabilityDecisions(ctx context.Context, obligationID, jurisdictionCode, entityRef string, limit int) ([]*domain.ApplicabilityDecision, error)
 	FindCurrentApplicability(ctx context.Context, obligationID, jurisdictionCode, entityRef string) (*domain.CurrentApplicability, error)
+
+	// ── Compliance Status ─────────────────────────────────────────────────────
+	CreateComplianceStatus(ctx context.Context, params domain.CreateComplianceStatusParams) (*domain.ComplianceStatus, error)
+	FindComplianceStatusByID(ctx context.Context, complianceStatusID string) (*domain.ComplianceStatus, error)
+	ListComplianceStatuses(ctx context.Context, filter domain.ListComplianceStatusFilter) ([]*domain.ComplianceStatus, error)
+	UpdateComplianceStatus(ctx context.Context, complianceStatusID, statusCode, statusReason, evidenceSufficiencyState string, expectedVersion int, actorID, correlationID string) (*domain.ComplianceStatus, error)
+
+	// ── Exception Cases ───────────────────────────────────────────────────────
+	CreateExceptionCase(ctx context.Context, params domain.CreateExceptionCaseParams) (*domain.ExceptionCase, error)
+	FindExceptionCaseByID(ctx context.Context, exceptionCaseID string) (*domain.ExceptionCase, error)
+	ListExceptionCases(ctx context.Context, filter domain.ListExceptionCasesFilter) ([]*domain.ExceptionCase, error)
+	UpdateExceptionCaseStatus(ctx context.Context, exceptionCaseID, caseStatus string, expectedVersion int, actorID, correlationID string) (*domain.ExceptionCase, error)
+
+	// ── Escalation Records ────────────────────────────────────────────────────
+	CreateEscalationRecord(ctx context.Context, params domain.CreateEscalationRecordParams) (*domain.EscalationRecord, error)
+	FindEscalationRecordByID(ctx context.Context, escalationRecordID string) (*domain.EscalationRecord, error)
+	ListEscalationRecords(ctx context.Context, exceptionCaseID string, limit int) ([]*domain.EscalationRecord, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -1250,4 +1267,612 @@ func (s *PgStore) GetTenantIDsWithObligations(ctx context.Context) ([]string, er
 		tenantIDs = append(tenantIDs, tid)
 	}
 	return tenantIDs, rows.Err()
+}
+
+// ── Compliance Status ────────────────────────────────────────────────────────
+
+const complianceStatusColumns = `
+	compliance_status_id,
+	tenant_id,
+	legal_entity_id,
+	domain_code,
+	status_code,
+	status_reason,
+	evaluated_at,
+	evidence_sufficiency_state,
+	created_at,
+	created_by_principal_id,
+	updated_at,
+	version`
+
+func scanComplianceStatus(row pgx.Row) (*domain.ComplianceStatus, error) {
+	cs := &domain.ComplianceStatus{}
+	err := row.Scan(
+		&cs.ComplianceStatusID,
+		&cs.TenantID,
+		&cs.LegalEntityID,
+		&cs.DomainCode,
+		&cs.StatusCode,
+		&cs.StatusReason,
+		&cs.EvaluatedAt,
+		&cs.EvidenceSufficiencyState,
+		&cs.CreatedAt,
+		&cs.CreatedByPrincipalID,
+		&cs.UpdatedAt,
+		&cs.Version,
+	)
+	return cs, err
+}
+
+func (s *PgStore) CreateComplianceStatus(ctx context.Context, params domain.CreateComplianceStatusParams) (*domain.ComplianceStatus, error) {
+	if params.ComplianceStatusID == "" {
+		params.ComplianceStatusID = uuid.New().String()
+	}
+
+	const query = `
+		INSERT INTO compliance_status (
+			compliance_status_id, tenant_id, legal_entity_id, domain_code, status_code,
+			status_reason, evaluated_at, evidence_sufficiency_state, created_by_principal_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING ` + complianceStatusColumns + `;`
+
+	var cs *domain.ComplianceStatus
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		cs, scanErr = scanComplianceStatus(tx.QueryRow(ctx, query,
+			params.ComplianceStatusID, tenantID, params.LegalEntityID, params.DomainCode,
+			params.StatusCode, params.StatusReason, params.EvaluatedAt,
+			params.EvidenceSufficiencyState, params.CreatedByPrincipalID))
+		if scanErr != nil {
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg CreateComplianceStatus failed", zap.Error(scanErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+		return insertOutboxEventTx(ctx, tx, tenantID, "compliance.status.changed", params.CorrelationID,
+			params.LegalEntityID, "", params.CreatedByPrincipalID, map[string]any{
+				"compliance_status_id": cs.ComplianceStatusID,
+				"legal_entity_id":      cs.LegalEntityID,
+				"domain_code":          cs.DomainCode,
+				"status_code":          cs.StatusCode,
+				"evaluated_at":         cs.EvaluatedAt,
+			})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cs, nil
+}
+
+func (s *PgStore) FindComplianceStatusByID(ctx context.Context, complianceStatusID string) (*domain.ComplianceStatus, error) {
+	const query = `
+		SELECT ` + complianceStatusColumns + `
+		FROM compliance_status
+		WHERE compliance_status_id = $1 AND tenant_id = $2;`
+
+	var cs *domain.ComplianceStatus
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		cs, scanErr = scanComplianceStatus(tx.QueryRow(ctx, query, complianceStatusID, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrComplianceStatusNotFound
+		}
+		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return nil, domain.ErrComplianceStatusNotFound
+		}
+		s.log.Error("pg FindComplianceStatusByID failed", zap.String("compliance_status_id", complianceStatusID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return cs, nil
+}
+
+func (s *PgStore) ListComplianceStatuses(ctx context.Context, filter domain.ListComplianceStatusFilter) ([]*domain.ComplianceStatus, error) {
+	tenantID, err := tenantOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if filter.TenantID != "" && filter.TenantID != tenantID {
+		return nil, domain.ErrTenantMissing
+	}
+
+	query := `SELECT ` + complianceStatusColumns + ` FROM compliance_status WHERE tenant_id = $1`
+	args := []any{tenantID}
+
+	addFilter := func(clause string, value any) {
+		args = append(args, value)
+		query += fmt.Sprintf(" AND %s $%d", clause, len(args))
+	}
+
+	if filter.LegalEntityID != "" {
+		addFilter("legal_entity_id =", filter.LegalEntityID)
+	}
+	if filter.DomainCode != "" {
+		addFilter("domain_code =", filter.DomainCode)
+	}
+	if filter.StatusCode != "" {
+		addFilter("status_code =", filter.StatusCode)
+	}
+
+	query += " ORDER BY evaluated_at DESC, compliance_status_id DESC"
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" LIMIT $%d", len(args))
+	args = append(args, filter.Offset)
+	query += fmt.Sprintf(" OFFSET $%d;", len(args))
+
+	var results []*domain.ComplianceStatus
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, args...)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg ListComplianceStatuses failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			cs, scanErr := scanComplianceStatus(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListComplianceStatuses scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, cs)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (s *PgStore) UpdateComplianceStatus(ctx context.Context, complianceStatusID, statusCode, statusReason, evidenceSufficiencyState string, expectedVersion int, actorID, correlationID string) (*domain.ComplianceStatus, error) {
+	var updated *domain.ComplianceStatus
+
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		const lockQuery = `
+			SELECT ` + complianceStatusColumns + `
+			FROM compliance_status
+			WHERE compliance_status_id = $1 AND tenant_id = $2
+			FOR UPDATE;`
+
+		current, err := scanComplianceStatus(tx.QueryRow(ctx, lockQuery, complianceStatusID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrComplianceStatusNotFound
+			}
+			if mapped := mapPgError(err); errors.Is(mapped, domain.ErrInvalidIdentifier) {
+				return domain.ErrComplianceStatusNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		if expectedVersion > 0 && current.Version != expectedVersion {
+			return domain.ErrVersionMismatch
+		}
+
+		if current.StatusCode == statusCode && current.StatusReason == statusReason && current.EvidenceSufficiencyState == evidenceSufficiencyState {
+			updated = current
+			return nil
+		}
+
+		const updateQuery = `
+			UPDATE compliance_status
+			SET status_code = $1,
+			    status_reason = $2,
+			    evidence_sufficiency_state = $3,
+			    updated_at = NOW(),
+			    version = version + 1
+			WHERE compliance_status_id = $4 AND tenant_id = $5
+			RETURNING ` + complianceStatusColumns + `;`
+
+		updated, err = scanComplianceStatus(tx.QueryRow(ctx, updateQuery, statusCode, statusReason, evidenceSufficiencyState, complianceStatusID, tenantID))
+		if err != nil {
+			s.log.Error("pg UpdateComplianceStatus failed",
+				zap.String("compliance_status_id", complianceStatusID),
+				zap.Error(err))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		return insertOutboxEventTx(ctx, tx, tenantID, "compliance.status.changed", correlationID,
+			updated.LegalEntityID, "", actorID, map[string]any{
+				"compliance_status_id":       updated.ComplianceStatusID,
+				"previous_status_code":       current.StatusCode,
+				"new_status_code":            updated.StatusCode,
+				"evidence_sufficiency_state": updated.EvidenceSufficiencyState,
+				"version":                    updated.Version,
+			})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// ── Exception Cases ──────────────────────────────────────────────────────────
+
+const exceptionCaseColumns = `
+	exception_case_id,
+	tenant_id,
+	legal_entity_id,
+	exception_type,
+	severity_level,
+	linked_object_type,
+	linked_object_id,
+	case_status,
+	escalated_at,
+	created_at,
+	created_by_principal_id,
+	updated_at,
+	version`
+
+func scanExceptionCase(row pgx.Row) (*domain.ExceptionCase, error) {
+	ec := &domain.ExceptionCase{}
+	err := row.Scan(
+		&ec.ExceptionCaseID,
+		&ec.TenantID,
+		&ec.LegalEntityID,
+		&ec.ExceptionType,
+		&ec.SeverityLevel,
+		&ec.LinkedObjectType,
+		&ec.LinkedObjectID,
+		&ec.CaseStatus,
+		&ec.EscalatedAt,
+		&ec.CreatedAt,
+		&ec.CreatedByPrincipalID,
+		&ec.UpdatedAt,
+		&ec.Version,
+	)
+	return ec, err
+}
+
+func (s *PgStore) CreateExceptionCase(ctx context.Context, params domain.CreateExceptionCaseParams) (*domain.ExceptionCase, error) {
+	if params.ExceptionCaseID == "" {
+		params.ExceptionCaseID = uuid.New().String()
+	}
+
+	const query = `
+		INSERT INTO exception_cases (
+			exception_case_id, tenant_id, legal_entity_id, exception_type, severity_level,
+			linked_object_type, linked_object_id, case_status, created_by_principal_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN', $8)
+		RETURNING ` + exceptionCaseColumns + `;`
+
+	var ec *domain.ExceptionCase
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		ec, scanErr = scanExceptionCase(tx.QueryRow(ctx, query,
+			params.ExceptionCaseID, tenantID, params.LegalEntityID, params.ExceptionType,
+			params.SeverityLevel, params.LinkedObjectType, params.LinkedObjectID,
+			params.CreatedByPrincipalID))
+		if scanErr != nil {
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg CreateExceptionCase failed", zap.Error(scanErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+		return insertOutboxEventTx(ctx, tx, tenantID, "exception.created", params.CorrelationID,
+			params.LegalEntityID, "", params.CreatedByPrincipalID, map[string]any{
+				"exception_case_id": ec.ExceptionCaseID,
+				"exception_type":    ec.ExceptionType,
+				"severity_level":    ec.SeverityLevel,
+				"linked_object_type": ec.LinkedObjectType,
+				"linked_object_id":   ec.LinkedObjectID,
+			})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ec, nil
+}
+
+func (s *PgStore) FindExceptionCaseByID(ctx context.Context, exceptionCaseID string) (*domain.ExceptionCase, error) {
+	const query = `
+		SELECT ` + exceptionCaseColumns + `
+		FROM exception_cases
+		WHERE exception_case_id = $1 AND tenant_id = $2;`
+
+	var ec *domain.ExceptionCase
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		ec, scanErr = scanExceptionCase(tx.QueryRow(ctx, query, exceptionCaseID, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrExceptionCaseNotFound
+		}
+		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return nil, domain.ErrExceptionCaseNotFound
+		}
+		s.log.Error("pg FindExceptionCaseByID failed", zap.String("exception_case_id", exceptionCaseID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return ec, nil
+}
+
+func (s *PgStore) ListExceptionCases(ctx context.Context, filter domain.ListExceptionCasesFilter) ([]*domain.ExceptionCase, error) {
+	tenantID, err := tenantOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if filter.TenantID != "" && filter.TenantID != tenantID {
+		return nil, domain.ErrTenantMissing
+	}
+
+	query := `SELECT ` + exceptionCaseColumns + ` FROM exception_cases WHERE tenant_id = $1`
+	args := []any{tenantID}
+
+	addFilter := func(clause string, value any) {
+		args = append(args, value)
+		query += fmt.Sprintf(" AND %s $%d", clause, len(args))
+	}
+
+	if filter.LegalEntityID != "" {
+		addFilter("legal_entity_id =", filter.LegalEntityID)
+	}
+	if filter.ExceptionType != "" {
+		addFilter("exception_type =", filter.ExceptionType)
+	}
+	if filter.CaseStatus != "" {
+		addFilter("case_status =", filter.CaseStatus)
+	}
+
+	query += " ORDER BY created_at DESC, exception_case_id DESC"
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" LIMIT $%d", len(args))
+	args = append(args, filter.Offset)
+	query += fmt.Sprintf(" OFFSET $%d;", len(args))
+
+	var results []*domain.ExceptionCase
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, args...)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg ListExceptionCases failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			ec, scanErr := scanExceptionCase(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListExceptionCases scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, ec)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (s *PgStore) UpdateExceptionCaseStatus(ctx context.Context, exceptionCaseID, caseStatus string, expectedVersion int, actorID, correlationID string) (*domain.ExceptionCase, error) {
+	var updated *domain.ExceptionCase
+
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		const lockQuery = `
+			SELECT ` + exceptionCaseColumns + `
+			FROM exception_cases
+			WHERE exception_case_id = $1 AND tenant_id = $2
+			FOR UPDATE;`
+
+		current, err := scanExceptionCase(tx.QueryRow(ctx, lockQuery, exceptionCaseID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrExceptionCaseNotFound
+			}
+			if mapped := mapPgError(err); errors.Is(mapped, domain.ErrInvalidIdentifier) {
+				return domain.ErrExceptionCaseNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		if expectedVersion > 0 && current.Version != expectedVersion {
+			return domain.ErrVersionMismatch
+		}
+
+		if current.CaseStatus == caseStatus {
+			updated = current
+			return nil
+		}
+
+		escalatedAt := current.EscalatedAt
+		if caseStatus == "ESCALATED" && current.EscalatedAt == nil {
+			now := time.Now().UTC()
+			escalatedAt = &now
+		}
+
+		const updateQuery = `
+			UPDATE exception_cases
+			SET case_status = $1,
+			    escalated_at = $2,
+			    updated_at = NOW(),
+			    version = version + 1
+			WHERE exception_case_id = $3 AND tenant_id = $4
+			RETURNING ` + exceptionCaseColumns + `;`
+
+		updated, err = scanExceptionCase(tx.QueryRow(ctx, updateQuery, caseStatus, escalatedAt, exceptionCaseID, tenantID))
+		if err != nil {
+			s.log.Error("pg UpdateExceptionCaseStatus failed",
+				zap.String("exception_case_id", exceptionCaseID),
+				zap.Error(err))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		eventType := "exception.updated"
+		if caseStatus == "ESCALATED" {
+			eventType = "exception.escalated"
+		} else if caseStatus == "CLOSED" || caseStatus == "RESOLVED" {
+			eventType = "exception.closed"
+		}
+
+		return insertOutboxEventTx(ctx, tx, tenantID, eventType, correlationID,
+			updated.LegalEntityID, "", actorID, map[string]any{
+				"exception_case_id": updated.ExceptionCaseID,
+				"previous_status":   current.CaseStatus,
+				"new_status":        updated.CaseStatus,
+				"version":           updated.Version,
+			})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// ── Escalation Records ───────────────────────────────────────────────────────
+
+const escalationRecordColumns = `
+	escalation_record_id,
+	exception_case_id,
+	escalated_to_role,
+	escalation_reason,
+	escalation_status,
+	escalated_at,
+	created_at,
+	created_by_principal_id`
+
+func scanEscalationRecord(row pgx.Row) (*domain.EscalationRecord, error) {
+	er := &domain.EscalationRecord{}
+	err := row.Scan(
+		&er.EscalationRecordID,
+		&er.ExceptionCaseID,
+		&er.EscalatedToRole,
+		&er.EscalationReason,
+		&er.EscalationStatus,
+		&er.EscalatedAt,
+		&er.CreatedAt,
+		&er.CreatedByPrincipalID,
+	)
+	return er, err
+}
+
+func (s *PgStore) CreateEscalationRecord(ctx context.Context, params domain.CreateEscalationRecordParams) (*domain.EscalationRecord, error) {
+	if params.EscalationRecordID == "" {
+		params.EscalationRecordID = uuid.New().String()
+	}
+
+	const query = `
+		INSERT INTO escalation_records (
+			escalation_record_id, exception_case_id, escalated_to_role, escalation_reason,
+			escalation_status, escalated_at, created_by_principal_id
+		) VALUES ($1, $2, $3, $4, 'PENDING', NOW(), $5)
+		RETURNING ` + escalationRecordColumns + `;`
+
+	var er *domain.EscalationRecord
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		er, scanErr = scanEscalationRecord(tx.QueryRow(ctx, query,
+			params.EscalationRecordID, params.ExceptionCaseID, params.EscalatedToRole,
+			params.EscalationReason, params.CreatedByPrincipalID))
+		if scanErr != nil {
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg CreateEscalationRecord failed", zap.Error(scanErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+		return insertOutboxEventTx(ctx, tx, tenantID, "escalation.created", params.CorrelationID,
+			"", "", params.CreatedByPrincipalID, map[string]any{
+				"escalation_record_id": er.EscalationRecordID,
+				"exception_case_id":    er.ExceptionCaseID,
+				"escalated_to_role":    er.EscalatedToRole,
+			})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return er, nil
+}
+
+func (s *PgStore) FindEscalationRecordByID(ctx context.Context, escalationRecordID string) (*domain.EscalationRecord, error) {
+	const query = `
+		SELECT ` + escalationRecordColumns + `
+		FROM escalation_records
+		WHERE escalation_record_id = $1 AND tenant_id = $2;`
+
+	var er *domain.EscalationRecord
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		er, scanErr = scanEscalationRecord(tx.QueryRow(ctx, query, escalationRecordID, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrEscalationRecordNotFound
+		}
+		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return nil, domain.ErrEscalationRecordNotFound
+		}
+		s.log.Error("pg FindEscalationRecordByID failed", zap.String("escalation_record_id", escalationRecordID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return er, nil
+}
+
+func (s *PgStore) ListEscalationRecords(ctx context.Context, exceptionCaseID string, limit int) ([]*domain.EscalationRecord, error) {
+	tenantID, err := tenantOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+
+	const query = `
+		SELECT ` + escalationRecordColumns + `
+		FROM escalation_records
+		WHERE exception_case_id = $1 AND tenant_id = $2
+		ORDER BY escalated_at DESC, escalation_record_id DESC
+		LIMIT $3;`
+
+	var results []*domain.EscalationRecord
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, exceptionCaseID, tenantID, limit)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg ListEscalationRecords failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			er, scanErr := scanEscalationRecord(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListEscalationRecords scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, er)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
 }

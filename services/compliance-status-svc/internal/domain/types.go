@@ -6,148 +6,118 @@ import (
 )
 
 var (
-	ErrStatusRecordNotFound = errors.New("compliance status record not found")
-	ErrGapNotFound          = errors.New("compliance gap not found")
-	ErrGapAlreadyResolved   = errors.New("compliance gap is already resolved")
-
-	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
-	// unauthenticated request, not an empty tenant named "default".
-	ErrTenantMissing = errors.New("tenant scope missing")
+	ErrComplianceStatusNotFound = errors.New("compliance status not found")
+	ErrTenantMissing            = errors.New("tenant scope missing")
+	ErrVersionMismatch          = errors.New("version mismatch")
 )
 
-type OverallStatus string
+// ComplianceStatusCode represents the compliance status code per Doc 04 §13.1
+type ComplianceStatusCode string
 
 const (
-	StatusCompliant    OverallStatus = "COMPLIANT"
-	StatusWarning      OverallStatus = "WARNING"
-	StatusNonCompliant OverallStatus = "NON_COMPLIANT"
-	StatusUnderReview  OverallStatus = "UNDER_REVIEW"
+	StatusCompliant       ComplianceStatusCode = "COMPLIANT"
+	StatusNonCompliant    ComplianceStatusCode = "NON_COMPLIANT"
+	StatusAtRisk          ComplianceStatusCode = "AT_RISK"
+	StatusUnknown         ComplianceStatusCode = "UNKNOWN"
+	StatusWaived          ComplianceStatusCode = "WAIVED"
 )
 
-type GapSeverity string
+// EvidenceSufficiencyState represents the evidence sufficiency state per Doc 04 §13.1
+type EvidenceSufficiencyState string
 
 const (
-	SeverityLow      GapSeverity = "LOW"
-	SeverityMedium   GapSeverity = "MEDIUM"
-	SeverityHigh     GapSeverity = "HIGH"
-	SeverityCritical GapSeverity = "CRITICAL"
+	EvidenceSufficient       EvidenceSufficiencyState = "SUFFICIENT"
+	EvidenceInsufficient     EvidenceSufficiencyState = "INSUFFICIENT"
+	EvidencePending          EvidenceSufficiencyState = "PENDING"
+	EvidenceNotApplicable    EvidenceSufficiencyState = "NOT_APPLICABLE"
 )
 
-type GapStatus string
+// DomainCode represents the domain code per Doc 04 §13.1
+type DomainCode string
 
 const (
-	GapOpen          GapStatus = "OPEN"
-	GapInRemediation GapStatus = "IN_REMEDIATION"
-	GapResolved      GapStatus = "RESOLVED"
-	GapDismissed     GapStatus = "DISMISSED"
+	DomainTax       DomainCode = "TAX"
+	DomainPayroll   DomainCode = "PAYROLL"
+	DomainHR        DomainCode = "HR"
+	DomainFinance   DomainCode = "FINANCE"
+	DomainLegal     DomainCode = "LEGAL"
+	DomainCommercial DomainCode = "COMMERCIAL"
 )
 
-// ComplianceHealth represents an evaluated compliance state for an entity and domain.
-type ComplianceHealth struct {
-	StatusID             string        `json:"status_id"`
-	TenantID             string        `json:"tenant_id"`
-	LegalEntityID        string        `json:"legal_entity_id"`
-	JurisdictionID       string        `json:"jurisdiction_id"`
-	DomainName           string        `json:"domain_name"`
-	OverallStatus        OverallStatus `json:"overall_status"`
-	HealthScore          float64       `json:"health_score"`
-	TotalObligations     int           `json:"total_obligations"`
-	FulfilledObligations int           `json:"fulfilled_obligations"`
-	PendingObligations   int           `json:"pending_obligations"`
-	OverdueObligations   int           `json:"overdue_obligations"`
-	OpenExceptions       int           `json:"open_exceptions"`
-	LastEvaluatedAt      time.Time     `json:"last_evaluated_at"`
-	Notes                string        `json:"notes,omitempty"`
-	EffectiveFrom        string        `json:"effective_from"`
-	EffectiveTo          *string       `json:"effective_to,omitempty"`
-	CreatedBy            string        `json:"created_by"`
-	CreatedAt            time.Time     `json:"created_at"`
-	UpdatedAt            time.Time     `json:"updated_at"`
+// ComplianceStatus represents the compliance status per Doc 04 §13.1
+type ComplianceStatus struct {
+	ComplianceStatusID       string                 `json:"compliance_status_id"`
+	TenantID                 string                 `json:"tenant_id"`
+	LegalEntityID            string                 `json:"legal_entity_id"`
+	DomainCode               DomainCode             `json:"domain_code"`
+	StatusCode               ComplianceStatusCode   `json:"status_code"`
+	StatusReason             string                 `json:"status_reason"`
+	EvaluatedAt              time.Time              `json:"evaluated_at"`
+	EvidenceSufficiencyState EvidenceSufficiencyState `json:"evidence_sufficiency_state"`
+	CreatedAt                time.Time              `json:"created_at"`
+	CreatedByPrincipalID     string                 `json:"created_by_principal_id"`
+	UpdatedAt                time.Time              `json:"updated_at"`
+	Version                  int                    `json:"version"`
 }
 
-// ComplianceGap represents an identified compliance deficit or exception.
-type ComplianceGap struct {
-	GapID           string      `json:"gap_id"`
-	TenantID        string      `json:"tenant_id"`
-	LegalEntityID   string      `json:"legal_entity_id"`
-	JurisdictionID  string      `json:"jurisdiction_id"`
-	DomainName      string      `json:"domain_name"`
-	GapType         string      `json:"gap_type"`
-	Severity        GapSeverity `json:"severity"`
-	SourceReference string      `json:"source_reference,omitempty"`
-	Description     string      `json:"description"`
-	RemediationPlan string      `json:"remediation_plan,omitempty"`
-	Status          GapStatus   `json:"status"`
-	DetectedAt      time.Time   `json:"detected_at"`
-	ResolvedAt      *time.Time  `json:"resolved_at,omitempty"`
-	CreatedAt       time.Time   `json:"created_at"`
-	UpdatedAt       time.Time   `json:"updated_at"`
+// CreateComplianceStatusParams holds input parameters for creating a compliance status
+type CreateComplianceStatusParams struct {
+	ComplianceStatusID       string
+	TenantID                 string
+	LegalEntityID            string
+	DomainCode               DomainCode
+	StatusCode               ComplianceStatusCode
+	StatusReason             string
+	EvidenceSufficiencyState EvidenceSufficiencyState
+	EvaluatedAt              time.Time
+	CreatedByPrincipalID     string
+	CorrelationID            string
 }
 
-// EvaluateComplianceRequest is the payload to evaluate compliance status.
-type EvaluateComplianceRequest struct {
-	LegalEntityID        string `json:"legal_entity_id"`
-	JurisdictionID       string `json:"jurisdiction_id"`
-	DomainName           string `json:"domain_name"`
-	TotalObligations     int    `json:"total_obligations"`
-	FulfilledObligations int    `json:"fulfilled_obligations"`
-	PendingObligations   int    `json:"pending_obligations"`
-	OverdueObligations   int    `json:"overdue_obligations"`
-	OpenExceptions       int    `json:"open_exceptions"`
-	Notes                string `json:"notes,omitempty"`
-	EffectiveFrom        string `json:"effective_from"`
-	CreatedBy            string `json:"created_by"`
+// UpdateComplianceStatusParams holds input parameters for updating a compliance status
+type UpdateComplianceStatusParams struct {
+	StatusCode               ComplianceStatusCode
+	StatusReason             string
+	EvidenceSufficiencyState EvidenceSufficiencyState
+	ExpectedVersion          int
 }
 
-// CreateGapRequest is the payload to log a new compliance gap.
-type CreateGapRequest struct {
-	LegalEntityID   string      `json:"legal_entity_id"`
-	JurisdictionID  string      `json:"jurisdiction_id"`
-	DomainName      string      `json:"domain_name"`
-	GapType         string      `json:"gap_type"`
-	Severity        GapSeverity `json:"severity"`
-	SourceReference string      `json:"source_reference,omitempty"`
-	Description     string      `json:"description"`
-	RemediationPlan string      `json:"remediation_plan,omitempty"`
+// ListComplianceStatusFilter holds optional filters for querying compliance statuses
+type ListComplianceStatusFilter struct {
+	TenantID       string
+	LegalEntityID  string
+	DomainCode     DomainCode
+	StatusCode     ComplianceStatusCode
+	Limit          int
+	Offset         int
 }
 
-// ResolveGapRequest is the payload to mark a gap resolved.
-type ResolveGapRequest struct {
-	RemediationNotes string `json:"remediation_notes,omitempty"`
-}
-
-// CalculateHealthScore computes numeric health score (0-100) and overall status.
-func (c *ComplianceHealth) CalculateHealthScore() {
-	if c.TotalObligations <= 0 {
-		if c.OverdueObligations > 0 || c.OpenExceptions > 0 {
-			c.HealthScore = 50.00
-			c.OverallStatus = StatusWarning
-			return
-		}
-		c.HealthScore = 100.00
-		c.OverallStatus = StatusCompliant
-		return
-	}
-
-	score := (float64(c.FulfilledObligations) / float64(c.TotalObligations)) * 100.00
-	// Deduct penalties for overdue obligations and open exceptions
-	score -= float64(c.OverdueObligations) * 15.00
-	score -= float64(c.OpenExceptions) * 10.00
-
-	if score < 0 {
-		score = 0
-	}
-	if score > 100 {
-		score = 100
-	}
-	c.HealthScore = score
-
-	switch {
-	case score >= 90.00:
-		c.OverallStatus = StatusCompliant
-	case score >= 70.00:
-		c.OverallStatus = StatusWarning
+// IsValidStatusCode checks if the status code is valid
+func IsValidStatusCode(code ComplianceStatusCode) bool {
+	switch code {
+	case StatusCompliant, StatusNonCompliant, StatusAtRisk, StatusUnknown, StatusWaived:
+		return true
 	default:
-		c.OverallStatus = StatusNonCompliant
+		return false
+	}
+}
+
+// IsValidEvidenceState checks if the evidence sufficiency state is valid
+func IsValidEvidenceState(state EvidenceSufficiencyState) bool {
+	switch state {
+	case EvidenceSufficient, EvidenceInsufficient, EvidencePending, EvidenceNotApplicable:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsValidDomainCode checks if the domain code is valid
+func IsValidDomainCode(code DomainCode) bool {
+	switch code {
+	case DomainTax, DomainPayroll, DomainHR, DomainFinance, DomainLegal, DomainCommercial:
+		return true
+	default:
+		return false
 	}
 }

@@ -230,6 +230,53 @@ func (s *stubStore) FindCurrentApplicability(_ context.Context, _, _, _ string) 
 	return s.currentApplicability, s.currentApplicabilityErr
 }
 
+// Compliance Status
+func (s *stubStore) CreateComplianceStatus(_ context.Context, _ domain.CreateComplianceStatusParams) (*domain.ComplianceStatus, error) {
+	return nil, nil
+}
+
+func (s *stubStore) FindComplianceStatusByID(_ context.Context, _ string) (*domain.ComplianceStatus, error) {
+	return nil, nil
+}
+
+func (s *stubStore) ListComplianceStatuses(_ context.Context, _ domain.ListComplianceStatusFilter) ([]*domain.ComplianceStatus, error) {
+	return nil, nil
+}
+
+func (s *stubStore) UpdateComplianceStatus(_ context.Context, _, _, _, _ string, _ int, _, _ string) (*domain.ComplianceStatus, error) {
+	return nil, nil
+}
+
+// Exception Cases
+func (s *stubStore) CreateExceptionCase(_ context.Context, _ domain.CreateExceptionCaseParams) (*domain.ExceptionCase, error) {
+	return nil, nil
+}
+
+func (s *stubStore) FindExceptionCaseByID(_ context.Context, _ string) (*domain.ExceptionCase, error) {
+	return nil, nil
+}
+
+func (s *stubStore) ListExceptionCases(_ context.Context, _ domain.ListExceptionCasesFilter) ([]*domain.ExceptionCase, error) {
+	return nil, nil
+}
+
+func (s *stubStore) UpdateExceptionCaseStatus(_ context.Context, _, _ string, _ int, _, _ string) (*domain.ExceptionCase, error) {
+	return nil, nil
+}
+
+// Escalation Records
+func (s *stubStore) CreateEscalationRecord(_ context.Context, _ domain.CreateEscalationRecordParams) (*domain.EscalationRecord, error) {
+	return nil, nil
+}
+
+func (s *stubStore) FindEscalationRecordByID(_ context.Context, _ string) (*domain.EscalationRecord, error) {
+	return nil, nil
+}
+
+func (s *stubStore) ListEscalationRecords(_ context.Context, _ string, _ int) ([]*domain.EscalationRecord, error) {
+	return nil, nil
+}
+
 // ── stub jurisdiction validator ──────────────────────────────────────────────
 
 type stubValidator struct {

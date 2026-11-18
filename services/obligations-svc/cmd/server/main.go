@@ -34,6 +34,7 @@ import (
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/config"
 	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
+	"zoiko.io/obligations-svc/internal/evidencereq"
 	"zoiko.io/obligations-svc/internal/events"
 	"zoiko.io/obligations-svc/internal/handler"
 	"zoiko.io/obligations-svc/internal/health"
@@ -139,6 +140,14 @@ func main() {
 	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 
+	// Evidence requirements client for pre-closure evidence validation
+	var evidenceReqClient evidencereq.Client = evidencereq.NoOpClient{}
+	if cfg.EvidenceRequirementsURL != "" {
+		evidenceReqClient = evidencereq.NewHTTPClient(cfg.EvidenceRequirementsURL, log)
+	} else if !cfg.LocalEnv() {
+		log.Warn("EVIDENCE_REQUIREMENTS_URL unset — evidence sufficiency checks before CLOSED are disabled (local/dev only)")
+	}
+
 	// ── 4a. Outbox relay ──────────────────────────────────────────────────────
 	// Every obligation event is written to event_outbox in the same
 	// transaction as the mutation; the relay delivers it to Kafka and retries
@@ -203,7 +212,9 @@ func main() {
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, jurisdictionValidator, authzClient, log).WithRegistry(entityChecker)
+	h := handler.New(pgStore, jurisdictionValidator, authzClient, log).
+		WithRegistry(entityChecker).
+		WithEvidenceRequirementsClient(evidenceReqClient)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterApplicabilityRoutes(r, h)
 

@@ -173,6 +173,63 @@ type CreateFilingRequirementParams struct {
 	SubmissionChannel   string
 }
 
+// CreateComplianceStatusParams holds input parameters for creating a compliance status.
+type CreateComplianceStatusParams struct {
+	ComplianceStatusID       string
+	TenantID                 string
+	LegalEntityID            string
+	DomainCode               string
+	StatusCode               string
+	StatusReason             string
+	EvidenceSufficiencyState string
+	EvaluatedAt              time.Time
+	CreatedByPrincipalID     string
+	CorrelationID            string
+}
+
+// CreateExceptionCaseParams holds input parameters for creating an exception case.
+type CreateExceptionCaseParams struct {
+	ExceptionCaseID        string
+	TenantID               string
+	LegalEntityID          string
+	ExceptionType          string
+	SeverityLevel          string
+	LinkedObjectType       string
+	LinkedObjectID         string
+	CreatedByPrincipalID   string
+	CorrelationID          string
+}
+
+// CreateEscalationRecordParams holds input parameters for creating an escalation record.
+type CreateEscalationRecordParams struct {
+	EscalationRecordID     string
+	ExceptionCaseID        string
+	EscalatedToRole        string
+	EscalationReason       string
+	CreatedByPrincipalID   string
+	CorrelationID          string
+}
+
+// ListComplianceStatusFilter holds optional filters for querying compliance statuses.
+type ListComplianceStatusFilter struct {
+	TenantID       string
+	LegalEntityID  string
+	DomainCode     string
+	StatusCode     string
+	Limit          int
+	Offset         int
+}
+
+// ListExceptionCasesFilter holds optional filters for querying exception cases.
+type ListExceptionCasesFilter struct {
+	TenantID       string
+	LegalEntityID  string
+	ExceptionType  string
+	CaseStatus     string
+	Limit          int
+	Offset         int
+}
+
 // ErrObligationNotFound is returned when an obligation_id does not exist.
 var ErrObligationNotFound = errorString("obligation not found")
 
@@ -265,6 +322,60 @@ var ErrCreatedByMismatch = errorString("created_by mismatch")
 
 // ErrLegalEntityMismatch is returned when X-Legal-Entity-Id doesn't match body legal_entity_id.
 var ErrLegalEntityMismatch = errorString("legal entity mismatch")
+
+// ComplianceStatus represents the compliance status of a legal entity for a domain.
+type ComplianceStatus struct {
+	ComplianceStatusID       string    `json:"compliance_status_id"`
+	TenantID                 string    `json:"tenant_id"`
+	LegalEntityID            string    `json:"legal_entity_id"`
+	DomainCode               string    `json:"domain_code"`
+	StatusCode               string    `json:"status_code"`
+	StatusReason             string    `json:"status_reason"`
+	EvaluatedAt              time.Time `json:"evaluated_at"`
+	EvidenceSufficiencyState string    `json:"evidence_sufficiency_state"`
+	CreatedAt                time.Time `json:"created_at"`
+	CreatedByPrincipalID     string    `json:"created_by_principal_id"`
+	UpdatedAt                time.Time `json:"updated_at"`
+	Version                  int       `json:"version"`
+}
+
+// ExceptionCase represents an exception case for a compliance/obligation issue.
+type ExceptionCase struct {
+	ExceptionCaseID   string    `json:"exception_case_id"`
+	TenantID          string    `json:"tenant_id"`
+	LegalEntityID     string    `json:"legal_entity_id"`
+	ExceptionType     string    `json:"exception_type"`
+	SeverityLevel     string    `json:"severity_level"`
+	LinkedObjectType  string    `json:"linked_object_type"`
+	LinkedObjectID    string    `json:"linked_object_id"`
+	CaseStatus        string    `json:"case_status"`
+	EscalatedAt       *time.Time `json:"escalated_at,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	CreatedByPrincipalID string  `json:"created_by_principal_id"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	Version           int       `json:"version"`
+}
+
+// EscalationRecord represents an escalation record for an exception case.
+type EscalationRecord struct {
+	EscalationRecordID  string    `json:"escalation_record_id"`
+	ExceptionCaseID     string    `json:"exception_case_id"`
+	EscalatedToRole     string    `json:"escalated_to_role"`
+	EscalationReason    string    `json:"escalation_reason"`
+	EscalationStatus    string    `json:"escalation_status"`
+	EscalatedAt         time.Time `json:"escalated_at"`
+	CreatedAt           time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+// ErrComplianceStatusNotFound is returned when a compliance status is not found.
+var ErrComplianceStatusNotFound = errorString("compliance_status not found")
+
+// ErrExceptionCaseNotFound is returned when an exception case is not found.
+var ErrExceptionCaseNotFound = errorString("exception_case not found")
+
+// ErrEscalationRecordNotFound is returned when an escalation record is not found.
+var ErrEscalationRecordNotFound = errorString("escalation_record not found")
 
 type errorString string
 

@@ -43,6 +43,11 @@ type Config struct {
 	// local/dev/test allows.
 	TenantRegistryURL string
 
+	// EvidenceRequirementsURL is evidence-requirements-svc's base URL. Called
+	// before CLOSED transition to verify evidence sufficiency (Doc 03 §8.6).
+	// Empty disables the check, which only ENV local/dev/test allows.
+	EvidenceRequirementsURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -97,10 +102,11 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "obligations-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.obligations.events"),
 		},
-		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
-		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		TenantRegistryURL:    os.Getenv("TENANT_REGISTRY_URL"),
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		JurisdictionRulesURL:    env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
+		AuthZServiceURL:         env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		TenantRegistryURL:       os.Getenv("TENANT_REGISTRY_URL"),
+		EvidenceRequirementsURL: os.Getenv("EVIDENCE_REQUIREMENTS_URL"),
+		OTELExporterEndpoint:    env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

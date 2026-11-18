@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -16,17 +18,14 @@ import (
 	"zoiko.io/compliance-status-svc/internal/store"
 )
 
-// Action types used when checking authorization for write operations against
-// authorization-svc. Every write action must be checked before it happens and
-// must fail closed (see internal/authz/client.go).
+// Action types used when checking authorization
 const (
-	actionComplianceStatusEvaluate = "COMPLIANCE_STATUS_EVALUATE"
-	actionComplianceGapCreate      = "COMPLIANCE_GAP_CREATE"
-	actionComplianceGapResolve     = "COMPLIANCE_GAP_RESOLVE"
+	actionComplianceStatusCreate = "COMPLIANCE_STATUS_CREATE"
+	actionComplianceStatusRead   = "COMPLIANCE_STATUS_READ"
+	actionComplianceStatusUpdate = "COMPLIANCE_STATUS_UPDATE"
 )
 
 // AuthZClient checks whether a principal is authorized to perform an action
-// against a legal entity. Implementations must fail closed.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
@@ -42,8 +41,6 @@ func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logge
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
 }
 
-// requirePrincipal extracts the calling principal from the X-Principal-Id
-// header, responding with 401 and returning ok=false if absent.
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
@@ -53,9 +50,6 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
-// writeAuthzErr responds appropriately for an error returned by AuthZClient.CheckAllowed:
-// explicit denial maps to 403, anything else (including unavailability) fails
-// closed as 503.
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	if errors.Is(err, authz.ErrAuthorizationDenied) {
 		writeError(w, http.StatusForbidden, "action not authorized")
@@ -66,26 +60,71 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/compliance-status", func(r chi.Router) {
-		r.Post("/evaluate", h.Evaluate)
-		r.Get("/", h.List)
-		r.Get("/{id}", h.GetByID)
-
-		r.Post("/gaps", h.CreateGap)
-		r.Get("/gaps", h.ListGaps)
-		r.Post("/gaps/{id}/resolve", h.ResolveGap)
+		r.Post("/", h.CreateComplianceStatus)
+		r.Get("/", h.ListComplianceStatuses)
+		r.Get("/{compliance_status_id}", h.GetComplianceStatus)
+		r.Post("/{compliance_status_id}", h.UpdateComplianceStatus)
 	})
 }
 
-func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
+type createComplianceStatusRequest struct {
+	ComplianceStatusID       string `json:"compliance_status_id,omitempty"`
+	LegalEntityID            string `json:"legal_entity_id"`
+	DomainCode               string `json:"domain_code"`
+	StatusCode               string `json:"status_code"`
+	StatusReason             string `json:"status_reason"`
+	EvidenceSufficiencyState string `json:"evidence_sufficiency_state"`
+	EvaluatedAt              string `json:"evaluated_at"` // RFC3339
+	CreatedByPrincipalID     string `json:"created_by_principal_id"`
+}
+
+func (req *createComplianceStatusRequest) validate() error {
+	if req.LegalEntityID == "" {
+		return errors.New("legal_entity_id is required")
+	}
+	if req.DomainCode == "" {
+		return errors.New("domain_code is required")
+	}
+	if !domain.IsValidDomainCode(domain.DomainCode(req.DomainCode)) {
+		return errors.New("invalid domain_code: must be TAX, PAYROLL, HR, FINANCE, LEGAL, or COMMERCIAL")
+	}
+	if req.StatusCode == "" {
+		return errors.New("status_code is required")
+	}
+	if !domain.IsValidStatusCode(domain.ComplianceStatusCode(req.StatusCode)) {
+		return errors.New("invalid status_code: must be COMPLIANT, NON_COMPLIANT, AT_RISK, UNKNOWN, or WAIVED")
+	}
+	if req.StatusReason == "" {
+		return errors.New("status_reason is required")
+	}
+	if req.EvidenceSufficiencyState == "" {
+		return errors.New("evidence_sufficiency_state is required")
+	}
+	if !domain.IsValidEvidenceState(domain.EvidenceSufficiencyState(req.EvidenceSufficiencyState)) {
+		return errors.New("invalid evidence_sufficiency_state: must be SUFFICIENT, INSUFFICIENT, PENDING, or NOT_APPLICABLE")
+	}
+	if req.EvaluatedAt == "" {
+		return errors.New("evaluated_at is required (RFC3339)")
+	}
+	if _, err := time.Parse(time.RFC3339, req.EvaluatedAt); err != nil {
+		return errors.New("evaluated_at must be RFC3339 format")
+	}
+	if req.CreatedByPrincipalID == "" {
+		return errors.New("created_by_principal_id is required")
+	}
+	return nil
+}
+
+func (h *Handler) CreateComplianceStatus(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
-	var req domain.EvaluateComplianceRequest
+	var req createComplianceStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.LegalEntityID == "" || req.JurisdictionID == "" {
-		writeError(w, http.StatusBadRequest, "legal_entity_id and jurisdiction_id are required")
+	if err := req.validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -93,147 +132,142 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionComplianceStatusEvaluate); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionComplianceStatusCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	c := &domain.ComplianceHealth{
-		TenantID:             tenantID,
-		LegalEntityID:        req.LegalEntityID,
-		JurisdictionID:       req.JurisdictionID,
-		DomainName:           req.DomainName,
-		TotalObligations:     req.TotalObligations,
-		FulfilledObligations: req.FulfilledObligations,
-		PendingObligations:   req.PendingObligations,
-		OverdueObligations:   req.OverdueObligations,
-		OpenExceptions:       req.OpenExceptions,
-		Notes:                req.Notes,
-		EffectiveFrom:        req.EffectiveFrom,
-		CreatedBy:            req.CreatedBy,
-	}
+	evaluatedAt, _ := time.Parse(time.RFC3339, req.EvaluatedAt)
 
-	if err := h.store.Evaluate(r.Context(), c); err != nil {
-		h.logger.Error("evaluate compliance status failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to evaluate compliance status")
+	cs, err := h.store.CreateComplianceStatus(r.Context(), domain.CreateComplianceStatusParams{
+		ComplianceStatusID:       req.ComplianceStatusID,
+		TenantID:                 tenantID,
+		LegalEntityID:            req.LegalEntityID,
+		DomainCode:               domain.DomainCode(req.DomainCode),
+		StatusCode:               domain.ComplianceStatusCode(req.StatusCode),
+		StatusReason:             req.StatusReason,
+		EvidenceSufficiencyState: domain.EvidenceSufficiencyState(req.EvidenceSufficiencyState),
+		EvaluatedAt:              evaluatedAt,
+		CreatedByPrincipalID:     req.CreatedByPrincipalID,
+		CorrelationID:            r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		h.logger.Error("create compliance status failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to create compliance status")
 		return
 	}
+
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "compliance.status.changed", SubjectID: c.StatusID, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
+		EventType: "compliance.status.changed", SubjectID: cs.ComplianceStatusID, TenantID: tenantID,
+		LegalEntityID: cs.LegalEntityID, Jurisdiction: "", ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: cs,
 	})
-	writeJSON(w, http.StatusOK, c)
+	writeJSON(w, http.StatusCreated, cs)
 }
 
-func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	c, err := h.store.GetByID(r.Context(), id)
+func (h *Handler) GetComplianceStatus(w http.ResponseWriter, r *http.Request) {
+	complianceStatusID := chi.URLParam(r, "compliance_status_id")
+
+	cs, err := h.store.FindComplianceStatusByID(r.Context(), complianceStatusID)
 	if err != nil {
-		if errors.Is(err, domain.ErrStatusRecordNotFound) {
-			writeError(w, http.StatusNotFound, "compliance status record not found")
+		if errors.Is(err, domain.ErrComplianceStatusNotFound) {
+			writeError(w, http.StatusNotFound, "compliance status not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to get compliance status record")
+		writeError(w, http.StatusInternalServerError, "failed to get compliance status")
 		return
 	}
-	writeJSON(w, http.StatusOK, c)
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, cs.LegalEntityID, actionComplianceStatusRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, cs)
 }
 
-func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) ListComplianceStatuses(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
-	domainName := r.URL.Query().Get("domain_name")
-	status := r.URL.Query().Get("status")
+	domainCode := r.URL.Query().Get("domain_code")
+	statusCode := r.URL.Query().Get("status_code")
+	limitStr := r.URL.Query().Get("limit")
+	offsetStr := r.URL.Query().Get("offset")
 
-	records, err := h.store.List(r.Context(), legalEntityID, jurisdictionID, domainName, status)
+	limit := 50
+	if limitStr != "" {
+		if v, err := strconv.Atoi(limitStr); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+	offset := 0
+	if offsetStr != "" {
+		if v, err := strconv.Atoi(offsetStr); err == nil && v >= 0 {
+			offset = v
+		}
+	}
+
+	filter := domain.ListComplianceStatusFilter{
+		LegalEntityID: legalEntityID,
+		DomainCode:    domain.DomainCode(domainCode),
+		StatusCode:    domain.ComplianceStatusCode(statusCode),
+		Limit:         limit,
+		Offset:        offset,
+	}
+
+	records, err := h.store.ListComplianceStatuses(r.Context(), filter)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list compliance status records")
+		writeError(w, http.StatusInternalServerError, "failed to list compliance statuses")
 		return
 	}
 	if records == nil {
-		records = []domain.ComplianceHealth{}
+		records = []*domain.ComplianceStatus{}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"compliance_status_records": records,
-		"total":                     len(records),
+		"compliance_statuses": records,
+		"total":               len(records),
 	})
 }
 
-func (h *Handler) CreateGap(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
+type updateComplianceStatusRequest struct {
+	StatusCode               string `json:"status_code"`
+	StatusReason             string `json:"status_reason"`
+	EvidenceSufficiencyState string `json:"evidence_sufficiency_state"`
+	ExpectedVersion          int    `json:"expected_version,omitempty"`
+}
 
-	var req domain.CreateGapRequest
+func (req *updateComplianceStatusRequest) validate() error {
+	if req.StatusCode == "" {
+		return errors.New("status_code is required")
+	}
+	if !domain.IsValidStatusCode(domain.ComplianceStatusCode(req.StatusCode)) {
+		return errors.New("invalid status_code: must be COMPLIANT, NON_COMPLIANT, AT_RISK, UNKNOWN, or WAIVED")
+	}
+	if req.StatusReason == "" {
+		return errors.New("status_reason is required")
+	}
+	if req.EvidenceSufficiencyState == "" {
+		return errors.New("evidence_sufficiency_state is required")
+	}
+	if !domain.IsValidEvidenceState(domain.EvidenceSufficiencyState(req.EvidenceSufficiencyState)) {
+		return errors.New("invalid evidence_sufficiency_state: must be SUFFICIENT, INSUFFICIENT, PENDING, or NOT_APPLICABLE")
+	}
+	return nil
+}
+
+func (h *Handler) UpdateComplianceStatus(w http.ResponseWriter, r *http.Request) {
+	complianceStatusID := chi.URLParam(r, "compliance_status_id")
+
+	var req updateComplianceStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.LegalEntityID == "" || req.JurisdictionID == "" || req.DomainName == "" || req.GapType == "" {
-		writeError(w, http.StatusBadRequest, "legal_entity_id, jurisdiction_id, domain_name, and gap_type are required")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionComplianceGapCreate); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	g := &domain.ComplianceGap{
-		TenantID:        tenantID,
-		LegalEntityID:   req.LegalEntityID,
-		JurisdictionID:  req.JurisdictionID,
-		DomainName:      req.DomainName,
-		GapType:         req.GapType,
-		Severity:        req.Severity,
-		SourceReference: req.SourceReference,
-		Description:     req.Description,
-		RemediationPlan: req.RemediationPlan,
-	}
-
-	if err := h.store.CreateGap(r.Context(), g); err != nil {
-		h.logger.Error("create compliance gap failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to log compliance gap")
-		return
-	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "compliance.gap.detected", SubjectID: g.GapID, TenantID: tenantID,
-		LegalEntityID: g.LegalEntityID, Jurisdiction: g.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: g,
-	})
-	writeJSON(w, http.StatusCreated, g)
-}
-
-func (h *Handler) ListGaps(w http.ResponseWriter, r *http.Request) {
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	domainName := r.URL.Query().Get("domain_name")
-	severity := r.URL.Query().Get("severity")
-	status := r.URL.Query().Get("status")
-
-	gaps, err := h.store.ListGaps(r.Context(), legalEntityID, domainName, severity, status)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list compliance gaps")
-		return
-	}
-	if gaps == nil {
-		gaps = []domain.ComplianceGap{}
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"compliance_gaps": gaps,
-		"total":           len(gaps),
-	})
-}
-
-func (h *Handler) ResolveGap(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
-
-	var req domain.ResolveGapRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if err := req.validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -242,39 +276,44 @@ func (h *Handler) ResolveGap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := h.store.GetGapByID(r.Context(), id)
+	// First check authorization by reading the existing record
+	existing, err := h.store.FindComplianceStatusByID(r.Context(), complianceStatusID)
 	if err != nil {
-		if errors.Is(err, domain.ErrGapNotFound) {
-			writeError(w, http.StatusNotFound, "compliance gap not found")
+		if errors.Is(err, domain.ErrComplianceStatusNotFound) {
+			writeError(w, http.StatusNotFound, "compliance status not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to resolve compliance gap")
+		writeError(w, http.StatusInternalServerError, "failed to get compliance status")
 		return
 	}
 
-	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionComplianceGapResolve); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionComplianceStatusUpdate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	g, err := h.store.ResolveGap(r.Context(), id, &req)
+	cs, err := h.store.UpdateComplianceStatus(r.Context(), complianceStatusID, domain.UpdateComplianceStatusParams{
+		StatusCode:               domain.ComplianceStatusCode(req.StatusCode),
+		StatusReason:             req.StatusReason,
+		EvidenceSufficiencyState: domain.EvidenceSufficiencyState(req.EvidenceSufficiencyState),
+		ExpectedVersion:          req.ExpectedVersion,
+	}, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrGapNotFound):
-			writeError(w, http.StatusNotFound, "compliance gap not found")
-		case errors.Is(err, domain.ErrGapAlreadyResolved):
-			writeError(w, http.StatusConflict, "compliance gap is already resolved")
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to resolve compliance gap")
+		if errors.Is(err, domain.ErrComplianceStatusNotFound) {
+			writeError(w, http.StatusNotFound, "compliance status not found")
+			return
 		}
+		h.logger.Error("update compliance status failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to update compliance status")
 		return
 	}
+
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "compliance.gap.resolved", SubjectID: id, TenantID: tenantID,
-		LegalEntityID: g.LegalEntityID, Jurisdiction: g.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: g,
+		EventType: "compliance.status.changed", SubjectID: cs.ComplianceStatusID, TenantID: cs.TenantID,
+		LegalEntityID: cs.LegalEntityID, Jurisdiction: "", ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: cs,
 	})
-	writeJSON(w, http.StatusOK, g)
+	writeJSON(w, http.StatusOK, cs)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
