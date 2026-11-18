@@ -6,11 +6,11 @@ compose stack, so a failure names the edge that is broken:
 
   tenant-entity-registry-svc  HTTP: the tenant of an unprojected entity
   identity-context-svc        HTTP: envelope JWKS + session introspection on the
-                              admin routes; Kafka: identity.subject.* into layer 0
+                               admin routes; Kafka: identity.subject.* into layer 0
   jurisdiction-rules-svc      HTTP: a jurisdiction-scoped SoD rule's jurisdiction
   delegated-authority-svc     Kafka: authority.* projected into the delegation layer
   access-control-svc          HTTP: its own authorization; Kafka: role.created
-                              invalidating authorization-svc's grant cache
+                               invalidating authorization-svc's grant cache
   mtls-management-svc         mTLS: its decisions arrive on authorization-svc :8449
   siem-integration-svc        HTTP: authorization.denied streamed to an exporter
   otel-collector / jaeger     OTLP: authorization-svc traces reach Jaeger
@@ -41,6 +41,15 @@ AUTHZ, IDENTITY, REGISTRY = f"{H}:8089", f"{H}:8080", f"{H}:8081"
 JURISDICTION, DELEGATION, ACCESS = f"{H}:8082", f"{H}:8136", f"{H}:8137"
 MTLS, SIEM, JAEGER = f"{H}:8140", f"{H}:8141", f"{H}:16686"
 
+# Credentials for getting identity envelopes.
+CREDS = {
+    ADMIN: ("admin@zoikosuite.com", "Zoiko@Governance1"),
+}
+
+# Cache for identity envelopes: principal_id -> (token, expires_at)
+EnvelopeCache = {}
+EnvelopeCacheTTL = 240  # seconds (4 minutes)
+
 results = []
 
 
@@ -50,9 +59,59 @@ def check(name, ok, detail=""):
     return bool(ok)
 
 
+def get_envelope(principal):
+    """Get a signed identity envelope for the principal, cached for 4 minutes."""
+    now = time.time()
+    if principal in EnvelopeCache:
+        token, expires = EnvelopeCache[principal]
+        if now < expires:
+            return token
+
+    if principal not in CREDS:
+        return None
+
+    email, password = CREDS[principal]
+
+    # Authenticate with identity-context-svc.
+    auth_body = json.dumps({
+        "client_id": "zoiko-console",
+        "client_secret": "local-dev-console-client-secret",
+        "username": email,
+        "password": password
+    }).encode()
+
+    try:
+        req = urllib.request.Request(f"{IDENTITY}/v1/authenticate", data=auth_body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            auth_result = json.loads(r.read())
+        access_token = auth_result["access_token"]
+    except Exception as e:
+        print(f"WARN: Failed to authenticate {email}: {e}", flush=True)
+        print("WARN: Falling back to headers-only mode (works under warn)", flush=True)
+        return None
+
+    # Resolve context for the demo legal entity.
+    resolve_body = json.dumps({"entity_id": ENTITY}).encode()
+    try:
+        req = urllib.request.Request(f"{IDENTITY}/v1/context/resolve", data=resolve_body, method="POST",
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            resolve_result = json.loads(r.read())
+        identity_token = resolve_result["identity_token"]
+    except Exception as e:
+        print(f"WARN: Failed to resolve context for {email}: {e}", flush=True)
+        print("WARN: Falling back to headers-only mode (works under warn)", flush=True)
+        return None
+
+    # Cache the envelope.
+    EnvelopeCache[principal] = (identity_token, now + EnvelopeCacheTTL)
+    return identity_token
+
+
 def envelope(principal=ADMIN, write=False, tenant=TENANT, entity=ENTITY):
     """The canonical input contract: identity, correlation, channel, and on a
-    write an Idempotency-Key and X-Occurred-At."""
+    write an Idempotency-Key and X-Occurred-At. Adds Authorization bearer when available."""
     rid = str(uuid.uuid4())
     h = {
         "X-Tenant-Id": tenant,
@@ -63,6 +122,12 @@ def envelope(principal=ADMIN, write=False, tenant=TENANT, entity=ENTITY):
         "X-Source-Channel": "api",
         "X-Source-System": "e2e-authorization-deps",
     }
+
+    # Add Authorization bearer from identity envelope.
+    env_token = get_envelope(principal)
+    if env_token:
+        h["Authorization"] = f"Bearer {env_token}"
+
     if write:
         h["Idempotency-Key"] = str(uuid.uuid4())
         h["X-Occurred-At"] = datetime.now(timezone.utc).isoformat()
@@ -127,7 +192,7 @@ def health():
         check(f"health {name}", s == 200, f"HTTP {s}" if s != 200 else "")
 
 
-# ── 1. the evaluation path itself ────────────────────────────────────────────
+# ── 1. the evaluation path itself ─────────────────────────────────────────────
 
 def core():
     s, _, b = authorize(ADMIN)
@@ -135,7 +200,7 @@ def core():
           f"HTTP {s} {b.get('decision')} {b.get('decision_basis', b.get('error', ''))}")
 
 
-# ── 2. tenant-entity-registry-svc ────────────────────────────────────────────
+# ── 2. tenant-entity-registry-svc ─────────────────────────────────────────────
 
 def registry():
     # An entity no projection has seen: authorization-svc must ask the registry
@@ -146,7 +211,7 @@ def registry():
           f"HTTP {s} {brief(b)}")
 
 
-# ── 3. identity-context-svc: envelope on the admin routes ────────────────────
+# ── 3. identity-context-svc: envelope on the admin routes ─────────────────────
 
 def identity_envelope(password):
     # The console's confidential client: identity-context-svc runs with
@@ -175,7 +240,7 @@ def identity_envelope(password):
     check("authz admin route refuses a tampered envelope", s == 401, f"HTTP {s} {b.get('error', '')}")
 
 
-# ── 4. jurisdiction-rules-svc ────────────────────────────────────────────────
+# ── 4. jurisdiction-rules-svc ─────────────────────────────────────────────────
 
 def jurisdiction():
     s, _, b = call("GET", f"{JURISDICTION}/v1/jurisdictions", envelope())
@@ -195,7 +260,7 @@ def jurisdiction():
     check("jurisdiction: rule scoped to a real jurisdiction is proposed", s in (201, 202), f"HTTP {s} {brief(b)}")
 
 
-# ── 5. delegated-authority-svc and identity-context-svc over Kafka ───────────
+# ── 5. delegated-authority-svc and identity-context-svc over Kafka ────────────
 
 def delegation_and_status(subject):
     s, _, b = authorize(subject)
@@ -250,7 +315,7 @@ def set_status(subject, status, quiet=False):
     return check(f"identity: subject set {status}", s in (200, 204), f"HTTP {s} {brief(b)}" if s not in (200, 204) else "")
 
 
-# ── 6. access-control-svc ────────────────────────────────────────────────────
+# ── 6. access-control-svc ─────────────────────────────────────────────────────
 
 def access_control():
     since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -280,7 +345,7 @@ def access_control():
         check("access-control: role.created consumed by authorization-svc", found, "" if found else "no invalidation logged in 30 s")
 
 
-# ── 7. mtls-management-svc → authorization-svc over mTLS ─────────────────────
+# ── 7. mtls-management-svc → authorization-svc over mTLS ──────────────────────
 
 def mtls():
     # mtls-management-svc asks for this decision on https://authorization-svc:8449
@@ -289,7 +354,7 @@ def mtls():
     check("mtls: mtls-management-svc got a decision over mTLS", s in (200, 403), f"HTTP {s} {brief(b)}" if s not in (200, 403) else f"HTTP {s}")
 
 
-# ── 8. siem-integration-svc ──────────────────────────────────────────────────
+# ── 8. siem-integration-svc ───────────────────────────────────────────────────
 
 def siem(subject):
     s, _, b = call("GET", f"{SIEM}/v1/siem/exporters?legal_entity_id={ENTITY}", envelope())
@@ -315,7 +380,7 @@ def siem(subject):
     check("siem: authorization.denied streamed by authorization-svc", found, "" if found else f"none seen (events HTTP {status})")
 
 
-# ── 9. otel-collector → jaeger ───────────────────────────────────────────────
+# ── 9. otel-collector → jaeger ────────────────────────────────────────────────
 
 def tracing():
     def listed():

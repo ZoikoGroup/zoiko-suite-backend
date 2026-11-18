@@ -560,3 +560,10 @@ turned up.
   `d8e1a895`; its login now sends the client.
 
 **Commits** (`shashi-changes`): backend `a374c56b` (access-control 000025), `8049bd5c` (000027), `13299a0c` (federation), `8e7cbc19` (passkeys, resets, MFA), `d8e1a895` (client auth, E2E, audit), `feec479b` (override); frontend `9dbf896` (identity tabs), `5ee180d` (Sign-in security).
+
+## 18 Nov 2026: CT-7 — Tooling principals + demo TOTP factors
+
+- **Tooling principals (CT-7 part 1):** Added `-tooling` flag to `cmd/seed-demo-principals/main.go` to seed the synthetic principals used by test scripts and seed-demo-rbac.ps1: seed admin `5eed0000-0000-4000-8000-00000000a001` and 5 personas (`a1000000-0000-4000-8000-000000000001` through `...0005`). Kept apart from the console's seven (which mirror lib/auth.ts). Dev-only passwords, same idempotent insert. Runs in a golang container with `.env` DATABASE_URL.
+- **Demo TOTP factors (CT-7 part 2 / Phase D):** Added `-totp` flag to seed ACTIVE TOTP rows for admin@ (code 333333) and legal.counsel@ (code 666666) with fixed dev secrets (base32 constant `JBSWY3DPEHPK3PXP`, gitleaks:allow). Secrets sealed with `mfa.Keyring.Seal + mfa.FactorAAD` under `MFA_SECRET_KEY/_ID` (compose local key; refuses when ENV is not local). Retires any existing TOTP row first (one-active index), deterministic `credential_id` → idempotent. Login stays password-only (`authenticator.go:291`), so nothing else changes.
+- **E2E TOTP helper:** `e2e-identity-context-deps.py` §5 now reuses an ACTIVE factor when one exists (known dev secret) and only revokes factors it created. Shared TOTP helper (RFC 6238 SHA1/6/30, wait for fresh step, replay guard `totp_last_used_step`) in Python (identity e2e line 102) and Node (tests/e2e/console/fixtures.ts).
+- **Result:** Break-glass approval / emergency suspension (REF-07) now proves with real TOTP step-up. Console specs updated with TOTP codes.

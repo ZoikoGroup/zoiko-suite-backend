@@ -26,6 +26,7 @@ import (
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	"zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/access-control-svc/internal/clients"
 	"zoiko.io/access-control-svc/internal/config"
@@ -38,7 +39,6 @@ import (
 	"zoiko.io/access-control-svc/internal/hrevents"
 	"zoiko.io/access-control-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
-	"zoiko.io/access-control-svc/internal/mtls"
 	"zoiko.io/access-control-svc/internal/outbox"
 	"zoiko.io/access-control-svc/internal/store"
 	"zoiko.io/access-control-svc/internal/telemetry"
@@ -340,13 +340,23 @@ func main() {
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
 	var httpClientForAuthz *http.Client
+	var authzIdentity *mtlsclient.Identity
 	if cfg.AuthzMTLSEnabled {
-		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "access-control-svc", platformScopeID)
-		if err != nil {
-			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		authzIdentity = mtlsclient.Start(context.Background(), mtlsclient.Options{
+			ServiceName:        "access-control-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		// Wait up to ~30s for the first certificate to be installed.
+		select {
+		case <-authzIdentity.Ready():
+			log.Info("mTLS certificate ready for authorization-svc calls")
+		case <-time.After(30 * time.Second):
+			log.Warn("mTLS certificate not ready after 30s; continuing with plaintext fallback",
+				zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
 		}
+		httpClientForAuthz = authzIdentity.HTTPClient(5 * time.Second)
 		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
-		httpClientForAuthz = mtlsHTTPClient
 	} else {
 		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
 	}
@@ -360,7 +370,7 @@ func main() {
 	// authorization-svc could never see this service's certificate and admit it
 	// as a registered delegate (its register A-01).
 	authzAdminClient := clients.NewAuthzAdminClientWithHTTP(authzBaseURL, httpClientForAuthz)
-	sodClient := clients.NewSoDClient(authzBaseURL)
+	sodClient := clients.NewSoDClientWithHTTP(authzBaseURL, httpClientForAuthz)
 	// The protected-action catalogue is this service's own table, not a call:
 	// the route the old client called (GET /v1/protected-permissions) exists
 	// nowhere in the estate.

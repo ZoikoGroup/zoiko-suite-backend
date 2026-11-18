@@ -493,6 +493,15 @@ authorization-svc, and the grantee then got `GRANTED rbac:role=PO_APPROVER` (was
 **Still to do on the real database:** `python deployments/migrate.py up` (or apply 000017 by hand),
 then `SELECT count(*) FROM permission_definitions WHERE description LIKE 'Enforced by %'` → 68.
 
+## 18 Nov 2026: AZ-2 / CT-3 — access-control-svc on mTLS as registered delegate
+
+- **mTLS client:** Replaced `internal/mtls.NewClientHTTPClient` (no bootstrap token, fatal on failure) with shared `zoiko.io/identity-envelope/mtlsclient.Start(ctx, Options{ServiceName: "access-control-svc", ManagementURL, BootstrapTokenPath})` — same pattern as decision-support-svc. Waits up to ~30 s on `identity.Ready()` before serving; warns and continues otherwise.
+- **Single HTTP client:** One `identity.HTTPClient(5s)` for all three authz clients: decision (`httpAuthzClient`), admin (`NewAuthzAdminClientWithHTTP`), and SoD (`NewSoDClientWithHTTP`).
+- **Config:** Added `MTLS_BOOTSTRAP_TOKEN_PATH` (default `/bootstrap/token`). Deleted `internal/mtls/` (no other user).
+- **Compose:** Added access-control-svc to the mtls-bootstrap-keygen loop; env `AUTHZ_MTLS_ENABLED: "true"`, `AUTHZ_MTLS_URL`, `MTLS_MANAGEMENT_SERVICE_URL`, `MTLS_BOOTSTRAP_TOKEN_PATH`; volume subpath `access-control-svc`; `depends_on mtls-bootstrap-keygen` + `mtls-management-svc`. authorization-svc already has `AUTHZ_ADMIN_DELEGATES: "access-control-svc"`.
+- **Tests:** SoD client with injected TLS client (httptest TLS server); existing suite passes; `go vet` clean.
+- **Result:** access-control-svc now provisions roles into authorization-svc over mTLS as a registered delegate. Blockers for `AUTHZ_IDENTITY_ASSERTION=require` (AZ-2) from this service are closed.
+
 ## 11 Nov 2026: R5 gaps closed for the governance ledger and IAM reads
 
 - **000050_register_iam_assignment_read**: authorization-svc checks

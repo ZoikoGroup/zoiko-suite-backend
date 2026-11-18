@@ -46,6 +46,13 @@ type ObligationStore interface {
 	CheckIdempotencyKey(ctx context.Context, idempotencyKey, requestHash string) (bool, string, string, error)
 	StoreIdempotencyKey(ctx context.Context, idempotencyKey, requestHash, resourceID, resourceType string) error
 
+	// ── WF-3: Deadline Clocks (WFC-05) ──────────────────────────────────────
+	CreateClock(ctx context.Context, params domain.CreateClockParams) (*domain.Clock, error)
+	FindClockByID(ctx context.Context, clockID string) (*domain.Clock, error)
+	ListClocks(ctx context.Context, filter domain.ListClocksFilter) ([]*domain.Clock, error)
+	TransitionClock(ctx context.Context, params domain.ClockTransitionParams) (*domain.Clock, bool, error)
+	FindActiveClocksForObligation(ctx context.Context, obligationID string) ([]*domain.Clock, error)
+
 	// ── Chunk 10: applicability decisions ────────────────────────────────────
 	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, bool, error)
 	ListApplicabilityDecisions(ctx context.Context, obligationID, jurisdictionCode, entityRef string, limit int) ([]*domain.ApplicabilityDecision, error)
@@ -325,6 +332,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Delete("/v1/obligations/{obligation_id}/workflow", h.UnlinkWorkflow)
 	r.Post("/v1/obligations/{obligation_id}/filing-requirements", h.CreateFilingRequirement)
 	r.Get("/v1/obligations/{obligation_id}/filing-requirements", h.ListFilingRequirements)
+	r.Post("/v1/obligations/{obligation_id}/clocks", h.CreateClock)
+	r.Get("/v1/obligations/{obligation_id}/clocks", h.ListClocks)
+	r.Get("/v1/obligations/{obligation_id}/clocks/{clock_id}", h.GetClock)
+	r.Post("/v1/obligations/{obligation_id}/clocks/{clock_id}/status", h.TransitionClock)
+	r.Post("/v1/obligations/{obligation_id}/clocks/{clock_id}/satisfy", h.SatisfyClock)
+	r.Post("/v1/obligations/{obligation_id}/clocks/{clock_id}/waive", h.WaiveClock)
+	r.Post("/v1/obligations/{obligation_id}/clocks/{clock_id}/not-applicable", h.NotApplicableClock)
 	registerCompletionRoutes(r, h)
 	RegisterComplianceRoutes(r, h)
 }
@@ -1126,6 +1140,654 @@ func (h *Handler) UnlinkWorkflow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, updated)
 }
 
+// =============================================================================
+// WF-3: Deadline Clocks (WFC-05)
+// =============================================================================
+
+// createClockRequest is the wire shape for POST /v1/obligations/{id}/clocks.
+type createClockRequest struct {
+	ClockClass          string                 `json:"clock_class"`            // HARD_LEGAL, SOFT_INTERNAL, ADVISORY, EXTENSION
+	CalendarCode        string                 `json:"calendar_code"`          // jurisdiction-rules calendar code
+	CalendarRuleID      string                 `json:"calendar_rule_id"`       // jurisdiction-rules rule ID
+	CalendarRuleVersion int                    `json:"calendar_rule_version"`  // rule version at computation
+	ComputedDeadline    time.Time              `json:"computed_deadline"`      // the deadline
+	DueSoonThreshold    string                 `json:"due_soon_threshold"`     // e.g. "168h" for 7 days (Go duration)
+	EscalationLadder    []domain.EscalationStep `json:"escalation_ladder"`     // ordered steps when overdue
+}
+
+func (req createClockRequest) missingField() string {
+	switch {
+	case req.ClockClass == "":
+		return "clock_class"
+	case req.CalendarCode == "":
+		return "calendar_code"
+	case req.CalendarRuleID == "":
+		return "calendar_rule_id"
+	case req.CalendarRuleVersion == 0:
+		return "calendar_rule_version"
+	case req.ComputedDeadline.IsZero():
+		return "computed_deadline"
+	case req.DueSoonThreshold == "":
+		return "due_soon_threshold"
+	default:
+		return ""
+	}
+}
+
+// CreateClock handles POST /v1/obligations/{obligation_id}/clocks.
+// Creates a computed deadline clock on an obligation.
+//
+// Response:
+//
+//	201 → clock created (PLANNED state)
+//	400 → missing/invalid field
+//	404 → obligation_id not found, or legal_entity mismatch
+//	409 → obligation not found or version mismatch
+//	503 → store or jurisdiction-rules-svc unavailable
+func (h *Handler) CreateClock(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req createClockRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if missing := req.missingField(); missing != "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": missing,
+		})
+		return
+	}
+
+	// Validate clock class
+	if !domain.ClockStatuses[domain.ClockClass(req.ClockClass)] {
+		// ClockClass is data, not a fixed enum - but we check it's not empty
+		// The store will enforce the obligation exists and legal_entity matches
+	}
+
+	// Parse due_soon_threshold as Go duration
+	dueSoonThreshold, err := time.ParseDuration(req.DueSoonThreshold)
+	if err != nil {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error":  "invalid_field",
+			"field":  "due_soon_threshold",
+			"detail": "must be a valid Go duration (e.g. 168h for 7 days)",
+		})
+		return
+	}
+
+	// Verify obligation exists and get its legal_entity_id
+	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, r, "CreateClock: obligation lookup failed", err)
+		return
+	}
+
+	// Authorized against the obligation's legal entity
+	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	// Entity-bound: the entity must exist in this tenant
+	if !h.checkEntity(w, r, parent.LegalEntityID) {
+		return
+	}
+
+	// Validate calendar_code and calendar_rule_id against jurisdiction-rules-svc
+	// (This ensures the calendar provenance is real)
+	if err := h.jurisdictionValidator.ValidateCalendarRule(r.Context(), req.CalendarCode, req.CalendarRuleID, req.CalendarRuleVersion); err != nil {
+		h.log.Error("CreateClock: calendar validation failed",
+			zap.String("calendar_code", req.CalendarCode),
+			zap.String("calendar_rule_id", req.CalendarRuleID),
+			zap.Int("calendar_rule_version", req.CalendarRuleVersion),
+			zap.Error(err))
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "jurisdiction_service_unavailable"})
+		return
+	}
+
+	params := domain.CreateClockParams{
+		ObligationID:         obligationID,
+		ClockClass:           domain.ClockClass(req.ClockClass),
+		CalendarCode:         req.CalendarCode,
+		CalendarRuleID:       req.CalendarRuleID,
+		CalendarRuleVersion:  req.CalendarRuleVersion,
+		ComputedDeadline:     req.ComputedDeadline,
+		DueSoonThreshold:     dueSoonThreshold,
+		EscalationLadder:     req.EscalationLadder,
+		CreatedByPrincipalID: principalID,
+		CorrelationID:        correlationID,
+	}
+
+	c, err := h.store.CreateClock(r.Context(), params)
+	if err != nil {
+		h.writeStoreErr(w, r, "CreateClock: store unavailable", err)
+		return
+	}
+
+	h.log.Info("clock created",
+		zap.String("clock_id", c.ClockID),
+		zap.String("obligation_id", obligationID),
+		zap.String("clock_class", string(c.ClockClass)),
+		zap.String("correlation_id", correlationID),
+	)
+	w.Header().Set("Location", "/v1/obligations/"+obligationID+"/clocks/"+c.ClockID)
+	writeJSON(w, r, http.StatusCreated, c)
+}
+
+// GetClock handles GET /v1/obligations/{obligation_id}/clocks/{clock_id}.
+func (h *Handler) GetClock(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	clockID := chi.URLParam(r, "clock_id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	c, err := h.store.FindClockByID(r.Context(), clockID)
+	if err != nil {
+		h.writeStoreErr(w, r, "GetClock: store unavailable", err)
+		return
+	}
+
+	// Verify clock belongs to the obligation
+	if c.ObligationID != obligationID {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "clock_not_found"})
+		return
+	}
+
+	if !h.authorize(w, r, principalID, c.LegalEntityID, authz.ActionObligationRead) {
+		return
+	}
+
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(c.Version)))
+	writeJSON(w, r, http.StatusOK, c)
+}
+
+// ListClocks handles GET /v1/obligations/{obligation_id}/clocks.
+// Lists clocks on an obligation with cursor paging (API-4).
+func (h *Handler) ListClocks(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	q := r.URL.Query()
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	limit, offset, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	// Verify obligation exists
+	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, r, "ListClocks: obligation lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionObligationRead) {
+		return
+	}
+
+	filter := domain.ListClocksFilter{
+		Limit:         limit,
+		Offset:        offset,
+		ObligationID:  obligationID,
+		LegalEntityID: parent.LegalEntityID,
+		ClockClass:    domain.ClockClass(q.Get("clock_class")),
+		ClockState:    domain.ClockState(q.Get("clock_state")),
+	}
+
+	if c := q.Get("cursor"); c != "" {
+		at, id, ok := decodeCursor(c)
+		if !ok || offset != 0 {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "cursor",
+				"detail": "cursor must be a next_cursor this endpoint returned, and cannot be combined with offset"})
+			return
+		}
+		filter.AfterCreatedAt, filter.AfterID = &at, id
+	}
+
+	results, err := h.store.ListClocks(r.Context(), filter)
+	if err != nil {
+		h.writeStoreErr(w, r, "ListClocks: store unavailable", err)
+		return
+	}
+
+	if results == nil {
+		results = []*domain.Clock{}
+	}
+	if len(results) == limit {
+		last := results[len(results)-1]
+		next := encodeCursor(last.CreatedAt, last.ClockID)
+		nq := r.URL.Query()
+		nq.Set("cursor", next)
+		nq.Del("offset")
+		w.Header().Set("X-Next-Cursor", next)
+		w.Header().Set("Link", "<"+r.URL.Path+"?"+nq.Encode()+`>; rel="next"`)
+	}
+	writeJSON(w, r, http.StatusOK, results)
+}
+
+// clockTransitionRequest is the wire shape for POST /v1/obligations/{id}/clocks/{clock_id}/status.
+type clockTransitionRequest struct {
+	ClockState          string   `json:"clock_state"`                    // ACTIVE, DUE_SOON, DUE, OVERDUE, FULFILLED, WAIVED, NOT_APPLICABLE, SUPERSEDED
+	ExpectedVersion     int      `json:"expected_version,omitempty"`     // If-Match version
+	EvidenceEvaluationIDs []string `json:"evidence_evaluation_ids,omitempty"` // for FULFILLED/WAIVED
+	Reason              string   `json:"reason,omitempty"`               // for WAIVED/NOT_APPLICABLE
+	AuthorityPrincipalID string   `json:"authority_principal_id,omitempty"` // for WAIVED/NOT_APPLICABLE
+	SupersededByClockID  string   `json:"superseded_by_clock_id,omitempty"` // for SUPERSEDED
+}
+
+// TransitionClock handles POST /v1/obligations/{obligation_id}/clocks/{clock_id}/status.
+// Generic clock state transition (used by sweep worker).
+func (h *Handler) TransitionClock(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	clockID := chi.URLParam(r, "clock_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req clockTransitionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.ClockState == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": "clock_state",
+		})
+		return
+	}
+	if !domain.ClockStatuses[domain.ClockState(req.ClockState)] {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error":  "invalid_field",
+			"field":  "clock_state",
+			"detail": "clock_state must be a valid clock state",
+		})
+		return
+	}
+
+	// Verify clock belongs to obligation
+	c, err := h.store.FindClockByID(r.Context(), clockID)
+	if err != nil {
+		h.writeStoreErr(w, r, "TransitionClock: clock lookup failed", err)
+		return
+	}
+	if c.ObligationID != obligationID {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "clock_not_found"})
+		return
+	}
+
+	if !h.authorize(w, r, principalID, c.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	// Parse If-Match header for optimistic locking
+	expectedVersion := req.ExpectedVersion
+	if match := r.Header.Get("If-Match"); match != "" {
+		match = strings.TrimPrefix(match, "W/")
+		match = strings.Trim(match, `"`)
+		if v, err := strconv.Atoi(match); err == nil {
+			expectedVersion = v
+		} else {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":  "invalid_if_match",
+				"detail": "If-Match must be an integer version",
+			})
+			return
+		}
+	}
+
+	params := domain.ClockTransitionParams{
+		ClockID:                 clockID,
+		NewState:                domain.ClockState(req.ClockState),
+		ExpectedVersion:         expectedVersion,
+		ActorPrincipalID:        principalID,
+		CorrelationID:           correlationID,
+		EvidenceEvaluationIDs:   req.EvidenceEvaluationIDs,
+		Reason:                  nilIfEmpty(req.Reason),
+		AuthorityPrincipalID:    nilIfEmpty(req.AuthorityPrincipalID),
+		NotApplicableReason:     nilIfEmpty(req.Reason), // same field for NOT_APPLICABLE
+		NotApplicableAuthorityPrincipalID: nilIfEmpty(req.AuthorityPrincipalID),
+		SupersededByClockID:     nilIfEmpty(req.SupersededByClockID),
+	}
+
+	updated, transitioned, err := h.store.TransitionClock(r.Context(), params)
+	if err != nil {
+		h.writeStoreErr(w, r, "TransitionClock: store unavailable", err)
+		return
+	}
+
+	h.log.Info("clock state transitioned",
+		zap.String("clock_id", clockID),
+		zap.String("new_state", string(updated.ClockState)),
+		zap.Bool("transitioned", transitioned),
+		zap.String("correlation_id", correlationID),
+	)
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(updated.Version)))
+	writeJSON(w, r, http.StatusOK, updated)
+}
+
+// satisfyClockRequest is the wire shape for POST /v1/obligations/{id}/clocks/{clock_id}/satisfy.
+type satisfyClockRequest struct {
+	EvidenceEvaluationIDs []string `json:"evidence_evaluation_ids"` // required
+	ExpectedVersion       int      `json:"expected_version,omitempty"`
+}
+
+// SatisfyClock handles POST /v1/obligations/{obligation_id}/clocks/{clock_id}/satisfy.
+// Marks a clock as FULFILLED with evidence (evidence required).
+func (h *Handler) SatisfyClock(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	clockID := chi.URLParam(r, "clock_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req satisfyClockRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.EvidenceEvaluationIDs) == 0 {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error":  "missing_field",
+			"field":  "evidence_evaluation_ids",
+			"detail": "at least one evidence evaluation ID is required to satisfy a clock",
+		})
+		return
+	}
+
+	// Verify clock belongs to obligation
+	c, err := h.store.FindClockByID(r.Context(), clockID)
+	if err != nil {
+		h.writeStoreErr(w, r, "SatisfyClock: clock lookup failed", err)
+		return
+	}
+	if c.ObligationID != obligationID {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "clock_not_found"})
+		return
+	}
+
+	if !h.authorize(w, r, principalID, c.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	// Parse If-Match header
+	expectedVersion := req.ExpectedVersion
+	if match := r.Header.Get("If-Match"); match != "" {
+		match = strings.TrimPrefix(match, "W/")
+		match = strings.Trim(match, `"`)
+		if v, err := strconv.Atoi(match); err == nil {
+			expectedVersion = v
+		} else {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":  "invalid_if_match",
+				"detail": "If-Match must be an integer version",
+			})
+			return
+		}
+	}
+
+	params := domain.ClockTransitionParams{
+		ClockID:                 clockID,
+		NewState:                domain.ClockStateFulfilled,
+		ExpectedVersion:         expectedVersion,
+		ActorPrincipalID:        principalID,
+		CorrelationID:           correlationID,
+		EvidenceEvaluationIDs:   req.EvidenceEvaluationIDs,
+	}
+
+	updated, transitioned, err := h.store.TransitionClock(r.Context(), params)
+	if err != nil {
+		h.writeStoreErr(w, r, "SatisfyClock: store unavailable", err)
+		return
+	}
+
+	h.log.Info("clock satisfied",
+		zap.String("clock_id", clockID),
+		zap.Strings("evidence_evaluation_ids", req.EvidenceEvaluationIDs),
+		zap.Bool("transitioned", transitioned),
+		zap.String("correlation_id", correlationID),
+	)
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(updated.Version)))
+	writeJSON(w, r, http.StatusOK, updated)
+}
+
+// waiveClockRequest is the wire shape for POST /v1/obligations/{id}/clocks/{clock_id}/waive.
+type waiveClockRequest struct {
+	Reason               string   `json:"reason"`                        // required
+	AuthorityPrincipalID string   `json:"authority_principal_id"`        // required
+	EvidenceEvaluationIDs []string `json:"evidence_evaluation_ids,omitempty"` // optional
+	ExpectedVersion      int      `json:"expected_version,omitempty"`
+}
+
+// WaiveClock handles POST /v1/obligations/{obligation_id}/clocks/{clock_id}/waive.
+// Marks a clock as WAIVED with authority + reason + evidence.
+func (h *Handler) WaiveClock(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	clockID := chi.URLParam(r, "clock_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req waiveClockRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Reason == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": "reason",
+		})
+		return
+	}
+	if req.AuthorityPrincipalID == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error":  "missing_field",
+			"field":  "authority_principal_id",
+			"detail": "waiver requires an authority principal",
+		})
+		return
+	}
+
+	// Verify clock belongs to obligation
+	c, err := h.store.FindClockByID(r.Context(), clockID)
+	if err != nil {
+		h.writeStoreErr(w, r, "WaiveClock: clock lookup failed", err)
+		return
+	}
+	if c.ObligationID != obligationID {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "clock_not_found"})
+		return
+	}
+
+	if !h.authorize(w, r, principalID, c.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	// Parse If-Match header
+	expectedVersion := req.ExpectedVersion
+	if match := r.Header.Get("If-Match"); match != "" {
+		match = strings.TrimPrefix(match, "W/")
+		match = strings.Trim(match, `"`)
+		if v, err := strconv.Atoi(match); err == nil {
+			expectedVersion = v
+		} else {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":  "invalid_if_match",
+				"detail": "If-Match must be an integer version",
+			})
+			return
+		}
+	}
+
+	params := domain.ClockTransitionParams{
+		ClockID:                 clockID,
+		NewState:                domain.ClockStateWaived,
+		ExpectedVersion:         expectedVersion,
+		ActorPrincipalID:        principalID,
+		CorrelationID:           correlationID,
+		EvidenceEvaluationIDs:   req.EvidenceEvaluationIDs,
+		Reason:                  &req.Reason,
+		AuthorityPrincipalID:    &req.AuthorityPrincipalID,
+	}
+
+	updated, transitioned, err := h.store.TransitionClock(r.Context(), params)
+	if err != nil {
+		h.writeStoreErr(w, r, "WaiveClock: store unavailable", err)
+		return
+	}
+
+	h.log.Info("clock waived",
+		zap.String("clock_id", clockID),
+		zap.String("authority", req.AuthorityPrincipalID),
+		zap.Bool("transitioned", transitioned),
+		zap.String("correlation_id", correlationID),
+	)
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(updated.Version)))
+	writeJSON(w, r, http.StatusOK, updated)
+}
+
+// notApplicableClockRequest is the wire shape for POST /v1/obligations/{id}/clocks/{clock_id}/not-applicable.
+type notApplicableClockRequest struct {
+	Reason                      string `json:"reason"`                              // required
+	AuthorityPrincipalID        string `json:"authority_principal_id"`              // required
+	ExpectedVersion             int    `json:"expected_version,omitempty"`
+}
+
+// NotApplicableClock handles POST /v1/obligations/{obligation_id}/clocks/{clock_id}/not-applicable.
+// Marks a clock as NOT_APPLICABLE with authority + reason.
+func (h *Handler) NotApplicableClock(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	clockID := chi.URLParam(r, "clock_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req notApplicableClockRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Reason == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": "reason",
+		})
+		return
+	}
+	if req.AuthorityPrincipalID == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error":  "missing_field",
+			"field":  "authority_principal_id",
+			"detail": "not-applicable requires an authority principal",
+		})
+		return
+	}
+
+	// Verify clock belongs to obligation
+	c, err := h.store.FindClockByID(r.Context(), clockID)
+	if err != nil {
+		h.writeStoreErr(w, r, "NotApplicableClock: clock lookup failed", err)
+		return
+	}
+	if c.ObligationID != obligationID {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "clock_not_found"})
+		return
+	}
+
+	if !h.authorize(w, r, principalID, c.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	// Parse If-Match header
+	expectedVersion := req.ExpectedVersion
+	if match := r.Header.Get("If-Match"); match != "" {
+		match = strings.TrimPrefix(match, "W/")
+		match = strings.Trim(match, `"`)
+		if v, err := strconv.Atoi(match); err == nil {
+			expectedVersion = v
+		} else {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":  "invalid_if_match",
+				"detail": "If-Match must be an integer version",
+			})
+			return
+		}
+	}
+
+	params := domain.ClockTransitionParams{
+		ClockID:                      clockID,
+		NewState:                     domain.ClockStateNotApplicable,
+		ExpectedVersion:              expectedVersion,
+		ActorPrincipalID:             principalID,
+		CorrelationID:                correlationID,
+		NotApplicableReason:          &req.Reason,
+		NotApplicableAuthorityPrincipalID: &req.AuthorityPrincipalID,
+	}
+
+	updated, transitioned, err := h.store.TransitionClock(r.Context(), params)
+	if err != nil {
+		h.writeStoreErr(w, r, "NotApplicableClock: store unavailable", err)
+		return
+	}
+
+	h.log.Info("clock marked not applicable",
+		zap.String("clock_id", clockID),
+		zap.String("authority", req.AuthorityPrincipalID),
+		zap.Bool("transitioned", transitioned),
+		zap.String("correlation_id", correlationID),
+	)
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(updated.Version)))
+	writeJSON(w, r, http.StatusOK, updated)
+}
+
+// nilIfEmpty returns a pointer to s if s is not empty, else nil.
+func nilIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 // ── POST /v1/obligations/{obligation_id}/filing-requirements ───────────────
 
 type createFilingRequirementRequest struct {
@@ -1217,6 +1879,7 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 
 // ListFilingRequirements handles
 // GET /v1/obligations/{obligation_id}/filing-requirements.
+// Supports cursor paging (API-4).
 //
 // Response:
 //
@@ -1244,12 +1907,28 @@ func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request)
 	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionFilingRequirementRead) {
 		return
 	}
-	limit, _, ok := parsePaging(w, r)
+	limit, offset, ok := parsePaging(w, r)
 	if !ok {
 		return
 	}
 
-	results, err := h.store.ListFilingRequirements(r.Context(), obligationID, limit)
+	filter := domain.ListFilingRequirementsFilter{
+		ObligationID: obligationID,
+		Limit:        limit,
+		Offset:       offset,
+	}
+
+	if c := r.URL.Query().Get("cursor"); c != "" {
+		at, id, ok := decodeCursor(c)
+		if !ok || offset != 0 {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "cursor",
+				"detail": "cursor must be a next_cursor this endpoint returned, and cannot be combined with offset"})
+			return
+		}
+		filter.AfterCreatedAt, filter.AfterID = &at, id
+	}
+
+	results, err := h.store.ListFilingRequirements(r.Context(), obligationID, filter)
 	if err != nil {
 		h.writeStoreErr(w, r, "ListFilingRequirements: store unavailable", err)
 		return
@@ -1257,6 +1936,15 @@ func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request)
 
 	if results == nil {
 		results = []*domain.FilingRequirement{}
+	}
+	if len(results) == limit {
+		last := results[len(results)-1]
+		next := encodeCursor(last.CreatedAt, last.FilingRequirementID)
+		nq := r.URL.Query()
+		nq.Set("cursor", next)
+		nq.Del("offset")
+		w.Header().Set("X-Next-Cursor", next)
+		w.Header().Set("Link", "<"+r.URL.Path+"?"+nq.Encode()+`>; rel="next"`)
 	}
 	writeJSON(w, r, http.StatusOK, results)
 }

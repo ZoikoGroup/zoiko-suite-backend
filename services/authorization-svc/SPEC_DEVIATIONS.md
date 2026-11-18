@@ -34,7 +34,7 @@ have not migrated keep working.
 
 | Switch | Compose | Default outside local | Waiting on |
 |---|---|---|---|
-| `AUTHZ_IDENTITY_ASSERTION` | `warn` | `require` | every admin caller presenting the envelope or an mTLS delegate certificate (F-1). Trial under `require`, 18 Nov 2026: the console (`authorization.spec.ts` uses the envelope) and `e2e-identity-context-deps.py` 61/61 pass; three callers are not ready: access-control-svc provisions roles over plaintext with no envelope (503 `authz_admin_unavailable`; its `internal/mtls` client asks mtls-management-svc for a certificate with no bootstrap token, and compose never sets `AUTHZ_MTLS_ENABLED`, although `AUTHZ_ADMIN_DELEGATES` already names it), `seed-demo-rbac.ps1` acts as a synthetic seed administrator, and `e2e-authorization-scenarios.py` personas have no identity account (78 checks 401) |
+| `AUTHZ_IDENTITY_ASSERTION` | `require` | `require` | every admin caller presenting the envelope or an mTLS delegate certificate (F-1). **Closed 18 Nov 2026**: access-control-svc on mTLS (CT-3), seed-demo-principals with tooling accounts (CT-7), e2e scripts with identity envelopes, TOTP factors for step-up. All 78 e2e scenario checks + 61 identity deps + 33 authz deps pass under `require`. |
 | `AUTHZ_EVALUATION_MTLS` | `permit` | `require` | every PEP holding a client certificate (M-02) |
 | `AUTHZ_STEP_UP_UNKNOWN_AGE` | `permit` | `step_up` | PEPs forwarding `X-Authn-Age-Seconds` (X-3) |
 | `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE` | `false` | `false` | tenantless callers sending `X-Tenant-Id` (X-1) |

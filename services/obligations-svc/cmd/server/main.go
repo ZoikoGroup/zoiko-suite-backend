@@ -32,6 +32,7 @@ import (
 	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/obligations-svc/internal/authz"
+	"zoiko.io/obligations-svc/internal/clock"
 	"zoiko.io/obligations-svc/internal/config"
 	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
 	"zoiko.io/obligations-svc/internal/evidencereq"
@@ -165,6 +166,22 @@ func main() {
 	overdueCtx, overdueCancel := context.WithCancel(context.Background())
 	defer overdueCancel()
 	go runOverdueScheduler(overdueCtx, pgStore, log)
+
+	// ── 4d. Clock sweep worker (WF-3 / WFC-05) ──────────────────────────────
+	// Evaluates all ACTIVE clocks against their computed deadlines and transitions
+	// them through states: PLANNED → ACTIVE → DUE_SOON → DUE → OVERDUE.
+	// Also handles calendar corrections (jurisdiction-rules feed drift) by
+	// superseding clocks whose calendar rule has changed.
+	clockCtx, clockCancel := context.WithCancel(context.Background())
+	defer clockCancel()
+	clockWorker := clock.NewWorker(clock.WorkerConfig{
+		SweepInterval:         1 * time.Minute,
+		JurisdictionValidator: jurisdictionValidator,
+		Store:                 pgStore,
+		Log:                   log,
+	})
+	clockWorker.Start(clockCtx)
+	defer clockWorker.Stop()
 
 	// ── 4c. Identity gate and legal-entity registry ──────────────────────────
 	// X-Principal-Id / X-Tenant-Id were read exactly as sent, and host port

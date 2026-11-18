@@ -427,6 +427,45 @@ def evidence_manifest():
     elif check("evidence-manifest: the manifest is verified with its owner — SATISFIED", s == 200 and b.get("outcome") == "SATISFIED", f"HTTP {s} {brief(b)}"):
         published[b["evaluation_id"]] = "SATISFIED"
 
+    # ── PBC authorization checks (ER-W6) ──────────────────────────────────────
+    # These test that PBC requests are properly authorized at the request's entity
+    due = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    s, hd, req = call("POST", f"{EVIDENCE}/v1/pbc/requests", envelope(write=True), {
+        "legal_entity_id": ENTITY, "title": f"e2e-pbc-authz-{STAMP}", "description": "authorization check",
+        "assigned_to_principal_id": APPROVER, "due_at": due, "correlation_id": "e2e-pbc-authz-" + STAMP})
+    rid = req.get("request_id")
+    if check("PBC: request created (201)", s == 201 and rid, f"HTTP {s} {brief(req) if s != 201 else ''}"):
+        etag = hd.get("ETag")
+        # Test outsider (different tenant) - should get 403 on GET/view/notes/acknowledge
+        s, _, b = call("GET", f"{EVIDENCE}/v1/pbc/requests/{rid}", envelope(principal=ADMIN, tenant=OTHER_TENANT))
+        check("PBC authorization: outsider 403 on GET", s == 403, f"HTTP {s} {code(b)}")
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/requests/{rid}/view", envelope(principal=ADMIN, tenant=OTHER_TENANT, write=True), {})
+        check("PBC authorization: outsider 403 on view", s == 403, f"HTTP {s} {code(b)}")
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/requests/{rid}/notes", envelope(principal=ADMIN, tenant=OTHER_TENANT, write=True), {"note": "test"})
+        check("PBC authorization: outsider 403 on notes", s == 403, f"HTTP {s} {code(b)}")
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/responses/{rid}/acknowledge", envelope(principal=ADMIN, tenant=OTHER_TENANT, write=True), {"response_id": "fake"})
+        check("PBC authorization: outsider 403 on acknowledge", s == 403, f"HTTP {s} {code(b)}")
+        # Test assignee - should be able to GET and view
+        s, _, b = call("GET", f"{EVIDENCE}/v1/pbc/requests/{rid}", envelope(principal=APPROVER))
+        check("PBC authorization: assignee GET", s == 200, f"HTTP {s}")
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/requests/{rid}/view", envelope(principal=APPROVER, write=True), {})
+        check("PBC authorization: assignee view", s == 200, f"HTTP {s}")
+        # Test AUDIT_ONLY by assignee - should get 403
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/requests/{rid}/notes", envelope(principal=APPROVER, write=True), {"note": "test"})
+        check("PBC authorization: AUDIT_ONLY by assignee 403", s == 403, f"HTTP {s} {code(b)}")
+        # Test AUDIT_ONLY by manager (ADMIN) - should get 201
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/requests/{rid}/notes", envelope(principal=ADMIN, write=True), {"note": "manager note"})
+        check("PBC authorization: AUDIT_ONLY by manager 201", s == 201, f"HTTP {s} {code(b)}")
+        # Test outsider view leaves ETag unchanged
+        s, hd_before, _ = call("GET", f"{EVIDENCE}/v1/pbc/requests/{rid}", envelope(principal=ADMIN))
+        etag_before = hd_before.get("ETag")
+        s, _, b = call("POST", f"{EVIDENCE}/v1/pbc/requests/{rid}/view", envelope(principal=ADMIN, tenant=OTHER_TENANT, write=True), {})
+        s, hd_after, _ = call("GET", f"{EVIDENCE}/v1/pbc/requests/{rid}", envelope(principal=ADMIN))
+        etag_after = hd_after.get("ETag")
+        check("PBC authorization: outsider view leaves ETag unchanged", etag_before == etag_after, f"before={etag_before} after={etag_after}")
+        # Cleanup
+        call("POST", f"{EVIDENCE}/v1/pbc/requests/{rid}/close", envelope(principal=ADMIN, write=True, if_match=etag), {})
+
 
 # ── 8. esignature-integration-svc ─────────────────────────────────────────────
 
@@ -446,6 +485,14 @@ def esignature():
         skip("esignature: a real envelope counts / an unknown one is MISSING",
              "esignature-integration-svc runs in the phase7 stack (its own postgres-p7/kafka-p7 network), not up beside this stack (BLOCKED)")
 
+# ── 8b. schema-registry-svc ───────────────────────────────────────────────────
+
+def schema_registry():
+    # Check that the evidence-requirements event schemas are registered
+    s, _, b = call("GET", f"{H}:8093/v1/schemas/evidence.requirement.satisfied/versions", envelope())
+    check("schema-registry: evidence.requirement.satisfied schema registered", s == 200 and isinstance(b.get("versions"), list) and len(b.get("versions", [])) > 0, f"HTTP {s} {brief(b)}")
+    s, _, b = call("GET", f"{H}:8093/v1/schemas/evidence.requirement.missing/versions", envelope())
+    check("schema-registry: evidence.requirement.missing schema registered", s == 200 and isinstance(b.get("versions"), list) and len(b.get("versions", [])) > 0, f"HTTP {s} {brief(b)}")
 
 # ── 9. Kafka ──────────────────────────────────────────────────────────────────
 
@@ -604,6 +651,7 @@ def main():
     document_vault(a.with_outage)
     evidence_manifest()
     esignature()
+    schema_registry()
     authorization(a.subject)
     pbc(a.subject)
     lists()

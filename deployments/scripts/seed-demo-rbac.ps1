@@ -123,6 +123,13 @@ $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 # below and the verification loop at the bottom.
 $PLATFORM_SCOPE = "00000000-0000-0000-0000-00000000f001"
 
+# Identity context service URL for getting envelopes.
+$IDENTITY_URL = "http://localhost:8080"
+
+# Cache for identity envelopes (actor -> @{ token; expires }). TTL ≤ 4 min.
+$EnvelopeCache = @{}
+$EnvelopeCacheTTL = 240  # seconds
+
 # One bundle per service, so a service's grants can be read off in one place and
 # a newly wired service is one entry rather than an edit in four places.
 #
@@ -168,7 +175,8 @@ $BUNDLES = @(
         Actions = @("EVIDENCE_EVALUATE", "EVIDENCE_REQUIREMENT_READ", "EVIDENCE_EVALUATION_READ",
                     "EVIDENCE_REQUIREMENT_CREATE", "EVIDENCE_REQUIREMENT_RETIRE",
                     "EVIDENCE_REQUEST_CREATE", "EVIDENCE_REQUEST_MANAGE",
-                    "EVIDENCE_REQUEST_SUBMIT_RESPONSE", "EVIDENCE_REQUEST_EVALUATE")
+                    "EVIDENCE_REQUEST_SUBMIT_RESPONSE", "EVIDENCE_REQUEST_EVALUATE",
+                    "EVIDENCE_MANIFEST_READ")
     },
     @{
         # accounts-payable-svc gates each lifecycle hop on its own action, so
@@ -1075,11 +1083,81 @@ if ($PSCmdlet.ParameterSetName -eq "Gateway") {
 # Non-writes (/v1/authorize probes) omit Idempotency-Key: the service classifies
 # that path as non-material, so it requires no idempotency key and the probe stays
 # representative of a real read-path call.
+function Get-Envelope {
+    param(
+        [Parameter(Mandatory)] [string] $Actor,
+        [Parameter(Mandatory)] [string] $Email,
+        [Parameter(Mandatory)] [string] $Password
+    )
+    # Check cache first.
+    if ($EnvelopeCache.ContainsKey($Actor)) {
+        $cached = $EnvelopeCache[$Actor]
+        if ((Get-Date) -lt $cached.expires) {
+            return $cached.token
+        }
+    }
+
+    # Authenticate with identity-context-svc.
+    $authBody = @{
+        client_id     = "zoiko-console"
+        client_secret = "local-dev-console-client-secret"
+        username      = $Email
+        password      = $Password
+    } | ConvertTo-Json -Compress
+
+    try {
+        $authResp = Invoke-WebRequest -Uri "$IDENTITY_URL/v1/authenticate" -Method POST `
+            -ContentType "application/json" -Body $authBody -UseBasicParsing -TimeoutSec 10
+        $authResult = $authResp.Content | ConvertFrom-Json
+        $accessToken = $authResult.access_token
+    } catch {
+        Write-Warning "Failed to authenticate $Email with identity-context-svc: $_"
+        Write-Warning "Falling back to headers-only mode (works under warn)"
+        return $null
+    }
+
+    # Resolve context for the demo legal entity.
+    $resolveBody = @{
+        entity_id = "22222222-2222-2222-2222-222222222222"
+    } | ConvertTo-Json -Compress
+
+    try {
+        $resolveResp = Invoke-WebRequest -Uri "$IDENTITY_URL/v1/context/resolve" -Method POST `
+            -ContentType "application/json" -Body $resolveBody `
+            -Headers @{ "Authorization" = "Bearer $accessToken" } `
+            -UseBasicParsing -TimeoutSec 10
+        $resolveResult = $resolveResp.Content | ConvertFrom-Json
+        $identityToken = $resolveResult.identity_token
+    } catch {
+        Write-Warning "Failed to resolve context for $Email: $_"
+        Write-Warning "Falling back to headers-only mode (works under warn)"
+        return $null
+    }
+
+    # Cache the envelope.
+    $EnvelopeCache[$Actor] = @{
+        token   = $identityToken
+        expires = (Get-Date).AddSeconds($EnvelopeCacheTTL)
+    }
+
+    return $identityToken
+}
+
 function New-AuthzEnvelope {
     param(
         [Parameter(Mandatory)] [string] $Path,
         [string] $Actor = $PRINCIPAL_ID
     )
+
+    # Map actor to their credentials for envelope retrieval.
+    $envelope = $null
+    switch ($Actor) {
+        $PRINCIPAL_ID    { $envelope = Get-Envelope -Actor $Actor -Email "admin@zoikosuite.com"    -Password "Zoiko@Governance1" }
+        $APPROVER_ID     { $envelope = Get-Envelope -Actor $Actor -Email "legal.counsel@zoikosuite.com" -Password "Zoiko@Legal2026!" }
+        $SEED_ADMIN_ID   { $envelope = Get-Envelope -Actor $Actor -Email "seed.admin@zoiko.local"   -Password "Seed@Admin2026!" }
+        default          { $envelope = $null }
+    }
+
     $headers = @{
         "X-Tenant-Id"       = $TENANT_ID
         "X-Principal-Id"    = $Actor
@@ -1089,6 +1167,11 @@ function New-AuthzEnvelope {
         "X-Source-System"   = "console-seed"
         "X-Source-Channel"  = "api"
     }
+
+    if ($envelope) {
+        $headers["Authorization"] = "Bearer $envelope"
+    }
+
     if ($Path -ne "/v1/authorize") {
         $headers["Idempotency-Key"] = [guid]::NewGuid().ToString()
         $headers["X-Occurred-At"]   = [DateTime]::UtcNow.ToString("o")

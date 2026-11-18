@@ -380,3 +380,185 @@ var ErrEscalationRecordNotFound = errorString("escalation_record not found")
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// =============================================================================
+// WF-3: Deadline Clocks (WFC-05)
+// =============================================================================
+// A "clock" is a computed deadline with calendar provenance, attached to an
+// obligation. An obligation may have multiple clocks (e.g. a HARD_LEGAL clock
+// for the statutory filing deadline, and a SOFT_INTERNAL clock for the team's
+// internal review). Clocks are evaluated by a background worker that sweeps
+// them against their computed deadlines and transitions through states.
+//
+// Clock classes (data, not code): HARD_LEGAL, SOFT_INTERNAL, ADVISORY, etc.
+// States: PLANNED → ACTIVE → DUE_SOON → DUE → OVERDUE → (FULFILLED | WAIVED | NOT_APPLICABLE | SUPERSEDED)
+// FULFILLED/WAIVED/NOT_APPLICABLE/SUPERSEDED are terminal. Only ACTIVE clocks
+// are evaluated by the sweep.
+//
+// Calendar provenance: each clock's deadline is computed from a jurisdiction-
+// rules business calendar (D2-1.F08). The calendar code and rule version are
+// stored so a consumer can reproduce the deadline.
+
+// ClockClass is a tag identifying the clock's regime. Data only — no code switch.
+type ClockClass string
+
+const (
+	ClockClassHardLegal     ClockClass = "HARD_LEGAL"     // statutory/regulatory deadline, fail-closed on miss
+	ClockClassSoftInternal  ClockClass = "SOFT_INTERNAL"  // internal review deadline, warning only
+	ClockClassAdvisory      ClockClass = "ADVISORY"       // no enforcement, informational
+	ClockClassExtension     ClockClass = "EXTENSION"      // granted extension period
+)
+
+// ClockState is the state of a clock. This IS a state machine.
+type ClockState string
+
+const (
+	ClockStatePlanned         ClockState = "PLANNED"          // created, deadline not yet active
+	ClockStateActive          ClockState = "ACTIVE"           // deadline active, being tracked
+	ClockStateDueSoon         ClockState = "DUE_SOON"         // within warning window (DUE_SOON threshold)
+	ClockStateDue             ClockState = "DUE"              // deadline day reached
+	ClockStateOverdue         ClockState = "OVERDUE"          // deadline passed without satisfaction
+	ClockStateFulfilled       ClockState = "FULFILLED"        // satisfied with evidence (terminal)
+	ClockStateWaived          ClockState = "WAIVED"           // waived with authority + evidence (terminal)
+	ClockStateNotApplicable   ClockState = "NOT_APPLICABLE"   // N-A with authority (terminal)
+	ClockStateSuperseded      ClockState = "SUPERSEDED"       // superseded by calendar correction (terminal)
+)
+
+// ClockStatuses is the set of valid clock states for validation.
+var ClockStatuses = map[ClockState]bool{
+	ClockStatePlanned: true, ClockStateActive: true, ClockStateDueSoon: true,
+	ClockStateDue: true, ClockStateOverdue: true, ClockStateFulfilled: true,
+	ClockStateWaived: true, ClockStateNotApplicable: true, ClockStateSuperseded: true,
+}
+
+// Clock represents a computed deadline clock attached to an obligation.
+type Clock struct {
+	ClockID              string     `json:"clock_id"`
+	ObligationID         string     `json:"obligation_id"`
+	TenantID             string     `json:"tenant_id"`
+	LegalEntityID        string     `json:"legal_entity_id"`
+
+	ClockClass           ClockClass `json:"clock_class"`
+	ClockState           ClockState `json:"clock_state"`
+
+	// Deadline computation
+	CalendarCode         string     `json:"calendar_code"`          // jurisdiction-rules calendar code
+	CalendarRuleID       string     `json:"calendar_rule_id"`       // jurisdiction-rules rule that produced this deadline
+	CalendarRuleVersion  int        `json:"calendar_rule_version"`  // version of the rule at computation time
+	ComputedDeadline     time.Time  `json:"computed_deadline"`      // the actual deadline timestamp
+	DueSoonThreshold     time.Duration `json:"due_soon_threshold"`  // warning window before deadline (e.g. 7d)
+
+	// Escalation
+	EscalationLadder     []EscalationStep `json:"escalation_ladder"` // ordered steps when overdue
+
+	// Satisfaction / Waiver / N-A
+	SatisfiedAt          *time.Time `json:"satisfied_at,omitempty"`
+	SatisfiedByPrincipal *string    `json:"satisfied_by_principal,omitempty"`
+	SatisfiedEvidenceIDs []string   `json:"satisfied_evidence_ids,omitempty"` // evaluation IDs
+	WaivedAt             *time.Time `json:"waived_at,omitempty"`
+	WaivedByPrincipal    *string    `json:"waived_by_principal,omitempty"`
+	WaivedReason         *string    `json:"waived_reason,omitempty"`
+	WaivedEvidenceIDs    []string   `json:"waived_evidence_ids,omitempty"`
+	NotApplicableAt      *time.Time `json:"not_applicable_at,omitempty"`
+	NotApplicableByPrincipal *string `json:"not_applicable_by_principal,omitempty"`
+	NotApplicableReason  *string    `json:"not_applicable_reason,omitempty"`
+	SupersededAt         *time.Time `json:"superseded_at,omitempty"`
+	SupersededByClockID  *string    `json:"superseded_by_clock_id,omitempty"`
+
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	Version              int       `json:"version"` // optimistic lock for clock transitions
+}
+
+// EscalationStep is one rung of an escalation ladder.
+type EscalationStep struct {
+	StepOrder       int           `json:"step_order"`        // 1-based
+	AfterOverdueBy  time.Duration `json:"after_overdue_by"`  // e.g. 24h, 72h
+	EscalatedToRole string        `json:"escalated_to_role"` // role code to notify/assign
+	ActionType      string        `json:"action_type"`       // NOTIFY, REASSIGN, INVALIDATE
+}
+
+// CreateClockParams holds input for creating a clock on an obligation.
+type CreateClockParams struct {
+	ObligationID         string
+	ClockClass           ClockClass
+	CalendarCode         string
+	CalendarRuleID       string
+	CalendarRuleVersion  int
+	ComputedDeadline     time.Time
+	DueSoonThreshold     time.Duration
+	EscalationLadder     []EscalationStep
+	CreatedByPrincipalID string
+	CorrelationID        string
+}
+
+// ListClocksFilter holds optional filters for querying clocks.
+type ListClocksFilter struct {
+	TenantID       string
+	LegalEntityID  string
+	ObligationID   string
+	ClockClass     ClockClass
+	ClockState     ClockState
+	Limit          int
+	Offset         int
+	AfterCreatedAt *time.Time
+	AfterID        string
+}
+
+// ListFilingRequirementsFilter holds optional filters for querying filing requirements.
+type ListFilingRequirementsFilter struct {
+	ObligationID string
+	Limit        int
+	Offset       int
+	AfterCreatedAt *time.Time
+	AfterID      string
+}
+
+// ClockTransitionParams holds input for transitioning a clock.
+type ClockTransitionParams struct {
+	ClockID              string
+	NewState             ClockState
+	ExpectedVersion      int
+	ActorPrincipalID     string
+	CorrelationID        string
+	// For FULFILLED:
+	EvidenceEvaluationIDs []string
+	// For WAIVED:
+	Reason          *string
+	AuthorityPrincipalID *string
+	// For NOT_APPLICABLE:
+	NotApplicableReason *string
+	NotApplicableAuthorityPrincipalID *string
+	// For SUPERSEDED:
+	SupersededByClockID *string
+}
+
+// ErrClockNotFound is returned when a clock_id does not exist.
+var ErrClockNotFound = errorString("clock not found")
+
+// ErrInvalidClockTransition is returned when a clock_state transition is illegal.
+var ErrInvalidClockTransition = errorString("invalid clock state transition")
+
+// ErrClockVersionMismatch is returned when an optimistic locking check fails on a clock.
+var ErrClockVersionMismatch = errorString("clock version mismatch: the clock has been modified by another request")
+
+// ErrWaiverAuthorityRequired is returned when a waiver lacks required authority.
+var ErrWaiverAuthorityRequired = errorString("waiver requires authority principal")
+
+// ErrNotApplicableAuthorityRequired is returned when N-A lacks required authority.
+var ErrNotApplicableAuthorityRequired = errorString("not applicable requires authority principal")
+
+// ClockStateTransitions defines the legal state transitions for a clock.
+// From -> allowed To states.
+var ClockStateTransitions = map[ClockState][]ClockState{
+	ClockStatePlanned:       {ClockStateActive, ClockStateSuperseded},
+	ClockStateActive:        {ClockStateDueSoon, ClockStateDue, ClockStateFulfilled, ClockStateWaived, ClockStateNotApplicable, ClockStateSuperseded},
+	ClockStateDueSoon:       {ClockStateDue, ClockStateFulfilled, ClockStateWaived, ClockStateNotApplicable, ClockStateSuperseded},
+	ClockStateDue:           {ClockStateOverdue, ClockStateFulfilled, ClockStateWaived, ClockStateNotApplicable, ClockStateSuperseded},
+	ClockStateOverdue:       {ClockStateFulfilled, ClockStateWaived, ClockStateNotApplicable, ClockStateSuperseded},
+	// Terminal states: no transitions out
+	ClockStateFulfilled:     {},
+	ClockStateWaived:        {},
+	ClockStateNotApplicable: {},
+	ClockStateSuperseded:    {},
+}

@@ -340,7 +340,7 @@ services:
     command:
       - |
         set -e
-        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc governance-decision-log-svc policy-svc workflow-svc contract-lifecycle-svc decision-support-svc evidence-manifest-svc; do
+        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc governance-decision-log-svc policy-svc workflow-svc contract-lifecycle-svc decision-support-svc evidence-manifest-svc access-control-svc; do
           mkdir -p "/bootstrap/$$svc"
           if [ ! -f "/bootstrap/$$svc/token" ]; then
             head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "/bootstrap/$$svc/token"
@@ -1705,7 +1705,7 @@ services:
       # service's mTLS off; production points at
       # https://identity-context-svc:8449/.well-known/jwks.json, which
       # allow-lists authorization-svc and is fetched with its own certificate.
-      AUTHZ_IDENTITY_ASSERTION: "warn"
+      AUTHZ_IDENTITY_ASSERTION: "${AUTHZ_IDENTITY_ASSERTION:-require}"
       AUTHZ_IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
       # AU-01: every verified envelope's session is checked here (live answers
       # reused for 5 s), so a logout stops the admin routes at once instead of
@@ -1831,6 +1831,8 @@ services:
         condition: service_healthy
       document-vault-svc:
         condition: service_healthy
+      clamav:
+        condition: service_healthy
       tenant-svc:
         condition: service_healthy
       # The compose service key is governance-svc (container
@@ -1903,6 +1905,25 @@ services:
     entrypoint: ["/bin/sh", "-c", "chown -R 65532:65532 /data/documents"]
     restart: "no"
 
+  # ── ClamAV for document-vault-svc virus scanning ──────────────────────────────
+  # Runs under "scan" profile; document-vault-svc refuses uploads without it.
+  clamav:
+    image: clamav/clamav:1.4.1
+    container_name: zoiko-clamav
+    mem_limit: 1g
+    cpus: "1.0"
+    command: ["clamd", "--foreground=true"]
+    profiles: ["scan"]
+    volumes:
+      - clamav_db:/var/lib/clamav
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
   # ── Phase 2: Document Vault Service (Port: 8094) ─────────────────────────────
   # Stores critical documents with version lineage, access lineage, integrity
   # controls (SHA-256, verified on every read), retention, and jurisdiction-
@@ -1924,8 +1945,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: document_vault
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_DOCUMENT_VAULT:-app_document_vault}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       STORAGE_DIR: "/data/documents"
       # Throwaway local-dev key — never used in staging/production, same
@@ -1944,6 +1965,8 @@ services:
       # Message both carrying a Topic), the transactional outbox had never
       # actually delivered a single event to Kafka.
       KAFKA_BROKERS: "kafka:9094"
+      # ClamAV for virus scanning — required for uploads (fails closed if unavailable)
+      CLAMAV_URL: "clamav:3310"
     volumes:
       - document_vault_storage:/data/documents
     depends_on:
@@ -1953,6 +1976,8 @@ services:
         condition: service_healthy
       document-vault-storage-init:
         condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
       # dead database pool reads as healthy while every read returns 500.
@@ -3014,12 +3039,33 @@ services:
       # EVENT_TRIGGERED review of the linked subject, reviewed by their manager
       # when linked, else by this principal. Unset turns the consumer off.
       ACS_EVENT_REVIEW_DEFAULT_REVIEWER: "5eed0000-0000-4000-8000-00000000a001"
+      # mTLS for authorization-svc calls (CT-3): present this service's
+      # certificate as a registered delegate (AUTHZ_ADMIN_DELEGATES in
+      # authorization-svc already includes access-control-svc).
+      AUTHZ_MTLS_ENABLED: "true"
+      AUTHZ_MTLS_URL: "https://authorization-svc:8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory access-control-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to access-control-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: access-control-svc
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
+      mtls-management-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8137/healthz"]
@@ -3224,6 +3270,8 @@ services:
       authorization-svc:
         condition: service_healthy
       document-vault-svc:
+        condition: service_healthy
+      clamav:
         condition: service_healthy
       tenant-svc:
         condition: service_healthy
@@ -3446,6 +3494,8 @@ services:
       accounts-receivable-svc:
         condition: service_healthy
       document-vault-svc:
+        condition: service_healthy
+      clamav:
         condition: service_healthy
       asset-management-svc:
         condition: service_healthy
@@ -5503,6 +5553,8 @@ services:
         condition: service_healthy
       document-vault-svc:
         condition: service_healthy
+      clamav:
+        condition: service_healthy
       tax-determination-svc:
         condition: service_healthy
       policy-svc:
@@ -5915,3 +5967,4 @@ volumes:
   mtls_bootstrap_token:
   gateway_admin_token:
   traefik-certs:
+  clamav_db:

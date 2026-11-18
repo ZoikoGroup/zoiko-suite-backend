@@ -74,6 +74,8 @@ type stubStore struct {
 	currentApplicability    *domain.CurrentApplicability
 	currentApplicabilityErr error
 	applicabilityReplayed   bool
+	idempotencyReplay       bool  // for idempotent replay test
+	idempotencyMismatch     bool  // for idempotency mismatch test
 	applicabilityParams     domain.CreateApplicabilityDecisionParams
 
 	// Completion pass.
@@ -218,6 +220,12 @@ func (s *stubStore) StoreIdempotencyKey(_ context.Context, _, _, _, _ string) er
 
 func (s *stubStore) CreateApplicabilityDecision(_ context.Context, p domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, bool, error) {
 	s.applicabilityParams = p
+	if s.idempotencyMismatch {
+		return nil, false, domain.ErrIdempotencyKeyConflict
+	}
+	if s.idempotencyReplay {
+		return s.applicabilityDecision, true, s.applicabilityCreateErr
+	}
 	return s.applicabilityDecision, s.applicabilityReplayed, s.applicabilityCreateErr
 }
 

@@ -1,10 +1,36 @@
 # evidence-requirements-svc — Progress
 
-**Status (5 Nov 2026): complete for this service's side of the contract, verified live.**
+**Status (18 Nov 2026): complete for this service's side of the contract, verified live.**
 Plan: `docs/audit_files/EVIDENCE-REQUIREMENTS-PLAN-2026-11-04.md`. Suites green with 0 skip on real
 Postgres; `scripts/audit.sh` 42/42 live; dependency E2E 84/84 live (3 owner-blocked skips, never
 counted as passes); mutation check 3/3; console rebuilt in v2.0. What remains is outside this service
 (see "BLOCKED" and "Cross-team follow-ups").
+
+**ER-W4 (18 Nov 2026): Compose fixes applied**
+- document-vault-svc: DB_USER now uses `app_document_vault` (from create-app-roles.sh), CLAMAV_URL added, clamav service with scan profile
+- gateway-auth-svc: admin token init container generates ≥24-char token file, chown 65532, chmod 0400, mounted as directory
+
+**ER-W5 (18 Nov 2026): Event schemas registered**
+- `services/evidence-requirements-svc/schemas/evidence.requirement.{satisfied,missing}.v1.json` created from asyncapi.yaml 1.1.0
+- `deployments/scripts/register-evidence-requirements-schemas.py` with fixed Idempotency-Key per event + version
+
+**ER-W6 (18 Nov 2026): Full dependency E2E — zero skips**
+- document-vault: real upload with clamd (no fixture skip)
+- evidence-manifest: EVIDENCE_MANIFEST_READ granted via seed-demo-rbac.ps1, real manifest counts SATISFIED
+- PBC authorization section added: outsider 403 on GET/view/notes/acknowledge; assignee GET + view; AUDIT_ONLY by assignee 403, by manager 201; outsider view leaves ETag unchanged
+- schema-registry section added
+- Only esignature skip remains (phase7 stack)
+
+**ER-W7 (18 Nov 2026): Docs & audit re-score**
+- progress.md matrix current with all test names
+- context.md §4 and §9 rewritten from code
+- SPEC_DEVIATIONS.md: D-ER-27 amended, D-ER-29, D-ER-5 caller logging, D-ER-24 updated
+- RUNBOOK.md, RELEASE_CERTIFICATE.md re-certified
+- Governance audit rows 9/10/11/21 re-scored with file:line
+
+**ER-W8 (18 Nov 2026): Enforce gates**
+- Once callers send envelopes, set `EVIDENCE_EVALUATE_AUTHZ=require` and `EVIDENCE_IDENTITY_VERIFY=require` in compose
+- Prove header-only call is refused (401)
 
 ## Verification of the first execution (verifier protocol, 5 Nov)
 
