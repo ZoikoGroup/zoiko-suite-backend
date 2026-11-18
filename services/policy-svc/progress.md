@@ -1,5 +1,25 @@
 # Policy Service — Progress & Phase Plan
 
+## Completion pass — 18 November 2026 (current status; supersedes the sections below)
+
+Release evidence: `RELEASE_CERTIFICATE.md`. Live audit: `scripts/audit.sh` 48/0.
+
+| Row | Status | Evidence |
+|---|---|---|
+| POL-3 / F07 identity | **enforce** (compose default) | `e2e-policy-deps.py` 112/112 under enforce; caller wire probe 6/6; callers' fail-closed unit tests |
+| F14 console + UI E2E | built | frontend `app/admin/policies` lifecycle, certification, compare, attestations, re-drive; `policies.spec.ts` 12/12 |
+| EST-7 named operations | built | 47 `x-spec-operation` tags; `TestOpenAPI_NamedSpecOperationsAreTagged` (mutation-checked) |
+| Consumed events | tested | `internal/consumer/handler_test.go` (topics match the producers' defaults) |
+| Suites | 289 pass (265 top-level), 0 fail, 0 skip | store suite on Postgres 16 as NOSUPERUSER NOBYPASSRLS |
+
+Found and fixed: the console activated with no `expected_version` (428) and had no review or
+certification path; under enforce the console's version drafts were 401 (the API client dropped
+the envelope); the e2e harness sent bare headers.
+
+Open, owned elsewhere: accounting-policy console (REF-07, next task) · EST-9 template grants ·
+evaluate 404/409/501 → 200 (callers) · float/currency callers · P-07 (decision-log D-06) · WF-6
+(workflow-svc) · ACTIVE tie-break sign-off · PDC-01 authority sources · production keys and grants.
+
 ## P-01 closed — 17 November 2026
 
 | Row | Status | Evidence |

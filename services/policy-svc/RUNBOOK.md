@@ -22,7 +22,7 @@ PDC-05 certification.
 |---|---|---|
 | `AUTHZ_SERVICE_URL`, `AUTHZ_PLATFORM_SCOPE_ID` | — | authorization-svc, and the legal entity presented for unscoped decisions |
 | `POLICY_EVALUATE_AUTHZ`, `POLICY_READ_AUTHZ` | enforce | `warn` only during a caller migration |
-| `POLICY_IDENTITY_VERIFY` | enforce | compose runs `warn` until EST-1 |
+| `POLICY_IDENTITY_VERIFY` | enforce | compose runs `enforce` since 18 Nov 2026 (POL-3); `warn` only while a caller is migrated to forward the envelope |
 | `POLICY_CERTIFICATION_GATE` | enforce | PDC-05 activation gate; `warn`/`off` only during migrations |
 | `POLICY_LEDGER_PRINCIPAL_ID` | — | the ledger writer (`svc-policy`); needs `GOVERNANCE_DECISION_RECORD` |
 | `GOVERNANCE_DECISION_LOG_MTLS_URL` | — | relay over mTLS (recommended) |
@@ -107,6 +107,12 @@ cache never needs a manual flush.
 
 - Unit and DB suites, against a scratch Postgres with a NOSUPERUSER NOBYPASSRLS role and 0 skips:
   `REQUIRE_DB_TESTS=1 TEST_DATABASE_URL=… go test -p 1 ./...` (see `progress.md` for counts).
-- Contract: `TestOpenAPI_MatchesTheRouter`, `TestAsyncAPI_MatchesTheCode`,
-  `TestR5_EveryCheckedActionIsRegistered`, `TestMigrations_NumberedOnceWithDownFiles`.
-- Live: `python deployments/scripts/e2e-policy-deps.py`.
+- Contract: `TestOpenAPI_MatchesTheRouter`, `TestOpenAPI_NamedSpecOperationsAreTagged`,
+  `TestAsyncAPI_MatchesTheCode`, `TestR5_EveryCheckedActionIsRegistered`,
+  `TestMigrations_NumberedOnceWithDownFiles`.
+- Live: `python deployments/scripts/e2e-policy-deps.py` (signs in as the demo admin and legal
+  counsel, so it runs under `POLICY_IDENTITY_VERIFY=enforce`).
+- Audit: `PY=<python> bash services/policy-svc/scripts/audit.sh` (static, suites on a scratch
+  database it creates and drops, identity, contract, negative paths, telemetry, RLS, E2E;
+  `SKIP_SUITES=1` / `SKIP_E2E=1` skip the slow sections). Evidence of the last pass:
+  `RELEASE_CERTIFICATE.md`.

@@ -80,7 +80,7 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D1-13 | key-management-svc :8143 | 🟡 | 11 | 0 | 1 | 0 | 0 | 9 | 1 | 0 | ✔ · ✔ · ✔ 3 pkgs | none (phase6 compose only) | shared, dead-wired · 5/5 | KM-0 |
 | D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 0 | 2 | 0 | 25 | 0 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs | S0–S6 by the implementer (S5 16 Nov: every console command driven live, harness 146/146, UI e2e 9/9) | v2.0 · 143/148 (FE `65b5121`) | VC-1; cross-team gaps |
 | D2-2 | governance-decision-log-svc :8083 | ✅ | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 9 pkgs (+ store IT) | S0–S6 verified 11 Nov (9 rows with independence waived by the user); 🏁 after the commit (verifier step 1) | v2.0 · 14/14 | Commit (R3) |
-| D2-3 | policy-svc :8085 | 🟡 | 14 | 0 | 7 | 2 | 1 | 3 | 0 | 1 | ✔ · ✔ · ✔ 12 pkgs | none | legacy · 7/39 | POL-0 |
+| D2-3 | policy-svc :8085 | 🟡 | 14 | 10 | 0 | 1 | 3 | 0 | 0 | 1 | ✔ · ✔ · ✔ 16 pkgs (18 Nov: 289 pass, 0 fail, 0 skip) | progress 18 Nov · RELEASE_CERTIFICATE | v2.0 · lifecycle + certification | POL-FE-4 (accounting) |
 | D2-4 | obligations-svc :8088 | 🟡 | 14 | 0 | 4 | 5 | 2 | 3 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | none | legacy · 7/24 | OB-0 |
 | D2-5 | authorization-svc :8089 | 🟡 | 23 | 0 | 13 | 4 | 1 | 4 | 0 | 1 | ✔ · ✔ · ✔ 14 pkgs | S0–S6 verified 2 Nov (main merged since); reconfirm | v2.0 · 64/80 | AZ-3 |
 | D2-6 | workflow-svc :8090 | 🟡 | 23 | 0 | 8 | 7 | 2 | 4 | 1 | 1 | ✔ · ✔ · ✔ 17 pkgs (3 re-run after an App Control block) | none | legacy · 19/76 | WF-0 |
@@ -944,35 +944,35 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 |---|---|
 | Spec | Doc 03 §8.1; GOV-05; ZS-SVC-V-001; REF-07 |
 | Latest score | 54 met / 2 partial / 0 failed of 56 (96.4%, 98.2% weighted) |
-| New since the audit | `openapi.yaml` + parity test (28 Oct); REF-2 waves 1–2 (`b1761456`, `196d2a71`, 07Yashjais). REF-2 not audited |
-| Stages | `progress.md` last updated 14 Oct |
-| Console | `/admin/policies` legacy |
+| New since the audit | `openapi.yaml` + parity test (28 Oct); REF-2 waves 1–2 (`b1761456`, `196d2a71`, 07Yashjais). REF-2 not audited. 18 Nov: identity enforced (POL-3), 47 `x-spec-operation` tags (EST-7), consumer tests, `scripts/audit.sh`, `RELEASE_CERTIFICATE.md` |
+| Stages | `progress.md` updated 18 Nov 2026; evidence in `services/policy-svc/RELEASE_CERTIFICATE.md` |
+| Console | `/admin/policies` v2.0: GOV-05 lifecycle, PDC-05 certification, compare, attestations, evidence re-drive (accounting policies still to do) |
 
 **Features**
 
 | ID | Feature | Status | Evidence | What is needed |
 |---|---|---|---|---|
-| D2-3.F01 | Policies and versions: `GET/POST /v1/policies`, `GET …/{id}`, `GET/POST …/{id}/versions`, `GET /v1/policy-versions/{id}`, `GET …/transitions`, `GET /v1/policy-versions/compare` | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-3.F02 | GOV-05 lifecycle: `POST …/versions/{v}/submit-review`, `…/approve` (maker-checker + own-object SoD), `…/activate`, `…/schedule`, `…/suspend`, `…/review-suspension` (suspender cannot review), `…/retire`; If-Match mandatory (428) | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-3.F03 | Evaluate, resolve, explain, evidence: `POST /v1/policies/evaluate`, `GET /v1/policies/resolve`, `GET /v1/policies/explain`, `GET /v1/policy-evaluations/{id}` | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-3.F04 | Evidence relayed into governance-decision-log-svc as `svc-policy` (durable outbox) | 🟡 | Reconfirm (was ✅): Governance audit; 11 Nov: production grant by authorization-svc 000043; relay proven live (GDL e2e "policy relay: *") | VC-1 |
-| D2-3.F05 | 8 event types; `jurisdiction_context` and `residency_region` on events | 🟡 | Reconfirm (was ✅): Governance audit | Kafka proof: X3; VC-1 |
-| D2-3.F06 | Control tests and attestations: `POST /v1/control-test-definitions`, `GET …/{id}`, `GET/POST …/{id}/executions`, `GET /v1/controls/{ref}/effectiveness`, `POST /v1/attestations`, `GET …/{id}`, `POST …/{id}/revoke` | 🟡 | Reconfirm (was ✅): Governance audit | VC-1 |
-| D2-3.F07 | Identity verification (JWKS envelope, or mTLS on `:8449`) | 🟡 | Compose `POLICY_IDENTITY_VERIFY` default `warn` (P-12); needs governance-decision-log to forward the envelope on replay | POL-3 |
+| D2-3.F01 | Policies and versions: `GET/POST /v1/policies`, `GET …/{id}`, `GET/POST …/{id}/versions`, `GET /v1/policy-versions/{id}`, `GET …/transitions`, `GET /v1/policy-versions/compare` | ✅ | 18 Nov: `e2e-policy-deps.py` 112/112 under enforce; UI e2e 12/12; `scripts/audit.sh` 48/0 | — |
+| D2-3.F02 | GOV-05 lifecycle: `POST …/versions/{v}/submit-review`, `…/approve` (maker-checker + own-object SoD), `…/activate`, `…/schedule`, `…/suspend`, `…/review-suspension` (suspender cannot review), `…/retire`; If-Match mandatory (428) | ✅ | 18 Nov: `e2e-policy-deps.py` 112/112 under enforce; UI e2e 12/12; `scripts/audit.sh` 48/0; maker–checker and suspender-cannot-review proven from the console | — |
+| D2-3.F03 | Evaluate, resolve, explain, evidence: `POST /v1/policies/evaluate`, `GET /v1/policies/resolve`, `GET /v1/policies/explain`, `GET /v1/policy-evaluations/{id}` | ✅ | 18 Nov: `e2e-policy-deps.py` 112/112 under enforce; UI e2e 12/12; `scripts/audit.sh` 48/0 | — |
+| D2-3.F04 | Evidence relayed into governance-decision-log-svc as `svc-policy` (durable outbox) | ✅ | 18 Nov: ledger relay checks in `e2e-policy-deps.py` 112/112; no FAILED evidence (`audit.sh`); console re-drive for FAILED rows | — |
+| D2-3.F05 | 8 event types; `jurisdiction_context` and `residency_region` on events | ✅ | 18 Nov: Kafka proof in `e2e-policy-deps.py` (`policy.version.activated` on `zoiko.policy.events`); consumed events tested (`internal/consumer`) | — |
+| D2-3.F06 | Control tests and attestations: `POST /v1/control-test-definitions`, `GET …/{id}`, `GET/POST …/{id}/executions`, `GET /v1/controls/{ref}/effectiveness`, `POST /v1/attestations`, `GET …/{id}`, `POST …/{id}/revoke` | ✅ | 18 Nov: UI e2e defines a control test, records a result, signs and revokes an attestation | — |
+| D2-3.F07 | Identity verification (JWKS envelope, or mTLS on `:8449`) | ✅ | 18 Nov: compose `enforce`. e2e 112/112 under enforce; caller wire probe 6/6 (expense-claim, payment-authorization, payroll-run forward the envelope; none → 401 → their fail-closed 403) | — |
 | D2-3.F08 | Evaluation for SPEND_CONTROL, SIGNATORY_MATRIX, SOD_RULE, LEGAL_BASIS (P-01) | 🔵 | 17 Nov: SIGNATORY_MATRIX resolved here; the other three are references (NOT_IMPLEMENTED) | — |
-| D2-3.F09 | `openapi.yaml` with router parity | 🟡 | Reconfirm (was ✅): Published 28 Oct (`e2a6c285`); `TestOpenAPI_MatchesTheRouter` (`internal/handler/api2_problem_test.go`); extended by REF-2 | VC-1 |
+| D2-3.F09 | `openapi.yaml` with router parity | ✅ | `TestOpenAPI_MatchesTheRouter`; 18 Nov: `TestOpenAPI_NamedSpecOperationsAreTagged` (EST-7, 47 tags, mutation-checked) | — |
 | D2-3.F10 | REF-07 accounting policy: `GET/POST /v1/accounting-policies`, `GET …/resolve`, `GET …/explain`, `GET …/versions/{id}`, `GET …/versions/{id}/impact`, `POST …/versions/{id}/submit-review|approve|activate|supersede|emergency-suspend|review-suspension` | 🔵 | REF-2 waves 1–2; registered actions 000039, 000040 | POL-1 |
-| D2-3.F11 | Callers report a policy-svc 401/403 as 401/403, not 503 (P-13: expense-claim-svc, payment-authorization-svc) | 🟡 | Other teams' services | Cross-team |
-| D2-3.F12 | V-001 PDC-05 certification suites, simulation, waivers | ❌ | Roadmap | POL-4 |
+| D2-3.F11 | Callers report a policy-svc 401/403 as 401/403, not 503 (P-13: expense-claim-svc, payment-authorization-svc) | ✅ | `956e68cc`, `de8264f6`; 18 Nov: `TestEvaluate_RefusedCallerIsNotAnOutage` (both), `TestApprovalPolicyFailsClosed` pass | — |
+| D2-3.F12 | V-001 PDC-05 certification suites, simulation, waivers | ✅ | POL-4 built; 18 Nov: certified from the console before activation (UI e2e) | — |
 | D2-3.F13 | Cursor paging (API-4) on `GET /v1/policies`, `GET /v1/accounting-policies`, executions | 🔵 | `TestLists_*`, `TestRegisters_ScopedFilteredPagedAndCounted` | POL-1 |
-| D2-3.F14 | Dependency E2E and console v2.0 | 🔄 | 17 Nov: `e2e-policy-deps.py` 111/111. Console "Policies & Controls" live, UI e2e 5/5; lifecycle commands not yet on the page | POL-FE-2, POL-FE-3 |
+| D2-3.F14 | Dependency E2E and console v2.0 | 🟡 | 18 Nov: e2e 112/112 under enforce; console lifecycle, certification, compare, attestations, re-drive; UI e2e 12/12. Accounting policies not on the page | POL-FE-4 |
 
 **Tasks**
 
 - [x] **POL-0 · Baseline (S0):** matrix in `progress.md` (GOV-05, Doc 03 §8.1, REF-07); suite with counts. 240 passing (224 top-level), 0 fail, 0 skip.
 - [x] **POL-1 · Verify REF-2 and the contract:** accounting-policy routes (maker-checker, emergency suspension needs a live break-glass session, supersession, If-Match, events, RLS, R5); keep `TestOpenAPI_MatchesTheRouter` green; API-4 on lists. Tests `TestREF07_*` for each spec negative path.
 - [x] **POL-2 · Policy types (P-01):** 17 Nov, per ZS-GOV-POL-001 / ZS-GOV-INT-002.
-- [ ] **POL-3 · P-12 enforce identity** after governance-decision-log forwards the envelope on replay. ⛔ BLOCKED on governance-decision-log.
+- [x] **POL-3 · P-12 enforce identity.** 18 Nov 2026: compose `enforce`; the documented blocker was stale (decision-log replay forwards the envelope since 21 Oct; the evaluate callers forward the caller's). Proof: `e2e-policy-deps.py` 112/112 under enforce, caller wire probe 6/6.
 - [x] **POL-4 · PDC-05** certification suites, simulation, waivers (V-001). Built and tested.
 - [x] **POL-5 · Live:** 17 Nov. `deployments/scripts/e2e-policy-deps.py` 111/111.
 
@@ -990,10 +990,11 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 **Tasks**
 
 - [x] **POL-FE-1 · Summary route + API client** for every route in Appendix B D2-3. `lib/api/policies.ts` covers the routes; every read goes out as the signed-in principal (`Caller`: X-Principal-Id plus the envelope), because policy-svc authorizes each read. `lib/api/client.ts` supports `extraHeaders` for break-glass.
-- [ ] **POL-FE-2 · Page v2.0.** 17 Nov, built to the "Policies & Controls" (Governance & Risk) mock: 5 KPIs with trend and sparkline, Control Effectiveness by Domain, Policies by Status, Control Reviews (6 / 12 months), one register of policy families and control tests (search, 5 filters, rows per page, CSV export of filtered or ticked rows), and a drawer (Overview, Requirements, Evidence, History). Create forms: policy, version, activate, evaluate, control test; record a test result. **Open:** version submit-review / approve / suspend / review-suspension / retire, accounting policies, attestation create / revoke and version compare are not on the page yet.
-- [ ] **POL-FE-3 · UI E2E** `tests/e2e/console/policies.spec.ts`, 5/5 live on 17 Nov: render from live data, define a control test, record a NOT_EFFECTIVE result and read it back, filters and export, empty state. **Open:** checker approval and activation, suspender cannot review, break-glass emergency suspension, compare versions (they wait on POL-FE-2).
+- [x] **POL-FE-2 · Page v2.0.** 17 Nov, built to the "Policies & Controls" (Governance & Risk) mock. 18 Nov: the drawer's Requirements tab carries the GOV-05 commands by status (submit-review, approve, activate / schedule, suspend, review-suspension, retire; each sends the version's row_version), PDC-05 certification (chip per version, test suite with add-test-case, run suite, waiver request and approval) and family retirement; History compares two versions; Evidence signs and revokes attestations and re-drives FAILED evidence. Fixed: activation sent no `expected_version` (428), and under enforce version drafts were 401 because the API client dropped the envelope. Accounting policies moved to POL-FE-4.
+- [x] **POL-FE-3 · UI E2E** `tests/e2e/console/policies.spec.ts`, 12/12 live on 18 Nov (twice) against policy-svc in enforce: the 5 control-test cases plus a two-person block (admin as maker, legal counsel as checker): draft, certify against two test cases, submit; the author's approval refused; checker approves and activates; the suspender's review refused, the checker's recorded; versions compare; an attestation signed and revoked.
+- [ ] **POL-FE-4 · Accounting policies (REF-07) on the page:** draft with rule mappings and impact, submit-review / approve / activate / supersede, emergency suspension under a break-glass session (`extraHeaders`), review-suspension; UI e2e including the break-glass path.
 
-**Blocked and decisions:** P-13 callers (cross-team); POL-3 waits on the out-of-domain evaluate callers forwarding the envelope.
+**Blocked and decisions:** none for POL-0…POL-FE-3 (18 Nov). Open: POL-FE-4; business sign-off on the ACTIVE tie-break.
 
 ---
 

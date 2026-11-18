@@ -10,6 +10,14 @@ SIGNATORY_MATRIX is evaluated here (`POST /internal/v1/policy/signatory-matrix/r
 SPEND_CONTROL, SOD_RULE and LEGAL_BASIS are decided by spend-controls-svc, authorization-svc and
 privacy-decision-svc; their versions here are references, and evaluate answers 501 NOT_IMPLEMENTED.
 
+## POL-3 / P-12: identity enforced — closed 18 Nov 2026
+
+Compose runs `POLICY_IDENTITY_VERIFY=enforce`, the code default. Every caller presents the
+signed envelope (console, expense-claim-svc, payment-authorization-svc, payroll-run-svc, which
+forward the person's) or a peer certificate on :8449 (governance-decision-log-svc,
+workflow-svc, notification-svc). Evidence: RELEASE_CERTIFICATE.md. A caller invoked with no
+envelope is refused 401 and fails closed.
+
 ## Evaluate keeps 404 / 409 / 501 (Doc 02 §9 wants 200)
 
 Its callers fail closed on these codes. The bodies carry `outcome` and `reason_codes`.
