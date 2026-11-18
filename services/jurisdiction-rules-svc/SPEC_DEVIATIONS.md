@@ -82,3 +82,11 @@ tenant-entity-registry-svc events (`establishment.*`, `registration.*`, `address
   unverified id would look like evidence.
 - **Registrations held by a party** (not a legal entity) are not projected.
 - **The ledger holds digests.** The recorded request and the evidence chain carry a digest of each establishment or registration id, never the id.
+
+## R4: two migrations numbered 000032
+
+`000032_registry_facts` (main's JUR-1 work) and `000032_tenant_row_security` (this branch) were
+written in parallel and met in the 16 Nov merge. `deployments/migrate.py` orders and tracks migrations
+by file name, so both apply deterministically (`registry_facts` first), and renaming either would
+orphan the applied-migration record of every database that has it. Up / down / up of 000032–000037
+on a scratch database passes (18 Nov 2026). A new migration takes 000038.

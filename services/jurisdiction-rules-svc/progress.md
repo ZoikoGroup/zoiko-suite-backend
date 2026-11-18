@@ -335,3 +335,27 @@ Before step 21 (not run live then, 17 checks): certify and everything after it i
 certifier independent of the author, compiler, test author and reviewers: three principals with
 JURISDICTION_* grants. Locally only admin and legal counsel hold them; granting a third is the user's call
 (tracker JR-8). The rest of the gaps are in the tracker, D2-1 "Remaining gaps (16 Nov)".
+
+## 7. VC-1 and the console gaps 13, 14 (18 Nov 2026)
+
+Verified by a session that built none of the rows. Tracker D2-1: 26 ✅, F24 🟡, F05 ⛔, F26 🧭.
+
+| Check | Result |
+|---|---|
+| Image | rebuilt from the branch (host binaries over the 16 Nov image); `000032_registry_facts` from main applied to the dev DB (43/43) |
+| Suites | 809 pass / 0 fail / 0 skip: unit, store 92, registryit 144 on scratch databases |
+| Mutants | 2/2 killed: the author activates their own rule (`TestActivation_RefusesTheAuthorBeforeAskingWorkflow`); a cursor not bound to its tenant (`TestAPI4_PagesCoverTheListOnceAndCursorsAreBound`) |
+| Migrations | 000032–000037 up / down / up on scratch |
+| Live | `e2e-jurisdiction-rules-deps.py` 82/82 (workflow-svc, feed consumer, dev signing key); `scripts/audit.sh` 24/0 |
+| Console | `jurisdictions.spec.ts` 12/12 (frontend `6c90395`, `a9b0d3e`) |
+
+Gap 13: the console's pack version could carry only rule modules, so no due date could come from a pack
+made there. It now names calendar versions and obligation rules; the spec packs a TAX_BANDS rule, an
+e-invoice profile rule and a due-date rule, and the released pack answers a calculation (200.00 on 1500),
+a due date moved off a Saturday (2026-11-09) and a registered submission. Gap 14: with cfo@ granted
+through the Authorization console (user's decision), a P0 hotfix is refused certification with one
+approving reviewer, certified after a second, refused in ring order and for a non-commander, and deployed
+by its incident commander under the ring-order exception; the retrospective is recorded.
+
+F24 stays 🟡: reads and runtime resolutions accept a headers-only identity (`warn`) until the tax and
+payroll readers outside D1/D2 forward the envelope.
