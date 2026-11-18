@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +27,8 @@ var ErrCrosswalkConflict = errors.New("identity crosswalk conflict: source ident
 var (
 	ErrBatchRefNotFound  = errors.New("migration batch ref not found")
 	ErrCertificateExists = errors.New("a certificate already exists for this batch")
+	ErrProgramNotFound   = errors.New("migration program not found")
+	ErrExtractNotFound   = errors.New("source extract not found")
 )
 
 // ControlPlaneStore is the persistence boundary for the batch-ref,
@@ -52,14 +56,27 @@ type ControlPlaneStore interface {
 
 	CreateCertificate(ctx context.Context, tenantID string, cert *domain.MigrationCertificate, correlationID string) (*domain.MigrationCertificate, error)
 	GetCertificateByBatchRefID(ctx context.Context, tenantID, batchRefID string) (*domain.MigrationCertificate, error)
+
+	CreateProgram(ctx context.Context, tenantID string, p *domain.MigrationProgram, correlationID string) (*domain.MigrationProgram, error)
+	GetProgramByBusinessID(ctx context.Context, tenantID, programID string) (*domain.MigrationProgram, error)
+	GetProgramByID(ctx context.Context, tenantID, id string) (*domain.MigrationProgram, error)
+	UpdateProgramStatus(ctx context.Context, tenantID, id string, status domain.ProgramStatus, actorID, correlationID string) (*domain.MigrationProgram, error)
+	GetProgramBatchSummary(ctx context.Context, tenantID, programInternalID string) (*domain.ProgramBatchSummary, error)
+
+	CreateExtract(ctx context.Context, tenantID string, e *domain.SourceExtract, actorID, correlationID string) (*domain.SourceExtract, error)
+	GetExtractByID(ctx context.Context, tenantID, id string) (*domain.SourceExtract, error)
+	GetLatestExtractByBusinessID(ctx context.Context, tenantID, extractID string) (*domain.SourceExtract, error)
+	ListExtractVersions(ctx context.Context, tenantID, extractID string) ([]domain.SourceExtract, error)
 }
 
 var _ ControlPlaneStore = (*PgStore)(nil)
 
 const (
-	aggregateBatchRef   = "migration-batch-ref"
-	aggregateCrosswalk  = "migration-identity-crosswalk"
+	aggregateBatchRef    = "migration-batch-ref"
+	aggregateCrosswalk   = "migration-identity-crosswalk"
 	aggregateCertificate = "migration-certificate"
+	aggregateProgram     = "migration-program"
+	aggregateExtract     = "migration-source-extract"
 )
 
 func (s *PgStore) CreateBatchRef(ctx context.Context, tenantID string, ref *domain.MigrationBatchRef, actorID, correlationID string) (*domain.MigrationBatchRef, error) {
@@ -79,13 +96,17 @@ func (s *PgStore) CreateBatchRef(ctx context.Context, tenantID string, ref *doma
 	ref.CreatedAt = now
 	ref.UpdatedAt = now
 
+	var programID any
+	if ref.ProgramID != "" {
+		programID = ref.ProgramID
+	}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO migration_batch_refs (id, tenant_id, legal_entity_id, job_id, batch_code, gl_book_id, status, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		INSERT INTO migration_batch_refs (id, tenant_id, legal_entity_id, program_id, job_id, batch_code, gl_book_id, status, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		ON CONFLICT ON CONSTRAINT migration_batch_refs_job_unique DO UPDATE SET updated_at = migration_batch_refs.updated_at
-		RETURNING id, status, gl_batch_id, gl_journal_id, gl_journal_number, reconciliation_status, created_at, updated_at, (xmax = 0) AS inserted`,
-		ref.ID, tenantID, ref.LegalEntityID, ref.JobID, ref.BatchCode, ref.GLBookID, string(ref.Status), actorID, now, now,
-	).Scan(&ref.ID, &ref.Status, nullStr(&ref.GLBatchID), nullStr(&ref.GLJournalID), nullStr(&ref.GLJournalNumber), nullStr(&ref.ReconciliationStatus), &ref.CreatedAt, &ref.UpdatedAt, new(bool))
+		RETURNING id, status, gl_batch_id, gl_journal_id, gl_journal_number, reconciliation_status, created_at, updated_at, COALESCE(program_id::text, ''), (xmax = 0) AS inserted`,
+		ref.ID, tenantID, ref.LegalEntityID, programID, ref.JobID, ref.BatchCode, ref.GLBookID, string(ref.Status), actorID, now, now,
+	).Scan(&ref.ID, &ref.Status, nullStr(&ref.GLBatchID), nullStr(&ref.GLJournalID), nullStr(&ref.GLJournalNumber), nullStr(&ref.ReconciliationStatus), &ref.CreatedAt, &ref.UpdatedAt, &ref.ProgramID, new(bool))
 	if err != nil {
 		return nil, fmt.Errorf("insert migration_batch_ref: %w", err)
 	}
@@ -141,10 +162,10 @@ func (s *PgStore) getBatchRef(ctx context.Context, tenantID, pred, arg string) (
 	}
 	var ref domain.MigrationBatchRef
 	err = tx.QueryRow(ctx, `
-		SELECT id, tenant_id, legal_entity_id, job_id, batch_code, gl_book_id, gl_batch_id, gl_journal_id, gl_journal_number,
+		SELECT id, tenant_id, legal_entity_id, COALESCE(program_id::text, ''), job_id, batch_code, gl_book_id, gl_batch_id, gl_journal_id, gl_journal_number,
 		       status, reconciliation_status, failure_reason, created_by, created_at, updated_at
 		FROM migration_batch_refs WHERE tenant_id = $1 AND `+pred, tenantID, arg).Scan(
-		&ref.ID, &ref.TenantID, &ref.LegalEntityID, &ref.JobID, &ref.BatchCode, &ref.GLBookID,
+		&ref.ID, &ref.TenantID, &ref.LegalEntityID, &ref.ProgramID, &ref.JobID, &ref.BatchCode, &ref.GLBookID,
 		nullStr(&ref.GLBatchID), nullStr(&ref.GLJournalID), nullStr(&ref.GLJournalNumber),
 		&ref.Status, nullStr(&ref.ReconciliationStatus), nullStr(&ref.FailureReason), &ref.CreatedBy, &ref.CreatedAt, &ref.UpdatedAt,
 	)
@@ -180,11 +201,11 @@ func (s *PgStore) UpdateBatchRef(ctx context.Context, tenantID, id string, statu
 			updated_at = $9
 		WHERE tenant_id = $1 AND id = $2
 		RETURNING id, tenant_id, legal_entity_id, job_id, batch_code, gl_book_id, gl_batch_id, gl_journal_id, gl_journal_number,
-		          status, reconciliation_status, failure_reason, created_by, created_at, updated_at`,
+		          status, reconciliation_status, failure_reason, created_by, created_at, updated_at, COALESCE(program_id::text, '')`,
 		tenantID, id, string(status), glBatchID, glJournalID, glJournalNumber, reconciliationStatus, failureReason, time.Now(),
 	).Scan(&ref.ID, &ref.TenantID, &ref.LegalEntityID, &ref.JobID, &ref.BatchCode, &ref.GLBookID,
 		nullStr(&ref.GLBatchID), nullStr(&ref.GLJournalID), nullStr(&ref.GLJournalNumber),
-		&ref.Status, nullStr(&ref.ReconciliationStatus), nullStr(&ref.FailureReason), &ref.CreatedBy, &ref.CreatedAt, &ref.UpdatedAt)
+		&ref.Status, nullStr(&ref.ReconciliationStatus), nullStr(&ref.FailureReason), &ref.CreatedBy, &ref.CreatedAt, &ref.UpdatedAt, &ref.ProgramID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrBatchRefNotFound
 	}
@@ -222,11 +243,11 @@ func (s *PgStore) ResetBatchRefForRetry(ctx context.Context, tenantID, id, batch
 			reconciliation_status = NULL, failure_reason = NULL, updated_at = $5
 		WHERE tenant_id = $1 AND id = $2
 		RETURNING id, tenant_id, legal_entity_id, job_id, batch_code, gl_book_id, gl_batch_id, gl_journal_id, gl_journal_number,
-		          status, reconciliation_status, failure_reason, created_by, created_at, updated_at`,
+		          status, reconciliation_status, failure_reason, created_by, created_at, updated_at, COALESCE(program_id::text, '')`,
 		tenantID, id, batchCode, glBookID, time.Now(),
 	).Scan(&ref.ID, &ref.TenantID, &ref.LegalEntityID, &ref.JobID, &ref.BatchCode, &ref.GLBookID,
 		nullStr(&ref.GLBatchID), nullStr(&ref.GLJournalID), nullStr(&ref.GLJournalNumber),
-		&ref.Status, nullStr(&ref.ReconciliationStatus), nullStr(&ref.FailureReason), &ref.CreatedBy, &ref.CreatedAt, &ref.UpdatedAt)
+		&ref.Status, nullStr(&ref.ReconciliationStatus), nullStr(&ref.FailureReason), &ref.CreatedBy, &ref.CreatedAt, &ref.UpdatedAt, &ref.ProgramID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrBatchRefNotFound
 	}
@@ -417,4 +438,340 @@ func (s *PgStore) GetCertificateByBatchRefID(ctx context.Context, tenantID, batc
 	}
 	_ = tx.Commit(ctx)
 	return &c, nil
+}
+
+// ─── Migration Program ─────────────────────────────────────────────────────
+
+func (s *PgStore) CreateProgram(ctx context.Context, tenantID string, p *domain.MigrationProgram, correlationID string) (*domain.MigrationProgram, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	p.ID = uuid.New().String()
+	p.TenantID = tenantID
+	p.Status = domain.ProgramOpen
+	p.CreatedAt, p.UpdatedAt = now, now
+
+	err = tx.QueryRow(ctx, `
+		INSERT INTO migration_programs (id, tenant_id, program_id, source_estate, target_scope, owner_principal_id, cutover_strategy, status, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		RETURNING id, created_at, updated_at`,
+		p.ID, tenantID, p.ProgramID, p.SourceEstate, p.TargetScope, p.OwnerPrincipalID, p.CutoverStrategy, string(p.Status), p.CreatedBy, now, now,
+	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("insert migration_program: %w", err)
+	}
+
+	if err := s.enqueueMigrationEvent(ctx, tx, "program", "created", "migration.program_created", aggregateProgram,
+		tenantID, "", p.ID, p.CreatedBy, correlationID, map[string]any{"program_id": p.ProgramID, "source_estate": p.SourceEstate, "cutover_strategy": p.CutoverStrategy}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (s *PgStore) GetProgramByBusinessID(ctx context.Context, tenantID, programID string) (*domain.MigrationProgram, error) {
+	return s.getProgram(ctx, tenantID, "program_id = $2", programID)
+}
+
+func (s *PgStore) GetProgramByID(ctx context.Context, tenantID, id string) (*domain.MigrationProgram, error) {
+	return s.getProgram(ctx, tenantID, "id = $2", id)
+}
+
+func (s *PgStore) getProgram(ctx context.Context, tenantID, pred, arg string) (*domain.MigrationProgram, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+	var p domain.MigrationProgram
+	err = tx.QueryRow(ctx, `
+		SELECT id, tenant_id, program_id, source_estate, target_scope, owner_principal_id, cutover_strategy, status, created_by, created_at, updated_at
+		FROM migration_programs WHERE tenant_id = $1 AND `+pred, tenantID, arg).Scan(
+		&p.ID, &p.TenantID, &p.ProgramID, &p.SourceEstate, &p.TargetScope, &p.OwnerPrincipalID, &p.CutoverStrategy, &p.Status, &p.CreatedBy, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrProgramNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = tx.Commit(ctx)
+	return &p, nil
+}
+
+func (s *PgStore) UpdateProgramStatus(ctx context.Context, tenantID, id string, status domain.ProgramStatus, actorID, correlationID string) (*domain.MigrationProgram, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+
+	var p domain.MigrationProgram
+	err = tx.QueryRow(ctx, `
+		UPDATE migration_programs SET status = $3, updated_at = $4
+		WHERE tenant_id = $1 AND id = $2
+		RETURNING id, tenant_id, program_id, source_estate, target_scope, owner_principal_id, cutover_strategy, status, created_by, created_at, updated_at`,
+		tenantID, id, string(status), time.Now(),
+	).Scan(&p.ID, &p.TenantID, &p.ProgramID, &p.SourceEstate, &p.TargetScope, &p.OwnerPrincipalID, &p.CutoverStrategy, &p.Status, &p.CreatedBy, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrProgramNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("update migration_program status: %w", err)
+	}
+
+	if err := s.enqueueMigrationEvent(ctx, tx, "program", "status-changed", "migration.program_status_changed", aggregateProgram,
+		tenantID, "", p.ID, actorID, correlationID, map[string]any{"program_id": p.ProgramID, "status": string(p.Status)}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (s *PgStore) GetProgramBatchSummary(ctx context.Context, tenantID, programInternalID string) (*domain.ProgramBatchSummary, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+
+	summary := &domain.ProgramBatchSummary{StatusCounts: make(map[string]int)}
+	rows, err := tx.Query(ctx, `
+		SELECT status, COUNT(*) FROM migration_batch_refs
+		WHERE tenant_id = $1 AND program_id = $2 GROUP BY status`, tenantID, programInternalID)
+	if err != nil {
+		return nil, fmt.Errorf("query program batch summary: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, err
+		}
+		summary.StatusCounts[status] = count
+		summary.TotalBatches += count
+		if status == string(domain.BatchRefReconciled) {
+			summary.ReconciledCount = count
+		}
+	}
+	_ = tx.Commit(ctx)
+	return summary, nil
+}
+
+// ─── Source Extract ─────────────────────────────────────────────────────────
+
+// CreateExtract registers an immutable landing. If e.ExtractID already names
+// an extract for this tenant, this call registers the NEXT version (a
+// correction, MIG-INV-03); a blank e.ExtractID mints a fresh business id at
+// version 1. pg_advisory_xact_lock on the (tenant, extract_id) pair, held for
+// the transaction, serializes two concurrent registrations of the same
+// extract_id so they can never compute the same "next version" twice --
+// the table's own unique constraint is the backstop, not the primary guard.
+func (s *PgStore) CreateExtract(ctx context.Context, tenantID string, e *domain.SourceExtract, actorID, correlationID string) (*domain.SourceExtract, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+
+	if e.ExtractID == "" {
+		e.ExtractID = uuid.New().String()
+	}
+
+	lockKey := lockKeyFor(tenantID, e.ExtractID)
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockKey); err != nil {
+		return nil, fmt.Errorf("acquire extract registration lock: %w", err)
+	}
+
+	var maxVersion int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migration_source_extracts WHERE tenant_id = $1 AND extract_id = $2`,
+		tenantID, e.ExtractID).Scan(&maxVersion); err != nil {
+		return nil, fmt.Errorf("compute next extract version: %w", err)
+	}
+
+	filesJSON, err := json.Marshal(e.Files)
+	if err != nil {
+		return nil, err
+	}
+	if e.AmountControls == nil {
+		e.AmountControls = map[string]domain.ExtractAmountControl{}
+	}
+	controlsJSON, err := json.Marshal(e.AmountControls)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	e.ID = uuid.New().String()
+	e.TenantID = tenantID
+	e.Version = maxVersion + 1
+	e.CreatedBy = actorID
+	e.CreatedAt = now
+
+	var programID any
+	if e.ProgramID != "" {
+		programID = e.ProgramID
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO migration_source_extracts
+		  (id, tenant_id, legal_entity_id, program_id, extract_id, version, source_watermark, generated_at,
+		   manifest_hash, record_count, files, amount_controls, created_by, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		RETURNING id, created_at`,
+		e.ID, tenantID, e.LegalEntityID, programID, e.ExtractID, e.Version, e.SourceWatermark, e.GeneratedAt,
+		e.ManifestHash, e.RecordCount, filesJSON, controlsJSON, e.CreatedBy, now,
+	).Scan(&e.ID, &e.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("insert migration_source_extract: %w", err)
+	}
+
+	if err := s.enqueueMigrationEvent(ctx, tx, "source-extract", "registered", "migration.source_extract_registered", aggregateExtract,
+		tenantID, e.LegalEntityID, e.ID, actorID, correlationID, map[string]any{
+			"extract_id": e.ExtractID, "version": e.Version, "manifest_hash": e.ManifestHash, "record_count": e.RecordCount,
+		}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// lockKeyFor derives a stable int64 advisory-lock key from a (tenant,
+// extract_id) pair. FNV-1a rather than hashtext() so the key is computed the
+// same way whether reasoned about in Go or in SQL, and is stable across
+// Postgres versions (hashtext's algorithm is not a stable contract).
+func lockKeyFor(tenantID, extractID string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(tenantID + "|" + extractID))
+	return int64(h.Sum64())
+}
+
+func (s *PgStore) GetExtractByID(ctx context.Context, tenantID, id string) (*domain.SourceExtract, error) {
+	return s.getExtract(ctx, tenantID, "id = $2", id)
+}
+
+func (s *PgStore) GetLatestExtractByBusinessID(ctx context.Context, tenantID, extractID string) (*domain.SourceExtract, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+	e, err := scanExtract(tx.QueryRow(ctx, extractSelectSQL+` WHERE tenant_id = $1 AND extract_id = $2 ORDER BY version DESC LIMIT 1`, tenantID, extractID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrExtractNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = tx.Commit(ctx)
+	return e, nil
+}
+
+func (s *PgStore) ListExtractVersions(ctx context.Context, tenantID, extractID string) ([]domain.SourceExtract, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, extractSelectSQL+` WHERE tenant_id = $1 AND extract_id = $2 ORDER BY version ASC`, tenantID, extractID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.SourceExtract
+	for rows.Next() {
+		e, err := scanExtractRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *e)
+	}
+	_ = tx.Commit(ctx)
+	return out, nil
+}
+
+func (s *PgStore) getExtract(ctx context.Context, tenantID, pred, arg string) (*domain.SourceExtract, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+	e, err := scanExtract(tx.QueryRow(ctx, extractSelectSQL+` WHERE tenant_id = $1 AND `+pred, tenantID, arg))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrExtractNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = tx.Commit(ctx)
+	return e, nil
+}
+
+const extractSelectSQL = `
+	SELECT id, tenant_id, legal_entity_id, COALESCE(program_id::text, ''), extract_id, version, source_watermark,
+	       generated_at, manifest_hash, record_count, files, amount_controls, created_by, created_at
+	FROM migration_source_extracts`
+
+// rowScanner is the subset of pgx.Row/pgx.Rows this file's two extract
+// scanners need -- one Scan signature shared between QueryRow's single-row
+// result and Query's multi-row iterator.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanExtract(row rowScanner) (*domain.SourceExtract, error) {
+	return scanExtractRows(row)
+}
+
+func scanExtractRows(row rowScanner) (*domain.SourceExtract, error) {
+	var e domain.SourceExtract
+	var filesJSON, controlsJSON []byte
+	if err := row.Scan(&e.ID, &e.TenantID, &e.LegalEntityID, &e.ProgramID, &e.ExtractID, &e.Version, &e.SourceWatermark,
+		&e.GeneratedAt, &e.ManifestHash, &e.RecordCount, &filesJSON, &controlsJSON, &e.CreatedBy, &e.CreatedAt); err != nil {
+		return nil, err
+	}
+	if len(filesJSON) > 0 {
+		if err := json.Unmarshal(filesJSON, &e.Files); err != nil {
+			return nil, fmt.Errorf("decode extract files: %w", err)
+		}
+	}
+	if len(controlsJSON) > 0 {
+		if err := json.Unmarshal(controlsJSON, &e.AmountControls); err != nil {
+			return nil, fmt.Errorf("decode extract amount_controls: %w", err)
+		}
+	}
+	return &e, nil
 }

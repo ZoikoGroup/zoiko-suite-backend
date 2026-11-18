@@ -37,6 +37,7 @@ type MigrationBatchRef struct {
 	ID                   string         `json:"id"`
 	TenantID             string         `json:"tenant_id"`
 	LegalEntityID        string         `json:"legal_entity_id"`
+	ProgramID            string         `json:"program_id,omitempty"`
 	JobID                string         `json:"job_id"`
 	BatchCode            string         `json:"batch_code"`
 	GLBookID             string         `json:"gl_book_id"`
@@ -57,6 +58,11 @@ type MigrationBatchRef struct {
 // window): the integrity job answers "is this extract trustworthy", this
 // request answers "where does it post and under what authority".
 type PromoteBatchRequest struct {
+	// ProgramID is the business program_id (MigrationProgram.ProgramID, not
+	// its internal uuid) this batch belongs to. Optional for backward
+	// compatibility: a promote call that omits it behaves exactly as before
+	// this field existed (the resulting batch ref simply has no program).
+	ProgramID         string                 `json:"program_id,omitempty"`
 	BookID            string                 `json:"book_id"`
 	BatchCode         string                 `json:"batch_code"`
 	CutoverDate       string                 `json:"cutover_date"`
@@ -234,6 +240,196 @@ type IssueCertificateRequest struct {
 func (r *IssueCertificateRequest) Validate() error {
 	if strings.TrimSpace(r.Scope) == "" {
 		return fmt.Errorf("scope is required")
+	}
+	return nil
+}
+
+// ─── Migration Program ─────────────────────────────────────────────────────
+
+// ProgramStatus is a MigrationProgram's own lifecycle, separate from any
+// individual batch's status: a program stays OPEN/IN_PROGRESS across many
+// validation jobs and promoted batches over the life of a migration
+// project, and only reaches COMPLETE by an explicit transition (never
+// inferred from "every batch so far happens to be reconciled" -- a program
+// can be COMPLETE with batches still pending in a later wave, or still
+// IN_PROGRESS after its first batch reconciles).
+type ProgramStatus string
+
+const (
+	ProgramOpen       ProgramStatus = "OPEN"
+	ProgramInProgress ProgramStatus = "IN_PROGRESS"
+	ProgramComplete   ProgramStatus = "COMPLETE"
+)
+
+// validProgramTransitions is the only linear, forward-only path a program's
+// status may take -- the same shape accounting-period-svc enforces for its
+// own guarded lifecycle (OPEN -> SOFT_CLOSED -> ...): one step forward, no
+// skipping, no going back.
+var validProgramTransitions = map[ProgramStatus]ProgramStatus{
+	ProgramOpen:       ProgramInProgress,
+	ProgramInProgress: ProgramComplete,
+}
+
+var validCutoverStrategies = map[string]bool{"BIG_BANG": true, "PHASED": true, "PARALLEL_RUN": true}
+
+// MigrationProgram is the top-level tracking object ZS-MIG-001 §4
+// describes: "this is one migration project" (e.g. one customer's full
+// onboarding), which can contain multiple batches over time. It aggregates
+// the MigrationBatchRefs that name it (ProgramBatchSummary); it holds no
+// posting state of its own.
+type MigrationProgram struct {
+	ID               string        `json:"id"`
+	TenantID         string        `json:"tenant_id"`
+	ProgramID        string        `json:"program_id"`
+	SourceEstate     string        `json:"source_estate"`
+	TargetScope      string        `json:"target_scope"`
+	OwnerPrincipalID string        `json:"owner_principal_id"`
+	CutoverStrategy  string        `json:"cutover_strategy"`
+	Status           ProgramStatus `json:"status"`
+	CreatedBy        string        `json:"created_by"`
+	CreatedAt        time.Time     `json:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at"`
+}
+
+// ProgramBatchSummary is how a program "aggregates/reports on its batches":
+// how many batches it has, and a breakdown of their current promotion
+// status, read live from migration_batch_refs rather than kept as a
+// counter on the program row (so it can never drift from the batches it
+// describes).
+type ProgramBatchSummary struct {
+	TotalBatches    int            `json:"total_batches"`
+	StatusCounts    map[string]int `json:"status_counts"`
+	ReconciledCount int            `json:"reconciled_count"`
+}
+
+// MigrationProgramView is a program plus its live batch summary -- the body
+// of GET /v1/migrations/programs/{id}.
+type MigrationProgramView struct {
+	MigrationProgram
+	Batches ProgramBatchSummary `json:"batches"`
+}
+
+// CreateProgramRequest is the body of POST /v1/migrations/programs.
+type CreateProgramRequest struct {
+	ProgramID        string `json:"program_id"`
+	SourceEstate     string `json:"source_estate"`
+	TargetScope      string `json:"target_scope"`
+	OwnerPrincipalID string `json:"owner_principal_id"`
+	CutoverStrategy  string `json:"cutover_strategy"`
+}
+
+func (r *CreateProgramRequest) Validate() error {
+	if strings.TrimSpace(r.ProgramID) == "" {
+		return fmt.Errorf("program_id is required")
+	}
+	if strings.TrimSpace(r.SourceEstate) == "" {
+		return fmt.Errorf("source_estate is required")
+	}
+	if strings.TrimSpace(r.TargetScope) == "" {
+		return fmt.Errorf("target_scope is required")
+	}
+	if strings.TrimSpace(r.OwnerPrincipalID) == "" {
+		return fmt.Errorf("owner_principal_id is required")
+	}
+	if !validCutoverStrategies[strings.ToUpper(strings.TrimSpace(r.CutoverStrategy))] {
+		return fmt.Errorf("cutover_strategy must be one of BIG_BANG, PHASED, PARALLEL_RUN")
+	}
+	return nil
+}
+
+// UpdateProgramStatusRequest is the body of
+// POST /v1/migrations/programs/{id}/status.
+type UpdateProgramStatusRequest struct {
+	Status string `json:"status"`
+}
+
+func (r *UpdateProgramStatusRequest) Validate() error {
+	switch ProgramStatus(strings.ToUpper(strings.TrimSpace(r.Status))) {
+	case ProgramOpen, ProgramInProgress, ProgramComplete:
+		return nil
+	default:
+		return fmt.Errorf("status must be one of OPEN, IN_PROGRESS, COMPLETE")
+	}
+}
+
+// NextProgramStatus validates the requested transition against the
+// program's current status and returns the new status to apply.
+func NextProgramStatus(current ProgramStatus, requested ProgramStatus) (ProgramStatus, error) {
+	if current == requested {
+		return current, nil // idempotent replay of the same transition
+	}
+	if validProgramTransitions[current] == requested {
+		return requested, nil
+	}
+	return "", fmt.Errorf("illegal program status transition %s -> %s", current, requested)
+}
+
+// ─── Source Extract ─────────────────────────────────────────────────────────
+
+// ExtractAmountControl is one named control total carried on a
+// SourceExtract -- the same shape PromoteCtrl already uses for a batch's
+// control totals, reused here because it is the same concept one layer
+// earlier: a control total the source side asserts about the extract,
+// before any of it has been mapped into GL lines.
+type ExtractAmountControl struct {
+	Total string `json:"total"`
+	Count int    `json:"count"`
+	Ref   string `json:"reference,omitempty"`
+}
+
+// SourceExtract (ZS-MIG-001 §4, MIG-INV-03): a frozen, versioned landing of
+// source data. Immutable once created -- there is no update endpoint for
+// it anywhere in this service, and the database refuses UPDATE/DELETE/
+// TRUNCATE on its table outright (migration 000010). A correction is a new
+// row: same ExtractID, Version = previous max + 1.
+type SourceExtract struct {
+	ID              string                          `json:"id"`
+	TenantID        string                          `json:"tenant_id"`
+	LegalEntityID   string                          `json:"legal_entity_id"`
+	ProgramID       string                          `json:"program_id,omitempty"`
+	ExtractID       string                          `json:"extract_id"`
+	Version         int                             `json:"version"`
+	SourceWatermark string                          `json:"source_watermark"`
+	GeneratedAt     time.Time                       `json:"generated_at"`
+	ManifestHash    string                          `json:"manifest_hash"`
+	RecordCount     int                             `json:"record_count"`
+	Files           []string                        `json:"files"`
+	AmountControls  map[string]ExtractAmountControl `json:"amount_controls,omitempty"`
+	CreatedBy       string                          `json:"created_by"`
+	CreatedAt       time.Time                       `json:"created_at"`
+}
+
+// RegisterExtractRequest is the body of POST /v1/migrations/extracts. If
+// ExtractID already names an existing extract for this tenant, the store
+// registers this as the next version (a correction, MIG-INV-03); if it is
+// new (or omitted), a fresh ExtractID is minted at version 1.
+type RegisterExtractRequest struct {
+	ExtractID       string                          `json:"extract_id,omitempty"`
+	LegalEntityID   string                          `json:"legal_entity_id"`
+	ProgramID       string                          `json:"program_id,omitempty"`
+	SourceWatermark string                          `json:"source_watermark"`
+	GeneratedAt     time.Time                       `json:"generated_at"`
+	ManifestHash    string                          `json:"manifest_hash"`
+	RecordCount     int                             `json:"record_count"`
+	Files           []string                        `json:"files"`
+	AmountControls  map[string]ExtractAmountControl `json:"amount_controls,omitempty"`
+}
+
+func (r *RegisterExtractRequest) Validate() error {
+	if strings.TrimSpace(r.LegalEntityID) == "" {
+		return fmt.Errorf("legal_entity_id is required")
+	}
+	if strings.TrimSpace(r.SourceWatermark) == "" {
+		return fmt.Errorf("source_watermark is required")
+	}
+	if r.GeneratedAt.IsZero() {
+		return fmt.Errorf("generated_at is required")
+	}
+	if strings.TrimSpace(r.ManifestHash) == "" {
+		return fmt.Errorf("manifest_hash is required")
+	}
+	if r.RecordCount < 0 {
+		return fmt.Errorf("record_count cannot be negative")
 	}
 	return nil
 }

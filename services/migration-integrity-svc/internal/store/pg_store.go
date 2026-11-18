@@ -104,15 +104,25 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Mi
 	job.CreatedAt = now
 	job.UpdatedAt = now
 
+	var extractID any
+	if job.SourceExtractID != "" {
+		extractID = job.SourceExtractID
+	}
+	var extractVersion any
+	if job.SourceExtractVersion > 0 {
+		extractVersion = job.SourceExtractVersion
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO migration_jobs
 		  (id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		   total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		   integrity_score_threshold, blocker_count, status, started_at, completed_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+		   integrity_score_threshold, blocker_count, status, started_at, completed_at, created_at, updated_at,
+		   source_extract_id, source_extract_version)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
 		job.ID, tenantID, job.LegalEntityID, job.MigrationName, job.SourceSystem, job.TargetService,
 		job.TotalRecordsCount, job.ValidRecordsCount, job.InvalidRecordsCount, job.IntegrityScore,
 		job.IntegrityScoreThreshold, job.BlockerCount, string(job.Status), job.StartedAt, job.CompletedAt, job.CreatedAt, job.UpdatedAt,
+		extractID, extractVersion,
 	)
 	if err != nil {
 		return fmt.Errorf("insert migration_job: %w", err)
@@ -191,21 +201,31 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 
 	var job domain.MigrationJob
 	var startedAt, completedAt *time.Time
+	var extractID *string
+	var extractVersion *int
 	err = tx.QueryRow(ctx, `
 		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		       integrity_score_threshold, blocker_count, status, started_at, completed_at, created_at, updated_at
+		       integrity_score_threshold, blocker_count, status, started_at, completed_at, created_at, updated_at,
+		       source_extract_id::text, source_extract_version
 		FROM migration_jobs
 		WHERE id = $1`, id).Scan(
 		&job.ID, &job.TenantID, &job.LegalEntityID, &job.MigrationName, &job.SourceSystem, &job.TargetService,
 		&job.TotalRecordsCount, &job.ValidRecordsCount, &job.InvalidRecordsCount, &job.IntegrityScore,
 		&job.IntegrityScoreThreshold, &job.BlockerCount, &job.Status, &startedAt, &completedAt, &job.CreatedAt, &job.UpdatedAt,
+		&extractID, &extractVersion,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("migration job not found: %w", err)
 	}
 	job.StartedAt = startedAt
 	job.CompletedAt = completedAt
+	if extractID != nil {
+		job.SourceExtractID = *extractID
+	}
+	if extractVersion != nil {
+		job.SourceExtractVersion = *extractVersion
+	}
 
 	rows, err := tx.Query(ctx, `
 		SELECT id, tenant_id, job_id, check_name, check_type, records_checked, records_passed, records_failed, severity, detail, created_at

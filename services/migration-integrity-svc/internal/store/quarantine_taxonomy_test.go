@@ -147,6 +147,16 @@ func TestMigration000005_BackfillsLegacyRowsAndReverses(t *testing.T) {
 		"000006_migration_batch_refs.up.sql":   true,
 		"000007_identity_crosswalk.up.sql":     true,
 		"000008_migration_certificates.up.sql": true,
+		// 000009-000011 add MigrationProgram, SourceExtract and the
+		// migration_jobs source-extract reference -- none of it touches
+		// migration_audit_entries' severity/reason_family columns this
+		// test backfills, so they are irrelevant to (and, for 000011,
+		// would require a migration_source_extracts row to satisfy its FK
+		// on an already-inserted job if applied here, which this isolated
+		// 000005-only scenario never creates).
+		"000009_migration_programs.up.sql":         true,
+		"000010_migration_source_extracts.up.sql":  true,
+		"000011_migration_jobs_extract_ref.up.sql": true,
 	}
 	var up5 string
 	for _, f := range files {
