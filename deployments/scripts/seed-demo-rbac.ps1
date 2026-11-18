@@ -485,7 +485,18 @@ $BUNDLES = @(
                     "POLICY_VERSION_APPROVE", "POLICY_VERSION_APPROVE_GLOBAL",
                     "POLICY_VERSION_ACTIVATE", "POLICY_VERSION_ACTIVATE_GLOBAL",
                     "POLICY_VERSION_SUSPEND", "POLICY_VERSION_SUSPEND_GLOBAL",
-                    "POLICY_VERSION_RETIRE", "POLICY_VERSION_RETIRE_GLOBAL")
+                    "POLICY_VERSION_RETIRE", "POLICY_VERSION_RETIRE_GLOBAL",
+                    # V-001 PDC-05 certification (access-control 000058). This
+                    # script REPLACES a bundle's actions, so they belong here:
+                    # until 18 Nov only e2e-policy-deps.py added them, by psql,
+                    # and every seed run took them away again.
+                    "POLICY_TEST_MANAGE", "POLICY_TEST_RUN", "POLICY_WAIVER_REQUEST", "POLICY_WAIVER_APPROVE",
+                    "POLICY_SIMULATE", "POLICY_EVIDENCE_REDELIVER",
+                    # REF-07 accounting policies (access-control 000039/000040).
+                    # The emergency suspension is still honoured only under a live
+                    # break-glass session; holding the action alone suspends nothing.
+                    "ACCOUNTING_POLICY_DRAFT", "ACCOUNTING_POLICY_APPROVE", "ACCOUNTING_POLICY_ACTIVATE",
+                    "ACCOUNTING_POLICY_EMERGENCY_SUSPEND")
     },
     @{
         # policy-svc's control tests and attestations (doc7 E3/E6) authorize
