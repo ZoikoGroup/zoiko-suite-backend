@@ -46,15 +46,8 @@ const (
 	// checked in the handler) and is not part of this claim.
 	CommandApproveFXRevaluation = "ApproveFXRevaluation"
 
-	// ACC-17 migration batch approve/certify (SPEC_DEVIATIONS A11). Commit
-	// (MarkMigrationBatchPosted) already has its own idempotency (the
-	// handler's own RECONCILED/CERTIFIED/POSTED status switch) and is not
-	// part of this claim; Validate is not either — see its own note in
-	// SPEC_DEVIATIONS for why (it has two possible terminal outcomes,
-	// VALIDATED or QUARANTINED, which this house pattern does not yet
-	// model).
-	CommandApproveMigrationBatch = "ApproveMigrationBatch"
-	CommandCertifyMigrationBatch = "CertifyMigrationBatch"
+	// ACC-17's migration batch approve/certify command names were retired
+	// along with its handlers and store methods — see SPEC_DEVIATIONS.md A9.
 
 	// ACC-14 period transitions (SPEC_DEVIATIONS A11). Only the two simple,
 	// single-UPDATE transitions are claimed; HardClose/Reclose/Reopen are
@@ -73,7 +66,6 @@ const (
 	targetPrepaymentSchedule claimTarget = "prepayment_schedule_id"
 	targetAllocationRule     claimTarget = "allocation_rule_version_id"
 	targetFXRevaluationRun   claimTarget = "fx_revaluation_run_id"
-	targetMigrationBatch     claimTarget = "migration_batch_id"
 	targetFiscalPeriod       claimTarget = "fiscal_period_id"
 )
 

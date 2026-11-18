@@ -1018,27 +1018,11 @@ func (c *Clients) getJournal(ctx context.Context, tenantID, journalID string) (*
 	return &detail, nil
 }
 
-// GetPostedJournal reads one journal back from general-ledger-svc, header and
-// lines, as the ledger holds it. ACC-17 uses it to reconcile an opening
-// balance batch to its target after posting: what the ledger recorded, not
-// what this service asked it to record. A 404 is reported as unavailable, not
-// as an empty journal — a journal this service was just given an id for and
-// cannot read back is something to retry, never a reconciliation pass.
-func (c *Clients) GetPostedJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error) {
-	detail, err := c.getJournal(ctx, tenantID, journalID)
-	if err != nil {
-		return nil, err
-	}
-	out := &domain.PostedJournal{
-		JournalID: detail.JournalID, Status: detail.Status,
-		LegalEntityID: detail.LegalEntityID, FiscalPeriod: detail.FiscalPeriod,
-		Lines: make([]domain.JournalLineInput, len(detail.Lines)),
-	}
-	for i, l := range detail.Lines {
-		out.Lines[i] = domain.JournalLineInput{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount}
-	}
-	return out, nil
-}
+// GetPostedJournal/CheckAPInvoiceExists/CheckARInvoiceExists were ACC-17's
+// own closure of its migration-batch write side (source-to-target
+// reconciliation and "Open AR/AP included both in history and opening
+// state") and were retired along with it — see SPEC_DEVIATIONS.md A9.
+// apInvoice itself stays: GetAPSubledgerTotal (ACC-06) still uses it.
 
 // ---------------------------------------------------------------------------
 // Accounts Payable Client
@@ -1053,47 +1037,6 @@ type apInvoice struct {
 	Amount        float64   `json:"amount"`
 	InvoiceNumber string    `json:"invoice_number"`
 	VendorID      string    `json:"vendor_id"`
-}
-
-// CheckAPInvoiceExists is CheckARInvoiceExists' own mirror for accounts-
-// payable-svc — ACC-17's "Open AR included both in history and opening
-// state" negative path applies identically to AP per the spec's own
-// Dependencies field ("AR/AP/Bank/Tax source domains").
-func (c *Clients) CheckAPInvoiceExists(ctx context.Context, tenantID, legalEntityID, vendorID, invoiceNumber string) (bool, error) {
-	u, err := url.Parse(c.apURL + "/v1/invoices")
-	if err != nil {
-		return false, err
-	}
-	q := u.Query()
-	q.Set("legal_entity_id", legalEntityID)
-	q.Set("vendor_id", vendorID)
-	q.Set("limit", strconv.Itoa(subledgerPageLimit))
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return false, domain.ErrAPServiceUnavailable
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false, domain.ErrAPServiceUnavailable
-	}
-	var list []apInvoice
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return false, err
-	}
-	for _, inv := range list {
-		if inv.InvoiceNumber == invoiceNumber {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // subledgerPageLimit is the largest page AP/AR will serve one request
@@ -1171,48 +1114,6 @@ type arInvoice struct {
 	Amount        float64   `json:"amount"`
 	InvoiceNumber string    `json:"invoice_number"`
 	CustomerID    string    `json:"customer_id"`
-}
-
-// CheckARInvoiceExists is ACC-17's own closure of "Open AR included both
-// in history and opening state" — it asks accounts-receivable-svc's real
-// register whether this customer already has a real, live invoice under
-// this invoice_number, rather than trusting the migration operator's own
-// crosswalk to be free of items that already exist elsewhere.
-func (c *Clients) CheckARInvoiceExists(ctx context.Context, tenantID, legalEntityID, customerID, invoiceNumber string) (bool, error) {
-	u, err := url.Parse(c.arURL + "/v1/invoices")
-	if err != nil {
-		return false, err
-	}
-	q := u.Query()
-	q.Set("legal_entity_id", legalEntityID)
-	q.Set("customer_id", customerID)
-	q.Set("limit", strconv.Itoa(subledgerPageLimit))
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return false, domain.ErrARServiceUnavailable
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false, domain.ErrARServiceUnavailable
-	}
-	var list []arInvoice
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return false, err
-	}
-	for _, inv := range list {
-		if inv.InvoiceNumber == invoiceNumber {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // GetARSubledgerTotal sums the OUTSTANDING (not yet PAID) balance of every
