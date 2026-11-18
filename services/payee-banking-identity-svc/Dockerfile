@@ -1,11 +1,12 @@
 FROM golang:1.25-alpine AS builder
 
-WORKDIR /app
+WORKDIR /app/payee-banking-identity-svc
 
-COPY go.mod go.sum ./
+COPY eventing /app/eventing
+COPY payee-banking-identity-svc/go.mod payee-banking-identity-svc/go.sum ./
 RUN go mod download
 
-COPY . .
+COPY payee-banking-identity-svc/ ./
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /server ./cmd/server
 RUN CGO_ENABLED=0 GOOS=linux go build -o /healthcheck ./cmd/healthcheck

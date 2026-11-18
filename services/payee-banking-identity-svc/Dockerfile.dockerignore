@@ -1,0 +1,4 @@
+# Build context is services/ (see Dockerfile).
+*
+!eventing
+!payee-banking-identity-svc

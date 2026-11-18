@@ -9,7 +9,10 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: zoiko-postgres
-    mem_limit: 1g
+    mem_limit: 2g
+    # ~110 services each hold a connection pool; the default max_connections=100 is
+    # exhausted by roughly 60 of them ("too many clients already").
+    command: ["postgres", "-c", "max_connections=600", "-c", "shared_buffers=256MB"]
     cpus: "1.0"
     ports:
       - "5432:5432"
@@ -3273,8 +3276,8 @@ services:
 
   treasury-svc:
     build:
-      context: ../services/treasury-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: treasury-svc/Dockerfile
     container_name: treasury-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -3288,6 +3291,7 @@ services:
       DB_USER: zoiko_app
       DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.treasury.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3448,8 +3452,8 @@ services:
   # tenant_id filters in every query from day one.
   bank-reconciliation-svc:
     build:
-      context: ../services/bank-reconciliation-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: bank-reconciliation-svc/Dockerfile
     container_name: bank-reconciliation-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -3463,6 +3467,7 @@ services:
       DB_USER: "${DB_USER_BANK_RECONCILIATION:-app_bank_reconciliation}"
       DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.bank-reconciliation.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4490,8 +4495,8 @@ services:
   # fingerprint before authorizing) is not yet wired.
   payee-banking-identity-svc:
     build:
-      context: ../services/payee-banking-identity-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payee-banking-identity-svc/Dockerfile
     container_name: payee-banking-identity-svc
     mem_limit: 256m
     cpus: "0.5"
