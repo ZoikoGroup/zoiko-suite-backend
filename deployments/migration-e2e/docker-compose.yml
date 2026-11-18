@@ -1,6 +1,7 @@
 # Minimal slice for proving migration-integrity-svc <-> general-ledger-svc
-# end to end: ONLY this service, general-ledger-svc, their Postgres, and
-# authorization-svc. Not part of the main deployments/docker-compose.yml
+# end to end, PLUS financial-control-svc reading general-ledger-svc's new
+# migration-batch-tieout control population: ONLY these services, their
+# Postgres, and authorization-svc. Not part of the main deployments/docker-compose.yml
 # (migration-integrity-svc isn't wired into that file at all yet, and this
 # task's instructions are explicit: never boot the whole stack). Kafka is
 # deliberately absent -- kafkaout.New's writer connects lazily (see
@@ -30,6 +31,7 @@ services:
       - ../../services/migration-integrity-svc/deployments/migrations:/migrations/migration-integrity:ro
       - ../../services/general-ledger-svc/deployments/migrations:/migrations/general-ledger:ro
       - ../../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
+      - ../../services/financial-control-svc/deployments/migrations:/migrations/financial-control:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -58,6 +60,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.authorization.events"
       KAFKA_DELEGATION_TOPIC: ""
       AUTHZ_IDENTITY_ASSERTION: "off"
+      AUTHZ_PLATFORM_SCOPE_ENTITY_ID: "aaaaaaaa-0000-4000-8000-0000000000ff"
     depends_on:
       postgres:
         condition: service_healthy
@@ -158,6 +161,49 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: on-failure
+
+  # financial-control-svc: proves its FIN-CTRL-038 (migration-batch-tieout) control now
+  # reads from general-ledger-svc instead of financial-close-svc. Only the one registered
+  # source this proof needs ("general-ledger") -- financial-close-svc is deliberately not
+  # part of this slice at all (the task never touches it).
+  financial-control-svc:
+    build:
+      context: ../../services
+      dockerfile: financial-control-svc/Dockerfile
+    container_name: mige2e-financial-control-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "18171:8171"
+    environment:
+      PORT: "8171"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: financial_control
+      DB_USER: app_financial_control
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.financial-control.events"
+      KAFKA_GROUP_ID: "financial-control-svc"
+      EVENT_RESIDENCY_REGION: "local"
+      EVENT_CLASSIFICATION: "confidential"
+      SOURCE_ENDPOINTS: "general-ledger=http://general-ledger-svc:8098"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8171/readyz"]
       interval: 5s
       timeout: 5s
       retries: 30

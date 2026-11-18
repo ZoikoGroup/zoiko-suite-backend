@@ -34,11 +34,13 @@ echo "Creating databases..."
 create_database migration_integrity
 create_database general_ledger
 create_database authorization_svc
+create_database financial_control
 
 echo "Applying migrations..."
 apply_migrations migration_integrity migration-integrity
 apply_migrations general_ledger general-ledger
 apply_migrations authorization_svc authorization
+apply_migrations financial_control financial-control
 
 # ── Application roles (NOSUPERUSER NOBYPASSRLS), general-ledger-svc and
 # authorization-svc only, matching deployments/scripts/create-app-roles.sh's
@@ -47,7 +49,7 @@ apply_migrations authorization_svc authorization
 # connecting as the superuser for this proof -- its RLS policies are
 # exercised by its own store integration tests, not by this script.
 APP_DB_PASSWORD="${APP_DB_PASSWORD:-postgres}"
-for entry in general_ledger:app_general_ledger authorization_svc:app_authorization; do
+for entry in general_ledger:app_general_ledger authorization_svc:app_authorization financial_control:app_financial_control; do
     db="${entry%%:*}"; role="${entry##*:}"
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<-EOSQL
         DO \$\$
