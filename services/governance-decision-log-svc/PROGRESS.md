@@ -433,7 +433,8 @@ panes, verify, seal, package verify, both downloads, full record).
 
 ## Next steps
 
-- [ ] Commit and open the PR (nothing committed yet).
+- [x] Commit: `c7d00cce` (11 Nov 2026). The PR to `main` is the estate's
+      closure step CL-7 (tracker Session 25). 18 Nov: dashboard row set to 🏁.
 - [x] GDL-2: workflow-svc's ledger relay live (e2e "workflow relay: *").
 - [x] contract-lifecycle-svc, decision-support-svc, evidence-manifest-svc on
       :8450 with their own certificates (D2-2.F07, 11 Nov evening).

@@ -121,7 +121,7 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 | F28 | Router ↔ openapi parity + kin-openapi validity | 🔵 (`TestOpenAPIMatchesTheRouter`, `TestOpenAPIDocumentIsValid`) |
 | R4 | RLS + FORCE on tenant data | 🔵 (000032 on five tables incl. async_operations 000036) |
 | R5 | Every checked action registered in access-control | 🔵 (access-control 000052: six new actions, nine templates) |
-| R10 | Negative paths named after their spec id | 🔵 (see §4; 17 🧭, 29 🟡) |
+| R10 | Negative paths named after their spec id | 🔵 (see §4: every id has a named test except JUR-NEG-17 🧭 and the n/a PDC-02 NP-15/NP-16; JUR-NEG-29 🟡) |
 | JR-FE-1 | Console summary route `GET /v1/jurisdiction-summary` | 🔵 |
 | S2 | asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, scripts/audit.sh, Postman | 🔵 (all present; Postman folders 04–07) |
 | S4 | `deployments/scripts/e2e-jurisdiction-rules-deps.py` | 🔵 (82/82 on 13 Nov with workflow-svc and the feed consumer; 59 + 2 SKIP with `--no-workflow`) |

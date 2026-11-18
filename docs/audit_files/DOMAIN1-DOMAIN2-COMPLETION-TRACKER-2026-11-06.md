@@ -79,10 +79,10 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D1-12 | carta-svc :8142 | 🟡 | 8 | 0 | 2 | 1 | 0 | 4 | 1 | 0 | ✔ · ✔ · ✔ 2 pkgs | none (phase6 compose only) | shared, dead-wired · 2/3 | CA-0 |
 | D1-13 | key-management-svc :8143 | 🟡 | 11 | 0 | 1 | 0 | 0 | 9 | 1 | 0 | ✔ · ✔ · ✔ 3 pkgs | none (phase6 compose only) | shared, dead-wired · 5/5 | KM-0 |
 | D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 0 | 2 | 0 | 25 | 0 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs | S0–S6 by the implementer (S5 16 Nov: every console command driven live, harness 146/146, UI e2e 9/9) | v2.0 · 143/148 (FE `65b5121`) | VC-1; cross-team gaps |
-| D2-2 | governance-decision-log-svc :8083 | ✅ | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 9 pkgs (+ store IT) | S0–S6 verified 11 Nov (9 rows with independence waived by the user); 🏁 after the commit (verifier step 1) | v2.0 · 14/14 | Commit (R3) |
-| D2-3 | policy-svc :8085 | 🟡 | 14 | 10 | 0 | 1 | 3 | 0 | 0 | 1 | ✔ · ✔ · ✔ 16 pkgs (18 Nov: 289 pass, 0 fail, 0 skip) | progress 18 Nov · RELEASE_CERTIFICATE | v2.0 · lifecycle + certification | POL-FE-4 (accounting) |
+| D2-2 | governance-decision-log-svc :8083 | 🏁 | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 9 pkgs (+ store IT) | S0–S6 verified 11 Nov (9 rows with independence waived by the user); verifier step 1 on 18 Nov: committed as one commit `c7d00cce` (105 files, no binaries; edits outside our 16 services are the three decision-log readers F07 names) | v2.0 · 14/14 | — (production broker X3 only) |
+| D2-3 | policy-svc :8085 | 🟡 | 14 | 10 | 0 | 1 | 3 | 0 | 0 | 0 | ✔ · ✔ · ✔ 16 pkgs (18 Nov: 289 pass, 0 fail, 0 skip) | progress 18 Nov · RELEASE_CERTIFICATE | v2.0 · lifecycle + certification | POL-FE-4 (accounting) |
 | D2-4 | obligations-svc :8088 | 🟡 | 14 | 0 | 4 | 5 | 2 | 3 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | none | legacy · 7/24 | OB-0 |
-| D2-5 | authorization-svc :8089 | 🟡 | 23 | 0 | 13 | 4 | 1 | 4 | 0 | 1 | ✔ · ✔ · ✔ 14 pkgs | S0–S6 verified 2 Nov (main merged since); reconfirm | v2.0 · 64/80 | AZ-3 |
+| D2-5 | authorization-svc :8089 | 🟡 | 23 | 4 | 13 | 5 | 0 | 0 | 0 | 1 | ✔ · ✔ · ✔ 14 pkgs (10 Nov: 900 pass / 0 fail / 1 by-design skip) | S0–S6 verified 2 Nov; AZ-3 re-verify after the merge 10 Nov; reconfirm | v2.0 · 64/80 | AZ-FE-1 |
 | D2-6 | workflow-svc :8090 | 🟡 | 23 | 0 | 8 | 7 | 2 | 4 | 1 | 1 | ✔ · ✔ · ✔ 17 pkgs (3 re-run after an App Control block) | none | legacy · 19/76 | WF-0 |
 | D2-7 | evidence-requirements-svc :8130 | 🟡 | 15 | 0 | 9 | 4 | 0 | 1 | 0 | 1 | ✔ · ✔ · ✔ 7 pkgs | S0–S6 verified 5 Nov; reconfirm | v2.0 · 18/22 | ER-W4 |
 | D2-8 | schema-registry-svc :8093 | 🟡 | 10 | 0 | 2 | 1 | 0 | 6 | 0 | 1 | ✔ · ✔ · ✔ 5 pkgs | none (no `progress.md`) | legacy · 5/5 | SR-0 |
