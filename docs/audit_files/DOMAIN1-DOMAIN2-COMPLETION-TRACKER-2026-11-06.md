@@ -4995,6 +4995,36 @@ admin-token volume mounted where a file is expected).
 
 ---
 
+### F2 · Decision sheet for D2-1, D2-2, D2-3, D2-5 (CL-2 draft, 18 Nov 2026)
+
+Drafted for the four services verified on 18 Nov; each waits on its owner. Our side already fails closed or answers explicitly.
+
+| # | Question | Options | Recommendation | Owner | Rows |
+|---|---|---|---|---|---|
+| DS-1 | Who owns entity-jurisdiction applicability (C8, J-05)? | (a) jurisdiction-rules-svc keeps a projection of tenant-entity-registry's assignments; (b) the registry owns it and this service reads it synchronously | (a): already built as a replay-safe projection with a backfill (J-10); the registry stays the owner of the facts | Architecture, with tenant-entity-registry and obligations owners | D2-1.F26 |
+| DS-2 | One precedence model (J-08): rule `precedence_level` or the registry's `precedence`? | (a) rule-level only; (b) registry-level only; (c) both, registry breaking ties | (a): the resolver, the harness and JUR-NEG-02/24 already use it; drop the registry field from the decision | Architecture / Tax Engineering | D2-1.F26 |
+| DS-3 | Public reads tier, `rule_payload` content and event naming (J-09) | Decide per item | Reads stay authenticated; `rule_payload` stays free JSON (typed values belong in parameters); event names follow C3 canonical names alongside | Product / architecture | D2-1.F26 |
+| DS-4 | Exemptions (with reverse charge and place of supply) as a rule family (JUR-NEG-17) | Specify the family, or keep exemptions out of packs | Specify with Tax Engineering as one wave; until then licence and scheme answers name `evidence_required` | Tax Engineering | D2-1 R10 |
+| DS-5 | Consistency policy for pack-version skew between regions (JUR-NEG-29) | Block regulated actions on skew, or report only | Report only (built) until services report the pack version they run; then block for filing actions | Architecture | D2-1 R10 |
+| DS-6 | TOTP as the interim second factor (SO-1) and session maximums 8 h / 2 h / 4 h (SO-2) | Sign off, or change | Sign off as built; revisit with the external IdP (D-4) | Security | D2-5.F16 |
+| DS-7 | Authoritative FX basis for limit comparisons (A09) | Reference-rate table (built) or a live rate source (REF-03 rate sets) | Keep the table locally; wire REF-03 when ORG-8 lands (EST-8 IAM-5) | Finance / pre-production | D2-5 (SPEC_DEVIATIONS #4) |
+| DS-8 | ACTIVE tie-break between policy versions at one scope | Refuse the tie (built: POLICY_CONFLICTED) or a precedence rule | Keep refusing; a tie is a governance error to fix, not to guess | Business owner | D2-3 |
+| DS-9 | Governed authority-source records (V-001 PDC-01) | Keep the GOV-05 model (version = package) or build PDC-01 aggregates | Roadmap: build when a service owns authority sources | Architecture | D2-3 (SPEC_DEVIATIONS) |
+
+### F3 · Cross-team requests for the same four services (CL-4 draft, 18 Nov 2026; not sent)
+
+Each names what to change, why, and the evidence. "Sent" is filled in when the user sends it.
+
+| # | To | What | Why | Evidence | Sent |
+|---|---|---|---|---|---|
+| CT-1 | external-data-feed-svc owner | Publish `regulatory.source.changed` (contract in jurisdiction-rules-svc `asyncapi.yaml`) with `external_feed_reference` | Automatic legal drift (J-03, J-04): matching ACTIVE rules move to UNDER_REVIEW | Consumer proven with a synthetic event, e2e 82/82 | — |
+| CT-2 | Tax and payroll reader services | Forward the caller's identity envelope on jurisdiction reads and runtime resolutions | Lets jurisdiction-rules-svc move reads from `warn` to `require` (J-01, X5) | D2-1.F24; admin writes already require it | — |
+| CT-3 | access-control-svc (D1-9, session 3) | Call authorization-svc's admin API over mTLS as the registered delegate: move `internal/mtls` to `identity-envelope/mtlsclient` (bootstrap token), set `AUTHZ_MTLS_ENABLED` in compose, add it to the keygen list | Blocks `AUTHZ_IDENTITY_ASSERTION=require` (AZ-2); a trial on 18 Nov refused its role provisioning (503 `authz_admin_unavailable`) | authorization-svc SPEC_DEVIATIONS (switch table) | ours, next |
+| CT-4 | Every PEP calling `/v1/authorize` | Present a client certificate (M-02); forward `X-Authn-Age-Seconds` (X-3); always send `X-Tenant-Id` (X-1) | Lets the three remaining authz switches move to strict | authorization-svc SPEC_DEVIATIONS | — |
+| CT-5 | expense-claim-svc, payment-authorization-svc owners | Send decimal amounts and the currency to policy evaluation; read `outcome` so evaluate can answer 200 (Doc 02 §9) | PDC-I-11 explicit currency; mandatory currency on new APPROVAL_THRESHOLD versions | policy-svc SPEC_DEVIATIONS | — |
+| CT-6 | governance-decision-log-svc (ours) with policy-svc | Decide D-06: purpose header on reads only | Removes P-07's header on ledger appends | policy-svc SPEC_DEVIATIONS P-07 | — |
+| CT-7 | Dev tooling (ours) | Move `seed-demo-rbac.ps1` and `e2e-authorization-scenarios.py` off headers-only admin calls (envelopes or mTLS delegates) | The other AZ-2 blocker; needed for EST-1 | 18 Nov trial | — |
+
 ## Part G · Re-score log
 
 One dated entry per verifier pass that re-scores rows: service, rows re-scored (old → new), new score, evidence (commit, test, E2E output). Newest last.
