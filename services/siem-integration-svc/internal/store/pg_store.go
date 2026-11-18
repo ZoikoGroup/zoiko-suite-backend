@@ -120,6 +120,40 @@ func (s *PgStore) GetExporterByID(ctx context.Context, tenantID, id string) (*do
 	return out, err
 }
 
+func (s *PgStore) SetExporterStatus(ctx context.Context, tenantID, id string, from []domain.ExporterStatus, to domain.ExporterStatus) (*domain.SIEMExporter, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, ErrNotFound
+	}
+	fromText := make([]string, len(from))
+	for i, f := range from {
+		fromText[i] = string(f)
+	}
+	var out *domain.SIEMExporter
+	err := s.inTenantTx(ctx, tenantID, func(tx pgx.Tx) error {
+		e, err := scanExporter(tx.QueryRow(ctx,
+			`UPDATE siem_exporters SET status = $3, updated_at = now()
+			  WHERE tenant_id = $1 AND id = $2 AND status = ANY($4)
+			  RETURNING `+exporterColumns, tenantID, id, string(to), fromText))
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Either not in this tenant, or in a status the change does not accept.
+			var exists bool
+			if qerr := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM siem_exporters WHERE tenant_id = $1 AND id = $2)`, tenantID, id).Scan(&exists); qerr != nil {
+				return fmt.Errorf("check exporter: %w", qerr)
+			}
+			if exists {
+				return ErrInvalidTransition
+			}
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("set exporter status: %w", err)
+		}
+		out = e
+		return nil
+	})
+	return out, err
+}
+
 func (s *PgStore) ListExporters(ctx context.Context, tenantID, legalEntityID string) ([]domain.SIEMExporter, error) {
 	var out []domain.SIEMExporter
 	err := s.inTenantTx(ctx, tenantID, func(tx pgx.Tx) error {

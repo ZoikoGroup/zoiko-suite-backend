@@ -59,7 +59,8 @@ func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 
 // Action constants passed to authorization-svc as action_type.
 const (
-	CartaAssessmentRead = "CARTA_ASSESSMENT_READ"
+	CartaAssessmentRead       = "CARTA_ASSESSMENT_READ"
+	CartaAssessmentReevaluate = "CARTA_ASSESSMENT_REEVALUATE"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -194,6 +195,7 @@ func NewRouter(h *Handler) http.Handler {
 		r.Post("/evaluate", h.EvaluateAccess)
 		r.Get("/assessments", h.ListAssessments)
 		r.Get("/assessments/{id}", h.GetAssessment)
+		r.Post("/assessments/{id}/reevaluate", h.ReevaluateAssessment)
 	})
 	return r
 }
@@ -219,6 +221,54 @@ func (h *Handler) EvaluateAccess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.okJSON(w, r, 201, asm)
+}
+
+// ReevaluateAssessment scores an assessment's recorded access context again
+// with the current model and records the result as a new assessment. The
+// original is never changed: assessments are the evidence of a decision taken
+// at a point in time. The caller must be authorized on the assessment's own
+// legal entity.
+func (h *Handler) ReevaluateAssessment(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	prev, err := h.store.GetAssessmentByID(r.Context(), tenantID, chi.URLParam(r, "id"))
+	if errors.Is(err, store.ErrNotFound) {
+		h.errJSON(w, r, 404, "assessment not found")
+		return
+	}
+	if err != nil {
+		h.logger.Error("get assessment failed", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to read assessment")
+		return
+	}
+	if !h.authorize(w, r, principalID, prev.LegalEntityID, CartaAssessmentReevaluate) {
+		return
+	}
+	req := domain.EvaluateRequest{LegalEntityID: prev.LegalEntityID, Context: prev.Context}
+	if err := req.Validate(); err != nil {
+		h.errJSON(w, r, http.StatusUnprocessableEntity, "the recorded context can no longer be evaluated: "+err.Error())
+		return
+	}
+	asm := domain.EvaluateAccess(&req, tenantID)
+	if err := h.store.SaveAssessment(r.Context(), tenantID, asm); err != nil {
+		h.logger.Error("save assessment failed", zap.Error(err))
+		h.errJSON(w, r, 500, "failed to save assessment")
+		return
+	}
+	h.logger.Info("carta assessment re-evaluated",
+		zap.String("previous_assessment_id", prev.ID), zap.String("assessment_id", asm.ID),
+		zap.String("principal_id", principalID), zap.String("decision", string(asm.Decision)))
+	h.okJSON(w, r, 201, map[string]interface{}{
+		"assessment":             asm,
+		"previous_assessment_id": prev.ID,
+		"previous_decision":      prev.Decision,
+	})
 }
 
 func (h *Handler) GetAssessment(w http.ResponseWriter, r *http.Request) {

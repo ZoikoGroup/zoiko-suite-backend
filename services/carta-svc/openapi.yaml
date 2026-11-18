@@ -186,6 +186,48 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  /v1/carta/assessments/{id}/reevaluate:
+    post:
+      summary: Re-evaluate an assessment
+      description: Scores the assessment's recorded access context again with the current model and records the result as a new assessment. The original is not changed.
+      operationId: ReevaluateAssessment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '201':
+          description: The new assessment, with the previous assessment id and decision
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assessment: { $ref: '#/components/schemas/CartaAssessment' }
+                  previous_assessment_id: { type: string }
+                  previous_decision: { type: string }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to re-evaluate (CARTA_ASSESSMENT_REEVALUATE)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Assessment not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: The recorded context can no longer be evaluated
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
 components:
   schemas:
     Problem:

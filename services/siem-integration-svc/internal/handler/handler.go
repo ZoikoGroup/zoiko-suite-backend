@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,6 +52,7 @@ func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 const (
 	SiemExporterCreate = "SIEM_EXPORTER_CREATE"
 	SiemExporterRead   = "SIEM_EXPORTER_READ"
+	SiemExporterUpdate = "SIEM_EXPORTER_UPDATE"
 	SiemEventRead      = "SIEM_EVENT_READ"
 )
 
@@ -189,6 +191,10 @@ func NewRouter(h *Handler) http.Handler {
 		r.Post("/exporters", h.CreateExporter)
 		r.Get("/exporters", h.ListExporters)
 		r.Get("/exporters/{id}", h.GetExporter)
+		// Lifecycle: ACTIVE -> PAUSED -> ACTIVE; ACTIVE|PAUSED -> DISABLED (final).
+		r.Post("/exporters/{id}/pause", h.transitionExporter([]domain.ExporterStatus{domain.ExporterActive}, domain.ExporterPaused))
+		r.Post("/exporters/{id}/resume", h.transitionExporter([]domain.ExporterStatus{domain.ExporterPaused}, domain.ExporterActive))
+		r.Post("/exporters/{id}/disable", h.transitionExporter([]domain.ExporterStatus{domain.ExporterActive, domain.ExporterPaused}, domain.ExporterDisabled))
 		r.Post("/stream", h.StreamEvent)
 		r.Get("/events", h.ListEvents)
 	})
@@ -264,6 +270,44 @@ func (h *Handler) GetExporter(w http.ResponseWriter, r *http.Request) {
 	h.okJSON(w, r, 200, exp)
 }
 
+// transitionExporter changes an exporter's status. It is authorized against
+// the exporter row's own legal entity, never a caller-supplied scope, and a
+// status the change does not accept is refused with 409.
+func (h *Handler) transitionExporter(from []domain.ExporterStatus, to domain.ExporterStatus) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenantID, ok := requireTenant(w, r)
+		if !ok {
+			return
+		}
+		principalID, ok := h.requirePrincipal(w, r)
+		if !ok {
+			return
+		}
+		id := chi.URLParam(r, "id")
+		exp, err := h.store.GetExporterByID(r.Context(), tenantID, id)
+		if err != nil {
+			h.lookupFailed(w, r, err)
+			return
+		}
+		if !h.authorize(w, r, principalID, exp.LegalEntityID, SiemExporterUpdate) {
+			return
+		}
+		updated, err := h.store.SetExporterStatus(r.Context(), tenantID, id, from, to)
+		if errors.Is(err, store.ErrInvalidTransition) {
+			h.errJSON(w, r, http.StatusConflict, fmt.Sprintf("exporter is %s; this change does not apply", exp.Status))
+			return
+		}
+		if err != nil {
+			h.lookupFailed(w, r, err)
+			return
+		}
+		h.logger.Info("siem exporter status changed",
+			zap.String("exporter_id", id), zap.String("from", string(exp.Status)), zap.String("to", string(to)),
+			zap.String("principal_id", principalID))
+		h.okJSON(w, r, http.StatusOK, updated)
+	}
+}
+
 func (h *Handler) ListExporters(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := requireTenant(w, r)
 	if !ok {
@@ -332,6 +376,16 @@ func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := req.Validate(); err != nil {
 		h.errJSON(w, r, 400, err.Error())
+		return
+	}
+	// A paused or disabled exporter accepts no events.
+	exp, err := h.store.GetExporterByID(r.Context(), tenantID, req.ExporterID)
+	if err != nil {
+		h.lookupFailed(w, r, err)
+		return
+	}
+	if exp.Status != domain.ExporterActive {
+		h.errJSON(w, r, http.StatusConflict, fmt.Sprintf("exporter is %s; it accepts no events", exp.Status))
 		return
 	}
 	evt := &domain.SIEMEvent{
