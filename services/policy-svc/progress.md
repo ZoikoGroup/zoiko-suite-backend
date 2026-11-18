@@ -1,5 +1,34 @@
 # Policy Service — Progress & Phase Plan
 
+## VC-1 and POL-FE-4 — 18 November 2026 (later; current status)
+
+Verified by a session that built none of F01–F13 (F14's accounting half was built in it; the
+user waived independence for that half). Tracker D2-3: 14 ✅ of 14.
+
+| Check | Result |
+|---|---|
+| Suites | 289 pass / 0 fail / 0 skip (store on a scratch Postgres, `REQUIRE_DB_TESTS=1`) |
+| Mutants | 2/2 killed: the author approves their own version (`TestLifecycle_MakerCheckerAndApprovalRequired`, `TestAccountingLifecycle_TheAuthorIsNeverTheCheckerAndEveryStepIsOrdered`); any basis counts as the break-glass session (`TestEmergencySuspend_NeedsASessionNotJustThePermission`) |
+| Migrations | 000010–000013 up / down / up on a scratch database |
+| Callers (P-13) | `TestEvaluate_RefusedCallerIsNotAnOutage` (expense-claim, payment-authorization), `TestApprovalPolicyFailsClosed` (payroll-run) re-run: pass |
+| Live | `e2e-policy-deps.py` 112/112 under enforce; `scripts/audit.sh` 48/0 |
+| Console | `policies.spec.ts` 16/16 (frontend `91fc4d9`, `b8e043e`) |
+
+POL-FE-4 (frontend): accounting draft with impact analysis and a pinned rule mapping (policy-svc's
+problem list shown on refusal), the REF-07 commands on accounting versions in place of the GOV-05
+ones (which this service refuses for accounting families), supersede by name, emergency
+suspension carrying `X-Break-Glass-Session-Id`, review-suspension, and the resolution and
+applicability from `/v1/policies/explain`, `/v1/accounting-policies/explain` and
+`/v1/accounting-policies`. Not driven live: a successful emergency suspension and its review
+(a live break-glass session needs a TOTP step-up the demo principals cannot give).
+
+Demo seed (`05b3d281`): POLICY_FULL now carries the PDC-05 and ACCOUNTING_POLICY_* actions; the
+seed replaces a bundle's actions, so the PDC-05 ones that only `e2e-policy-deps.py` added by psql
+were removed by every seed run.
+
+Open, owned elsewhere: ACTIVE tie-break sign-off (business); callers reading `outcome` so evaluate
+can answer 200; the two float callers; P-07 (decision-log D-06); production keys and grants.
+
 ## Completion pass — 18 November 2026 (current status; supersedes the sections below)
 
 Release evidence: `RELEASE_CERTIFICATE.md`. Live audit: `scripts/audit.sh` 48/0.

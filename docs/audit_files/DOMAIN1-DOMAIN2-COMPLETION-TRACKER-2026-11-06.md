@@ -80,7 +80,7 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D1-13 | key-management-svc :8143 | 🟡 | 11 | 0 | 1 | 0 | 0 | 9 | 1 | 0 | ✔ · ✔ · ✔ 3 pkgs | none (phase6 compose only) | shared, dead-wired · 5/5 | KM-0 |
 | D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 0 | 2 | 0 | 25 | 0 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs | S0–S6 by the implementer (S5 16 Nov: every console command driven live, harness 146/146, UI e2e 9/9) | v2.0 · 143/148 (FE `65b5121`) | VC-1; cross-team gaps |
 | D2-2 | governance-decision-log-svc :8083 | 🏁 | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 9 pkgs (+ store IT) | S0–S6 verified 11 Nov (9 rows with independence waived by the user); verifier step 1 on 18 Nov: committed as one commit `c7d00cce` (105 files, no binaries; edits outside our 16 services are the three decision-log readers F07 names) | v2.0 · 14/14 | — (production broker X3 only) |
-| D2-3 | policy-svc :8085 | 🟡 | 14 | 10 | 0 | 1 | 3 | 0 | 0 | 0 | ✔ · ✔ · ✔ 16 pkgs (18 Nov: 289 pass, 0 fail, 0 skip) | progress 18 Nov · RELEASE_CERTIFICATE | v2.0 · lifecycle + certification | POL-FE-4 (accounting) |
+| D2-3 | policy-svc :8085 | ✅ | 14 | 14 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 16 pkgs (18 Nov: 289 pass, 0 fail, 0 skip) | VC-1 18 Nov (e2e 112/112, audit 48/0, 2 mutants, up/down/up); F14 independence waived | v2.0 · 34/39 (5 with a recorded reason) | — (cross-team and the tie-break decision only) |
 | D2-4 | obligations-svc :8088 | 🟡 | 14 | 0 | 4 | 5 | 2 | 3 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | none | legacy · 7/24 | OB-0 |
 | D2-5 | authorization-svc :8089 | 🟡 | 23 | 19 | 0 | 2 | 0 | 0 | 1 | 1 | ✔ · ✔ · ✔ 14 pkgs (18 Nov: 903 pass / 0 fail / 1 by-design skip, both DSNs) | VC-1 18 Nov (deps 33/33, personas 78/78, audit 49/0, 2 mutants); AZ-2 blocked by access-control-svc and the dev seed | v2.0 · 80/80 | AZ-2 (after D1-9 mTLS) |
 | D2-6 | workflow-svc :8090 | 🟡 | 23 | 0 | 8 | 7 | 2 | 4 | 1 | 1 | ✔ · ✔ · ✔ 17 pkgs (3 re-run after an App Control block) | none | legacy · 19/76 | WF-0 |
@@ -945,27 +945,27 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 | Spec | Doc 03 §8.1; GOV-05; ZS-SVC-V-001; REF-07 |
 | Latest score | 54 met / 2 partial / 0 failed of 56 (96.4%, 98.2% weighted) |
 | New since the audit | `openapi.yaml` + parity test (28 Oct); REF-2 waves 1–2 (`b1761456`, `196d2a71`, 07Yashjais). REF-2 not audited. 18 Nov: identity enforced (POL-3), 47 `x-spec-operation` tags (EST-7), consumer tests, `scripts/audit.sh`, `RELEASE_CERTIFICATE.md` |
-| Stages | `progress.md` updated 18 Nov 2026; evidence in `services/policy-svc/RELEASE_CERTIFICATE.md` |
+| Stages | `progress.md` updated 18 Nov 2026; evidence in `services/policy-svc/RELEASE_CERTIFICATE.md`. **18 Nov VC-1:** suites 289/0/0, 2 mutants killed, migrations 000010–000013 up/down/up, `e2e-policy-deps.py` 112/112, `audit.sh` 48/0, `policies.spec.ts` 16/16 |
 | Console | `/admin/policies` v2.0: GOV-05 lifecycle, PDC-05 certification, compare, attestations, evidence re-drive (accounting policies still to do) |
 
 **Features**
 
 | ID | Feature | Status | Evidence | What is needed |
 |---|---|---|---|---|
-| D2-3.F01 | Policies and versions: `GET/POST /v1/policies`, `GET …/{id}`, `GET/POST …/{id}/versions`, `GET /v1/policy-versions/{id}`, `GET …/transitions`, `GET /v1/policy-versions/compare` | ✅ | 18 Nov: `e2e-policy-deps.py` 112/112 under enforce; UI e2e 12/12; `scripts/audit.sh` 48/0 | — |
-| D2-3.F02 | GOV-05 lifecycle: `POST …/versions/{v}/submit-review`, `…/approve` (maker-checker + own-object SoD), `…/activate`, `…/schedule`, `…/suspend`, `…/review-suspension` (suspender cannot review), `…/retire`; If-Match mandatory (428) | ✅ | 18 Nov: `e2e-policy-deps.py` 112/112 under enforce; UI e2e 12/12; `scripts/audit.sh` 48/0; maker–checker and suspender-cannot-review proven from the console | — |
-| D2-3.F03 | Evaluate, resolve, explain, evidence: `POST /v1/policies/evaluate`, `GET /v1/policies/resolve`, `GET /v1/policies/explain`, `GET /v1/policy-evaluations/{id}` | ✅ | 18 Nov: `e2e-policy-deps.py` 112/112 under enforce; UI e2e 12/12; `scripts/audit.sh` 48/0 | — |
-| D2-3.F04 | Evidence relayed into governance-decision-log-svc as `svc-policy` (durable outbox) | ✅ | 18 Nov: ledger relay checks in `e2e-policy-deps.py` 112/112; no FAILED evidence (`audit.sh`); console re-drive for FAILED rows | — |
-| D2-3.F05 | 8 event types; `jurisdiction_context` and `residency_region` on events | ✅ | 18 Nov: Kafka proof in `e2e-policy-deps.py` (`policy.version.activated` on `zoiko.policy.events`); consumed events tested (`internal/consumer`) | — |
-| D2-3.F06 | Control tests and attestations: `POST /v1/control-test-definitions`, `GET …/{id}`, `GET/POST …/{id}/executions`, `GET /v1/controls/{ref}/effectiveness`, `POST /v1/attestations`, `GET …/{id}`, `POST …/{id}/revoke` | ✅ | 18 Nov: UI e2e defines a control test, records a result, signs and revokes an attestation | — |
-| D2-3.F07 | Identity verification (JWKS envelope, or mTLS on `:8449`) | ✅ | 18 Nov: compose `enforce`. e2e 112/112 under enforce; caller wire probe 6/6 (expense-claim, payment-authorization, payroll-run forward the envelope; none → 401 → their fail-closed 403) | — |
-| D2-3.F08 | Evaluation for SPEND_CONTROL, SIGNATORY_MATRIX, SOD_RULE, LEGAL_BASIS (P-01) | 🔵 | 17 Nov: SIGNATORY_MATRIX resolved here; the other three are references (NOT_IMPLEMENTED) | — |
-| D2-3.F09 | `openapi.yaml` with router parity | ✅ | `TestOpenAPI_MatchesTheRouter`; 18 Nov: `TestOpenAPI_NamedSpecOperationsAreTagged` (EST-7, 47 tags, mutation-checked) | — |
-| D2-3.F10 | REF-07 accounting policy: `GET/POST /v1/accounting-policies`, `GET …/resolve`, `GET …/explain`, `GET …/versions/{id}`, `GET …/versions/{id}/impact`, `POST …/versions/{id}/submit-review|approve|activate|supersede|emergency-suspend|review-suspension` | 🔵 | REF-2 waves 1–2; registered actions 000039, 000040 | POL-1 |
-| D2-3.F11 | Callers report a policy-svc 401/403 as 401/403, not 503 (P-13: expense-claim-svc, payment-authorization-svc) | ✅ | `956e68cc`, `de8264f6`; 18 Nov: `TestEvaluate_RefusedCallerIsNotAnOutage` (both), `TestApprovalPolicyFailsClosed` pass | — |
-| D2-3.F12 | V-001 PDC-05 certification suites, simulation, waivers | ✅ | POL-4 built; 18 Nov: certified from the console before activation (UI e2e) | — |
-| D2-3.F13 | Cursor paging (API-4) on `GET /v1/policies`, `GET /v1/accounting-policies`, executions | 🔵 | `TestLists_*`, `TestRegisters_ScopedFilteredPagedAndCounted` | POL-1 |
-| D2-3.F14 | Dependency E2E and console v2.0 | 🟡 | 18 Nov: e2e 112/112 under enforce; console lifecycle, certification, compare, attestations, re-drive; UI e2e 12/12. Accounting policies not on the page | POL-FE-4 |
+| D2-3.F01 | Policies and versions: `GET/POST /v1/policies`, `GET …/{id}`, `GET/POST …/{id}/versions`, `GET /v1/policy-versions/{id}`, `GET …/transitions`, `GET /v1/policy-versions/compare` | ✅ | VC-1 18 Nov 2026 (verifier did not build the row): suites 289 pass / 0 fail / 0 skip (store on Postgres 16, `REQUIRE_DB_TESTS=1`); `e2e-policy-deps.py` 112/112 under enforce; `audit.sh` 48/0; `policies.spec.ts` 16/16 | — |
+| D2-3.F02 | GOV-05 lifecycle: `POST …/versions/{v}/submit-review`, `…/approve` (maker-checker + own-object SoD), `…/activate`, `…/schedule`, `…/suspend`, `…/review-suspension` (suspender cannot review), `…/retire`; If-Match mandatory (428) | ✅ | VC-1 18 Nov 2026: mutant "the author approves their own version" killed (`TestLifecycle_MakerCheckerAndApprovalRequired`, `TestAccountingLifecycle_TheAuthorIsNeverTheCheckerAndEveryStepIsOrdered`); console maker–checker and suspender-cannot-review (`policies.spec.ts` 16/16); suites 289/0/0 | — |
+| D2-3.F03 | Evaluate, resolve, explain, evidence: `POST /v1/policies/evaluate`, `GET /v1/policies/resolve`, `GET /v1/policies/explain`, `GET /v1/policy-evaluations/{id}` | ✅ | VC-1 18 Nov 2026: `e2e-policy-deps.py` 112/112 (evaluate, resolve, explain, evidence); suites 289/0/0 | — |
+| D2-3.F04 | Evidence relayed into governance-decision-log-svc as `svc-policy` (durable outbox) | ✅ | VC-1 18 Nov 2026: ledger relay checks in `e2e-policy-deps.py` 112/112 with governance-decision-log-svc in `require`; `audit.sh` 48/0 (policy_evidence_outbox FAILED = 0) | — |
+| D2-3.F05 | 8 event types; `jurisdiction_context` and `residency_region` on events | ✅ | VC-1 18 Nov 2026: Kafka read-back in `e2e-policy-deps.py` 112/112; `TestAsyncAPI_MatchesTheCode` and consumer tests in the suite (289/0/0); `audit.sh` outbox unpublished = 0 | — |
+| D2-3.F06 | Control tests and attestations: `POST /v1/control-test-definitions`, `GET …/{id}`, `GET/POST …/{id}/executions`, `GET /v1/controls/{ref}/effectiveness`, `POST /v1/attestations`, `GET …/{id}`, `POST …/{id}/revoke` | ✅ | VC-1 18 Nov 2026: `policies.spec.ts` defines a control test, records a result, signs and revokes an attestation (16/16); suites 289/0/0 | — |
+| D2-3.F07 | Identity verification (JWKS envelope, or mTLS on `:8449`) | ✅ | VC-1 18 Nov 2026: compose `POLICY_IDENTITY_VERIFY=enforce`; `e2e-policy-deps.py` 112/112 signs in as admin@ and legal.counsel@; the console spec runs under enforce | — |
+| D2-3.F08 | Evaluation for SPEND_CONTROL, SIGNATORY_MATRIX, SOD_RULE, LEGAL_BASIS (P-01) | ✅ | VC-1 18 Nov 2026: SIGNATORY_MATRIX resolved here (e2e: the matrix's boundary suite runs through the live evaluator); SPEND_CONTROL, SOD_RULE and LEGAL_BASIS are references answered 501 with the owning service named (e2e P0-01), by the P-01 decision of 17 Nov (SPEC_DEVIATIONS) | — |
+| D2-3.F09 | `openapi.yaml` with router parity | ✅ | VC-1 18 Nov 2026: `TestOpenAPI_MatchesTheRouter`, `TestOpenAPI_NamedSpecOperationsAreTagged` in the suite (289/0/0) | — |
+| D2-3.F10 | REF-07 accounting policy: `GET/POST /v1/accounting-policies`, `GET …/resolve`, `GET …/explain`, `GET …/versions/{id}`, `GET …/versions/{id}/impact`, `POST …/versions/{id}/submit-review|approve|activate|supersede|emergency-suspend|review-suspension` | ✅ | VC-1 18 Nov 2026: REF-07 store and handler suites (289/0/0) incl. `TestREF07_StaleVersionIs412`; mutant "any basis counts as the break-glass session" killed (`TestEmergencySuspend_NeedsASessionNotJustThePermission`); console (FE `91fc4d9`): draft with impact and a pinned rule, maker–checker, activate, supersede by name, emergency suspension refused without a live session. Migrations 000010–000013 up/down/up on scratch | — |
+| D2-3.F11 | Callers report a policy-svc 401/403 as 401/403, not 503 (P-13: expense-claim-svc, payment-authorization-svc) | ✅ | VC-1 18 Nov 2026, re-run: `TestEvaluate_RefusedCallerIsNotAnOutage` (expense-claim-svc, payment-authorization-svc) and `TestApprovalPolicyFailsClosed` (payroll-run-svc) pass on the branch (`956e68cc`, `de8264f6`); caller wire probe in `e2e-policy-deps.py` 112/112 | — |
+| D2-3.F12 | V-001 PDC-05 certification suites, simulation, waivers | ✅ | VC-1 18 Nov 2026: PDC-05 suites in 289/0/0; certified from the console before activation (`policies.spec.ts`) | — |
+| D2-3.F13 | Cursor paging (API-4) on `GET /v1/policies`, `GET /v1/accounting-policies`, executions | ✅ | VC-1 18 Nov 2026: `TestLists_*`, `TestRegisters_ScopedFilteredPagedAndCounted` in 289/0/0; `/v1/policies` and `/v1/accounting-policies` stay applicability sets by design (SPEC_DEVIATIONS) | — |
+| D2-3.F14 | Dependency E2E and console v2.0 | ✅ | 18 Nov 2026, independence waived by the user for the accounting half (POL-FE-4 built in this session): `e2e-policy-deps.py` 112/112 under enforce; console lifecycle, certification, compare, attestations, re-drive and accounting policies; `policies.spec.ts` 16/16 live; tsc, eslint clean | — |
 
 **Tasks**
 
@@ -992,9 +992,9 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 - [x] **POL-FE-1 · Summary route + API client** for every route in Appendix B D2-3. `lib/api/policies.ts` covers the routes; every read goes out as the signed-in principal (`Caller`: X-Principal-Id plus the envelope), because policy-svc authorizes each read. `lib/api/client.ts` supports `extraHeaders` for break-glass.
 - [x] **POL-FE-2 · Page v2.0.** 17 Nov, built to the "Policies & Controls" (Governance & Risk) mock. 18 Nov: the drawer's Requirements tab carries the GOV-05 commands by status (submit-review, approve, activate / schedule, suspend, review-suspension, retire; each sends the version's row_version), PDC-05 certification (chip per version, test suite with add-test-case, run suite, waiver request and approval) and family retirement; History compares two versions; Evidence signs and revokes attestations and re-drives FAILED evidence. Fixed: activation sent no `expected_version` (428), and under enforce version drafts were 401 because the API client dropped the envelope. Accounting policies moved to POL-FE-4.
 - [x] **POL-FE-3 · UI E2E** `tests/e2e/console/policies.spec.ts`, 12/12 live on 18 Nov (twice) against policy-svc in enforce: the 5 control-test cases plus a two-person block (admin as maker, legal counsel as checker): draft, certify against two test cases, submit; the author's approval refused; checker approves and activates; the suspender's review refused, the checker's recorded; versions compare; an attestation signed and revoked.
-- [ ] **POL-FE-4 · Accounting policies (REF-07) on the page:** draft with rule mappings and impact, submit-review / approve / activate / supersede, emergency suspension under a break-glass session (`extraHeaders`), review-suspension; UI e2e including the break-glass path.
+- [x] **POL-FE-4 · Accounting policies (REF-07) on the page:** *18 Nov (FE `91fc4d9`, `b8e043e`): draft (impact, pinned rule mapping, policy-svc's own problem list on refusal), REF-07 commands in the drawer instead of the GOV-05 ones, supersede by name, emergency suspension with the session id (`X-Break-Glass-Session-Id`), review-suspension; resolution and applicability from policy-svc's explain. `policies.spec.ts` 16/16. The emergency suspension's success and its review need a live break-glass session, which needs a TOTP step-up the demo principals cannot give: the refusal without one is driven. Demo grants: seed `05b3d281`.* draft with rule mappings and impact, submit-review / approve / activate / supersede, emergency suspension under a break-glass session (`extraHeaders`), review-suspension; UI e2e including the break-glass path.
 
-**Blocked and decisions:** none for POL-0…POL-FE-3 (18 Nov). Open: POL-FE-4; business sign-off on the ACTIVE tie-break.
+**Blocked and decisions:** none for POL-0…POL-FE-4 (18 Nov). Open: business sign-off on the ACTIVE tie-break (decision); callers reading `outcome` so evaluate can answer 200, and the two float callers (cross-team, SPEC_DEVIATIONS).
 
 ---
 
@@ -5002,6 +5002,7 @@ One dated entry per verifier pass that re-scores rows: service, rows re-scored (
 | Date | Service | Rows re-scored | New score | Evidence |
 |---|---|---|---|---|
 | 6 Nov 2026 | (all) | None: file built from the six sources | Latest scores are in D2 (Domain 1) and E2 (Domain 2; later passes in E9 and E11) | The `Source:` lines in this file |
+| 18 Nov 2026 | D2-3 policy-svc | VC-1: F01–F07, F09, F11–F13 (set ✅ by the 18 Nov implementing session without a verifier) confirmed; F08, F10, F13 🔵 → ✅; F14 🟡 → ✅ with independence waived by the user (POL-FE-4 built in this session) | 14 ✅ of 14 | Host suites 289 pass / 0 fail / 0 skip (store on a scratch Postgres, `REQUIRE_DB_TESTS=1`); mutants killed 2/2 (author approves own version; any basis counts as the break-glass session); migrations 000010–000013 up/down/up on scratch; callers' P-13 tests re-run (expense-claim, payment-authorization, payroll-run); live `e2e-policy-deps.py` 112/112 under enforce, `audit.sh` 48/0; console `policies.spec.ts` 16/16, tsc / eslint clean. Seed fixed so the demo POLICY_FULL keeps the PDC-05 and REF-07 actions (`05b3d281`) |
 | 18 Nov 2026 | D2-5 authorization-svc | VC-1: F01–F12, F14 ("Reconfirm") and F15, F17, F19, F20, F22 → ✅ (the verifier built none of them). F23 → ✅ with independence waived by the user (AZ-FE-1/2 built in this session). F21 → ⛔ (production measurement). F13, F18 stay 🟡 (AZ-2, callers). F16 🧭 | 19 ✅ · 2 🟡 · 1 ⛔ · 1 🧭 of 23 | Image rebuilt from the branch (host binaries over the 10 Nov image). Host suites 903 pass / 0 fail / 1 by-design skip (`TEST_DATABASE_URL` legacy + `AUTHZ_IT_DSN` NOBYPASSRLS); mutants killed 2/2 (holder resumes own grant; mutation without If-Match); live `e2e-authorization-deps.py` 33/33 (siem-integration-svc, otel-collector, Jaeger up), `e2e-authorization-scenarios.py` 78/78, `audit.sh` 49/0; console `authorization.spec.ts` 11/11, tsc / eslint clean, vitest 197/197. `AUTHZ_IDENTITY_ASSERTION=require` trial: identity 61/61 and the console pass; access-control-svc, the dev seed and the persona harness fail, so compose stays `warn` |
 | 11 Nov 2026 (latest) | D2-2 governance-decision-log-svc | F01–F04, F07–F09, F11, F13 🔵 → ✅, **independence waived by the user** (built and verified in the same session); dashboard 13/13 ✅ | 13 ✅ of 13 | Uncommitted tree. Suites (golang:1.26): GDL 215/0/0 (DB), identity-envelope, contract-lifecycle, decision-support, evidence-manifest, policy, workflow ok; authorization store 152/0/1, access-control 155/0/0 (all 51 migrations); authorization 000042/000043 and access-control 000050/000051 up/down/up; mutants 6/6 killed; R7 callers and R5 registrations checked; live: seed verification, e2e 128/128 (require), --scheduled-seal 4/4, audit.sh live 40/40 (its 3 host-test sections blocked by Windows Application Control, run in the container instead), governance.spec.ts 5/5, tsc/eslint clean, vitest 8/8 |
 | 11 Nov 2026 (late) | D2-2 governance-decision-log-svc | No status change (implementer pass): F04, F07, F13 evidence extended — event schemas registered (R9), reader grants by migration (authorization-svc 000042, AC-2 in part), console spec re-run | 4 ✅ · 9 🔵 · 0 🟡 · 0 🧭 of 13 | GDL suite 215/0/0; authorization store suite 151/0/1 (the by-design skip); e2e 128/128; governance.spec.ts 5/5; schema registration run twice (idempotent, v1 each) |
@@ -6418,42 +6419,17 @@ Every screen-relevant route is called.
 | POST | `/v1/decisions/{decision_id}/replay` |
 | GET | `/v1/decisions/{decision_id}/replay-manifests` |
 
-## D2-3 · policy-svc: client calls 7 of 39 screen-relevant routes
+## D2-3 · policy-svc: client calls 34 of 39 screen-relevant routes
 
-| Method | Path not called yet |
-|---|---|
-| GET | `/v1/accounting-policies` |
-| POST | `/v1/accounting-policies` |
-| GET | `/v1/accounting-policies/explain` |
-| GET | `/v1/accounting-policies/resolve` |
-| GET | `/v1/accounting-policies/versions/{version_id}` |
-| POST | `/v1/accounting-policies/versions/{version_id}/submit-review` |
-| POST | `/v1/accounting-policies/versions/{version_id}/approve` |
-| POST | `/v1/accounting-policies/versions/{version_id}/activate` |
-| POST | `/v1/accounting-policies/versions/{version_id}/supersede` |
-| POST | `/v1/accounting-policies/versions/{version_id}/emergency-suspend` |
-| POST | `/v1/accounting-policies/versions/{version_id}/review-suspension` |
-| GET | `/v1/accounting-policies/versions/{version_id}/impact` |
-| POST | `/v1/attestations` |
-| GET | `/v1/attestations/{id}` |
-| POST | `/v1/attestations/{id}/revoke` |
-| POST | `/v1/control-test-definitions` |
-| GET | `/v1/control-test-definitions/{id}` |
-| GET | `/v1/control-test-definitions/{id}/executions` |
-| POST | `/v1/control-test-definitions/{id}/executions` |
-| GET | `/v1/controls/{control_ref}/effectiveness` |
-| GET | `/v1/policies/explain` |
-| GET | `/v1/policies/resolve` |
-| POST | `/v1/policies/{policy_id}/versions/{version_id}/approve` |
-| POST | `/v1/policies/{policy_id}/versions/{version_id}/retire` |
-| POST | `/v1/policies/{policy_id}/versions/{version_id}/review-suspension` |
-| POST | `/v1/policies/{policy_id}/versions/{version_id}/schedule` |
-| POST | `/v1/policies/{policy_id}/versions/{version_id}/submit-review` |
-| POST | `/v1/policies/{policy_id}/versions/{version_id}/suspend` |
-| GET | `/v1/policy-evaluations/{evidence_id}` |
-| GET | `/v1/policy-versions/compare` |
-| GET | `/v1/policy-versions/{version_id}` |
-| GET | `/v1/policy-versions/{version_id}/transitions` |
+18 Nov 2026 (FE `91fc4d9`, `b8e043e`). The 27 other routes listed on 6 Nov are called by the console now (GOV-05 commands, accounting draft, version, impact and lifecycle, control tests and executions, effectiveness, attestations, compare, transitions, version reads, both explains and the accounting applicability set). Not called, each with its reason:
+
+| Method | Path | Reason |
+|---|---|---|
+| GET | `/v1/policies/resolve` | The runtime callers' route; the console shows `/v1/policies/explain`, the same answer with its trace |
+| GET | `/v1/accounting-policies/resolve` | Same, for accounting: the console shows `/v1/accounting-policies/explain` |
+| GET | `/v1/attestations/{id}` | Single-record read; the drawer lists attestations from `GET /v1/attestations` |
+| GET | `/v1/control-test-definitions/{id}` | Single-record read; served by the register list |
+| GET | `/v1/policy-evaluations/{evidence_id}` | Single-record read; the Evidence pane lists evaluations from `GET /v1/policy-evaluations` |
 
 ## D2-4 · obligations-svc: client calls 7 of 24 screen-relevant routes
 
