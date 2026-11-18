@@ -88,7 +88,7 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D2-8 | schema-registry-svc :8093 | 🟡 | 10 | 0 | 2 | 1 | 0 | 6 | 0 | 1 | ✔ · ✔ · ✔ 5 pkgs | none (no `progress.md`) | legacy · 5/5 | SR-0 |
 | D2-9 | retention-registry-svc :8148 | 🟡 | 11 | 0 | 4 | 1 | 1 | 4 | 0 | 1 | ✔ · ✔ · ✔ 4 pkgs | none (no openapi, no `progress.md`) | legacy · 7/7 | RR-0 |
 | D2-10 | libraries + GTRM compiler | 🟡 | 10 | 0 | 2 | 2 | 2 | 3 | 0 | 1 | ✔ · ✔ · ✔ 23 pkgs (gtrm root: stray `go.mod`) | none | — (no UI) | LIB-1 |
-| | **Total (23 sections, 26 units)** | | **392** | **0** | **151** | **80** | **36** | **98** | **12** | **15** | **26 / 26 modules green** | 0 🏁 (2 awaiting reconfirmation) | **4 v2.0 · 289/797** | |
+| | **Total (23 sections, 26 units)** | | **392** | **72** | **122** | **68** | **18** | **86** | **13** | **13** | **26 / 26 modules green** | 1 🏁 (D2-2, 18 Nov) | **4 v2.0 · 289/797** (6 Nov count; on 18 Nov D2-1 143/148, D2-2 14/14, D2-3 34/39, D2-5 80/80) | |
 
 "Unit" means `go test -count=1 ./...` without the `integration` tag. Store integration suites need a scratch Postgres and were not re-run on 6 Nov; each service's S0 task runs them.
 
