@@ -27,6 +27,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -311,10 +312,25 @@ func main() {
 	} else {
 		log.Warn("AUTHZ_ENTITY_REGISTRY_URL unset — tenants of unprojected entities are not verified; tenantless questions about them are evaluated across tenants")
 	}
+	// ZS-IAM-001 §31: the FX basis authority limits convert with is the
+	// operator's choice, stated once here and named in every converted decision.
+	fxRates, err := handler.ParseFXReferenceRates(cfg.FXReferenceRates)
+	if err != nil {
+		log.Fatal("AUTHZ_FX_REFERENCE_RATES is invalid", zap.Error(err))
+	}
+	if fxRates != nil {
+		h.SetFXReferenceRates(fxRates)
+		log.Info("authority-limit FX reference rates configured", zap.Int("currencies", len(fxRates)))
+	}
+	// §26 decision, cache, outbox, session and projection telemetry.
+	authzMetrics := telemetry.NewAuthzMetrics(prometheus.DefaultRegisterer, "authorization-svc", authzStore.Telemetry)
+	authzMetrics.RegisterSIEMDrops(prometheus.DefaultRegisterer, "authorization-svc", siemClient.Dropped)
+	h.SetMetrics(authzMetrics)
 	handler.RegisterRoutes(r, h)
 
 	relayCtx, stopRelay := context.WithCancel(context.Background())
 	defer stopRelay()
+	go authzMetrics.RunSampler(relayCtx, pgStore.OperationalSnapshot, authzStore.Telemetry, cfg.OpsSampleInterval, log)
 	go outbox.NewRelay(pool, kafkaWriter, time.Second, 100, log).Run(relayCtx)
 	// Records what has run out: GOV-04 exceptions past expiry
 	// (sod.exception.expired) and privileged assignments whose approval
@@ -453,6 +469,7 @@ func main() {
 		// cached delegation lookups, or an upstream revocation would keep
 		// granting for up to a TTL after it was applied.
 		consumer := events.NewConsumer(log, authzStore)
+		consumer.SetObserver(authzMetrics)
 		go consumer.Run(consumerCtx, reader)
 	}
 
@@ -532,6 +549,7 @@ func main() {
 			PartitionWatchInterval: partitionWatchInterval,
 		})
 		lifecycleConsumer := events.NewLifecycleConsumer(log, authzStore)
+		lifecycleConsumer.SetObserver(authzMetrics)
 		go lifecycleConsumer.Run(consumerCtx, lifecycleReader)
 		log.Info("lifecycle consumer wired", zap.Strings("topics", cfg.Kafka.LifecycleTopics))
 

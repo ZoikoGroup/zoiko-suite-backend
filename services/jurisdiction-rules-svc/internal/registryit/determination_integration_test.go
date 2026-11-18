@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,7 +28,7 @@ const decisionPath = "/v1/jurisdiction-decisions:resolve"
 func newEnvDetermination() *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
-	r := chi.NewRouter()
+	r := newRouter()
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithEntityApplicability(st).WithEntityFacts(st)
 	handler.RegisterRoutes(r, h)
 	return &env{srv: r, pub: pub, auth: auth}
@@ -53,7 +52,10 @@ func decide(t *testing.T, e *env, tenant string, body map[string]any, want int) 
 	return r
 }
 
-func determination(r map[string]any) map[string]any { m, _ := r["determination"].(map[string]any); return m }
+func determination(r map[string]any) map[string]any {
+	m, _ := r["determination"].(map[string]any)
+	return m
+}
 
 func TestJurisdictionDecision_IsDeterminedFromAuthorisedAssignmentsAndAClaimNeverWidensThem(t *testing.T) {
 	e := newEnvDetermination()
@@ -191,7 +193,7 @@ func TestJurisdictionDecision_EvidenceHoldsNoTenantOrEntityIdsAndReplaysAreIdemp
 	mustStatus(t, 409, code, c)
 }
 
-func TestJurisdictionDecision_RequestValidationAndRouteWiring(t *testing.T) {
+func TestPDC02NP11_JurisdictionDecision_RequestValidationAndRouteWiring(t *testing.T) {
 	e := newEnvDetermination()
 	ok := map[string]any{"legal_entity_id": "e1", "purpose": "TAX", "effective_at": time.Now().UTC().Format(time.RFC3339)}
 	with := func(k string, v any) map[string]any {
@@ -206,7 +208,7 @@ func TestJurisdictionDecision_RequestValidationAndRouteWiring(t *testing.T) {
 		}
 		return m
 	}
-	code, r := e.do("POST", decisionPath, "tax-ops", ok)
+	code, r := e.doWithHeaders("POST", decisionPath, "tax-ops", ok, map[string]string{"X-Tenant-Id": ""})
 	assert.Equal(t, 401, code, "X-Tenant-Id is required: %v", r)
 	decide(t, e, "t1", with("legal_entity_id", nil), 400)
 	decide(t, e, "t1", with("purpose", "PAYROLL"), 400)
@@ -235,7 +237,7 @@ func newEnvGated() *env {
 	if err != nil {
 		panic(err)
 	}
-	r := chi.NewRouter()
+	r := newRouter()
 	handler.RegisterRoutes(r, handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithCertificationPolicy(1).WithResolver(res))
 	return &env{srv: r, pub: pub, auth: auth}
 }

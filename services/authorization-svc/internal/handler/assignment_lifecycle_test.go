@@ -72,7 +72,14 @@ func lifecycleDo(t *testing.T, s handler.AuthorizationStore, method, path, body 
 	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Tenant-Id", lifecycleTenant)
+	// If-Match is required on assignment mutations (AZ-1). Tests that are not
+	// about versions send the explicit unconditional form; "" removes it.
+	req.Header.Set("If-Match", "*")
 	for k, v := range headers {
+		if v == "" {
+			req.Header.Del(k)
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 	w := httptest.NewRecorder()
@@ -229,21 +236,26 @@ func TestListRoleAssignments_AsOfRefusesBadInstants(t *testing.T) {
 	}
 }
 
-// Revoke and approve take If-Match when it is sent, and still work without
-// it: the console and access-control-svc do not send one yet.
-func TestRevokeRoleAssignment_IfMatchHonouredNotRequired(t *testing.T) {
+// Revoke requires If-Match (AZ-1, 10 Nov 2026): a stale one is 412, none at
+// all is 428, the current one succeeds and returns the new ETag.
+func TestRevokeRoleAssignment_IfMatchRequired(t *testing.T) {
 	existing := domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: "a-1", PrincipalID: "p-1", RoleID: "r-1", Version: 7}
 	if w := lifecycleDo(t, newLifecycleStore(existing), http.MethodPost, "/v1/admin/role-assignments/a-1/revoke",
 		`{"reason_code":"LEAVER"}`, map[string]string{"If-Match": `"v6"`}); w.Code != http.StatusPreconditionFailed {
 		t.Fatalf("stale If-Match: expected 412, got %d: %s", w.Code, w.Body.String())
 	}
 	if w := lifecycleDo(t, newLifecycleStore(existing), http.MethodPost, "/v1/admin/role-assignments/a-1/revoke",
-		`{"reason_code":"LEAVER","expected_version":6}`, nil); w.Code != http.StatusPreconditionFailed {
+		`{"reason_code":"LEAVER","expected_version":6}`, map[string]string{"If-Match": ""}); w.Code != http.StatusPreconditionFailed {
 		t.Fatalf("stale expected_version: expected 412, got %d: %s", w.Code, w.Body.String())
 	}
-	w := lifecycleDo(t, newLifecycleStore(existing), http.MethodPost, "/v1/admin/role-assignments/a-1/revoke", `{"reason_code":"LEAVER"}`, nil)
+	if w := lifecycleDo(t, newLifecycleStore(existing), http.MethodPost, "/v1/admin/role-assignments/a-1/revoke",
+		`{"reason_code":"LEAVER"}`, map[string]string{"If-Match": ""}); w.Code != http.StatusPreconditionRequired {
+		t.Fatalf("no If-Match: expected 428, got %d: %s", w.Code, w.Body.String())
+	}
+	w := lifecycleDo(t, newLifecycleStore(existing), http.MethodPost, "/v1/admin/role-assignments/a-1/revoke", `{"reason_code":"LEAVER"}`,
+		map[string]string{"If-Match": `"v7"`})
 	if w.Code != http.StatusOK || w.Header().Get("ETag") != `"v7"` {
-		t.Fatalf("no If-Match: expected 200 with ETag, got %d %q: %s", w.Code, w.Header().Get("ETag"), w.Body.String())
+		t.Fatalf("current If-Match: expected 200 with ETag, got %d %q: %s", w.Code, w.Header().Get("ETag"), w.Body.String())
 	}
 }
 

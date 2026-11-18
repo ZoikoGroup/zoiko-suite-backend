@@ -2,6 +2,7 @@ package lifecycle_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -80,7 +81,16 @@ func TestMerge_EndsTheDuplicatesSessionsAndEmitsTheEvent(t *testing.T) {
 	assert.Equal(t, "p-2", m.SurvivorID)
 	require.Len(t, ended, 1)
 	assert.Equal(t, enderCall{"t-1", "p-1", domain.SessionEndMerged, "admin"}, ended[0], "the duplicate's sessions end, not the survivor's")
-	assert.Equal(t, []string{"identity.subject.merged"}, eventTypes(t, st.recs))
+	assert.Equal(t, []string{"identity.subject.merged", "principal.status.changed", "identity.subject.disabled"}, eventTypes(t, st.recs))
+	// S1-14: the status pair disables the duplicate, in the fields authorization-svc projects.
+	for _, r := range st.recs[1:] {
+		var env struct {
+			Payload map[string]any `json:"payload"`
+		}
+		require.NoError(t, json.Unmarshal(r.Payload, &env))
+		assert.Equal(t, "p-1", env.Payload["principal_id"], "%s names the duplicate", r.EventType)
+		assert.Equal(t, "DISABLED", env.Payload["new_status"], "%s", r.EventType)
+	}
 }
 
 func TestMerge_ReplayEndsNothing(t *testing.T) {

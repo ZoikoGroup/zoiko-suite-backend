@@ -33,12 +33,14 @@ import (
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/apicontract/asyncpgx"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
 	"zoiko.io/jurisdiction-rules-svc/internal/consumer"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	"zoiko.io/jurisdiction-rules-svc/internal/entityregistry"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
@@ -168,6 +170,13 @@ func main() {
 	r.Use(otelchi.Middleware("jurisdiction-rules-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(gate.Middleware)
+	// J-01: administrative writes need a verified identity even while the
+	// gate runs in warn mode for the out-of-domain readers.
+	if cfg.IdentityVerifyAdmin == "require" {
+		r.Use(handler.RequireVerifiedIdentity(handler.AdminWrite))
+	} else {
+		log.Warn("IDENTITY_VERIFY_ADMIN=off: administrative writes trust identity headers (local/dev only)")
+	}
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
@@ -181,6 +190,12 @@ func main() {
 	// Idempotency-Key replay on admin writes (runs after the envelope, which
 	// guarantees the key is present).
 	r.Use(handler.IdempotencyMiddleware(pgStore, log))
+
+	// One database transaction per write request (J-11): its changes and the
+	// outbox rows announcing them commit together, and the response is sent
+	// only after the commit. Inside the idempotency middleware, so a replay is
+	// always of a committed response.
+	r.Use(handler.UnitOfWork(pgStore, log))
 
 	h := handler.New(pgStore, authzClient, publisher, cfg.AuthZPlatformScopeID, log)
 	var registryPub events.RegistryPublisher
@@ -234,6 +249,28 @@ func main() {
 		log.Warn("pack signing disabled: PACK_SIGNING_KEY_REF/PACK_SIGNING_KEY_FILE are not set; the sign command will answer 503")
 	}
 	h.WithEntityApplicability(pgStore).WithEntityFacts(pgStore)
+	// J-10: the entity projection can be rebuilt from the registry for
+	// entities whose events left Kafka retention.
+	if cfg.TenantRegistryURL != "" {
+		h.WithEntityBackfill(entityregistry.New(cfg.TenantRegistryURL), pgStore)
+	} else {
+		log.Warn("TENANT_REGISTRY_URL unset: the entity applicability backfill route is not mounted")
+	}
+	// J-16: parked outbox events can be listed and requeued by an operator.
+	h.WithOutboxRecovery(pgStore)
+	// JR-FE-1: the console summary counts.
+	h.WithSummary(pgStore)
+	// API-5: pack compile and test runs can run as asynchronous operations.
+	h.WithAsyncOperations(asyncpgx.New(pgStore.OperationsDB()), pgStore)
+	// API-3: ETag on every aggregate read, If-Match on its commands.
+	h.WithAggregateVersions(pgStore)
+	// API-4: next_cursor tokens are signed with the configured key, so they
+	// survive a restart and work on every replica.
+	cursors, err := apicontract.NewCursorSigner(cfg.CursorSigningKey)
+	if err != nil {
+		log.Fatal("cursor signing key refused", zap.Error(err))
+	}
+	h.WithCursors(cursors)
 
 	// J-02: activation confirms its X-Approval-Reference with workflow-svc.
 	switch {
@@ -245,6 +282,15 @@ func main() {
 		log.Warn("WORKFLOW_SERVICE_URL unset — activation approval references are recorded, not confirmed (local/dev only)")
 	}
 	handler.RegisterRoutes(r, h)
+
+	// s26 rule lifecycle: rules reaching the start or end of their effective
+	// interval are announced when the instant passes.
+	if registryPub != nil && writer != nil {
+		watcher := events.NewEffectivityWatcher(log, pgStore, registryPub, time.Duration(cfg.RuleEffectivityIntervalSeconds)*time.Second)
+		watcher.Start()
+		defer watcher.Stop()
+		log.Info("rule effectivity watcher started", zap.Int("interval_seconds", cfg.RuleEffectivityIntervalSeconds))
+	}
 
 	// Entity consumer (Doc 03 §8.2 consumed events): projects entity.created and
 	// entity.jurisdiction.changed from tenant-entity-registry-svc.
@@ -286,6 +332,23 @@ func main() {
 		})
 		go consumer.NewEntityConsumer(log, pgStore).WithFacts(pgStore).WithMetrics(metrics).Run(consumerCtx, entityReader)
 		log.Info("entity consumer wired", zap.String("topic", cfg.Kafka.EntityTopic), zap.String("group_id", cfg.Kafka.GroupID))
+	}
+
+	// Automatic legal drift (J-03/J-04): regulatory.source.changed moves the
+	// ACTIVE rules citing the changed external_feed_reference to UNDER_REVIEW.
+	if len(cfg.Kafka.Brokers) > 0 && cfg.Kafka.RegulatoryFeedTopic != "" && writer != nil {
+		feedReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: cfg.Kafka.Brokers, GroupID: cfg.Kafka.GroupID + "-regulatory-feed", Topic: cfg.Kafka.RegulatoryFeedTopic,
+			MinBytes: 1, MaxBytes: 10e6, MaxWait: 500 * time.Millisecond, StartOffset: kafka.FirstOffset,
+			ErrorLogger: kafka.LoggerFunc(func(msg string, args ...any) {
+				log.Error("kafka consumer error", zap.String("topic", cfg.Kafka.RegulatoryFeedTopic), zap.String("detail", fmt.Sprintf(msg, args...)))
+			}),
+			WatchPartitionChanges: true, PartitionWatchInterval: 30 * time.Second,
+		})
+		go consumer.NewFeedConsumer(log, pgStore, publisher).Run(consumerCtx, feedReader)
+		log.Info("regulatory feed consumer wired", zap.String("topic", cfg.Kafka.RegulatoryFeedTopic))
+	} else {
+		log.Info("regulatory feed consumer off (KAFKA_REGULATORY_FEED_TOPIC unset): legal drift is recorded by hand only")
 	}
 
 	// ── 7. Health probes + metrics ────────────────────────────────────────────

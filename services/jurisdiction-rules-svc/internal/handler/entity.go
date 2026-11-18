@@ -84,7 +84,6 @@ func (h *Handler) WithApprovalVerifier(v approval.Verifier) *Handler {
 	return h
 }
 
-
 // EntityFactReader reads the establishment and registration facts projection (JUR-1).
 type EntityFactReader interface {
 	ListEntityFacts(ctx context.Context, tenantID, legalEntityID string, at time.Time) ([]domain.FactRow, error)

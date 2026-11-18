@@ -75,7 +75,7 @@ func scanKey(r pgx.Row) (*domain.TrustedKey, error) {
 // with the same public key is a no-op; a different key under the same ref is
 // refused (a key_ref names one key forever).
 func (s *PgStore) RegisterSigningKey(ctx context.Context, keyRef, algorithm string, pub []byte, actor string) (*domain.TrustedKey, bool, error) {
-	k, err := scanKey(s.pool.QueryRow(ctx, `INSERT INTO pack_signing_keys (key_ref, algorithm, public_key, created_by_principal_id)
+	k, err := scanKey(s.db(ctx).QueryRow(ctx, `INSERT INTO pack_signing_keys (key_ref, algorithm, public_key, created_by_principal_id)
 		VALUES ($1,$2,$3,$4) ON CONFLICT (key_ref) DO NOTHING RETURNING `+keyCols, keyRef, algorithm, pub, actor))
 	if err == nil {
 		return k, true, nil
@@ -94,7 +94,7 @@ func (s *PgStore) RegisterSigningKey(ctx context.Context, keyRef, algorithm stri
 }
 
 func (s *PgStore) GetSigningKey(ctx context.Context, keyRef string) (*domain.TrustedKey, error) {
-	k, err := scanKey(s.pool.QueryRow(ctx, `SELECT `+keyCols+` FROM pack_signing_keys WHERE key_ref=$1`, keyRef))
+	k, err := scanKey(s.db(ctx).QueryRow(ctx, `SELECT `+keyCols+` FROM pack_signing_keys WHERE key_ref=$1`, keyRef))
 	if err != nil {
 		return nil, s.registryFail("GetSigningKey", err, domain.ErrKeyNotFound)
 	}
@@ -102,7 +102,7 @@ func (s *PgStore) GetSigningKey(ctx context.Context, keyRef string) (*domain.Tru
 }
 
 func (s *PgStore) ListSigningKeys(ctx context.Context) ([]*domain.TrustedKey, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+keyCols+` FROM pack_signing_keys ORDER BY created_at, key_ref`)
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+keyCols+` FROM pack_signing_keys ORDER BY created_at, key_ref`)
 	if err != nil {
 		return nil, s.registryFail("ListSigningKeys", err, nil)
 	}
@@ -128,7 +128,7 @@ func (s *PgStore) SetSigningKeyStatus(ctx context.Context, keyRef, status, reaso
 	if cur.Status == status {
 		return cur, false, nil
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE pack_signing_keys SET status=$2, status_reason=$3, status_changed_at=NOW(), status_changed_by=$4
+	if _, err := s.db(ctx).Exec(ctx, `UPDATE pack_signing_keys SET status=$2, status_reason=$3, status_changed_at=NOW(), status_changed_by=$4
 		WHERE key_ref=$1`, keyRef, status, reason, actor); err != nil {
 		return nil, false, s.registryFail("SetSigningKeyStatus", err, nil)
 	}
@@ -378,7 +378,7 @@ func (s *PgStore) GetPackArtifact(ctx context.Context, ref, version string) (*Pa
 	if _, err := s.GetPackVersion(ctx, ref, version); err != nil {
 		return nil, err
 	}
-	a, err := scanArtifact(s.pool.QueryRow(ctx, `SELECT `+artifactCols+` FROM pack_artifacts a
+	a, err := scanArtifact(s.db(ctx).QueryRow(ctx, `SELECT `+artifactCols+` FROM pack_artifacts a
 		JOIN jurisdiction_pack_versions v USING (pack_version_id) JOIN jurisdiction_packs p USING (pack_id)
 		WHERE p.pack_ref=$1 AND v.version=$2`, ref, version))
 	if err != nil {
@@ -460,7 +460,7 @@ func (s *PgStore) VerifyPackArtifact(ctx context.Context, ref, version string) (
 		return nil, domain.VerificationResult{}, err
 	}
 	var versionDigest *string
-	if err := s.pool.QueryRow(ctx, `SELECT artifact_digest FROM jurisdiction_pack_versions WHERE pack_version_id::text=$1`, a.PackVersionID).
+	if err := s.db(ctx).QueryRow(ctx, `SELECT artifact_digest FROM jurisdiction_pack_versions WHERE pack_version_id::text=$1`, a.PackVersionID).
 		Scan(&versionDigest); err != nil {
 		return nil, domain.VerificationResult{}, s.registryFail("VerifyPackArtifact", err, nil)
 	}

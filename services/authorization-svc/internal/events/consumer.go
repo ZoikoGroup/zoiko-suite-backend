@@ -158,6 +158,8 @@ const dedupeTTL = 24 * time.Hour
 type Consumer struct {
 	log   *zap.Logger
 	store DelegationProjector
+	// observer is the projection telemetry; nil records nothing.
+	observer ProjectionObserver
 
 	// seen is an in-process event-id set. Deliberately NOT the Redis-backed
 	// deduper identity-context-svc uses: this service has no Redis dependency
@@ -247,6 +249,7 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 			c.log.Info("delegation consumer stopping with an unapplied message — not committed, so it is redelivered")
 			return
 		}
+		observeApplied(c.observer, ObserverDelegation, msg.Value, func(t string) bool { return ConsumedEventTypes[t] }, time.Now())
 		if err := reader.CommitMessages(ctx, msg); err != nil {
 			c.log.Error("failed to commit offset", zap.Error(err))
 		}

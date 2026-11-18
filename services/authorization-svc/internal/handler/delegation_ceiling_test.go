@@ -51,7 +51,9 @@ func TestDelegationCeiling(t *testing.T) {
 		{"exactly the cap", usd500, map[string]string{"amount": "500.00", "currency": "USD"}, false, ""},
 		{"over the cap", usd500, map[string]string{"amount": "500.01", "currency": "USD"}, true, "delegation_limit:exceeded"},
 		{"capped but no amount", usd500, nil, true, "delegation_limit:amount_required"},
-		{"currency defaults to the cap's", usd500, map[string]string{"amount": "400"}, false, ""},
+		// No currency is no comparison (10 Nov 2026): it used to be read as the
+		// cap's own currency, so an amount in yen passed as dollars.
+		{"capped but no currency", usd500, map[string]string{"amount": "400"}, true, "delegation_limit:currency_required"},
 		// 400 GBP ≈ 512.82 USD at the reference rates: over a 500 USD cap.
 		{"converted at reference rates", usd500, map[string]string{"amount": "400", "currency": "GBP"}, true, "delegation_limit:exceeded"},
 		// A caller-supplied rate must not choose the ceiling.

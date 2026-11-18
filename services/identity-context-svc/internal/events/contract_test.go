@@ -108,6 +108,16 @@ func producedEventTypes() []string {
 		events.EventSupportContextReviewed,
 		events.EventDispositionExecuted,
 		events.EventDispositionBlocked,
+		// Administrator password reset (IC-13, internal/lifecycle RequestReset
+		// and DecideReset).
+		events.EventPasswordResetRequest,
+		events.EventPasswordResetDecided,
+		// Not listed: EventSubjectInvited, EventIdPRegistered,
+		// EventIdPStatusChanged, EventFederatedLogin, EventGroupMappingProposed,
+		// EventGroupMappingDecided, EventGroupMembershipChange and
+		// EventSCIMConnectionCreated are declared in publisher.go but nothing
+		// emits them (federation emits FederationEventTypes instead). Add each
+		// here, with its asyncapi.yaml message, when code starts emitting it.
 	}, events.FederationEventTypes()...)
 }
 

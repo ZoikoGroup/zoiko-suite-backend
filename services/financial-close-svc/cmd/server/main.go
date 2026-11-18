@@ -246,7 +246,7 @@ func main() {
 	}, pgStore, nil, periodmirror.NewMetrics(prometheus.DefaultRegisterer), log)
 
 	h := handler.New(pgStore, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log).
-		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL)).
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL).WithLogger(log)).
 		SetCloseGateEnforced(cfg.CloseGateMode == "enforce").
 		SetWorkflowRefs(pgStore, cfg.WorkflowRefCallers).
 		SetSubledgerControlGateEnforced(cfg.SubledgerControlGateMode == "enforce").

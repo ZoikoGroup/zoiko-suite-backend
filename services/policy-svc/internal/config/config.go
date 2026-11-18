@@ -36,6 +36,13 @@ type Config struct {
 	// delivers every stored evaluation to POST /v1/decisions there.
 	GovernanceDecisionLogServiceURL string
 
+	// GovernanceDecisionLogMTLSURL, when set, sends the evidence relay to
+	// governance-decision-log-svc's mTLS peer listener (e.g.
+	// https://governance-decision-log-svc:8450) with policy-svc's own client
+	// certificate, provisioned from MTLS_MANAGEMENT_SERVICE_URL with
+	// MTLS_BOOTSTRAP_TOKEN_PATH. Unset keeps the plaintext URL above.
+	GovernanceDecisionLogMTLSURL string
+
 	// LedgerPrincipalID is the principal policy-svc writes to the governance
 	// ledger as (decision D-02). It must hold GOVERNANCE_DECISION_RECORD.
 	// Unset, evaluations still succeed and are stored, but stay PENDING.
@@ -130,6 +137,7 @@ func Load() (*Config, error) {
 		AuthZServiceURL:                 env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID:            env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 		GovernanceDecisionLogServiceURL: env("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-decision-log-svc:8083"),
+		GovernanceDecisionLogMTLSURL:    env("GOVERNANCE_DECISION_LOG_MTLS_URL", ""),
 		LedgerPrincipalID:               env("POLICY_LEDGER_PRINCIPAL_ID", ""),
 		EvaluateAuthz:                   env("POLICY_EVALUATE_AUTHZ", "enforce"),
 		ReadAuthz:                       env("POLICY_READ_AUTHZ", "enforce"),

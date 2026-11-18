@@ -108,6 +108,11 @@ type AssignmentQuery struct {
 	IncludeUsage bool
 	Limit        int
 	Offset       int
+	// Keyset (API-4 cursor paging): order by assignment id and return the
+	// rows after AfterID ("" = from the start), ignoring Offset. Stable under
+	// concurrent inserts and deletes, unlike an offset.
+	Keyset  bool
+	AfterID string
 }
 
 // DelegatedAuthority grants a delegate principal the ability to act within

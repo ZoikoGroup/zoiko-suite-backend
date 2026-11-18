@@ -30,6 +30,15 @@ type Config struct {
 	// to the governance-decision-log-svc per GOV §1 "No evidence afterthought".
 	GovernanceDecisionLogServiceURL string
 
+	// GovernanceDecisionLogMTLSURL, when set, sends the ledger relay to
+	// governance-decision-log-svc's mTLS peer listener (e.g.
+	// https://governance-decision-log-svc:8450) with workflow-svc's own client
+	// certificate, provisioned from MTLSManagementServiceURL with
+	// MTLSBootstrapTokenPath (this service's own token, register M-01).
+	GovernanceDecisionLogMTLSURL string
+	MTLSManagementServiceURL     string
+	MTLSBootstrapTokenPath       string
+
 	// LedgerPrincipalID is the workflow-svc service principal the outbox
 	// ledger deliverer writes as. Empty leaves decision_log events pending.
 	LedgerPrincipalID string
@@ -103,6 +112,9 @@ func Load() (*Config, error) {
 		AuthorizationServiceURL:         env("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
 		DocumentVaultServiceURL:         env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
 		GovernanceDecisionLogServiceURL: env("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-decision-log-svc:8083"),
+		GovernanceDecisionLogMTLSURL:    env("GOVERNANCE_DECISION_LOG_MTLS_URL", ""),
+		MTLSManagementServiceURL:        env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		MTLSBootstrapTokenPath:          env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
 		LedgerPrincipalID:               env("WORKFLOW_LEDGER_PRINCIPAL_ID", ""),
 		ReadAuthzMode:                   env("WORKFLOW_READ_AUTHZ", "enforce"),
 		RegistryServiceURL:              env("TENANT_ENTITY_REGISTRY_SERVICE_URL", "http://tenant-entity-registry-svc:8081"),

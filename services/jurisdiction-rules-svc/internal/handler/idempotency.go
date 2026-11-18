@@ -144,4 +144,3 @@ func (c *capturingWriter) Write(b []byte) (int, error) {
 	}
 	return c.ResponseWriter.Write(b)
 }
-

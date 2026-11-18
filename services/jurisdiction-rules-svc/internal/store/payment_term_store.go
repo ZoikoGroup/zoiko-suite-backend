@@ -71,7 +71,7 @@ func (s *PgStore) CreatePaymentTerm(ctx context.Context, code, name string, juri
 	}
 	const cols = `term_id::text, term_code, term_name, jurisdiction_id::text, created_at, created_by`
 	var t domain.PaymentTerm
-	err := s.pool.QueryRow(ctx, `
+	err := s.db(ctx).QueryRow(ctx, `
 		INSERT INTO payment_terms (term_code, term_name, jurisdiction_id, created_by) VALUES ($1, $2, $3::uuid, $4)
 		ON CONFLICT (term_code) DO NOTHING RETURNING `+cols, code, name, jurisdictionID, actor).
 		Scan(&t.TermID, &t.TermCode, &t.TermName, &t.JurisdictionID, &t.CreatedAt, &t.CreatedBy)
@@ -101,7 +101,7 @@ func derefStr(p *string) string {
 // GetPaymentTerm returns a term by its code.
 func (s *PgStore) GetPaymentTerm(ctx context.Context, code string) (*domain.PaymentTerm, error) {
 	var t domain.PaymentTerm
-	err := s.pool.QueryRow(ctx, `SELECT term_id::text, term_code, term_name, jurisdiction_id::text, created_at, created_by FROM payment_terms WHERE term_code = $1`, code).
+	err := s.db(ctx).QueryRow(ctx, `SELECT term_id::text, term_code, term_name, jurisdiction_id::text, created_at, created_by FROM payment_terms WHERE term_code = $1`, code).
 		Scan(&t.TermID, &t.TermCode, &t.TermName, &t.JurisdictionID, &t.CreatedAt, &t.CreatedBy)
 	if err != nil {
 		return nil, s.registryFail("GetPaymentTerm", err, domain.ErrPaymentTermNotFound)
@@ -114,7 +114,7 @@ func (s *PgStore) GetPaymentTermVersion(ctx context.Context, code string, versio
 	if _, err := s.GetPaymentTerm(ctx, code); err != nil {
 		return nil, err
 	}
-	v, err := s.loadPaymentTermVersion(ctx, s.pool, false, `t.term_code = $1 AND v.version = $2`, code, version)
+	v, err := s.loadPaymentTermVersion(ctx, s.db(ctx), false, `t.term_code = $1 AND v.version = $2`, code, version)
 	if err != nil {
 		return nil, s.registryFail("GetPaymentTermVersion", err, domain.ErrPaymentTermVersionNotFound)
 	}
@@ -126,7 +126,7 @@ func (s *PgStore) ListPaymentTermVersions(ctx context.Context, code string) ([]*
 	if _, err := s.GetPaymentTerm(ctx, code); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+ptvCols+ptvFrom+`WHERE t.term_code = $1 ORDER BY v.version`, code)
+	rows, err := s.db(ctx).Query(ctx, `SELECT `+ptvCols+ptvFrom+`WHERE t.term_code = $1 ORDER BY v.version`, code)
 	if err != nil {
 		return nil, s.registryFail("ListPaymentTermVersions", err, nil)
 	}
@@ -430,10 +430,10 @@ func (s *PgStore) ResolvePaymentTermVersion(ctx context.Context, code, on string
 	var v *domain.PaymentTermVersion
 	var err error
 	if pin != nil {
-		v, err = s.loadPaymentTermVersion(ctx, s.pool, false,
+		v, err = s.loadPaymentTermVersion(ctx, s.db(ctx), false,
 			`t.term_code = $1 AND v.version = $2 AND v.approved_at IS NOT NULL AND v.approved_at <= $3`, code, *pin, known)
 	} else {
-		v, err = s.loadPaymentTermVersion(ctx, s.pool, false, `t.term_code = $1 AND v.approved_at IS NOT NULL AND v.approved_at <= $2
+		v, err = s.loadPaymentTermVersion(ctx, s.db(ctx), false, `t.term_code = $1 AND v.approved_at IS NOT NULL AND v.approved_at <= $2
 			AND v.effective_from <= $3::date
 			AND (v.ends_on IS NULL OR $3::date < v.ends_on OR COALESCE(v.superseded_at, v.retired_at) > $2)
 			ORDER BY v.version DESC LIMIT 1`, code, known, on)

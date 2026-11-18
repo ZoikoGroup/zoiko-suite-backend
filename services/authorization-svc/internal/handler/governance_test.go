@@ -74,6 +74,7 @@ func govPost(r chi.Router, caller, path, body string) *httptest.ResponseRecorder
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", caller)
 	req.Header.Set("X-Tenant-Id", govTenant)
+	req.Header.Set("If-Match", "*") // required on assignment mutations (AZ-1)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w

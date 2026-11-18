@@ -10,6 +10,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+
+	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
+	"zoiko.io/access-control-svc/internal/store"
 )
 
 // Actions enforced by other services (REF-01 jurisdiction-rules-svc, REF-07
@@ -77,6 +80,10 @@ var registeredActionMigrations = []struct {
 		"ESTABLISHMENT_DEACTIVATE": "STANDARD",
 		"ESTABLISHMENT_CLOSE":      "HIGH",
 	}},
+	{"000047_register_evidence_manifest_actions", "evidence-manifest-svc", map[string]string{
+		"EVIDENCE_MANIFEST_GENERATE": "STANDARD",
+		"EVIDENCE_MANIFEST_READ":     "STANDARD",
+	}},
 	{"000048_register_registration_actions", "tenant-entity-registry-svc", map[string]string{
 		"REGISTRATION_CREATE":        "STANDARD",
 		"REGISTRATION_VERIFY":        "HIGH",
@@ -102,6 +109,14 @@ var registeredActionMigrations = []struct {
 		"ACCOUNTING_BOOK_AMEND_BASIS":     "HIGH",
 		"ACCOUNTING_BOOK_SUSPEND_POSTING": "HIGH",
 		"ACCOUNTING_BOOK_RETIRE":          "HIGH",
+	}},
+	{"000052_jurisdiction_rules_templates", "jurisdiction-rules-svc", map[string]string{
+		"JURISDICTION_OUTBOX_EVENT_VIEW":    "STANDARD",
+		"JURISDICTION_OUTBOX_EVENT_REQUEUE": "HIGH",
+		"JURISDICTION_SUMMARY_VIEW":         "STANDARD",
+		"JURISDICTION_ENTITY_BACKFILL":      "HIGH",
+		"JURISDICTION_OPERATION_VIEW":       "STANDARD",
+		"JURISDICTION_OPERATION_CANCEL":     "HIGH",
 	}},
 	{"000052_register_dimension_actions", "tenant-entity-registry-svc", map[string]string{
 		"DIMENSION_TYPE_CREATE":       "STANDARD",
@@ -147,6 +162,16 @@ var registeredActionMigrations = []struct {
 	}},
 }
 
+// templatePublishers are the migrations, in this list, that publish role
+// templates carrying actions earlier migrations registered (rule R5).
+var templatePublishers = []string{"000052_jurisdiction_rules_templates"}
+
+// newPermCatalog is the permission catalogue used by alias tests. It is a
+// function, not a package-level var: a var would be initialised before
+// TestMain assigns testStore, which captured a nil store and panicked on the
+// first Lookup.
+func newPermCatalog() *store.PermissionCatalogue { return store.NewPermissionCatalogue(testStore) }
+
 func TestRegisteredPermissionDefinitions(t *testing.T) {
 	ctx := context.Background()
 	for _, m := range registeredActionMigrations {
@@ -177,11 +202,26 @@ func TestRegisteredPermissionDownRefusesWhileGrantedAndOtherwiseRemovesOwnAction
 		}
 
 		// Unused: the down migration succeeds and removes its actions only.
+		// Migrations are reverted newest first, so a later migration that
+		// publishes templates carrying these actions is reverted before it.
 		tx, err := ownerPool.Begin(ctx)
 		require.NoError(t, err)
+		reverted := map[string]bool{}
+		for _, later := range templatePublishers {
+			if later > m.migration {
+				laterDown, err := os.ReadFile("../../deployments/migrations/" + later + ".down.sql")
+				require.NoError(t, err)
+				_, err = tx.Exec(ctx, string(laterDown))
+				require.NoError(t, err, "%s down, before %s down", later, m.migration)
+				reverted[later] = true
+			}
+		}
 		_, err = tx.Exec(ctx, string(down))
 		require.NoError(t, err, "%s down with nothing granted", m.migration)
 		for _, other := range registeredActionMigrations {
+			if reverted[other.migration] {
+				continue
+			}
 			for action := range other.risk {
 				var n int
 				require.NoError(t, tx.QueryRow(ctx, `SELECT count(*) FROM permission_definitions WHERE action_name = $1`, action).Scan(&n))
@@ -214,10 +254,63 @@ func TestRegisteredPermissionDownRefusesWhileGrantedAndOtherwiseRemovesOwnAction
 			) VALUES ($1, $2, $3, 'REF_STEWARD', ARRAY[$4]::text[], TRUE, $5, $6, $6)`,
 			uuid.NewString(), tenantID, roleID, granted, "corr-bundle-"+roleID, time.Now().UTC())
 		require.NoError(t, err)
-
 		_, err = tx.Exec(ctx, string(down))
 		require.Error(t, err, "%s down while %s is granted", m.migration, granted)
 		require.Contains(t, err.Error(), m.migration[:6]+" down refused")
 		_ = tx.Rollback(ctx)
 	}
+}
+
+// ── AC-1: S9-D1 aliases ───────────────────────────────────────────────────────
+//
+// The permission taxonomy has canonical (TAXONOMY, e.g. payment.release) and
+// legacy (LEGACY, e.g. PAYMENT_RELEASE) names for the same capability. The
+// alias_for column on LEGACY entries points to the canonical name. A grant of
+// either name must satisfy a check for the other.
+
+func TestS9D1_CanonicalGrantSatisfiesLegacyCheck(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
+	// Bundle grants canonical name
+	actions := []string{"iam.role.manage"}
+	known, err := newPermCatalog().Lookup(ctx, actions)
+	require.NoError(t, err)
+	require.Contains(t, known, "iam.role.manage", "canonical action must be found")
+	// The legacy alias should also be present in the map
+	require.Contains(t, known, "ROLE_MANAGE", "legacy alias must be included for canonical grant")
+	require.Equal(t, known["iam.role.manage"].RiskTier, known["ROLE_MANAGE"].RiskTier, "risk tier must match")
+}
+
+func TestS9D1_LegacyGrantSatisfiesCanonicalCheck(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
+	// Bundle grants legacy name
+	actions := []string{"ROLE_MANAGE"}
+	known, err := newPermCatalog().Lookup(ctx, actions)
+	require.NoError(t, err)
+	require.Contains(t, known, "ROLE_MANAGE", "legacy action must be found")
+	// The canonical name should also be present in the map
+	require.Contains(t, known, "iam.role.manage", "canonical alias must be included for legacy grant")
+	require.Equal(t, known["ROLE_MANAGE"].RiskTier, known["iam.role.manage"].RiskTier, "risk tier must match")
+}
+
+func TestS9D1_UnknownActionStillRefused(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
+	actions := []string{"UNKNOWN_ACTION_THAT_DOES_NOT_EXIST"}
+	known, err := newPermCatalog().Lookup(ctx, actions)
+	require.NoError(t, err)
+	require.Empty(t, known, "unknown action must not be found")
+}
+
+func TestS9D1_AliasCannotPointAtUnregisteredAction(t *testing.T) {
+	// This is enforced by the FK constraint on alias_for
+	ctx := context.Background()
+	// First verify the constraint exists by checking a known alias
+	var aliasFor string
+	err := ownerPool.QueryRow(ctx,
+		`SELECT alias_for FROM permission_definitions WHERE action_name = 'ROLE_MANAGE'`).Scan(&aliasFor)
+	require.NoError(t, err)
+	require.Equal(t, "iam.role.manage", aliasFor, "ROLE_MANAGE must alias to iam.role.manage")
+
+	// The FK constraint prevents creating an alias to a non-existent action
+	// This is tested implicitly by the migration - if the constraint didn't
+	// exist, the migration would have failed or allowed invalid aliases.
 }

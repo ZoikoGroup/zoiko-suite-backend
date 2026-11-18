@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -65,7 +64,7 @@ func newEnvOps(signer domain.Signer, ring, region string) *env {
 	if err != nil {
 		panic(err)
 	}
-	r := chi.NewRouter()
+	r := newRouter()
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithCertificationPolicy(1).
 		WithResolver(res).WithOperations(handler.OpsPolicy{HotfixRetroSLA: 72 * time.Hour})
 	if signer != nil {
@@ -126,7 +125,7 @@ func resolveOutcome(t *testing.T, c *certFixture) (string, map[string]any) {
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
 
-func TestRelease_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
+func TestJURNEG28_Release_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
 	c := opsPack(t, "", "")
 	e := c.e
 
@@ -174,7 +173,7 @@ func TestRelease_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
 	require.Error(t, err, "release history is append-only")
 }
 
-func TestRelease_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing.T) {
+func TestJURNEG15_Release_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing.T) {
 	a := opsPack(t, "", "")
 	a.certifyVersion(t, a.version) // pack A: CERTIFIED
 
@@ -291,11 +290,16 @@ func TestDeployment_RingOrderSoakAndHealthGates(t *testing.T) {
 	assert.GreaterOrEqual(t, len(rings["rings"].([]any)), 3)
 	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": ringCanary, "ordinal": 9})
 	mustStatus(t, 409, code, r)
+	// Another code on a taken order: named, with the ring that holds it.
+	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": "canary-two", "ordinal": 1})
+	mustStatus(t, 409, code, r)
+	assert.Equal(t, "ring_ordinal_taken", r["code"])
+	assert.Contains(t, r["detail"], "ordinal 1 is already ring "+ringCanary)
 	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": "Bad Code", "ordinal": 1})
 	mustStatus(t, 400, code, r)
 }
 
-func TestResolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
+func TestJURNEG29_Resolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU) // this resolver instance serves canary / eu-west
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -332,7 +336,7 @@ func TestResolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
 
 // ── rollback ────────────────────────────────────────────────────────────────
 
-func TestRollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T) {
+func TestJURNEG19_Rollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -396,7 +400,7 @@ func TestRollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T)
 
 // ── emergency hotfix ────────────────────────────────────────────────────────
 
-func TestHotfix_EnhancedReviewRingExceptionAndRetrospective(t *testing.T) {
+func TestJURNEG14_Hotfix_EnhancedReviewRingExceptionAndRetrospective(t *testing.T) {
 	c := opsPack(t, ringEarly, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -571,7 +575,7 @@ func TestSourceChangeIntake_OpensReviewButNeverTouchesRules(t *testing.T) {
 
 // ── metrics ─────────────────────────────────────────────────────────────────
 
-func TestOpsMetrics_ReportsSkewAgeUpcomingAndWhatItDoesNotMeasure(t *testing.T) {
+func TestJURNEG29_OpsMetrics_ReportsSkewAgeUpcomingAndWhatItDoesNotMeasure(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)

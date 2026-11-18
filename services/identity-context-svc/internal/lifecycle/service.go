@@ -434,6 +434,13 @@ func (s *Service) RequestReset(ctx context.Context, a Actor, principalID, reason
 // DecideReset records an approver's decision. The approver is neither the
 // requester nor the subject and holds a recent second-factor authentication;
 // the link is issued and delivered when the approvals are complete.
+//
+// IC-13 (S1-13 K-7):
+// - Metric incremented AFTER commit
+// - Store outages map to 503 (service unavailable)
+// - Expiry committed before refusing (handled in store)
+// - Event emitted for every decision (handled in store)
+// - Link delivery failure returns 502/503
 func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision, reason string) (*domain.PasswordResetRequest, error) {
 	decision = strings.ToUpper(strings.TrimSpace(decision))
 	if reason = strings.TrimSpace(reason); len(reason) > 500 {
@@ -462,9 +469,6 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision,
 	if err != nil {
 		return nil, err
 	}
-	if ic8 := metrics.Default(); ic8 != nil {
-		ic8.PasswordResets.WithLabelValues(decision).Inc()
-	}
 	out, err := s.store.DecideResetRequest(ctx, a.TenantID, requestID,
 		domain.ResetApproval{ApproverID: a.PrincipalID, At: s.now(), Decision: decision, Reason: reason},
 		func(ctx context.Context, tx pgx.Tx, rr *domain.PasswordResetRequest) error {
@@ -474,16 +478,25 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision,
 				RequestID: rr.RequestID, ExpiresAt: s.now().Add(s.cfg.ResetTTL)})
 		}, rec)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrConflict, err)
+		// IC-13: Map store outages to service unavailable (503), not conflict (409)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("password reset decision unavailable: %w", err)
+	}
+	// IC-13: Metric incremented AFTER successful commit
+	if ic8 := metrics.Default(); ic8 != nil {
+		ic8.PasswordResets.WithLabelValues(decision).Inc()
 	}
 	if out != nil && out.Status == "ISSUED" && issued != "" {
 		if s.notifier == nil {
 			return out, ErrNotifierUnconfigured
 		}
+		// IC-13: Link delivery failure returns error (502/503), not silent warn
 		if err := s.notifier.Notify(ctx, Notice{TenantID: out.TenantID, PrincipalID: out.PrincipalID, Intent: s.cfg.IntentReset,
 			Link: s.linkFor(domain.CredentialTokenReset, issued), ExpiresAt: s.now().Add(s.cfg.ResetTTL),
 			SourceEventID: "reset-" + out.RequestID, CorrelationID: a.CorrelationID}); err != nil {
-			s.log.Warn("approved reset link not delivered", zap.String("request_id", requestID), zap.Error(err))
+			return nil, fmt.Errorf("password reset link delivery failed: %w", err)
 		}
 	}
 	return out, nil
@@ -629,11 +642,30 @@ func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, dupli
 	}
 	m, created, err := s.store.MergeIdentities(ctx, a.TenantID, survivorID, duplicateID, reason, a.PrincipalID, a.CorrelationID,
 		func(m store.IdentityMerge) ([]outbox.Record, error) {
-			rec, err := events.Render(events.EventSubjectMerged, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,
+			// IC-14 (S1-14 merge route parity): emit the same three events as Merge (POST /v1/subjects/{id}/merge).
+			merged, err := events.Render(events.EventSubjectMerged, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,
 				map[string]any{"merge_id": m.MergeID, "tenant_id": m.TenantID, "survivor_id": m.SurvivorID,
 					"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": m.Reason, "link_outcomes": m.LinkOutcomes,
 					"merged_at": m.MergedAt, "correlation_id": a.CorrelationID})
-			return []outbox.Record{rec}, err
+			if err != nil {
+				return nil, err
+			}
+			recs := []outbox.Record{merged}
+			// The status pair is about the duplicate, which is now disabled. authorization-svc projects
+			// principal.status.changed from principal_id and new_status and skips an event without them, so
+			// without these fields the duplicate would stay ACTIVE there.
+			status := map[string]any{"principal_id": m.DuplicateID, "tenant_id": m.TenantID,
+				"new_status": string(domain.PrincipalStatusDisabled), "merge_id": m.MergeID, "survivor_id": m.SurvivorID,
+				"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": "merged into " + m.SurvivorID + ": " + m.Reason,
+				"correlation_id": a.CorrelationID}
+			for _, et := range []string{events.EventPrincipalStatusChanged, events.EventSubjectDisabled} {
+				rec, err := events.Render(et, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.DuplicateID, status)
+				if err != nil {
+					return nil, err
+				}
+				recs = append(recs, rec)
+			}
+			return recs, nil
 		})
 	switch {
 	case errors.Is(err, store.ErrMergeConflict):

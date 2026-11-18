@@ -396,7 +396,7 @@ func TestBusinessCalendar_AddBusinessDaysIsDeterministicAndNamesWhatItSkipped(t 
 
 // A due date worked out today is never silently changed by a calendar amended
 // tomorrow: ask as it was known then, or name the version.
-func TestBusinessCalendar_AnAmendmentDoesNotRewriteHistory(t *testing.T) {
+func TestREF10NP40_BusinessCalendar_AnAmendmentDoesNotRewriteHistory(t *testing.T) {
 	c := newCalFx(t)
 	c.imp(t, "2026-2", gbHolidays(), 201)
 	v1 := c.publish(t, 1)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -70,6 +71,24 @@ func TestActivation_FailsClosedWhenWorkflowIsDown(t *testing.T) {
 	rr := postJSONWithApproval(t, routerWithApprovals(activationStore(), v), "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"}, "wf-123")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", rr.Code)
+	}
+}
+
+// The author's own activation is refused here, before workflow-svc is asked:
+// the answer cannot change, so it must not depend on workflow-svc being up
+// (a 503 would tell the author to retry).
+func TestActivation_RefusesTheAuthorBeforeAskingWorkflow(t *testing.T) {
+	st := activationStore()
+	v := &stubApprovals{err: approval.ErrUnavailable}
+	rr := postJSONWithApprovalAs(t, routerWithApprovals(st, v), "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"}, "author-1", "wf-123")
+	if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "self_approval_forbidden") {
+		t.Fatalf("expected 403 self_approval_forbidden, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if v.calls != 0 {
+		t.Fatalf("workflow-svc was asked %d times", v.calls)
+	}
+	if st.transitionArgs.RuleID != "" {
+		t.Fatal("the rule was transitioned by its author")
 	}
 }
 

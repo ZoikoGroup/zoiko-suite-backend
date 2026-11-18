@@ -77,7 +77,7 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 const requirementColumns = `
 	evidence_requirement_id, tenant_id, legal_entity_id, domain_code, action_type,
 	evidence_type, requirement_payload, effective_from, effective_to,
-	created_at, created_by_principal_id, correlation_id, idempotency_key`
+	created_at, created_by_principal_id, correlation_id, idempotency_key, record_version`
 
 func scanRequirement(row pgx.Row) (*domain.EvidenceRequirement, error) {
 	var r domain.EvidenceRequirement
@@ -85,7 +85,7 @@ func scanRequirement(row pgx.Row) (*domain.EvidenceRequirement, error) {
 	if err := row.Scan(
 		&r.EvidenceRequirementID, &r.TenantID, &r.LegalEntityID, &r.DomainCode, &r.ActionType,
 		&r.EvidenceType, &payload, &r.EffectiveFrom, &r.EffectiveTo,
-		&r.CreatedAt, &r.CreatedByPrincipalID, &r.CorrelationID, &r.IdempotencyKey,
+		&r.CreatedAt, &r.CreatedByPrincipalID, &r.CorrelationID, &r.IdempotencyKey, &r.RecordVersion,
 	); err != nil {
 		return nil, err
 	}
@@ -155,6 +155,7 @@ func (s *PgStore) CreateRequirement(ctx context.Context, r *domain.EvidenceRequi
 			r.RequirementPayload = payload
 			r.CreatedAt = now
 			r.EffectiveTo = nil
+			r.RecordVersion = 1 // the column default (migration 000010)
 			return nil
 		}
 
@@ -295,15 +296,20 @@ func (s *PgStore) EffectiveRequirements(ctx context.Context, tenantID, legalEnti
 // does not exist within this tenant. Never a silent no-op:
 // invoice-approval-svc's non-atomic read-then-write is the anti-pattern
 // here, and it can double-apply under concurrency.
-func (s *PgStore) EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID string) (*domain.EvidenceRequirement, error) {
+func (s *PgStore) EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID string, expectedVersion int64) (*domain.EvidenceRequirement, error) {
 	var out *domain.EvidenceRequirement
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// API-3: the version check is part of the same compare-and-set, so two
+		// administrators retiring from the same read cannot both succeed.
+		// expectedVersion 0 is "If-Match: *" (unconditional).
 		r, err := scanRequirement(tx.QueryRow(ctx, `
 			UPDATE evidence_requirements
-			SET effective_to = $1, retired_by_principal_id = $2, retired_reason = $3
+			SET effective_to = $1, retired_by_principal_id = $2, retired_reason = $3,
+			    record_version = record_version + 1
 			WHERE evidence_requirement_id = $4 AND tenant_id = $5 AND effective_to IS NULL
+			  AND ($6::bigint = 0 OR record_version = $6::bigint)
 			RETURNING `+requirementColumns,
-			effectiveTo, actorPrincipalID, reason, requirementID, tenantID))
+			effectiveTo, actorPrincipalID, reason, requirementID, tenantID, expectedVersion))
 		if err == nil {
 			out = r
 			return nil
@@ -318,19 +324,28 @@ func (s *PgStore) EndDateRequirement(ctx context.Context, tenantID, requirementI
 			return err
 		}
 
-		// Zero rows updated. Distinguish "already retired" from "not found
-		// in this tenant" so the caller gets a truthful error instead of a
-		// generic one. Same transaction, so the answer is consistent with
-		// the UPDATE that just ran.
-		var exists bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM evidence_requirements
-				WHERE evidence_requirement_id = $1 AND tenant_id = $2)
-		`, requirementID, tenantID).Scan(&exists); err != nil {
+		// Zero rows updated. Distinguish "not found in this tenant", "stale
+		// If-Match" and "already retired" so the caller gets a truthful error
+		// instead of a generic one. Same transaction, so the answer is
+		// consistent with the UPDATE that just ran. A stale version is
+		// reported before "already retired": the caller's read is out of date
+		// either way, and 412 tells them to read again.
+		var current int64
+		var retired bool
+		switch err := tx.QueryRow(ctx, `
+			SELECT record_version, effective_to IS NOT NULL
+			FROM evidence_requirements
+			WHERE evidence_requirement_id = $1 AND tenant_id = $2
+		`, requirementID, tenantID).Scan(&current, &retired); {
+		case errors.Is(err, pgx.ErrNoRows):
+			return domain.ErrRequirementNotFound
+		case err != nil:
 			return err
 		}
-		if exists {
+		if expectedVersion != 0 && current != expectedVersion {
+			return &domain.StaleVersionError{Current: current}
+		}
+		if retired {
 			return domain.ErrAlreadyRetired
 		}
 		return domain.ErrRequirementNotFound

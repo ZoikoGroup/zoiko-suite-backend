@@ -16,6 +16,7 @@ package domain
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -72,6 +73,11 @@ type EvidenceRequirement struct {
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	CorrelationID        string    `json:"correlation_id"`
 	IdempotencyKey       string    `json:"idempotency_key"`
+
+	// RecordVersion is the API-3 optimistic-concurrency version (migration
+	// 000010). It is served as the ETag "v<n>" and bumped by every mutation,
+	// so an end-date sent against a stale read is refused with 412.
+	RecordVersion int64 `json:"record_version"`
 }
 
 // RequirementSpec is the decoded shape of EvidenceRequirement.
@@ -142,6 +148,14 @@ type PresentArtifact struct {
 // in this service enumerates the permitted set.
 const EvidenceTypeSupportingDocument = "SUPPORTING_DOCUMENT"
 
+// EvidenceTypeEvidenceManifest references an evidence-manifest-svc manifest.
+// Verified against evidence-manifest-svc GET /v1/evidence-manifests/{id}.
+const EvidenceTypeEvidenceManifest = "EVIDENCE_MANIFEST"
+
+// EvidenceTypeSignature references an esignature-integration-svc envelope.
+// Verified against esignature-integration-svc GET /v1/esignature/envelopes/{id}.
+const EvidenceTypeSignature = "SIGNATURE"
+
 // EvaluateRequest is the body of POST /v1/evidence/evaluate.
 type EvaluateRequest struct {
 	LegalEntityID    string            `json:"legal_entity_id"`
@@ -200,11 +214,79 @@ type ListRequirementsFilter struct {
 	LegalEntityID string
 	DomainCode    string
 	ActionType    string
+	EvidenceType  string
 	// AsOf restricts results to requirements effective at that instant.
 	// Zero value means "no effective-date filter — return all, including
 	// retired ones", which is what an auditor reviewing history needs.
 	AsOf time.Time
 }
+
+// ListEvaluationsFilter holds the filter[...] values of the evaluation
+// register (GET /v1/evidence/evaluations). Every field is optional.
+type ListEvaluationsFilter struct {
+	LegalEntityID string
+	DomainCode    string
+	ActionType    string
+	Outcome       string
+	Since         time.Time
+}
+
+// ListEvidenceRequestsFilter holds the filters of the PBC register
+// (GET /v1/pbc/requests). OpenOnly keeps the route's original meaning —
+// requests not yet SATISFIED or CLOSED — unless a status filter is given.
+type ListEvidenceRequestsFilter struct {
+	LegalEntityID string
+	Status        string
+	OpenOnly      bool
+}
+
+// EvidenceSummary is the response for GET /v1/evidence/summary: the counts
+// behind the console's KPI row. Every count is read in one transaction; if
+// any of them cannot be read the route answers 503 rather than a partial
+// summary, so a console never shows an unreadable figure as 0.
+type EvidenceSummary struct {
+	ActiveRequirements           int `json:"active_requirements"`
+	EvaluationsSatisfied30d      int `json:"evaluations_satisfied_30d"`
+	EvaluationsMissing30d        int `json:"evaluations_missing_30d"`
+	EvaluationsNoRequirements30d int `json:"evaluations_no_requirements_30d"`
+	// ActionsWithNoRequirements30d counts distinct (domain_code, action_type)
+	// pairs evaluated with NO_REQUIREMENTS_DEFINED in the last 30 days.
+	ActionsWithNoRequirements30d int `json:"actions_with_no_requirements_30d"`
+	OpenPBCRequests              int `json:"open_pbc_requests"`
+	OverduePBCRequests           int `json:"overdue_pbc_requests"`
+	// UnpublishedOutboxOlderThan5Minutes is platform-wide (the outbox is not
+	// tenant-scoped): events written but not yet on Kafka after 5 minutes.
+	UnpublishedOutboxOlderThan5Minutes int `json:"unpublished_outbox_older_than_5_minutes"`
+	// RequirementsByEvidenceType counts active requirements per evidence_type
+	// (the console's "Evidence types" panel).
+	RequirementsByEvidenceType map[string]int `json:"requirements_by_evidence_type"`
+	// RequirementsByDomain counts active requirements per domain_code (the
+	// console's catalogue coverage panel).
+	RequirementsByDomain map[string]int `json:"requirements_by_domain"`
+	// UncoveredActions lists up to 20 (domain_code, action_type) pairs that
+	// were evaluated with NO_REQUIREMENTS_DEFINED in the last 30 days.
+	UncoveredActions []UncoveredAction `json:"uncovered_actions"`
+}
+
+// UncoveredAction is one action evaluated with no requirement in force.
+type UncoveredAction struct {
+	DomainCode  string    `json:"domain_code"`
+	ActionType  string    `json:"action_type"`
+	Evaluations int       `json:"evaluations"`
+	LastAt      time.Time `json:"last_evaluated_at"`
+}
+
+// StaleVersionError is returned by a conditional mutation (API-3) whose
+// expected record_version is not the row's current one. It carries the
+// current version so the 412 can name it.
+type StaleVersionError struct{ Current int64 }
+
+func (e *StaleVersionError) Error() string {
+	return fmt.Sprintf("record_version is %d; the supplied If-Match is stale", e.Current)
+}
+
+// Is makes errors.Is(err, ErrVersionMismatch) match any StaleVersionError.
+func (e *StaleVersionError) Is(target error) bool { return target == ErrVersionMismatch }
 
 // OutboxEvent represents an event to be written to the outbox table.
 type OutboxEvent struct {
@@ -245,6 +327,10 @@ var (
 	// anti-pattern this guards against.
 	ErrAlreadyRetired = errorString("evidence requirement is already retired")
 
+	// ErrVersionMismatch is what a StaleVersionError matches: an API-3
+	// conditional mutation whose If-Match names an older record_version.
+	ErrVersionMismatch = errorString("record_version does not match If-Match")
+
 	ErrAuthorizationDenied             = errorString("authorization denied for this evidence requirement action")
 	ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
 
@@ -272,6 +358,16 @@ var (
 	ErrDocumentNotFound           = errorString("referenced document not found")
 	ErrDocumentMismatch           = errorString("referenced document belongs to a different tenant or legal entity")
 	ErrDocumentServiceUnavailable = errorString("document-vault-svc unavailable")
+
+	// Evidence-manifest verification errors. Fail closed on all of them.
+	ErrManifestNotFound           = errorString("referenced evidence manifest not found")
+	ErrManifestMismatch           = errorString("referenced evidence manifest belongs to a different tenant or legal entity")
+	ErrManifestServiceUnavailable = errorString("evidence-manifest-svc unavailable")
+
+	// Esignature verification errors. Fail closed on all of them.
+	ErrEnvelopeNotFound           = errorString("referenced esignature envelope not found")
+	ErrEnvelopeMismatch           = errorString("referenced esignature envelope belongs to a different tenant or legal entity")
+	ErrEnvelopeServiceUnavailable = errorString("esignature-integration-svc unavailable")
 
 	// The legal entity is not held by tenant-entity-registry-svc in the
 	// caller's tenant, or the registry could not answer (fail-closed).

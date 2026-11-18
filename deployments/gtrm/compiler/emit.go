@@ -105,32 +105,33 @@ var untrustedInboundHeaders = []string{
 }
 
 // gatewayAuthResponseHeaders is the ForwardAuth authResponseHeaders list.
-// Traefik deletes each name from the forwarded request and then copies the
-// gateway's value, if it set one, so the list does two jobs: it makes every
-// header gateway-auth-svc's Verify sets authoritative, and it strips the ones
-// the gateway never sets. A header the handler sets and this list omits
-// passes the client's copy through untouched. It must match the compose
-// "gateway-auth" middleware; gateway-auth-svc's edge-contract test checks both.
-var gatewayAuthResponseHeaders = []string{
-	"X-Principal-Id",
-	"X-Tenant-Id",
-	"X-Legal-Entity-Id",
-	"X-Correlation-Id",
-	"X-Jurisdiction-Context",
-	"X-Timezone",
-	"X-Residency-Policy-Id",
-	"X-Tenant-Context-Stale",
-	"X-Workload-Id",
-	"X-Support-Context-Id",
-	"X-Source-Channel",
-	"X-Source-Channel-Basis",
-	"X-Assurance-Level",
-	"X-Authn-Age-Seconds",
-	"X-Audience",
-	"X-Token-Audience",
-	"X-Initiating-Subject-Id",
-	"X-On-Behalf-Of",
-}
+	// Traefik deletes each name from the forwarded request and then copies the
+	// gateway's value, if it set one, so the list does two jobs: it makes every
+	// header gateway-auth-svc's Verify sets authoritative, and it strips the ones
+	// the gateway never sets. A header the handler sets and this list omits
+	// passes the client's copy through untouched. It must match the compose
+	// "gateway-auth" middleware; gateway-auth-svc's edge-contract test checks both.
+	var gatewayAuthResponseHeaders = []string{
+		"X-Principal-Id",
+		"X-Tenant-Id",
+		"X-Legal-Entity-Id",
+		"X-Correlation-Id",
+		"X-Jurisdiction-Context",
+		"X-Timezone",
+		"X-Residency-Policy-Id",
+		"X-Tenant-Context-Stale",
+		"X-Workload-Id",
+		"X-Support-Context-Id",
+		"X-Source-Channel",
+		"X-Source-Channel-Basis",
+		"X-Assurance-Level",
+		"X-Authn-Age-Seconds",
+		"X-Audience",
+		"X-Token-Audience",
+		"X-Initiating-Subject-Id",
+		"X-On-Behalf-Of",
+		"X-Identity-Envelope",
+	}
 
 const (
 	backendPort       = "8080" // pools run as non-root (distroless); can't bind <1024

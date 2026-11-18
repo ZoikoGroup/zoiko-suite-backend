@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"zoiko.io/gateway-auth-svc/internal/admission"
 	"zoiko.io/gateway-auth-svc/internal/carta"
+	"zoiko.io/gateway-auth-svc/internal/commercial"
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
 	"zoiko.io/gateway-auth-svc/internal/siem"
@@ -23,12 +25,14 @@ import (
 )
 
 type Handler struct {
-	cfg    *config.Config
-	jwks   *jwks.Client
-	carta  *carta.Client
-	siem   *siem.Client
-	tenant *tenantctx.Resolver
-	log    *zap.Logger
+	cfg      *config.Config
+	jwks     *jwks.Client
+	carta    *carta.Client
+	siem     *siem.Client
+	tenant   *tenantctx.Resolver
+	commercial *commercial.Client
+	exchanger  *idenv.Exchanger
+	log      *zap.Logger
 
 	// adm and rec are the INT-01 admission controls and the bounded record of
 	// refusals. rec is never nil; adm is the zero value (admit everything)
@@ -68,18 +72,22 @@ type DomainMetrics interface {
 	// denied, unavailable or disabled.
 	TenantContext(outcome string)
 	// CartaDecision records a continuous-risk decision, including the ALLOW
-	// and STEP_UP_MFA ones that do not block.
+	// one that does not block and STEP_UP_MFA, which is enforced as 401
+	// step_up_required (AU-23).
 	CartaDecision(decision string)
+	// ExchangeFailure records a token exchange failure for the given audience.
+	ExchangeFailure(audience string)
 }
 
 // nopMetrics is the default, so a Handler built without metrics — every
 // handler unit test — behaves identically and needs no wiring.
 type nopMetrics struct{}
 
-func (nopMetrics) VerifyDecision(string) {}
-func (nopMetrics) JWKSError(string)      {}
-func (nopMetrics) TenantContext(string)  {}
-func (nopMetrics) CartaDecision(string)  {}
+func (nopMetrics) VerifyDecision(string)     {}
+func (nopMetrics) JWKSError(string)          {}
+func (nopMetrics) TenantContext(string)      {}
+func (nopMetrics) CartaDecision(string)      {}
+func (nopMetrics) ExchangeFailure(string)    {}
 
 // New builds the ForwardAuth handler. tenantResolver may be nil, which disables
 // GOV-01 context resolution — see config.TenantRegistryURL.
@@ -91,15 +99,26 @@ func New(
 	tenantResolver *tenantctx.Resolver,
 	log *zap.Logger,
 ) *Handler {
+	var exchanger *idenv.Exchanger
+	if cfg.IdentityTokenExchangeURL != "" && cfg.IdentityTokenExchangeClientID != "" && cfg.IdentityTokenExchangeClientSecret != "" {
+		exchanger = idenv.NewExchanger(
+			cfg.IdentityTokenExchangeURL,
+			cfg.IdentityTokenExchangeClientID,
+			cfg.IdentityTokenExchangeClientSecret,
+			nil, // use default 5s HTTP client
+		)
+	}
 	return &Handler{
-		cfg:     cfg,
-		jwks:    jwksClient,
-		carta:   cartaClient,
-		siem:    siemClient,
-		tenant:  tenantResolver,
-		log:     log,
-		metrics: nopMetrics{},
-		rec:     admission.NewRecorder(1024, 0, nil),
+		cfg:         cfg,
+		jwks:        jwksClient,
+		carta:       cartaClient,
+		siem:        siemClient,
+		tenant:      tenantResolver,
+		commercial:  commercial.NewWithExchanger(cfg.CommercialAccountServiceURL, exchanger),
+		exchanger:   exchanger,
+		log:         log,
+		metrics:     nopMetrics{},
+		rec:         admission.NewRecorder(1024, 0, nil),
 	}
 }
 
@@ -112,6 +131,10 @@ func (h *Handler) UseMetrics(m DomainMetrics) *Handler {
 	}
 	return h
 }
+
+// Exchanger returns the configured token exchanger, for outbound calls that
+// need audience exchange (AU-12 / GW-5). Nil if not configured.
+func (h *Handler) Exchanger() *idenv.Exchanger { return h.exchanger }
 
 // UseRevocation makes /verify refuse an envelope whose session has ended. A
 // logout used to leave the envelope passing the edge until it expired (Auth
@@ -323,7 +346,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	// already-fail-closed JWT check, not a replacement for it.
 	assessment := h.carta.Evaluate(ctx,
 		claims.Principal.PrincipalID, claims.TenantID, claims.LegalEntityID,
-		clientIP(r), r.Method+" "+r.Header.Get("X-Forwarded-Uri"),
+		h.clientIP(r), r.Method+" "+r.Header.Get("X-Forwarded-Uri"),
 		// No resource-classification registry exists on this platform yet
 		// (see docs/architecture/full-architecture-gap-analysis.md #16) —
 		// MEDIUM is an explicit, honestly-labeled placeholder floor, not a
@@ -405,6 +428,32 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ZS-SEC-001 §8 / D1-5d: residency gate. Compare the tenant's effective
+	// residency policy against the edge-resolved region (X-Zoiko-Resolved-Region
+	// from GTRM's per-tenant middleware). On a material write with a STRICT
+	// policy whose region disagrees, refuse. Unknown policy on a write fails
+	// closed. Reads are never blocked. Unconfigured tenant registry skips the
+	// gate entirely.
+	if h.tenant.Enabled() && materialWrite(originalMethod(r)) {
+		if !h.checkResidency(ctx, w, r, rc, claims, &resolved) {
+			return
+		}
+	}
+
+	// S3-D1 / GW-3: commercial plan and org unit lookup.
+	// Best-effort call to commercial-account-svc; failure omits the headers
+	// rather than failing the request. The headers are stripped from clients
+	// at the edge (GTRM strip lists, compose authResponseHeaders).
+	if h.commercial.Enabled() {
+		plan, orgUnit, err := h.commercial.GetCommercialPlan(ctx, claims.TenantID)
+		if err == nil {
+			setIfPresent(w, "X-Commercial-Plan", plan)
+			setIfPresent(w, "X-Org-Unit-Id", orgUnit)
+		}
+		// On ErrNotFound or ErrUnavailable we simply omit the headers —
+		// the spec says "an unknown commercial plan omits the header".
+	}
+
 	w.Header().Set("X-Principal-Id", claims.Principal.PrincipalID)
 	w.Header().Set("X-Tenant-Id", claims.TenantID)
 	w.Header().Set("X-Legal-Entity-Id", claims.LegalEntityID)
@@ -442,6 +491,48 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		// unset). Recorded rather than left blank so "no tenant-context series
 		// at all" cannot be misread as "the resolver is failing silently".
 		h.metrics.TenantContext("disabled")
+	}
+
+	// GW-5 / IAM-1 / AU-12: per-service audience exchange.
+	// If the target route has a configured audience different from the edge
+	// audience, exchange the token. Unknown protected routes fail closed.
+	forwardedURI := r.Header.Get("X-Forwarded-Uri")
+	if forwardedURI != "" && h.cfg.GatewayAudienceRoutes != nil {
+		targetAudience := h.lookupAudience(forwardedURI)
+		if targetAudience != "" && targetAudience != h.cfg.ExpectedAudience {
+			// This route requires audience exchange. If no exchanger is configured, fail closed.
+			if h.exchanger == nil {
+				h.log.Error("audience exchange required but exchanger not configured",
+					zap.String("target_audience", targetAudience),
+					zap.String("forwarded_uri", forwardedURI),
+				)
+				h.metrics.ExchangeFailure(targetAudience)
+				h.refuse(w, r, rc, refusal{
+					outcome: outcomeOverloaded, code: "auth_denied", status: http.StatusServiceUnavailable,
+					detail: "audience exchange not configured", retryable: true,
+				})
+				return
+			}
+			exchangedToken, err := h.exchanger.Exchange(ctx, rawToken, targetAudience)
+			if err != nil {
+				h.log.Error("token exchange failed",
+					zap.String("target_audience", targetAudience),
+					zap.String("forwarded_uri", forwardedURI),
+					zap.Error(err),
+				)
+				h.metrics.ExchangeFailure(targetAudience)
+				h.refuse(w, r, rc, refusal{
+					outcome: outcomeOverloaded, code: "auth_denied", status: http.StatusServiceUnavailable,
+					detail: "token exchange failed", retryable: true,
+				})
+				return
+			}
+			// Set the exchanged token in a header that Traefik forwards to the backend.
+			// The backend's gate middleware must be configured to read this header.
+			w.Header().Set("X-Identity-Envelope", exchangedToken)
+			// Also set the target audience for debugging/observability.
+			w.Header().Set("X-Token-Audience", targetAudience)
+		}
 	}
 
 	h.metrics.VerifyDecision(outcomeAllowed)
@@ -585,19 +676,151 @@ func severityFor(d carta.Decision) siem.Severity {
 	}
 }
 
-// clientIP prefers the value Traefik sets over the raw socket address, which
-// would otherwise always be the gateway container's own address.
-// clientIP is the address CARTA scores. It is the RIGHTMOST X-Forwarded-For
-// entry: the one appended by the proxy directly in front of this service,
-// which no client can write. The leftmost entry is whatever the client sent,
-// so taking it let any caller choose the IP its risk was assessed on. With
-// ForwardAuth's trustForwardHeader off, Traefik sends a single entry (its
-// peer), so rightmost and only are the same.
-func clientIP(r *http.Request) string {
+// checkResidency enforces the tenant's data residency policy against the
+// edge-resolved region. Returns true if the check passed or was skipped,
+// false if the request was refused.
+func (h *Handler) checkResidency(ctx context.Context, w http.ResponseWriter, r *http.Request, rc *reqCtx, claims *envelopeClaims, resolved *tenantctx.Context) bool {
+	resolvedRegion := r.Header.Get("X-Zoiko-Resolved-Region")
+	if resolvedRegion == "" {
+		// No region header means this route hasn't been onboarded onto
+		// GTRM-resolved routing yet — no comparison is made.
+		return true
+	}
+
+	policyID := resolved.ResidencyPolicyID
+	if policyID == "" {
+		// No policy means nothing to enforce.
+		return true
+	}
+
+	residency, err := h.tenant.Residency(ctx, claims.TenantID, policyID)
+	switch {
+	case err == nil:
+		// Policy found; check mode and region.
+		if residency.Mode == "STRICT_REGION" && residency.RegionCode != "" && residency.RegionCode != resolvedRegion {
+			h.log.Warn("residency policy mismatch — refusing write",
+				zap.String("principal_id", claims.Principal.PrincipalID),
+				zap.String("tenant_id", claims.TenantID),
+				zap.String("policy_id", policyID),
+				zap.String("policy_mode", residency.Mode),
+				zap.String("policy_region", residency.RegionCode),
+				zap.String("edge_region", resolvedRegion),
+			)
+			h.metrics.TenantContext("residency_denied")
+			h.siem.Stream(ctx, claims.TenantID, "residency_denied", siem.SeverityHigh,
+				"residency policy "+policyID+" requires region "+residency.RegionCode+", edge resolved "+resolvedRegion)
+			h.refuse(w, r, rc, refusal{
+				outcome: outcomeResidencyDenied, code: "context_invalid", status: http.StatusForbidden,
+				detail: "data residency policy requires region " + residency.RegionCode,
+				severity: siem.SeverityHigh, dedicated: true,
+				headers: [][2]string{{"X-Residency-Policy-Id", policyID}, {"X-Residency-Required-Region", residency.RegionCode}},
+			})
+			return false
+		}
+		return true
+	case errors.Is(err, tenantctx.ErrResidencyUnknown):
+		// Unknown policy on a write fails closed.
+		h.log.Warn("residency policy unknown — failing write closed",
+			zap.String("principal_id", claims.Principal.PrincipalID),
+			zap.String("tenant_id", claims.TenantID),
+			zap.String("policy_id", policyID),
+		)
+		h.metrics.TenantContext("residency_unknown")
+		h.siem.Stream(ctx, claims.TenantID, "residency_denied", siem.SeverityHigh,
+			"residency policy "+policyID+" not resolvable")
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeResidencyDenied, code: "context_invalid", status: http.StatusForbidden,
+			detail: "residency policy not resolvable",
+			severity: siem.SeverityHigh, dedicated: true,
+			headers: [][2]string{{"X-Residency-Policy-Id", policyID}},
+		})
+		return false
+	default:
+		// Registry unreachable: fail closed on a write.
+		h.log.Error("residency policy lookup unavailable — failing write closed",
+			zap.String("principal_id", claims.Principal.PrincipalID),
+			zap.String("tenant_id", claims.TenantID),
+			zap.String("policy_id", policyID),
+			zap.Error(err),
+		)
+		h.metrics.TenantContext("residency_unresolved")
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeResidencyUnresolved, code: "context_invalid", status: http.StatusServiceUnavailable,
+			detail: "residency policy could not be resolved",
+			retryable: true, retryAfter: 5,
+			headers: [][2]string{{"X-Residency-Policy-Id", policyID}, {"X-Tenant-Context", "unresolved"}},
+		})
+		return false
+	}
+}
+
+// clientIP returns the client address for rate limiting and risk scoring.
+// It uses the trusted proxy configuration: the right-most X-Forwarded-For
+// entry NOT in a trusted CIDR is the client IP. An untrusted peer's XFF
+// is ignored. TrustedProxyDepth limits how many trusted hops to skip from
+// the right; 0 means only the immediate peer is trusted.
+func (h *Handler) clientIP(r *http.Request) string {
+	if len(h.cfg.TrustedProxyCIDRs) == 0 {
+		// No trusted proxy config: fall back to rightmost hop (original behavior)
+		hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+		for i := len(hops) - 1; i >= 0; i-- {
+			if hop := strings.TrimSpace(hops[i]); hop != "" {
+				return hop
+			}
+		}
+		return r.RemoteAddr
+	}
+
+	// Parse X-Forwarded-For hops
 	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	if len(hops) == 0 {
+		return r.RemoteAddr
+	}
+
+	// TrustedProxyDepth limits how many hops from the right we trust.
+	// We skip trusted hops from the right and return the first untrusted one.
+	depth := h.cfg.TrustedProxyDepth
+	if depth <= 0 {
+		depth = 1
+	}
+
+	// Build a list of hops from right to left (closest proxy first)
 	for i := len(hops) - 1; i >= 0; i-- {
-		if hop := strings.TrimSpace(hops[i]); hop != "" {
+		hop := strings.TrimSpace(hops[i])
+		if hop == "" {
+			continue
+		}
+
+		// Check if this hop is in a trusted CIDR
+		trusted := false
+		for _, cidr := range h.cfg.TrustedProxyCIDRs {
+			_, network, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+			if network.Contains(net.ParseIP(hop)) {
+				trusted = true
+				break
+			}
+		}
+
+		if trusted {
+			depth--
+			if depth <= 0 {
+				continue
+			}
+		} else {
+			// This is the first untrusted hop - the real client
 			return hop
+		}
+	}
+
+	// All hops were trusted or we ran out of depth - fall back to rightmost
+	if len(hops) > 0 {
+		for i := len(hops) - 1; i >= 0; i-- {
+			if hop := strings.TrimSpace(hops[i]); hop != "" {
+				return hop
+			}
 		}
 	}
 	return r.RemoteAddr
@@ -642,6 +865,8 @@ const (
 	outcomeCartaUnavailable         = "carta_unavailable"
 	outcomeRateLimited              = "rate_limited"
 	outcomeOverloaded               = "overloaded"
+	outcomeResidencyDenied          = "residency_denied"
+	outcomeResidencyUnresolved      = "residency_unresolved"
 )
 
 // denialReasonHeader names why a request was refused, on every refusal.
@@ -693,4 +918,24 @@ func setAuthnAge(w http.ResponseWriter, authTime int64, now time.Time) {
 		age = 0
 	}
 	w.Header().Set("X-Authn-Age-Seconds", strconv.FormatInt(age, 10))
+}
+
+// lookupAudience finds the target audience for the given forwarded URI.
+// It matches the longest path prefix in GatewayAudienceRoutes.
+func (h *Handler) lookupAudience(forwardedURI string) string {
+	if h.cfg.GatewayAudienceRoutes == nil {
+		return ""
+	}
+	// Match the longest prefix.
+	var bestMatch string
+	var bestAudience string
+	for prefix, audience := range h.cfg.GatewayAudienceRoutes {
+		if strings.HasPrefix(forwardedURI, prefix) {
+			if len(prefix) > len(bestMatch) {
+				bestMatch = prefix
+				bestAudience = audience
+			}
+		}
+	}
+	return bestAudience
 }

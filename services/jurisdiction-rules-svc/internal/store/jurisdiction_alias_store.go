@@ -190,7 +190,7 @@ func (s *PgStore) ListJurisdictionAliases(ctx context.Context, jurisdictionID st
 		query += ` AND valid_from <= $2 AND (valid_to IS NULL OR valid_to > $2)`
 		args = append(args, *at)
 	}
-	rows, err := s.pool.Query(ctx, query+` ORDER BY valid_from, alias_system, alias_code_norm`, args...)
+	rows, err := s.db(ctx).Query(ctx, query+` ORDER BY valid_from, alias_system, alias_code_norm`, args...)
 	if err != nil {
 		return nil, s.unavailable("ListJurisdictionAliases", err)
 	}
@@ -232,7 +232,7 @@ func (s *PgStore) ResolveCode(ctx context.Context, q domain.ResolveQuery) (*doma
 
 func (s *PgStore) resolveAliasCode(ctx context.Context, system string, q domain.ResolveQuery) (*domain.CodeResolution, error) {
 	norm := domain.NormalizeCode(q.Code)
-	a, err := scanAlias(s.pool.QueryRow(ctx, `
+	a, err := scanAlias(s.db(ctx).QueryRow(ctx, `
 		SELECT `+aliasColumns+` FROM jurisdiction_aliases
 		 WHERE alias_system = $1 AND alias_code_norm = $2
 		   AND valid_from <= $3 AND (valid_to IS NULL OR valid_to > $3)`, system, norm, q.AsOf))
@@ -256,7 +256,7 @@ func (s *PgStore) unmappedOrUnknown(ctx context.Context, system, norm string, at
 	var from time.Time
 	var to *time.Time
 	var open bool
-	err := s.pool.QueryRow(ctx, `
+	err := s.db(ctx).QueryRow(ctx, `
 		SELECT min(valid_from), max(valid_to), bool_or(valid_to IS NULL)
 		  FROM jurisdiction_aliases WHERE alias_system = $1 AND alias_code_norm = $2
 		HAVING count(*) > 0`, system, norm).Scan(&from, &to, &open)
@@ -292,7 +292,7 @@ func (s *PgStore) explainNotInForce(ctx context.Context, err error, at time.Time
 
 func (s *PgStore) resolveInternalCode(ctx context.Context, q domain.ResolveQuery) (*domain.CodeResolution, error) {
 	norm := domain.NormalizeCode(q.Code)
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db(ctx).Query(ctx, `
 		SELECT jurisdiction_id::text, jurisdiction_type, jurisdiction_name
 		  FROM jurisdictions
 		 WHERE upper(jurisdiction_code) = $1 AND ($2 = '' OR jurisdiction_type = $2)
