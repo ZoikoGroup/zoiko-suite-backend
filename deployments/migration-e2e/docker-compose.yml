@@ -1,7 +1,9 @@
 # Minimal slice for proving migration-integrity-svc <-> general-ledger-svc
 # end to end, PLUS financial-control-svc reading general-ledger-svc's new
 # migration-batch-tieout control population: ONLY these services, their
-# Postgres, and authorization-svc. Not part of the main deployments/docker-compose.yml
+# Postgres, authorization-svc, and tenant-entity-registry-svc (so
+# authorization-svc can resolve tenant-from-legal-entity for real instead of
+# needing a manual SQL seed). Not part of the main deployments/docker-compose.yml
 # (migration-integrity-svc isn't wired into that file at all yet, and this
 # task's instructions are explicit: never boot the whole stack). Kafka is
 # deliberately absent -- kafkaout.New's writer connects lazily (see
@@ -32,6 +34,7 @@ services:
       - ../../services/general-ledger-svc/deployments/migrations:/migrations/general-ledger:ro
       - ../../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
       - ../../services/financial-control-svc/deployments/migrations:/migrations/financial-control:ro
+      - ../../services/tenant-entity-registry-svc/deployments/migrations:/migrations/tenant-entity-registry:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -61,11 +64,59 @@ services:
       KAFKA_DELEGATION_TOPIC: ""
       AUTHZ_IDENTITY_ASSERTION: "off"
       AUTHZ_PLATFORM_SCOPE_ENTITY_ID: "aaaaaaaa-0000-4000-8000-0000000000ff"
+      # Tenant of an entity /v1/authorize has no projection for is checked
+      # with the registry, never taken on the caller's word (same pattern as
+      # the main deployments/docker-compose.yml). No depends_on on purpose --
+      # the registry being down refuses only those entities (503), and
+      # tenant-entity-registry-svc itself depends on authorization-svc being
+      # healthy first.
+      AUTHZ_ENTITY_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8089/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: on-failure
+
+  # tenant-entity-registry-svc: authorization-svc's AUTHZ_ENTITY_REGISTRY_URL
+  # above resolves tenant-from-legal-entity here instead of trusting the
+  # caller's own X-Tenant-Id -- without this container, financial-control-svc/
+  # general-ledger-svc calls that omit tenant_id and rely on that resolution
+  # need a manual SQL seed to work around the missing lookup. Minimal
+  # standalone config: no Kafka (KAFKA_BROKERS empty, same lazy-connect
+  # pattern as the rest of this file), no mTLS (gateway-auth-svc's mTLS pilot
+  # is out of scope for this slice).
+  tenant-entity-registry-svc:
+    build:
+      context: ../../
+      dockerfile: services/tenant-entity-registry-svc/Dockerfile
+    container_name: mige2e-tenant-entity-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "18081:8081"
+    environment:
+      PORT: "8081"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: tenant_entity_registry
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: ""
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      AUTHZ_PLATFORM_SCOPE_ID: "aaaaaaaa-0000-4000-8000-0000000000ff"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8081/healthz"]
       interval: 5s
       timeout: 5s
       retries: 30

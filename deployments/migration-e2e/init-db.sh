@@ -1,9 +1,14 @@
 #!/bin/bash
 # First-boot init for the migration-integrity-svc <-> general-ledger-svc
 # wiring end-to-end proof. Minimal, standalone slice: THIS creates only the
-# three databases this proof needs (migration_integrity, general_ledger,
-# authorization_svc), not the whole platform's ~90-database schema that
-# deployments/init-db.sh provisions. Mirrors that script's two rules:
+# databases this proof needs (migration_integrity, general_ledger,
+# authorization_svc, financial_control, tenant_entity_registry), not the
+# whole platform's ~90-database schema that deployments/init-db.sh
+# provisions. tenant_entity_registry backs authorization-svc's tenant-from-
+# legal-entity resolution (AUTHZ_ENTITY_REGISTRY_URL) -- without it,
+# authorization-svc's checks for financial-control-svc/general-ledger-svc
+# calls that omit tenant_id need a manual SQL seed instead. Mirrors that
+# script's two rules:
 # apply every *.up.sql under each mounted /migrations/<dir> in lexical
 # order, and fail loudly if a directory is unmounted or empty rather than
 # silently leaving a service with no schema.
@@ -35,12 +40,14 @@ create_database migration_integrity
 create_database general_ledger
 create_database authorization_svc
 create_database financial_control
+create_database tenant_entity_registry
 
 echo "Applying migrations..."
 apply_migrations migration_integrity migration-integrity
 apply_migrations general_ledger general-ledger
 apply_migrations authorization_svc authorization
 apply_migrations financial_control financial-control
+apply_migrations tenant_entity_registry tenant-entity-registry
 
 # ── Application roles (NOSUPERUSER NOBYPASSRLS), general-ledger-svc and
 # authorization-svc only, matching deployments/scripts/create-app-roles.sh's
