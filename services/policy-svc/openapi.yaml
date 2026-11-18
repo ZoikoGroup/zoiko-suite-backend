@@ -60,6 +60,7 @@ paths:
     post:
       tags: [policies]
       operationId: createPolicy
+      x-spec-operation: GOV-05 CreatePolicyDraft (policy family)
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CorrelationID'
@@ -88,6 +89,7 @@ paths:
     get:
       tags: [resolution]
       operationId: listApplicablePolicyVersions
+      x-spec-operation: Doc 03 8.1 get applicable policy set
       description: The governing version of every applicable chain, most specific scope first.
       parameters:
         - $ref: '#/components/parameters/PolicyType'
@@ -112,6 +114,7 @@ paths:
     get:
       tags: [resolution]
       operationId: resolveEffectivePolicy
+      x-spec-operation: GOV-05 ResolveEffectivePolicy; Doc 03 8.1 validate threshold applicability
       parameters:
         - $ref: '#/components/parameters/PolicyType'
         - $ref: '#/components/parameters/TenantIDQuery'
@@ -133,6 +136,7 @@ paths:
     get:
       tags: [resolution]
       operationId: explainPolicyResolution
+      x-spec-operation: GOV-05 ExplainPolicyResolution
       parameters:
         - $ref: '#/components/parameters/PolicyType'
         - $ref: '#/components/parameters/TenantIDQuery'
@@ -169,6 +173,7 @@ paths:
     post:
       tags: [evaluation]
       operationId: evaluatePolicy
+      x-spec-operation: Doc 03 8.1 evaluate policy against action context
       parameters:
         - $ref: '#/components/parameters/CorrelationID'
       requestBody:
@@ -292,6 +297,7 @@ paths:
     post:
       tags: [policies]
       operationId: retirePolicyFamily
+      x-spec-operation: GOV-05 RetirePolicy (family, D8)
       description: >-
         Retires a policy family: no new versions, history kept. Refused (409 POLICY_IN_USE) while
         a version is ACTIVE or SCHEDULED. Needs the family's record_version and a reason_code;
@@ -328,6 +334,7 @@ paths:
     post:
       tags: [versions]
       operationId: createPolicyVersion
+      x-spec-operation: GOV-05 CreatePolicyDraft (version)
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CorrelationID'
@@ -349,6 +356,7 @@ paths:
     get:
       tags: [versions]
       operationId: listVersionHistory
+      x-spec-operation: Doc 03 8.1 retrieve policy version history
       parameters:
         - $ref: '#/components/parameters/PageSize'
         - $ref: '#/components/parameters/Cursor'
@@ -371,6 +379,7 @@ paths:
     post:
       tags: [versions]
       operationId: submitPolicyVersionForReview
+      x-spec-operation: GOV-05 SubmitPolicyReview
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -391,6 +400,7 @@ paths:
     post:
       tags: [versions]
       operationId: approvePolicyVersion
+      x-spec-operation: GOV-05 ApprovePolicy
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -411,6 +421,7 @@ paths:
     post:
       tags: [versions]
       operationId: activatePolicyVersion
+      x-spec-operation: GOV-05 ActivatePolicy; SupersedePolicy when a successor activates
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -431,6 +442,7 @@ paths:
     post:
       tags: [versions]
       operationId: schedulePolicyVersion
+      x-spec-operation: GOV-05 ScheduleActivation
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -451,6 +463,7 @@ paths:
     post:
       tags: [versions]
       operationId: suspendPolicyVersion
+      x-spec-operation: GOV-05 EmergencySuspendPolicy
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -471,6 +484,7 @@ paths:
     post:
       tags: [versions]
       operationId: retirePolicyVersion
+      x-spec-operation: GOV-05 RetirePolicy (version)
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -491,6 +505,7 @@ paths:
     post:
       tags: [versions]
       operationId: reviewPolicyVersionSuspension
+      x-spec-operation: GOV-05 negative path 3 suspension evidenced and reviewed
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -509,6 +524,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: draftAccountingPolicy
+      x-spec-operation: REF-07 DraftAccountingPolicy
       summary: DraftAccountingPolicy, draft a version of an accounting policy (REF-07)
       description: |
         Drafts a version of the accounting policy for `(policy_domain, book_id, jurisdiction_id)` in
@@ -557,6 +573,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: listApplicableAccountingPolicies
+      x-spec-operation: REF-07 applicable accounting policy set
       summary: ListApplicablePolicies, the accounting policies that apply (REF-07)
       description: |
         For the entity, book, jurisdiction and date, the resolution of every policy domain that has
@@ -593,6 +610,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: resolveAccountingPolicy
+      x-spec-operation: REF-07 ResolveAccountingPolicy
       summary: ResolveAccountingPolicy, the one policy that governs (REF-07)
       description: |
         Resolves by `policy_domain`, `book_id`, `jurisdiction_id`, `legal_entity_id` and the
@@ -630,6 +648,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: explainAccountingResolution
+      x-spec-operation: REF-07 ExplainAccountingResolution
       summary: ExplainPolicyResolution for an accounting policy (REF-07)
       description: |
         The resolution for one domain and, for every candidate version, whether it governs and why
@@ -659,6 +678,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: getAccountingPolicyVersion
+      x-spec-operation: REF-07 GetAccountingPolicyVersion
       summary: GetPolicyVersion for an accounting policy (REF-07)
       description: |
         The version with its applicability, what it rests on (framework source, approved policy
@@ -684,6 +704,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: submitAccountingPolicy
+      x-spec-operation: REF-07 SubmitAccountingPolicy
       summary: Submit an accounting policy draft for review (REF-07)
       description: |
         Moves a DRAFT to REVIEW. Needs `ACCOUNTING_POLICY_DRAFT`. Every lifecycle command needs the version's
@@ -711,6 +732,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: approveAccountingPolicyVersion
+      x-spec-operation: REF-07 ApproveAccountingPolicy
       summary: ApprovePolicyVersion (REF-07)
       description: |
         Approves a version in REVIEW. **The author cannot approve their own version** (`403 SOD_CONFLICT`, also
@@ -739,6 +761,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: activateAccountingPolicyVersion
+      x-spec-operation: REF-07 ActivateAccountingPolicy
       summary: ActivatePolicyVersion (REF-07)
       description: |
         Activates an APPROVED version: ACTIVE now, or SCHEDULED when its `effective_from` is in the future. Needs
@@ -772,6 +795,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: supersedeAccountingPolicyVersion
+      x-spec-operation: REF-07 SupersedeAccountingPolicy
       summary: SupersedePolicyVersion (REF-07)
       description: |
         Activates an APPROVED version over the active version it names in `supersedes_version_id`, which must be the
@@ -802,6 +826,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: emergencySuspendAccountingPolicy
+      x-spec-operation: REF-07 EmergencySuspendAccountingPolicy (break-glass)
       summary: EmergencySuspendPolicy (REF-07)
       description: |
         Withdraws an ACTIVE or SCHEDULED version at once. **Needs a live break-glass session:** its id in
@@ -834,6 +859,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: reviewAccountingPolicySuspension
+      x-spec-operation: REF-07 ReviewAccountingPolicySuspension
       summary: Review an emergency suspension (REF-07)
       description: |
         The independent review of an emergency suspension, with `reason_code` and an `outcome` of `UPHELD` or
@@ -862,6 +888,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: getAccountingPolicyImpact
+      x-spec-operation: REF-07 AccountingPolicyImpactAnalysis
       summary: Impact of activating an accounting policy version (REF-07)
       description: |
         What activating the version would do, worked out from the policies that exist, so a reviewer need not take
@@ -958,6 +985,7 @@ paths:
     get:
       tags: [versions]
       operationId: comparePolicyVersions
+      x-spec-operation: GOV-05 ComparePolicyVersions
       parameters:
         - {name: base, in: query, required: true, schema: {type: string, format: uuid}}
         - {name: target, in: query, required: true, schema: {type: string, format: uuid}}
@@ -979,6 +1007,7 @@ paths:
     get:
       tags: [versions]
       operationId: getPolicyVersion
+      x-spec-operation: GOV-05 GetPolicyVersion
       responses:
         '200': {$ref: '#/components/responses/PolicyVersion'}
         '400': {$ref: '#/components/responses/Problem'}
@@ -993,6 +1022,7 @@ paths:
     get:
       tags: [versions]
       operationId: listPolicyVersionTransitions
+      x-spec-operation: GOV-05 lifecycle evidence (approval, activation, suspension)
       parameters:
         - $ref: '#/components/parameters/PageSize'
         - $ref: '#/components/parameters/Cursor'
@@ -1044,6 +1074,7 @@ paths:
     get:
       tags: [evaluation]
       operationId: getPolicyEvaluation
+      x-spec-operation: Doc 03 8.1 preserve evaluation basis for governed decisions
       responses:
         '200':
           description: The recorded evaluation evidence
@@ -1060,6 +1091,7 @@ paths:
     post:
       tags: [controls]
       operationId: createControlTestDefinition
+      x-spec-operation: doc7 E3 define control test
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1110,6 +1142,7 @@ paths:
     get:
       tags: [controls]
       operationId: getControlTestDefinition
+      x-spec-operation: doc7 E3 read control test
       responses:
         '200':
           description: The definition
@@ -1128,6 +1161,7 @@ paths:
     post:
       tags: [controls]
       operationId: createControlTestExecution
+      x-spec-operation: doc7 E3 record control test execution
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1151,6 +1185,7 @@ paths:
     get:
       tags: [controls]
       operationId: listControlTestExecutions
+      x-spec-operation: doc7 E3 control test executions
       parameters:
         - $ref: '#/components/parameters/PageSize'
         - $ref: '#/components/parameters/Cursor'
@@ -1171,6 +1206,7 @@ paths:
     get:
       tags: [controls]
       operationId: getControlEffectiveness
+      x-spec-operation: doc7 E3 control effectiveness
       responses:
         '200':
           description: Design status and operating effectiveness from the latest reviewed execution
@@ -1186,6 +1222,7 @@ paths:
     post:
       tags: [attestations]
       operationId: createAttestation
+      x-spec-operation: doc7 E6 sign attestation
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1232,6 +1269,7 @@ paths:
     get:
       tags: [attestations]
       operationId: getAttestation
+      x-spec-operation: doc7 E6 read attestation
       responses:
         '200':
           description: The attestation
@@ -1250,6 +1288,7 @@ paths:
     post:
       tags: [attestations]
       operationId: revokeAttestation
+      x-spec-operation: doc7 E6 revoke attestation
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
