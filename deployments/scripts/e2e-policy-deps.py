@@ -125,8 +125,52 @@ def call(method, url, headers=None, body=None, timeout=20, raw_body=None):
     return status, hdrs, parsed, content
 
 
+# Demo logins for the principals that act on policy-svc. Under
+# POLICY_IDENTITY_VERIFY=enforce (POL-3) bare identity headers are refused 401,
+# so every call as one of these principals carries identity-context-svc's
+# signed envelope for that principal and legal entity, as the console does.
+CREDS = {
+    ADMIN: ("admin@zoikosuite.com", "Zoiko@Governance1"),
+    APPROVER: ("legal.counsel@zoikosuite.com", "Zoiko@Legal2026!"),
+}
+_SIGNED = {}
+
+
+def login_envelope(email, password, entity=ENTITY):
+    """A console login's signed envelope for one legal entity, or (None, why)."""
+    s, _, b, _ = call("POST", f"{IDENTITY}/v1/authenticate", {"Content-Type": "application/json"},
+                      {"tenant_id": TENANT, "email": email, "password": password,
+                       "client_id": os.environ.get("IDENTITY_CONSOLE_CLIENT_ID", "zoiko-console"),
+                       "client_secret": os.environ.get("IDENTITY_CONSOLE_CLIENT_SECRET", "local-dev-console-client-secret")})
+    if s != 200 or not b.get("access_token"):
+        return None, f"login HTTP {s} {brief(b)}"
+    s, _, r, _ = call("POST", f"{IDENTITY}/v1/context/resolve", envelope(write=True),
+                      {"bearer_token": b["access_token"], "legal_entity_id": entity})
+    return (r.get("envelope_jwt"), "") if r.get("envelope_jwt") else (None, f"resolve HTTP {s} {brief(r)}")
+
+
+def signed(principal, entity):
+    """The cached envelope for (principal, entity); refreshed after 4 minutes."""
+    key = (principal, entity or ENTITY)
+    hit = _SIGNED.get(key)
+    if hit and hit[1] > time.time():
+        return hit[0]
+    if principal not in CREDS:
+        return None
+    jwt, _ = login_envelope(*CREDS[principal], entity=entity or ENTITY)
+    if jwt:
+        _SIGNED[key] = (jwt, time.time() + 240)
+    return jwt
+
+
 def pol(method, path, principal=ADMIN, body=None, write=None, entity=ENTITY, tenant=TENANT, extra=None, raw_body=None):
     h = envelope(principal, write=(method != "GET") if write is None else write, tenant=tenant, entity=entity)
+    # A spoofed tenant header goes without an envelope: the envelope names the
+    # real tenant, and the point of those checks is the header alone.
+    if tenant == TENANT and "Authorization" not in (extra or {}):
+        jwt = signed(principal, entity)
+        if jwt:
+            h["Authorization"] = "Bearer " + jwt
     h.update(extra or {})
     return call(method, POLICY + path, h, body, raw_body=raw_body)
 
@@ -324,22 +368,23 @@ def grants():
                           {"principal_id": principal, "legal_entity_id": scope, "action_type": action})
         check(f"authorization: {action} granted to {principal[:8]} on {scope[-4:]}", s == 200 and b.get("decision") == "PERMIT",
               f"HTTP {s} {b.get('decision')} {b.get('decision_basis', '')}")
+    s, _, b, _ = call("POST", f"{AUTHZ}/v1/authorize", envelope(STRANGER, entity=ENTITY),
+                      {"principal_id": STRANGER, "legal_entity_id": ENTITY, "action_type": "POLICY_EVALUATE"})
+    check("authorization: POLICY_EVALUATE is not granted to a stranger", s in (200, 403) and b.get("decision") != "PERMIT",
+          f"HTTP {s} {b.get('decision')}")
+    # The stranger has no login, so no signed envelope. Under enforce (POL-3)
+    # policy-svc refuses the unverified identity before authorization (401);
+    # under warn it reaches the authorization gate (403). Either way: refused.
     s, _, b, _ = resolve(resolve_body("5", actor_principal_id=STRANGER), principal=STRANGER)
-    check("authorization: a principal without POLICY_EVALUATE cannot resolve (403)", s == 403, f"HTTP {s} {b.get('code')}")
+    check("authorization: a principal without POLICY_EVALUATE cannot resolve (403, or 401 unverified under enforce)",
+          s == 403 or (s == 401 and b.get("reason_code", b.get("code")) in ("identity_assertion_required", "IDENTITY_UNVERIFIED")) or
+          (s == 401 and "identity" in json.dumps(b)), f"HTTP {s} {b.get('code')}")
 
 
 # ── 3. identity-context-svc: the console's signed envelope ───────────────────
 
 def envelope_jwt():
-    s, _, b, _ = call("POST", f"{IDENTITY}/v1/authenticate", {"Content-Type": "application/json"},
-                      {"tenant_id": TENANT, "email": "admin@zoikosuite.com", "password": "Zoiko@Governance1",
-                       "client_id": os.environ.get("IDENTITY_CONSOLE_CLIENT_ID", "zoiko-console"),
-                       "client_secret": os.environ.get("IDENTITY_CONSOLE_CLIENT_SECRET", "local-dev-console-client-secret")})
-    if s != 200 or not b.get("access_token"):
-        return None, f"login HTTP {s} {brief(b)}"
-    s, _, r, _ = call("POST", f"{IDENTITY}/v1/context/resolve", envelope(write=True),
-                      {"bearer_token": b["access_token"], "legal_entity_id": ENTITY})
-    return (r.get("envelope_jwt"), "") if r.get("envelope_jwt") else (None, f"resolve HTTP {s} {brief(r)}")
+    return login_envelope(*CREDS[ADMIN])
 
 
 def identity():
@@ -601,7 +646,7 @@ def contract_negatives(state):
     s, _, _, got = pol("GET", f"/internal/v1/policy/decisions/{d['decision_id']}")
     check("decisions: GET /internal/v1/policy/decisions/{id} serves the exact signed bytes", s == 200 and got == raw, f"HTTP {s}")
     s, _, b, _ = pol("GET", f"/internal/v1/policy/decisions/{d['decision_id']}", tenant=OTHER_TENANT)
-    check("isolation: another tenant cannot read the decision", s in (403, 404), f"HTTP {s} {b.get('code')}")
+    check("isolation: another tenant cannot read the decision", s in (401, 403, 404), f"HTTP {s} {b.get('code')}")
     rc, out, _ = psql(f"SELECT decision_outcome, valid_until IS NOT NULL, decision_envelope::jsonb ? 'integrity', policy_type "
                       f"FROM policy_evaluations WHERE evaluation_id = '{d['decision_id']}';")
     check("evidence: the decision is stored with outcome, validity and its signed envelope", out == "SIGNATURE_REQUIRED|t|t|SIGNATORY_MATRIX", out)

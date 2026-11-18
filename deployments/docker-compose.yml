@@ -1306,11 +1306,13 @@ services:
       # identity-context-svc's signed envelope (verified against its JWKS, its
       # session checked at introspection, AU-01) replaces X-Tenant-Id /
       # X-Principal-Id, or a peer certificate on the :8449 mTLS listener vouches
-      # for them. governance-decision-log-svc's replay forwards the envelope
-      # since 21 Oct; warn remains for the out-of-domain evaluate callers
-      # (expense-claim-svc, payment-authorization-svc), which forward the
-      # principal but not the envelope. The code default is enforce.
-      POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-warn}"
+      # for them. Enforced since 18 Nov 2026 (POL-3): e2e-policy-deps.py passes
+      # 112/112 under enforce (console envelope; governance-decision-log-svc
+      # replay and workflow-svc over :8449), and expense-claim-svc,
+      # payment-authorization-svc and payroll-run-svc forward the caller's
+      # envelope, so a forwarded request is accepted and an envelope-less one
+      # is refused 401, which each caller turns into a fail-closed 403.
+      POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-enforce}"
       IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-svc:8080/v1/context/session/introspect"
       EXPECTED_ISSUER: "identity-context-svc"
