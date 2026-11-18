@@ -47,13 +47,20 @@ service. One scoring defect was fixed in this pass (B1).
   service is narrowed to certificates/evidence over financial-close's
   batches. The ownership table suggests the second; the code supports
   neither yet.
-- **A2. None of the §4 object model exists.** MigrationProgram, SourceSystem,
-  SourceDataset, SourceExtract (watermark, manifest hash, record count, amount
-  controls), MappingRuleSet, IdentityCrosswalk, MigrationCandidate,
-  QuarantineItem, MigrationRun, ReconciliationRun, MigrationCertificate,
-  CutoverRun, StabilizationCase — none are modelled. A "job" has no extract
-  identity, no source watermark, no mapping version and no batch identity
-  (MIG-INV-02, -03, -05, -11; §17 certificate minimum).
+- **A2. None of the §4 object model exists** (partly closed -- see D).
+  MigrationProgram, SourceSystem, SourceDataset, SourceExtract (watermark,
+  manifest hash, record count, amount controls), MappingRuleSet,
+  IdentityCrosswalk, MigrationCandidate, QuarantineItem, MigrationRun,
+  ReconciliationRun, MigrationCertificate, CutoverRun, StabilizationCase —
+  none are modelled. A "job" has no extract identity, no source watermark,
+  no mapping version and no batch identity (MIG-INV-02, -03, -05, -11; §17
+  certificate minimum). MigrationProgram, SourceExtract and IdentityCrosswalk
+  are now built (D1/D2, C2); MigrationCertificate and MigrationBatchRef
+  (C1/C3) cover part of MigrationRun/MigrationCertificate's ground.
+  SourceSystem, SourceDataset, MappingRuleSet, MigrationCandidate,
+  QuarantineItem, ReconciliationRun, CutoverRun and StabilizationCase
+  remain unmodelled -- the cutover-runbook pieces (CutoverRun,
+  StabilizationCase, the `G0`-`G10` gates) deliberately so (D6).
 - **A3. No migration certificate.** The ownership table's one named
   responsibility. §17 requires the certificate to name source watermarks,
   extract hashes, mapping versions, accepted batches, target release/schema,
@@ -331,3 +338,101 @@ ordinary chart-of-accounts/dimension rules).
   layer this service does not have and this task did not add; see the
   worked example below for how the two are joined by hand via the
   crosswalk's `source_ref`.
+
+## D. `MigrationProgram` and `SourceExtract` (§4 object model, continued)
+
+A later pass on top of C1-C7 above. §4 still names two objects neither this
+service nor anything else in the platform modelled: `MigrationProgram` (the
+top-level "this is one migration project" tracking object) and
+`SourceExtract` (a frozen, versioned landing of source data, MIG-INV-03:
+"Source extracts are immutable after landing; corrections create new
+extract versions"). This pass adds exactly those two, following C1-C7's own
+conventions (authz action naming, tenant/per-entity scoping, migration
+numbering, outbox events via `enqueueMigrationEvent`), and nothing else --
+the rest of A/B/C above is unchanged and still accurate.
+
+- **D1. `MigrationProgram`** (`migration_programs`, migration `000009`).
+  `tenant, program_id, source estate, target scope, owner, status, cutover
+  strategy` per §4, with a `status` lifecycle (`OPEN -> IN_PROGRESS ->
+  COMPLETE`, linear and forward-only -- `domain.NextProgramStatus`, the same
+  guarded-lifecycle shape `accounting-period-svc` uses for its own periods)
+  set only by an explicit `POST /v1/migrations/programs/{id}/status`, never
+  inferred from its batches' state. `migration_batch_refs` gained a nullable
+  `program_id` FK in the same migration (additive: every batch ref promoted
+  before this migration, and any `/promote` call that still omits
+  `program_id`, keeps exactly its pre-existing "no program" semantics --
+  `PromoteBatchRequest.ProgramID` is optional). `GET
+  /v1/migrations/programs/{id}` returns the program plus a live
+  `ProgramBatchSummary` (total batches, a count per promotion status,
+  reconciled count) computed by `GROUP BY status` over
+  `migration_batch_refs` at read time, never a stored counter that could
+  drift from the batches it describes.
+
+- **D2. `SourceExtract`** (`migration_source_extracts`, migration `000010`).
+  `extract_id, source watermark, generated_at, files/objects, manifest
+  hash, record count, amount controls` per §4. Append-only: there is no
+  update endpoint anywhere in this service for it, and the database itself
+  refuses `UPDATE`/`DELETE`/`TRUNCATE` on the table outright (the same
+  `BEFORE ... RAISE EXCEPTION` trigger pattern `accounting-period-svc` uses
+  for its own append-only `period_state_history`,
+  `deployments/migrations/000002_immutability.up.sql` there --
+  `migration_source_extract_forbid_mutation()` here). A "correction" is a
+  new row: `POST /v1/migrations/extracts` with an already-used `extract_id`
+  registers `version = previous max + 1` (`store.CreateExtract`, guarded by
+  `pg_advisory_xact_lock` on the `(tenant, extract_id)` pair so two
+  concurrent corrections can never race to the same version number); the
+  original row is never touched. `GET /v1/migrations/extracts?extract_id=`
+  lists every version of one extract in order, which is the visible proof
+  that a correction is a new row, not a rewrite.
+
+- **D3. `/validate` now optionally binds to an extract** (`migration_jobs`
+  gained nullable `source_extract_id`/`source_extract_version`, migration
+  `000011`). `ValidateMigrationRequest.SourceExtractID` is optional and
+  backward compatible: a caller that omits it validates the submitted
+  records directly, exactly as this endpoint behaved before `SourceExtract`
+  existed (nothing that calls `/validate` today needs to change). When
+  provided, the handler requires the extract's `legal_entity_id` to match
+  the request's and its `record_count` to equal `len(Records)` before
+  validating -- refusing with 409 otherwise -- so a retry cannot silently
+  validate a different population under an already-registered extract's
+  name. This is deliberately a consistency check on the extract's own
+  declared header, not a re-fetch of the extract's actual file contents:
+  this service holds no file/object store client, matching C7's own note
+  that this pass does not add a mapping/transform layer it does not have.
+
+- **D4. Authorization actions added**: `MIGRATION_PROGRAM_WRITE`,
+  `MIGRATION_PROGRAM_VIEW` (tenant-scoped, like
+  `MIGRATION_CROSSWALK_*` -- a program is not attached to one legal entity),
+  `MIGRATION_EXTRACT_REGISTER`, `MIGRATION_EXTRACT_VIEW` (per-legal-entity,
+  like the job/batch-ref actions -- an extract names exactly one
+  `legal_entity_id`).
+
+- **D5. Proven end to end** (manual proof against the same minimal compose
+  slice C1-C7 used, `deployments/migration-e2e/`; not re-committed as a
+  script): create a program -> register a `SourceExtract` v1 ->
+  `/validate` against it (record-count mismatch refused with 409 when
+  tried) -> resolve the crosswalk -> `/promote` (now carrying `program_id`)
+  drives general-ledger-svc's real Stage -> Validate -> Approve -> Post ->
+  Reconcile to `RECONCILED`/`MATCHED` -> `/certificate` issues, backed by
+  GL's fresh evidence read -> `GET /programs/{id}` reports
+  `total_batches: 1, status_counts: {RECONCILED: 1}` -> a direct `UPDATE`/
+  `DELETE` against `migration_source_extracts` for that extract, run as the
+  Postgres superuser itself (not through this service's API at all), was
+  refused by the trigger with `MIG-INV-03` in the error text -> the correct
+  path, registering `extract_id` again, created v2 while v1's
+  `manifest_hash` stayed exactly `sha256:aaa111` -- confirming the refused
+  mutation attempts left the original row untouched. The program's status
+  was then walked `OPEN -> IN_PROGRESS -> COMPLETE` through `POST
+  .../status`, with `IN_PROGRESS -> OPEN` and `OPEN -> COMPLETE` both
+  refused with 409 as illegal transitions.
+
+- **D6. Cutover-runbook gates (`G0`-`G10`) remain deliberately out of
+  scope.** Per the Engineering Build Blueprint, the gated cutover-runbook
+  capability (`CutoverRun`, `StabilizationCase`, and the `G0`-`G10`
+  go/no-go gate sequence §4/§23 also name) is Phase 6 "trust maturity" —
+  not a blocker for the program/extract/batch/certificate chain this pass
+  and C1-C7 together now support end to end. `MigrationProgram` and
+  `SourceExtract` are built because batches and certificates needed them to
+  mean anything concrete (a batch belonging to no program, an extract with
+  no frozen identity); the cutover runbook is a separate, later capability
+  this task does not build and was not asked to.
