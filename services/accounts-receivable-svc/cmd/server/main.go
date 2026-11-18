@@ -29,6 +29,7 @@ import (
 	"zoiko.io/accounts-receivable-svc/internal/ar08"
 	"zoiko.io/accounts-receivable-svc/internal/ar09"
 	"zoiko.io/accounts-receivable-svc/internal/ar10"
+	"zoiko.io/accounts-receivable-svc/internal/catalogref"
 	"zoiko.io/accounts-receivable-svc/internal/arctl"
 	"zoiko.io/accounts-receivable-svc/internal/authz"
 	"zoiko.io/accounts-receivable-svc/internal/config"
@@ -205,12 +206,14 @@ func main() {
 	// AR-03 Sales Order. kit.OpenItems is AR-07's; until it is wired the credit
 	// check compares only the order's own value and records exposure_available:false.
 	// (Pass a literal nil: a typed-nil module would count as non-nil.)
-	ar03m := ar03.New(kitDeps, ar01m, ar07m)
+	// BIZ-07: a catalog:<offering>:<version> catalog_version_ref is verified at approval.
+	catalogChecker := catalogref.NewHTTPChecker(cfg.CatalogServiceURL)
+	ar03m := ar03.New(kitDeps, ar01m, ar07m).WithCatalog(catalogChecker)
 	ar03m.Register(r)
 
 	// AR-02 Quote / Estimate. AR-03 is the order creator, so quote conversion
 	// and order creation commit atomically.
-	ar02m := ar02.New(kitDeps, ar01m, taxdet.NewHTTPClient(cfg.TaxDeterminationURL), ar03m)
+	ar02m := ar02.New(kitDeps, ar01m, taxdet.NewHTTPClient(cfg.TaxDeterminationURL), ar03m).WithCatalog(catalogChecker)
 	ar02m.Register(r)
 
 	// AR-04 Customer Invoice. Receivable creation needs AR-07 (kit.OpenItems,

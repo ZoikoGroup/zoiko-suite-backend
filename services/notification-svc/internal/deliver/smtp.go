@@ -12,6 +12,7 @@ import (
 	"net/smtp"
 	"net/textproto"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,6 +51,7 @@ type SMTPProvider struct {
 	host     string
 	port     int
 	username string
+	pwMu     sync.RWMutex
 	password string
 	tlsMode  TLSMode
 
@@ -304,7 +306,7 @@ func (p *SMTPProvider) authenticate(client *smtp.Client) error {
 	}
 	// PlainAuth refuses a connection it does not consider secure, so on
 	// starttls/implicit this is PLAIN over TLS and never a cleartext password.
-	if err := client.Auth(smtp.PlainAuth("", p.username, p.password, p.host)); err != nil {
+	if err := client.Auth(smtp.PlainAuth("", p.username, p.currentPassword(), p.host)); err != nil {
 		// Bad credentials are permanent; retrying re-sends them and, at some
 		// providers, contributes to a lockout.
 		return classifySMTPError(fmt.Errorf("authenticating to %s as %q: %w", p.addr(), p.username, err))
@@ -535,4 +537,22 @@ func isLoopbackHost(host string) bool {
 		return ip.IsLoopback()
 	}
 	return false
+}
+
+// SetPassword replaces the SMTP password, so a credential rotated in the vault reaches a running provider (S7-B3).
+// An empty password is refused: it would silently turn authenticated sending into an unauthenticated attempt.
+func (p *SMTPProvider) SetPassword(password string) error {
+	if password == "" {
+		return errors.New("smtp: an empty password is not accepted")
+	}
+	p.pwMu.Lock()
+	p.password = password
+	p.pwMu.Unlock()
+	return nil
+}
+
+func (p *SMTPProvider) currentPassword() string {
+	p.pwMu.RLock()
+	defer p.pwMu.RUnlock()
+	return p.password
 }

@@ -1,0 +1,1 @@
+{"type":"object","description":"ZS-EVENT-001 payload of com.zoikosuite.accounting.account-mapping.created (general-ledger-svc, schema 1.0.0): a draft account mapping was created.","properties":{"mapping_key":{"type":"string"},"account_code":{"type":"string"},"is_high_risk":{"type":"boolean"}},"required":["mapping_key","account_code","is_high_risk"]}

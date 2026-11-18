@@ -26,13 +26,17 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /healthcheck ./cmd/healthcheck/
 
 # ─── Stage 2: runtime ─────────────────────────────────────────────────────────
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.20
+
+RUN addgroup -g 65532 nonroot && adduser -u 65532 -G nonroot -D nonroot
 
 COPY --from=builder /gateway-auth-svc /gateway-auth-svc
 COPY --from=builder /healthcheck /healthcheck
+COPY services/gateway-auth-svc/entrypoint.sh /entrypoint.sh
 
-USER nonroot:nonroot
+RUN chmod +x /entrypoint.sh && apk add --no-cache openssl su-exec
 
+# Run as root to provision the token file, then drop to nonroot
 EXPOSE 8092
 
-ENTRYPOINT ["/gateway-auth-svc"]
+ENTRYPOINT ["/entrypoint.sh"]

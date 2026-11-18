@@ -1,0 +1,2 @@
+DROP TRIGGER IF EXISTS trg_enforce_catalog_activation_mappings ON inventory_catalog_offering_versions;
+DROP FUNCTION IF EXISTS enforce_catalog_activation_mappings();

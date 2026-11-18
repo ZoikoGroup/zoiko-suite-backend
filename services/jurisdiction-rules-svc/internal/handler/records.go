@@ -234,4 +234,3 @@ func (h *Handler) finishRecordDecision(w http.ResponseWriter, r *http.Request, k
 	}
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, key: json.RawMessage(stored.Response)})
 }
-

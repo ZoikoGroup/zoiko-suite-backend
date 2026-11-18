@@ -153,7 +153,7 @@ func ncdServer(t *testing.T) (http.Handler, *ncd.Service, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	pg := store.New(pool)
+	pg := store.New(pool, store.WithEventRegion("local"))
 	st := store.NewNCD(pg)
 	svc := ncd.NewService(st, okResolver{}, ncd.RouterTransport{Email: &okEmail{}, Inbox: st}, ncd.DefaultLimits(), zap.NewNop())
 	grants := grantSet{"alice|*": true, "bob|*": true}

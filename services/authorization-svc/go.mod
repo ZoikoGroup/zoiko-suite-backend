@@ -19,6 +19,8 @@ require (
 	go.uber.org/zap v1.27.0
 )
 
+require github.com/kylelemons/godebug v1.1.0 // indirect
+
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -58,7 +60,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	gopkg.in/yaml.v3 v3.0.1
 	zoiko.io/identity-envelope v0.0.0
 )
 

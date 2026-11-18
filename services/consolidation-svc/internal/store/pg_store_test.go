@@ -17,6 +17,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"zoiko.io/eventing/contracttest"
 	"go.uber.org/zap"
 
 	"zoiko.io/consolidation-svc/internal/domain"
@@ -40,6 +42,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
+	// ZS-EVENT-001 12.1: every event this test emitted must satisfy its published schema.
+	t.Cleanup(func() { contracttest.Verify(t, pool, filepath.Join(base, "../../contracts/events")) })
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
 		command_idempotency, eventing_outbox, consolidation_eliminations, consolidation_adjustment_transitions, consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs

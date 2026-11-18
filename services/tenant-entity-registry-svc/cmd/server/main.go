@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,8 +34,10 @@ import (
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/config"
+	"zoiko.io/tenant-entity-registry-svc/internal/currency"
 	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
 	svcenvelope "zoiko.io/tenant-entity-registry-svc/internal/envelope"
+	"zoiko.io/tenant-entity-registry-svc/internal/fiscalcal"
 	"zoiko.io/tenant-entity-registry-svc/internal/handler"
 	"zoiko.io/tenant-entity-registry-svc/internal/health"
 	"zoiko.io/tenant-entity-registry-svc/internal/idempotency"
@@ -187,6 +190,26 @@ func main() {
 	svc.ConfigureMakerChecker(cfg.MakerCheckerLegacyBodyApprover, time.Duration(cfg.ApprovalTTLHours)*time.Hour)
 	svc.ConfigureCompatibility(cfg.LegacyEntityCreateActive, cfg.OnboardingKeyOptional)
 
+	// REF-03: currency codes are checked against currency-registry-svc, read-only and fail-closed. Outside development
+	// and test, no registry means no exchange-rate ingestion, never an unconfirmed currency.
+	var currencyValidator currency.Validator
+	switch {
+	case cfg.CurrencyRegistryURL != "":
+		currencyValidator = currency.NewHTTP(cfg.CurrencyRegistryURL, log)
+	case strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging"):
+		currencyValidator = currency.Unavailable{}
+	default:
+		currencyValidator = currency.NewStub(log)
+	}
+	svc.WithCurrencyValidator(currencyValidator)
+
+	// ORG-03 s4.3: a fiscal calendar reference must name a calendar of the tenant (fiscal-calendar-svc, read-only, fail-closed).
+	if cfg.FiscalCalendarURL != "" {
+		svc.WithFiscalCalendarValidator(fiscalcal.NewHTTP(cfg.FiscalCalendarURL, log))
+	} else {
+		log.Warn("FISCAL_CALENDAR_URL unset: fiscal calendar references are format-checked only")
+	}
+
 	// ORG-02 §4.2 server-resolved provisioning context: plan entitlement from
 	// commercial-account-svc and the restricted-jurisdiction list.
 	var entitlementChecker entitlement.Checker = entitlement.NewStubChecker(log)
@@ -243,6 +266,7 @@ func main() {
 	// contract §3, §9.2 DoD gates 2 and 4.
 	handler.RegisterRoutes(r, h, idempotency.Middleware(pgStore, log))
 	go purgeIdempotencyKeys(relayCtx, pgStore, log)
+	go sweepRegistrationExpiries(relayCtx, svc, log)
 	go watchOutbox(relayCtx, relay, metrics, log)
 
 	// ── 7. Health probes (separate path, no auth) ────────────────────────────
@@ -398,6 +422,32 @@ func watchOutbox(ctx context.Context, relay *outbox.Relay, m *telemetry.Metrics,
 		published, failed := relay.Stats()
 		m.OutboxPublished.Set(float64(published))
 		m.OutboxFailed.Set(float64(failed))
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// registrationSweepEvery is how often registrations past their expiry date are recorded as EXPIRED and those coming
+// are warned about. Expiry is also computed from the dates on every read, so a late sweep never lets an expired
+// registration read as active; the sweep is what publishes the events and keeps the stored status true.
+const registrationSweepEvery = time.Hour
+
+// registrationWarnDays is how far ahead registration.expiring is published.
+const registrationWarnDays = 30
+
+func sweepRegistrationExpiries(ctx context.Context, svc *registry.Service, log *zap.Logger) {
+	t := time.NewTicker(registrationSweepEvery)
+	defer t.Stop()
+	for {
+		res, err := svc.SweepRegistrationExpiries(ctx, time.Now().UTC(), registrationWarnDays)
+		if err != nil && ctx.Err() == nil {
+			log.Error("registration expiry sweep failed", zap.Error(err))
+		} else if res.Expired > 0 || res.Warned > 0 {
+			log.Info("registration expiry sweep", zap.Int("expired", res.Expired), zap.Int("warned", res.Warned))
+		}
 		select {
 		case <-ctx.Done():
 			return

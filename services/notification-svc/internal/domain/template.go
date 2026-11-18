@@ -196,6 +196,19 @@ func (e ErrTemplateVariablesMissing) Error() string {
 	return fmt.Sprintf("version %s requires variables: %s", e.VersionID, strings.Join(e.Missing, ", "))
 }
 
+// ErrTemplateVariablesUndeclared backs ValidateTemplate: the wording references a variable
+// the version's schema does not declare. Blocking it at validation (spec BIZ-03: a missing
+// variable schema blocks publication) keeps an undeclared variable from rendering as blank
+// text at send time.
+type ErrTemplateVariablesUndeclared struct {
+	VersionID  string
+	Undeclared []string
+}
+
+func (e ErrTemplateVariablesUndeclared) Error() string {
+	return fmt.Sprintf("version %s uses variables its schema does not declare: %s", e.VersionID, strings.Join(e.Undeclared, ", "))
+}
+
 // ErrTemplateVariablesUnexpected backs RenderPreview and the governed-template
 // send: a variable the version's schema does not declare is refused rather than
 // silently ignored (ZS-SVC-Y-001 NP-07). An ignored variable is how a caller

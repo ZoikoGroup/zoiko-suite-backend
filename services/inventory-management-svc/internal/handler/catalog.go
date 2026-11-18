@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -10,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/inventory-management-svc/internal/domain"
+	svcmiddleware "zoiko.io/inventory-management-svc/internal/middleware"
 )
 
 // ── POST /v1/catalog/offerings ──────────────────────────────────────────────
@@ -46,7 +49,7 @@ func (h *Handler) CreateOffering(w http.ResponseWriter, r *http.Request) {
 		Description: req.Description, Unit: req.Unit, AvailabilityRules: req.AvailabilityRules,
 		Status: domain.CatalogVersionStatusDraft, CreatedAt: now, CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateOffering(r.Context(), o, v, req.Variants); err != nil {
+	if err := h.store.CreateOffering(h.eventCtx(r), o, v, req.Variants); err != nil {
 		if errors.Is(err, domain.ErrDuplicateOfferingSKU) {
 			writeError(w, http.StatusUnprocessableEntity, "duplicate_sku", err.Error())
 			return
@@ -55,7 +58,6 @@ func (h *Handler) CreateOffering(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	h.publisher.PublishOfferingCreated(r.Context(), getCorrelationID(r), principalID, *o, *v)
 	writeJSON(w, http.StatusCreated, map[string]any{"offering": o, "version": v})
 }
 
@@ -320,7 +322,7 @@ func (h *Handler) ActivateOffering(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tenantID, ok := h.requireTenant(w, r)
+	_, ok = h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -338,17 +340,24 @@ func (h *Handler) ActivateOffering(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	linked, err := h.store.GetMappings(r.Context(), versionID)
+	if err != nil {
+		h.log.Error("ActivateOffering: mappings unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if missing := domain.MissingRequiredCatalogMappings(linked); len(missing) > 0 {
+		writeError(w, http.StatusUnprocessableEntity, "CATALOG_MAPPING_REQUIRED",
+			domain.ErrCatalogMappingRequired.Error()+": "+strings.Join(missing, ", "))
+		return
+	}
 	now := time.Now().UTC()
-	supersededID, err := h.store.ActivateOfferingVersion(r.Context(), id, versionID, principalID, now)
+	_, err = h.store.ActivateOfferingVersion(h.eventCtx(r), id, versionID, principalID, now)
 	if err != nil {
 		h.writeCatalogErr(w, err)
 		return
 	}
 	v.Status, v.ActivatedAt, v.ActivatedByPrincipalID = domain.CatalogVersionStatusActive, &now, &principalID
-	h.publisher.PublishOfferingActivated(r.Context(), getCorrelationID(r), principalID, tenantID, o.LegalEntityID, *v)
-	if supersededID != nil {
-		h.publisher.PublishOfferingVersionSuperseded(r.Context(), getCorrelationID(r), principalID, tenantID, o.LegalEntityID, id, *supersededID)
-	}
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -368,7 +377,7 @@ func (h *Handler) SuspendOfferingVersion(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	tenantID, ok := h.requireTenant(w, r)
+	_, ok = h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -387,12 +396,11 @@ func (h *Handler) SuspendOfferingVersion(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.SuspendOfferingVersion(r.Context(), versionID, principalID, req.Reason, now); err != nil {
+	if err := h.store.SuspendOfferingVersion(h.eventCtx(r), versionID, principalID, req.Reason, now); err != nil {
 		h.writeCatalogErr(w, err)
 		return
 	}
 	v.Status, v.SuspendedAt, v.SuspendedByPrincipalID, v.SuspensionReason = domain.CatalogVersionStatusSuspended, &now, &principalID, &req.Reason
-	h.publisher.PublishOfferingSuspended(r.Context(), getCorrelationID(r), principalID, tenantID, o.LegalEntityID, *v)
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -412,7 +420,7 @@ func (h *Handler) RetireOfferingVersion(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	tenantID, ok := h.requireTenant(w, r)
+	_, ok = h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -431,12 +439,11 @@ func (h *Handler) RetireOfferingVersion(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.RetireOfferingVersion(r.Context(), versionID, principalID, req.Reason, now); err != nil {
+	if err := h.store.RetireOfferingVersion(h.eventCtx(r), versionID, principalID, req.Reason, now); err != nil {
 		h.writeCatalogErr(w, err)
 		return
 	}
 	v.Status, v.RetiredAt, v.RetiredByPrincipalID, v.RetirementReason = domain.CatalogVersionStatusRetired, &now, &principalID, &req.Reason
-	h.publisher.PublishOfferingRetired(r.Context(), getCorrelationID(r), principalID, tenantID, o.LegalEntityID, *v)
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -545,4 +552,77 @@ func (h *Handler) writeCatalogErr(w http.ResponseWriter, err error) {
 		h.log.Error("catalog store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 	}
+}
+
+// ── GET /v1/catalog/offerings/{id}/versions/{versionID}/usability ──────────
+
+// VersionUsability answers a consuming domain's question before it pins a
+// version in a protected transaction: "is this version usable?". Usable means
+// the version is ACTIVE and carries every required mapping — the same two
+// conditions the activation gate enforces, re-checked now because a version
+// can be suspended or retired after activation. Always 200 for a version that
+// exists in the caller's tenant under the named offering; 404 otherwise.
+// Read-only: it changes nothing and publishes nothing.
+func (h *Handler) VersionUsability(w http.ResponseWriter, r *http.Request) {
+	offeringID := chi.URLParam(r, "id")
+	versionID := chi.URLParam(r, "versionID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	v, err := h.store.GetOfferingVersion(r.Context(), versionID)
+	if err != nil {
+		h.writeCatalogErr(w, err)
+		return
+	}
+	if v.OfferingID != offeringID {
+		writeError(w, http.StatusNotFound, "offering_version_not_found", "")
+		return
+	}
+	o, err := h.store.GetOffering(r.Context(), v.OfferingID)
+	if err != nil {
+		h.writeCatalogErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, o.LegalEntityID, actionCatalogRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	linked, err := h.store.GetMappings(r.Context(), versionID)
+	if err != nil {
+		h.log.Error("VersionUsability: mappings unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	missing := domain.MissingRequiredCatalogMappings(linked)
+	if missing == nil {
+		missing = []string{}
+	}
+	usable := v.Status == domain.CatalogVersionStatusActive && len(missing) == 0
+	reason := ""
+	switch {
+	case v.Status != domain.CatalogVersionStatusActive:
+		reason = "version status is " + v.Status + ", not ACTIVE"
+	case len(missing) > 0:
+		reason = "missing required mapping(s): " + strings.Join(missing, ", ")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"offering_id":      v.OfferingID,
+		"version_id":       v.VersionID,
+		"version_number":   v.VersionNumber,
+		"status":           v.Status,
+		"unit":             v.Unit,
+		"usable":           usable,
+		"missing_mappings": missing,
+		"reason":           reason,
+	})
+}
+
+// eventCtx carries the request's correlation id to the store, which writes the catalog events in the
+// same transaction as the change.
+func (h *Handler) eventCtx(r *http.Request) context.Context {
+	return svcmiddleware.WithCorrelation(r.Context(), getCorrelationID(r))
 }

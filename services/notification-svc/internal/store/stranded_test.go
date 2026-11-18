@@ -25,7 +25,7 @@ import (
 // A row in flight for longer than the threshold is found.
 func TestPgStore_FindStranded_FindsAnAbandonedInFlightRow(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-stranded-1")
@@ -66,7 +66,7 @@ func TestPgStore_FindStranded_FindsAnAbandonedInFlightRow(t *testing.T) {
 // those.
 func TestPgStore_FindStranded_UsesCreatedAtWhenNeverAttempted(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-stranded-never")
@@ -90,7 +90,7 @@ func TestPgStore_FindStranded_UsesCreatedAtWhenNeverAttempted(t *testing.T) {
 // twice.
 func TestPgStore_FindStranded_LeavesRecentInFlightRowsAlone(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-stranded-fresh")
@@ -114,7 +114,7 @@ func TestPgStore_FindStranded_LeavesRecentInFlightRowsAlone(t *testing.T) {
 // certain rather than possible.
 func TestPgStore_FindStranded_IgnoresConcludedRows(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	for _, tc := range []struct {
@@ -151,7 +151,7 @@ func TestPgStore_FindStranded_IgnoresConcludedRows(t *testing.T) {
 // notification.
 func TestPgStore_FindStranded_IgnoresRowsAlreadyScheduled(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-stranded-scheduled")
@@ -181,7 +181,7 @@ func TestPgStore_FindStranded_IgnoresRowsAlreadyScheduled(t *testing.T) {
 // whole outcome the feature exists for.
 func TestPgStore_ReviveStranded_MakesTheRowVisibleToTheDuePoll(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-revive-1")
@@ -214,7 +214,7 @@ func TestPgStore_ReviveStranded_MakesTheRowVisibleToTheDuePoll(t *testing.T) {
 // notification a fresh retry budget and the policy ceiling still bounds it.
 func TestPgStore_ReviveStranded_KeepsTheAttemptCount(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-revive-attempts")
@@ -258,7 +258,7 @@ func TestPgStore_ReviveStranded_KeepsTheAttemptCount(t *testing.T) {
 // the schedule and send it twice.
 func TestPgStore_ReviveStranded_RefusesARowThatIsNotStale(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-revive-fresh")
@@ -280,7 +280,7 @@ func TestPgStore_ReviveStranded_RefusesARowThatIsNotStale(t *testing.T) {
 // same second cannot both take it.
 func TestPgStore_ReviveStranded_IsClaimedOnce(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-revive-once")
@@ -309,7 +309,7 @@ func TestPgStore_ReviveStranded_IsClaimedOnce(t *testing.T) {
 // write.
 func TestPgStore_ReviveStranded_DoesNotCrossTenants(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-revive-tenant")
 	n.CreatedAt = time.Now().UTC().Add(-2 * time.Hour)

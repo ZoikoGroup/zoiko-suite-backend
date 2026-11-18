@@ -27,7 +27,7 @@ func complete(t *testing.T, s *store.PgStore, tenant, id, status, failure, recei
 // without angle brackets, or its attempt id, finds that attempt.
 func TestDirectAttempt_IsFoundByItsProviderMessageID(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := seedNotification(t, s, "tenant-pmid", "corr-pmid-1")
 	if err := complete(t, s, "tenant-pmid", n.NotificationID, "SENT", "", receiptFor("<abc-123@example.com>")); err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ func TestDirectAttempt_IsFoundByItsProviderMessageID(t *testing.T) {
 // callback attach itself to it.
 func TestDirectAttempt_FailedAttemptRecordsNoProviderMessageID(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := seedNotification(t, s, "tenant-pmid", "corr-pmid-2")
 	if err := complete(t, s, "tenant-pmid", n.NotificationID, "FAILED", "550 no such user", receiptFor("<should-not-be-stored@example.com>")); err != nil {
 		t.Fatal(err)
@@ -77,7 +77,7 @@ func TestDirectAttempt_FailedAttemptRecordsNoProviderMessageID(t *testing.T) {
 // refused, not merged.
 func TestDirectAttempt_ProviderMessageIDIsUnique(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	a := seedNotification(t, s, "tenant-pmid", "corr-pmid-3a")
 	b := seedNotification(t, s, "tenant-pmid", "corr-pmid-3b")
 	if err := complete(t, s, "tenant-pmid", a.NotificationID, "SENT", "", receiptFor("<dup@example.com>")); err != nil {
@@ -96,7 +96,7 @@ func TestDirectAttempt_ProviderMessageIDIsUnique(t *testing.T) {
 // suppression, which the direct-send guard then enforces.
 func TestDirectAttempt_HardBounceCallbackBecomesASuppression(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := newNotification("tenant-bounce", "entity-1", "recipient-1", "corr-pmid-4")
 	n.RecipientAddress, n.RecipientAddressSource = "gone@example.com", domain.AddressSourceRequest
 	if created, err := s.CreateNotification(tenantCtx("tenant-bounce"), n); err != nil || !created {

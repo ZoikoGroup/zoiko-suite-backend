@@ -59,7 +59,7 @@ func clearOutbox(t *testing.T, pool *pgxpool.Pool) {
 
 func TestDRC03_RetentionEvents_ScheduleResolvedAndDispositionDue(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "evt-retention", string(domain.RecordClassTaxReturnSupport), "US-CA")
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassTaxReturnSupport), "US-CA", 30)
 	clearOutbox(t, pool)
@@ -104,7 +104,7 @@ func TestDRC03_RetentionEvents_ScheduleResolvedAndDispositionDue(t *testing.T) {
 
 func TestDRC03_LegalHoldEvents_TargetAddedActivatedReleased(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec1 := createTestRecord(t, s, "evt-hold-1", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	rec2 := createTestRecord(t, s, "evt-hold-2", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	clearOutbox(t, pool)
@@ -148,7 +148,7 @@ func TestDRC03_LegalHoldEvents_TargetAddedActivatedReleased(t *testing.T) {
 
 func TestDRC03_RefusedOperation_LeavesNoEvent(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "evt-refused", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	hold, err := s.CreateLegalHold(tenantCtx(), domain.CreateLegalHoldParams{
 		MatterRef: "Matter-refused", HoldReasonCode: "LITIGATION", RecordIDs: []string{rec.RecordID}, IssuedByPrincipalID: "counsel-frank",
@@ -168,7 +168,7 @@ func TestDRC03_RefusedOperation_LeavesNoEvent(t *testing.T) {
 
 func TestDRC04_PreservationEvents_RenditionIntegrityExport(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := createTestDocument(t, s, "evt-preservation")
 	clearOutbox(t, pool)
 

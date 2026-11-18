@@ -20,6 +20,14 @@ type Config struct {
 	AuthzMTLSEnabled         bool
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
+
+	// EventResidencyRegion (EVENT_RESIDENCY_REGION, e.g. uk or eu-west) is stamped on
+	// every outbox event. Required: an event with a guessed region is worse than a
+	// service that refuses to start.
+	EventResidencyRegion string
+	// Env (ENV) is "local" for developer stacks; only then may the Kafka writer
+	// auto-create the topic.
+	Env string
 }
 
 func Load() (*Config, error) {
@@ -31,7 +39,13 @@ func Load() (*Config, error) {
 	if dbURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
+	region := os.Getenv("EVENT_RESIDENCY_REGION")
+	if region == "" {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required (e.g. uk, eu-west): every emitted event must carry its residency region")
+	}
 	return &Config{
+		EventResidencyRegion: region,
+		Env:                  getEnvOrDefault("ENV", "local"),
 		Port:                 port,
 		DatabaseURL:          dbURL,
 		KafkaBrokers:         getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),

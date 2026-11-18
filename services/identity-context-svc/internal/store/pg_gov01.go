@@ -57,16 +57,7 @@ func (s *PgStore) InsertSessionContextWithEvent(
 // depend on an outbox.Store instance just to write one row inside a
 // transaction it already holds.
 func (s *PgStore) outboxEnqueueTx(ctx context.Context, tx pgx.Tx, rec outbox.Record) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO event_outbox (event_id, event_type, tenant_id, partition_key, payload)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (event_id) DO NOTHING`,
-		rec.EventID, rec.EventType, rec.TenantID, rec.PartitionKey, rec.Payload,
-	)
-	if err != nil {
-		return fmt.Errorf("enqueue outbox event %q: %w", rec.EventType, err)
-	}
-	return nil
+	return outbox.EnqueueEventingTx(ctx, tx, rec)
 }
 
 // nullIfEmpty maps "" to a SQL NULL.

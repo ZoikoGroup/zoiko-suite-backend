@@ -1,0 +1,66 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.payment-execution-state.settled (payment-status-svc, schema 1.0.0). OBSERVED contract inferred from 14 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "ConflictReason": {
+      "type": "string"
+    },
+    "CreatedAt": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "CreatedByPrincipalID": {
+      "type": "string"
+    },
+    "FinalitySource": {
+      "type": "string"
+    },
+    "HasOpenConflict": {
+      "type": "boolean"
+    },
+    "LegalEntityID": {
+      "type": "string"
+    },
+    "MappingVersion": {
+      "type": "string"
+    },
+    "PaymentID": {
+      "type": "string"
+    },
+    "ProviderKey": {
+      "type": "string"
+    },
+    "ProviderRequestID": {
+      "type": "string"
+    },
+    "SourceReference": {
+      "type": "string"
+    },
+    "Status": {
+      "type": "string"
+    },
+    "TenantID": {
+      "type": "string"
+    },
+    "UpdatedAt": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "ConflictReason",
+    "CreatedAt",
+    "CreatedByPrincipalID",
+    "FinalitySource",
+    "HasOpenConflict",
+    "LegalEntityID",
+    "MappingVersion",
+    "PaymentID",
+    "ProviderKey",
+    "ProviderRequestID",
+    "SourceReference",
+    "Status",
+    "TenantID",
+    "UpdatedAt"
+  ],
+  "type": "object"
+}

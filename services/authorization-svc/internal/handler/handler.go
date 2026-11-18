@@ -209,6 +209,13 @@ type Handler struct {
 	sessionLimits SessionLimits
 	// breakGlassApprovals is the AU-02 quorum; see SetBreakGlassApprovals.
 	breakGlassApprovals int
+	// fxRates is the authority-limit FX reference table
+	// (AUTHZ_FX_REFERENCE_RATES); nil is StandardReferenceFXRates. See
+	// SetFXReferenceRates.
+	fxRates map[string]float64
+	// metrics is the §26 decision telemetry; nil records nothing. See
+	// SetMetrics.
+	metrics DecisionMetrics
 }
 
 // SetEntityRegistry lets resolveTenantScope check, with
@@ -271,6 +278,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/delegated-authorities", h.CreateDelegatedAuthority)
 	r.Get("/v1/admin/delegated-authorities", h.ListDelegatedAuthorities)
 	r.Post("/v1/admin/delegated-authorities/{delegation_id}/revoke", h.RevokeDelegatedAuthority)
+	// ZS-IAM-001 §21's own names for the same commands (tracker D2-5.F19):
+	// aliases, not a second implementation — one handler, one set of checks.
+	// The colon form is the documented one; the slash form is served too
+	// because some HTTP tooling percent-encodes a colon in a path segment
+	// (access-control-svc serves /v1/iam/access-assignments the same way).
+	r.Post("/v1/iam/delegations", h.CreateDelegatedAuthority)
+	r.Get("/v1/iam/delegations", h.ListDelegatedAuthorities)
+	r.Post("/v1/iam/delegations/{delegation_id}:revoke", h.RevokeDelegatedAuthority)
+	r.Post("/v1/iam/delegations/{delegation_id}/revoke", h.RevokeDelegatedAuthority)
 	r.Post("/v1/admin/sod-rules", h.CreateSoDRule)
 	r.Get("/v1/admin/sod-rules", h.ListSoDRules)
 	r.Post("/v1/admin/sod-rules/{sod_rule_id}/retire", h.RetireSoDRule)
@@ -1009,6 +1025,11 @@ func (h *Handler) ListPermissionBundles(w http.ResponseWriter, r *http.Request) 
 	if bundles == nil {
 		bundles = []domain.PermissionBundle{}
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, bundles, func(x domain.PermissionBundle) string { return x.PermissionBundleID }, 500)
+		return
+	}
 	writeJSON(w, http.StatusOK, bundles)
 }
 
@@ -1476,7 +1497,7 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_expected_version", "message": "expected_version must be positive"})
 		return
 	}
-	expected, ok := optionalExpectedVersion(w, r, body.ExpectedVersion)
+	expected, ok := expectedVersion(w, r, body.ExpectedVersion)
 	if !ok {
 		return
 	}
@@ -2301,6 +2322,11 @@ func (h *Handler) ListABACRules(w http.ResponseWriter, r *http.Request) {
 	if rules == nil {
 		rules = []domain.ABACRule{}
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, rules, func(x domain.ABACRule) string { return x.ABACRuleID }, 500)
+		return
+	}
 	writeJSON(w, http.StatusOK, rules)
 }
 
@@ -2981,7 +3007,8 @@ type grantingAssignmentFinder interface {
 // decision leaves /v1/authorize and the canonical API through here, so "no
 // material action executes without an authorization decision artifact" holds
 // on both. Writes a 503 and returns false if the artifact cannot be written.
-func (h *Handler) recordDecision(w http.ResponseWriter, r *http.Request, in evalContext, evaluationEntityID string, res *evalResult) (*domain.AccessDecisionLog, bool) {
+func (h *Handler) recordDecision(w http.ResponseWriter, r *http.Request, in evalContext, evaluationEntityID string, res *evalResult) (decision *domain.AccessDecisionLog, recorded bool) {
+	defer func() { h.observeRecorded(in, res, recorded) }()
 	expires := time.Now().UTC().Add(decisionTTL)
 	params := domain.RecordAccessDecisionParams{
 		PrincipalID: in.PrincipalID,
@@ -3166,10 +3193,37 @@ func (h *Handler) ListRoleAssignments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	qs := r.URL.Query()
+	// API-4 cursor paging (page_size / cursor): keyset on the assignment id in
+	// SQL, so a traversal of a large register neither repeats nor skips rows
+	// when assignments are added or removed between pages.
+	if pageRequested(r) {
+		p, ok := parsePage(w, r)
+		if !ok {
+			return
+		}
+		pager, ok := h.store.(assignmentPager)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		page, err := pager.QueryRoleAssignments(r.Context(), domain.AssignmentQuery{
+			TenantID: tenantScope, PrincipalID: principalFilter, RoleID: roleFilter, ActiveOnly: activeOnly,
+			IncludeUsage: qs.Get("include_usage") == "true", Limit: p.size + 1, Keyset: true, AfterID: p.after,
+		})
+		if err != nil {
+			h.log.Error("ListRoleAssignments: store unavailable",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		writePageOf(w, p, page, func(a domain.PrincipalRoleAssignment) string { return a.PrincipalRoleAssignmentID }, false)
+		return
+	}
+
 	// Paged / usage form: limit, offset, include_usage=true. The plain form
 	// stops at 500 rows without saying so; a caller that must see every
 	// assignment (an access review) pages with offset until a short page.
-	qs := r.URL.Query()
 	if qs.Has("limit") || qs.Has("offset") || qs.Get("include_usage") == "true" {
 		limit, lErr := atoiOrZero(qs.Get("limit"))
 		offset, oErr := atoiOrZero(qs.Get("offset"))
@@ -3256,6 +3310,11 @@ func (h *Handler) ListSoDRules(w http.ResponseWriter, r *http.Request) {
 	if rules == nil {
 		rules = []domain.SoDRule{}
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, rules, func(x domain.SoDRule) string { return x.SoDRuleID }, 500)
+		return
+	}
 	writeJSON(w, http.StatusOK, rules)
 }
 
@@ -3311,6 +3370,11 @@ func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
 	}
 	if roles == nil {
 		roles = []domain.Role{}
+	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, roles, func(x domain.Role) string { return x.RoleID }, 500)
+		return
 	}
 	writeJSON(w, http.StatusOK, roles)
 }
@@ -3371,6 +3435,11 @@ func (h *Handler) ListDelegatedAuthorities(w http.ResponseWriter, r *http.Reques
 	}
 	if delegations == nil {
 		delegations = []domain.DelegatedAuthority{}
+	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, delegations, func(x domain.DelegatedAuthority) string { return x.DelegatedAuthorityID }, 500)
+		return
 	}
 	writeJSON(w, http.StatusOK, delegations)
 }
@@ -3627,6 +3696,11 @@ func (h *Handler) ListPrivilegedSessions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, sessions, func(x domain.PrivilegedSession) string { return x.SessionID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
@@ -3877,6 +3951,11 @@ func (h *Handler) ListBreakGlassSessions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, sessions, func(x domain.BreakGlassSession) string { return x.SessionID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
@@ -4117,6 +4196,11 @@ func (h *Handler) ListSupportSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, sessions, func(x domain.SupportSession) string { return x.SessionID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 

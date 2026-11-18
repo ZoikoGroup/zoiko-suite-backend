@@ -1,0 +1,32 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.identity.federation.login-succeeded (identity-context-svc, schema 1.0.0). OBSERVED contract inferred from 3 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "config_version": {
+      "type": "integer"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "degraded_keys": {
+      "type": "boolean"
+    },
+    "issuer": {
+      "type": "string"
+    },
+    "mfa_asserted": {
+      "type": "boolean"
+    },
+    "principal_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "config_version",
+    "connection_id",
+    "degraded_keys",
+    "issuer",
+    "mfa_asserted",
+    "principal_id"
+  ],
+  "type": "object"
+}

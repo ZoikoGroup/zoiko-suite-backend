@@ -29,7 +29,7 @@ import (
 // add it, and the reads bypass the store's own filter entirely.
 func TestLegacyTables_RLSIsolatesTenantsAsTheAppRole(t *testing.T) {
 	app, admin := openTestPools(t)
-	s := store.New(app)
+	s := store.New(app, store.WithEventRegion("local"))
 	ctx := context.Background()
 	tenantA, tenantB := "tenant-a-"+uuid.NewString()[:8], "tenant-b-"+uuid.NewString()[:8]
 	actx := tenantCtx(tenantA)
@@ -107,7 +107,7 @@ func TestLegacyTables_RLSIsolatesTenantsAsTheAppRole(t *testing.T) {
 		QuietStart: &quietStart, QuietEnd: &quietEnd, MutedChannels: []string{}, UpdatedBy: "usr-1"})
 	must(t, err)
 	// Counters are written only when quotas are on, so count through a quota-enabled store.
-	must(t, send(store.New(app).WithQuota(quota.Limits{RecipientPerHour: 100}), tenantA, "corr-rls-quota-"+uuid.NewString(), "usr-quota", "T0"))
+	must(t, send(store.New(app, store.WithEventRegion("local")).WithQuota(quota.Limits{RecipientPerHour: 100}), tenantA, "corr-rls-quota-"+uuid.NewString(), "usr-quota", "T0"))
 
 	// INT-04 outbound webhooks and the shared consumer inbox (migration 000032), seeded as
 	// the app role under tenant A, which also exercises each policy's WITH CHECK.
@@ -197,6 +197,7 @@ func legacyTenantTables(t *testing.T, admin *pgxpool.Pool) []string {
 		JOIN information_schema.tables tb ON tb.table_schema = c.table_schema AND tb.table_name = c.table_name
 		WHERE c.table_schema = 'public' AND c.column_name = 'tenant_id' AND tb.table_type = 'BASE TABLE'
 		  AND c.table_name NOT LIKE 'ncd\_%'
+		  AND c.table_name <> 'eventing_outbox' -- the shared library's outbox is cross-tenant by design (its relay drains every tenant); see BIZ03_CERTIFICATION.md
 		ORDER BY 1`)
 	if err != nil {
 		t.Fatal(err)

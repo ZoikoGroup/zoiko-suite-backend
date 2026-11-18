@@ -1,6 +1,7 @@
 {
     "allowed_hosts":  [
-                          "pending-review.invalid"
+                          "pending-review.invalid",
+                          "www.zoikosuite.com"
                       ],
     "capability_ids":  [
 
@@ -13,7 +14,7 @@
     "routes":  [
                    {
                        "approval_ref":  "SYNTHETIC-ROUTE-APPROVAL",
-                       "url":  "https://example.invalid/pricing",
+                       "url":  "https://www.zoikosuite.com/pricing",
                        "market_codes":  [
                                             "ALL"
                                         ],
@@ -110,6 +111,9 @@
                    }
                ],
     "synonyms":  {
+                     "audited":  ["recorded", "decision", "record"],
+                     "bills":  ["accounts", "payable", "supplier", "invoices"],
+                     "bill":  ["accounts", "payable", "supplier", "invoice"],
                      "ar":  [
                                 "accounts",
                                 "receivable"

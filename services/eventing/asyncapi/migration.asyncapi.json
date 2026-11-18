@@ -1,0 +1,231 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "audit-entry": {
+      "address": "zoikosuite.migration.audit-entry.v1",
+      "messages": {
+        "remediated": {
+          "$ref": "#/components/messages/audit-entry.remediated"
+        }
+      }
+    },
+    "job": {
+      "address": "zoikosuite.migration.job.v1",
+      "messages": {
+        "archived": {
+          "$ref": "#/components/messages/job.archived"
+        },
+        "integrity-validated": {
+          "$ref": "#/components/messages/job.integrity-validated"
+        },
+        "integrity-violations-detected": {
+          "$ref": "#/components/messages/job.integrity-violations-detected"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "audit-entry.remediated": {
+        "contentType": "application/json",
+        "description": "Producer: Migration Integrity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Migration (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.migration.audit-entry.remediated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Audit Entry: remediated.",
+        "title": "audit-entry remediated",
+        "x-zoiko-event-type": "com.zoikosuite.migration.audit-entry.remediated",
+        "x-zoiko-origin": "extension"
+      },
+      "job.archived": {
+        "contentType": "application/json",
+        "description": "Producer: Migration Integrity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Migration (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.migration.job.archived",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Job: archived.",
+        "title": "job archived",
+        "x-zoiko-event-type": "com.zoikosuite.migration.job.archived",
+        "x-zoiko-origin": "extension"
+      },
+      "job.integrity-validated": {
+        "contentType": "application/json",
+        "description": "Producer: Migration Integrity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Migration (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.migration.job.integrity-validated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Job: integrity-validated.",
+        "title": "job integrity-validated",
+        "x-zoiko-event-type": "com.zoikosuite.migration.job.integrity-validated",
+        "x-zoiko-origin": "extension"
+      },
+      "job.integrity-violations-detected": {
+        "contentType": "application/json",
+        "description": "Producer: Migration Integrity Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Migration (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.migration.job.integrity-violations-detected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Job: integrity-violations-detected.",
+        "title": "job integrity-violations-detected",
+        "x-zoiko-event-type": "com.zoikosuite.migration.job.integrity-violations-detected",
+        "x-zoiko-origin": "extension"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite migration domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.audit-entry": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/audit-entry"
+      },
+      "description": "Producer(s): Migration Integrity Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/audit-entry/messages/remediated"
+        }
+      ],
+      "summary": "Publish audit-entry facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.job": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/job"
+      },
+      "description": "Producer(s): Migration Integrity Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/job/messages/archived"
+        },
+        {
+          "$ref": "#/channels/job/messages/integrity-validated"
+        },
+        {
+          "$ref": "#/channels/job/messages/integrity-violations-detected"
+        }
+      ],
+      "summary": "Publish job facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

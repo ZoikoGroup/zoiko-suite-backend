@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/events"
+	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/store"
 )
 
@@ -49,7 +50,7 @@ func TestAU11_PasskeyRegistrationIsAssuranceHistory(t *testing.T) {
 	assert.Equal(t, "PASSKEY", hist[0].AssuranceLevel)
 
 	var outboxed int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM event_outbox WHERE event_id = $1`, rec.EventID).Scan(&outboxed))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM eventing_outbox WHERE event_type = $1 AND aggregate_id = $2`, outbox.CanonicalType(rec.EventType), rec.PartitionKey).Scan(&outboxed))
 	assert.Equal(t, 1, outboxed, "the enrolment event commits with the credential")
 
 	sum, err := s.GetIdentitySummary(ctx, "t-1")

@@ -46,10 +46,25 @@ func roundCents(v float64) float64 {
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// eventRegion is the residency region stamped on shared-outbox events (BIZ-07).
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by every shared-outbox event.
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {

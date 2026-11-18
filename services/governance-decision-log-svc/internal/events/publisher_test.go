@@ -98,3 +98,56 @@ func TestDecisionReplayed_EnvelopeNamesTheReplayerAndTheDecision(t *testing.T) {
 	assert.Equal(t, "dec-1", env.AggregateID)
 	assert.Equal(t, "corr-r", env.CorrelationID)
 }
+
+// Group decision C3 / rule R9: every event is queued under its Doc 03 wire
+// name AND the Event Catalogue canonical name, carrying the same payload and
+// payload_hash; the alias has its own id and names the wire event it copies.
+func TestC3_CanonicalNameEmittedAlongsideTheWireName(t *testing.T) {
+	d := domain.GovernanceDecision{DecisionID: "dec-1", TenantID: "tenant-1", LegalEntityID: "entity-1",
+		ActorID: "actor-1", CorrelationID: "corr-1", RuleBasis: "PC:v1", DecidedAt: time.Now()}
+	recorded, err := events.DecisionRecorded(d)
+	require.NoError(t, err)
+	replayed, err := events.DecisionReplayed(d, domain.ReplayManifest{ReplayManifestID: "m-1", DecisionID: "dec-1"}, "corr-r")
+	require.NoError(t, err)
+
+	for wire, canonical := range map[string][]byte{
+		"governance.decision.recorded": recorded,
+		"governance.decision.replayed": replayed,
+	} {
+		queued, err := events.WithCanonicalAlias(canonical)
+		require.NoError(t, err)
+		require.Len(t, queued, 2, wire)
+		assert.Equal(t, wire, queued[0].Type)
+		assert.Equal(t, "com.zoikosuite."+wire, queued[1].Type)
+
+		var w, a struct {
+			EventID        string          `json:"event_id"`
+			EventType      string          `json:"event_type"`
+			AliasOf        string          `json:"alias_of_event_id"`
+			RetentionClass string          `json:"retention_class"`
+			PayloadHash    string          `json:"payload_hash"`
+			Payload        json.RawMessage `json:"payload"`
+		}
+		require.NoError(t, json.Unmarshal(queued[0].Envelope, &w))
+		require.NoError(t, json.Unmarshal(queued[1].Envelope, &a))
+		assert.Equal(t, wire, w.EventType, "the wire event is queued unchanged")
+		assert.Empty(t, w.AliasOf)
+		assert.Equal(t, queued[1].Type, a.EventType)
+		assert.Equal(t, w.EventID, a.AliasOf, "the alias names the wire event")
+		assert.NotEqual(t, w.EventID, a.EventID, "the alias has its own event id")
+		assert.Equal(t, w.PayloadHash, a.PayloadHash)
+		assert.JSONEq(t, string(w.Payload), string(a.Payload))
+		assert.Equal(t, "EV-REGULATED", w.RetentionClass, "decision D2-2.F11")
+		assert.Equal(t, "EV-REGULATED", a.RetentionClass)
+	}
+}
+
+func TestC3_UnknownTypeIsQueuedAlone(t *testing.T) {
+	queued, err := events.WithCanonicalAlias([]byte(`{"event_id":"e","event_type":"something.else"}`))
+	require.NoError(t, err)
+	require.Len(t, queued, 1)
+	_, err = events.WithCanonicalAlias([]byte(`not json`))
+	assert.Error(t, err)
+	_, err = events.WithCanonicalAlias([]byte(`{}`))
+	assert.Error(t, err, "an envelope without event_type is never queued")
+}

@@ -133,12 +133,18 @@ func TestSupersede_NewerVersionMustBeDeployedWhereTheOlderIs(t *testing.T) {
 // releaseOnly builds, certifies and tries to publish a pack of only the given rules, returning the publish result without asserting it.
 func (s *payrollScenario) releaseOnly(t *testing.T, ruleIDs []string) (ref string, publishCode int, publishBody map[string]any) {
 	t.Helper()
+	return s.releaseOnlyIn(t, ruleIDs, s.jur.JurisdictionCode)
+}
+
+// releaseOnlyIn is releaseOnly for a pack scoped to jurisdiction jurCode.
+func (s *payrollScenario) releaseOnlyIn(t *testing.T, ruleIDs []string, jurCode string) (ref string, publishCode int, publishBody map[string]any) {
+	t.Helper()
 	e := s.e
 	ref = uniqueRef("jur.p")
 	s.packRef = ref
 	code, r := e.do("POST", "/v1/admin/packs", "author", map[string]any{"pack_ref": ref, "pack_name": "Subset", "owner": "Payroll Compliance"})
 	mustStatus(t, 201, code, r)
-	code, r = e.do("POST", "/v1/admin/packs/"+ref+"/versions", "author", manifest(ref, "2026.08.1", s.jur.JurisdictionCode, map[string]any{"rule_modules": ruleIDs, "effective_from": "2025-01-01"}))
+	code, r = e.do("POST", "/v1/admin/packs/"+ref+"/versions", "author", manifest(ref, "2026.08.1", jurCode, map[string]any{"rule_modules": ruleIDs, "effective_from": "2025-01-01"}))
 	mustStatus(t, 201, code, r)
 	for _, step := range []string{"/submit-review", "/compile", "/sign"} {
 		code, r = e.do("POST", s.path(step), "author", nil)

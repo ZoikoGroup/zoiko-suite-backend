@@ -160,6 +160,11 @@ func (h *Handler) ListWorkloadBindings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, list, func(x domain.WorkloadBinding) string { return x.WorkloadID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"workload_bindings": list})
 }
 
@@ -192,7 +197,7 @@ func (h *Handler) setWorkloadBindingActive(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	expected, ok := optionalExpectedVersion(w, r, bodyVersion)
+	expected, ok := expectedVersion(w, r, bodyVersion)
 	if !ok {
 		return
 	}

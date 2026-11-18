@@ -15,7 +15,7 @@ import (
 // database: exact lookup by version identity, never "latest", and tenant-scoped.
 
 func TestPgStore_FindVersionByID_ReturnsTheExactVersion(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 
 	doc := &domain.Document{
 		TenantID: testTenantID, LegalEntityID: "22222222-2222-2222-2222-222222222222",
@@ -45,7 +45,7 @@ func TestPgStore_FindVersionByID_ReturnsTheExactVersion(t *testing.T) {
 }
 
 func TestPgStore_FindVersionByID_IsTenantScoped(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 
 	doc := &domain.Document{
 		TenantID: testTenantID, LegalEntityID: "22222222-2222-2222-2222-222222222222",
@@ -68,7 +68,7 @@ func TestPgStore_FindVersionByID_IsTenantScoped(t *testing.T) {
 }
 
 func TestPgStore_FindVersionByID_UnknownAndMalformedIDsAreNotFound(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	for _, id := range []string{
 		"00000000-0000-0000-0000-000000000000", // well formed, no such version
 		"not-a-uuid", "", "latest", "1", "' OR 1=1 --",
@@ -80,7 +80,7 @@ func TestPgStore_FindVersionByID_UnknownAndMalformedIDsAreNotFound(t *testing.T)
 }
 
 func TestPgStore_FindVersionByID_RequiresATenant(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	_, err := s.FindVersionByID(middleware.WithTenant(tenantCtx(), ""), "00000000-0000-0000-0000-000000000000")
 	require.Error(t, err, "no tenant context is never an unscoped read")
 }

@@ -26,6 +26,8 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	eventingoutbox "zoiko.io/eventing/outbox"
 	"zoiko.io/identity-context-svc/internal/auth"
 	"zoiko.io/identity-context-svc/internal/authz"
 	"zoiko.io/identity-context-svc/internal/config"
@@ -164,6 +166,17 @@ func main() {
 	}
 	log.Info("Postgres connection established", zap.String("db_name", cfg.DB.Name))
 
+	// ZS-EVENT-001: events are written to the shared eventing_outbox. The
+	// region is stamped on every event (an event with no region is refused),
+	// and the table must exist before the first request tries to enqueue.
+	if cfg.EventResidencyRegion == "" {
+		log.Fatal("EVENT_RESIDENCY_REGION is required")
+	}
+	outbox.SetEventRegion(cfg.EventResidencyRegion)
+	if err := eventingoutbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema missing (apply migration 000020)", zap.Error(err))
+	}
+
 	// ── Kafka producer ────────────────────────────────────────────────────
 	// Connects lazily on first write — unlike Postgres/Redis this is not a
 	// fail-fast startup dependency. Publish failures are handled per-call by
@@ -267,6 +280,25 @@ func main() {
 	relayCtx, stopRelay := context.WithCancel(context.Background())
 	defer stopRelay()
 	go relay.Run(relayCtx)
+
+	// The eventing relay delivers what the publisher now writes to
+	// eventing_outbox, with acknowledged (RequireAll) Kafka writes. The legacy
+	// relay above only drains rows still in event_outbox; nothing new is
+	// written there.
+	eventingWriter, err := kafkaout.New(kafkaout.Config{
+		Brokers:                cfg.Kafka.Brokers,
+		Topic:                  cfg.Kafka.Topic,
+		AllowAutoTopicCreation: true,
+	})
+	if err != nil {
+		log.Fatal("eventing outbox kafka writer", zap.Error(err))
+	}
+	defer func() { _ = eventingWriter.Close() }()
+	eventingRelay, err := eventingoutbox.NewRelay(pool, eventingWriter, eventingoutbox.DefaultConfig(), log)
+	if err != nil {
+		log.Fatal("eventing outbox relay", zap.Error(err))
+	}
+	go eventingRelay.Run(relayCtx)
 
 	// Sampled rather than incremented at the enqueue site: the depth is a
 	// property of the TABLE, and several replicas share one outbox. A per-process
@@ -375,8 +407,8 @@ func main() {
 			principalRepo,
 			identityctx.IngressPolicy(cfg.IngressPolicy),
 			log,
-		// Without a TTL every binding reads FRESH forever, so §4's STALE state
-		// was unreachable in any deployment. Labels only — STALE is admitted.
+			// Without a TTL every binding reads FRESH forever, so §4's STALE state
+			// was unreachable in any deployment. Labels only — STALE is admitted.
 		).WithBindingTTL(time.Duration(cfg.IngressBindingTTLSeconds) * time.Second)).
 		// Residency has been recorded on every session since migration 000005
 		// and never enforced. Empty allow-list keeps enforcement off.
@@ -491,7 +523,7 @@ func main() {
 		zap.String("authenticate_endpoint", cfg.AuthPlane.PasswordEndpoint))
 
 	lifecycleSvc, err := newLifecycle(cfg, principalRepo, hasher,
-		principalSessionEnder(principalRepo, provider, sessionCache), loginLimiter, log)
+		principalSessionEnder(principalRepo, provider, sessionCache, publisher, log), loginLimiter, log)
 	if err != nil {
 		log.Fatal("failed to build the subject lifecycle", zap.Error(err))
 	}

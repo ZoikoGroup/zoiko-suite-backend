@@ -216,11 +216,6 @@ type Publisher interface {
 	// BIZ-07 (Product & Service Catalog) — the spec's own named Events:
 	// "OfferingCreated; OfferingActivated; OfferingSuspended;
 	// OfferingRetired; OfferingVersionSuperseded."
-	PublishOfferingCreated(ctx context.Context, correlationID, actorID string, o domain.Offering, v domain.OfferingVersion)
-	PublishOfferingActivated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
-	PublishOfferingSuspended(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
-	PublishOfferingRetired(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
-	PublishOfferingVersionSuperseded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, offeringID, versionID string)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -478,6 +473,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 			r.Get("/", h.GetOfferingVersion)
 			r.Get("/variants", h.ListVariants)
 			r.Get("/mappings", h.GetMappings)
+			r.Get("/usability", h.VersionUsability)
 			r.Post("/approve", h.ApproveOffering)
 			r.Post("/activate", h.ActivateOffering)
 			r.Post("/suspend", h.SuspendOfferingVersion)

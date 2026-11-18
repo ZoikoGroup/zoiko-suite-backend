@@ -121,9 +121,10 @@ func (h *Handler) changeSuspension(w http.ResponseWriter, r *http.Request, suspe
 	if !h.applyReason(w, &r, reason) {
 		return
 	}
-	// If-Match (API-3) is honoured, not yet required: callers that predate it
-	// send none on assignments.
-	expected, ok := optionalExpectedVersion(w, r, body.ExpectedVersion)
+	// If-Match (API-3) is required (428 without it) since 10 Nov 2026 (AZ-1):
+	// the console sends the row's version and access-control-svc sends
+	// If-Match: * on its monotonic revocations.
+	expected, ok := expectedVersion(w, r, body.ExpectedVersion)
 	if !ok {
 		return
 	}

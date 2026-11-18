@@ -34,7 +34,7 @@ func queuedNotification(t *testing.T, s *store.PgStore, tenant, corr string, not
 func tp(d time.Duration) *time.Time { v := time.Now().UTC().Add(d); return &v }
 
 func TestSchedule_AQueuedSendWaitsAndCarriesItsJob(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	n := queuedNotification(t, s, "tenant-sched", "corr-sched-1", tp(2*time.Hour), tp(48*time.Hour))
 
 	got, err := s.GetNotification(tenantCtx("tenant-sched"), n.NotificationID)
@@ -70,7 +70,7 @@ func TestSchedule_AQueuedSendWaitsAndCarriesItsJob(t *testing.T) {
 
 func TestSchedule_EveryAttemptAndItsEventCarryTheJob(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := seedNotification(t, s, "tenant-sched-job", "corr-sched-job")
 	require.NoError(t, s.ScheduleRetry(tenantCtx("tenant-sched-job"), n.NotificationID, "tenant-sched-job", "421 later",
 		time.Now().UTC(), time.Now().Add(time.Minute).UTC(), domain.AttemptMeta{Origin: domain.AttemptOriginRequest}))
@@ -90,7 +90,7 @@ func TestSchedule_EveryAttemptAndItsEventCarryTheJob(t *testing.T) {
 
 func TestSchedule_OnlyAQueuedCommunicationCanBeCancelled(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-cancel"
 	ctx := tenantCtx(tenant)
 	n := queuedNotification(t, s, tenant, "corr-cancel-1", tp(time.Hour), nil)
@@ -126,7 +126,7 @@ func TestSchedule_OnlyAQueuedCommunicationCanBeCancelled(t *testing.T) {
 }
 
 func TestSchedule_ACancellationNeverDescribesAMessageThatWasSent(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-cancel-race"
 	ctx := tenantCtx(tenant)
 
@@ -158,7 +158,7 @@ func TestSchedule_ACancellationNeverDescribesAMessageThatWasSent(t *testing.T) {
 
 func TestSchedule_ACommunicationPastItsExpiryIsNeverSent(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-expire"
 	ctx := tenantCtx(tenant)
 	// A queued send whose expiry falls before the scheduled time is refused by the CHECK in the
@@ -203,7 +203,7 @@ func TestSchedule_ACommunicationPastItsExpiryIsNeverSent(t *testing.T) {
 }
 
 func TestSchedule_ExpiryLeavesWhatIsInFlightOrConcludedAlone(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-expire-guard"
 	ctx := tenantCtx(tenant)
 
@@ -221,7 +221,7 @@ func TestSchedule_ExpiryLeavesWhatIsInFlightOrConcludedAlone(t *testing.T) {
 
 func TestSchedule_TheDatabaseHoldsTheTimingRules(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-sched-db"
 	n := queuedNotification(t, s, tenant, "corr-sched-db", tp(time.Hour), tp(5*time.Hour))
 	exec := func(q string, args ...any) error {
@@ -261,7 +261,7 @@ func (schedResolver) ResolveEmail(context.Context, string, string, string) (stri
 
 func TestSchedule_AWorkerSendsAScheduledMessageWhenDueAndNeverAnExpiredOne(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-sched-worker"
 	ctx := tenantCtx(tenant)
 

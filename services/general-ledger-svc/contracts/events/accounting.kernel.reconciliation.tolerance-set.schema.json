@@ -1,0 +1,36 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.reconciliation.tolerance-set (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 4 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "effective_from": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "match_amount": {
+      "type": "string"
+    },
+    "reconciliation_type": {
+      "type": "string"
+    },
+    "tolerance_rule_id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer"
+    },
+    "warning_amount": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "effective_from",
+    "legal_entity_id",
+    "match_amount",
+    "reconciliation_type",
+    "tolerance_rule_id",
+    "version",
+    "warning_amount"
+  ],
+  "type": "object"
+}

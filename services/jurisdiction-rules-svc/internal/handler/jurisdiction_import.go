@@ -158,28 +158,42 @@ func (h *Handler) ListJurisdictionImports(w http.ResponseWriter, r *http.Request
 		h.writeAuthzError(w, r, err)
 		return
 	}
-	status := r.URL.Query().Get("status")
+	limit := 0
+	if !isPagedRequest(r) {
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > 200 {
+				writeError(w, r, http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 200")
+				return
+			}
+			limit = n
+		}
+	}
+	p, ok := h.beginList(w, r, []string{"status"}, map[string]string{"status": "status"})
+	if !ok {
+		return
+	}
+	status := p.filter("status")
 	switch status {
 	case "", domain.ImportProposed, domain.ImportApproved, domain.ImportRejected:
 	default:
 		writeError(w, r, http.StatusBadRequest, "invalid_status", "status must be PROPOSED, APPROVED or REJECTED")
 		return
 	}
-	limit := 0
-	if v := r.URL.Query().Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 200 {
-			writeError(w, r, http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 200")
-			return
-		}
-		limit = n
+	if p.paged {
+		// The store reads the newest first from the start; read through the
+		// end of this page and keep the page.
+		limit = p.offset + p.fetch()
 	}
 	out, err := s.ListJurisdictionImports(r.Context(), status, limit)
 	if err != nil {
 		h.writeImportError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"imports": out})
+	if p.paged {
+		out = pageOf(p, out)
+	}
+	finishListAs(h, w, r, p, "imports", out)
 }
 
 // GetJurisdictionImport handles GET /v1/admin/jurisdiction-imports/{batch_id}.

@@ -14,6 +14,8 @@ import (
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"zoiko.io/eventing/contracttest"
 )
 
 // appRole mirrors the deployed zoiko_app role: no superuser, no BYPASSRLS. The
@@ -104,7 +106,7 @@ func TestMain(m *testing.M) {
 		}
 		defer appPool.Close()
 
-		return m.Run()
+		return contracttest.FinishSuite(superPool, "../../contracts/events", m.Run())
 	}()
 
 	_ = pg.Stop()

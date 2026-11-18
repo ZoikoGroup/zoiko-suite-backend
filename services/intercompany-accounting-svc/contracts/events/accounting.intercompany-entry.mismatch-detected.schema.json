@@ -1,0 +1,67 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.intercompany-entry.mismatch-detected (intercompany-accounting-svc, schema 1.0.0). OBSERVED contract inferred from 16 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "amount": {
+      "type": "integer"
+    },
+    "counterparty_amount": {
+      "type": "number"
+    },
+    "counterparty_currency_code": {
+      "type": "string"
+    },
+    "currency_code": {
+      "type": "string"
+    },
+    "dimensions": {
+      "type": "object"
+    },
+    "fiscal_period": {
+      "type": "string"
+    },
+    "intercompany_entry_id": {
+      "type": "string"
+    },
+    "match_status": {
+      "type": "string"
+    },
+    "mismatch_reason": {
+      "type": "string"
+    },
+    "source_journal_id": {
+      "type": "string"
+    },
+    "source_legal_entity_id": {
+      "type": "string"
+    },
+    "target_journal_id": {
+      "type": "string"
+    },
+    "target_legal_entity_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "amount",
+    "counterparty_amount",
+    "counterparty_currency_code",
+    "currency_code",
+    "dimensions",
+    "intercompany_entry_id",
+    "match_status",
+    "mismatch_reason",
+    "source_journal_id",
+    "source_legal_entity_id",
+    "target_legal_entity_id",
+    "tenant_id",
+    "timestamp"
+  ],
+  "type": "object"
+}

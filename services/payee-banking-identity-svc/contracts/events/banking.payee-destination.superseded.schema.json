@@ -1,0 +1,65 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.payee-destination.superseded (payee-banking-identity-svc, schema 1.0.0). OBSERVED contract inferred from 4 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "account_last4": {
+      "type": "string"
+    },
+    "country_code": {
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "currency": {
+      "type": "string"
+    },
+    "destination_id": {
+      "type": "string"
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "party_ref": {
+      "type": "string"
+    },
+    "scope": {
+      "type": "string"
+    },
+    "source_type": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "superseded_by_destination_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_last4",
+    "country_code",
+    "created_at",
+    "currency",
+    "destination_id",
+    "fingerprint",
+    "legal_entity_id",
+    "party_ref",
+    "scope",
+    "source_type",
+    "status",
+    "tenant_id",
+    "updated_at"
+  ],
+  "type": "object"
+}

@@ -28,7 +28,7 @@ type recalcEnv struct {
 func newRecalcEnv(t *testing.T, sku string) *recalcEnv {
 	t.Helper()
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	itemID := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, sku, domain.ValuationMethodFIFO)
@@ -96,7 +96,7 @@ func TestPgStore_RecalculateValuation_CleanLayerHasNoDrift(t *testing.T) {
 
 func TestPgStore_RecalculateValuation_CentRoundingIsNotDrift(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	itemID := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-RC-R", domain.ValuationMethodFIFO)

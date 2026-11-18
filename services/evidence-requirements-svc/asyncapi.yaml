@@ -1,0 +1,117 @@
+asyncapi: '3.0.0'
+info:
+  title: evidence-requirements-svc events
+  version: '1.1.0'
+  description: |
+    Events of evidence-requirements-svc (Doc 03 §8.6): one per recorded SATISFIED or MISSING
+    determination. NO_REQUIREMENTS_DEFINED publishes nothing, and a replayed evaluation
+    (same Idempotency-Key and body) publishes nothing again.
+
+    Delivery: the event is written to the transactional outbox in the same transaction as the
+    evaluation row (migration 000008; runtime append access 000011) and published by the outbox
+    worker, which polls every 5 seconds and retries until Kafka accepts it. At-least-once:
+    consumers de-duplicate on event_id.
+
+    Kafka record: no headers; key `<tenant_id>/<evaluation_id>`; value the EventEnvelope below
+    (JSON). Verified on the local stack, 5 Nov 2026 (e2e-evidence-requirements-deps.py §9).
+
+    Schema registry: schema-registry-svc's registration route was not exercised for these two
+    schemas in this pass (cross-team follow-up in progress.md).
+servers:
+  local:
+    host: kafka:9094
+    protocol: kafka
+    description: Compose broker (PLAINTEXT listener inside the network)
+channels:
+  evidenceRequirementsEvents:
+    address: zoiko.evidence-requirements.events
+    messages:
+      satisfied:
+        $ref: '#/components/messages/EvidenceRequirementSatisfied'
+      missing:
+        $ref: '#/components/messages/EvidenceRequirementMissing'
+operations:
+  publishSatisfied:
+    action: send
+    channel:
+      $ref: '#/channels/evidenceRequirementsEvents'
+    messages:
+      - $ref: '#/channels/evidenceRequirementsEvents/messages/satisfied'
+  publishMissing:
+    action: send
+    channel:
+      $ref: '#/channels/evidenceRequirementsEvents'
+    messages:
+      - $ref: '#/channels/evidenceRequirementsEvents/messages/missing'
+components:
+  messages:
+    EvidenceRequirementSatisfied:
+      name: evidence.requirement.satisfied
+      title: Every requirement in force for the action was met
+      bindings:
+        kafka:
+          key:
+            type: string
+            description: '<tenant_id>/<evaluation_id>'
+      payload:
+        $ref: '#/components/schemas/EventEnvelope'
+    EvidenceRequirementMissing:
+      name: evidence.requirement.missing
+      title: At least one requirement in force was not met; the action must not complete
+      bindings:
+        kafka:
+          key:
+            type: string
+            description: '<tenant_id>/<evaluation_id>'
+      payload:
+        $ref: '#/components/schemas/EventEnvelope'
+  schemas:
+    EventEnvelope:
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, tenant_id, legal_entity_id, correlation_id, aggregate_type, aggregate_id, payload]
+      properties:
+        event_id: {type: string, format: uuid, description: The outbox row id; consumers de-duplicate on it}
+        event_type: {type: string, enum: [evidence.requirement.satisfied, evidence.requirement.missing]}
+        event_version: {type: string, const: '1.0'}
+        emitted_at: {type: string, format: date-time, description: When the outbox row was written (same transaction as the decision)}
+        schema_version: {type: string, const: '1.0'}
+        source_service: {type: string, const: evidence-requirements-svc}
+        tenant_id: {type: string, format: uuid}
+        legal_entity_id: {type: string, format: uuid}
+        actor_id: {type: string, description: The principal or workload the determination was made for}
+        correlation_id: {type: string, description: The evaluate request's correlation_id}
+        causation_id: {type: string, description: The request's causation (X-Causation-Id), when the caller sent one}
+        jurisdiction_context: {type: string, description: The server-resolved jurisdiction context, when the edge resolved one}
+        aggregate_type: {type: string, const: evidence_evaluation}
+        aggregate_id: {type: string, format: uuid, description: The evaluation_id}
+        governing_refs:
+          type: object
+          description: The requirement set the determination was tested against, so a consumer can reproduce it.
+          properties:
+            requirement_ids: {type: array, items: {type: string, format: uuid}}
+        payload: {$ref: '#/components/schemas/Determination'}
+    Determination:
+      type: object
+      required: [evaluation_id, tenant_id, legal_entity_id, domain_code, action_type, outcome, requirement_ids, idempotency_key, evaluated_for_principal_id, correlation_id]
+      properties:
+        evaluation_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        legal_entity_id: {type: string, format: uuid}
+        domain_code: {type: string}
+        action_type: {type: string}
+        outcome: {type: string, enum: [SATISFIED, MISSING]}
+        requirement_ids: {type: array, items: {type: string, format: uuid}}
+        unmet:
+          type: array
+          description: Present on evidence.requirement.missing only — each requirement not met, and why.
+          items:
+            type: object
+            properties:
+              evidence_requirement_id: {type: string, format: uuid}
+              evidence_type: {type: string}
+              reason: {type: string}
+        idempotency_key: {type: string}
+        evaluated_for_principal_id: {type: string}
+        correlation_id: {type: string}
+        causation_id: {type: string}
+        jurisdiction_context: {type: string}

@@ -1,0 +1,1164 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "case": {
+      "address": "zoikosuite.business.case.v1",
+      "messages": {
+        "closed": {
+          "$ref": "#/components/messages/case.closed"
+        },
+        "opened": {
+          "$ref": "#/components/messages/case.opened"
+        }
+      }
+    },
+    "classification": {
+      "address": "zoikosuite.business.classification.v1",
+      "messages": {
+        "confirmed": {
+          "$ref": "#/components/messages/classification.confirmed"
+        },
+        "proposed": {
+          "$ref": "#/components/messages/classification.proposed"
+        },
+        "reclassified": {
+          "$ref": "#/components/messages/classification.reclassified"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/classification.superseded"
+        }
+      }
+    },
+    "comment": {
+      "address": "zoikosuite.business.comment.v1",
+      "messages": {
+        "added": {
+          "$ref": "#/components/messages/comment.added"
+        },
+        "edited": {
+          "$ref": "#/components/messages/comment.edited"
+        },
+        "moderated": {
+          "$ref": "#/components/messages/comment.moderated"
+        }
+      }
+    },
+    "deadline": {
+      "address": "zoikosuite.business.deadline.v1",
+      "messages": {
+        "became-due-soon": {
+          "$ref": "#/components/messages/deadline.became-due-soon"
+        },
+        "became-overdue": {
+          "$ref": "#/components/messages/deadline.became-overdue"
+        },
+        "completed": {
+          "$ref": "#/components/messages/deadline.completed"
+        },
+        "created": {
+          "$ref": "#/components/messages/deadline.created"
+        },
+        "due": {
+          "$ref": "#/components/messages/deadline.due"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/deadline.superseded"
+        }
+      }
+    },
+    "document": {
+      "address": "zoikosuite.business.document.v1",
+      "messages": {
+        "archived": {
+          "$ref": "#/components/messages/document.archived"
+        },
+        "classification-changed": {
+          "$ref": "#/components/messages/document.classification-changed"
+        },
+        "disposition-requested": {
+          "$ref": "#/components/messages/document.disposition-requested"
+        },
+        "record-declared": {
+          "$ref": "#/components/messages/document.record-declared"
+        },
+        "stored": {
+          "$ref": "#/components/messages/document.stored"
+        },
+        "superseded": {
+          "$ref": "#/components/messages/document.superseded"
+        },
+        "version-upload-quarantined": {
+          "$ref": "#/components/messages/document.version-upload-quarantined"
+        },
+        "versioned": {
+          "$ref": "#/components/messages/document.versioned"
+        }
+      }
+    },
+    "form": {
+      "address": "zoikosuite.business.form.v1",
+      "messages": {
+        "submitted": {
+          "$ref": "#/components/messages/form.submitted"
+        }
+      }
+    },
+    "interaction": {
+      "address": "zoikosuite.business.interaction.v1",
+      "messages": {
+        "logged": {
+          "$ref": "#/components/messages/interaction.logged"
+        }
+      }
+    },
+    "mention": {
+      "address": "zoikosuite.business.mention.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/mention.created"
+        }
+      }
+    },
+    "offering": {
+      "address": "zoikosuite.business.offering.v1",
+      "messages": {
+        "activated": {
+          "$ref": "#/components/messages/offering.activated"
+        },
+        "created": {
+          "$ref": "#/components/messages/offering.created"
+        },
+        "retired": {
+          "$ref": "#/components/messages/offering.retired"
+        },
+        "suspended": {
+          "$ref": "#/components/messages/offering.suspended"
+        }
+      }
+    },
+    "offering-version": {
+      "address": "zoikosuite.business.offering-version.v1",
+      "messages": {
+        "superseded": {
+          "$ref": "#/components/messages/offering-version.superseded"
+        }
+      }
+    },
+    "opportunity": {
+      "address": "zoikosuite.business.opportunity.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/opportunity.created"
+        },
+        "stage-changed": {
+          "$ref": "#/components/messages/opportunity.stage-changed"
+        }
+      }
+    },
+    "relationship": {
+      "address": "zoikosuite.business.relationship.v1",
+      "messages": {
+        "closed": {
+          "$ref": "#/components/messages/relationship.closed"
+        },
+        "created": {
+          "$ref": "#/components/messages/relationship.created"
+        }
+      }
+    },
+    "task": {
+      "address": "zoikosuite.business.task.v1",
+      "messages": {
+        "assigned": {
+          "$ref": "#/components/messages/task.assigned"
+        },
+        "completed": {
+          "$ref": "#/components/messages/task.completed"
+        },
+        "created": {
+          "$ref": "#/components/messages/task.created"
+        },
+        "escalated": {
+          "$ref": "#/components/messages/task.escalated"
+        },
+        "reopened": {
+          "$ref": "#/components/messages/task.reopened"
+        }
+      }
+    },
+    "template": {
+      "address": "zoikosuite.business.template.v1",
+      "messages": {
+        "created": {
+          "$ref": "#/components/messages/template.created"
+        },
+        "published": {
+          "$ref": "#/components/messages/template.published"
+        },
+        "retired": {
+          "$ref": "#/components/messages/template.retired"
+        },
+        "version-approved": {
+          "$ref": "#/components/messages/template.version-approved"
+        }
+      }
+    },
+    "thread": {
+      "address": "zoikosuite.business.thread.v1",
+      "messages": {
+        "resolved": {
+          "$ref": "#/components/messages/thread.resolved"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "case.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Case Service. Primary consumers / intent: Reporting/retention. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.case.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Case: closed.",
+        "title": "case closed",
+        "x-zoiko-event-type": "com.zoikosuite.business.case.closed",
+        "x-zoiko-origin": "spec"
+      },
+      "case.opened": {
+        "contentType": "application/json",
+        "description": "Producer: Case Service. Primary consumers / intent: Task/workflow. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.case.opened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Case: opened.",
+        "title": "case opened",
+        "x-zoiko-event-type": "com.zoikosuite.business.case.opened",
+        "x-zoiko-origin": "spec"
+      },
+      "classification.confirmed": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.classification.confirmed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Classification: confirmed.",
+        "title": "classification confirmed",
+        "x-zoiko-event-type": "com.zoikosuite.business.classification.confirmed",
+        "x-zoiko-origin": "extension"
+      },
+      "classification.proposed": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.classification.proposed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Classification: proposed.",
+        "title": "classification proposed",
+        "x-zoiko-event-type": "com.zoikosuite.business.classification.proposed",
+        "x-zoiko-origin": "extension"
+      },
+      "classification.reclassified": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.classification.reclassified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Classification: reclassified.",
+        "title": "classification reclassified",
+        "x-zoiko-event-type": "com.zoikosuite.business.classification.reclassified",
+        "x-zoiko-origin": "extension"
+      },
+      "classification.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.classification.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Classification: superseded.",
+        "title": "classification superseded",
+        "x-zoiko-event-type": "com.zoikosuite.business.classification.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "comment.added": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.comment.added",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Comment: added.",
+        "title": "comment added",
+        "x-zoiko-event-type": "com.zoikosuite.business.comment.added",
+        "x-zoiko-origin": "extension"
+      },
+      "comment.edited": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.comment.edited",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Comment: edited.",
+        "title": "comment edited",
+        "x-zoiko-event-type": "com.zoikosuite.business.comment.edited",
+        "x-zoiko-origin": "extension"
+      },
+      "comment.moderated": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.comment.moderated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Comment: moderated.",
+        "title": "comment moderated",
+        "x-zoiko-event-type": "com.zoikosuite.business.comment.moderated",
+        "x-zoiko-origin": "extension"
+      },
+      "deadline.became-due-soon": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.became-due-soon",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: became-due-soon.",
+        "title": "deadline became-due-soon",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.became-due-soon",
+        "x-zoiko-origin": "extension"
+      },
+      "deadline.became-overdue": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.became-overdue",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: became-overdue.",
+        "title": "deadline became-overdue",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.became-overdue",
+        "x-zoiko-origin": "extension"
+      },
+      "deadline.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: completed.",
+        "title": "deadline completed",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.completed",
+        "x-zoiko-origin": "extension"
+      },
+      "deadline.created": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: created.",
+        "title": "deadline created",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.created",
+        "x-zoiko-origin": "extension"
+      },
+      "deadline.due": {
+        "contentType": "application/json",
+        "description": "Producer: Deadline Service. Primary consumers / intent: Task/escalation. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.deadline.due",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Obligation/deadline: due.",
+        "title": "deadline due",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.due",
+        "x-zoiko-origin": "spec"
+      },
+      "deadline.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.deadline.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Deadline: superseded.",
+        "title": "deadline superseded",
+        "x-zoiko-event-type": "com.zoikosuite.business.deadline.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "document.archived": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.archived",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: archived.",
+        "title": "document archived",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.archived",
+        "x-zoiko-origin": "extension"
+      },
+      "document.classification-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Document Service. Primary consumers / intent: Access/retention. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.document.classification-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: classification-changed.",
+        "title": "document classification-changed",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.classification-changed",
+        "x-zoiko-origin": "spec"
+      },
+      "document.disposition-requested": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.disposition-requested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: disposition-requested.",
+        "title": "document disposition-requested",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.disposition-requested",
+        "x-zoiko-origin": "extension"
+      },
+      "document.record-declared": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.record-declared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: record-declared.",
+        "title": "document record-declared",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.record-declared",
+        "x-zoiko-origin": "extension"
+      },
+      "document.stored": {
+        "contentType": "application/json",
+        "description": "Producer: Document Service. Primary consumers / intent: Linked domain/evidence. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.document.stored",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: stored.",
+        "title": "document stored",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.stored",
+        "x-zoiko-origin": "spec"
+      },
+      "document.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: superseded.",
+        "title": "document superseded",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "document.version-upload-quarantined": {
+        "contentType": "application/json",
+        "description": "Producer: Document Vault Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.document.version-upload-quarantined",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: version-upload-quarantined.",
+        "title": "document version-upload-quarantined",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.version-upload-quarantined",
+        "x-zoiko-origin": "extension"
+      },
+      "document.versioned": {
+        "contentType": "application/json",
+        "description": "Producer: Document Service. Primary consumers / intent: Linked domain/evidence. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.document.versioned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Document: versioned.",
+        "title": "document versioned",
+        "x-zoiko-event-type": "com.zoikosuite.business.document.versioned",
+        "x-zoiko-origin": "spec"
+      },
+      "form.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Form Service. Primary consumers / intent: Owning domain/workflow. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.form.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Form submission: submitted.",
+        "title": "form submitted",
+        "x-zoiko-event-type": "com.zoikosuite.business.form.submitted",
+        "x-zoiko-origin": "spec"
+      },
+      "interaction.logged": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.interaction.logged",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Interaction: logged.",
+        "title": "interaction logged",
+        "x-zoiko-event-type": "com.zoikosuite.business.interaction.logged",
+        "x-zoiko-origin": "extension"
+      },
+      "mention.created": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.mention.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Mention: created.",
+        "title": "mention created",
+        "x-zoiko-event-type": "com.zoikosuite.business.mention.created",
+        "x-zoiko-origin": "extension"
+      },
+      "offering-version.superseded": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering-version.superseded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering Version: superseded.",
+        "title": "offering-version superseded",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering-version.superseded",
+        "x-zoiko-origin": "extension"
+      },
+      "offering.activated": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering.activated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering: activated.",
+        "title": "offering activated",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering.activated",
+        "x-zoiko-origin": "extension"
+      },
+      "offering.created": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering: created.",
+        "title": "offering created",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering.created",
+        "x-zoiko-origin": "extension"
+      },
+      "offering.retired": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering.retired",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering: retired.",
+        "title": "offering retired",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering.retired",
+        "x-zoiko-origin": "extension"
+      },
+      "offering.suspended": {
+        "contentType": "application/json",
+        "description": "Producer: Inventory Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.offering.suspended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Offering: suspended.",
+        "title": "offering suspended",
+        "x-zoiko-event-type": "com.zoikosuite.business.offering.suspended",
+        "x-zoiko-origin": "extension"
+      },
+      "opportunity.created": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.opportunity.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Opportunity: created.",
+        "title": "opportunity created",
+        "x-zoiko-event-type": "com.zoikosuite.business.opportunity.created",
+        "x-zoiko-origin": "extension"
+      },
+      "opportunity.stage-changed": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.opportunity.stage-changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Opportunity: stage-changed.",
+        "title": "opportunity stage-changed",
+        "x-zoiko-event-type": "com.zoikosuite.business.opportunity.stage-changed",
+        "x-zoiko-origin": "extension"
+      },
+      "relationship.closed": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.relationship.closed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Relationship: closed.",
+        "title": "relationship closed",
+        "x-zoiko-event-type": "com.zoikosuite.business.relationship.closed",
+        "x-zoiko-origin": "extension"
+      },
+      "relationship.created": {
+        "contentType": "application/json",
+        "description": "Producer: Counterparty Management Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.relationship.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Relationship: created.",
+        "title": "relationship created",
+        "x-zoiko-event-type": "com.zoikosuite.business.relationship.created",
+        "x-zoiko-origin": "extension"
+      },
+      "task.assigned": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.task.assigned",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: assigned.",
+        "title": "task assigned",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.assigned",
+        "x-zoiko-origin": "extension"
+      },
+      "task.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Task Service. Primary consumers / intent: Workflow/metrics. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.task.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: completed.",
+        "title": "task completed",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "task.created": {
+        "contentType": "application/json",
+        "description": "Producer: Task Service. Primary consumers / intent: Work queues. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.task.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: created.",
+        "title": "task created",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.created",
+        "x-zoiko-origin": "spec"
+      },
+      "task.escalated": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.task.escalated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: escalated.",
+        "title": "task escalated",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.escalated",
+        "x-zoiko-origin": "extension"
+      },
+      "task.reopened": {
+        "contentType": "application/json",
+        "description": "Producer: Exception Escalation Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.task.reopened",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Task: reopened.",
+        "title": "task reopened",
+        "x-zoiko-event-type": "com.zoikosuite.business.task.reopened",
+        "x-zoiko-origin": "extension"
+      },
+      "template.created": {
+        "contentType": "application/json",
+        "description": "Producer: Notification Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.template.created",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Template: created.",
+        "title": "template created",
+        "x-zoiko-event-type": "com.zoikosuite.business.template.created",
+        "x-zoiko-origin": "extension"
+      },
+      "template.published": {
+        "contentType": "application/json",
+        "description": "Producer: Template Service. Primary consumers / intent: Form/document generation. Family: Business Operations & Documents. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.business.template.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Template: published.",
+        "title": "template published",
+        "x-zoiko-event-type": "com.zoikosuite.business.template.published",
+        "x-zoiko-origin": "spec"
+      },
+      "template.retired": {
+        "contentType": "application/json",
+        "description": "Producer: Notification Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.template.retired",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Template: retired.",
+        "title": "template retired",
+        "x-zoiko-event-type": "com.zoikosuite.business.template.retired",
+        "x-zoiko-origin": "extension"
+      },
+      "template.version-approved": {
+        "contentType": "application/json",
+        "description": "Producer: Notification Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.template.version-approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Template: version-approved.",
+        "title": "template version-approved",
+        "x-zoiko-event-type": "com.zoikosuite.business.template.version-approved",
+        "x-zoiko-origin": "extension"
+      },
+      "thread.resolved": {
+        "contentType": "application/json",
+        "description": "Producer: Comments Collaboration Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Business Operations & Documents (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.business.thread.resolved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Thread: resolved.",
+        "title": "thread resolved",
+        "x-zoiko-event-type": "com.zoikosuite.business.thread.resolved",
+        "x-zoiko-origin": "extension"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite business domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.case": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/case"
+      },
+      "description": "Producer(s): Case Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/case/messages/closed"
+        },
+        {
+          "$ref": "#/channels/case/messages/opened"
+        }
+      ],
+      "summary": "Publish case facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.classification": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/classification"
+      },
+      "description": "Producer(s): Document Vault Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/classification/messages/confirmed"
+        },
+        {
+          "$ref": "#/channels/classification/messages/proposed"
+        },
+        {
+          "$ref": "#/channels/classification/messages/reclassified"
+        },
+        {
+          "$ref": "#/channels/classification/messages/superseded"
+        }
+      ],
+      "summary": "Publish classification facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.comment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/comment"
+      },
+      "description": "Producer(s): Comments Collaboration Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/comment/messages/added"
+        },
+        {
+          "$ref": "#/channels/comment/messages/edited"
+        },
+        {
+          "$ref": "#/channels/comment/messages/moderated"
+        }
+      ],
+      "summary": "Publish comment facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.deadline": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/deadline"
+      },
+      "description": "Producer(s): Deadline Service, Exception Escalation Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/deadline/messages/became-due-soon"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/became-overdue"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/completed"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/created"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/due"
+        },
+        {
+          "$ref": "#/channels/deadline/messages/superseded"
+        }
+      ],
+      "summary": "Publish deadline facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.document": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/document"
+      },
+      "description": "Producer(s): Document Service, Document Vault Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/document/messages/archived"
+        },
+        {
+          "$ref": "#/channels/document/messages/classification-changed"
+        },
+        {
+          "$ref": "#/channels/document/messages/disposition-requested"
+        },
+        {
+          "$ref": "#/channels/document/messages/record-declared"
+        },
+        {
+          "$ref": "#/channels/document/messages/stored"
+        },
+        {
+          "$ref": "#/channels/document/messages/superseded"
+        },
+        {
+          "$ref": "#/channels/document/messages/version-upload-quarantined"
+        },
+        {
+          "$ref": "#/channels/document/messages/versioned"
+        }
+      ],
+      "summary": "Publish document facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.form": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/form"
+      },
+      "description": "Producer(s): Form Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/form/messages/submitted"
+        }
+      ],
+      "summary": "Publish form facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.interaction": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/interaction"
+      },
+      "description": "Producer(s): Counterparty Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/interaction/messages/logged"
+        }
+      ],
+      "summary": "Publish interaction facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.mention": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/mention"
+      },
+      "description": "Producer(s): Comments Collaboration Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/mention/messages/created"
+        }
+      ],
+      "summary": "Publish mention facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.offering": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/offering"
+      },
+      "description": "Producer(s): Inventory Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/offering/messages/activated"
+        },
+        {
+          "$ref": "#/channels/offering/messages/created"
+        },
+        {
+          "$ref": "#/channels/offering/messages/retired"
+        },
+        {
+          "$ref": "#/channels/offering/messages/suspended"
+        }
+      ],
+      "summary": "Publish offering facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.offering-version": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/offering-version"
+      },
+      "description": "Producer(s): Inventory Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/offering-version/messages/superseded"
+        }
+      ],
+      "summary": "Publish offering-version facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.opportunity": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/opportunity"
+      },
+      "description": "Producer(s): Counterparty Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/opportunity/messages/created"
+        },
+        {
+          "$ref": "#/channels/opportunity/messages/stage-changed"
+        }
+      ],
+      "summary": "Publish opportunity facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.relationship": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/relationship"
+      },
+      "description": "Producer(s): Counterparty Management Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/relationship/messages/closed"
+        },
+        {
+          "$ref": "#/channels/relationship/messages/created"
+        }
+      ],
+      "summary": "Publish relationship facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.task": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/task"
+      },
+      "description": "Producer(s): Exception Escalation Service, Task Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/task/messages/assigned"
+        },
+        {
+          "$ref": "#/channels/task/messages/completed"
+        },
+        {
+          "$ref": "#/channels/task/messages/created"
+        },
+        {
+          "$ref": "#/channels/task/messages/escalated"
+        },
+        {
+          "$ref": "#/channels/task/messages/reopened"
+        }
+      ],
+      "summary": "Publish task facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.template": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/template"
+      },
+      "description": "Producer(s): Notification Service, Template Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/template/messages/created"
+        },
+        {
+          "$ref": "#/channels/template/messages/published"
+        },
+        {
+          "$ref": "#/channels/template/messages/retired"
+        },
+        {
+          "$ref": "#/channels/template/messages/version-approved"
+        }
+      ],
+      "summary": "Publish template facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.thread": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/thread"
+      },
+      "description": "Producer(s): Comments Collaboration Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/thread/messages/resolved"
+        }
+      ],
+      "summary": "Publish thread facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

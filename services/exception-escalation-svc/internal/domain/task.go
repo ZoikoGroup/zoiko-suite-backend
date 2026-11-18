@@ -150,6 +150,8 @@ type CreateCaseParams struct {
 
 type CloseCaseParams struct {
 	CaseID, TenantID, ActorPrincipalID, ClosureReason string
+	// CorrelationID is carried onto the case.closed event.
+	CorrelationID string
 }
 
 type CreateTaskParams struct {
@@ -163,11 +165,15 @@ type CreateTaskParams struct {
 	SLADeadline                      *time.Time
 	AssignedToRole, AssignedToUser   string
 	CreatedByPrincipalID             string
+	// CorrelationID is carried onto the task.created event.
+	CorrelationID string
 }
 
 type AssignTaskParams struct {
 	TaskID, TenantID, ActorPrincipalID string
 	AssignedToRole, AssignedToUser     string
+	// CorrelationID is carried onto the task.assigned event.
+	CorrelationID string
 }
 
 type StartTaskParams struct {
@@ -180,14 +186,20 @@ type BlockTaskParams struct {
 
 type EscalateTaskParams struct {
 	TaskID, TenantID, ActorPrincipalID, EscalatedToRole, Reason string
+	// CorrelationID is carried onto the task.escalated event.
+	CorrelationID string
 }
 
 type CompleteTaskParams struct {
 	TaskID, TenantID, ActorPrincipalID, CompletionNotes string
+	// CorrelationID is carried onto the task.completed event.
+	CorrelationID string
 }
 
 type ReopenTaskParams struct {
 	TaskID, TenantID, ActorPrincipalID, Reason string
+	// CorrelationID is carried onto the task.reopened event.
+	CorrelationID string
 }
 
 type CancelTaskParams struct {
@@ -204,6 +216,8 @@ type ListQueueParams struct {
 var (
 	ErrCaseNotFound        = errors.New("case not found")
 	ErrCaseAlreadyClosedWC = errors.New("case is already closed")
+	// ErrCaseEntityMismatch: a task may only join a case of its own legal entity.
+	ErrCaseEntityMismatch = errors.New("task legal entity does not match the case legal entity")
 	ErrTaskNotFound        = errors.New("task not found")
 	ErrTaskInvalidState    = errors.New("task is not in a state that permits this action")
 )

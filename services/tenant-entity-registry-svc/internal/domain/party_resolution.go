@@ -40,6 +40,8 @@ func DecisionsFor(caseType string) []string {
 		return []string{DecisionAcceptProposed, DecisionKeepVerified}
 	case CaseIdentifierConflict:
 		return []string{DecisionKeepHolder, DecisionMoveToRequester}
+	case CaseVerificationConflict:
+		return []string{DecisionKeepVerified, DecisionAcceptObservation}
 	}
 	return nil
 }

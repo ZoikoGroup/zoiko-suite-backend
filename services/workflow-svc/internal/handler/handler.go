@@ -45,7 +45,7 @@ type WorkflowStore interface {
 	VerifyRelease(ctx context.Context, params domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error)
 	EscalateToWorkflow(ctx context.Context, params domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error)
 	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
-	ListPendingApprovals(ctx context.Context, tenantID string, limit, offset int) ([]*domain.WorkflowInstance, error)
+	ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
 
 	// Workflow definitions (WFC-02) — see internal/store/pg_store.go.
@@ -123,7 +123,7 @@ type WorkflowStore interface {
 	RouteToDomain(ctx context.Context, params domain.RouteToDomainParams) (*domain.FormSubmissionRoute, error)
 	GetSubmissionVersion(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmissionVersionInfo, error)
 	GetValidationResult(ctx context.Context, tenantID, submissionID string) (*domain.ValidationResult, error)
-	ListPendingSubmissions(ctx context.Context, tenantID, formID string, limit, offset int) ([]*domain.FormSubmission, error)
+	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -142,9 +142,8 @@ type EventPublisher interface {
 	PublishWorkflowInvalidated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishAuditEngagementEvent(ctx context.Context, eventType string, engagement domain.AuditEngagement, actorID, correlationID string) error
 
-	// BIZ-04 Form — see internal/events/publisher.go's own doc comments.
-	PublishFormPublished(ctx context.Context, f domain.FormDefinition, actorID, correlationID string) error
-	PublishFormEvent(ctx context.Context, eventType string, s domain.FormSubmission, actorID, correlationID string) error
+	// The BIZ-04 form events are not published here: the store writes them to the outbox in
+	// the same transaction as the change.
 }
 
 // DocumentVaultClient verifies evidence references without making workflow-svc
@@ -2258,7 +2257,29 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	instances, err := h.store.ListPendingApprovals(r.Context(), tenantScope, getIntQuery(r, "limit", 50), getIntQuery(r, "offset", 0))
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
+	}
+
+	var cursor *domain.PaginationCursor
+	if cursorStr := r.URL.Query().Get("cursor"); cursorStr != "" {
+		c, err := domain.DecodePaginationCursor(cursorStr)
+		if err != nil {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_cursor",
+				"message": "cursor is not valid",
+			})
+			return
+		}
+		cursor = c
+	}
+
+	instances, nextCursor, err := h.store.ListPendingApprovals(r.Context(), tenantScope, domain.ListPendingApprovalsParams{
+		TenantID: tenantScope,
+		Limit:    limit,
+		Cursor:   cursor,
+	})
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "ListPendingApprovals")
 		return
@@ -2266,7 +2287,23 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 	if instances == nil {
 		instances = []*domain.WorkflowInstance{}
 	}
-	writeJSON(w, r, http.StatusOK, instances)
+
+	type listResponse struct {
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                     `json:"next_cursor,omitempty"`
+		Watermark  string                     `json:"watermark,omitempty"`
+	}
+
+	resp := listResponse{
+		Records: instances,
+	}
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			resp.NextCursor = encoded
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, resp)
 }
 
 // GetApprovalEvidence handles GET /v1/workflows/{workflow_instance_id}/evidence.

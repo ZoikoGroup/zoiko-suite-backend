@@ -68,6 +68,7 @@ func openEmptyPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	for _, table := range resetTables {
 		if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS `+table+` CASCADE`); err != nil {

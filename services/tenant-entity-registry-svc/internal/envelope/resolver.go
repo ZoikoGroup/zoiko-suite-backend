@@ -30,8 +30,8 @@ import (
 //	book_id / reporting_basis  needs REF-06 Accounting Book / Ledger Basis
 //	functional_currency        needs REF-02 Currency Registry (§6.1)
 //	exchange_rate              needs REF-03 Foreign Exchange Rates (§6.1)
-//	fiscal period validity     needs REF-04 Fiscal Calendar — LegalEntity carries
-//	                           a fiscal_calendar_id, but nothing resolves it
+//	fiscal period validity     is fiscal-calendar-svc (REF-04) :resolve. The entity's
+//	                           fiscal_calendar_id is checked there at creation; the period is not resolved here
 //
 // Those four are reported in the gap table rather than faked here. Filling
 // book_id with a default would be the exact failure INV-03 exists to prevent:

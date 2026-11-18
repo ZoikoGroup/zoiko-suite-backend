@@ -170,6 +170,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 	r.Post("/v1/secret-policies", h.CreateSecretPolicy)
 	r.Get("/v1/secret-policies", h.ListApplicableSecretPolicyVersions)
+	r.Get("/v1/secret-paths/status", h.SecretPathStatus)
 	r.Post("/v1/secret-policies/{secret_policy_id}/versions", h.CreateSecretPolicyVersion)
 	r.Post("/v1/secret-policies/{secret_policy_id}/versions/{version_id}/activate", h.ActivateVersion)
 	r.Get("/v1/secret-policies/{secret_policy_id}/versions", h.ListVersionHistory)

@@ -78,7 +78,7 @@ func countDocuments(t *testing.T, admin *pgxpool.Pool, title string) int {
 
 func TestDocumentVersionsAndAccessLog_AreAppendOnly(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.New(admin, zap.NewNop())
+	s := store.New(admin, zap.NewNop(), store.WithEventRegion("local"))
 	app := appRolePool(t, admin)
 	ctx := tenantCtx()
 
@@ -147,7 +147,7 @@ func claim(principal, key, hash string) domain.IdempotencyClaim {
 
 func TestCreateDocumentIdempotent_SameKeyReplays_OneDocument(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.New(admin, zap.NewNop())
+	s := store.New(admin, zap.NewNop(), store.WithEventRegion("local"))
 	ctx := tenantCtx()
 	h := strings.Repeat("a", 64)
 
@@ -175,7 +175,7 @@ func TestCreateDocumentIdempotent_SameKeyReplays_OneDocument(t *testing.T) {
 
 func TestCreateDocumentIdempotent_ScopeIsTenantPrincipalKey(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.New(admin, zap.NewNop())
+	s := store.New(admin, zap.NewNop(), store.WithEventRegion("local"))
 	ctx := tenantCtx()
 	h := strings.Repeat("b", 64)
 
@@ -206,7 +206,7 @@ func TestCreateDocumentIdempotent_ScopeIsTenantPrincipalKey(t *testing.T) {
 
 func TestCreateDocumentIdempotent_ConcurrentSameKey_OneLogicalOperation(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.New(admin, zap.NewNop())
+	s := store.New(admin, zap.NewNop(), store.WithEventRegion("local"))
 	ctx := tenantCtx()
 	h := strings.Repeat("c", 64)
 
@@ -241,7 +241,7 @@ func TestCreateDocumentIdempotent_ConcurrentSameKey_OneLogicalOperation(t *testi
 
 func TestCreateDocumentIdempotent_FailedOperationClaimsNothing(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.New(admin, zap.NewNop())
+	s := store.New(admin, zap.NewNop(), store.WithEventRegion("local"))
 	ctx := tenantCtx()
 	h := strings.Repeat("d", 64)
 
@@ -263,7 +263,7 @@ func TestCreateDocumentIdempotent_FailedOperationClaimsNothing(t *testing.T) {
 
 func TestAddVersionIdempotent_SameKeyReplays_OneVersion(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.New(admin, zap.NewNop())
+	s := store.New(admin, zap.NewNop(), store.WithEventRegion("local"))
 	ctx := tenantCtx()
 
 	doc, v1 := newDoc("idem-version")
@@ -292,7 +292,7 @@ func TestAddVersionIdempotent_SameKeyReplays_OneVersion(t *testing.T) {
 // hold cannot be put into disposition; releasing the hold unblocks it.
 func TestRequestDisposition_BlockedWhileARecordOfTheDocumentIsUnderHold(t *testing.T) {
 	admin := requireTestDB(t)
-	s := store.New(admin, zap.NewNop())
+	s := store.New(admin, zap.NewNop(), store.WithEventRegion("local"))
 	ctx := tenantCtx()
 
 	rec := createTestRecord(t, s, "disp-hold", string(domain.RecordClassLegalMatterRecord), "US-DE")

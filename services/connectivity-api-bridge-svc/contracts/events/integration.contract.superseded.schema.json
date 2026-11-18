@@ -1,0 +1,20 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.contract.superseded (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 9 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "connector_id": {
+      "type": "string"
+    },
+    "contract_version_id": {
+      "type": "string"
+    },
+    "superseded_by": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "connector_id",
+    "contract_version_id",
+    "superseded_by"
+  ],
+  "type": "object"
+}

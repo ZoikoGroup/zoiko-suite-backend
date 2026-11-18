@@ -3,14 +3,10 @@
 # go.mod replaces zoiko.io/eventing with ../eventing, and Docker can only
 # COPY from inside the build context -- matching general-ledger-svc's
 # Dockerfile, which has the same replace directive and the same build-context
-# requirement.
-#
-# Previously this Dockerfile only had a runtime stage that COPYed a
-# pre-built ./server and ./healthcheck from the build context, with nothing
-# in this repository building them -- the service could not actually be
-# built into an image. Added for the migration-integrity-svc <->
-# general-ledger-svc wiring task, which needs to run this service as a real
-# container alongside general-ledger-svc and authorization-svc.
+# requirement. main independently added a builder stage for this service
+# (PR #262) but kept the old single-directory context, which cannot resolve
+# ../eventing; this keeps that fix's intent (give the service a real builder
+# stage) while using the build-context-correct form.
 
 # ─── Stage 1: builder ─────────────────────────────────────────────────────────
 FROM golang:1.25-alpine AS builder

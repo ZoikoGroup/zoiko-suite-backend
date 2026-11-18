@@ -169,12 +169,16 @@ func (h *Handler) ListJurisdictionAliases(w http.ResponseWriter, r *http.Request
 		}
 		at = &t
 	}
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	out, err := s.ListJurisdictionAliases(r.Context(), chi.URLParam(r, "jurisdiction_id"), at)
 	if err != nil {
 		h.writeAliasError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	finishList(h, w, r, p, pageOf(p, out))
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {

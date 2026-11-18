@@ -32,10 +32,12 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS statement_disclosures CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS statement_facts CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS financial_statement_sets CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS eventing_outbox CASCADE;`)
@@ -43,6 +45,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_eventing_outbox.up.sql",
+		"000003_statement_fact_source_accounts.up.sql",
+		"000004_statement_disclosures.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {

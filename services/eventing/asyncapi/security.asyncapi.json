@@ -1,0 +1,279 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "key-policy": {
+      "address": "zoikosuite.security.key-policy.v1",
+      "messages": {
+        "changed": {
+          "$ref": "#/components/messages/key-policy.changed"
+        }
+      }
+    },
+    "privileged-session": {
+      "address": "zoikosuite.security.privileged-session.v1",
+      "messages": {
+        "ended": {
+          "$ref": "#/components/messages/privileged-session.ended"
+        },
+        "started": {
+          "$ref": "#/components/messages/privileged-session.started"
+        }
+      }
+    },
+    "secret": {
+      "address": "zoikosuite.security.secret.v1",
+      "messages": {
+        "rotated": {
+          "$ref": "#/components/messages/secret.rotated"
+        }
+      }
+    },
+    "security-event": {
+      "address": "zoikosuite.security.security-event.v1",
+      "messages": {
+        "raised": {
+          "$ref": "#/components/messages/security-event.raised"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "key-policy.changed": {
+        "contentType": "application/json",
+        "description": "Producer: Security. Primary consumers / intent: Encryption services. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.security.key-policy.changed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Key policy: changed.",
+        "title": "key-policy changed",
+        "x-zoiko-event-type": "com.zoikosuite.security.key-policy.changed",
+        "x-zoiko-origin": "spec"
+      },
+      "privileged-session.ended": {
+        "contentType": "application/json",
+        "description": "Producer: Security. Primary consumers / intent: SIEM/evidence. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.security.privileged-session.ended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Privileged session: ended.",
+        "title": "privileged-session ended",
+        "x-zoiko-event-type": "com.zoikosuite.security.privileged-session.ended",
+        "x-zoiko-origin": "spec"
+      },
+      "privileged-session.started": {
+        "contentType": "application/json",
+        "description": "Producer: Security. Primary consumers / intent: SIEM/evidence. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.security.privileged-session.started",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Privileged session: started.",
+        "title": "privileged-session started",
+        "x-zoiko-event-type": "com.zoikosuite.security.privileged-session.started",
+        "x-zoiko-origin": "spec"
+      },
+      "secret.rotated": {
+        "contentType": "application/json",
+        "description": "Producer: Security. Primary consumers / intent: Dependent workloads/ops. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.security.secret.rotated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Secret/key: rotated.",
+        "title": "secret rotated",
+        "x-zoiko-event-type": "com.zoikosuite.security.secret.rotated",
+        "x-zoiko-origin": "spec"
+      },
+      "security-event.raised": {
+        "contentType": "application/json",
+        "description": "Producer: Security. Primary consumers / intent: SIEM/incident response. Family: Security & Platform Operations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.security.security-event.raised",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Security event: raised.",
+        "title": "security-event raised",
+        "x-zoiko-event-type": "com.zoikosuite.security.security-event.raised",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite security domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.key-policy": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/key-policy"
+      },
+      "description": "Producer(s): Security. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/key-policy/messages/changed"
+        }
+      ],
+      "summary": "Publish key-policy facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.privileged-session": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/privileged-session"
+      },
+      "description": "Producer(s): Security. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/privileged-session/messages/ended"
+        },
+        {
+          "$ref": "#/channels/privileged-session/messages/started"
+        }
+      ],
+      "summary": "Publish privileged-session facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.secret": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/secret"
+      },
+      "description": "Producer(s): Security. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/secret/messages/rotated"
+        }
+      ],
+      "summary": "Publish secret facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.security-event": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/security-event"
+      },
+      "description": "Producer(s): Security. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/security-event/messages/raised"
+        }
+      ],
+      "summary": "Publish security-event facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

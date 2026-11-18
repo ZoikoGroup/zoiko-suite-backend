@@ -136,8 +136,8 @@ func TestPgStore_SetPrincipalLifecycleWritesItsEvents_Integration(t *testing.T) 
 	require.Equal(t, domain.PrincipalStatusDisabled, p.Status)
 
 	var n int
-	require.NoError(t, admin.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE payload->>'correlation_id' = 'corr-dis'
-		AND event_type IN ('principal.status.changed', 'identity.subject.disabled')`).Scan(&n))
+	require.NoError(t, admin.QueryRow(ctx, `SELECT count(*) FROM eventing_outbox WHERE convert_from(payload,'UTF8')::jsonb->>'correlation_id' = 'corr-dis'
+		AND event_type IN ('com.zoikosuite.identity.principal.status-changed', 'com.zoikosuite.identity.subject.disabled')`).Scan(&n))
 	require.Equal(t, 2, n, "both event names are enqueued with the change")
 
 	changed, err = s.SetPrincipalLifecycle(ctx, "t-1", "p-1", domain.PrincipalStatusDisabled, "admin-1", "again", "corr-dis-2", recs...)

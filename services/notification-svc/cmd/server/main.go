@@ -35,17 +35,23 @@ import (
 	"zoiko.io/notification-svc/internal/idempotency"
 	"zoiko.io/notification-svc/internal/identity"
 	"zoiko.io/notification-svc/internal/ledger"
+	"zoiko.io/notification-svc/internal/legalbasis"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
 	"zoiko.io/notification-svc/internal/ncd"
 	"zoiko.io/notification-svc/internal/outbox"
+	"zoiko.io/notification-svc/internal/partycontacts"
 	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/privacy"
+	"zoiko.io/notification-svc/internal/recordvault"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/senderauth"
 	"zoiko.io/notification-svc/internal/store"
+	"zoiko.io/eventing/kafkaout"
+	eventingoutbox "zoiko.io/eventing/outbox"
 	"zoiko.io/notification-svc/internal/telemetry"
 	"zoiko.io/notification-svc/internal/unsubscribe"
+	"zoiko.io/notification-svc/internal/vaultsecrets"
 	"zoiko.io/notification-svc/internal/webhook"
 )
 
@@ -121,7 +127,12 @@ func main() {
 	log.Info("db pool connected")
 
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
-	pgStore := store.New(pool)
+	// The shared eventing outbox table must exist before the first write tries to enqueue
+	// into it; a missing table would otherwise fail template writes at request time.
+	if err := eventingoutbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema missing", zap.Error(err))
+	}
+	pgStore := store.New(pool, store.WithEventRegion(cfg.EventResidencyRegion))
 	if cfg.QuotaEnabled {
 		pgStore.WithQuota(cfg.QuotaLimits)
 		log.Info("send quotas are on", zap.Any("limits", cfg.QuotaLimits))
@@ -203,6 +214,61 @@ func main() {
 		log.Warn("DKIM not configured — this service sends unsigned mail; the mail provider must sign it (§11.1)")
 	}
 
+	// S7-B3: provider and callback secrets are leased from the vault when paths are configured (never logged). They are
+	// fetched before anything uses them, so a service that cannot obtain its provider credential does not start; the
+	// refresher below then carries rotations to the running providers and verifier.
+	var (
+		smtpPrimary, smtpSecondary *deliver.SMTPProvider
+		webhookVerifierRef         *webhook.Verifier
+		secretRefresher            *vaultsecrets.Refresher
+	)
+	if cfg.Secrets.Enabled() {
+		vc, verr := vaultsecrets.NewClient(cfg.Secrets.VaultURL, cfg.Secrets.Principal, cfg.Secrets.TenantID, nil)
+		if verr != nil {
+			log.Fatal("secret vault client configuration is invalid", zap.Error(verr))
+		}
+		var vs []vaultsecrets.Secret
+		if p := cfg.Secrets.SMTPPasswordPath; p != "" {
+			vs = append(vs, vaultsecrets.Secret{Name: "smtp_password", Path: p, Apply: func(v []byte) error {
+				cfg.Email.Password = string(v)
+				if smtpPrimary != nil {
+					return smtpPrimary.SetPassword(string(v))
+				}
+				return nil
+			}})
+		}
+		if p := cfg.Secrets.SMTPSecondaryPasswordPath; p != "" {
+			vs = append(vs, vaultsecrets.Secret{Name: "smtp_secondary_password", Path: p, Apply: func(v []byte) error {
+				cfg.SecondaryEmail.Password = string(v)
+				if smtpSecondary != nil {
+					return smtpSecondary.SetPassword(string(v))
+				}
+				return nil
+			}})
+		}
+		if p := cfg.Secrets.WebhookSecretsPath; p != "" {
+			vs = append(vs, vaultsecrets.Secret{Name: "webhook_secrets", Path: p, Apply: func(v []byte) error {
+				parsed, perr := config.ParseWebhookSecrets(string(v))
+				if perr != nil {
+					return perr
+				}
+				cfg.WebhookSecrets = parsed
+				if webhookVerifierRef != nil {
+					webhookVerifierRef.SetSecrets(parsed)
+				}
+				return nil
+			}})
+		}
+		secretRefresher = vaultsecrets.NewRefresher(vc, vs, log)
+		loadCtx, cancelLoad := context.WithTimeout(context.Background(), 30*time.Second)
+		lerr := secretRefresher.Load(loadCtx)
+		cancelLoad()
+		if lerr != nil {
+			log.Fatal("could not lease the service secrets from the vault", zap.Error(lerr))
+		}
+		log.Info("service secrets leased from the vault", zap.Int("secrets", len(vs)), zap.Duration("refresh_interval", cfg.Secrets.RefreshInterval))
+	}
+
 	var emailProvider deliver.Provider
 	switch cfg.Email.Provider {
 	case "":
@@ -224,6 +290,7 @@ func main() {
 			log.Fatal("email provider configuration is invalid", zap.Error(err))
 		}
 		emailProvider = p
+		smtpPrimary = p
 		log.Info("smtp email provider configured",
 			zap.String("host", cfg.Email.Host),
 			zap.Int("port", cfg.Email.Port),
@@ -285,6 +352,7 @@ func main() {
 			log.Fatal("secondary email provider configuration is invalid", zap.Error(err))
 		}
 		secondaryEmailProvider = sp
+		smtpSecondary = sp
 		log.Info("secondary smtp failover provider configured",
 			zap.String("host", cfg.SecondaryEmail.Host),
 			zap.Int("port", cfg.SecondaryEmail.Port))
@@ -329,6 +397,21 @@ func main() {
 	ncdSvc := ncd.NewService(ncdStore, identityClient,
 		ncd.RouterTransport{Email: deliverer, Inbox: ncdStore, Unsubscribe: ncdUnsub}, ncd.DefaultLimits(), log)
 	ncdSvc.SetMetrics(telemetry.NewNCD("notification-svc", prometheus.DefaultRegisterer))
+	// S7-B2: with a document vault configured, the notice evidence package is declared as a record by this service.
+	// S7-C1: a party of the sender's own tenant can be addressed through its verified contact points.
+	// S7-C2: a regulated notice legal basis must be an active LEGAL_BASIS policy version in policy-svc.
+	if cfg.LegalBasisPolicyURL != "" {
+		ncdSvc.SetLegalBasisVerifier(legalbasis.NewClient(cfg.LegalBasisPolicyURL, cfg.LegalBasisPrincipal, 3*time.Second, log))
+		log.Info("notice legal basis is verified against policy-svc", zap.String("url", cfg.LegalBasisPolicyURL))
+	}
+	if cfg.PartyContactsURL != "" {
+		ncdSvc.SetPartyContacts(partycontacts.NewClient(cfg.PartyContactsURL, cfg.PartyContactsPrincipal, 3*time.Second, log))
+		log.Info("party recipients resolve through tenant-entity-registry-svc", zap.String("url", cfg.PartyContactsURL))
+	}
+	if cfg.DocumentVaultURL != "" {
+		ncdSvc.SetRecordVault(recordvault.NewClient(cfg.DocumentVaultURL, cfg.DocumentVaultTimeout, log))
+		log.Info("notice record declaration through document-vault-svc is on", zap.String("document_vault_url", cfg.DocumentVaultURL))
+	}
 	gatedDeliverer := ncd.GatedDeliverer{Inner: deliverer, Svc: ncdSvc}
 
 	// ── 4b. Retry policy and worker ──────────────────────────────────────────
@@ -385,7 +468,10 @@ func main() {
 	}
 	directDeliverer.WithPreferences(ncd.LegacyPreferenceSource{Svc: ncdSvc})
 	if cfg.PrivacyEnforcement {
-		gate, gerr := privacy.NewGate(privacy.NewClient(cfg.PrivacyDecisionURL, cfg.PrivacyTimeout, log), pgStore, log)
+		privacyClient := privacy.NewClient(cfg.PrivacyDecisionURL, cfg.PrivacyTimeout, log)
+		// S7-B1: the NCD channel decision asks privacy-decision-svc itself; a caller-supplied permission is ignored.
+		ncdSvc.SetPrivacyDecider(privacyClient)
+		gate, gerr := privacy.NewGate(privacyClient, pgStore, log)
 		if gerr != nil {
 			log.Fatal("failed to construct the privacy gate", zap.Error(gerr))
 		}
@@ -469,6 +555,7 @@ func main() {
 	// (ZS-SVC-Y-001 INV-27, NP-26). With none configured every callback is refused:
 	// the route is envelope-exempt, so there is no other gate in front of it.
 	webhookVerifier := webhook.NewVerifier(cfg.WebhookSecrets, cfg.WebhookTolerance)
+	webhookVerifierRef = webhookVerifier
 	if len(webhookVerifier.Providers()) == 0 {
 		log.Warn("NOTIFICATION_WEBHOOK_SECRETS is empty: every provider callback will be refused; " +
 			"delivery receipts, bounces and complaints will not be recorded until a secret is configured")
@@ -537,6 +624,9 @@ func main() {
 	// forever with nothing to move them. The worker drains that backlog and
 	// then finds nothing, which is the correct behaviour for "disabled".
 	workerCtx, stopWorker := context.WithCancel(context.Background())
+	if secretRefresher != nil {
+		go secretRefresher.Run(workerCtx, cfg.Secrets.RefreshInterval)
+	}
 	defer stopWorker()
 
 	retryWorker := retry.NewWorker(
@@ -569,6 +659,27 @@ func main() {
 	// Shares workerCtx with the retry worker, so both stop on the same cancel.
 	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
 	go relay.Run(workerCtx)
+
+	// Second relay, for the BIZ-03 template events on the shared eventing outbox. With no
+	// brokers configured the relay is not started: its events stay queued in eventing_outbox.
+	if len(cfg.Kafka.Brokers) == 0 {
+		log.Warn("no KAFKA_BROKERS configured: the eventing outbox relay is not running; BIZ-03 template events will queue in eventing_outbox")
+	} else {
+		eventingWriter, err := kafkaout.New(kafkaout.Config{
+			Brokers:                cfg.Kafka.Brokers,
+			Topic:                  cfg.Kafka.Topic,
+			AllowAutoTopicCreation: cfg.Env == "local",
+		})
+		if err != nil {
+			log.Fatal("eventing outbox kafka writer", zap.Error(err))
+		}
+		defer func() { _ = eventingWriter.Close() }()
+		eventingRelay, err := eventingoutbox.NewRelay(pool, eventingWriter, eventingoutbox.DefaultConfig(), log)
+		if err != nil {
+			log.Fatal("eventing outbox relay", zap.Error(err))
+		}
+		go eventingRelay.Run(workerCtx)
+	}
 
 	// INT-04 outbound webhooks: API, fan-out consumer and dispatcher (off unless enabled).
 	wireWebhookOut(workerCtx, cfg, log, pool, pgStore, authzClient, r)

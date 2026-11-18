@@ -62,7 +62,7 @@ func (h *Handler) evaluateDelegationCeiling(ctx context.Context, in evalContext,
 		attrs = map[string]string{}
 	}
 	for _, c := range ceilings {
-		b, r := ownCeilingRefusal(c, attrs)
+		b, r := ownCeilingRefusal(c, attrs, h.fxReferenceRates())
 		if b == "" && c.DelegatorPrincipalID != "" {
 			asDelegator := in
 			asDelegator.PrincipalID = c.DelegatorPrincipalID
@@ -88,7 +88,7 @@ func (h *Handler) evaluateDelegationCeiling(ctx context.Context, in evalContext,
 // ownCeilingRefusal is why one delegation's own ceiling does not cover the
 // request, or "" when it does. A kind the delegation does not cap is
 // unconstrained by it.
-func ownCeilingRefusal(c domain.DelegationCeiling, attrs map[string]string) (basis, reason string) {
+func ownCeilingRefusal(c domain.DelegationCeiling, attrs map[string]string, rates map[string]float64) (basis, reason string) {
 	if c.LimitMinor != nil && c.LimitCurrency != nil {
 		amountStr := attrs["amount"]
 		if amountStr == "" {
@@ -105,12 +105,15 @@ func ownCeilingRefusal(c domain.DelegationCeiling, attrs map[string]string) (bas
 		cur := strings.ToUpper(*c.LimitCurrency)
 		rc := strings.ToUpper(strings.TrimSpace(attrs["currency"]))
 		if rc == "" {
-			rc = cur
+			// Not read as the cap's own currency any more (10 Nov 2026): an
+			// amount in yen passed as dollars.
+			return "delegation_limit:currency_required",
+				"the delegation conferring this action is capped in " + cur + "; the request must state the amount's currency"
 		}
 		rate := 1.0
 		if rc != cur {
-			from, okFrom := StandardReferenceFXRates[rc]
-			to, okTo := StandardReferenceFXRates[cur]
+			from, okFrom := rates[rc]
+			to, okTo := rates[cur]
 			if !okFrom || !okTo || to <= 0 {
 				return "delegation_limit:exceeded", "the amount's currency cannot be compared with the delegation's ceiling"
 			}

@@ -114,8 +114,8 @@ func TestFederation_LifecycleMakerChecker(t *testing.T) {
 	if n := r.count(t, `SELECT count(*) FROM federation_connection_events WHERE connection_id='c-1'`); n != 2 {
 		t.Fatalf("trail rows: %d", n)
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.version_proposed' AND tenant_id='t-1'`) != 1 ||
-		r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.activated' AND tenant_id='t-1'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.version-proposed' AND tenant_id='t-1'`) != 1 ||
+		r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.activated' AND tenant_id='t-1'`) != 1 {
 		t.Fatal("federation_activated is enqueued with the approval")
 	}
 }
@@ -220,8 +220,8 @@ func TestFederation_ChangingAnActiveConnectionNeverInterruptsIt(t *testing.T) {
 		t.Fatalf("%+v", ver)
 	}
 	// a later approval event, not another activation
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.activated'`) != 1 ||
-		r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.version_approved'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.activated'`) != 1 ||
+		r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.version-approved'`) != 1 {
 		t.Fatal("activation is announced once; later approvals are version approvals")
 	}
 }
@@ -278,7 +278,7 @@ func TestFederation_SuspendResumeRevoke(t *testing.T) {
 		t.Fatal("revoked")
 	}
 	for _, evt := range []string{"suspended", "resumed", "revoked"} {
-		if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type=$1`, "identity.federation."+evt) != 1 {
+		if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type=$1`, "com.zoikosuite.identity.federation."+evt) != 1 {
 			t.Errorf("event %s", evt)
 		}
 	}
@@ -297,7 +297,7 @@ func TestFederation_KeyHealthTransitionsOnce(t *testing.T) {
 	if d.Status != federation.ConnDegraded || d.StatusReason != "keys unreachable" {
 		t.Fatalf("%+v", d.Connection)
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.degraded'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.degraded'`) != 1 {
 		t.Fatal("federation_degraded is announced once, on the transition")
 	}
 	// a degraded connection still authenticates (it may be on cached keys)
@@ -309,7 +309,7 @@ func TestFederation_KeyHealthTransitionsOnce(t *testing.T) {
 	if d, _ = r.s.GetConnection(ctx, "t-1", "c-1"); d.Status != federation.ConnActive {
 		t.Fatalf("recovered: %+v", d.Connection)
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.recovered'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.recovered'`) != 1 {
 		t.Fatal("recovery is announced once")
 	}
 	// health never overrides an operator's decision
@@ -395,7 +395,7 @@ func TestFederation_Links(t *testing.T) {
 	if _, err := r.s.GetLink(ctx, "t-1", "missing"); !errors.Is(err, federation.ErrLinkNotFound) {
 		t.Fatalf("%v", err)
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.link.created'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.link.created'`) != 1 {
 		t.Fatal("identity_link_created is announced")
 	}
 	// the email address is nowhere in the link
@@ -425,7 +425,7 @@ func TestFederation_LoginEvidenceAndSingleUseTokens(t *testing.T) {
 	if r.count(t, `SELECT count(*) FROM federation_login_log`) != 1 || r.count(t, `SELECT count(*) FROM federation_token_uses`) != 1 {
 		t.Fatal("a replay leaves no second login row")
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.login_succeeded'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.login-succeeded'`) != 1 {
 		t.Fatal("the success is announced exactly once")
 	}
 	got, _ := r.s.GetLink(ctx, "t-1", l.LinkID)
@@ -514,7 +514,7 @@ func TestFederation_ConcurrentApprovalsDecideOnce(t *testing.T) {
 	if ok != 1 {
 		t.Fatalf("a version is approved once: %d", ok)
 	}
-	if r.count(t, `SELECT count(*) FROM event_outbox WHERE event_type='identity.federation.activated'`) != 1 {
+	if r.count(t, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.identity.federation.activated'`) != 1 {
 		t.Fatal("one activation event")
 	}
 }

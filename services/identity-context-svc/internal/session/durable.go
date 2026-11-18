@@ -390,18 +390,23 @@ func (d *DurableCache) Invalidate(
 
 // EvictAllForPrincipal revokes every live session a principal holds within the
 // caller's tenant, and reports how many.
-//
-// The id set is the UNION of the Redis reverse index and the durable store's
-// live rows. Neither alone is sufficient: Redis loses sessions on a flush or an
-// eviction under memory pressure, and Postgres is the slower of the two to
-// reflect a session issued moments ago. A revocation that missed sessions
-// because one source was stale is the failure mode that matters here, so both
-// are consulted and the union is revoked.
 func (d *DurableCache) EvictAllForPrincipal(
 	ctx context.Context,
 	principalID, tenantID string,
 	reason domain.InvalidationReason,
 ) (int, error) {
+	ids, err := d.EvictAllForPrincipalWithIDs(ctx, principalID, tenantID, reason)
+	return len(ids), err
+}
+
+// EvictAllForPrincipalWithIDs revokes every live session a principal holds within the
+// caller's tenant, and returns the list of session context IDs that were revoked.
+// This is used for per-session revocation events (IC-16 / S1-12 K-6).
+func (d *DurableCache) EvictAllForPrincipalWithIDs(
+	ctx context.Context,
+	principalID, tenantID string,
+	reason domain.InvalidationReason,
+) ([]string, error) {
 	now := time.Now().UTC()
 	ids := make(map[string]struct{})
 
@@ -418,10 +423,8 @@ func (d *DurableCache) EvictAllForPrincipal(
 
 	durable, err := d.store.FindLiveSessionIDsForPrincipal(ctx, principalID, tenantID, now)
 	if err != nil {
-		// Fail outright only if the cache gave us nothing either — a partial
-		// revocation beats none.
 		if len(ids) == 0 {
-			return 0, fmt.Errorf("find live sessions: %w", err)
+			return nil, fmt.Errorf("find live sessions: %w", err)
 		}
 		d.log.Warn("durable session lookup failed — revoking cached set only",
 			zap.String("principal_id", principalID),
@@ -432,11 +435,9 @@ func (d *DurableCache) EvictAllForPrincipal(
 		ids[id] = struct{}{}
 	}
 
-	revoked := 0
+	revoked := make([]string, 0, len(ids))
 	var firstErr error
 	for id := range ids {
-		// Invalidate re-checks tenancy per session, so an id that reached the
-		// Redis index from another tenant is skipped rather than revoked.
 		if err := d.Invalidate(ctx, id, tenantID, reason, now); err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -446,13 +447,13 @@ func (d *DurableCache) EvictAllForPrincipal(
 		if err := d.cache.Evict(ctx, id); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		revoked++
+		revoked = append(revoked, id)
 	}
 
 	if err := d.cache.ClearPrincipalIndex(ctx, principalID); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	countRevocation(reason, revoked)
+	countRevocation(reason, len(revoked))
 	return revoked, firstErr
 }
 

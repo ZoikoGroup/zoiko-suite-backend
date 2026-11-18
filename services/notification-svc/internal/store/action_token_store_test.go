@@ -40,7 +40,7 @@ func createTestIntent(t *testing.T, s *store.PgStore, tenantID, email string) *l
 
 func TestActionTokenStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantA := "tenant-action-a"
@@ -87,7 +87,7 @@ func TestActionTokenStore_RLS_TenantIsolation(t *testing.T) {
 
 func TestActionTokenStore_SingleUse_Consumption(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-action-consume"
@@ -129,7 +129,7 @@ func TestActionTokenStore_SingleUse_Consumption(t *testing.T) {
 
 func TestActionTokenStore_ExpiredToken(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-action-expired"
@@ -160,7 +160,7 @@ func TestActionTokenStore_ExpiredToken(t *testing.T) {
 
 func TestActionTokenStore_RevokeToken(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-action-revoke"

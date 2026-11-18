@@ -492,3 +492,14 @@ authorization-svc, and the grantee then got `GRANTED rbac:role=PO_APPROVER` (was
 
 **Still to do on the real database:** `python deployments/migrate.py up` (or apply 000017 by hand),
 then `SELECT count(*) FROM permission_definitions WHERE description LIKE 'Enforced by %'` → 68.
+
+## 11 Nov 2026: R5 gaps closed for the governance ledger and IAM reads
+
+- **000050_register_iam_assignment_read**: authorization-svc checks
+  `iam.assignment.read` in five handlers but it was never registered; now
+  registered (TAXONOMY, STANDARD) and carried by IAM_ACCESS_ADMINISTRATOR v2.
+- **000051_governance_ledger_writer_template**: GOVERNANCE_DECISION_RECORD was
+  registered but carried by no template; template GOVERNANCE_LEDGER_WRITER v1
+  (RECORD, READ).
+- Both up/down/up on scratch; store suite 155/0/0 on a scratch DB built from all
+  51 migrations; applied live.

@@ -49,7 +49,7 @@ func createActiveRetentionRule(t *testing.T, s *store.PgStore, recordClass, juri
 // retention rule.
 func TestDRC03_ApproveRetentionRuleVersion_SelfApprovalRefused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	rr, err := s.CreateRetentionRuleVersion(tenantCtx(), domain.CreateRetentionRuleVersionParams{
 		RecordClass: string(domain.RecordClassTaxReturnSupport), JurisdictionSelector: "US-CA",
@@ -68,7 +68,7 @@ func TestDRC03_ApproveRetentionRuleVersion_SelfApprovalRefused(t *testing.T) {
 // class/jurisdiction, with an immediately-known trigger date.
 func TestDRC03_BindRetentionRule_HappyPath(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "bind-happy", string(domain.RecordClassTaxReturnSupport), "US-CA")
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassTaxReturnSupport), "US-CA", 30)
 
@@ -87,7 +87,7 @@ func TestDRC03_BindRetentionRule_HappyPath(t *testing.T) {
 // refused outright.
 func TestDRC03_BindRetentionRule_MismatchRefused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "bind-mismatch", string(domain.RecordClassLegalContract), "US-NY")
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassTaxReturnSupport), "US-CA", 30)
 
@@ -100,7 +100,7 @@ func TestDRC03_BindRetentionRule_MismatchRefused(t *testing.T) {
 // Binding to a DRAFT (not yet ACTIVE) rule is refused.
 func TestDRC03_BindRetentionRule_InactiveRuleRefused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "bind-inactive", string(domain.RecordClassTaxReturnSupport), "US-CA")
 	draftRule, err := s.CreateRetentionRuleVersion(tenantCtx(), domain.CreateRetentionRuleVersionParams{
 		RecordClass: string(domain.RecordClassTaxReturnSupport), JurisdictionSelector: "US-CA",
@@ -119,7 +119,7 @@ func TestDRC03_BindRetentionRule_InactiveRuleRefused(t *testing.T) {
 // RecordTriggerEvent later moves it to ACTIVE with due_at computed.
 func TestDRC03_WaitingForTrigger_ThenRecordTriggerEvent(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "waiting-trigger", string(domain.RecordClassEmploymentRecord), "US-TX")
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassEmploymentRecord), "US-TX", 90)
 
@@ -142,7 +142,7 @@ func TestDRC03_WaitingForTrigger_ThenRecordTriggerEvent(t *testing.T) {
 // EvaluateDue refuses to mark a retention as DUE before its own due_at.
 func TestDRC03_EvaluateDue_RefusedBeforeDueDate(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "not-yet-due", string(domain.RecordClassTaxReturnSupport), "US-CA")
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassTaxReturnSupport), "US-CA", 365)
 
@@ -165,7 +165,7 @@ func TestDRC03_EvaluateDue_RefusedBeforeDueDate(t *testing.T) {
 // retention review is otherwise complete.
 func TestDRC03_LegalHold_BlocksApproveForDisposition(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "hold-blocks", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassLegalMatterRecord), "US-DE", 1)
 
@@ -207,7 +207,7 @@ func TestDRC03_LegalHold_BlocksApproveForDisposition(t *testing.T) {
 // also executes) the release cannot also be its own approver.
 func TestDRC03_LegalHold_ReleaseRejectsSelfApproval(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "hold-self-release", string(domain.RecordClassLegalMatterRecord), "US-DE")
 
 	hold, err := s.CreateLegalHold(tenantCtx(), domain.CreateLegalHoldParams{
@@ -235,7 +235,7 @@ func TestDRC03_LegalHold_ReleaseRejectsSelfApproval(t *testing.T) {
 // command in this wave.
 func TestDRC03_FullDryRunPipeline_NoHold(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "full-pipeline", string(domain.RecordClassComplianceEvidence), "US-WA")
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassComplianceEvidence), "US-WA", 7)
 
@@ -263,7 +263,7 @@ func TestDRC03_FullDryRunPipeline_NoHold(t *testing.T) {
 // A record cannot be bound to two retention rules.
 func TestDRC03_BindRetentionRule_AlreadyBoundRefused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "double-bind", string(domain.RecordClassCorporateRecord), "US-DE")
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassCorporateRecord), "US-DE", 365)
 
@@ -282,7 +282,7 @@ func TestDRC03_BindRetentionRule_AlreadyBoundRefused(t *testing.T) {
 // target together.
 func TestDRC03_LegalHold_MultipleTargetsReleasedTogether(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec1 := createTestRecord(t, s, "multi-target-1", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	rec2 := createTestRecord(t, s, "multi-target-2", string(domain.RecordClassLegalMatterRecord), "US-DE")
 
@@ -317,7 +317,7 @@ func TestDRC03_LegalHold_MultipleTargetsReleasedTogether(t *testing.T) {
 // there is no asynchronous apply pipeline in this wave.
 func TestDRC03_AddLegalHoldTarget_ToActiveHold_AppliesImmediately(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec1 := createTestRecord(t, s, "add-target-1", string(domain.RecordClassLegalMatterRecord), "US-DE")
 	rec2 := createTestRecord(t, s, "add-target-2", string(domain.RecordClassLegalMatterRecord), "US-DE")
 
@@ -336,7 +336,7 @@ func TestDRC03_AddLegalHoldTarget_ToActiveHold_AppliesImmediately(t *testing.T) 
 // Duplicate target on the same hold is refused.
 func TestDRC03_AddLegalHoldTarget_DuplicateRefused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rec := createTestRecord(t, s, "dup-target", string(domain.RecordClassLegalMatterRecord), "US-DE")
 
 	hold, err := s.CreateLegalHold(tenantCtx(), domain.CreateLegalHoldParams{
@@ -351,7 +351,7 @@ func TestDRC03_AddLegalHoldTarget_DuplicateRefused(t *testing.T) {
 // Tenant isolation: cross-tenant reads are denied by RLS.
 func TestDRC03_TenantIsolation(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	rule := createActiveRetentionRule(t, s, string(domain.RecordClassAccountingWorkpaper), "US-CA", 30)
 
 	otherTenantCtx := middleware.WithTenant(context.Background(), "99999999-9999-9999-9999-999999999999")

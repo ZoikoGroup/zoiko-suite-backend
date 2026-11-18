@@ -1,0 +1,40 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.contract.published (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 101 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "capabilities": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "compat_class": {
+      "type": "string"
+    },
+    "connector_id": {
+      "type": "string"
+    },
+    "contract_version_id": {
+      "type": "string"
+    },
+    "effective_from": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "semver": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "capabilities",
+    "compat_class",
+    "connector_id",
+    "contract_version_id",
+    "effective_from",
+    "owner",
+    "semver"
+  ],
+  "type": "object"
+}
