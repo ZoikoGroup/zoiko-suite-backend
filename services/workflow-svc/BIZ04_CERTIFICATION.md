@@ -2,7 +2,7 @@
 
 **Service host:** workflow-svc (BIZ-04 is bolted onto this service; no separate service)
 **Assessed against:** `ZoikoSuite_Business_Operations_Content_Services_Detailed_Service_Specifications_v1_0` (ZS-SVC-P-001) section 6
-**Status: NOT CERTIFIED.** Core contract implemented and now evidenced; three spec items remain open.
+**Status: NOT CERTIFIED.** Core contract implemented and now evidenced; the five events are now committed with the change; three spec items remain open.
 
 A certificate listing only successes certifies nothing, so the last sections say what was **not** verified.
 
@@ -14,7 +14,7 @@ A certificate listing only successes certifies nothing, so the last sections say
 | Queries: GetForm, GetSubmission, GetSubmissionVersion, GetValidationResult, ListPendingSubmissions | Implemented | same |
 | Lifecycles (form and submission) | Enforced by database CHECK constraints; submitted values immutable by trigger | migration 000018 |
 | Authorization / SoD | Publish is maker-checker (owner cannot publish; DB CHECK + store + 403). Separate actions `FORM_MANAGE`, `FORM_APPROVE`, `FORM_SUBMIT`, `FORM_READ`. | handler, migration 000018 |
-| Events (5) | Published as `form.published` and `form.submission.{received,validated,rejected,routed}` | `internal/events/publisher.go` |
+| Events (5) | `form.published` and `form.submission.{received,validated,rejected,routed}` are written to the service's outbox in the same transaction as the change and delivered by the existing outbox relay. They keep the service's own event names and envelope; they are **not** on the shared eventing outbox, have no published schema and no catalogue entry (see open item 4) | `internal/store/form_store.go`, `internal/outbox` |
 | Failure: target-domain rejection leaves submission accepted as evidence | Routes recorded separately (`form_submission_routes`); submission stays ACCEPTED | store |
 | API contract | `openapi.biz04-forms.yaml`, tied to the router by a test | this directory |
 | Dependency: BIZ-01 attachments | **Not implemented** — no attachment or digest fields on submissions | — |
@@ -46,6 +46,13 @@ go test ./...                     all packages pass against a throwaway postgres
 form store tests                  15/15 pass as a NOSUPERUSER NOBYPASSRLS role
 ```
 
+## Event delivery fix (after the audit)
+
+- The handler used to publish these five events after the commit and only log a failure, so a broker problem lost them silently, unlike the service's workflow events, which already used its outbox. The store now writes each event with `outbox.Insert` in the same transaction as the change, and the handler no longer publishes. A refused command (self-publish, republish, routing a rejected submission) writes no event.
+- The `PublishFormPublished` and `PublishFormEvent` publisher methods and the handler's dependency on them were removed. The routed event now also carries the route id, target domain and outcome.
+- Tested: `TestPgStore_FormEvents_WrittenWithEachChange` (accepted path: received, validated, routed; rejected path: received, rejected and no routed; correlation id and actor carried; refused commands write nothing) passes against Postgres 16 and fails when an event type is changed. The full workflow-svc suite passes.
+- Not verified: delivery through a real Kafka broker.
+
 ## NOT verified
 
 - Handler behavior was not re-tested beyond the existing handler tests and the route/contract test; the HTTP status codes in `openapi.biz04-forms.yaml` were written from reading the handlers, not from calls against a running service.
@@ -58,5 +65,5 @@ form store tests                  15/15 pass as a NOSUPERUSER NOBYPASSRLS role
 1. **Attachments and digests** (BIZ-01): needs a decision on how a submission references vault documents.
 2. **Routing separation of duties:** who counts as the "target-domain mapping approver", and whether the submitter may route their own accepted submission, is a policy decision.
 3. **Classification / retention** of submitted values: policy decision.
-4. Event-name contract test and AsyncAPI file for the form events (not written).
+4. Event contract test, AsyncAPI file and catalogue entries for the form events (not written), and whether workflow-svc as a whole moves to the shared eventing outbox with canonical names (a service-wide decision: it has its own outbox and about a dozen other event types).
 5. Run the rest of the store suite under a non-superuser role.

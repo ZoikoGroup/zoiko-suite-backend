@@ -29,7 +29,7 @@ func newLandedCost(movementID, key string, amount float64, at time.Time) *domain
 // replay, and that the allocation row's economic fields cannot be changed.
 func TestPgStore_AllocateLandedCost_SplitHistoryAndImmutability(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -105,7 +105,7 @@ func TestPgStore_AllocateLandedCost_SplitHistoryAndImmutability(t *testing.T) {
 
 func TestPgStore_AllocateLandedCost_FullyConsumed_AllToCOGS(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -138,7 +138,7 @@ func TestPgStore_AllocateLandedCost_FullyConsumed_AllToCOGS(t *testing.T) {
 
 func TestPgStore_AllocateLandedCost_RefusalsLeaveNothingBehind(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()

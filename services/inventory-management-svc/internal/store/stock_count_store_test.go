@@ -14,7 +14,7 @@ import (
 
 func TestPgStore_FreezeCountPopulation_CapturesRealSystemQuantity(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -53,7 +53,7 @@ func TestPgStore_FreezeCountPopulation_CapturesRealSystemQuantity(t *testing.T) 
 // invalidation."
 func TestPgStore_FreezeCountPopulation_LinesImmutable(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -90,7 +90,7 @@ func TestPgStore_FreezeCountPopulation_LinesImmutable(t *testing.T) {
 // of negative path #3.
 func TestPgStore_ApproveCountVariance_SelfApprovalRefused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -132,7 +132,7 @@ func TestPgStore_ApproveCountVariance_SelfApprovalRefused(t *testing.T) {
 // the only thing that ever changes on-hand as a result of a count.
 func TestPgStore_GenerateAdjustment_CreatesRealMovement(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -213,7 +213,7 @@ func TestPgStore_GenerateAdjustment_CreatesRealMovement(t *testing.T) {
 // but must not certify.
 func TestPgStore_CertifyStockCount_UnapprovedVarianceRefused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -290,7 +290,7 @@ func TestPgStore_CertifyStockCount_UnapprovedVarianceRefused(t *testing.T) {
 // commands blocks that today.
 func TestPgStore_GetUnapprovedVarianceCount_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()

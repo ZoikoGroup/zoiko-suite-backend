@@ -18,7 +18,8 @@ import (
 	"zoiko.io/comments-collaboration-svc/internal/authz"
 	"zoiko.io/comments-collaboration-svc/internal/config"
 	svcenvelope "zoiko.io/comments-collaboration-svc/internal/envelope"
-	"zoiko.io/comments-collaboration-svc/internal/events"
+	"zoiko.io/eventing/kafkaout"
+	eventingoutbox "zoiko.io/eventing/outbox"
 	"zoiko.io/comments-collaboration-svc/internal/handler"
 	"zoiko.io/comments-collaboration-svc/internal/health"
 	"zoiko.io/comments-collaboration-svc/internal/middleware"
@@ -64,9 +65,42 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	pgStore := store.NewPgStore(pool)
+	// The shared eventing outbox table must exist before the first write tries to enqueue into it.
+	if pool != nil {
+		if err := eventingoutbox.VerifySchema(ctx, pool); err != nil {
+			logger.Fatal("eventing outbox schema missing", zap.Error(err))
+		}
+	}
+	pgStore := store.NewPgStore(pool, store.WithEventRegion(cfg.EventResidencyRegion))
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+
+	// Relay for the BIZ-09 events on the shared eventing outbox. With no database or no brokers the
+	// relay is not started: events queue in eventing_outbox and none are lost.
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	eventingRelayDone := make(chan struct{}, 1)
+	if pool == nil || cfg.KafkaBrokers == "" {
+		logger.Warn("no database or KAFKA_BROKERS: the eventing outbox relay is not running; BIZ-09 events will queue in eventing_outbox")
+		eventingRelayDone <- struct{}{}
+	} else {
+		eventingWriter, err := kafkaout.New(kafkaout.Config{
+			Brokers:                brokers,
+			Topic:                  cfg.KafkaEventsTopic,
+			AllowAutoTopicCreation: cfg.Env == "local",
+		})
+		if err != nil {
+			logger.Fatal("eventing outbox kafka writer", zap.Error(err))
+		}
+		defer func() { _ = eventingWriter.Close() }()
+		eventingRelay, err := eventingoutbox.NewRelay(pool, eventingWriter, eventingoutbox.DefaultConfig(), logger)
+		if err != nil {
+			logger.Fatal("eventing outbox relay", zap.Error(err))
+		}
+		go func() {
+			eventingRelay.Run(relayCtx)
+			eventingRelayDone <- struct{}{}
+		}()
+	}
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
 		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "comments-collaboration-svc", platformScopeID)
@@ -80,7 +114,7 @@ func main() {
 	}
 
 	retentionClient := retention.NewHTTPClient(cfg.RetentionRegistryURL, logger)
-	h := handler.New(pgStore, publisher, authzClient, logger).WithRetentionClient(retentionClient)
+	h := handler.New(pgStore, authzClient, logger).WithRetentionClient(retentionClient)
 	// No ObjectVisibilityChecker is registered here yet — no other domain
 	// service exposes a CanView endpoint for comments-collaboration-svc to
 	// call. Until one is, every Mention refuses fail-closed (see
@@ -131,6 +165,14 @@ func main() {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
+	}
+	// Stop the relay after the server: requests finishing during Shutdown may still commit
+	// events. Anything not delivered stays in the outbox for the next process.
+	cancelRelay()
+	select {
+	case <-eventingRelayDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("eventing outbox relay did not stop before the shutdown deadline")
 	}
 	if pool != nil {
 		pool.Close()

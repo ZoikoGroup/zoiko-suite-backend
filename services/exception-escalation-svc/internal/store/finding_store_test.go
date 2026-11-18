@@ -29,8 +29,11 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	pool, err := pgxpool.New(context.Background(), dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS eventing_outbox;
+		DROP TABLE IF EXISTS deadline_due_history;
 		DROP TABLE IF EXISTS deadline_escalations;
 		DROP TABLE IF EXISTS deadlines;
 		DROP TABLE IF EXISTS task_transitions;
@@ -103,7 +106,7 @@ func newExceptionCaseForFindingTest(t *testing.T, pool *pgxpool.Pool) *domain.Ex
 // required -> block closure."
 func TestPgStore_CloseFinding_RequiresRemediationEvidence(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c := newExceptionCaseForFindingTest(t, pool)
 	finding, err := s.CreateFinding(ctx(), domain.CreateFindingParams{
@@ -129,7 +132,7 @@ func TestPgStore_CloseFinding_RequiresRemediationEvidence(t *testing.T) {
 // is refused by the trigger.
 func TestPgStore_AuditFinding_OriginalContentImmutable(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c := newExceptionCaseForFindingTest(t, pool)
 	finding, err := s.CreateFinding(ctx(), domain.CreateFindingParams{
@@ -155,7 +158,7 @@ func TestPgStore_AuditFinding_OriginalContentImmutable(t *testing.T) {
 // regardless of the parent finding's own status.
 func TestPgStore_ScopeLimitation_SurvivesFindingClosure(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c := newExceptionCaseForFindingTest(t, pool)
 	finding, err := s.CreateFinding(ctx(), domain.CreateFindingParams{

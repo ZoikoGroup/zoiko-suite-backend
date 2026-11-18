@@ -18,7 +18,7 @@ import (
 
 func TestAttempts_RetryThenSuccessRecordsTheChain(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-attempts-chain")
 
@@ -57,7 +57,7 @@ func TestAttempts_RetryThenSuccessRecordsTheChain(t *testing.T) {
 
 func TestAttempts_UnknownOutcomeIsRecordedAsUnknown(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-attempts-unknown")
 
@@ -78,7 +78,7 @@ func TestAttempts_UnknownOutcomeIsRecordedAsUnknown(t *testing.T) {
 // affects zero rows must not add an attempt to someone else's chain.
 func TestAttempts_ARaceLoserRecordsNothing(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-attempts-race")
 
@@ -98,7 +98,7 @@ func TestAttempts_ARaceLoserRecordsNothing(t *testing.T) {
 // Attempt rows are tenant-isolated: another tenant reads none.
 func TestAttempts_TenantIsolated(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := seedNotification(t, s, "tenant-a", "corr-attempts-rls")
 	at := time.Now().UTC()
 	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "ok", &at, "c", domain.AttemptMeta{}); err != nil {

@@ -31,9 +31,13 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	pool, err := pgxpool.New(context.Background(), dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
+	// Registered after pool.Close so it runs first (cleanups are LIFO): every event a
+	// test left in the eventing outbox must satisfy the schema this service publishes.
+	verifyEventContracts(t, pool)
 
 	// Fresh schema per test run.
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS eventing_outbox;
 		DROP TABLE IF EXISTS legal_hold_resolutions;
 		DROP FUNCTION IF EXISTS reject_legal_hold_resolution_mutation() CASCADE;
 		DROP TABLE IF EXISTS upload_reservations;
@@ -126,7 +130,7 @@ func sha256Hex(label string) string {
 
 func TestPgStore_CreateDocument_And_FindByID(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	doc := &domain.Document{
 		TenantID:      "11111111-1111-1111-1111-111111111111",
@@ -150,7 +154,7 @@ func TestPgStore_CreateDocument_And_FindByID(t *testing.T) {
 
 func TestPgStore_AddVersion_BumpsCurrentVersion_PreservesLineage(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	doc := &domain.Document{
 		TenantID:      "11111111-1111-1111-1111-111111111111",
@@ -196,7 +200,7 @@ func newDocForDeclareTest(t *testing.T, s *store.PgStore, label string) *domain.
 // re-applied.
 func TestPgStore_DeclareRecord_Succeeds_ThenRejectsRedeclaration(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "redeclare")
 
 	declared, err := s.DeclareRecord(tenantCtx(), domain.DeclareRecordParams{
@@ -225,7 +229,7 @@ func TestPgStore_DeclareRecord_Succeeds_ThenRejectsRedeclaration(t *testing.T) {
 // AUD-06: forward-link once, never twice, never an in-place rewrite.
 func TestPgStore_SupersedeDocument_LinksForwardThenRejectsSecondSupersede(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	original := newDocForDeclareTest(t, s, "supersede-orig")
 	replacement := newDocForDeclareTest(t, s, "supersede-new")
 
@@ -254,7 +258,7 @@ func TestPgStore_SupersedeDocument_LinksForwardThenRejectsSecondSupersede(t *tes
 // input-validation paths: self-supersede and a nonexistent replacement.
 func TestPgStore_SupersedeDocument_RejectsSelfAndUnknownTarget(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "self")
 
 	_, err := s.SupersedeDocument(tenantCtx(), domain.SupersedeDocumentParams{
@@ -273,7 +277,7 @@ func TestPgStore_SupersedeDocument_RejectsSelfAndUnknownTarget(t *testing.T) {
 // new events actually land, same discipline as Wave 1's tests.
 func TestPgStore_DeclareRecord_InsertsOutboxEventAtomically(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "outbox-declare")
 
 	_, err := s.DeclareRecord(tenantCtx(), domain.DeclareRecordParams{
@@ -281,17 +285,13 @@ func TestPgStore_DeclareRecord_InsertsOutboxEventAtomically(t *testing.T) {
 	}, "corr-outbox-declare")
 	require.NoError(t, err)
 
-	var count int
-	err = pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.record_declared'`,
-		doc.DocumentID).Scan(&count)
-	require.NoError(t, err)
+	count := eventingCount(t, pool, "com.zoikosuite.business.document.record-declared", doc.DocumentID)
 	require.Equal(t, 1, count)
 }
 
 func TestPgStore_SupersedeDocument_InsertsOutboxEventAtomically(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	original := newDocForDeclareTest(t, s, "outbox-supersede-orig")
 	replacement := newDocForDeclareTest(t, s, "outbox-supersede-new")
 
@@ -300,11 +300,7 @@ func TestPgStore_SupersedeDocument_InsertsOutboxEventAtomically(t *testing.T) {
 	}, "corr-outbox-supersede")
 	require.NoError(t, err)
 
-	var count int
-	err = pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.superseded'`,
-		original.DocumentID).Scan(&count)
-	require.NoError(t, err)
+	count := eventingCount(t, pool, "com.zoikosuite.business.document.superseded", original.DocumentID)
 	require.Equal(t, 1, count)
 }
 
@@ -313,7 +309,7 @@ func TestPgStore_SupersedeDocument_InsertsOutboxEventAtomically(t *testing.T) {
 // DB layer.
 func TestPgStore_MoveToArchive_Succeeds_ThenRejectsSecondArchive(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "archive")
 
 	archived, err := s.MoveToArchive(tenantCtx(), domain.MoveToArchiveParams{
@@ -334,10 +330,7 @@ func TestPgStore_MoveToArchive_Succeeds_ThenRejectsSecondArchive(t *testing.T) {
 	_, err = pool.Exec(tenantCtx(), `UPDATE documents SET archived_by_principal_id = 'tampered' WHERE document_id = $1`, doc.DocumentID)
 	require.Error(t, err, "expected the trigger to refuse mutating an existing archive")
 
-	var count int
-	err = pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.archived'`, doc.DocumentID).Scan(&count)
-	require.NoError(t, err)
+	count := eventingCount(t, pool, "com.zoikosuite.business.document.archived", doc.DocumentID)
 	require.Equal(t, 1, count)
 }
 
@@ -346,7 +339,7 @@ func TestPgStore_MoveToArchive_Succeeds_ThenRejectsSecondArchive(t *testing.T) {
 // ARCHIVED itself is not.
 func TestPgStore_MoveToArchive_SupersededDocumentIsArchivable(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	original := newDocForDeclareTest(t, s, "archive-superseded-orig")
 	replacement := newDocForDeclareTest(t, s, "archive-superseded-new")
 	_, err := s.SupersedeDocument(tenantCtx(), domain.SupersedeDocumentParams{
@@ -365,7 +358,7 @@ func TestPgStore_MoveToArchive_SupersededDocumentIsArchivable(t *testing.T) {
 // the archive proof for RequestDisposition.
 func TestPgStore_RequestDisposition_Succeeds_ThenRejectsSecondRequest(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "disposition")
 
 	requested, err := s.RequestDisposition(tenantCtx(), domain.RequestDispositionParams{
@@ -385,10 +378,7 @@ func TestPgStore_RequestDisposition_Succeeds_ThenRejectsSecondRequest(t *testing
 	_, err = pool.Exec(tenantCtx(), `UPDATE documents SET disposition_requested_by_principal_id = 'tampered' WHERE document_id = $1`, doc.DocumentID)
 	require.Error(t, err, "expected the trigger to refuse mutating an existing disposition request")
 
-	var count int
-	err = pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.disposition_requested'`, doc.DocumentID).Scan(&count)
-	require.NoError(t, err)
+	count := eventingCount(t, pool, "com.zoikosuite.business.document.disposition-requested", doc.DocumentID)
 	require.Equal(t, 1, count)
 }
 
@@ -398,7 +388,7 @@ func TestPgStore_RequestDisposition_Succeeds_ThenRejectsSecondRequest(t *testing
 // timestamps.
 func TestPgStore_GetAsOfDocument_ReconstructsVersionLineage(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "asof")
 
 	var midpoint time.Time
@@ -429,7 +419,7 @@ func TestPgStore_GetAsOfDocument_ReconstructsVersionLineage(t *testing.T) {
 // duplicate link for the same (document, object) pair.
 func TestPgStore_LinkDocument_Succeeds_ThenRejectsDuplicate(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "link")
 
 	link, err := s.LinkDocument(tenantCtx(), domain.LinkDocumentParams{
@@ -468,7 +458,7 @@ func TestPgStore_LinkDocument_Succeeds_ThenRejectsDuplicate(t *testing.T) {
 
 func TestPgStore_LinkDocument_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, err := s.LinkDocument(tenantCtx(), domain.LinkDocumentParams{
 		DocumentID: "00000000-0000-0000-0000-000000000000", LinkedObjectType: "EXPENSE_CLAIM", LinkedObjectID: "claim-1",
 		LinkedByPrincipalID: "linker-1",
@@ -482,18 +472,18 @@ func TestPgStore_LinkDocument_UnknownDocument_ReturnsNotFound(t *testing.T) {
 // record that an upload was rejected before ever reaching storage.
 func TestPgStore_RecordQuarantinedVersionUpload_InsertsOutboxEventNoMutation(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "quarantine")
 
 	err := s.RecordQuarantinedVersionUpload(tenantCtx(), doc.DocumentID, "uploader-1", "malware signature match", "corr-quarantine-1")
 	require.NoError(t, err)
 
-	var eventType, reason string
+	require.Equal(t, 1, eventingCount(t, pool, "com.zoikosuite.business.document.version-upload-quarantined", doc.DocumentID))
+	var reason string
 	err = pool.QueryRow(context.Background(),
-		`SELECT event_type, payload->'payload'->>'reason' FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.version_upload_quarantined'`,
-		doc.DocumentID).Scan(&eventType, &reason)
+		`SELECT convert_from(payload, 'UTF8')::jsonb->'data'->>'reason' FROM eventing_outbox WHERE event_type = $1 AND convert_from(payload, 'UTF8')::jsonb->'data'->>'document_id' = $2`,
+		"com.zoikosuite.business.document.version-upload-quarantined", doc.DocumentID).Scan(&reason)
 	require.NoError(t, err)
-	require.Equal(t, "document.version_upload_quarantined", eventType)
 	require.Equal(t, "malware signature match", reason)
 
 	current, err := s.FindDocumentByID(tenantCtx(), doc.DocumentID)
@@ -503,7 +493,7 @@ func TestPgStore_RecordQuarantinedVersionUpload_InsertsOutboxEventNoMutation(t *
 
 func TestPgStore_RecordQuarantinedVersionUpload_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	err := s.RecordQuarantinedVersionUpload(tenantCtx(), "00000000-0000-0000-0000-000000000000", "uploader-1", "reason", "corr")
 	require.ErrorIs(t, err, domain.ErrDocumentNotFound)
 }
@@ -513,7 +503,7 @@ func TestPgStore_RecordQuarantinedVersionUpload_UnknownDocument_ReturnsNotFound(
 // CANDIDATE proposal, not a trusted-final value.
 func TestPgStore_CreateDocument_SeedsCandidateClassification(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "seed-classification")
 
 	current, err := s.GetClassification(tenantCtx(), doc.DocumentID)
@@ -531,7 +521,7 @@ func TestPgStore_CreateDocument_SeedsCandidateClassification(t *testing.T) {
 // same classification is refused.
 func TestPgStore_ConfirmClassification_Succeeds_UpdatesDocumentSnapshot(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "confirm")
 	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
 	require.NoError(t, err)
@@ -557,10 +547,7 @@ func TestPgStore_ConfirmClassification_Succeeds_UpdatesDocumentSnapshot(t *testi
 	_, err = pool.Exec(tenantCtx(), `UPDATE record_classifications SET confirmed_by_principal_id = 'tampered' WHERE classification_id = $1`, proposal.ClassificationID)
 	require.Error(t, err, "expected the trigger to refuse mutating an existing confirmation")
 
-	var count int
-	err = pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'classification.confirmed'`, doc.DocumentID).Scan(&count)
-	require.NoError(t, err)
+	count := eventingCount(t, pool, "com.zoikosuite.business.classification.confirmed", doc.DocumentID)
 	require.Equal(t, 1, count)
 }
 
@@ -569,7 +556,7 @@ func TestPgStore_ConfirmClassification_Succeeds_UpdatesDocumentSnapshot(t *testi
 // human-sourced proposals.
 func TestPgStore_ConfirmClassification_RejectsSelfConfirmation(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "self-confirm")
 	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
 	require.NoError(t, err)
@@ -586,7 +573,7 @@ func TestPgStore_ConfirmClassification_RejectsSelfConfirmation(t *testing.T) {
 // domain.AIConfidenceAutoConfirmThreshold's own doc comment).
 func TestPgStore_ClassifyRecord_AISourceRequiresConfidence(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "ai-source")
 	// The seeded CANDIDATE proposal from creation does NOT block a second
 	// proposal — only an existing CONFIRMED/RESTRICTED classification
@@ -613,7 +600,7 @@ func TestPgStore_ClassifyRecord_AISourceRequiresConfidence(t *testing.T) {
 // has never had a classification confirmed (ClassifyRecord is the
 // command for a first-ever proposal, not Reclassify).
 func TestPgStore_Reclassify_RequiresExistingConfirmedClassification(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "reclassify-precondition")
 
 	_, err := s.Reclassify(tenantCtx(), domain.ReclassifyParams{
@@ -631,7 +618,7 @@ func TestPgStore_Reclassify_RequiresExistingConfirmedClassification(t *testing.T
 // re-point or clear that forward link afterward.
 func TestPgStore_Reclassify_ThenSupersede_ConfirmsNewAndSupersedesOld(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "reclassify-supersede")
 	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
 	require.NoError(t, err)
@@ -667,18 +654,14 @@ func TestPgStore_Reclassify_ThenSupersede_ConfirmsNewAndSupersedesOld(t *testing
 	_, err = pool.Exec(tenantCtx(), `UPDATE record_classifications SET superseded_by_classification_id = NULL WHERE classification_id = $1`, original.ClassificationID)
 	require.Error(t, err, "expected the trigger to refuse clearing an existing supersession link")
 
-	var supersededCount int
-	err = pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'classification.superseded'`, doc.DocumentID).Scan(&supersededCount)
-	require.NoError(t, err)
-	require.Equal(t, 1, supersededCount)
+	require.Equal(t, 1, eventingCount(t, pool, "com.zoikosuite.business.classification.superseded", doc.DocumentID))
 }
 
 // TestPgStore_SupersedeClassification_RejectsSelfConfirmation is the
 // negative-controlled proof that SupersedeClassification enforces the
 // same maker-checker rule as ConfirmClassification for the new proposal.
 func TestPgStore_SupersedeClassification_RejectsSelfConfirmation(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "reclassify-self-confirm")
 	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
 	require.NoError(t, err)
@@ -703,7 +686,7 @@ func TestPgStore_SupersedeClassification_RejectsSelfConfirmation(t *testing.T) {
 // negative-controlled proof that a classification can only ever be
 // superseded once.
 func TestPgStore_SupersedeClassification_RejectsAlreadySuperseded(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "reclassify-double-supersede")
 	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
 	require.NoError(t, err)
@@ -739,7 +722,7 @@ func TestPgStore_SupersedeClassification_RejectsAlreadySuperseded(t *testing.T) 
 // before a reclassification returns the classification that governed
 // then, not the document's current one.
 func TestPgStore_GetAsOfClassification_ReturnsWhatGovernedAtThatTime(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "as-of-classification")
 	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
 	require.NoError(t, err)
@@ -773,7 +756,7 @@ func TestPgStore_GetAsOfClassification_ReturnsWhatGovernedAtThatTime(t *testing.
 // audit-trail query returns every proposal, including ones this
 // document's current classification no longer reflects.
 func TestPgStore_ListClassificationHistory_ReturnsFullTrail(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "history")
 	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
 	require.NoError(t, err)
@@ -798,7 +781,7 @@ func TestPgStore_ListClassificationHistory_ReturnsFullTrail(t *testing.T) {
 // governance-backlog query only surfaces documents with no
 // CONFIRMED/RESTRICTED classification yet.
 func TestPgStore_ListUnclassified_ExcludesConfirmedDocuments(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	unconfirmed := newDocForDeclareTest(t, s, "unclassified")
 	confirmedDoc := newDocForDeclareTest(t, s, "will-be-confirmed")
 	proposal, err := s.GetClassification(tenantCtx(), confirmedDoc.DocumentID)
@@ -824,7 +807,7 @@ func TestPgStore_ListUnclassified_ExcludesConfirmedDocuments(t *testing.T) {
 // exists in this codebase yet (see AIConfidenceAutoConfirmThreshold's
 // own doc comment).
 func TestPgStore_ExplainPolicyMapping_NeverFabricatesAutoConfirm(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc := newDocForDeclareTest(t, s, "policy-mapping")
 	confidence := 0.99
 	aiProposal, err := s.ClassifyRecord(tenantCtx(), domain.ClassifyRecordParams{
@@ -842,7 +825,7 @@ func TestPgStore_ExplainPolicyMapping_NeverFabricatesAutoConfirm(t *testing.T) {
 
 func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	_, err := s.AddVersion(tenantCtx(), "00000000-0000-0000-0000-000000000000",
 		&domain.DocumentVersion{ChecksumSHA256: sha256Hex("x"), StorageKey: "k", ContentType: "text/plain", CreatedByPrincipalID: "p"}, "corr-notfound")
@@ -855,7 +838,7 @@ func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {
 // as the document/version insert — see internal/outbox's own package doc.
 func TestPgStore_CreateDocument_InsertsOutboxEventAtomically(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	doc := &domain.Document{
 		TenantID:      "11111111-1111-1111-1111-111111111111",
@@ -884,15 +867,17 @@ func TestPgStore_CreateDocument_InsertsOutboxEventAtomically(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 	// ZS-SVC-S-001 §9.3: document_created and document_version_committed replace
-	// the old document.uploaded; the BIZ-02 classification proposal is unchanged.
-	require.ElementsMatch(t, []string{"classification.proposed", "document_created", "document_version_committed"}, types)
+	// the old document.uploaded and stay on the older outbox. The BIZ-02 classification
+	// proposal now goes to the shared eventing outbox.
+	require.ElementsMatch(t, []string{"document_created", "document_version_committed"}, types)
+	require.Equal(t, 1, eventingCount(t, pool, "com.zoikosuite.business.classification.proposed", doc.DocumentID))
 }
 
 // TestPgStore_AddVersion_InsertsOutboxEventAtomically mirrors the create
 // test for the version_created event.
 func TestPgStore_AddVersion_InsertsOutboxEventAtomically(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	doc := &domain.Document{
 		TenantID:      "11111111-1111-1111-1111-111111111111",
@@ -919,7 +904,7 @@ func TestPgStore_AddVersion_InsertsOutboxEventAtomically(t *testing.T) {
 
 func TestPgStore_RecordAccess_IsAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	doc := &domain.Document{
 		TenantID:      "11111111-1111-1111-1111-111111111111",

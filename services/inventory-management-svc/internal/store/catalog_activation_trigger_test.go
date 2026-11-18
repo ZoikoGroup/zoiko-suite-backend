@@ -16,7 +16,7 @@ import (
 // ACCOUNTING mappings, even for a writer that bypasses the handler.
 func TestPgStore_Catalog_ActivationRequiresMappings_EnforcedInDatabase(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	now := time.Now().UTC()

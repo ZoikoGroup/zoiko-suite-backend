@@ -16,7 +16,7 @@ import (
 // item's base UOM is refused with ErrUOMMismatch and leaves on-hand untouched.
 func TestPgStore_CommitMovement_UOMMismatch_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()

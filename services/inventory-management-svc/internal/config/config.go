@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -9,6 +10,11 @@ import (
 type Config struct {
 	Env  string
 	Port int
+
+	// EventResidencyRegion (EVENT_RESIDENCY_REGION, e.g. uk or eu-west) is stamped on every event
+	// written to the shared eventing outbox (the BIZ-07 offering events). Required: an event with a
+	// guessed region is worse than a service that refuses to start.
+	EventResidencyRegion string
 
 	DB DBConfig
 
@@ -81,7 +87,12 @@ type KafkaConfig struct {
 }
 
 func Load() (*Config, error) {
+	region := strings.TrimSpace(os.Getenv("EVENT_RESIDENCY_REGION"))
+	if region == "" {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required (the residency region stamped on every shared-outbox event)")
+	}
 	return &Config{
+		EventResidencyRegion: region,
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8168),
 		DB: DBConfig{

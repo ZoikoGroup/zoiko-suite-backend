@@ -17,7 +17,7 @@ import (
 
 func TestHousekeepingStore_ActionToken_Expiry_And_Purge(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-hk-tokens"
@@ -130,7 +130,7 @@ func TestHousekeepingStore_ActionToken_Expiry_And_Purge(t *testing.T) {
 
 func TestHousekeepingStore_StaleIntents_Expiry(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-hk-intents"
@@ -203,7 +203,7 @@ func TestHousekeepingStore_StaleIntents_Expiry(t *testing.T) {
 // events with them. The database now refuses the DELETE on every evidence table.
 func TestHousekeepingStore_DeliveryEvidenceIsNeverDeleted(t *testing.T) {
 	pool, admin := openTestPools(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-hk-ledger"

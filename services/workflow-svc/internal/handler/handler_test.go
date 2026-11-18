@@ -434,7 +434,6 @@ type stubPublisher struct {
 	completedCalls   int
 	invalidatedCalls int
 	auditEvents      []string
-	formEvents       []string
 }
 
 func (p *stubPublisher) PublishWorkflowStarted(_ context.Context, _ domain.WorkflowInstance) error {
@@ -463,14 +462,6 @@ func (p *stubPublisher) PublishWorkflowInvalidated(_ context.Context, _ domain.W
 }
 func (p *stubPublisher) PublishAuditEngagementEvent(_ context.Context, eventType string, _ domain.AuditEngagement, _, _ string) error {
 	p.auditEvents = append(p.auditEvents, eventType)
-	return nil
-}
-func (p *stubPublisher) PublishFormPublished(_ context.Context, _ domain.FormDefinition, _, _ string) error {
-	p.formEvents = append(p.formEvents, "form.published")
-	return nil
-}
-func (p *stubPublisher) PublishFormEvent(_ context.Context, eventType string, _ domain.FormSubmission, _, _ string) error {
-	p.formEvents = append(p.formEvents, eventType)
 	return nil
 }
 

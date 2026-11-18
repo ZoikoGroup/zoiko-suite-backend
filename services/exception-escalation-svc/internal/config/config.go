@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 type Config struct {
@@ -15,6 +16,12 @@ type Config struct {
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
 	JurisdictionRulesURL     string
+
+	// EventResidencyRegion (EVENT_RESIDENCY_REGION, e.g. uk or eu-west) is stamped on every
+	// event written to the shared eventing outbox (the BIZ-08 deadline events). Required.
+	EventResidencyRegion string
+	// Env (ENV) is "local" for developer stacks; only then may the Kafka writer auto-create the topic.
+	Env string
 }
 
 func Load() (*Config, error) {
@@ -26,7 +33,13 @@ func Load() (*Config, error) {
 	if dbURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
+	region := strings.TrimSpace(os.Getenv("EVENT_RESIDENCY_REGION"))
+	if region == "" {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required (the residency region stamped on every shared-outbox event)")
+	}
 	return &Config{
+		EventResidencyRegion: region,
+		Env:                  getEnvOrDefault("ENV", "local"),
 		Port:                     port,
 		DatabaseURL:              dbURL,
 		KafkaBrokers:             getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),

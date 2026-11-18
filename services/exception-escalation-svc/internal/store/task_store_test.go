@@ -12,7 +12,7 @@ import (
 
 func TestPgStore_CreateCase_ThenClose_ThenRejectsDoubleClose(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c, err := s.CreateCase(ctx(), domain.CreateCaseParams{
 		TenantID: "default", LegalEntityID: "le-1", CaseType: "COMPLIANCE_REVIEW", Purpose: "Quarterly review", CreatedByPrincipalID: "owner-1",
@@ -35,14 +35,14 @@ func TestPgStore_CreateCase_ThenClose_ThenRejectsDoubleClose(t *testing.T) {
 
 func TestPgStore_GetCase_UnknownCase_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	_, err := s.GetCase(ctx(), "case-does-not-exist")
 	require.ErrorIs(t, err, domain.ErrCaseNotFound)
 }
 
 func TestPgStore_CreateTask_LandsNewAndRecordsHistory(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	task, err := s.CreateTask(ctx(), domain.CreateTaskParams{
 		TenantID: "default", LegalEntityID: "le-1", TaskType: "EXPENSE_REVIEW", Priority: domain.TaskPriorityHigh,
@@ -65,7 +65,7 @@ func TestPgStore_CreateTask_LandsNewAndRecordsHistory(t *testing.T) {
 
 func TestPgStore_CreateTask_DefaultsPriorityToMedium(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	task, err := s.CreateTask(ctx(), domain.CreateTaskParams{
 		TenantID: "default", LegalEntityID: "le-1", TaskType: "GENERIC", LinkedObjectType: "INVOICE", LinkedObjectID: "inv-1", CreatedByPrincipalID: "creator-1",
 	})
@@ -75,7 +75,7 @@ func TestPgStore_CreateTask_DefaultsPriorityToMedium(t *testing.T) {
 
 func TestPgStore_AssignTask_ThenStart_ThenRejectsStartWithoutAssign(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	task, err := s.CreateTask(ctx(), domain.CreateTaskParams{
 		TenantID: "default", LegalEntityID: "le-1", TaskType: "EXPENSE_REVIEW",
@@ -112,7 +112,7 @@ func TestPgStore_AssignTask_ThenStart_ThenRejectsStartWithoutAssign(t *testing.T
 
 func TestPgStore_GetTask_UnknownTask_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	_, err := s.GetTask(ctx(), "task-does-not-exist")
 	require.ErrorIs(t, err, domain.ErrTaskNotFound)
 }
@@ -122,7 +122,7 @@ func TestPgStore_GetTask_UnknownTask_ReturnsNotFound(t *testing.T) {
 // task_transitions is refused outright.
 func TestPgStore_TaskTransitions_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	task, err := s.CreateTask(ctx(), domain.CreateTaskParams{
 		TenantID: "default", LegalEntityID: "le-1", TaskType: "EXPENSE_REVIEW",
@@ -145,7 +145,7 @@ func TestPgStore_TaskTransitions_AreAppendOnly(t *testing.T) {
 // task's own lifecycle.
 func TestPgStore_CreateTask_WithCase(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c, err := s.CreateCase(ctx(), domain.CreateCaseParams{
 		TenantID: "default", LegalEntityID: "le-1", CaseType: "COMPLIANCE_REVIEW", CreatedByPrincipalID: "owner-1",
@@ -183,7 +183,7 @@ func inProgressTaskForTest(t *testing.T, s *store.PgStore, linkedObjectID string
 
 func TestPgStore_BlockTask_ThenRejectsBlockFromWrongState(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	task := inProgressTaskForTest(t, s, "exp-200")
 
 	blocked, err := s.BlockTask(ctx(), domain.BlockTaskParams{TaskID: task.TaskID, TenantID: "default", ActorPrincipalID: "assignee-1", Reason: "waiting on receipts"})
@@ -198,7 +198,7 @@ func TestPgStore_BlockTask_ThenRejectsBlockFromWrongState(t *testing.T) {
 
 func TestPgStore_EscalateTask_FromInProgressAndFromBlocked(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	// From IN_PROGRESS directly.
 	task1 := inProgressTaskForTest(t, s, "exp-201")
@@ -225,7 +225,7 @@ func TestPgStore_EscalateTask_FromInProgressAndFromBlocked(t *testing.T) {
 
 func TestPgStore_CompleteTask_FromAnyActiveState(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	for _, tc := range []struct {
 		name string
@@ -258,7 +258,7 @@ func TestPgStore_CompleteTask_FromAnyActiveState(t *testing.T) {
 
 func TestPgStore_ReopenTask_FromCompleted_ThenRejectsFromInProgress(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	task := inProgressTaskForTest(t, s, "exp-203")
 	completed, err := s.CompleteTask(ctx(), domain.CompleteTaskParams{TaskID: task.TaskID, TenantID: "default", ActorPrincipalID: "assignee-1"})
 	require.NoError(t, err)
@@ -277,7 +277,7 @@ func TestPgStore_ReopenTask_FromCompleted_ThenRejectsFromInProgress(t *testing.T
 
 func TestPgStore_CancelTask_FromActiveStates_ThenRejectsFromTerminal(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	task, err := s.CreateTask(ctx(), domain.CreateTaskParams{TenantID: "default", LegalEntityID: "le-1", TaskType: "X", LinkedObjectType: "Y", LinkedObjectID: "cancel-1", CreatedByPrincipalID: "creator-1"})
 	require.NoError(t, err)
@@ -299,7 +299,7 @@ func TestPgStore_CancelTask_FromActiveStates_ThenRejectsFromTerminal(t *testing.
 
 func TestPgStore_ListQueue_FiltersByAssigneeAndStatus(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	_, err := s.CreateTask(ctx(), domain.CreateTaskParams{TenantID: "default", LegalEntityID: "le-queue", TaskType: "X", LinkedObjectType: "Y", LinkedObjectID: "q1", CreatedByPrincipalID: "creator-1"})
 	require.NoError(t, err)
@@ -324,7 +324,7 @@ func TestPgStore_ListQueue_FiltersByAssigneeAndStatus(t *testing.T) {
 
 func TestPgStore_GetSLAState_OverdueAndNotOverdueAndUnset(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	past := timeMustParse(t, "2020-01-01T00:00:00Z")
 	overdueTask, err := s.CreateTask(ctx(), domain.CreateTaskParams{
@@ -360,7 +360,7 @@ func TestPgStore_GetSLAState_OverdueAndNotOverdueAndUnset(t *testing.T) {
 
 func TestPgStore_GetLinkedObjectStatus_IsAPassthroughNotALiveLookup(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 	task, err := s.CreateTask(ctx(), domain.CreateTaskParams{
 		TenantID: "default", LegalEntityID: "le-1", TaskType: "X", LinkedObjectType: "EXPENSE_CLAIM", LinkedObjectID: "exp-999", CreatedByPrincipalID: "creator-1",
 	})
@@ -378,7 +378,7 @@ func TestPgStore_GetLinkedObjectStatus_IsAPassthroughNotALiveLookup(t *testing.T
 // as it was — never fabricated into COMPLETED or CLOSED.
 func TestPgStore_CloseCase_CascadesCompletedTasksToClosedOnly(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c, err := s.CreateCase(ctx(), domain.CreateCaseParams{TenantID: "default", LegalEntityID: "le-1", CaseType: "COMPLIANCE_REVIEW", CreatedByPrincipalID: "owner-1"})
 	require.NoError(t, err)

@@ -17,7 +17,7 @@ import (
 
 func TestExport_RecipientAndPurpose_ArePersistedAndAnnounced(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "export-recipient")
 
 	pkg, err := s.CreateExportPackage(tenantCtx(), domain.CreateExportPackageParams{
@@ -51,7 +51,7 @@ func TestExport_RecipientAndPurpose_ArePersistedAndAnnounced(t *testing.T) {
 
 func TestExport_WithoutRecipient_StaysAsBefore(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "export-no-recipient")
 	item := []domain.ExportPackageItemInput{{ItemType: string(domain.ExportItemDocumentVersion), RefID: v.DocumentVersionID}}
 
@@ -69,7 +69,7 @@ func TestExport_WithoutRecipient_StaysAsBefore(t *testing.T) {
 }
 
 func TestExport_RecipientIsTenantScoped(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "export-tenant")
 	pkg, err := s.CreateExportPackage(tenantCtx(), domain.CreateExportPackageParams{
 		RequestedByPrincipalID: "exporter-1", RecipientScope: "r", Purpose: "p",

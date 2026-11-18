@@ -19,7 +19,7 @@ func newInApp(tenantID, recipient, correlationID string) *domain.Notification {
 
 func TestPgStore_RecipientAddressAndProvenanceRoundTrip(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "employee-9", "corr-addr")
 	n.RecipientAddress = "employee@example.com"
@@ -47,7 +47,7 @@ func TestPgStore_RecipientAddressAndProvenanceRoundTrip(t *testing.T) {
 // other means that path is wrong.
 func TestPgStore_AddressWithoutProvenanceIsRejected(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "employee-9", "corr-noprov")
 	n.RecipientAddress = "employee@example.com"
@@ -62,7 +62,7 @@ func TestPgStore_AddressWithoutProvenanceIsRejected(t *testing.T) {
 
 func TestPgStore_CompleteDelivery_RecordsProviderEvidence(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "employee-9", "corr-evidence")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -90,7 +90,7 @@ func TestPgStore_CompleteDelivery_RecordsProviderEvidence(t *testing.T) {
 // happened would be whatever ran last.
 func TestPgStore_CompleteDelivery_DoesNotReopenAConcludedNotification(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "employee-9", "corr-once")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -120,7 +120,7 @@ func TestPgStore_CompleteDelivery_DoesNotReopenAConcludedNotification(t *testing
 
 func TestPgStore_MarkRead_SetsAndKeepsTheFirstRead(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newInApp("tenant-a", "employee-9", "corr-read")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -151,7 +151,7 @@ func TestPgStore_MarkRead_SetsAndKeepsTheFirstRead(t *testing.T) {
 
 func TestPgStore_MarkRead_IsScopedToTheRecipientAndTenant(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newInApp("tenant-a", "employee-9", "corr-scope")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -176,7 +176,7 @@ func TestPgStore_MarkRead_IsScopedToTheRecipientAndTenant(t *testing.T) {
 // email was opened.
 func TestPgStore_MarkRead_RefusesNonInAppChannels(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "employee-9", "corr-email-read") // EMAIL
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -191,7 +191,7 @@ func TestPgStore_MarkRead_RefusesNonInAppChannels(t *testing.T) {
 
 func TestPgStore_CountUnread(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	ctx := tenantCtx("tenant-a")
 	mine := newInApp("tenant-a", "employee-9", "corr-u1")
@@ -231,7 +231,7 @@ func TestPgStore_CountUnread(t *testing.T) {
 
 func TestPgStore_ListNotifications_UnreadOnly(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	ctx := tenantCtx("tenant-a")
 	read := newInApp("tenant-a", "employee-9", "corr-l1")

@@ -22,7 +22,7 @@ func newTestLocation(tenantID, legalEntityID, code string) *domain.InventoryLoca
 
 func TestPgStore_CreateLocation_And_GetLocation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -50,7 +50,7 @@ func TestPgStore_CreateLocation_And_GetLocation(t *testing.T) {
 
 func TestPgStore_CreateLocation_DuplicateCode_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -72,7 +72,7 @@ func TestPgStore_CreateLocation_DuplicateCode_Refused(t *testing.T) {
 // versioned."
 func TestPgStore_ReparentLocation_Versions(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -113,7 +113,7 @@ func TestPgStore_ReparentLocation_Versions(t *testing.T) {
 // transaction-level proof of negative path #1.
 func TestPgStore_ReparentLocation_CrossEntity_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -136,7 +136,7 @@ func TestPgStore_ReparentLocation_CrossEntity_Refused(t *testing.T) {
 // transaction-level proof of negative path #2.
 func TestPgStore_ReparentLocation_Circular_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -160,7 +160,7 @@ func TestPgStore_ReparentLocation_Circular_Refused(t *testing.T) {
 // negative path #4.
 func TestPgStore_SetQuarantine_SelfReleaseRefused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()

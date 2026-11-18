@@ -34,7 +34,7 @@ import (
 // announces it are ONE transaction.
 func TestOutbox_ConcludingADeliveryEnqueuesItsEvent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := seedNotification(t, s, "tenant-a", "corr-outbox-1")
@@ -68,7 +68,7 @@ func TestOutbox_ConcludingADeliveryEnqueuesItsEvent(t *testing.T) {
 // enqueued anyway, one delivery would produce two notification.sent events.
 func TestOutbox_ARaceLoserEnqueuesNothing(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := seedNotification(t, s, "tenant-a", "corr-outbox-race")
@@ -93,7 +93,7 @@ func TestOutbox_ARaceLoserEnqueuesNothing(t *testing.T) {
 // relay runs long after that request is gone.
 func TestOutbox_StoredPayloadIsTheFinishedEnvelope(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := seedNotification(t, s, "tenant-a", "corr-outbox-envelope")
@@ -134,7 +134,7 @@ func TestOutbox_StoredPayloadIsTheFinishedEnvelope(t *testing.T) {
 
 func TestOutbox_ClaimMarksPublishedOnlyWhenTheCallbackSucceeds(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := seedNotification(t, s, "tenant-a", "corr-claim-1")
@@ -190,7 +190,7 @@ func TestOutbox_ClaimMarksPublishedOnlyWhenTheCallbackSucceeds(t *testing.T) {
 // silent shape the outbox exists to remove. It must name itself.
 func TestOutbox_RelayDrainsEveryTenant(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	for _, tenant := range []string{"tenant-a", "tenant-b", "tenant-c"} {
 		ctx := tenantCtx(tenant)
@@ -220,7 +220,7 @@ func TestOutbox_RelayDrainsEveryTenant(t *testing.T) {
 // that is an hour of governed notices whose issue nobody has been told about.
 func TestOutbox_DepthReportsBacklogAndAge(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	pending, age, err := s.OutboxDepth(context.Background())
@@ -344,7 +344,7 @@ func eventTypesFor(t *testing.T, pool *pgxpool.Pool, aggregate string) []string 
 // the database says so, not because a caller predicted it.
 func TestOutbox_EventCarriesTheCommittedRow(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := seedNotification(t, s, "tenant-a", "corr-outbox-committed")
@@ -379,7 +379,7 @@ func TestOutbox_EventCarriesTheCommittedRow(t *testing.T) {
 // both in the transitions' own transactions.
 func TestOutbox_UnknownThenResolvedEnqueuesBoth(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	n := seedNotification(t, s, "tenant-a", "corr-outbox-unknown")
@@ -414,7 +414,7 @@ func TestOutbox_UnknownThenResolvedEnqueuesBoth(t *testing.T) {
 // template, in their own transaction.
 func TestOutbox_TemplateLifecycleEnqueuesEachEvent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
@@ -438,8 +438,8 @@ func TestOutbox_TemplateLifecycleEnqueuesEachEvent(t *testing.T) {
 		t.Fatalf("retire: %v", err)
 	}
 
-	got := eventTypesFor(t, pool, tmpl.TemplateID)
-	want := []string{events.TypeTemplateCreated, events.TypeTemplateVersionApproved, events.TypeTemplatePublished, events.TypeTemplateRetired}
+	got := eventingTypes(t, pool, tmpl.TemplateID)
+	want := []string{"com.zoikosuite.business.template.created", "com.zoikosuite.business.template.version-approved", "com.zoikosuite.business.template.published", "com.zoikosuite.business.template.retired"}
 	if len(got) != len(want) {
 		t.Fatalf("template events = %v, want %v", got, want)
 	}
@@ -455,7 +455,7 @@ func TestOutbox_TemplateLifecycleEnqueuesEachEvent(t *testing.T) {
 // superuser, which bypasses row-level security even under FORCE.
 func TestOutbox_TenantIsolatedOutsideTheRelayHatch(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	var super bool
 	if err := pool.QueryRow(context.Background(), "SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&super); err != nil {
 		t.Fatalf("role check: %v", err)
@@ -502,7 +502,7 @@ func TestOutbox_TenantIsolatedOutsideTheRelayHatch(t *testing.T) {
 // with a resolution deadline and the spec's NCD-014.
 func TestOutbox_EveryAttemptEnqueuesItsAttemptEvent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-attempt-events")
 

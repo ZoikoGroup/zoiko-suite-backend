@@ -38,10 +38,27 @@ import (
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+
+	// eventRegion is the residency region stamped on every event written to the
+	// eventing outbox. Empty means none was configured, and every such write then
+	// fails (envelope.New refuses it) rather than emitting an event with a guessed region.
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
-	return &PgStore{pool: pool, log: log}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by every eventing-outbox event.
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // tenantOf returns the caller's tenant, or ErrTenantMissing.
@@ -250,6 +267,11 @@ func (s *PgStore) createDocumentTx(ctx context.Context, tx pgx.Tx, tenantID stri
 func (s *PgStore) insertDocumentOutboxEvent(ctx context.Context, tx pgx.Tx, eventType, documentID, tenantID, legalEntityID, actorID, correlationID string, payload map[string]any) error {
 	if correlationID == "" {
 		correlationID = documentID
+	}
+	// BIZ-01/BIZ-02 events that the DRC spec does not name go to the shared eventing
+	// outbox with canonical types; see eventing_events.go.
+	if ce, ok := canonicalDocumentEvents[eventType]; ok {
+		return s.enqueueCanonicalEvent(ctx, tx, ce, eventType, documentID, tenantID, legalEntityID, actorID, correlationID, payload)
 	}
 	env, err := outbox.NewVariantAEnvelope(eventType, correlationID, tenantID, legalEntityID, actorID, payload)
 	if err != nil {

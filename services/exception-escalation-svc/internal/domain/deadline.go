@@ -125,6 +125,8 @@ type CreateDeadlineParams struct {
 	OwnerPrincipalID                 string
 	CalcRule, CalcInputs             string
 	CreatedByPrincipalID             string
+	// CorrelationID is carried onto the deadline.created event.
+	CorrelationID string
 }
 
 // MirrorAuthoritativeDeadlineParams — BIZ-08's own
@@ -144,6 +146,8 @@ type MirrorAuthoritativeDeadlineParams struct {
 	OwnerPrincipalID                     string
 	SourceType, SourceRef, SourceVersion string
 	CreatedByPrincipalID                 string
+	// CorrelationID is carried onto the deadline.created and deadline.superseded events.
+	CorrelationID string
 }
 
 type AssignOwnerParams struct {
@@ -152,6 +156,8 @@ type AssignOwnerParams struct {
 
 type CompleteDeadlineParams struct {
 	DeadlineID, TenantID, ActorPrincipalID string
+	// CorrelationID is carried onto the deadline.completed event.
+	CorrelationID string
 }
 
 // RecalculateParams — BIZ-08's own Recalculate command. Only ever valid
@@ -163,6 +169,22 @@ type RecalculateParams struct {
 	DeadlineID, TenantID, ActorPrincipalID string
 	DueAt                                  time.Time
 	CalcRule, CalcInputs                   string
+	// Reason is required: a manual change of a due date needs a stated reason (spec BIZ-08:
+	// manual override requires reason/authority). It is recorded with the change.
+	Reason string
+}
+
+// DueChange is one append-only record of a recalculation: what the due date was, what it
+// became, why, and who did it.
+type DueChange struct {
+	ChangeID      string    `json:"change_id"`
+	PreviousDueAt time.Time `json:"previous_due_at"`
+	NewDueAt      time.Time `json:"new_due_at"`
+	PreviousRule  string    `json:"previous_calc_rule,omitempty"`
+	NewRule       string    `json:"new_calc_rule,omitempty"`
+	Reason        string    `json:"reason"`
+	ChangedBy     string    `json:"changed_by"`
+	ChangedAt     time.Time `json:"changed_at"`
 }
 
 type WaiveParams struct {
@@ -185,11 +207,16 @@ type EscalateParams struct {
 // ListUpcomingParams filters ListUpcoming's read.
 type ListUpcomingParams struct {
 	TenantID, LegalEntityID, OwnerPrincipalID string
+	// ActorPrincipalID and CorrelationID are carried onto the deadline.due_soon events the
+	// read emits for deadlines it is the first to see cross the threshold.
+	ActorPrincipalID, CorrelationID string
 }
 
 // ListOverdueParams filters ListOverdue's read.
 type ListOverdueParams struct {
 	TenantID, LegalEntityID, OwnerPrincipalID string
+	// ActorPrincipalID and CorrelationID are carried onto the deadline.overdue events.
+	ActorPrincipalID, CorrelationID string
 }
 
 // ExplainCalculationResult is ExplainCalculation's own result — the
@@ -203,6 +230,8 @@ type ExplainCalculationResult struct {
 	CalcRule   string    `json:"calc_rule,omitempty"`
 	CalcInputs string    `json:"calc_inputs,omitempty"`
 	Note       string    `json:"note"`
+	// Changes is the history of manual recalculations, oldest first.
+	Changes []DueChange `json:"changes,omitempty"`
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -210,6 +239,7 @@ type ExplainCalculationResult struct {
 var (
 	ErrDeadlineNotFound       = errors.New("deadline not found")
 	ErrDeadlineInvalidState   = errors.New("deadline is not in a state that permits this action")
+	ErrDeadlineReasonRequired = errors.New("a reason is required to recalculate a deadline")
 	ErrDeadlineSourceRequired = errors.New("source_type, source_ref and source_version are required to mirror an authoritative deadline")
 
 	// ErrDeadlineSourceConflict is the doc's own named stable error,

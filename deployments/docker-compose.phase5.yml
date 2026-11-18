@@ -521,13 +521,14 @@ services:
 
   exception-escalation-svc:
     build:
-      context: ../services/exception-escalation-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: exception-escalation-svc/Dockerfile
     container_name: exception-escalation-svc-p5
     ports:
       - "8133:8133"
     environment:
       PORT: "8133"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/exception_escalation?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.exception-escalation.events"

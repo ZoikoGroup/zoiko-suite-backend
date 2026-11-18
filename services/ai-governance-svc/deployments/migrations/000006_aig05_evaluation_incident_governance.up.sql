@@ -12,7 +12,7 @@
 -- ReactivateRelease (root cause documented + a passing re-evaluation
 -- recorded after the incident).
 --
--- ai_evaluations and ai_incidents are both caller-attested evidence —
+-- ai_evaluations and ai_incident_records are both caller-attested evidence —
 -- no real eval-running pipeline or production telemetry exists in
 -- this codebase to generate them automatically (same honest-scoping
 -- already used for AIG-02's gate booleans and AIG-04's execution_ref),
@@ -129,7 +129,7 @@ CREATE TRIGGER trigger_evaluation_immutability
 -- caller-attested identifiers, never real foreign keys. At least one
 -- of model_release_id/use_case_id must be named: an incident with
 -- nothing affected isn't an AI incident.
-CREATE TABLE ai_incidents (
+CREATE TABLE ai_incident_records (
     incident_id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     severity                  VARCHAR(8) NOT NULL CHECK (severity IN ('AI-P0', 'AI-P1', 'AI-P2', 'AI-P3')),
     model_release_id          UUID REFERENCES ai_model_releases(model_release_id),
@@ -154,8 +154,8 @@ CREATE TABLE ai_incidents (
     CHECK (incident_state <> 'CLOSED' OR closure_evidence IS NOT NULL)
 );
 
-CREATE INDEX idx_ai_incidents_release ON ai_incidents (model_release_id, incident_state);
-CREATE INDEX idx_ai_incidents_severity ON ai_incidents (severity, incident_state);
+CREATE INDEX idx_ai_incident_records_release ON ai_incident_records (model_release_id, incident_state);
+CREATE INDEX idx_ai_incident_records_severity ON ai_incident_records (severity, incident_state);
 
 -- Forward-only per §8.4/§8.6: OPEN -> CONTAINED -> RESOLVED -> CLOSED.
 -- CLOSED is terminal. Each stage's required evidence field (checked
@@ -166,7 +166,7 @@ CREATE OR REPLACE FUNCTION aig05_enforce_incident_lifecycle()
 RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        RAISE EXCEPTION 'ai_incidents rows cannot be deleted';
+        RAISE EXCEPTION 'ai_incident_records rows cannot be deleted';
     END IF;
     IF OLD.incident_state = 'CLOSED' THEN
         RAISE EXCEPTION 'ai_incident % is CLOSED and immutable', OLD.incident_id;
@@ -203,5 +203,5 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trigger_incident_lifecycle
-    BEFORE UPDATE OR DELETE ON ai_incidents
+    BEFORE UPDATE OR DELETE ON ai_incident_records
     FOR EACH ROW EXECUTE FUNCTION aig05_enforce_incident_lifecycle();

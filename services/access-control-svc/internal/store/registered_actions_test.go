@@ -150,6 +150,16 @@ var registeredActionMigrations = []struct {
 		"PARTY_CONTACT_RETIRE": "STANDARD",
 		"PARTY_CONTACT_READ":   "STANDARD",
 	}},
+	{"000057_register_crm_read_actions", "counterparty-management-svc", map[string]string{
+		"CRM_READ":         "STANDARD",
+		"CRM_CONSENT_READ": "STANDARD",
+	}},
+	{"000058_register_restricted_classification_action", "document-vault-svc", map[string]string{
+		"CONFIRM_RESTRICTED_CLASSIFICATION": "HIGH",
+	}},
+	{"000059_register_comment_moderate_action", "comments-collaboration-svc", map[string]string{
+		"COMMENT_MODERATE": "STANDARD",
+	}},
 }
 
 // templatePublishers are the migrations, in this list, that publish role

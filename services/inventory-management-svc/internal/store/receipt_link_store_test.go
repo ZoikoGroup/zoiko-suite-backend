@@ -17,7 +17,7 @@ import (
 // receipt is refused, and the link row can never be updated or deleted.
 func TestPgStore_ReceiptLink_IdempotentConflictAndImmutable(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -49,7 +49,7 @@ func TestPgStore_ReceiptLink_IdempotentConflictAndImmutable(t *testing.T) {
 // the rest is reported as unlinked, never silently posted.
 func TestPgStore_GetRunInboundValue_SplitsLinkedAndUnlinked(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -91,7 +91,7 @@ func TestPgStore_GetRunInboundValue_SplitsLinkedAndUnlinked(t *testing.T) {
 
 func TestPgStore_ValuationRun_KernelPosting_SplitsInboundByStockAndRecordsEveryJournal(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
