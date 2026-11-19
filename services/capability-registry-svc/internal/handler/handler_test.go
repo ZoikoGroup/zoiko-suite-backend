@@ -464,8 +464,9 @@ func TestResolveCapability_IncidentRestrictedOverridesEverything(t *testing.T) {
 
 	wRelease := httptest.NewRecorder()
 	r.ServeHTTP(wRelease, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
-		State:  "INCIDENT_RESTRICTED",
-		Reason: "provider outage",
+		State:                      "INCIDENT_RESTRICTED",
+		Reason:                     "provider outage",
+		ReconciliationProcedureRef: "RUNBOOK-INC-4471",
 	}))
 	if wRelease.Code != http.StatusCreated {
 		t.Fatalf("expected 201 setting release state, got %d — %s", wRelease.Code, wRelease.Body.String())
@@ -844,6 +845,107 @@ func TestSetReleaseState_InvalidState_Rejected(t *testing.T) {
 	}))
 	if wValid.Code != http.StatusCreated {
 		t.Fatalf("expected 201 for valid release state GA, got %d: %s", wValid.Code, wValid.Body.String())
+	}
+}
+
+// ── Gap 2: kill-switch rigor on emergency release-state transitions ───────
+// (2026-11-19 audit) — INCIDENT_RESTRICTED and DISABLED now require both a
+// reason and a reconciliation_procedure_ref, matching
+// kill-switch-registry-svc's required-on-engage field; routine promotions
+// (GA/BETA/PILOT/INTERNAL) stay exempt from both.
+
+func TestSetReleaseState_EmergencyStateWithoutReconciliationRef_Rejected(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "KILL_SWITCH_NO_REF")
+
+	for _, state := range []string{"INCIDENT_RESTRICTED", "DISABLED"} {
+		t.Run(state, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
+				State:  state,
+				Reason: "provider outage",
+				// ReconciliationProcedureRef deliberately omitted.
+			}))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %s with no reconciliation_procedure_ref, got %d: %s", state, w.Code, w.Body.String())
+			}
+			if !bytes.Contains(w.Body.Bytes(), []byte("reconciliation_procedure_ref")) {
+				t.Errorf("expected error to mention reconciliation_procedure_ref, got %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestSetReleaseState_EmergencyStateWithoutReason_Rejected(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "KILL_SWITCH_NO_REASON")
+
+	for _, state := range []string{"INCIDENT_RESTRICTED", "DISABLED"} {
+		t.Run(state, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
+				State:                      state,
+				ReconciliationProcedureRef: "RUNBOOK-INC-1",
+				// Reason deliberately omitted.
+			}))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %s with no reason, got %d: %s", state, w.Code, w.Body.String())
+			}
+			if !bytes.Contains(w.Body.Bytes(), []byte("reason is required")) {
+				t.Errorf("expected error to mention reason is required, got %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestSetReleaseState_EmergencyStateWithReconciliationRef_Succeeds(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "KILL_SWITCH_WITH_REF")
+
+	for _, state := range []string{"INCIDENT_RESTRICTED", "DISABLED"} {
+		t.Run(state, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
+				State:                      state,
+				Reason:                     "provider outage",
+				ReconciliationProcedureRef: "RUNBOOK-INC-" + state,
+			}))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("expected 201 for %s with a reconciliation_procedure_ref, got %d: %s", state, w.Code, w.Body.String())
+			}
+			var rel domain.Release
+			if err := json.NewDecoder(w.Body).Decode(&rel); err != nil {
+				t.Fatalf("decode release: %v", err)
+			}
+			if rel.ReconciliationProcedureRef == nil || *rel.ReconciliationProcedureRef != "RUNBOOK-INC-"+state {
+				t.Fatalf("expected reconciliation_procedure_ref to round-trip, got %+v", rel)
+			}
+		})
+	}
+}
+
+// TestSetReleaseState_RoutinePromotionsExemptFromReconciliationRef proves the
+// other half of Gap 2: GA/BETA/PILOT/INTERNAL still work with neither reason
+// nor reconciliation_procedure_ref — this rigor is specific to the two
+// emergency-style states, not every transition.
+func TestSetReleaseState_RoutinePromotionsExemptFromReconciliationRef(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "ROUTINE_PROMOTIONS_EXEMPT")
+
+	for _, state := range []string{"GA", "BETA", "PILOT", "INTERNAL"} {
+		t.Run(state, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
+				State: state,
+			}))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("expected 201 for routine state %s with neither field, got %d: %s", state, w.Code, w.Body.String())
+			}
+		})
 	}
 }
 

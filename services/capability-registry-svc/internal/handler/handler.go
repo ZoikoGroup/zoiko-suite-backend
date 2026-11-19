@@ -452,6 +452,23 @@ func (h *Handler) UpdateIntegrationHealth(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, response)
 }
 
+// SetReleaseState holds the two emergency-style transitions
+// (INCIDENT_RESTRICTED, DISABLED) to the same rigor doc7 §32.1's kill-switch
+// doctrine requires elsewhere in this platform (Gap 2 fix, 2026-11-19):
+// kill-switch-registry-svc requires a non-empty reconciliation_procedure_ref
+// on every engage, because a kill switch that can be flipped with no
+// recorded plan for how it gets turned back off safely is not a real
+// incident control. This service's own Release.State had none of that —
+// the same one permission and an optional free-text reason covered both a
+// routine GA promotion and an emergency incident restriction.
+//
+// This is deliberately a LOCAL control, not a call out to
+// kill-switch-registry-svc: that service answers a different, genuinely
+// cross-cutting question ("must this class of action be stopped right now"
+// across plane/domain/provider/tenant scopes), while this one is "is this
+// one capability operationally enabled" (capability_id-scoped only, per the
+// domain package's doc comment). Routine GA/BETA/PILOT/INTERNAL promotions
+// are explicitly exempt from both requirements — they are not incidents.
 func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 	capabilityID := chi.URLParam(r, "id")
 	var req domain.SetReleaseStateRequest
@@ -466,6 +483,16 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 	if !domain.ReleaseState(req.State).Valid() {
 		writeError(w, http.StatusBadRequest, "state must be one of GA, BETA, PILOT, INTERNAL, DISABLED, INCIDENT_RESTRICTED")
 		return
+	}
+	if domain.IsEmergencyReleaseState(domain.ReleaseState(req.State)) {
+		if strings.TrimSpace(req.Reason) == "" {
+			writeError(w, http.StatusBadRequest, "reason is required for INCIDENT_RESTRICTED and DISABLED transitions")
+			return
+		}
+		if strings.TrimSpace(req.ReconciliationProcedureRef) == "" {
+			writeError(w, http.StatusBadRequest, "reconciliation_procedure_ref is required for INCIDENT_RESTRICTED and DISABLED transitions")
+			return
+		}
 	}
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -486,6 +513,9 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Reason != "" {
 		rel.Reason = &req.Reason
+	}
+	if req.ReconciliationProcedureRef != "" {
+		rel.ReconciliationProcedureRef = &req.ReconciliationProcedureRef
 	}
 	claim, ok := buildClaim(w, r, principalID, "SetReleaseState", rel.ReleaseID, http.StatusCreated, rel, raw)
 	if !ok {
@@ -533,9 +563,9 @@ func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) 
 	}
 
 	c := &domain.CapabilityClaim{
-		ClaimID: uuid.NewString(),
+		ClaimID:      uuid.NewString(),
 		CapabilityID: capabilityID,
-		ClaimText: req.ClaimText,
+		ClaimText:    req.ClaimText,
 		// The wording owner is the creator, always — never a free-text value
 		// supplied by the caller. See the domain.CapabilityClaim doc comment.
 		WordingOwnerPrincipalID: principalID,

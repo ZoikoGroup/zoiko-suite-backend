@@ -489,11 +489,11 @@ func (s *PgStore) CreateRelease(ctx context.Context, r *domain.Release, claim do
 		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO releases (
-				release_id, capability_id, state, reason, effective_from,
-				created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`, r.ReleaseID, r.CapabilityID, string(r.State), r.Reason, r.EffectiveFrom,
-			r.CreatedAt, r.CreatedByPrincipalID,
+				release_id, capability_id, state, reason, reconciliation_procedure_ref,
+				effective_from, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`, r.ReleaseID, r.CapabilityID, string(r.State), r.Reason, r.ReconciliationProcedureRef,
+			r.EffectiveFrom, r.CreatedAt, r.CreatedByPrincipalID,
 		)
 		if err != nil {
 			if isForeignKeyViolation(err) || isInvalidTextRepresentation(err) {
@@ -509,12 +509,12 @@ func (s *PgStore) GetReleaseByID(ctx context.Context, releaseID string) (*domain
 	var r domain.Release
 	var state string
 	err := s.pool.QueryRow(ctx, `
-		SELECT release_id, capability_id, state, reason, effective_from,
-		       created_at, created_by_principal_id
+		SELECT release_id, capability_id, state, reason, reconciliation_procedure_ref,
+		       effective_from, created_at, created_by_principal_id
 		FROM releases WHERE release_id = $1
 	`, releaseID).Scan(
-		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.EffectiveFrom,
-		&r.CreatedAt, &r.CreatedByPrincipalID,
+		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.ReconciliationProcedureRef,
+		&r.EffectiveFrom, &r.CreatedAt, &r.CreatedByPrincipalID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrReleaseNotFound
@@ -535,13 +535,13 @@ func (s *PgStore) GetCurrentRelease(ctx context.Context, capabilityID string) (*
 	var r domain.Release
 	var state string
 	err := s.pool.QueryRow(ctx, `
-		SELECT release_id, capability_id, state, reason, effective_from,
-		       created_at, created_by_principal_id
+		SELECT release_id, capability_id, state, reason, reconciliation_procedure_ref,
+		       effective_from, created_at, created_by_principal_id
 		FROM releases WHERE capability_id = $1
 		ORDER BY effective_from DESC, created_at DESC, release_id DESC LIMIT 1
 	`, capabilityID).Scan(
-		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.EffectiveFrom,
-		&r.CreatedAt, &r.CreatedByPrincipalID,
+		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.ReconciliationProcedureRef,
+		&r.EffectiveFrom, &r.CreatedAt, &r.CreatedByPrincipalID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrReleaseNotFound
