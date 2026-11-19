@@ -19,6 +19,7 @@ import (
 	authzpkg "zoiko.io/capability-registry-svc/internal/authz"
 	"zoiko.io/capability-registry-svc/internal/domain"
 	svcenvelope "zoiko.io/capability-registry-svc/internal/envelope"
+	jurisdictionpkg "zoiko.io/capability-registry-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/capability-registry-svc/internal/middleware"
 )
 
@@ -356,11 +357,34 @@ func (s *stubAuthz) recordedCalls() []stubAuthzCall {
 
 var _ AuthzChecker = (*stubAuthz)(nil)
 
+// stubJurisdictionValidator accepts any market_code by default (every
+// existing test in this file uses arbitrary codes like "US"/"GB" that
+// predate Gap 3's real jurisdiction check) — unless codes is non-nil, in
+// which case only market codes listed in it are accepted. This mirrors the
+// swap-at-construction convention other services in this platform already
+// use (e.g. tenant-entity-registry-svc's StubJurisdictionValidator vs.
+// HTTPJurisdictionValidator).
+type stubJurisdictionValidator struct {
+	codes map[string]bool // nil means "accept everything"
+}
+
+func (v *stubJurisdictionValidator) ValidateExists(_ context.Context, marketCode string) error {
+	if v.codes == nil {
+		return nil
+	}
+	if v.codes[marketCode] {
+		return nil
+	}
+	return jurisdictionpkg.ErrMarketCodeNotFound
+}
+
+var _ JurisdictionValidator = (*stubJurisdictionValidator)(nil)
+
 var testRequestSequence atomic.Uint64
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubAuthz{}, logger)
+	return New(newStubStore(), &stubAuthz{}, &stubJurisdictionValidator{}, logger)
 }
 
 // newTestHandlerWithStore returns the test store so event-outbox records can
@@ -368,7 +392,7 @@ func newTestHandler() *Handler {
 func newTestHandlerWithPublisher() (*Handler, *stubStore) {
 	logger, _ := zap.NewDevelopment()
 	st := newStubStore()
-	return New(st, &stubAuthz{}, logger), st
+	return New(st, &stubAuthz{}, &stubJurisdictionValidator{}, logger), st
 }
 
 func newTestRouter(h *Handler) *chi.Mux {
@@ -673,6 +697,78 @@ func TestCreateCapabilityClaim_ExpiryReviewDateCurrentBoundaryBehavior(t *testin
 				t.Fatalf("valid RFC3339 date was not preserved: %v", claim.ExpiryReviewDate)
 			}
 		})
+	}
+}
+
+// ── Gap 3: market_code validated against jurisdiction-rules-svc
+// (2026-11-19 audit) ─────────────────────────────────────────────────────
+
+// newTestHandlerWithJurisdiction wires a handler against a
+// stubJurisdictionValidator that only accepts the given codes — unlike
+// newTestHandler's default permissive stub — so these tests actually
+// exercise the real/unknown-code distinction rather than the existing
+// tests' "anything goes" posture.
+func newTestHandlerWithJurisdiction(codes ...string) *Handler {
+	logger, _ := zap.NewDevelopment()
+	accepted := make(map[string]bool, len(codes))
+	for _, c := range codes {
+		accepted[c] = true
+	}
+	return New(newStubStore(), &stubAuthz{}, &stubJurisdictionValidator{codes: accepted}, logger)
+}
+
+func TestCreateMarketRelease_KnownJurisdictionCode_Succeeds(t *testing.T) {
+	h := newTestHandlerWithJurisdiction("GB")
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "JURISDICTION_KNOWN")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/market-releases", domain.CreateMarketReleaseRequest{
+		MarketCode: "GB", LegalApprovalStatus: "APPROVED", State: "GA", EffectiveFrom: "2026-01-01T00:00:00Z",
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for a real, valid jurisdiction code, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateMarketRelease_UnknownJurisdictionCode_Rejected(t *testing.T) {
+	h := newTestHandlerWithJurisdiction("GB") // "ZZ" is deliberately not in the accepted set.
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "JURISDICTION_UNKNOWN")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/market-releases", domain.CreateMarketReleaseRequest{
+		MarketCode: "ZZ", LegalApprovalStatus: "APPROVED", State: "GA", EffectiveFrom: "2026-01-01T00:00:00Z",
+	}))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown jurisdiction code, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("not a known jurisdiction code")) {
+		t.Errorf("expected error to mention the unknown jurisdiction code, got %s", w.Body.String())
+	}
+}
+
+// jurisdictionUnavailable always reports the jurisdiction service as
+// unreachable — proves the fail-closed path independent of whether a code
+// happens to be known or unknown.
+type jurisdictionUnavailable struct{}
+
+func (jurisdictionUnavailable) ValidateExists(context.Context, string) error {
+	return jurisdictionpkg.ErrServiceUnavailable
+}
+
+func TestCreateMarketRelease_JurisdictionServiceUnavailable_FailsClosed(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubAuthz{}, jurisdictionUnavailable{}, logger)
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "JURISDICTION_UNAVAILABLE")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/market-releases", domain.CreateMarketReleaseRequest{
+		MarketCode: "GB", LegalApprovalStatus: "APPROVED", State: "GA", EffectiveFrom: "2026-01-01T00:00:00Z",
+	}))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when jurisdiction-rules-svc is unreachable, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -1007,7 +1103,7 @@ func TestUpdateIntegrationHealth_InvalidHealthStatus_Rejected(t *testing.T) {
 func TestResolveCapability_FailsClosedOnCorruptedState(t *testing.T) {
 	st := newStubStore()
 	logger, _ := zap.NewDevelopment()
-	h := New(st, &stubAuthz{}, logger)
+	h := New(st, &stubAuthz{}, &stubJurisdictionValidator{}, logger)
 	r := newTestRouter(h)
 	cap := createTestCapability(t, r, "CORRUPTED_RELEASE_STATE")
 
@@ -1054,7 +1150,7 @@ func TestGetCapability_NoPrincipal_Returns401(t *testing.T) {
 
 func TestGetCapability_AuthzDenied_Returns403(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, &stubJurisdictionValidator{}, logger)
 	r := newTestRouter(h)
 
 	w := httptest.NewRecorder()
@@ -1114,7 +1210,7 @@ func TestListCapabilityClaims_NoPrincipal_Returns401(t *testing.T) {
 
 func TestListCapabilityClaims_AuthzDenied_Returns403(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, &stubJurisdictionValidator{}, logger)
 	r := newTestRouter(h)
 
 	w := httptest.NewRecorder()
@@ -1167,7 +1263,7 @@ func TestResolveCapability_NoPrincipal_Returns401(t *testing.T) {
 
 func TestResolveCapability_AuthzDenied_Returns403(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, &stubJurisdictionValidator{}, logger)
 	r := newTestRouter(h)
 
 	w := httptest.NewRecorder()
@@ -1181,7 +1277,7 @@ func TestResolveCapability_Authorized_UsesPlatformScopeAction(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	st := newStubStore()
 	az := &stubAuthz{}
-	h := New(st, az, logger)
+	h := New(st, az, &stubJurisdictionValidator{}, logger)
 	seedCapability(st, "RESOLVE_AUTHORIZED")
 	r := newTestRouter(h)
 
@@ -1222,7 +1318,7 @@ func TestResolveCapability_DeployedEnvelopePosture(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			logger, _ := zap.NewDevelopment()
 			st := newStubStore()
-			h := New(st, &stubAuthz{}, logger)
+			h := New(st, &stubAuthz{}, &stubJurisdictionValidator{}, logger)
 			capability := seedCapability(st, "RESOLVE_ENVELOPE")
 			r := newEnvelopeRouter(h, mode)
 			path := "/v1/capability-resolution/" + capability.CapabilityCode

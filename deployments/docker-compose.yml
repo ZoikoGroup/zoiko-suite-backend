@@ -4775,12 +4775,23 @@ services:
       # refuses to start without it. Same default as the other adopters.
       EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Gap 3 fix: market_code is validated against the real jurisdiction
+      # taxonomy before a market release is persisted (doc7 §Q1). Same env
+      # var name and port convention the rest of the platform already uses
+      # for this dependency (obligations-svc, tenant-entity-registry-svc, et al).
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      # jurisdiction-rules-svc's compose service key is jurisdiction-svc;
+      # JURISDICTION_RULES_URL above targets its container_name instead,
+      # same as every other depends_on-less JURISDICTION_RULES_URL consumer
+      # in this file.
+      jurisdiction-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

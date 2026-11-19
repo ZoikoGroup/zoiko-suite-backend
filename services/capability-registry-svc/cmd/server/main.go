@@ -21,6 +21,7 @@ import (
 	svcenvelope "zoiko.io/capability-registry-svc/internal/envelope"
 	"zoiko.io/capability-registry-svc/internal/handler"
 	"zoiko.io/capability-registry-svc/internal/health"
+	"zoiko.io/capability-registry-svc/internal/jurisdiction"
 	"zoiko.io/capability-registry-svc/internal/middleware"
 	"zoiko.io/capability-registry-svc/internal/mtls"
 	"zoiko.io/capability-registry-svc/internal/store"
@@ -115,7 +116,9 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, authzClient, logger)
+	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionServiceURL, logger)
+
+	h := handler.New(pgStore, authzClient, jurisdictionValidator, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

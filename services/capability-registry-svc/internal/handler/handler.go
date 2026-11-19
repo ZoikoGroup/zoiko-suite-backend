@@ -17,6 +17,7 @@ import (
 
 	authzpkg "zoiko.io/capability-registry-svc/internal/authz"
 	"zoiko.io/capability-registry-svc/internal/domain"
+	jurisdictionpkg "zoiko.io/capability-registry-svc/internal/jurisdiction"
 	"zoiko.io/capability-registry-svc/internal/store"
 )
 
@@ -60,14 +61,23 @@ type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
-type Handler struct {
-	store  store.Store
-	authz  AuthzChecker
-	logger *zap.Logger
+// JurisdictionValidator validates a market_code against the real
+// jurisdiction/market taxonomy (Gap 3 fix) before it is persisted on a
+// market_releases row. See internal/jurisdiction for the production HTTP
+// implementation against jurisdiction-rules-svc.
+type JurisdictionValidator interface {
+	ValidateExists(ctx context.Context, marketCode string) error
 }
 
-func New(st store.Store, az AuthzChecker, logger *zap.Logger) *Handler {
-	return &Handler{store: st, authz: az, logger: logger}
+type Handler struct {
+	store        store.Store
+	authz        AuthzChecker
+	jurisdiction JurisdictionValidator
+	logger       *zap.Logger
+}
+
+func New(st store.Store, az AuthzChecker, jv JurisdictionValidator, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, jurisdiction: jv, logger: logger}
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -294,6 +304,26 @@ func (h *Handler) CreateMarketRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.authorize(w, r, principalID, MarketReleaseCreate) {
 		return
+	}
+
+	// Gap 3 fix: market_code must name a real, known jurisdiction — doc7
+	// §Q1's jurisdiction/entity/language gating, not just a non-empty
+	// string. Fail-closed: an unreachable jurisdiction-rules-svc rejects
+	// the write (503), it never silently accepts an unvalidated code.
+	if err := h.jurisdiction.ValidateExists(r.Context(), req.MarketCode); err != nil {
+		switch {
+		case errors.Is(err, jurisdictionpkg.ErrMarketCodeNotFound):
+			writeError(w, http.StatusBadRequest, "market_code is not a known jurisdiction code: "+req.MarketCode)
+			return
+		case errors.Is(err, jurisdictionpkg.ErrServiceUnavailable):
+			h.logger.Error("jurisdiction validation unavailable — failing closed", zap.String("market_code", req.MarketCode))
+			writeError(w, http.StatusServiceUnavailable, "jurisdiction validation service unavailable")
+			return
+		default:
+			h.logger.Error("jurisdiction validation failed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "jurisdiction validation failed")
+			return
+		}
 	}
 
 	m := &domain.MarketRelease{
