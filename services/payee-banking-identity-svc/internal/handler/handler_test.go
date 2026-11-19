@@ -145,15 +145,28 @@ func proposeDestination(t *testing.T, r http.Handler, partyRef string, source do
 	return &d
 }
 
+// verifyDestination acts as "principal-verifier" — deliberately NOT
+// "principal-proposer" (proposeDestination's actor): SPEC_DEVIATIONS A6's
+// verifier/activator SoD check means the destination's own proposer can no
+// longer verify it, so every existing test that walks a destination through
+// its lifecycle needs an independent verifier too.
 func verifyDestination(t *testing.T, r http.Handler, destinationID, method string) *httptest.ResponseRecorder {
 	t.Helper()
-	return doRequest(r, http.MethodPost, "/org10/destinations/"+destinationID+"/verify",
-		domain.VerifyDestinationRequest{VerificationMethod: method, VerificationEvidenceRef: "evidence-ref-1"}, testTenant)
+	return doRequestAs(r, http.MethodPost, "/org10/destinations/"+destinationID+"/verify",
+		domain.VerifyDestinationRequest{VerificationMethod: method, VerificationEvidenceRef: "evidence-ref-1"}, testTenant, "principal-verifier")
 }
 
 func approveDestination(t *testing.T, r http.Handler, destinationID string) *httptest.ResponseRecorder {
 	t.Helper()
 	return doRequestAs(r, http.MethodPost, "/org10/destinations/"+destinationID+"/approve", nil, testTenant, "principal-checker")
+}
+
+// activateDestination acts as "principal-activator" — deliberately NOT
+// "principal-proposer", for the same SPEC_DEVIATIONS A6 reason as
+// verifyDestination.
+func activateDestination(t *testing.T, r http.Handler, destinationID string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doRequestAs(r, http.MethodPost, "/org10/destinations/"+destinationID+"/activate", nil, testTenant, "principal-activator")
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -267,7 +280,7 @@ func TestProposePayeeDestination_ChangeRiskClassification_DestinationChange(t *t
 	first := proposeDestination(t, r, "party-change-risk", domain.SourceSupplierPortal)
 	verifyDestination(t, r, first.DestinationID, "OUTBOUND_CALL_TO_SUPPLIER")
 	approveDestination(t, r, first.DestinationID)
-	w := doRequest(r, http.MethodPost, "/org10/destinations/"+first.DestinationID+"/activate", nil, testTenant)
+	w := activateDestination(t, r, first.DestinationID)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 activating first destination, got %d: %s", w.Code, w.Body.String())
 	}
@@ -284,6 +297,51 @@ func TestProposePayeeDestination_ChangeRiskClassification_DestinationChange(t *t
 	}
 	if second.PriorDestinationID != first.DestinationID {
 		t.Fatalf("expected PriorDestinationID to point at the prior active destination %s, got %s", first.DestinationID, second.PriorDestinationID)
+	}
+}
+
+// TestVerifyPayeeDestination_SelfVerification_Denied and
+// TestActivateDestination_SelfActivation_Denied are the verifier/activator
+// half of SPEC_DEVIATIONS A6: the same own-object SoD check
+// ApprovePayeeDestination already enforces, mirrored onto Verify and
+// Activate.
+func TestVerifyPayeeDestination_SelfVerification_Denied(t *testing.T) {
+	party := newStubParty()
+	party.add("party-verify-sod", testLegalEntity)
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, party)
+	d := proposeDestination(t, r, "party-verify-sod", domain.SourceSupplierPortal) // proposed by "principal-proposer"
+
+	w := doRequestAs(r, http.MethodPost, "/org10/destinations/"+d.DestinationID+"/verify",
+		domain.VerifyDestinationRequest{VerificationMethod: "OUTBOUND_CALL_TO_SUPPLIER", VerificationEvidenceRef: "evidence-ref-1"},
+		testTenant, "principal-proposer")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 self-verification denied, got %d: %s", w.Code, w.Body.String())
+	}
+
+	w = doRequestAs(r, http.MethodPost, "/org10/destinations/"+d.DestinationID+"/verify",
+		domain.VerifyDestinationRequest{VerificationMethod: "OUTBOUND_CALL_TO_SUPPLIER", VerificationEvidenceRef: "evidence-ref-1"},
+		testTenant, "principal-independent-verifier")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for an independent verifier, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestActivateDestination_SelfActivation_Denied(t *testing.T) {
+	party := newStubParty()
+	party.add("party-activate-sod", testLegalEntity)
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, party)
+	d := proposeDestination(t, r, "party-activate-sod", domain.SourceSupplierPortal) // proposed by "principal-proposer"
+	verifyDestination(t, r, d.DestinationID, "OUTBOUND_CALL_TO_SUPPLIER")
+	approveDestination(t, r, d.DestinationID) // approved by "principal-checker"
+
+	w := doRequestAs(r, http.MethodPost, "/org10/destinations/"+d.DestinationID+"/activate", nil, testTenant, "principal-proposer")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 self-activation denied, got %d: %s", w.Code, w.Body.String())
+	}
+
+	w = doRequestAs(r, http.MethodPost, "/org10/destinations/"+d.DestinationID+"/activate", nil, testTenant, "principal-independent-activator")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for an independent activator, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -359,7 +417,7 @@ func TestActivateDestination_SupersedesPriorActive(t *testing.T) {
 	first := proposeDestination(t, r, "party-5", domain.SourceSupplierPortal)
 	verifyDestination(t, r, first.DestinationID, "OUTBOUND_CALL_TO_SUPPLIER")
 	approveDestination(t, r, first.DestinationID)
-	w := doRequest(r, http.MethodPost, "/org10/destinations/"+first.DestinationID+"/activate", nil, testTenant)
+	w := activateDestination(t, r, first.DestinationID)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 activating first destination, got %d: %s", w.Code, w.Body.String())
 	}
@@ -374,7 +432,7 @@ func TestActivateDestination_SupersedesPriorActive(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &second)
 	verifyDestination(t, r, second.DestinationID, "OUTBOUND_CALL_TO_SUPPLIER")
 	approveDestination(t, r, second.DestinationID)
-	w = doRequest(r, http.MethodPost, "/org10/destinations/"+second.DestinationID+"/activate", nil, testTenant)
+	w = activateDestination(t, r, second.DestinationID)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 activating second destination, got %d: %s", w.Code, w.Body.String())
 	}

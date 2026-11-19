@@ -456,7 +456,10 @@ func (h *Handler) VerifyPayeeDestination(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin) {
+	// Own-object SoD, mirroring ApprovePayeeDestination's self-approval
+	// check exactly (SPEC_DEVIATIONS A6): the destination's own proposer
+	// cannot also be the one who verifies it.
+	if !h.authorizeOwnObject(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin, d.ProposedByPrincipalID) {
 		return
 	}
 	// The state guard is deliberately in the store, after the idempotency
@@ -553,7 +556,11 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin) {
+	// Own-object SoD, mirroring ApprovePayeeDestination's self-approval
+	// check exactly (SPEC_DEVIATIONS A6): the destination's own proposer
+	// cannot also be the one who activates it, once someone else has
+	// approved it.
+	if !h.authorizeOwnObject(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin, d.ProposedByPrincipalID) {
 		return
 	}
 
