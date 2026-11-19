@@ -346,7 +346,7 @@ func TestControlPopulation_WatermarkStableThenChangesWithStatus(t *testing.T) {
 
 	// Quarantine the RECEIVED statement a-sA2 through the service's own command.
 	ctx := middleware.WithTenant(context.Background(), cpT1)
-	if err := f.s.QuarantineStatement(ctx, cpT1, "a-sA2", "bad balance"); err != nil {
+	if err := f.s.QuarantineStatement(ctx, cpT1, "a-sA2", "bad balance", "actor", "corr"); err != nil {
 		t.Fatalf("quarantine: %v", err)
 	}
 	after := f.get(t, cpT1, q)
