@@ -307,18 +307,16 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Initialize with 0 balance trace
-	bal := &domain.CashBalance{
-		BalanceID:        uuid.New().String(),
-		TenantID:         tenantID,
-		BankAccountID:    acct.BankAccountID,
-		LedgerBalance:    "0",
-		AvailableBalance: "0",
-		AsOfTimestamp:    time.Now().UTC(),
-		CorrelationID:    r.Header.Get("X-Correlation-ID"),
-	}
-	_ = h.store.CreateCashBalance(r.Context(), bal)
-
+	// No balance trace is written here any more. Before, this wrote a
+	// permanent cash_balances row of exactly "0.00" with its own error
+	// discarded — the single most severe Banking & Treasury audit finding:
+	// treasury-svc never had a real bank balance, because nothing ever
+	// updated that placeholder. A real cash_balances row now only ever
+	// comes from a real BankStatementAccepted event
+	// (internal/events/bank_statement_consumer.go) — a freshly registered
+	// account correctly has NO balance on file until its bank actually
+	// reports one, which composeBankBalances already treats as a stale/
+	// partial position rather than presenting a fabricated zero as current.
 	writeJSON(w, http.StatusCreated, acct)
 }
 
