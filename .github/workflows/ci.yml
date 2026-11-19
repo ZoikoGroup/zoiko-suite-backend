@@ -265,7 +265,19 @@ jobs:
         # Uses embedded-postgres (downloads real Postgres binaries automatically).
         # No separate Postgres service container is needed.
         # Proves /healthz and /readyz return 200 against a real DB.
-        run: go test -v -tags=integration -count=1 -timeout=600s ./cmd/server/
+        # The binaries are resolved from Maven Central at test start; a transient
+        # "no version found matching" there fails the run in ~4s. Retry the whole
+        # step a couple of times so a registry blip is not a red build; a real
+        # test failure still fails all three attempts.
+        run: |
+          for attempt in 1 2 3; do
+            if go test -v -tags=integration -count=1 -timeout=600s ./cmd/server/; then
+              exit 0
+            fi
+            echo "::warning::integration attempt ${attempt} failed"
+            sleep $((attempt * 15))
+          done
+          exit 1
 
       - name: Integration test — jurisdiction-rules registry suite with embedded Postgres
         if: matrix.service == 'jurisdiction-rules-svc'
