@@ -256,9 +256,15 @@ func (h *Handler) maskVersions(w http.ResponseWriter, r *http.Request, principal
 }
 
 // ProposePayeeDestination verifies the named party genuinely exists via
-// counterparty-management-svc before ever creating a candidate against
-// it. Negative-path enforcement lives one step later, at
-// VerifyPayeeDestination — see internal/domain's package doc.
+// counterparty-management-svc, is in eligible standing (not blocked/
+// inactive/non-compliant), and that the account identifier is a
+// structurally valid format for its stated country, before ever creating a
+// candidate against it. The candidate's resting state after this returns is
+// VERIFICATION_PENDING, not CANDIDATE — see SPEC_DEVIATIONS A4. Independent
+// verification of the bank details themselves is not performed here — that
+// is VerifyPayeeDestination's job — see internal/domain's package doc.
+// Sanctions/fraud screening is NOT wired here; see SPEC_DEVIATIONS A3 for
+// why.
 func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request) {
 	var req domain.ProposeDestinationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -276,6 +282,14 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "source_type must be SUPPLIER_PORTAL, INVOICE_OCR, EMAIL, or MANUAL_ENTRY")
 		return
 	}
+	// Format/account-country validation — §4.10's "server-resolved context"
+	// line (SPEC_DEVIATIONS A3): refuse a proposal whose account identifier
+	// is not a structurally valid account/IBAN for its stated country
+	// before any party lookup or write is attempted.
+	if err := domain.ValidateAccountFormat(req.CountryCode, req.AccountIdentifier); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -290,13 +304,24 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 	}
 
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if _, err := h.party.GetParty(r.Context(), verifiedTenant, req.LegalEntityID, req.PartyRef); err != nil {
+	party, err := h.party.GetParty(r.Context(), verifiedTenant, req.LegalEntityID, req.PartyRef)
+	if err != nil {
 		if errors.Is(err, domain.ErrPartyNotFound) {
 			writeError(w, http.StatusBadRequest, domain.ErrPartyNotFound.Error())
 			return
 		}
 		h.log.Error("ProposePayeeDestination: counterparty-management-svc lookup failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, domain.ErrPartyServiceUnavailable.Error())
+		return
+	}
+	// Party status / compliance enforcement — §4.10's "server-resolved
+	// context" line's "party status" clause (SPEC_DEVIATIONS A3): the
+	// ORG-07 lookup already returns Status and ComplianceStatus; this is
+	// the literal fix for discarding them. A blocked/inactive
+	// (SUSPENDED/TERMINATED) or non-compliant (REJECTED) party can no
+	// longer get a destination candidate.
+	if !domain.PartyEligibleForDestination(party.Status, party.ComplianceStatus) {
+		writeError(w, http.StatusBadRequest, domain.ErrPartyNotEligible.Error())
 		return
 	}
 

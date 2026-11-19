@@ -64,6 +64,10 @@ func (p *stubParty) add(id, legalEntityID string) {
 	p.parties[id] = counterparty.Counterparty{CounterpartyID: id, LegalEntityID: legalEntityID, Status: "ACTIVE", ComplianceStatus: "VERIFIED"}
 }
 
+func (p *stubParty) addWithStatus(id, legalEntityID, status, complianceStatus string) {
+	p.parties[id] = counterparty.Counterparty{CounterpartyID: id, LegalEntityID: legalEntityID, Status: status, ComplianceStatus: complianceStatus}
+}
+
 func (p *stubParty) GetParty(_ context.Context, _, legalEntityID, partyRef string) (*counterparty.Counterparty, error) {
 	cp, ok := p.parties[partyRef]
 	if !ok || cp.LegalEntityID != legalEntityID {
@@ -160,11 +164,126 @@ func TestProposePayeeDestination(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
 
 	d := proposeDestination(t, r, "party-1", domain.SourceSupplierPortal)
-	if d.Status != domain.StatusCandidate {
-		t.Fatalf("expected CANDIDATE, got %s", d.Status)
+	// SPEC_DEVIATIONS A4: the candidate's resting state is now
+	// VERIFICATION_PENDING, not CANDIDATE — proven directly off the real
+	// response, not inferred from the final state after a later command.
+	if d.Status != domain.StatusVerificationPending {
+		t.Fatalf("expected VERIFICATION_PENDING, got %s", d.Status)
 	}
 	if d.AccountLast4 != "3456" {
 		t.Fatalf("expected masked last4 3456, got %q", d.AccountLast4)
+	}
+	if d.ChangeRiskClassification != domain.ChangeRiskNewDestination {
+		t.Fatalf("expected NEW_DESTINATION for a party with no prior active destination, got %s", d.ChangeRiskClassification)
+	}
+	if d.PriorDestinationID != "" {
+		t.Fatalf("expected no prior destination id for a first-time proposal, got %q", d.PriorDestinationID)
+	}
+}
+
+// TestProposePayeeDestination_BlockedParty_Rejected and
+// TestProposePayeeDestination_NonCompliantParty_Rejected are the literal fix
+// for SPEC_DEVIATIONS A3's "party status"/compliance gap: the ORG-07
+// Status/ComplianceStatus the client already returns is no longer discarded.
+func TestProposePayeeDestination_BlockedParty_Rejected(t *testing.T) {
+	party := newStubParty()
+	party.addWithStatus("party-blocked", testLegalEntity, "SUSPENDED", "VERIFIED")
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
+	w := doRequest(r, http.MethodPost, "/org10/destinations/", domain.ProposeDestinationRequest{
+		LegalEntityID: testLegalEntity, PartyRef: "party-blocked", FinancialInstitution: "Bank",
+		AccountIdentifier: "1234567890123456", CountryCode: "US", Currency: "USD", PayeeName: "Acme", SourceType: domain.SourceSupplierPortal,
+	}, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a SUSPENDED party, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestProposePayeeDestination_NonCompliantParty_Rejected(t *testing.T) {
+	party := newStubParty()
+	party.addWithStatus("party-rejected", testLegalEntity, "ACTIVE", "REJECTED")
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
+	w := doRequest(r, http.MethodPost, "/org10/destinations/", domain.ProposeDestinationRequest{
+		LegalEntityID: testLegalEntity, PartyRef: "party-rejected", FinancialInstitution: "Bank",
+		AccountIdentifier: "1234567890123456", CountryCode: "US", Currency: "USD", PayeeName: "Acme", SourceType: domain.SourceSupplierPortal,
+	}, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for REJECTED compliance, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestProposePayeeDestination_OnboardingPendingCompliance_Allowed(t *testing.T) {
+	party := newStubParty()
+	party.addWithStatus("party-onboarding", testLegalEntity, "ONBOARDING", "PENDING")
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
+	w := doRequest(r, http.MethodPost, "/org10/destinations/", domain.ProposeDestinationRequest{
+		LegalEntityID: testLegalEntity, PartyRef: "party-onboarding", FinancialInstitution: "Bank",
+		AccountIdentifier: "1234567890123456", CountryCode: "US", Currency: "USD", PayeeName: "Acme", SourceType: domain.SourceSupplierPortal,
+	}, testTenant)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for ONBOARDING/PENDING (not blocked/inactive, not non-compliant), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestProposePayeeDestination_InvalidIBAN_Rejected and
+// TestProposePayeeDestination_ValidIBAN_Accepted are the literal fix for
+// SPEC_DEVIATIONS A3's format-validation gap.
+func TestProposePayeeDestination_InvalidIBAN_Rejected(t *testing.T) {
+	party := newStubParty()
+	party.add("party-iban-bad", testLegalEntity)
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
+	w := doRequest(r, http.MethodPost, "/org10/destinations/", domain.ProposeDestinationRequest{
+		LegalEntityID: testLegalEntity, PartyRef: "party-iban-bad", FinancialInstitution: "Deutsche Bank",
+		// DE89370400440532013000 is a real, valid test IBAN; flip the last
+		// digit so the mod-97 checksum fails.
+		AccountIdentifier: "DE89370400440532013001", CountryCode: "DE", Currency: "EUR", PayeeName: "Acme GmbH", SourceType: domain.SourceSupplierPortal,
+	}, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an IBAN that fails its checksum, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestProposePayeeDestination_ValidIBAN_Accepted(t *testing.T) {
+	party := newStubParty()
+	party.add("party-iban-good", testLegalEntity)
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
+	w := doRequest(r, http.MethodPost, "/org10/destinations/", domain.ProposeDestinationRequest{
+		LegalEntityID: testLegalEntity, PartyRef: "party-iban-good", FinancialInstitution: "Deutsche Bank",
+		AccountIdentifier: "DE89370400440532013000", CountryCode: "DE", Currency: "EUR", PayeeName: "Acme GmbH", SourceType: domain.SourceSupplierPortal,
+	}, testTenant)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for a structurally valid IBAN, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestProposePayeeDestination_ChangeRiskClassification_DestinationChange
+// proves the first-time-vs-change distinction described in the task: a
+// party that already has an ACTIVE destination gets DESTINATION_CHANGE
+// with PriorDestinationID pointing at it when a new one is proposed.
+func TestProposePayeeDestination_ChangeRiskClassification_DestinationChange(t *testing.T) {
+	party := newStubParty()
+	party.add("party-change-risk", testLegalEntity)
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, party)
+
+	first := proposeDestination(t, r, "party-change-risk", domain.SourceSupplierPortal)
+	verifyDestination(t, r, first.DestinationID, "OUTBOUND_CALL_TO_SUPPLIER")
+	approveDestination(t, r, first.DestinationID)
+	w := doRequest(r, http.MethodPost, "/org10/destinations/"+first.DestinationID+"/activate", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 activating first destination, got %d: %s", w.Code, w.Body.String())
+	}
+
+	req := domain.ProposeDestinationRequest{
+		LegalEntityID: testLegalEntity, PartyRef: "party-change-risk", FinancialInstitution: "Second Bank",
+		AccountIdentifier: "9999999999999999", CountryCode: "US", Currency: "USD", PayeeName: "Acme Supplies", SourceType: domain.SourceSupplierPortal,
+	}
+	w = doRequest(r, http.MethodPost, "/org10/destinations/", req, testTenant)
+	var second domain.PayeeDestination
+	_ = json.Unmarshal(w.Body.Bytes(), &second)
+	if second.ChangeRiskClassification != domain.ChangeRiskDestinationChange {
+		t.Fatalf("expected DESTINATION_CHANGE once the party has an active destination, got %s", second.ChangeRiskClassification)
+	}
+	if second.PriorDestinationID != first.DestinationID {
+		t.Fatalf("expected PriorDestinationID to point at the prior active destination %s, got %s", first.DestinationID, second.PriorDestinationID)
 	}
 }
 

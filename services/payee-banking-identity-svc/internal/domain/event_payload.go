@@ -31,6 +31,9 @@ type DestinationEventPayload struct {
 	AccountLast4  string            `json:"account_last4"`
 	Fingerprint   string            `json:"fingerprint"`
 
+	ChangeRiskClassification string `json:"change_risk_classification,omitempty"`
+	PriorDestinationID       string `json:"prior_destination_id,omitempty"`
+
 	SupersededByDestinationID string `json:"superseded_by_destination_id,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
@@ -47,6 +50,7 @@ func NewDestinationEventPayload(d *PayeeDestination, tenantID string) Destinatio
 		PartyRef: d.PartyRef, Scope: d.Scope, Status: d.Status, SourceType: d.SourceType,
 		CountryCode: d.CountryCode, Currency: d.Currency,
 		AccountLast4: d.AccountLast4, Fingerprint: d.Fingerprint,
+		ChangeRiskClassification: d.ChangeRiskClassification, PriorDestinationID: d.PriorDestinationID,
 		SupersededByDestinationID: d.SupersededByDestinationID,
 		CreatedAt:                 d.CreatedAt, UpdatedAt: d.UpdatedAt,
 	}

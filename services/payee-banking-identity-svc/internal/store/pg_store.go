@@ -152,7 +152,7 @@ const destColumns = `
 	account_identifier, account_last4, country_code, currency, payee_name, source_type, fingerprint, status,
 	verification_method, verification_evidence_ref, verified_by_principal_id, verified_at,
 	approved_by_principal_id, approved_at, superseded_by_destination_id, suspend_reason,
-	proposed_by_principal_id, created_at, updated_at`
+	proposed_by_principal_id, created_at, updated_at, change_risk_classification, prior_destination_id`
 
 // destReadColumns is every destination READ's projection: destColumns, with
 // account_identifier wrapped in COALESCE(..., ”) -- a scrubbed row
@@ -172,23 +172,28 @@ const destReadColumns = `
 	COALESCE(account_identifier, ''), account_last4, country_code, currency, payee_name, source_type, fingerprint, status,
 	verification_method, verification_evidence_ref, verified_by_principal_id, verified_at,
 	approved_by_principal_id, approved_at, superseded_by_destination_id, suspend_reason,
-	proposed_by_principal_id, created_at, updated_at,
+	proposed_by_principal_id, created_at, updated_at, change_risk_classification, prior_destination_id,
 	COALESCE((SELECT t.account_identifier_token FROM payee_destination_identifier_tokens t
 		WHERE t.destination_id = payee_destinations.destination_id), '')`
 
 func scanDestination(row pgx.Row) (*domain.PayeeDestination, error) {
 	d := &domain.PayeeDestination{}
 	var supersededBy *string
+	var priorDestination *string
 	err := row.Scan(&d.DestinationID, &d.TenantID, &d.LegalEntityID, &d.PartyRef, &d.Scope, &d.FinancialInstitution,
 		&d.AccountIdentifier, &d.AccountLast4, &d.CountryCode, &d.Currency, &d.PayeeName, &d.SourceType, &d.Fingerprint, &d.Status,
 		&d.VerificationMethod, &d.VerificationEvidenceRef, &d.VerifiedByPrincipalID, &d.VerifiedAt,
 		&d.ApprovedByPrincipalID, &d.ApprovedAt, &supersededBy, &d.SuspendReason,
-		&d.ProposedByPrincipalID, &d.CreatedAt, &d.UpdatedAt, &d.AccountIdentifierToken)
+		&d.ProposedByPrincipalID, &d.CreatedAt, &d.UpdatedAt, &d.ChangeRiskClassification, &priorDestination,
+		&d.AccountIdentifierToken)
 	if err != nil {
 		return nil, err
 	}
 	if supersededBy != nil {
 		d.SupersededByDestinationID = *supersededBy
+	}
+	if priorDestination != nil {
+		d.PriorDestinationID = *priorDestination
 	}
 	return d, nil
 }
@@ -375,14 +380,45 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 			return nil
 		}
 
+		// Change-risk classification and "prior version" context (§4.10's
+		// server-resolved context line — SPEC_DEVIATIONS A3): compare this
+		// candidate against the party/scope's current ACTIVE row, if any,
+		// inside this same transaction so the classification is computed
+		// against a consistent snapshot, not a racing read.
+		var priorActiveID *string
+		var priorIDStr string
+		scanErr := tx.QueryRow(ctx, `
+			SELECT destination_id::text FROM payee_destinations
+			WHERE party_ref = $1 AND scope = $2 AND status = 'ACTIVE'`,
+			req.PartyRef, scope,
+		).Scan(&priorIDStr)
+		changeRisk := domain.ChangeRiskNewDestination
+		if scanErr == nil {
+			changeRisk = domain.ChangeRiskDestinationChange
+			priorActiveID = &priorIDStr
+		} else if !errors.Is(scanErr, pgx.ErrNoRows) {
+			return scanErr
+		}
+
+		// The spec's own lifecycle is "Candidate -> VerificationPending ->
+		// Verified -> ..." (SPEC_DEVIATIONS A4). A candidate's only
+		// observable resting state, from the moment ProposePayeeDestination
+		// returns, is VERIFICATION_PENDING — "proposed, independent
+		// verification not yet received" — never CANDIDATE: that state has
+		// no reachable command path of its own (there is no separate
+		// "RequestVerification" command the spec names), so leaving a
+		// committed row there would just be a second, indistinguishable
+		// name for the same pre-verification condition. VerifyDestination's
+		// WHERE clause still also accepts the legacy 'CANDIDATE' value for
+		// any row that predates this change.
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			INSERT INTO payee_destinations (`+destColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'CANDIDATE',
-				'', '', '', NULL, '', NULL, NULL, '', $14, NOW(), NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'VERIFICATION_PENDING',
+				'', '', '', NULL, '', NULL, NULL, '', $14, NOW(), NOW(), $15, $16)
 			RETURNING `+destReadColumns,
 			destinationID, nullableTenant(tenantID), req.LegalEntityID, req.PartyRef, scope, req.FinancialInstitution,
 			storedIdentifier, last4, req.CountryCode, req.Currency, req.PayeeName, req.SourceType, fingerprint,
-			principalID,
+			principalID, changeRisk, priorActiveID,
 		))
 		if err != nil {
 			return err

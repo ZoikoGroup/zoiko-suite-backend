@@ -123,13 +123,24 @@ func (s *stubStore) ProposeDestination(_ context.Context, tenantID string, req d
 	if scope == "" {
 		scope = "DEFAULT"
 	}
+	changeRisk := domain.ChangeRiskNewDestination
+	priorDestinationID := ""
+	for _, other := range s.destinations {
+		if other.PartyRef == req.PartyRef && other.Scope == scope && other.Status == domain.StatusActive {
+			changeRisk = domain.ChangeRiskDestinationChange
+			priorDestinationID = other.DestinationID
+			break
+		}
+	}
+
 	now := time.Now().UTC()
 	d := &domain.PayeeDestination{
 		DestinationID: uuid.New().String(), TenantID: strp(tenantID), LegalEntityID: req.LegalEntityID,
 		PartyRef: req.PartyRef, Scope: scope, FinancialInstitution: req.FinancialInstitution,
 		AccountIdentifier: req.AccountIdentifier, AccountLast4: domain.Last4(req.AccountIdentifier),
 		CountryCode: req.CountryCode, Currency: req.Currency, PayeeName: req.PayeeName, SourceType: req.SourceType,
-		Fingerprint: fingerprint, Status: domain.StatusCandidate, ProposedByPrincipalID: principalID,
+		Fingerprint: fingerprint, Status: domain.StatusVerificationPending, ProposedByPrincipalID: principalID,
+		ChangeRiskClassification: changeRisk, PriorDestinationID: priorDestinationID,
 		CreatedAt: now, UpdatedAt: now,
 	}
 	s.destinations[d.DestinationID] = d
