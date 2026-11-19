@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	"zoiko.io/workflow-svc/internal/store"
 )
 
 const (
@@ -658,4 +661,551 @@ func (h *Handler) writeFormAuthzErr(w http.ResponseWriter, r *http.Request, err 
 		return
 	}
 	writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_unavailable"})
+}
+
+// =============================================================================
+// WFC-04: Cases (WF-2)
+// =============================================================================
+
+type createCaseRequest struct {
+	WorkflowInstanceID    *string `json:"workflow_instance_id,omitempty"`
+	CaseType              string  `json:"case_type"`                // INVESTIGATION, DISPUTE, EXCEPTION, etc.
+	Title                 string  `json:"title"`
+	Description           string  `json:"description"`
+	AssignedToPrincipalID *string `json:"assigned_to_principal_id,omitempty"`
+}
+
+func (req createCaseRequest) missingField() string {
+	switch {
+	case req.CaseType == "":
+		return "case_type"
+	case req.Title == "":
+		return "title"
+	default:
+		return ""
+	}
+}
+
+// CreateCase handles POST /v1/cases.
+// Creates a new case (optionally linked to a workflow instance).
+func (h *Handler) CreateCase(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req createCaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "bad_request", "invalid JSON body", correlationID, nil)
+		return
+	}
+	if missing := req.missingField(); missing != "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": missing,
+		})
+		return
+	}
+
+	// Verify workflow exists if provided
+	if req.WorkflowInstanceID != nil {
+		_, err := h.store.FindWorkflowByID(r.Context(), *req.WorkflowInstanceID)
+		if err != nil {
+			writeStoreErr(w, r, h.log, err, correlationID, "CreateCase")
+			return
+		}
+	}
+
+	// Authorize against legal entity (need to get from workflow or create with tenant scope)
+	// For now, require AUDIT_ENGAGEMENT_MANAGE or similar
+	// TODO: Add specific CASE_CREATE action
+	if !h.authorizeRead(w, r, nil, principalID, correlationID, "CreateCase") {
+		return
+	}
+
+	params := domain.CreateCaseParams{
+		TenantID:             tenantID,
+		LegalEntityID:        "", // will be set from workflow or require in request
+		WorkflowInstanceID:   req.WorkflowInstanceID,
+		CaseType:             req.CaseType,
+		Title:                req.Title,
+		Description:          req.Description,
+		AssignedToPrincipal:  req.AssignedToPrincipalID,
+		CreatedByPrincipalID: principalID,
+		CorrelationID:        correlationID,
+	}
+
+	// If linked to workflow, get legal entity from workflow
+	if req.WorkflowInstanceID != nil {
+		wf, err := h.store.FindWorkflowByID(r.Context(), *req.WorkflowInstanceID)
+		if err != nil {
+			writeStoreErr(w, r, h.log, err, correlationID, "CreateCase")
+			return
+		}
+		params.LegalEntityID = wf.LegalEntityID
+	} else {
+		// Need legal entity in request for standalone case
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error":  "missing_field",
+			"field":  "legal_entity_id",
+			"detail": "required when not linking to a workflow",
+		})
+		return
+	}
+
+	c, err := h.store.CreateCase(r.Context(), params)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "CreateCase")
+		return
+	}
+
+	h.log.Info("case created",
+		zap.String("case_id", c.CaseID),
+		zap.String("case_type", c.CaseType),
+		zap.String("correlation_id", correlationID),
+	)
+	w.Header().Set("Location", "/v1/cases/"+c.CaseID)
+	writeJSON(w, r, http.StatusCreated, c)
+}
+
+// GetCase handles GET /v1/cases/{case_id}.
+func (h *Handler) GetCase(w http.ResponseWriter, r *http.Request) {
+	caseID := chi.URLParam(r, "case_id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	c, err := h.store.FindCaseByID(r.Context(), caseID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "GetCase")
+		return
+	}
+
+	if !h.authorizeRead(w, r, nil, principalID, r.Header.Get("X-Correlation-ID"), "GetCase") {
+		return
+	}
+
+	writeJSONWithETag(w, r, http.StatusOK, c, c.RowVersion)
+}
+
+// ListCases handles GET /v1/cases.
+// Lists cases with optional filters.
+func (h *Handler) ListCases(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	if !h.authorizeRead(w, r, nil, principalID, r.Header.Get("X-Correlation-ID"), "ListCases") {
+		return
+	}
+
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
+	}
+
+	filter := domain.ListCasesFilter{
+		TenantID:       tenantID,
+		LegalEntityID:  r.URL.Query().Get("legal_entity_id"),
+		CaseType:       r.URL.Query().Get("case_type"),
+		CaseState:      domain.CaseState(r.URL.Query().Get("case_state")),
+		Limit:          limit,
+		Offset:         getIntQuery(r, "offset", 0),
+	}
+
+	if wfID := r.URL.Query().Get("workflow_instance_id"); wfID != "" {
+		filter.WorkflowInstanceID = &wfID
+	}
+
+	results, err := h.store.ListCases(r.Context(), filter)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "ListCases")
+		return
+	}
+
+	if results == nil {
+		results = []*domain.Case{}
+	}
+	writeJSON(w, r, http.StatusOK, results)
+}
+
+type transitionCaseRequest struct {
+	CaseState          string  `json:"case_state"`                    // IN_REVIEW, RESOLVED, CLOSED, ESCALATED
+	ExpectedVersion    int     `json:"expected_version,omitempty"`    // If-Match version
+	ResolutionReason   *string `json:"resolution_reason,omitempty"`   // for RESOLVED
+	CloseReason        *string `json:"close_reason,omitempty"`        // for CLOSED
+}
+
+// TransitionCase handles POST /v1/cases/{case_id}/status.
+// Transitions a case to a new state.
+func (h *Handler) TransitionCase(w http.ResponseWriter, r *http.Request) {
+	caseID := chi.URLParam(r, "case_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req transitionCaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "bad_request", "invalid JSON body", correlationID, nil)
+		return
+	}
+	if req.CaseState == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": "case_state",
+		})
+		return
+	}
+	if !domain.CaseStates[domain.CaseState(req.CaseState)] {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error":  "invalid_field",
+			"field":  "case_state",
+			"detail": "case_state must be a valid case state",
+		})
+		return
+	}
+
+	if !h.authorizeRead(w, r, nil, principalID, correlationID, "TransitionCase") {
+		return
+	}
+
+	// Parse If-Match header
+	expectedVersion := req.ExpectedVersion
+	if match := r.Header.Get("If-Match"); match != "" {
+		match = strings.TrimPrefix(match, "W/")
+		match = strings.Trim(match, `"`)
+		if v, err := strconv.Atoi(match); err == nil {
+			expectedVersion = v
+		} else {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":  "invalid_if_match",
+				"detail": "If-Match must be an integer version",
+			})
+			return
+		}
+	}
+
+	params := domain.TransitionCaseParams{
+		CaseID:           caseID,
+		NewState:         domain.CaseState(req.CaseState),
+		ExpectedVersion:  expectedVersion,
+		ActorPrincipalID: principalID,
+		CorrelationID:    correlationID,
+		ResolutionReason: req.ResolutionReason,
+		CloseReason:      req.CloseReason,
+	}
+
+	updated, transitioned, err := h.store.TransitionCase(r.Context(), params)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "TransitionCase")
+		return
+	}
+
+	h.log.Info("case state transitioned",
+		zap.String("case_id", caseID),
+		zap.String("new_state", string(updated.CaseState)),
+		zap.Bool("transitioned", transitioned),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSONWithETag(w, r, http.StatusOK, updated, updated.RowVersion)
+}
+
+// GetCaseWorkflow handles GET /v1/cases/{case_id}/workflow.
+// Returns the linked workflow instance if any.
+func (h *Handler) GetCaseWorkflow(w http.ResponseWriter, r *http.Request) {
+	caseID := chi.URLParam(r, "case_id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	c, err := h.store.FindCaseByID(r.Context(), caseID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "GetCaseWorkflow")
+		return
+	}
+
+	if !h.authorizeRead(w, r, nil, principalID, r.Header.Get("X-Correlation-ID"), "GetCaseWorkflow") {
+		return
+	}
+
+	if c.WorkflowInstanceID == nil {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "no_linked_workflow"})
+		return
+	}
+
+	wf, err := h.store.FindWorkflowByID(r.Context(), *c.WorkflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "GetCaseWorkflow")
+		return
+	}
+
+	writeJSON(w, r, http.StatusOK, wf)
+}
+
+// =============================================================================
+// ST-1/2/3: State Machine Registry
+// =============================================================================
+
+// GetStateMachine handles GET /v1/state-machines/{workflow_type}.
+// Returns the state machine definition for a workflow type.
+func (h *Handler) GetStateMachine(w http.ResponseWriter, r *http.Request) {
+	workflowType := chi.URLParam(r, "workflow_type")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	// Authorization: WORKFLOW_READ on platform scope
+	if !h.authorizeRead(w, r, nil, principalID, r.Header.Get("X-Correlation-ID"), "GetStateMachine") {
+		return
+	}
+
+	// Look up the workflow definition to get its stage structure
+	defs, _, err := h.store.ListWorkflowDefinitions(r.Context(), domain.ListWorkflowDefinitionsParams{
+		TenantID:     tenantID,
+		WorkflowType: &workflowType,
+		IsActive:     ptrBool(true),
+		Limit:        1,
+	})
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "GetStateMachine")
+		return
+	}
+
+	if len(defs) == 0 {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{
+			"error": "state_machine_not_found",
+			"detail": "no active workflow definition for type: " + workflowType,
+		})
+		return
+	}
+
+	def := defs[0]
+	// Build state machine from definition stages
+	states := []string{"PENDING"}
+	transitions := map[string][]string{
+		"PENDING": {"APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "EXPIRED"},
+	}
+
+	var defStages []domain.DefinitionStage
+	if len(def.StagesJSON) > 0 {
+		if err := json.Unmarshal(def.StagesJSON, &defStages); err != nil {
+			h.log.Warn("failed to unmarshal stages_json", zap.Error(err))
+		} else {
+			for _, stage := range defStages {
+				states = append(states, "STAGE_"+strconv.Itoa(stage.Order))
+			}
+		}
+	}
+	states = append(states, "APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "EXPIRED")
+
+	response := map[string]any{
+		"workflow_type":    def.WorkflowType,
+		"definition_id":    def.WorkflowDefinitionID,
+		"version":          def.Version,
+		"states":           states,
+		"transitions":      transitions,
+		"initial_state":    "PENDING",
+		"terminal_states":  []string{"APPROVED", "REJECTED", "CANCELLED", "EXPIRED"},
+		"requires_human":   true,
+	}
+	writeJSON(w, r, http.StatusOK, response)
+}
+
+// GetAvailableActions handles GET /v1/workflows/{workflow_instance_id}/available-actions.
+// Returns the actions available for the current principal on this workflow.
+// ST-2 endpoint.
+func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
+	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "GetAvailableActions")
+		return
+	}
+
+	if instance.TenantID != tenantID {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+		return
+	}
+
+	// Check if principal can act on this workflow
+	canAct := false
+	reason := ""
+	actions := []string{}
+
+	if instance.WorkflowStatus == domain.WorkflowStatusPending {
+		stage, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
+		if err != nil {
+			writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "GetAvailableActions")
+			return
+		}
+
+		if stage.ApproverPrincipalID == principalID {
+			canAct = true
+			actions = []string{"APPROVE", "REJECT", "REQUEST_CHANGES"}
+		} else if stage.StageType == domain.StageTypeQuorum {
+			// Check if principal is in quorum pool
+			// For now, check via store
+			var eligible bool
+			err := h.store.(*store.PgStore).Pool().QueryRow(r.Context(),
+				`SELECT EXISTS(SELECT 1 FROM workflow_stage_quorum_approvers WHERE workflow_stage_id = $1 AND approver_principal_id = $2)`,
+				stage.WorkflowStageID, principalID).Scan(&eligible)
+			if err == nil && eligible {
+				canAct = true
+				actions = []string{"APPROVE", "REJECT"}
+			}
+		} else if instance.InitiatedBy == principalID {
+			// Initiator can cancel
+			canAct = true
+			actions = []string{"CANCEL"}
+		}
+
+		// Approvers and admins can escalate
+		if canAct || stage.ApproverPrincipalID == principalID {
+			actions = append(actions, "ESCALATE", "ESCALATE_TO")
+		}
+
+		if !canAct && stage.ApproverPrincipalID != principalID {
+			reason = "not the current approver for this stage"
+		}
+	} else if instance.WorkflowStatus == domain.WorkflowStatusEscalated {
+		// Escalation target can act
+		_, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
+		if err == nil && instance.EscalationTarget != nil && *instance.EscalationTarget == principalID {
+			canAct = true
+			actions = []string{"APPROVE", "REJECT", "REQUEST_CHANGES"}
+		}
+	} else if instance.WorkflowStatus == domain.WorkflowStatusApproved ||
+		instance.WorkflowStatus == domain.WorkflowStatusRejected ||
+		instance.WorkflowStatus == domain.WorkflowStatusCancelled ||
+		instance.WorkflowStatus == domain.WorkflowStatusExpired {
+		// Terminal states - no actions
+		actions = []string{}
+	}
+
+	response := domain.AvailableActions{
+		WorkflowInstanceID: workflowInstanceID,
+		CurrentStage:       instance.CurrentStage,
+		CurrentStatus:      instance.WorkflowStatus,
+		Actions:            actions,
+		PrincipalID:        principalID,
+		CanAct:             canAct,
+		Reason:             reason,
+	}
+	writeJSON(w, r, http.StatusOK, response)
+}
+
+// GetTransitionHistory handles GET /v1/workflows/{workflow_instance_id}/transition-history.
+// Returns the complete transition history for a workflow.
+// ST-3 endpoint.
+func (h *Handler) GetTransitionHistory(w http.ResponseWriter, r *http.Request) {
+	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "GetTransitionHistory")
+		return
+	}
+
+	if instance.TenantID != tenantID {
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+		return
+	}
+
+	if !h.authorizeRead(w, r, instance, principalID, r.Header.Get("X-Correlation-ID"), "GetTransitionHistory") {
+		return
+	}
+
+	transitions, err := h.store.GetApprovalEvidence(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, r.Header.Get("X-Correlation-ID"), "GetTransitionHistory")
+		return
+	}
+
+history := make([]domain.TransitionHistoryEntry, len(transitions))
+	for i, t := range transitions {
+		fromStage := 0
+		if t.StageOrder != nil && *t.StageOrder > 0 {
+			fromStage = *t.StageOrder - 1
+		}
+		toStage := 0
+		if t.StageOrder != nil {
+			toStage = *t.StageOrder
+		}
+		history[i] = domain.TransitionHistoryEntry{
+			TransitionID:       t.WorkflowTransitionID,
+			WorkflowInstanceID: t.WorkflowInstanceID,
+			FromStage:          fromStage,
+			ToStage:            toStage,
+			FromStatus:         t.FromState,
+			ToStatus:           t.ToState,
+			ActorPrincipalID:   t.ActedBy,
+ActionType:         t.FromState + "->" + t.ToState,
+			Rationale:          t.Rationale,
+			DecisionID:         t.AccessDecisionID,
+			Quorum:             nil,
+			OccurredAt:         t.ActedAt,
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, history)
+}
+
+// ptrBool returns a pointer to a bool.
+func ptrBool(b bool) *bool {
+	return &b
 }

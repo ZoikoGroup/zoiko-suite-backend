@@ -35,7 +35,7 @@ func eventFn(m store.IdentityMerge) ([]outbox.Record, error) {
 }
 
 func (r *fedRig) merge(survivor, duplicate string) (*store.IdentityMerge, bool, error) {
-	return r.s.MergeIdentities(context.Background(), "t-1", survivor, duplicate, "same person", "admin-9", "corr-m", eventFn)
+	return r.s.MergeIdentities(context.Background(), "t-1", survivor, duplicate, "same person", "admin-9", "corr-m", 1, eventFn)
 }
 
 func TestMerge_MovesLinksDisablesDuplicateAndKeepsItsRow(t *testing.T) {

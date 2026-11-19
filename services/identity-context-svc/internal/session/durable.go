@@ -86,12 +86,18 @@ type DurableCache struct {
 	// sessions (SESSION_CAP_WORKLOAD). Zero leaves workloads uncapped.
 	maxSessionsPerWorkload int
 	onRevoke               RevocationHook
+	onSessionRevoked       PerSessionRevocationHook
 }
 
 // RevocationHook is told about every session the concurrency cap ends, so the
 // revocation leaves the service as identity.session.revoked like any other
 // (it used to be recorded on the row and nowhere else).
 type RevocationHook func(ctx context.Context, sessionContextID, principalID, tenantID string, reason domain.InvalidationReason, correlationID string)
+
+// PerSessionRevocationHook is called for every individual session revocation,
+// so each one emits identity.session.revoked through the outbox with full
+// context (tenant_id, actor, correlation_id). This is IC-16 / S1-12 K-6.
+type PerSessionRevocationHook func(ctx context.Context, sessionContextID, principalID, tenantID string, reason domain.InvalidationReason, actorID, correlationID string)
 
 // NewDurableCache wraps a Redis cache with a durable evidence store.
 func NewDurableCache(cache HotCache, store ContextStore, log *zap.Logger, maxSessionsPerPrincipal int) *DurableCache {
@@ -110,6 +116,13 @@ func (d *DurableCache) WithWorkloadCap(n int) *DurableCache {
 // WithRevocationHook sets the hook the concurrency cap calls.
 func (d *DurableCache) WithRevocationHook(h RevocationHook) *DurableCache {
 	d.onRevoke = h
+	return d
+}
+
+// WithPerSessionRevocationHook sets the hook called for every individual
+// session revocation (IC-16 / S1-12 K-6).
+func (d *DurableCache) WithPerSessionRevocationHook(h PerSessionRevocationHook) *DurableCache {
+	d.onSessionRevoked = h
 	return d
 }
 
@@ -263,7 +276,7 @@ func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, sc domain
 	revoked := 0
 	var firstErr error
 	for _, id := range toRevoke {
-		if err := d.Invalidate(ctx, id, tenantID, domain.InvalidationReasonSessionConcurrencyCap, now); err != nil {
+		if err := d.Invalidate(ctx, id, tenantID, domain.InvalidationReasonSessionConcurrencyCap, now, principalID, sc.CorrelationID); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -318,7 +331,7 @@ func (d *DurableCache) EvictAllForTenant(
 	revoked := 0
 	var firstErr error
 	for _, id := range ids {
-		if err := d.Invalidate(ctx, id, tenantID, reason, now); err != nil {
+		if err := d.Invalidate(ctx, id, tenantID, reason, now, "", ""); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -365,11 +378,15 @@ func (d *DurableCache) GetSessionContext(ctx context.Context, sessionContextID, 
 
 // Invalidate appends the invalidation to both stores. Idempotent: an
 // already-invalidated session is a no-op in each.
+//
+// If actorID and correlationID are provided and a PerSessionRevocationHook is
+// registered, the hook is called for this revocation (IC-16 / S1-12 K-6).
 func (d *DurableCache) Invalidate(
 	ctx context.Context,
 	sessionContextID, tenantID string,
 	reason domain.InvalidationReason,
 	at time.Time,
+	actorID, correlationID string,
 ) error {
 	sc, err := d.GetSessionContext(ctx, sessionContextID, tenantID)
 	if err != nil {
@@ -385,6 +402,9 @@ func (d *DurableCache) Invalidate(
 	if err := d.store.MarkSessionInvalidated(ctx, sessionContextID, tenantID, reason, at); err != nil {
 		return fmt.Errorf("record session invalidation: %w", err)
 	}
+	if d.onSessionRevoked != nil && actorID != "" {
+		d.onSessionRevoked(ctx, sessionContextID, sc.PrincipalID, tenantID, reason, actorID, correlationID)
+	}
 	return nil
 }
 
@@ -395,7 +415,7 @@ func (d *DurableCache) EvictAllForPrincipal(
 	principalID, tenantID string,
 	reason domain.InvalidationReason,
 ) (int, error) {
-	ids, err := d.EvictAllForPrincipalWithIDs(ctx, principalID, tenantID, reason)
+	ids, err := d.EvictAllForPrincipalWithIDs(ctx, principalID, tenantID, reason, "", "")
 	return len(ids), err
 }
 
@@ -406,6 +426,7 @@ func (d *DurableCache) EvictAllForPrincipalWithIDs(
 	ctx context.Context,
 	principalID, tenantID string,
 	reason domain.InvalidationReason,
+	actorID, correlationID string,
 ) ([]string, error) {
 	now := time.Now().UTC()
 	ids := make(map[string]struct{})
@@ -438,7 +459,7 @@ func (d *DurableCache) EvictAllForPrincipalWithIDs(
 	revoked := make([]string, 0, len(ids))
 	var firstErr error
 	for id := range ids {
-		if err := d.Invalidate(ctx, id, tenantID, reason, now); err != nil {
+		if err := d.Invalidate(ctx, id, tenantID, reason, now, actorID, correlationID); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -469,6 +490,7 @@ func (d *DurableCache) EvictAllForEntity(
 	ctx context.Context,
 	legalEntityID, tenantID string,
 	reason domain.InvalidationReason,
+	actorID, correlationID string,
 ) (int, error) {
 	ids, err := d.cache.SessionIDsForEntity(ctx, legalEntityID)
 	if err != nil {
@@ -482,7 +504,7 @@ func (d *DurableCache) EvictAllForEntity(
 	revoked := 0
 	var firstErr error
 	for _, id := range ids {
-		if err := d.Invalidate(ctx, id, tenantID, reason, now); err != nil {
+		if err := d.Invalidate(ctx, id, tenantID, reason, now, actorID, correlationID); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}

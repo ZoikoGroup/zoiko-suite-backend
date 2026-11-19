@@ -180,6 +180,12 @@ type stubStore struct {
 	listPendingApprovalsErr error
 	approvalTransitions     []*domain.WorkflowTransition
 	approvalEvidenceErr     error
+
+	// For API-4 cursor paging tests
+	pendingApprovals       []*domain.WorkflowInstance
+	pendingNextCursor      *domain.PaginationCursor
+	pendingSubmissions     []*domain.FormSubmission
+	pendingSubNextCursor   *domain.PaginationCursor
 }
 
 func (s *stubStore) CreateForm(_ context.Context, _ domain.CreateFormParams) (*domain.FormDefinition, bool, error) {
@@ -218,8 +224,12 @@ func (s *stubStore) GetSubmissionVersion(_ context.Context, _, _ string) (*domai
 func (s *stubStore) GetValidationResult(_ context.Context, _, _ string) (*domain.ValidationResult, error) {
 	return s.validationResult, s.getValidationResultErr
 }
-func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, _ domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
-	return s.pendingSubmissions, nil, s.listPendingErr
+func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, p domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
+	if p.Cursor != nil && s.pendingSubNextCursor != nil {
+		// Return next page
+		return s.pendingSubmissions[1:], nil, s.listPendingErr
+	}
+	return s.pendingSubmissions[:2], s.pendingSubNextCursor, s.listPendingErr
 }
 func (s *stubStore) EscalateToWorkflow(_ context.Context, _ domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error) {
 	return s.escalateToInstance, s.escalateToTransitioned, s.escalateToErr
@@ -227,8 +237,12 @@ func (s *stubStore) EscalateToWorkflow(_ context.Context, _ domain.EscalateToWor
 func (s *stubStore) RequestChanges(_ context.Context, _, _, _ string, _ *string, _ ...domain.LifecycleCommand) error {
 	return s.requestChangesErr
 }
-func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, _ domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
-	return s.pendingInstances, nil, s.listPendingApprovalsErr
+func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, p domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
+	if p.Cursor != nil && s.pendingNextCursor != nil {
+		// Return next page
+		return s.pendingApprovals[1:], nil, s.listPendingApprovalsErr
+	}
+	return s.pendingApprovals[:2], s.pendingNextCursor, s.listPendingApprovalsErr
 }
 func (s *stubStore) GetApprovalEvidence(_ context.Context, _ string) ([]*domain.WorkflowTransition, error) {
 	return s.approvalTransitions, s.approvalEvidenceErr
@@ -239,8 +253,8 @@ func (s *stubStore) CreateWorkflowDefinition(_ context.Context, _ domain.CreateW
 func (s *stubStore) GetWorkflowDefinition(_ context.Context, _ domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
 	return s.workflowDefinition, s.definitionErr
 }
-func (s *stubStore) ListWorkflowDefinitions(_ context.Context, _ domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, error) {
-	return s.workflowDefinitions, s.definitionErr
+func (s *stubStore) ListWorkflowDefinitions(_ context.Context, _ domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error) {
+	return s.workflowDefinitions, nil, s.definitionErr
 }
 func (s *stubStore) SupersedeWorkflowDefinition(_ context.Context, _, _ string) error {
 	return s.definitionErr
@@ -1371,5 +1385,197 @@ func TestVerifyRelease_InvalidFingerprintFormat_BadRequest(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for bad fingerprint, got %d", w.Code)
+	}
+}
+
+// TestListWorkflowDefinitions_API4Cursor proves cursor paging works.
+func TestListWorkflowDefinitions_API4Cursor(t *testing.T) {
+	defs := make([]*domain.WorkflowDefinition, 3)
+	for i := 0; i < 3; i++ {
+		defs[i] = &domain.WorkflowDefinition{
+			WorkflowDefinitionID: fmt.Sprintf("def-%d", i),
+			WorkflowType:         fmt.Sprintf("TYPE-%d", i),
+			Version:              i + 1,
+			IsActive:             true,
+			RowVersion:           1,
+		}
+	}
+
+	store := &stubStore{workflowDefinitions: defs, definitionErr: nil}
+	r := newTestRouter(store)
+
+	// Page 1
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflow-definitions?limit=2", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp1 struct {
+		Records    []*domain.WorkflowDefinition `json:"records"`
+		NextCursor string                       `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp1.Records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(resp1.Records))
+	}
+	if resp1.NextCursor == "" {
+		t.Fatalf("expected next_cursor on page 1")
+	}
+
+	// Page 2
+	req = scoped(httptest.NewRequest(http.MethodGet, "/v1/workflow-definitions?limit=2&cursor="+resp1.NextCursor, nil))
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on page 2, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp2 struct {
+		Records    []*domain.WorkflowDefinition `json:"records"`
+		NextCursor string                       `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp2.Records) != 1 {
+		t.Fatalf("expected 1 record on page 2, got %d", len(resp2.Records))
+	}
+	if resp2.NextCursor != "" {
+		t.Fatalf("expected no next_cursor on last page")
+	}
+
+	// Verify ordering
+	if resp1.Records[0].WorkflowType != "TYPE-2" || resp1.Records[1].WorkflowType != "TYPE-1" {
+		t.Fatalf("expected DESC ordering by type, version")
+	}
+}
+
+// TestListPendingApprovals_API4Cursor proves cursor paging works for pending approvals.
+func TestListPendingApprovals_API4Cursor(t *testing.T) {
+	insts := make([]*domain.WorkflowInstance, 3)
+	for i := 0; i < 3; i++ {
+		insts[i] = &domain.WorkflowInstance{
+			WorkflowInstanceID: fmt.Sprintf("inst-%d", i),
+			WorkflowStatus:     "PENDING",
+			CurrentStage:       1,
+			RowVersion:         1,
+		}
+	}
+
+	store := &stubStore{
+		pendingApprovals: insts,
+		pendingNextCursor: &domain.PaginationCursor{WorkflowInstanceID: "inst-1", StageOrder: 1},
+	}
+	r := newTestRouter(store)
+
+	// Page 1
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/pending?limit=2", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp1 struct {
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                       `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp1.Records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(resp1.Records))
+	}
+	if resp1.NextCursor == "" {
+		t.Fatalf("expected next_cursor on page 1")
+	}
+
+	// Page 2
+	req = scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/pending?limit=2&cursor="+resp1.NextCursor, nil))
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on page 2, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp2 struct {
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                       `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp2.Records) != 1 {
+		t.Fatalf("expected 1 record on page 2, got %d", len(resp2.Records))
+	}
+	if resp2.NextCursor != "" {
+		t.Fatalf("expected no next_cursor on last page")
+	}
+}
+
+// TestListPendingSubmissions_API4Cursor proves cursor paging works for form submissions.
+func TestListPendingSubmissions_API4Cursor(t *testing.T) {
+	subs := make([]*domain.FormSubmission, 3)
+	for i := 0; i < 3; i++ {
+		subs[i] = &domain.FormSubmission{
+			SubmissionID: fmt.Sprintf("sub-%d", i),
+			FormID:       "form-1",
+			Status:       "PENDING",
+			RowVersion:   1,
+		}
+	}
+
+	store := &stubStore{
+		pendingSubmissions: subs,
+		pendingSubNextCursor: &domain.PaginationCursor{SubmissionID: "sub-1"},
+	}
+	r := newTestRouter(store)
+
+	// Page 1
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/forms/form-1/pending-submissions?limit=2", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp1 struct {
+		Records    []*domain.FormSubmission `json:"records"`
+		NextCursor string                       `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp1.Records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(resp1.Records))
+	}
+	if resp1.NextCursor == "" {
+		t.Fatalf("expected next_cursor on page 1")
+	}
+
+	// Page 2
+	req = scoped(httptest.NewRequest(http.MethodGet, "/v1/forms/form-1/pending-submissions?limit=2&cursor="+resp1.NextCursor, nil))
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on page 2, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp2 struct {
+		Records    []*domain.FormSubmission `json:"records"`
+		NextCursor string                       `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp2.Records) != 1 {
+		t.Fatalf("expected 1 record on page 2, got %d", len(resp2.Records))
+	}
+	if resp2.NextCursor != "" {
+		t.Fatalf("expected no next_cursor on last page")
 	}
 }

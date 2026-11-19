@@ -546,6 +546,11 @@ func Load() (*Config, error) {
 	if cfg.IDPClientAuth == "required" && cfg.IDPClientSecretsFile == "" {
 		return nil, errors.New("IDP_CLIENT_AUTH=required needs IDP_CLIENT_SECRETS_FILE: no client could ever log in")
 	}
+	// IC-FE-4 / S1-B1: outside local the console must authenticate as a confidential
+	// client; the fallback local credential list is a development-only crutch.
+	if cfg.Environment != "local" && cfg.IDPClientAuth != "required" {
+		return nil, fmt.Errorf("IDP_CLIENT_AUTH must be 'required' in %s: the console must present a verified client credential (IDP_CLIENT_SECRETS_FILE)", cfg.Environment)
+	}
 
 	keys, err := mfaKeyring(env("MFA_SECRET_KEY", ""), cfg.MFASecretKeyID, env("MFA_SECRET_PREVIOUS_KEYS", ""))
 	if err != nil {

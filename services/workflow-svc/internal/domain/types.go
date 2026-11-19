@@ -337,13 +337,13 @@ type GetWorkflowDefinitionParams struct {
 	WorkflowDefinitionID *string
 }
 
-// ListWorkflowDefinitionsParams holds input for listing workflow definitions.
+// ListWorkflowDefinitionsParams holds input for listing workflow definitions with cursor paging (API-4).
 type ListWorkflowDefinitionsParams struct {
 	TenantID     string
 	WorkflowType *string
 	IsActive     *bool
 	Limit        int
-	Offset       int
+	Cursor       *PaginationCursor
 }
 
 // ListPendingApprovalsParams holds input for listing pending approvals with cursor paging (API-4).
@@ -372,25 +372,36 @@ var ErrAuthorizationDenied = errorString("authorization denied for this approval
 var ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
 
 // ErrConcurrencyConflict is returned when an optimistic concurrency check fails:
-// the workflow or stage was modified by another transaction concurrently.
-var ErrConcurrencyConflict = errorString("concurrency conflict: workflow was modified by another request")
+	// the workflow or stage was modified by another transaction concurrently.
+	var ErrConcurrencyConflict = errorString("concurrency conflict: workflow was modified by another request")
 
-// ErrIdempotencyMismatch is returned when the same idempotency key is used
-// with a different request body — INV-08 / GCP §16 IDEMPOTENCY_MISMATCH.
-var ErrIdempotencyMismatch = errorString("idempotency key mismatch: same key used with different request body")
+	// ErrIdempotencyMismatch is returned when the same idempotency key is used
+	// with a different request body — INV-08 / GCP §16 IDEMPOTENCY_MISMATCH.
+	var ErrIdempotencyMismatch = errorString("idempotency key mismatch: same key used with different request body")
 
-// ErrInitiatorCannotBeApprover is a creation-time validation error:
-// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3)
-// forbids a workflow's initiator from being listed as an approver in any
-// of its own stages.
-var ErrInitiatorCannotBeApprover = errorString("initiated_by may not appear as an approver in any stage")
+	// ErrInitiatorCannotBeApprover is a creation-time validation error:
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3)
+	// forbids a workflow's initiator from being listed as an approver in any
+	// of its own stages.
+	var ErrInitiatorCannotBeApprover = errorString("initiated_by may not appear as an approver in any stage")
 
-// ErrSelfApprovalNotAllowed is the decision-time, defense-in-depth
-// enforcement of the same Segregation of Duties doctrine: the principal who
-// initiated a workflow may not submit an approve/reject action on it, even
-// if they were (incorrectly) recorded as an assigned approver for the
-// current stage.
-var ErrSelfApprovalNotAllowed = errorString("principal may not approve or decide on their own submission")
+	// ErrSelfApprovalNotAllowed is the decision-time, defense-in-depth
+	// enforcement of the same Segregation of Duties doctrine: the principal who
+	// initiated a workflow may not submit an approve/reject action on it, even
+	// if they were (incorrectly) recorded as an assigned approver for the
+	// current stage.
+	var ErrSelfApprovalNotAllowed = errorString("principal may not approve or decide on their own submission")
+
+	// ErrTenantMissing is returned when a tenant-scoped operation is attempted
+	// without a valid tenant ID in the context.
+	var ErrTenantMissing = errorString("tenant ID missing from context")
+
+	// ErrInvalidIdentifier is returned when a database identifier (UUID, etc.)
+	// cannot be parsed from the request.
+	var ErrInvalidIdentifier = errorString("invalid identifier")
+
+	// ErrInvalidField is returned when a request field has an invalid value.
+	var ErrInvalidField = errorString("invalid field")
 
 // Subject binding, invalidation & release gate errors per ZS-STATE-001.
 var ErrInvalidSubjectFingerprint = errorString("invalid subject fingerprint format")
@@ -450,3 +461,179 @@ func DecodePaginationCursor(s string) (*PaginationCursor, error) {
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// =============================================================================
+// WFC-04: Cases (WF-2)
+// =============================================================================
+// A Case is a distinct business object from a workflow instance. It represents
+// a matter under review (e.g., an investigation, dispute, or exception) that
+// may link to one or more workflows for approval steps. Cases have their own
+// lifecycle and can exist independently of workflows.
+//
+// Case states: OPEN → IN_REVIEW → RESOLVED / CLOSED / ESCALATED
+// Terminal states: RESOLVED, CLOSED
+
+type CaseState string
+
+const (
+	CaseStateOpen       CaseState = "OPEN"
+	CaseStateInReview   CaseState = "IN_REVIEW"
+	CaseStateResolved   CaseState = "RESOLVED"
+	CaseStateClosed     CaseState = "CLOSED"
+	CaseStateEscalated  CaseState = "ESCALATED"
+)
+
+var CaseStates = map[CaseState]bool{
+	CaseStateOpen: true, CaseStateInReview: true, CaseStateResolved: true,
+	CaseStateClosed: true, CaseStateEscalated: true,
+}
+
+type Case struct {
+	CaseID              string    `json:"case_id"`
+	TenantID            string    `json:"tenant_id"`
+	LegalEntityID       string    `json:"legal_entity_id"`
+	WorkflowInstanceID  *string   `json:"workflow_instance_id,omitempty"` // optional link
+	CaseType            string    `json:"case_type"`                    // INVESTIGATION, DISPUTE, EXCEPTION, etc.
+	CaseState           CaseState `json:"case_state"`
+	Title               string    `json:"title"`
+	Description         string    `json:"description"`
+	AssignedToPrincipal *string   `json:"assigned_to_principal,omitempty"`
+	OpenedAt            time.Time `json:"opened_at"`
+	ResolvedAt          *time.Time `json:"resolved_at,omitempty"`
+	ClosedAt            *time.Time `json:"closed_at,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
+	Version             int       `json:"version"`
+	RowVersion          int       `json:"row_version"`
+}
+
+type CreateCaseParams struct {
+	TenantID       string
+	LegalEntityID  string
+	WorkflowInstanceID *string
+	CaseType       string
+	Title          string
+	Description    string
+	AssignedToPrincipal *string
+	CreatedByPrincipalID string
+	CorrelationID  string
+}
+
+type TransitionCaseParams struct {
+	CaseID            string
+	NewState          CaseState
+	ExpectedVersion   int
+	ActorPrincipalID  string
+	CorrelationID     string
+	ResolutionReason  *string // for RESOLVED
+	CloseReason       *string // for CLOSED
+}
+
+type ListCasesFilter struct {
+	TenantID       string
+	LegalEntityID  string
+	WorkflowInstanceID *string
+	CaseType       string
+	CaseState      CaseState
+	Limit          int
+	Offset         int
+	AfterCreatedAt *time.Time
+	AfterID        string
+}
+
+var ErrCaseNotFound = errorString("case not found")
+var ErrInvalidCaseTransition = errorString("invalid case state transition")
+
+// Case state transitions
+var CaseStateTransitions = map[CaseState][]CaseState{
+	CaseStateOpen:      {CaseStateInReview, CaseStateEscalated, CaseStateClosed},
+	CaseStateInReview:  {CaseStateResolved, CaseStateClosed, CaseStateEscalated},
+	CaseStateEscalated: {CaseStateInReview, CaseStateResolved, CaseStateClosed},
+	// Terminal states: no transitions out
+	CaseStateResolved:  {},
+	CaseStateClosed:    {},
+}
+
+// =============================================================================
+// ST-1/2/3: State Machine Registry
+// =============================================================================
+
+// StateMachineRegistry holds the allowed states and transitions for each
+// workflow type. This is loaded from workflow definitions.
+type StateMachineRegistry struct {
+	// Maps workflow_type -> state machine definition
+	definitions map[string]*StateMachineDef
+}
+
+type StateMachineDef struct {
+	WorkflowType     string
+	States           []string
+	Transitions      map[string][]string // from_state -> []to_state
+	InitialState     string
+	TerminalStates   []string
+	RequiresHuman    bool // whether approvals require human (not service account)
+}
+
+// GetStateMachine returns the state machine for a workflow type.
+// Returns nil if not found.
+func (r *StateMachineRegistry) GetStateMachine(workflowType string) *StateMachineDef {
+	return r.definitions[workflowType]
+}
+
+// RegisterStateMachine registers a state machine for a workflow type.
+func (r *StateMachineRegistry) RegisterStateMachine(def *StateMachineDef) {
+	if r.definitions == nil {
+		r.definitions = make(map[string]*StateMachineDef)
+	}
+	r.definitions[def.WorkflowType] = def
+}
+
+// IsValidTransition checks if a transition is allowed for a workflow type.
+func (r *StateMachineRegistry) IsValidTransition(workflowType, fromState, toState string) bool {
+	def := r.GetStateMachine(workflowType)
+	if def == nil {
+		return false
+	}
+	allowed, ok := def.Transitions[fromState]
+	if !ok {
+		return false
+	}
+	for _, s := range allowed {
+		if s == toState {
+			return true
+		}
+	}
+	return false
+}
+
+// AvailableActions returns the actions available for a principal at a given stage.
+// This is the ST-2 endpoint: GET /v1/workflows/{id}/available-actions
+type AvailableActions struct {
+	WorkflowInstanceID string   `json:"workflow_instance_id"`
+	CurrentStage       int      `json:"current_stage"`
+	CurrentStatus      string   `json:"current_status"`
+	Actions            []string `json:"actions"` // APPROVE, REJECT, REQUEST_CHANGES, ESCALATE, CANCEL, INVALIDATE, etc.
+	PrincipalID        string   `json:"principal_id"`
+	CanAct             bool     `json:"can_act"`
+	Reason             string   `json:"reason,omitempty"` // why can_act is false
+}
+
+// TransitionHistoryEntry is one entry in the transition history.
+// This is the ST-3 endpoint: GET /v1/workflows/{id}/transition-history
+type TransitionHistoryEntry struct {
+	TransitionID      string    `json:"transition_id"`
+	WorkflowInstanceID string   `json:"workflow_instance_id"`
+	FromStage         int       `json:"from_stage"`
+	ToStage           int       `json:"to_stage"`
+	FromStatus        string    `json:"from_status"`
+	ToStatus          string    `json:"to_status"`
+	ActorPrincipalID  string    `json:"actor_principal_id"`
+	ActionType        string    `json:"action_type"` // APPROVE, REJECT, REQUEST_CHANGES, ESCALATE, etc.
+	Rationale         *string   `json:"rationale,omitempty"`
+	DecisionID        *string   `json:"decision_id,omitempty"`
+	Quorum            any       `json:"quorum,omitempty"`
+	OccurredAt        time.Time `json:"occurred_at"`
+}
+
+// ErrNoStateMachine is returned when no state machine is registered for a workflow type.
+var ErrNoStateMachine = errorString("no state machine registered for workflow type")

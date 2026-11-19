@@ -51,7 +51,7 @@ type Store interface {
 	// other has already merged away.
 	MergeSubjects(ctx context.Context, tenantID, survivorID, duplicateID, actor, reason, correlationID string,
 		duplicateVersion int64, recs ...outbox.Record) (*store.MergeResult, error)
-	MergeIdentities(ctx context.Context, tenantID, survivorID, duplicateID, reason, actor, correlationID string,
+	MergeIdentities(ctx context.Context, tenantID, survivorID, duplicateID, reason, actor, correlationID string, duplicateVersion int64,
 		build func(m store.IdentityMerge) ([]outbox.Record, error)) (*store.IdentityMerge, bool, error)
 }
 
@@ -628,7 +628,9 @@ func (s *Service) Merge(ctx context.Context, a Actor, survivorID, duplicateID, r
 // Idempotent: the second identical call returns the recorded merge with created=false and ends nothing.
 // The actor may be neither identity (an administrator does not merge their own account), which is the recovery
 // separation: nobody approves their own identity recovery.
-func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, duplicateID, reason string) (*store.IdentityMerge, bool, error) {
+//
+// IC-14 (S1-14): adds duplicateVersion (If-Match) parameter for optimistic locking.
+func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, duplicateID, reason string, duplicateVersion int64) (*store.IdentityMerge, bool, error) {
 	survivorID, duplicateID, reason = strings.TrimSpace(survivorID), strings.TrimSpace(duplicateID), strings.TrimSpace(reason)
 	switch {
 	case survivorID == "" || duplicateID == "":
@@ -640,7 +642,7 @@ func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, dupli
 	case a.PrincipalID == survivorID || a.PrincipalID == duplicateID:
 		return nil, false, fmt.Errorf("%w: you cannot merge your own identity", ErrForbidden)
 	}
-	m, created, err := s.store.MergeIdentities(ctx, a.TenantID, survivorID, duplicateID, reason, a.PrincipalID, a.CorrelationID,
+	m, created, err := s.store.MergeIdentities(ctx, a.TenantID, survivorID, duplicateID, reason, a.PrincipalID, a.CorrelationID, duplicateVersion,
 		func(m store.IdentityMerge) ([]outbox.Record, error) {
 			// IC-14 (S1-14 merge route parity): emit the same three events as Merge (POST /v1/subjects/{id}/merge).
 			merged, err := events.Render(events.EventSubjectMerged, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,

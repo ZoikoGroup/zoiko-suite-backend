@@ -37,7 +37,7 @@ type ObligationStore interface {
 	UpdateObligationWorkflow(ctx context.Context, obligationID, workflowID, actorID, correlationID string) (*domain.Obligation, error)
 	UpdateObligation(ctx context.Context, params domain.UpdateObligationParams) (*domain.Obligation, bool, error)
 	CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error)
-	ListFilingRequirements(ctx context.Context, obligationID string, limit int) ([]*domain.FilingRequirement, error)
+	ListFilingRequirements(ctx context.Context, filter domain.ListFilingRequirementsFilter) ([]*domain.FilingRequirement, error)
 	FindFilingRequirement(ctx context.Context, obligationID, filingRequirementID string) (*domain.FilingRequirement, error)
 	UpdateFilingStatus(ctx context.Context, params domain.UpdateFilingStatusParams) (*domain.FilingRequirement, bool, error)
 	ListFilingTransitions(ctx context.Context, obligationID, filingRequirementID string) ([]*domain.FilingTransition, error)
@@ -1209,9 +1209,13 @@ func (h *Handler) CreateClock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate clock class
-	if !domain.ClockStatuses[domain.ClockClass(req.ClockClass)] {
-		// ClockClass is data, not a fixed enum - but we check it's not empty
-		// The store will enforce the obligation exists and legal_entity matches
+	if !domain.ClockClasses[domain.ClockClass(req.ClockClass)] {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error":  "invalid_field",
+			"field":  "clock_class",
+			"detail": "must be one of HARD_LEGAL, SOFT_INTERNAL, ADVISORY, EXTENSION",
+		})
+		return
 	}
 
 	// Parse due_soon_threshold as Go duration
@@ -1928,7 +1932,7 @@ func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request)
 		filter.AfterCreatedAt, filter.AfterID = &at, id
 	}
 
-	results, err := h.store.ListFilingRequirements(r.Context(), obligationID, filter)
+	results, err := h.store.ListFilingRequirements(r.Context(), filter)
 	if err != nil {
 		h.writeStoreErr(w, r, "ListFilingRequirements: store unavailable", err)
 		return

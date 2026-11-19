@@ -157,7 +157,7 @@ func (m *mockSessionCache) GetSessionContext(_ context.Context, id, _ string) (*
 	defer m.mu.Unlock()
 	return m.storedCtx[id], nil
 }
-func (m *mockSessionCache) Invalidate(_ context.Context, id, _ string, reason domain.InvalidationReason, at time.Time) error {
+func (m *mockSessionCache) Invalidate(_ context.Context, id, _ string, reason domain.InvalidationReason, at time.Time, _, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.invalidated = append(m.invalidated, id)
@@ -168,6 +168,12 @@ func (m *mockSessionCache) Invalidate(_ context.Context, id, _ string, reason do
 	return nil
 }
 func (m *mockSessionCache) EvictAllForPrincipal(_ context.Context, _, _ string, _ domain.InvalidationReason) (int, error) {
+	return 0, nil
+}
+func (m *mockSessionCache) EvictAllForPrincipalWithIDs(_ context.Context, _, _ string, _ domain.InvalidationReason, _, _ string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockSessionCache) EvictAllForEntity(_ context.Context, _, _ string, _ domain.InvalidationReason, _, _ string) (int, error) {
 	return 0, nil
 }
 

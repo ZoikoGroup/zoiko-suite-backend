@@ -182,25 +182,28 @@ services:
   # ── S3-Class Object Storage (MinIO — §10.3 Document & Evidence Store) ────────
   # Port 9000: S3 API consumed by services. Port 9001: MinIO Console UI.
   # http://localhost:9001 (minioadmin / miniosecret) — dev only.
-  # Bucket naming follows data-classification tiers defined in §10.3:
-  #   zoiko-restricted | zoiko-confidential | zoiko-internal | zoiko-public
+# Bucket naming follows data-classification tiers defined in §10.3:
+#   zoiko-restricted | zoiko-confidential | zoiko-internal | zoiko-public
   minio:
-    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    image: localstack/localstack:3.0
     container_name: zoiko-minio
     mem_limit: 512m
     cpus: "0.5"
-    command: server /data --console-address ":9001"
+    command: ["localstack", "start", "--host"]
     ports:
       - "9000:9000"
       - "9001:9001"
+      - "4566:4566"
+      - "4510-4559:4510-4559"
     environment:
+      SERVICES: s3
+      DEBUG: 1
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: miniosecret
     volumes:
-      - minio_data:/data
+      - minio_data:/var/lib/localstack
     healthcheck:
-      # mc ready polls the S3 health endpoint — guaranteed by the image.
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -739,7 +742,7 @@ services:
       # SCIM provisioning, role requests to access-control-svc, and the deprovisioning worker. Requires
       # FEDERATION_ENABLED. IDENTITY_SERVICE_PRINCIPAL_ID needs ROLE_MANAGE on the entities its mappings name:
       # an operator grant, never something federation gives itself.
-      FEDERATION_PROVISIONING_ENABLED: "${FEDERATION_PROVISIONING_ENABLED:-false}"
+      FEDERATION_PROVISIONING_ENABLED: "${FEDERATION_PROVISIONING_ENABLED:-true}"
       FEDERATION_WORKER_INTERVAL_SECONDS: "15"
       FEDERATION_RETRY_BASE_SECONDS: "10"
       FEDERATION_REVOKE_RETRY_MAX_SECONDS: "60"
@@ -1908,20 +1911,20 @@ services:
   # ── ClamAV for document-vault-svc virus scanning ──────────────────────────────
   # Runs under "scan" profile; document-vault-svc refuses uploads without it.
   clamav:
-    image: clamav/clamav:1.4.1
+    image: clamav/clamav:latest
     container_name: zoiko-clamav
     mem_limit: 1g
     cpus: "1.0"
-    command: ["clamd", "--foreground=true"]
+    command: ["sh", "-c", "freshclam -d --checks=1 & clamd --foreground=true"]
     profiles: ["scan"]
     volumes:
       - clamav_db:/var/lib/clamav
     healthcheck:
-      test: ["CMD-SHELL", "clamdscan --ping || exit 1"]
+      test: ["CMD-SHELL", "clamdscan --ping=3 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 120s
     restart: on-failure
 
   # ── Phase 2: Document Vault Service (Port: 8094) ─────────────────────────────

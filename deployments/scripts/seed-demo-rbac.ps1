@@ -116,6 +116,15 @@ $WORKFLOW_SERVICE_ID      = "svc-workflow"
 $CONTRACT_LIFECYCLE_SERVICE_ID = "svc-contract-lifecycle"
 $DECISION_SUPPORT_SERVICE_ID   = "svc-decision-support"
 
+# identity-context-svc's own identity (IDENTITY_SERVICE_PRINCIPAL_ID).
+# Its federation provisioning pipeline (IC-15 / S1-B5) calls access-control-svc
+# to create assignments for mapped roles. It acts as svc-identity-context and
+# must hold ROLE_MANAGE on the legal entities its mappings name: an operator
+# grant, never something federation gives itself. The production grant is
+# provisioned by access-control-svc migration 000061 in every tenant; this script
+# only verifies it in the demo tenant.
+$IDENTITY_SERVICE_ID = "svc-identity-context"
+
 $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 
 # Platform-scope records (decisions, config, flags, secret policies, policy
@@ -910,6 +919,18 @@ $BUNDLES = @(
                     # proposed the version.
                     "FEDERATION_READ", "FEDERATION_CONFIGURE", "FEDERATION_APPROVE",
                     "FEDERATION_SUSPEND", "FEDERATION_LINK", "FEDERATION_PROVISIONING_MANAGE")
+    },
+    @{
+        # identity-context-svc's federation provisioning operator (IC-15 / S1-B5).
+        # The provisioning pipeline (internal/federation/provision.go) calls
+        # access-control-svc to create assignments for mapped roles. It acts as
+        # svc-identity-context and must hold ROLE_MANAGE on the legal entities its
+        # mappings name: an operator grant, never something federation gives itself.
+        # The production grant is provisioned by access-control-svc migration 000061
+        # in every tenant; this bundle is the demo tenant verification.
+        Code    = "IDENTITY_PROVISIONING_OPERATOR"
+        Service = "identity-context-svc"
+        Actions = @("ROLE_MANAGE")
     },
     @{
         # siem-integration-svc (access-control 000024): configuring where the
@@ -2013,6 +2034,19 @@ foreach ($p in @($PRINCIPAL_ID, $APPROVER_ID)) {
             Write-Host "     $p does not hold TOKEN_DETOKENIZE on $scope ($outcome)" -ForegroundColor Green
         }
     }
+}
+
+# IC-15: identity-context-svc provisioning operator must hold ROLE_MANAGE on the
+# demo legal entity (migration 000061 provisions it in every tenant).
+Write-Host "Verifying identity-context-svc provisioning operator (IC-15):" -ForegroundColor Cyan
+$probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+    principal_id = $IDENTITY_SERVICE_ID; legal_entity_id = $LEGAL_ENTITY; action_type = "ROLE_MANAGE"
+}
+if ($probe.body.decision_outcome -ne "GRANTED") {
+    $failed += "ROLE_MANAGE ($IDENTITY_SERVICE_ID on $LEGAL_ENTITY)"
+    Write-Host ("     {0,-28} {1,-28} -> {2}" -f $IDENTITY_SERVICE_ID, "ROLE_MANAGE", $probe.body.decision_outcome) -ForegroundColor Red
+} else {
+    Write-Host ("     {0,-28} {1,-28} -> GRANTED" -f $IDENTITY_SERVICE_ID, "ROLE_MANAGE") -ForegroundColor Green
 }
 
 if ($failed.Count -gt 0) {

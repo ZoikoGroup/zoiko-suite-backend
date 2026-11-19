@@ -12,6 +12,11 @@ import (
 	"zoiko.io/identity-context-svc/internal/domain"
 )
 
+// notSuspended is the predicate every query that frames or counts a role holder
+// adds: the latest suspension, if any, is not newer than the latest resumption.
+const notSuspended = `
+		  AND NOT (suspended_at IS NOT NULL AND (resumed_at IS NULL OR suspended_at > resumed_at))`
+
 // ErrUnknownPrincipal: see domain.ErrUnknownPrincipal.
 var ErrUnknownPrincipal = domain.ErrUnknownPrincipal
 
@@ -127,6 +132,65 @@ func (s *PgStore) EndRoleAssignment(ctx context.Context, tenantID, assignmentID 
 		_, err := tx.Exec(ctx, `
 			UPDATE principal_role_assignments SET effective_to = LEAST(effective_to, $1)
 			 WHERE assignment_id = $2 AND tenant_id = $3`, at, assignmentID, tenantID)
+		return err
+	})
+}
+
+// SuspendRoleAssignment suspends a projected assignment (iam.assignment.suspended).
+// The assignment is held back, not ended: it can be resumed. The suspension is
+// recorded by setting suspended_at. Nothing is tombstoned, since a suspension
+// is reversible. If the assignment is not yet projected, the suspension is
+// recorded in pending_role_assignment_suspensions (IC-12).
+func (s *PgStore) SuspendRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error {
+	if tenantID == "" || assignmentID == "" {
+		return errors.New("SuspendRoleAssignment: tenant_id and assignment_id are required")
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// First, try to update an existing projection row
+		cmdTag, err := tx.Exec(ctx, `
+			UPDATE principal_role_assignments SET suspended_at = $1
+			 WHERE assignment_id = $2 AND tenant_id = $3`, at, assignmentID, tenantID)
+		if err != nil {
+			return err
+		}
+		if cmdTag.RowsAffected() > 0 {
+			// Projection row existed, suspension applied
+			return nil
+		}
+		// No projection row yet: record in pending table (IC-12)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO pending_role_assignment_suspensions (tenant_id, assignment_id, suspended_at)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (tenant_id, assignment_id) DO UPDATE
+			   SET suspended_at = $3`, tenantID, assignmentID, at)
+		return err
+	})
+}
+
+// ResumeRoleAssignment resumes a suspended assignment (iam.assignment.resumed).
+// Lifts the hold by setting resumed_at; revokes nothing, because a resume only
+// adds access. If the assignment was pending (no projection row), the pending
+// suspension is cleared.
+func (s *PgStore) ResumeRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error {
+	if tenantID == "" || assignmentID == "" {
+		return errors.New("ResumeRoleAssignment: tenant_id and assignment_id are required")
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// First, try to update an existing projection row
+		cmdTag, err := tx.Exec(ctx, `
+			UPDATE principal_role_assignments SET resumed_at = $1
+			 WHERE assignment_id = $2 AND tenant_id = $3`, at, assignmentID, tenantID)
+		if err != nil {
+			return err
+		}
+		if cmdTag.RowsAffected() > 0 {
+			// Projection row existed, resume applied
+			return nil
+		}
+		// No projection row: clear the pending suspension
+		_, err = tx.Exec(ctx, `
+			DELETE FROM pending_role_assignment_suspensions
+			 WHERE tenant_id = $1 AND assignment_id = $2`, tenantID, assignmentID)
 		return err
 	})
 }

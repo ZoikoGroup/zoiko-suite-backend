@@ -358,6 +358,7 @@ func main() {
 	// identity.session.revoked, like every other revocation, and is streamed
 	// to SIEM as a security signal.
 	sessionCache.WithRevocationHook(capRevocationHook(publisher, siemClient, log)).
+		WithPerSessionRevocationHook(perSessionRevocationHook(publisher, log)).
 		WithWorkloadCap(cfg.SessionCapWorkload)
 
 	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
@@ -708,7 +709,8 @@ func main() {
 		WithLifecycle(lifecycleSvc).
 		WithConsole(principalRepo, cursorSigner).
 		WithIdentityReader(principalRepo).
-		WithIdentityMerger(identityMerger{svc: lifecycleSvc})
+		WithIdentityMerger(identityMerger{svc: lifecycleSvc}).
+		WithMetrics(ic8Metrics)
 	provider.RegisterRoutes(r)
 	identityctx.RegisterRoutes(r, h)
 	rootHandler, stopFederation := mountFederation(r, config.LoadFederation(), config.LoadProvisioning(), cfg, principalRepo, idpIssuer, authzClient, siemClient, sessionEvictor{cache: sessionCache}, log)

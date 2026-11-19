@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/federation"
 	"zoiko.io/identity-context-svc/internal/lifecycle"
@@ -222,8 +223,9 @@ func (h *Handler) ListIdentityAuthenticationEvents(w http.ResponseWriter, r *htt
 const ActionIdentityMerge = "IDENTITY_MERGE"
 
 // IdentityMerger is the merge command (internal/lifecycle.Service.MergeDuplicate).
+// IC-14 (S1-14): adds If-Match version and stepped-up actor.
 type IdentityMerger interface {
-	MergeDuplicate(ctx context.Context, tenantID, actorID, survivorID, duplicateID, reason, correlationID string) (*store.IdentityMerge, bool, error)
+	MergeDuplicate(ctx context.Context, tenantID string, actor lifecycle.Actor, survivorID, duplicateID, reason string, duplicateVersion int64, correlationID string) (*store.IdentityMerge, bool, error)
 }
 
 // WithIdentityMerger wires the merge command. Nil answers 501.
@@ -240,6 +242,8 @@ type mergeRequest struct {
 // MergeIdentity answers POST /v1/identities/{survivorID}/merge (ORG-01 MergeDuplicateIdentity): 201 when the merge is made, 200 when the
 // same merge had already been made (idempotent by tenant and duplicate), 409 when the duplicate was merged into
 // someone else or the merge would chain.
+//
+// IC-14 (S1-14): requires If-Match on the duplicate's record_version and a stepped-up actor (recent MFA).
 func (h *Handler) MergeIdentity(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
@@ -256,6 +260,23 @@ func (h *Handler) MergeIdentity(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable, "identity merge is not configured in this deployment")
 		return
 	}
+	// IC-14: If-Match is required on the duplicate subject's ETag
+	version, any, present, err := apicontract.IfMatchVersion(r)
+	if !present {
+		writeCoded(w, r, http.StatusPreconditionRequired, "precondition_required",
+			"If-Match with the duplicate subject's ETag is required")
+		return
+	}
+	if err != nil || any {
+		writeCoded(w, r, http.StatusBadRequest, "invalid_if_match",
+			"If-Match must be the duplicate subject's ETag from GET /v1/subjects/{id}")
+		return
+	}
+	// IC-14: requires a stepped-up actor (recent MFA)
+	actor, ok := h.steppedUpActor(w, r, tenantID, caller)
+	if !ok {
+		return
+	}
 	var req mergeRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
 	dec.DisallowUnknownFields()
@@ -263,8 +284,8 @@ func (h *Handler) MergeIdentity(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, r, http.StatusBadRequest, "invalid_request", "invalid request body")
 		return
 	}
-	m, created, err := h.merger.MergeDuplicate(r.Context(), tenantID, caller, chi.URLParam(r, "principalID"),
-		req.DuplicateID, req.Reason, strings.TrimSpace(r.Header.Get("X-Correlation-ID")))
+	m, created, err := h.merger.MergeDuplicate(r.Context(), tenantID, actor, chi.URLParam(r, "principalID"),
+		req.DuplicateID, req.Reason, version, strings.TrimSpace(r.Header.Get("X-Correlation-ID")))
 	if err != nil {
 		switch {
 		case errors.Is(err, lifecycle.ErrInvalid):
@@ -275,6 +296,8 @@ func (h *Handler) MergeIdentity(w http.ResponseWriter, r *http.Request) {
 			writeCoded(w, r, http.StatusNotFound, "not_found", err.Error())
 		case errors.Is(err, lifecycle.ErrConflict):
 			writeCoded(w, r, http.StatusConflict, "merge_conflict", err.Error())
+		case errors.Is(err, store.ErrMergeStale):
+			writeCoded(w, r, http.StatusPreconditionFailed, "stale_version", err.Error())
 		default:
 			h.log.Error("identity merge failed", zap.Error(err))
 			writeCoded(w, r, http.StatusInternalServerError, "internal_error", "failed to merge the identity")

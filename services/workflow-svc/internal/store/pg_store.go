@@ -7,8 +7,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +21,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 	"zoiko.io/workflow-svc/internal/outbox"
 )
@@ -54,7 +58,7 @@ type Store interface {
 	// Workflow Definitions (versioned, immutable) per R-001 WFC-02
 	CreateWorkflowDefinition(ctx context.Context, params domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error)
 	GetWorkflowDefinition(ctx context.Context, params domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error)
-	ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, error)
+	ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error)
 	SupersedeWorkflowDefinition(ctx context.Context, oldDefID, newDefID string) error
 
 	// Additional workflow definition lifecycle methods
@@ -67,12 +71,25 @@ type Store interface {
 	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
 	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
+
+	// WFC-04: Cases (WF-2)
+	CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, error)
+	FindCaseByID(ctx context.Context, caseID string) (*domain.Case, error)
+	ListCases(ctx context.Context, filter domain.ListCasesFilter) ([]*domain.Case, error)
+	TransitionCase(ctx context.Context, params domain.TransitionCaseParams) (*domain.Case, bool, error)
+	FindCasesByWorkflowInstance(ctx context.Context, workflowInstanceID string) ([]*domain.Case, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+}
+
+// Pool returns the underlying connection pool for direct queries.
+// Use sparingly — prefer withRLS or withTenantTx.
+func (s *PgStore) Pool() *pgxpool.Pool {
+	return s.pool
 }
 
 // New returns an open PgStore. Caller must call pool.Close() when done.
@@ -99,6 +116,65 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// mapPgError turns the Postgres failures that are really caller mistakes into
+// domain errors, so they stop arriving at the handler as "the store is
+// unavailable".
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+		return domain.ErrInvalidIdentifier
+	}
+	return err
+}
+
+// tenantOf reads the caller's tenant from the context.
+func tenantOf(ctx context.Context) string {
+	if env, ok := svcenvelope.FromContext(ctx); ok && env.TenantID != "" {
+		return env.TenantID
+	}
+	return svcmiddleware.TenantFromContext(ctx)
+}
+
+// withTenantTx runs fn inside a transaction with app.tenant_id installed, so
+// the row-level security policy has something to compare against.
+func (s *PgStore) withTenantTx(ctx context.Context, fn func(tx pgx.Tx, tenantID string) error) error {
+	tenantID := tenantOf(ctx)
+	if tenantID == "" {
+		return domain.ErrTenantMissing
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if err := fn(tx, tenantID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// insertOutboxEventTx inserts an event into the outbox within an existing transaction.
+func insertOutboxEventTx(ctx context.Context, tx pgx.Tx, tenantID, eventType, correlationID, legalEntityID, jurisdictionID, actorID string, payload map[string]any) error {
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal outbox payload: %w", err)
+	}
+
+	const query = `
+		INSERT INTO outbox (tenant_id, event_type, correlation_id, legal_entity_id, jurisdiction_id, actor_id, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW());`
+
+	_, err = tx.Exec(ctx, query, tenantID, eventType, correlationID, legalEntityID, jurisdictionID, actorID, payloadBytes)
+	if err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
 }
 
 // ── workflow_instances ───────────────────────────────────────────────────────
@@ -1178,4 +1254,371 @@ func (s *PgStore) ListPendingApprovals(ctx context.Context, tenantID string, par
 	}
 
 	return instances, nextCursor, nil
+}
+
+// =============================================================================
+// WFC-04: Cases (WF-2)
+// =============================================================================
+
+const caseColumns = `
+	case_id,
+	tenant_id,
+	legal_entity_id,
+	workflow_instance_id,
+	case_type,
+	case_state,
+	title,
+	description,
+	assigned_to_principal_id,
+	opened_at,
+	resolved_at,
+	closed_at,
+	created_at,
+	updated_at,
+	version,
+	row_version`
+
+func scanCase(row pgx.Row) (*domain.Case, error) {
+	c := &domain.Case{}
+	err := row.Scan(
+		&c.CaseID,
+		&c.TenantID,
+		&c.LegalEntityID,
+		&c.WorkflowInstanceID,
+		&c.CaseType,
+		&c.CaseState,
+		&c.Title,
+		&c.Description,
+		&c.AssignedToPrincipal,
+		&c.OpenedAt,
+		&c.ResolvedAt,
+		&c.ClosedAt,
+		&c.CreatedAt,
+		&c.UpdatedAt,
+		&c.Version,
+		&c.RowVersion,
+	)
+	return c, err
+}
+
+// CreateCase creates a new case.
+func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, error) {
+	if params.WorkflowInstanceID != nil {
+		// Verify workflow exists and is in same tenant
+		_, err := s.FindWorkflowByID(ctx, *params.WorkflowInstanceID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	const query = `
+		INSERT INTO cases (
+			case_id, tenant_id, legal_entity_id, workflow_instance_id,
+			case_type, case_state, title, description, assigned_to_principal_id,
+			opened_at, created_by_principal_id
+		) VALUES (gen_random_uuid(), $1, $2, $3, $4, 'OPEN', $5, $6, $7, NOW(), $8)
+		RETURNING ` + caseColumns + `;`
+
+	var c *domain.Case
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		if params.TenantID != tenantID {
+			return domain.ErrTenantMissing
+		}
+
+		var scanErr error
+		c, scanErr = scanCase(tx.QueryRow(ctx, query,
+			tenantID, params.LegalEntityID, params.WorkflowInstanceID,
+			params.CaseType, params.Title, params.Description,
+			params.AssignedToPrincipal, params.CreatedByPrincipalID))
+		if scanErr != nil {
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+
+		// Write case.created event
+		return insertOutboxEventTx(ctx, tx, tenantID, "case.created", params.CorrelationID,
+			params.LegalEntityID, "", params.CreatedByPrincipalID, map[string]any{
+				"case_id":            c.CaseID,
+				"case_type":          c.CaseType,
+				"case_state":         string(c.CaseState),
+				"workflow_instance_id": c.WorkflowInstanceID,
+				"version":            c.Version,
+			})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// FindCaseByID returns the Case with the given case_id.
+func (s *PgStore) FindCaseByID(ctx context.Context, caseID string) (*domain.Case, error) {
+	const query = `
+		SELECT ` + caseColumns + `
+		FROM cases
+		WHERE case_id = $1 AND tenant_id = $2;`
+
+	var c *domain.Case
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		c, scanErr = scanCase(tx.QueryRow(ctx, query, caseID, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrCaseNotFound
+		}
+		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return nil, domain.ErrCaseNotFound
+		}
+		s.log.Error("pg FindCaseByID failed", zap.String("case_id", caseID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return c, nil
+}
+
+// ListCases returns cases matching the given filter.
+func (s *PgStore) ListCases(ctx context.Context, filter domain.ListCasesFilter) ([]*domain.Case, error) {
+	tenantID := tenantOf(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrTenantMissing
+	}
+	if filter.TenantID != "" && filter.TenantID != tenantID {
+		return nil, domain.ErrTenantMissing
+	}
+
+	query := `SELECT ` + caseColumns + ` FROM cases WHERE tenant_id = $1`
+	args := []any{tenantID}
+
+	addFilter := func(clause string, value any) {
+		args = append(args, value)
+		query += fmt.Sprintf(" AND %s $%d", clause, len(args))
+	}
+
+	if filter.LegalEntityID != "" {
+		addFilter("legal_entity_id =", filter.LegalEntityID)
+	}
+	if filter.WorkflowInstanceID != nil {
+		addFilter("workflow_instance_id =", *filter.WorkflowInstanceID)
+	}
+	if filter.CaseType != "" {
+		addFilter("case_type =", filter.CaseType)
+	}
+	if filter.CaseState != "" {
+		addFilter("case_state =", filter.CaseState)
+	}
+
+	query += " ORDER BY created_at DESC, case_id DESC"
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" LIMIT $%d", len(args))
+	args = append(args, filter.Offset)
+	query += fmt.Sprintf(" OFFSET $%d;", len(args))
+
+	var results []*domain.Case
+	var err error
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, args...)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg ListCases failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			c, scanErr := scanCase(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListCases scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, c)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// TransitionCase transitions a case to a new state, enforcing the case state machine.
+func (s *PgStore) TransitionCase(ctx context.Context, params domain.TransitionCaseParams) (*domain.Case, bool, error) {
+	var updated *domain.Case
+
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		// Lock the case row
+		const lockQuery = `
+			SELECT ` + caseColumns + `
+			FROM cases
+			WHERE case_id = $1 AND tenant_id = $2
+			FOR UPDATE;`
+
+		current, err := scanCase(tx.QueryRow(ctx, lockQuery, params.CaseID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrCaseNotFound
+			}
+			if mapped := mapPgError(err); errors.Is(mapped, domain.ErrInvalidIdentifier) {
+				return domain.ErrCaseNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		if params.ExpectedVersion > 0 && current.Version != params.ExpectedVersion {
+			return domain.ErrConcurrencyConflict
+		}
+
+		// Check if transition is allowed
+		allowed, ok := domain.CaseStateTransitions[current.CaseState]
+		if !ok {
+			return domain.ErrInvalidCaseTransition
+		}
+		transitionAllowed := false
+		for _, s := range allowed {
+			if s == params.NewState {
+				transitionAllowed = true
+				break
+			}
+		}
+		if !transitionAllowed {
+			return domain.ErrInvalidCaseTransition
+		}
+
+		// Idempotent: already in target state
+		if current.CaseState == params.NewState {
+			updated = current
+			return nil
+		}
+
+		// Validate terminal state requirements
+		switch params.NewState {
+		case domain.CaseStateResolved:
+			if params.ResolutionReason == nil || *params.ResolutionReason == "" {
+				return domain.ErrInvalidField
+			}
+		case domain.CaseStateClosed:
+			if params.CloseReason == nil || *params.CloseReason == "" {
+				return domain.ErrInvalidField
+			}
+		}
+
+		// Build update query
+		setClauses := []string{"case_state = $1", "updated_at = NOW()", "version = version + 1"}
+		args := []any{params.NewState}
+		argIdx := 2
+
+		var eventType string
+		now := time.Now().UTC()
+
+		switch params.NewState {
+		case domain.CaseStateInReview:
+			eventType = "case.in_review"
+		case domain.CaseStateResolved:
+			setClauses = append(setClauses,
+				"resolved_at = $"+strconv.Itoa(argIdx), "close_reason = $"+strconv.Itoa(argIdx+1))
+			args = append(args, now, *params.ResolutionReason)
+			argIdx += 2
+			eventType = "case.resolved"
+		case domain.CaseStateClosed:
+			setClauses = append(setClauses,
+				"closed_at = $"+strconv.Itoa(argIdx), "close_reason = $"+strconv.Itoa(argIdx+1))
+			args = append(args, now, *params.CloseReason)
+			argIdx += 2
+			eventType = "case.closed"
+		case domain.CaseStateEscalated:
+			eventType = "case.escalated"
+		}
+
+		args = append(args, params.CaseID, tenantID)
+		updateQuery := `
+			UPDATE cases
+			SET ` + strings.Join(setClauses, ", ") + `
+			WHERE case_id = $` + strconv.Itoa(len(args)-1) + ` AND tenant_id = $` + strconv.Itoa(len(args)) + `
+			RETURNING ` + caseColumns + `;`
+
+		updated, err = scanCase(tx.QueryRow(ctx, updateQuery, args...))
+		if err != nil {
+			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		// Write case event
+		payload := map[string]any{
+			"case_id":        updated.CaseID,
+			"case_type":      updated.CaseType,
+			"previous_state": current.CaseState,
+			"new_state":      updated.CaseState,
+			"version":        updated.Version,
+		}
+
+		switch params.NewState {
+		case domain.CaseStateResolved:
+			payload["resolved_by"] = params.ActorPrincipalID
+			payload["resolution_reason"] = *params.ResolutionReason
+		case domain.CaseStateClosed:
+			payload["closed_by"] = params.ActorPrincipalID
+			payload["close_reason"] = *params.CloseReason
+		case domain.CaseStateEscalated:
+			payload["escalated_by"] = params.ActorPrincipalID
+		}
+
+		return insertOutboxEventTx(ctx, tx, tenantID, eventType, params.CorrelationID,
+			updated.LegalEntityID, "", params.ActorPrincipalID, payload)
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return updated, updated != nil, nil
+}
+
+// FindCasesByWorkflowInstance returns all cases linked to a workflow instance.
+func (s *PgStore) FindCasesByWorkflowInstance(ctx context.Context, workflowInstanceID string) ([]*domain.Case, error) {
+	const query = `
+		SELECT ` + caseColumns + `
+		FROM cases
+		WHERE workflow_instance_id = $1 AND tenant_id = $2
+		ORDER BY created_at DESC;`
+
+	tenantID := tenantOf(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrTenantMissing
+	}
+
+	var results []*domain.Case
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, workflowInstanceID, tenantID)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg FindCasesByWorkflowInstance failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			c, scanErr := scanCase(rows)
+			if scanErr != nil {
+				s.log.Error("pg FindCasesByWorkflowInstance scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, c)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
 }

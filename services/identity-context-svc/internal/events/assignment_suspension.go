@@ -13,14 +13,6 @@ import (
 	"zoiko.io/identity-context-svc/internal/domain"
 )
 
-// RoleAssignmentSuspender holds a projected assignment back from session
-// resolution and lifts the hold. Separate from RoleAssignmentProjector so a
-// directory that predates suspension keeps satisfying that interface.
-type RoleAssignmentSuspender interface {
-	SuspendRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error
-	ResumeRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error
-}
-
 // assignmentRef is the subject of an assignment event. authorization-svc names
 // the assignment principal_role_assignment_id; access-control-svc names it
 // assignment_id. Either identifies it, and the principal is the subject, never
@@ -77,7 +69,7 @@ func (c *Consumer) handleAssignmentSuspended(ctx context.Context, ev inbound) er
 	}
 	// IC-11 + IC-12: ALWAYS write the suspension projection, even for stale
 	// events and even when the assignment has no projection row yet.
-	if s, ok := c.roles.(RoleAssignmentSuspender); ok && p.assignment() != "" {
+	if s, ok := c.roles.(RoleAssignmentProjector); ok && p.assignment() != "" {
 		if err := s.SuspendRoleAssignment(ctx, ev.TenantID, p.assignment(), c.eventTime(ev)); err != nil {
 			c.log.Error("failed to suspend projected role assignment — will retry",
 				zap.String("assignment_id", p.assignment()), zap.Error(err))
@@ -112,7 +104,7 @@ func (c *Consumer) handleAssignmentSuspended(ctx context.Context, ev inbound) er
 // handleAssignmentResumed lifts the hold. It revokes nothing: a resume only
 // adds access, so the next resolve simply frames the role again.
 func (c *Consumer) handleAssignmentResumed(ctx context.Context, ev inbound) error {
-	s, ok := c.roles.(RoleAssignmentSuspender)
+	s, ok := c.roles.(RoleAssignmentProjector)
 	if !ok {
 		return nil
 	}

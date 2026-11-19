@@ -13,8 +13,6 @@ package clock
 import (
 	"context"
 	"errors"
-	"fmt"
-	"strconv"
 	"sync"
 	"time"
 

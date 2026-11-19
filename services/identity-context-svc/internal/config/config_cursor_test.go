@@ -26,6 +26,8 @@ func TestConfig_CursorKeyRequiredInProtectedTiers(t *testing.T) {
 func TestConfig_CommercialAccountURLRequiredOutsideLocal(t *testing.T) {
 	mfaBaseEnv(t)
 	t.Setenv("MFA_SECRET_KEY", testMFAKey)
+	t.Setenv("IDP_CLIENT_AUTH", "required")
+	t.Setenv("IDP_CLIENT_SECRETS_FILE", "/fake/secrets.json")
 	t.Setenv("DEPLOY_ENVIRONMENT", "production")
 	t.Setenv("COMMERCIAL_ACCOUNT_URL", "")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "COMMERCIAL_ACCOUNT_URL") {

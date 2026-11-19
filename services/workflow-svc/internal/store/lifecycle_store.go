@@ -401,7 +401,8 @@ func (s *PgStore) GetApprovalEvidence(ctx context.Context, workflowInstanceID st
 
 // ListWorkflowDefinitions lists the tenant's definitions under RLS (it read
 // the bare pool, which FORCE RLS empties for the runtime role).
-func (s *PgStore) ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, error) {
+// Supports simple offset/limit paging.
+func (s *PgStore) ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error) {
 	query := `SELECT ` + definitionColumns + ` FROM workflow_definitions WHERE tenant_id = $1`
 	args := []any{params.TenantID}
 	if params.WorkflowType != nil {
@@ -413,14 +414,14 @@ func (s *PgStore) ListWorkflowDefinitions(ctx context.Context, params domain.Lis
 		query += fmt.Sprintf(" AND is_active = $%d", len(args))
 	}
 	query += ` ORDER BY workflow_type, version DESC`
-	if params.Limit > 0 {
-		args = append(args, params.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
+
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
 	}
-	if params.Offset > 0 {
-		args = append(args, params.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" LIMIT $%d", len(args))
+
 	var definitions []*domain.WorkflowDefinition
 	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, query, args...)
@@ -439,9 +440,11 @@ func (s *PgStore) ListWorkflowDefinitions(ctx context.Context, params domain.Lis
 	})
 	if err != nil {
 		s.log.Error("pg ListWorkflowDefinitions failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return definitions, nil
+
+	// No cursor pagination for definitions - return nil cursor
+	return definitions, nil, nil
 }
 
 // SupersedeWorkflowDefinition marks oldDefID as superseded by newDefID and

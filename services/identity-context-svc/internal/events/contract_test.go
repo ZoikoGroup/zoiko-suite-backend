@@ -112,12 +112,17 @@ func producedEventTypes() []string {
 		// and DecideReset).
 		events.EventPasswordResetRequest,
 		events.EventPasswordResetDecided,
-		// Not listed: EventSubjectInvited, EventIdPRegistered,
-		// EventIdPStatusChanged, EventFederatedLogin, EventGroupMappingProposed,
-		// EventGroupMappingDecided, EventGroupMembershipChange and
-		// EventSCIMConnectionCreated are declared in publisher.go but nothing
-		// emits them (federation emits FederationEventTypes instead). Add each
-		// here, with its asyncapi.yaml message, when code starts emitting it.
+		events.EventPasswordResetExpired,
+		// IC-17: reserved for future emission (declared in asyncapi.yaml).
+		"identity.subject.invited",
+		"identity.idp.registered",
+		"identity.idp.status_changed",
+		"identity.federation.login",
+		"identity.group_role_mapping.proposed",
+		// EventSubjectInvited, EventIdPRegistered, EventIdPStatusChanged,
+		// EventFederatedLogin, EventGroupMappingProposed, EventGroupMappingDecided,
+		// EventGroupMembershipChange, EventSCIMConnectionCreated,
+		// EventSCIMSyncCompleted were declared but never emitted — removed.
 	}, events.FederationEventTypes()...)
 }
 

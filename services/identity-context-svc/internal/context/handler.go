@@ -17,6 +17,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/domain"
 	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 	"zoiko.io/identity-context-svc/internal/lifecycle"
+	"zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/ratelimit"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
@@ -110,6 +111,9 @@ type Handler struct {
 
 	// merger backs POST /v1/identities/{id}/merge. Nil answers 501.
 	merger IdentityMerger
+
+	// metrics holds the IC-8 instruments; nil disables IAM-8 revocation lag recording.
+	metrics *metrics.IC8
 }
 
 // StatusChanger changes a principal's status as one governed command: the
@@ -135,6 +139,12 @@ func (h *Handler) WithStatusChanger(s StatusChanger) *Handler {
 // WithLifecycle wires the subject lifecycle commands.
 func (h *Handler) WithLifecycle(s *lifecycle.Service) *Handler {
 	h.lifecycle = s
+	return h
+}
+
+// WithMetrics wires the IC-8 instruments for IAM-8 revocation SLO measurement.
+func (h *Handler) WithMetrics(m *metrics.IC8) *Handler {
+	h.metrics = m
 	return h
 }
 
@@ -467,8 +477,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/identities/{principalID}", h.GetIdentity)
 		r.Get("/identities/{principalID}/links", h.ListIdentityProviderLinks)
 		r.Get("/identities/{principalID}/assurance-history", h.GetIdentityAssuranceHistory)
-		r.Get("/identities/{principalID}/authentication-events", h.ListIdentityAuthenticationEvents)
+r.Get("/identities/{principalID}/authentication-events", h.ListIdentityAuthenticationEvents)
 		r.Post("/identities/{principalID}/merge", h.MergeIdentity)
+
+		// ── Internal: revocation SLO (IAM-8) ───────────────────────────────────────
+		// Called by gateway-auth-svc /verify when it confirms a session is revoked.
+		r.Post("/internal/revocation/verify", h.VerifyRevocation)
 	})
 }
 

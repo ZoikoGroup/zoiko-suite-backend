@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://schemas.zoiko.io/evidence.requirement.satisfied.v1.json",
+  "title": "Evidence Requirement Satisfied",
+  "description": "Published when all evidence requirements for an action are satisfied. The action may proceed.",
+  "type": "object",
+  "required": ["event_id", "event_type", "event_version", "emitted_at", "schema_version", "source_service", "tenant_id", "legal_entity_id", "correlation_id", "aggregate_type", "aggregate_id", "payload"],
+  "properties": {
+    "event_id": { "type": "string", "format": "uuid", "description": "The outbox row id; consumers de-duplicate on it" },
+    "event_type": { "type": "string", "const": "evidence.requirement.satisfied" },
+    "event_version": { "type": "string", "const": "1.0" },
+    "emitted_at": { "type": "string", "format": "date-time", "description": "When the outbox row was written (same transaction as the decision)" },
+    "schema_version": { "type": "string", "const": "1.0" },
+    "source_service": { "type": "string", "const": "evidence-requirements-svc" },
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "legal_entity_id": { "type": "string", "format": "uuid" },
+    "actor_id": { "type": "string", "description": "The principal or workload the determination was made for" },
+    "correlation_id": { "type": "string", "description": "The evaluate request's correlation_id" },
+    "causation_id": { "type": "string", "description": "The request's causation (X-Causation-Id), when the caller sent one" },
+    "jurisdiction_context": { "type": "string", "description": "The server-resolved jurisdiction context, when the edge resolved one" },
+    "aggregate_type": { "type": "string", "const": "evidence_evaluation" },
+    "aggregate_id": { "type": "string", "format": "uuid", "description": "The evaluation_id" },
+    "governing_refs": {
+      "type": "object",
+      "description": "The requirement set the determination was tested against, so a consumer can reproduce it.",
+      "properties": {
+        "requirement_ids": { "type": "array", "items": { "type": "string", "format": "uuid" } }
+      }
+    },
+    "payload": { "$ref": "#/$defs/Determination" }
+  },
+  "$defs": {
+    "Determination": {
+      "type": "object",
+      "required": ["evaluation_id", "tenant_id", "legal_entity_id", "domain_code", "action_type", "outcome", "requirement_ids", "idempotency_key", "evaluated_for_principal_id", "correlation_id"],
+      "properties": {
+        "evaluation_id": { "type": "string", "format": "uuid" },
+        "tenant_id": { "type": "string", "format": "uuid" },
+        "legal_entity_id": { "type": "string", "format": "uuid" },
+        "domain_code": { "type": "string" },
+        "action_type": { "type": "string" },
+        "outcome": { "type": "string", "const": "SATISFIED" },
+        "requirement_ids": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+        "unmet": { "type": "array", "items": { "type": "object" } },
+        "idempotency_key": { "type": "string" },
+        "evaluated_for_principal_id": { "type": "string" },
+        "correlation_id": { "type": "string" },
+        "causation_id": { "type": "string" },
+        "jurisdiction_context": { "type": "string" }
+      }
+    }
+  }
+}

@@ -49,10 +49,17 @@ type WorkflowStore interface {
 	ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
 
+	// WFC-04: Cases (WF-2)
+	CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, error)
+	FindCaseByID(ctx context.Context, caseID string) (*domain.Case, error)
+	ListCases(ctx context.Context, filter domain.ListCasesFilter) ([]*domain.Case, error)
+	TransitionCase(ctx context.Context, params domain.TransitionCaseParams) (*domain.Case, bool, error)
+	FindCasesByWorkflowInstance(ctx context.Context, workflowInstanceID string) ([]*domain.Case, error)
+
 	// Workflow definitions (WFC-02) — see internal/store/pg_store.go.
 	CreateWorkflowDefinition(ctx context.Context, params domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error)
 	GetWorkflowDefinition(ctx context.Context, params domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error)
-	ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, error)
+	ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error)
 	SupersedeWorkflowDefinition(ctx context.Context, oldDefID, newDefID string) error
 	ActivateWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 	SuspendWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
@@ -307,6 +314,22 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{submission_id}/supersede", h.SupersedeSubmission)
 		r.Post("/{submission_id}/route", h.RouteToDomain)
 	})
+
+	// WFC-04: Cases (WF-2)
+	r.Route("/v1/cases", func(r chi.Router) {
+		r.Post("/", h.CreateCase)
+		r.Get("/", h.ListCases)
+		r.Get("/{case_id}", h.GetCase)
+		r.Post("/{case_id}/status", h.TransitionCase)
+		r.Get("/{case_id}/workflow", h.GetCaseWorkflow)
+	})
+
+	// ST-1/2/3: State Machine Registry
+	r.Route("/v1/state-machines", func(r chi.Router) {
+		r.Get("/{workflow_type}", h.GetStateMachine)
+	})
+	r.Get("/v1/workflows/{workflow_instance_id}/available-actions", h.GetAvailableActions)
+	r.Get("/v1/workflows/{workflow_instance_id}/transition-history", h.GetTransitionHistory)
 }
 
 // requireTenant reads the caller's verified tenant scope, set into
@@ -1958,6 +1981,7 @@ func (h *Handler) CreateWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 }
 
 // ListWorkflowDefinitions handles GET /v1/workflow-definitions.
+// Supports cursor paging (API-4).
 func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -1971,12 +1995,30 @@ func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	definitions, err := h.store.ListWorkflowDefinitions(r.Context(), domain.ListWorkflowDefinitionsParams{
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
+	}
+
+	var cursor *domain.PaginationCursor
+	if cursorStr := r.URL.Query().Get("cursor"); cursorStr != "" {
+		c, err := domain.DecodePaginationCursor(cursorStr)
+		if err != nil {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_cursor",
+				"message": "cursor is not valid",
+			})
+			return
+		}
+		cursor = c
+	}
+
+	definitions, nextCursor, err := h.store.ListWorkflowDefinitions(r.Context(), domain.ListWorkflowDefinitionsParams{
 		TenantID:     tenantScope,
 		WorkflowType: getOptionalQuery(r, "workflow_type"),
 		IsActive:     getOptionalBoolQuery(r, "is_active"),
-		Limit:        getIntQuery(r, "limit", 50),
-		Offset:       getIntQuery(r, "offset", 0),
+		Limit:        limit,
+		Cursor:       cursor,
 	})
 	if err != nil {
 		h.log.Error("ListWorkflowDefinitions: store unavailable", zap.Error(err))
@@ -1986,7 +2028,22 @@ func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request
 	if definitions == nil {
 		definitions = []*domain.WorkflowDefinition{}
 	}
-	writeJSON(w, r, http.StatusOK, definitions)
+
+	type listResponse struct {
+		Records    []*domain.WorkflowDefinition `json:"records"`
+		NextCursor string                       `json:"next_cursor,omitempty"`
+	}
+
+	resp := listResponse{
+		Records: definitions,
+	}
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			resp.NextCursor = encoded
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, resp)
 }
 
 // GetWorkflowDefinition handles GET /v1/workflow-definitions/{workflow_definition_id}.

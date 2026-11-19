@@ -1,6 +1,15 @@
 -- Migration 000014: WF-3 Deadline Clocks (WFC-05)
 -- Creates the obligation_clocks table with all clock states, escalation, and calendar provenance
 
+-- Helper function to update updated_at column
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
 CREATE TABLE obligation_clocks (
     clock_id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     obligation_id           uuid NOT NULL REFERENCES obligations(obligation_id) ON DELETE CASCADE,
@@ -56,7 +65,7 @@ ALTER TABLE obligation_clocks FORCE ROW LEVEL SECURITY;
 
 -- Policy: users can only see clocks in their tenant
 CREATE POLICY obligation_clocks_tenant_isolation ON obligation_clocks
-    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), ''));
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 -- Trigger to update updated_at on change
 CREATE TRIGGER obligation_clocks_updated_at

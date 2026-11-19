@@ -1,6 +1,6 @@
 # workflow-svc — Progress
 
-**Status (18 Nov 2026):** Doc 03 §8.4 complete + WFC-01..03 in progress; governed under the runtime role.
+**Status (19 Nov 2026):** Doc 03 §8.4 complete + WFC-01..03 + WFC-04 + ST-1/2/3 complete; governed under the runtime role.
 
 The Governance Platform audit (14 Oct: 26 ✅ / 23 ⚠️ / 12 ❌) was re-run on
 21 Oct and every local gap closed. The first finding was a defect the earlier
@@ -90,10 +90,10 @@ correctly (N-3); the gateway route and published port (H-4).
 
 | Item | Description | Status | Evidence |
 |------|-------------|--------|----------|
-| L-2 | Quorum races: serialize votes on one stage with `FOR UPDATE` on stage row; tallies per review cycle; ESCALATED stages votable | IN PROGRESS | TestWF1_QuorumNoRace |
-| L-8 | RLS on six tables: stages, transitions, quorum_votes, quorum_tallies, outbox, workflow_definitions; runtime role NOBYPASSRLS | IN PROGRESS | Store integration tests as NOBYPASSRLS |
-| Q-3 | State model, common columns, event naming | IN PROGRESS | TestWF1_StateModelConsistency |
-| Q-6 | Per-type approve authority: approve authority resolved per workflow type; authorization attributes workflow_type, approver_role, stage_order | IN PROGRESS | TestWF1_ApproveAuthorityPerType |
+| L-2 | Quorum races: serialize votes on one stage with `FOR UPDATE` on stage row; tallies per review cycle; ESCALATED stages votable | ✅ Done | TestWF1_QuorumNoRace |
+| L-8 | RLS on six tables: stages, transitions, quorum_votes, quorum_tallies, outbox, workflow_definitions; runtime role NOBYPASSRLS | ✅ Done | Migration 000017 (5 tables) + 000022 (outbox); Store integration tests as NOBYPASSRLS |
+| Q-3 | State model, common columns, event naming | ✅ Done | TestWF1_StateModelConsistency |
+| Q-6 | Per-type approve authority: approve authority resolved per workflow type; authorization attributes workflow_type, approver_role, stage_order | ✅ Done | TestWF1_ApproveAuthorityPerType |
 
 ## Feature Matrix (WF-0 Baseline)
 
@@ -101,7 +101,7 @@ correctly (N-3); the gateway route and published port (H-4).
 |---|---|---|---|---|
 | D2-6.F01 | Create workflow instance | `POST /v1/workflows`, `GET /v1/workflows`, `GET …/{id}` | TestWF1_Create, TestWF1_Get, TestWF1_List | DONE |
 | D2-6.F02 | Submit action (approve/reject/request-changes) | `POST …/{id}/actions` | TestWF1_Actions | DONE |
-| D2-6.F03 | Quorum voting | `POST …/{id}/vote` | TestWF1_QuorumNoRace | IN PROGRESS |
+| D2-6.F03 | Quorum voting | `POST …/{id}/vote` | TestWF1_QuorumNoRace | DONE |
 | D2-6.F04 | Escalation / escalate-to | `POST …/{id}/escalate`, `POST …/{id}/escalate-to` | TestWF1_Escalation | DONE |
 | D2-6.F05 | Cancel / invalidate / next-approver | `POST …/{id}/cancel`, `POST …/{id}/invalidate`, `GET …/{id}/next-approver` | TestWF1_Lifecycle | DONE |
 | D2-6.F06 | Workflow definitions | `GET/POST /v1/workflow-definitions`, `GET …/{id}`, `GET/POST …/{id}/versions`, `POST …/{id}/retire` | TestWF1_Definitions | DONE |
@@ -110,13 +110,13 @@ correctly (N-3); the gateway route and published port (H-4).
 | D2-6.F09 | Registry check of legal entity | `GET /v1/entities/{id}/status` | TestWF1_RegistryCheck | DONE |
 | D2-6.F10 | Timer sweep | `internal/timers` | TestWF1_Timers | DONE |
 | D2-6.F11 | Consumed events (policy.updated, etc.) | `internal/consumer` | TestWF1_ConsumedEvents | DONE |
-| D2-6.F12 | **WFC-01..03: Quorum, RLS, State Model, Authority** | | TestWF1_* | IN PROGRESS |
-| D2-6.F13 | Audit Engagement module | `GET/POST /v1/audit-engagements`, transitions, workpapers | TestAUD_* | PENDING |
-| D2-6.F14 | Forms module | `GET/POST /v1/forms`, submissions, routing | TestFORM_* | PENDING |
-| D2-6.F15 | **WFC-04: Cases** | Case lifecycle, linking | TestWF2_* | PENDING |
-| D2-6.F16 | **ST-1/2/3: State Machine Registry** | Registry, available-actions, transition-history, no generic status writes | TestST_* | PENDING |
-| D2-6.F17 | API-4 cursor paging | All list endpoints | TestWF1_API4Paging | IN PROGRESS |
-| D2-6.F18 | Dependency E2E + console v2.0 | `e2e-workflow-deps.py`, console | WF-8, WF-FE | PENDING |
+| D2-6.F12 | **WFC-01..03: Quorum, RLS, State Model, Authority** | | TestWF1_* | DONE |
+| D2-6.F13 | Audit Engagement module | `GET/POST /v1/audit-engagements`, transitions, workpapers | TestAUD_* | DONE |
+| D2-6.F14 | Forms module | `GET/POST /v1/forms`, submissions, routing | TestFORM_* | DONE |
+| D2-6.F15 | **WFC-04: Cases** | Case lifecycle, linking | TestWF2_* | DONE |
+| D2-6.F16 | **ST-1/2/3: State Machine Registry** | Registry, available-actions, transition-history, no generic status writes | TestST_* | DONE |
+| D2-6.F17 | API-4 cursor paging | All list endpoints | TestWF1_API4Paging | DONE |
+| D2-6.F18 | Dependency E2E + console v2.0 | `e2e-workflow-deps.py`, console | WF-8, WF-FE | IN PROGRESS |
 
 ## History: v1 built and verified end-to-end (2026-07-09)
 

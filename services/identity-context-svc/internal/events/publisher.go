@@ -108,8 +108,7 @@ const (
 	// (ORG-1), by POST /v1/subjects/{id}/merge or POST /v1/identities/{id}/merge.
 	// Consumers re-point what they hold for the duplicate (role assignments,
 	// delegations) to the survivor; the duplicate id is never reused.
-	EventSubjectMerged     = "identity.subject.merged"
-	EventSCIMSyncCompleted = "identity.scim_sync.completed"
+	EventSubjectMerged = "identity.subject.merged"
 
 	// ── Auth plane closure (15 Oct 2026) ─────────────────────────────────────
 	EventLoginSessionStarted   = "identity.login_session.started"
@@ -120,14 +119,7 @@ const (
 	EventPasswordChanged       = "identity.password.changed"
 	EventPasswordResetRequest  = "identity.password_reset.requested"
 	EventPasswordResetDecided  = "identity.password_reset.decided"
-	EventSubjectInvited        = "identity.subject.invited"
-	EventIdPRegistered         = "identity.idp.registered"
-	EventIdPStatusChanged      = "identity.idp.status_changed"
-	EventFederatedLogin        = "identity.federation.login"
-	EventGroupMappingProposed  = "identity.group_role_mapping.proposed"
-	EventGroupMappingDecided   = "identity.group_role_mapping.decided"
-	EventGroupMembershipChange = "identity.group.membership_changed"
-	EventSCIMConnectionCreated = "identity.scim_connection.created"
+	EventPasswordResetExpired  = "identity.password_reset.expired"
 	EventTokenExchanged        = "identity.token.exchanged"
 )
 

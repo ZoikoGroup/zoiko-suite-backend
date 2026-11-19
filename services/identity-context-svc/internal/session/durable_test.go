@@ -308,7 +308,7 @@ func TestSessionCap_EvictedEnvelopeRefusedByIntrospection(t *testing.T) {
 	f.seed("sc-1", "tenant-a", "p-1")
 
 	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-1", "tenant-a",
-		domain.InvalidationReasonSessionConcurrencyCap, time.Now().UTC()))
+		domain.InvalidationReasonSessionConcurrencyCap, time.Now().UTC(), "actor-1", "corr-1"))
 	require.NoError(t, f.dc.Evict(context.Background(), "sc-1"))
 
 	_, err := f.dc.Get(context.Background(), "sc-1", "tenant-a")
@@ -428,7 +428,7 @@ func TestInvalidate_ForeignTenantIsANoOp(t *testing.T) {
 	f.seed("sc-1", "tenant-a", "p-1")
 
 	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-1", "tenant-b",
-		domain.InvalidationReasonAdminRevoke, time.Now().UTC()))
+		domain.InvalidationReasonAdminRevoke, time.Now().UTC(), "actor-1", "corr-1"))
 
 	assert.Empty(t, f.store.invalidated,
 		"a session in another tenant must not be revocable by id alone")
@@ -440,7 +440,7 @@ func TestInvalidate_OwnTenantMarksBothStores(t *testing.T) {
 	f.seed("sc-1", "tenant-a", "p-1")
 
 	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-1", "tenant-a",
-		domain.InvalidationReasonLogout, time.Now().UTC()))
+		domain.InvalidationReasonLogout, time.Now().UTC(), "actor-1", "corr-1"))
 
 	assert.Equal(t, []string{"sc-1"}, f.store.invalidated)
 	require.NotNil(t, f.store.contexts["sc-1"].InvalidatedAt)
@@ -449,7 +449,7 @@ func TestInvalidate_OwnTenantMarksBothStores(t *testing.T) {
 func TestInvalidate_AbsentSessionIsANoOpNotAnError(t *testing.T) {
 	f := newFixture()
 	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-nope", "tenant-a",
-		domain.InvalidationReasonLogout, time.Now().UTC()))
+		domain.InvalidationReasonLogout, time.Now().UTC(), "actor-1", "corr-1"))
 }
 
 // ── Principal-wide revocation ───────────────────────────────────────────────
@@ -547,7 +547,7 @@ func TestEvictAllForEntity_RevokesEntityScopedSessions(t *testing.T) {
 	f.hot.byEntity["entity-1"] = []string{"sc-1"}
 
 	n, err := f.dc.EvictAllForEntity(context.Background(), "entity-1", "tenant-a",
-		domain.InvalidationReasonAdminRevoke)
+		domain.InvalidationReasonAdminRevoke, "actor-1", "corr-1")
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
@@ -557,7 +557,7 @@ func TestEvictAllForEntity_RevokesEntityScopedSessions(t *testing.T) {
 func TestEvictAllForEntity_NoSessionsIsNotAnError(t *testing.T) {
 	f := newFixture()
 	n, err := f.dc.EvictAllForEntity(context.Background(), "entity-nobody", "tenant-a",
-		domain.InvalidationReasonAdminRevoke)
+		domain.InvalidationReasonAdminRevoke, "actor-1", "corr-1")
 	require.NoError(t, err)
 	assert.Zero(t, n)
 }

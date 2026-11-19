@@ -402,6 +402,14 @@ func (e errorString) Error() string { return string(e) }
 // ClockClass is a tag identifying the clock's regime. Data only — no code switch.
 type ClockClass string
 
+// ClockClasses is the set of valid clock classes for validation.
+var ClockClasses = map[ClockClass]bool{
+	ClockClassHardLegal:    true,
+	ClockClassSoftInternal: true,
+	ClockClassAdvisory:     true,
+	ClockClassExtension:    true,
+}
+
 const (
 	ClockClassHardLegal     ClockClass = "HARD_LEGAL"     // statutory/regulatory deadline, fail-closed on miss
 	ClockClassSoftInternal  ClockClass = "SOFT_INTERNAL"  // internal review deadline, warning only

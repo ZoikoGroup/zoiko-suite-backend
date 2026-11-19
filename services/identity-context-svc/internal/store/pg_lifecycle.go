@@ -13,6 +13,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/outbox"
 )
 
@@ -407,7 +408,16 @@ func (s *PgStore) DecideResetRequest(ctx context.Context, tenantID, requestID st
 					WHERE request_id = $1`, requestID, raw, r.Status, r.DecidedAt); err != nil {
 					return err
 				}
-				return s.enqueueAll(ctx, tx, recs)
+				// Render the expiry event
+				rec, err := events.Render(events.EventPasswordResetExpired, tenantID, "", "identity-context-svc", "", requestID, map[string]any{
+					"request_id":   requestID,
+					"principal_id": r.PrincipalID,
+					"reason":       "expired",
+				})
+				if err != nil {
+					return err
+				}
+				return s.enqueueAll(ctx, tx, append(recs, rec))
 			}
 			return errors.New("reset request expired")
 		}

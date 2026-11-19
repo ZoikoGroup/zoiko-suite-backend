@@ -26,7 +26,7 @@ type mergeStore struct {
 	recs    []outbox.Record
 }
 
-func (s *mergeStore) MergeIdentities(_ context.Context, tenantID, survivorID, duplicateID, reason, actor, _ string,
+func (s *mergeStore) MergeIdentities(_ context.Context, tenantID, survivorID, duplicateID, reason, actor, _ string, duplicateVersion int64,
 	build func(m store.IdentityMerge) ([]outbox.Record, error)) (*store.IdentityMerge, bool, error) {
 	s.calls++
 	if s.err != nil {
@@ -63,7 +63,7 @@ func TestMerge_RefusesBeforeTheStore(t *testing.T) {
 			st := &mergeStore{created: true}
 			var ended []enderCall
 			_, _, err := mergeSvc(st, &ended).MergeDuplicate(context.Background(),
-				lifecycle.Actor{PrincipalID: tc.actor, TenantID: "t-1"}, tc.survivor, tc.duplicate, tc.reason)
+				lifecycle.Actor{PrincipalID: tc.actor, TenantID: "t-1"}, tc.survivor, tc.duplicate, tc.reason, 1)
 			assert.ErrorIs(t, err, tc.want)
 			assert.Zero(t, st.calls, "nothing reaches the store")
 			assert.Empty(t, ended)
@@ -75,7 +75,7 @@ func TestMerge_EndsTheDuplicatesSessionsAndEmitsTheEvent(t *testing.T) {
 	st := &mergeStore{created: true}
 	var ended []enderCall
 	m, created, err := mergeSvc(st, &ended).MergeDuplicate(context.Background(),
-		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1", CorrelationID: "corr"}, "p-2", "p-1", "same person")
+		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1", CorrelationID: "corr"}, "p-2", "p-1", "same person", 1)
 	require.NoError(t, err)
 	assert.True(t, created)
 	assert.Equal(t, "p-2", m.SurvivorID)
@@ -97,7 +97,7 @@ func TestMerge_ReplayEndsNothing(t *testing.T) {
 	st := &mergeStore{created: false}
 	var ended []enderCall
 	_, created, err := mergeSvc(st, &ended).MergeDuplicate(context.Background(),
-		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person")
+		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person", 1)
 	require.NoError(t, err)
 	assert.False(t, created)
 	assert.Empty(t, ended)
@@ -110,12 +110,12 @@ func TestMerge_MapsTheStoresAnswers(t *testing.T) {
 	} {
 		var ended []enderCall
 		_, _, err := mergeSvc(&mergeStore{err: tc.in}, &ended).MergeDuplicate(context.Background(),
-			lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person")
+			lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person", 1)
 		assert.ErrorIs(t, err, tc.want)
 		assert.Empty(t, ended)
 	}
 	_, _, err := mergeSvc(&mergeStore{err: errors.New("db down")}, new([]enderCall)).MergeDuplicate(context.Background(),
-		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person")
+		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person", 1)
 	assert.Error(t, err)
 	assert.NotErrorIs(t, err, lifecycle.ErrConflict)
 }
