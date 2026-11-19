@@ -159,7 +159,7 @@ func TestPgStoreCapabilityClaim_ExpiryReviewDateRoundTrip(t *testing.T) {
 			idempotency := testIdempotencyClaim("tenant-date", "CreateCapabilityClaim", "claim-key-"+test.name, "request-"+test.name, claimID)
 			claim := &domain.CapabilityClaim{
 				ClaimID: claimID, CapabilityID: capability.CapabilityID, ClaimText: "expiry date persistence",
-				WordingOwnerPrincipalID: "wording-owner", ApprovedByPrincipalID: "legal-approver",
+				WordingOwnerPrincipalID: "wording-owner", ApprovalStatus: string(domain.ClaimApprovalPending),
 				ExpiryReviewDate: test.date, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "idempotency-test-principal",
 			}
 			if err := store.CreateCapabilityClaim(ctx, claim, idempotency); err != nil {
@@ -179,6 +179,66 @@ func TestPgStoreCapabilityClaim_ExpiryReviewDateRoundTrip(t *testing.T) {
 				t.Fatalf("expected date %v to round-trip, got %v", test.date, got.ExpiryReviewDate)
 			}
 		})
+	}
+}
+
+// TestPgStoreDecideCapabilityClaim_OnlyPendingClaimDecidable proves the
+// Gap 1 store-level enforcement against real Postgres: the UPDATE only
+// matches a PENDING row, so a second decision attempt on an already-decided
+// claim affects zero rows and the store reports ErrClaimDecisionInvalid
+// instead of silently re-applying it.
+func TestPgStoreDecideCapabilityClaim_OnlyPendingClaimDecidable(t *testing.T) {
+	_, pool := openIdempotencyTestPool(t)
+	ctx := context.Background()
+	store := newTestStore(pool)
+
+	capability := newTestCapability("CLAIM_DECISION_STORE")
+	if err := store.CreateCapability(ctx, capability,
+		testIdempotencyClaim("tenant-decide", "CreateCapability", "cap-key", "cap-request", capability.CapabilityID)); err != nil {
+		t.Fatalf("create capability: %v", err)
+	}
+
+	claimID := uuid.NewString()
+	claim := &domain.CapabilityClaim{
+		ClaimID: claimID, CapabilityID: capability.CapabilityID, ClaimText: "claim for decision test",
+		WordingOwnerPrincipalID: "wording-owner", ApprovalStatus: string(domain.ClaimApprovalPending),
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "wording-owner",
+	}
+	if err := store.CreateCapabilityClaim(ctx, claim,
+		testIdempotencyClaim("tenant-decide", "CreateCapabilityClaim", "claim-key", "claim-request", claimID)); err != nil {
+		t.Fatalf("create capability claim: %v", err)
+	}
+
+	decidedAt := time.Now().UTC()
+	if err := store.DecideCapabilityClaim(ctx, claimID, "APPROVED", "legal-approver", decidedAt,
+		testIdempotencyClaim("tenant-decide", "DecideCapabilityClaim", "decide-key-1", "decide-request-1", claimID)); err != nil {
+		t.Fatalf("first decision should succeed: %v", err)
+	}
+
+	got, err := store.GetCapabilityClaimByID(ctx, claimID)
+	if err != nil {
+		t.Fatalf("get decided claim: %v", err)
+	}
+	if got.ApprovalStatus != "APPROVED" || got.ApprovedByPrincipalID == nil || *got.ApprovedByPrincipalID != "legal-approver" || got.ApprovedAt == nil {
+		t.Fatalf("expected claim approved by legal-approver with approved_at set, got %+v", got)
+	}
+
+	// A second decision — even with a fresh idempotency key, so it is not
+	// treated as a replay — must be refused: the claim is no longer PENDING.
+	err = store.DecideCapabilityClaim(ctx, claimID, "REJECTED", "another-approver", time.Now().UTC(),
+		testIdempotencyClaim("tenant-decide", "DecideCapabilityClaim", "decide-key-2", "decide-request-2", claimID))
+	if !errors.Is(err, domain.ErrClaimDecisionInvalid) {
+		t.Fatalf("expected ErrClaimDecisionInvalid deciding an already-decided claim, got %v", err)
+	}
+
+	// The already-APPROVED state must not have been overwritten by the
+	// rejected second attempt.
+	stillApproved, err := store.GetCapabilityClaimByID(ctx, claimID)
+	if err != nil {
+		t.Fatalf("get claim after rejected second decision: %v", err)
+	}
+	if stillApproved.ApprovalStatus != "APPROVED" {
+		t.Fatalf("expected claim to remain APPROVED, got %+v", stillApproved)
 	}
 }
 

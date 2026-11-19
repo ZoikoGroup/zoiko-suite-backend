@@ -253,6 +253,30 @@ func (s *stubStore) GetCapabilityClaimByID(_ context.Context, id string) (*domai
 	return nil, domain.ErrClaimNotFound
 }
 
+func (s *stubStore) DecideCapabilityClaim(_ context.Context, claimID, decision, deciderPrincipalID string, decidedAt time.Time, claim domain.IdempotencyClaim) error {
+	var capabilityID string
+	return s.withIdempotency(claim, "capability_claim.decided", func() string { return capabilityID }, func() error {
+		for capID, list := range s.claims {
+			for i := range list {
+				if list[i].ClaimID == claimID {
+					if list[i].ApprovalStatus != string(domain.ClaimApprovalPending) {
+						return domain.ErrClaimDecisionInvalid
+					}
+					list[i].ApprovalStatus = decision
+					decider := deciderPrincipalID
+					list[i].ApprovedByPrincipalID = &decider
+					at := decidedAt
+					list[i].ApprovedAt = &at
+					capabilityID = capID
+					s.claims[capID] = list
+					return nil
+				}
+			}
+		}
+		return domain.ErrClaimNotFound
+	})
+}
+
 // ResolveCapability mirrors pg_store.go's fail-closed logic exactly (2026-10-05
 // re-audit, Gap 1, plus the GOV-11 legal-approval gate): an unrecognized
 // release/market-release state, an unapproved customer-facing market release,
@@ -509,42 +533,103 @@ func TestCreateCapability_DuplicateCodeConflict(t *testing.T) {
 	}
 }
 
-func TestCreateCapabilityClaim_SoDDistinctPrincipalsEnforced(t *testing.T) {
+// TestCreateCapabilityClaim_WordingOwnerIsAlwaysTheAuthenticatedCreator
+// proves the Gap 1 fix: wording_owner_principal_id is never accepted as
+// free text any more — it is always the principal who authenticated the
+// create call, even if the (now removed) old fields were somehow still
+// present on the wire.
+func TestCreateCapabilityClaim_WordingOwnerIsAlwaysTheAuthenticatedCreator(t *testing.T) {
 	h := newTestHandler()
 	r := newTestRouter(h)
 	cap := createTestCapability(t, r, "PAYMENT_ROUTING")
 
-	// Negative Case: wording_owner == approved_by (SoD violation) -> Expect 400 Bad Request.
-	wSame := httptest.NewRecorder()
-	r.ServeHTTP(wSame, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-		ClaimText:               "Instant settlement capability across EEA markets.",
-		WordingOwnerPrincipalID: "principal-user-01",
-		ApprovedByPrincipalID:   "principal-user-01",
-	}))
-	if wSame.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request when wording owner equals approver, got %d: %s", wSame.Code, wSame.Body.String())
-	}
-	if !bytes.Contains(wSame.Body.Bytes(), []byte("must be distinct principals")) {
-		t.Errorf("expected error message to mention distinct principals, got %s", wSame.Body.String())
-	}
-
-	// Positive Case: wording_owner != approved_by (SoD satisfied) -> Expect 201 Created.
-	wDistinct := httptest.NewRecorder()
-	r.ServeHTTP(wDistinct, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-		ClaimText:               "Instant settlement capability across EEA markets.",
-		WordingOwnerPrincipalID: "principal-wording-owner",
-		ApprovedByPrincipalID:   "principal-legal-approver",
-	}))
-	if wDistinct.Code != http.StatusCreated {
-		t.Fatalf("expected 201 Created when wording owner and approver are distinct, got %d: %s", wDistinct.Code, wDistinct.Body.String())
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
+		ClaimText: "Instant settlement capability across EEA markets.",
+	})
+	req.Header.Set("X-Principal-Id", "principal-wording-owner")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
 	}
 
 	var claim domain.CapabilityClaim
-	if err := json.NewDecoder(wDistinct.Body).Decode(&claim); err != nil {
+	if err := json.NewDecoder(w.Body).Decode(&claim); err != nil {
 		t.Fatalf("failed to decode created claim: %v", err)
 	}
-	if claim.WordingOwnerPrincipalID != "principal-wording-owner" || claim.ApprovedByPrincipalID != "principal-legal-approver" {
-		t.Errorf("claim contains unexpected principals: %+v", claim)
+	if claim.WordingOwnerPrincipalID != "principal-wording-owner" {
+		t.Fatalf("expected wording owner to be the authenticated creator, got %+v", claim)
+	}
+	if claim.ApprovalStatus != string(domain.ClaimApprovalPending) {
+		t.Fatalf("expected a freshly created claim to be PENDING, got %+v", claim)
+	}
+	if claim.ApprovedByPrincipalID != nil {
+		t.Fatalf("expected no approver recorded at creation time, got %+v", claim)
+	}
+}
+
+// TestDecideCapabilityClaim_SelfApprovalBlockedDifferentApproverSucceeds is
+// this gap's real SoD proof: the same caller who created the claim cannot
+// also decide it, and a different, properly authenticated principal can —
+// the same self-approval-refused / different-approver-succeeds pattern
+// ai-governance-svc's DecideAutomationAction test uses.
+func TestDecideCapabilityClaim_SelfApprovalBlockedDifferentApproverSucceeds(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "SOD_CLAIM_DECISION")
+
+	create := httptest.NewRecorder()
+	createReq := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
+		ClaimText: "Instant settlement capability across EEA markets.",
+	})
+	createReq.Header.Set("X-Principal-Id", "principal-wording-owner")
+	r.ServeHTTP(create, createReq)
+	if create.Code != http.StatusCreated {
+		t.Fatalf("failed to create claim: %d %s", create.Code, create.Body.String())
+	}
+	var claim domain.CapabilityClaim
+	if err := json.NewDecoder(create.Body).Decode(&claim); err != nil {
+		t.Fatalf("decode created claim: %v", err)
+	}
+
+	// Same caller attempts to decide their own claim -> refused, 403.
+	selfDecide := httptest.NewRecorder()
+	selfReq := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims/"+claim.ClaimID+"/decision",
+		domain.DecideCapabilityClaimRequest{Decision: "APPROVED"})
+	selfReq.Header.Set("X-Principal-Id", "principal-wording-owner")
+	r.ServeHTTP(selfDecide, selfReq)
+	if selfDecide.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on self-approval, got %d: %s", selfDecide.Code, selfDecide.Body.String())
+	}
+	if !bytes.Contains(selfDecide.Body.Bytes(), []byte("self-approval")) {
+		t.Errorf("expected error message to mention self-approval, got %s", selfDecide.Body.String())
+	}
+
+	// A different, authenticated principal decides -> succeeds, 200.
+	approve := httptest.NewRecorder()
+	approveReq := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims/"+claim.ClaimID+"/decision",
+		domain.DecideCapabilityClaimRequest{Decision: "APPROVED"})
+	approveReq.Header.Set("X-Principal-Id", "principal-legal-approver")
+	r.ServeHTTP(approve, approveReq)
+	if approve.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a different approver, got %d: %s", approve.Code, approve.Body.String())
+	}
+	var decided domain.CapabilityClaim
+	if err := json.NewDecoder(approve.Body).Decode(&decided); err != nil {
+		t.Fatalf("decode decided claim: %v", err)
+	}
+	if decided.ApprovalStatus != "APPROVED" || decided.ApprovedByPrincipalID == nil || *decided.ApprovedByPrincipalID != "principal-legal-approver" {
+		t.Fatalf("expected claim approved by principal-legal-approver, got %+v", decided)
+	}
+
+	// A second decision attempt on an already-decided claim -> refused, 409.
+	again := httptest.NewRecorder()
+	againReq := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims/"+claim.ClaimID+"/decision",
+		domain.DecideCapabilityClaimRequest{Decision: "APPROVED"})
+	againReq.Header.Set("X-Principal-Id", "principal-another-approver")
+	r.ServeHTTP(again, againReq)
+	if again.Code != http.StatusConflict {
+		t.Fatalf("expected 409 deciding an already-decided claim, got %d: %s", again.Code, again.Body.String())
 	}
 }
 
@@ -566,10 +651,8 @@ func TestCreateCapabilityClaim_ExpiryReviewDateCurrentBoundaryBehavior(t *testin
 		t.Run(test.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-				ClaimText:               "Review date boundary test",
-				WordingOwnerPrincipalID: "principal-wording-owner",
-				ApprovedByPrincipalID:   "principal-legal-approver",
-				ExpiryReviewDate:        test.date,
+				ClaimText:        "Review date boundary test",
+				ExpiryReviewDate: test.date,
 			}))
 			if w.Code != test.wantStatus {
 				t.Fatalf("expected %d for expiry_review_date %q, got %d: %s",
@@ -1151,7 +1234,7 @@ func TestCreateCapabilityClaim_PublishesEvent(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-		ClaimText: "Claim for event test.", WordingOwnerPrincipalID: "owner-1", ApprovedByPrincipalID: "approver-1",
+		ClaimText: "Claim for event test.",
 	}))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
@@ -1217,7 +1300,7 @@ func TestCreateCapabilityClaim_InvalidCapabilityID_Returns404(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/does-not-exist/claims", domain.CreateCapabilityClaimRequest{
-		ClaimText: "x", WordingOwnerPrincipalID: "a", ApprovedByPrincipalID: "b",
+		ClaimText: "x",
 	}))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for nonexistent capability_id, got %d: %s", w.Code, w.Body.String())
@@ -1324,7 +1407,7 @@ func TestAllWrites_IdempotencyReplayPreservesResponseAndEmitsOneEvent(t *testing
 		domain.SetReleaseStateRequest{State: "GA", Reason: "replay test"}, http.StatusCreated)
 	performReplay(http.MethodPost, "/v1/capabilities/"+capability.CapabilityID+"/claims", "all-claim-key",
 		domain.CreateCapabilityClaimRequest{
-			ClaimText: "Replay-safe claim.", WordingOwnerPrincipalID: "owner", ApprovedByPrincipalID: "checker",
+			ClaimText: "Replay-safe claim.",
 		}, http.StatusCreated)
 
 	wantEvents := map[string]int{
@@ -1468,7 +1551,7 @@ func TestAllWrites_StillRequireIdempotencyKey(t *testing.T) {
 		}),
 		buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{State: "GA"}),
 		buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-			ClaimText: "approved claim", WordingOwnerPrincipalID: "writer", ApprovedByPrincipalID: "checker",
+			ClaimText: "approved claim",
 		}),
 	}
 	for i, req := range requests {

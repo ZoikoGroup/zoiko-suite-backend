@@ -33,6 +33,10 @@ const (
 	ReleaseStateSet             = "RELEASE_STATE_SET"
 	CapabilityClaimCreate       = "CAPABILITY_CLAIM_CREATE"
 
+	// CapabilityClaimDecide gates the Gap 1 maker-checker decision step —
+	// approving or rejecting a claim a *different* principal proposed.
+	CapabilityClaimDecide = "CAPABILITY_CLAIM_DECIDE"
+
 	// Read actions, same CREATE/READ naming convention as above. Added per
 	// the 2026-10-05 re-audit: GetCapability, ListIntegrationCapabilities,
 	// and ListCapabilityClaims had no auth check and no documented rationale
@@ -175,6 +179,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/release-state", h.SetReleaseState)
 		r.Post("/{id}/claims", h.CreateCapabilityClaim)
 		r.Get("/{id}/claims", h.ListCapabilityClaims)
+		r.Post("/{id}/claims/{claimId}/decision", h.DecideCapabilityClaim)
 	})
 	r.Put("/v1/integration-capabilities/{id}/health", h.UpdateIntegrationHealth)
 	r.Get("/v1/capability-resolution/{capabilityCode}", h.ResolveCapability)
@@ -501,6 +506,12 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, rel)
 }
 
+// CreateCapabilityClaim is the "propose" half of Gap 1's maker-checker
+// split. It no longer accepts wording_owner_principal_id or
+// approved_by_principal_id as free text: the wording owner is always the
+// authenticated caller making this request, and nobody can be recorded as
+// having approved a claim that was just created. Approval is a separate,
+// later call (DecideCapabilityClaim) by a different authenticated principal.
 func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) {
 	capabilityID := chi.URLParam(r, "id")
 	var req domain.CreateCapabilityClaimRequest
@@ -508,12 +519,8 @@ func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if req.ClaimText == "" || req.WordingOwnerPrincipalID == "" || req.ApprovedByPrincipalID == "" {
-		writeError(w, http.StatusBadRequest, "claim_text, wording_owner_principal_id, and approved_by_principal_id are required")
-		return
-	}
-	if req.WordingOwnerPrincipalID == req.ApprovedByPrincipalID {
-		writeError(w, http.StatusBadRequest, "wording_owner_principal_id and approved_by_principal_id must be distinct principals (segregation of duties)")
+	if req.ClaimText == "" {
+		writeError(w, http.StatusBadRequest, "claim_text is required")
 		return
 	}
 
@@ -526,11 +533,13 @@ func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) 
 	}
 
 	c := &domain.CapabilityClaim{
-		ClaimID:                 uuid.NewString(),
-		CapabilityID:            capabilityID,
-		ClaimText:               req.ClaimText,
-		WordingOwnerPrincipalID: req.WordingOwnerPrincipalID,
-		ApprovedByPrincipalID:   req.ApprovedByPrincipalID,
+		ClaimID: uuid.NewString(),
+		CapabilityID: capabilityID,
+		ClaimText: req.ClaimText,
+		// The wording owner is the creator, always — never a free-text value
+		// supplied by the caller. See the domain.CapabilityClaim doc comment.
+		WordingOwnerPrincipalID: principalID,
+		ApprovalStatus:          string(domain.ClaimApprovalPending),
 		CreatedAt:               time.Now().UTC(),
 		CreatedByPrincipalID:    principalID,
 	}
@@ -562,6 +571,72 @@ func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusCreated, c)
+}
+
+// DecideCapabilityClaim is the "approve"/"reject" half of Gap 1's
+// maker-checker split — doc7 §C2's actual segregation-of-duties guarantee.
+// It fetches the existing claim first so the self-approval check below
+// compares against the real wording owner, not a value the caller supplies;
+// the same ordering (fetch, then authorize, then compare principals)
+// ai-governance-svc's DecideAutomationAction uses for the same reason.
+func (h *Handler) DecideCapabilityClaim(w http.ResponseWriter, r *http.Request) {
+	claimID := chi.URLParam(r, "claimId")
+	var req domain.DecideCapabilityClaimRequest
+	raw, ok := readRawBody(w, r, &req)
+	if !ok {
+		return
+	}
+	if req.Decision != string(domain.ClaimApprovalApproved) && req.Decision != string(domain.ClaimApprovalRejected) {
+		writeError(w, http.StatusBadRequest, "decision must be APPROVED or REJECTED")
+		return
+	}
+
+	existing, err := h.store.GetCapabilityClaimByID(r.Context(), claimID)
+	if err != nil {
+		if errors.Is(err, domain.ErrClaimNotFound) {
+			writeError(w, http.StatusNotFound, "capability claim not found")
+			return
+		}
+		h.logger.Error("fetch capability claim for decision failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to fetch capability claim")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, CapabilityClaimDecide) {
+		return
+	}
+	if principalID == existing.WordingOwnerPrincipalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalBlocked.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	decided := *existing
+	decided.ApprovalStatus = req.Decision
+	decided.ApprovedByPrincipalID = &principalID
+	decided.ApprovedAt = &now
+
+	claim, ok := buildClaim(w, r, principalID, "DecideCapabilityClaim", claimID, http.StatusOK, &decided, raw)
+	if !ok {
+		return
+	}
+	if err := h.store.DecideCapabilityClaim(r.Context(), claimID, req.Decision, principalID, now, claim); err != nil {
+		if finishOrReplay(w, err) {
+			return
+		}
+		if errors.Is(err, domain.ErrClaimDecisionInvalid) {
+			writeError(w, http.StatusConflict, "capability claim is not pending a decision")
+			return
+		}
+		h.logger.Error("decide capability claim failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to decide capability claim")
+		return
+	}
+	writeJSON(w, http.StatusOK, &decided)
 }
 
 func (h *Handler) ListCapabilityClaims(w http.ResponseWriter, r *http.Request) {
