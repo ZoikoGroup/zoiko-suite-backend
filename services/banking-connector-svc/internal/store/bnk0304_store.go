@@ -20,11 +20,13 @@ import (
 
 const statementColumns = `
 	statement_id, connection_id, tenant_id, statement_format, statement_date, opening_balance, closing_balance, transaction_count, ingested_at,
-	content_hash, source_id, import_batch_id, status, quarantine_reason, created_by_principal_id`
+	content_hash, source_id, import_batch_id, status, quarantine_reason, created_by_principal_id,
+	raw_file_document_id, raw_file_checksum_sha256`
 
 func scanStatement(row pgx.Row, s *domain.BankStatement) error {
 	return row.Scan(&s.StatementID, &s.ConnectionID, &s.TenantID, &s.StatementFormat, &s.StatementDate, &s.OpeningBalance, &s.ClosingBalance, &s.TransactionCount, &s.IngestedAt,
-		&s.ContentHash, &s.SourceID, &s.ImportBatchID, &s.Status, &s.QuarantineReason, &s.CreatedByPrincipalID)
+		&s.ContentHash, &s.SourceID, &s.ImportBatchID, &s.Status, &s.QuarantineReason, &s.CreatedByPrincipalID,
+		&s.RawFileDocumentID, &s.RawFileChecksumSHA256)
 }
 
 // IngestStatement is BNK-03's real entry point: a RECEIVED-status header
@@ -39,12 +41,14 @@ func (p *PgStore) IngestStatement(ctx context.Context, tenantID string, req doma
 		row := tx.QueryRow(ctx, `
 			INSERT INTO bank_statements (
 				statement_id, connection_id, tenant_id, statement_format, statement_date, opening_balance, closing_balance, transaction_count, ingested_at,
-				content_hash, source_id, import_batch_id, status, created_by_principal_id
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),$9,$10,$11,'RECEIVED',$12)
+				content_hash, source_id, import_batch_id, status, created_by_principal_id,
+				raw_file_document_id, raw_file_checksum_sha256
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),$9,$10,$11,'RECEIVED',$12,$13,$14)
 			ON CONFLICT (connection_id, content_hash) WHERE content_hash <> '' DO NOTHING
 			RETURNING `+statementColumns,
 			statementID, req.ConnectionID, tenantID, req.StatementFormat, req.StatementDate, req.OpeningBalance, req.ClosingBalance, len(req.Lines),
-			req.ContentHash, req.SourceID, req.ImportBatchID, actorPrincipalID)
+			req.ContentHash, req.SourceID, req.ImportBatchID, actorPrincipalID,
+			req.RawFileDocumentID, req.RawFileChecksumSHA256)
 		err := scanStatement(row, &s)
 		if err == nil {
 			result.Created = true
