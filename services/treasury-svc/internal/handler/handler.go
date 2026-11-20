@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/treasury-svc/internal/domain"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
+	"zoiko.io/treasury-svc/internal/tokenization"
 )
 
 // Store defines persistence contract for treasury service.
@@ -168,6 +169,12 @@ type Handler struct {
 	banking         BankingConnector
 	currency        CurrencyClient
 	log             *zap.Logger
+
+	// tokenizer and tokenizationEnforced back BNK-01's real
+	// masking/tokenization of bank account numbers (the doc's own
+	// "Security/KMS/Tokenization" dependency) — see WithTokenization.
+	tokenizer            tokenization.Tokenizer
+	tokenizationEnforced bool
 }
 
 func New(store Store, authz AuthZClient, clients Clients, transferClients TransferClients, banking BankingConnector, log *zap.Logger, currency CurrencyClient) *Handler {
@@ -180,6 +187,19 @@ func New(store Store, authz AuthZClient, clients Clients, transferClients Transf
 		currency:        currency,
 		log:             log,
 	}
+}
+
+// WithTokenization wires the key-management-svc client RegisterBankAccount,
+// RotateAccountIdentifierToken and the privileged account-number read
+// (bnk01_handler.go) use. enforced=false (the default) keeps every one of
+// those paths behaving EXACTLY as before — t is still set whenever a
+// tokenization service is configured (never nil-called only because
+// enforcement is off), the same "needed for reads of already-tokenized rows
+// regardless of the current flag" convention banking-connector-svc's and
+// payee-banking-identity-svc's identical method uses.
+func (h *Handler) WithTokenization(t tokenization.Tokenizer, enforced bool) *Handler {
+	h.tokenizer, h.tokenizationEnforced = t, enforced
+	return h
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -252,6 +272,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/accounts/{accountID}/masked", h.GetBankAccountMasked)
 		r.Get("/accounts/{accountID}/available-actions", h.GetAvailableActions)
 		r.Get("/accounts/{accountID}/connection-options", h.ListConnectionOptions)
+		// The privileged, narrowly-scoped FULL account-number read — the
+		// counterpart to /masked above, exactly banking-connector-svc's own
+		// GET .../account-number pattern (BNK-02's
+		// GetConnectionAccountNumber), gated by the same narrow
+		// TOKEN_DETOKENIZE grant rather than any broader permission.
+		r.Get("/accounts/{accountID}/account-number", h.GetBankAccountNumber)
 
 		// BNK-08 — see internal/handler/bnk08_handler.go.
 		r.Post("/cash-position/calculate", h.CalculateCashPosition)
@@ -291,12 +317,48 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// BNK-01's real masking/tokenization of the account identifier
+	// (Security/KMS/Tokenization dependency). While TOKENIZATION_ENFORCED is
+	// false (the default), this is a no-op: maskedAccountNumber is exactly
+	// req.MaskedAccountNumber, accountNumberToken stays empty, and nothing
+	// below this block changes from before. Only when enforced does this
+	// service require the REAL value (req.AccountNumber), tokenize it via
+	// key-management-svc, and derive the stored masked form server-side —
+	// never from caller input.
+	maskedAccountNumber := req.MaskedAccountNumber
+	var accountNumberToken string
+	if h.tokenizationEnforced {
+		if req.AccountNumber == "" {
+			writeError(w, http.StatusBadRequest, "missing_field", "account_number is required when tokenization is enforced")
+			return
+		}
+		if h.tokenizer == nil {
+			h.log.Error("RegisterBankAccount: tokenization enforced but no tokenizer configured")
+			writeError(w, http.StatusServiceUnavailable, "tokenization_not_configured", "tokenization service not configured")
+			return
+		}
+		token, err := h.tokenizer.Tokenize(r.Context(), tokenization.Scope{
+			TenantID:      tenantID,
+			PrincipalID:   principalID,
+			LegalEntityID: req.LegalEntityID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"),
+		}, tokenization.ClassificationRestricted, req.AccountNumber)
+		if err != nil {
+			h.log.Error("RegisterBankAccount: tokenize account number failed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "tokenization_service_unavailable", "tokenization service unavailable")
+			return
+		}
+		maskedAccountNumber = domain.MaskAccountNumber(req.AccountNumber)
+		accountNumberToken = token
+	}
+
 	acct := &domain.BankAccount{
 		BankAccountID:           uuid.New().String(),
 		TenantID:                tenantID,
 		LegalEntityID:           req.LegalEntityID,
 		AccountName:             req.AccountName,
-		MaskedAccountNumber:     req.MaskedAccountNumber,
+		MaskedAccountNumber:     maskedAccountNumber,
+		AccountNumberToken:      accountNumberToken,
 		BankIdentifier:          req.BankIdentifier,
 		CurrencyCode:            req.CurrencyCode,
 		AccountStatus:           "ACTIVE",
