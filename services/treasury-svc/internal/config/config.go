@@ -65,6 +65,15 @@ type Config struct {
 	// service has never owned, and doesn't start owning now.
 	BankingConnectorServiceURL string
 
+	// CurrencyRegistryURL is currency-registry-svc's (REF-02) base URL —
+	// the platform's one real currency-reference service. BNK-09's
+	// CreateTreasuryTransfer/AmendTreasuryTransfer resolve each currency's
+	// real minor-unit count from it rather than applying a single
+	// hardcoded decimal-places rule to every currency. Empty disables the
+	// check (internal/handler.CurrencyClient is nil-safe), same convention
+	// as BankingConnectorServiceURL above.
+	CurrencyRegistryURL string
+
 	// OTELExporterEndpoint is where telemetry sends trace data.
 	OTELExporterEndpoint string
 }
@@ -142,6 +151,7 @@ func Load() (*Config, error) {
 		PaymentAdapterServiceURL: env("PAYMENT_ADAPTER_SERVICE_URL", "http://payment-initiation-adapter-svc:8162"),
 		IntercompanyServiceURL:   env("INTERCOMPANY_SERVICE_URL", "http://intercompany-accounting-svc:8105"),
 		BankingConnectorServiceURL: env("BANKING_CONNECTOR_SERVICE_URL", "http://banking-connector-svc:8145"),
+		CurrencyRegistryURL:        env("CURRENCY_REGISTRY_URL", "http://currency-registry-svc:8172"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }

@@ -24,6 +24,7 @@ import (
 	"zoiko.io/treasury-svc/internal/authz"
 	"zoiko.io/treasury-svc/internal/clients"
 	"zoiko.io/treasury-svc/internal/config"
+	"zoiko.io/treasury-svc/internal/currency"
 	svcenvelope "zoiko.io/treasury-svc/internal/envelope"
 	"zoiko.io/treasury-svc/internal/events"
 	"zoiko.io/treasury-svc/internal/handler"
@@ -161,6 +162,10 @@ func main() {
 	clientsWrapper := clients.New(cfg.APServiceURL, cfg.ARServiceURL, cfg.ObligationsServiceURL, log)
 	transferClients := clients.NewTransferClients(cfg.PaymentAdapterServiceURL, cfg.LedgerServiceURL, cfg.IntercompanyServiceURL, log)
 	bankingConnectorClient := clients.NewBankingConnectorHTTPClient(cfg.BankingConnectorServiceURL)
+	var currencyClient handler.CurrencyClient
+	if cfg.CurrencyRegistryURL != "" {
+		currencyClient = currency.New(cfg.CurrencyRegistryURL)
+	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -180,7 +185,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, authzClient, clientsWrapper, transferClients, bankingConnectorClient, log)
+	h := handler.New(pgStore, authzClient, clientsWrapper, transferClients, bankingConnectorClient, log, currencyClient)
 	handler.RegisterRoutes(r, h)
 
 	// ── 4c. BankStatementAccepted consumer (BNK-08) ─────────────────────────

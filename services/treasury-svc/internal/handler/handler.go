@@ -118,6 +118,18 @@ type BankingConnector interface {
 	ListConnectionOptions(ctx context.Context, tenantID, legalEntityID, bankAccountID, correlationID string) ([]domain.ConnectionOption, error)
 }
 
+// CurrencyClient resolves a currency's real ISO 4217 minor-unit count from
+// currency-registry-svc (REF-02) — see internal/currency. Optional (nil is a
+// valid value): a deployment that hasn't wired CURRENCY_REGISTRY_URL simply
+// can't enforce the per-currency decimal-places check in
+// CreateTreasuryTransfer/AmendTreasuryTransfer, the same "missing client,
+// not a startup failure" convention BankingConnector above already uses —
+// existing callers (and every pre-existing test) are unaffected by this
+// field's addition.
+type CurrencyClient interface {
+	MinorUnits(ctx context.Context, code string, asOf time.Time) (int, error)
+}
+
 const (
 	actionRegisterAccount  = "TREASURY_ACCOUNT_REGISTER"
 	actionSetThreshold     = "TREASURY_THRESHOLD_SET"
@@ -154,16 +166,18 @@ type Handler struct {
 	clients         Clients
 	transferClients TransferClients
 	banking         BankingConnector
+	currency        CurrencyClient
 	log             *zap.Logger
 }
 
-func New(store Store, authz AuthZClient, clients Clients, transferClients TransferClients, banking BankingConnector, log *zap.Logger) *Handler {
+func New(store Store, authz AuthZClient, clients Clients, transferClients TransferClients, banking BankingConnector, log *zap.Logger, currency CurrencyClient) *Handler {
 	return &Handler{
 		store:           store,
 		authz:           authz,
 		clients:         clients,
 		transferClients: transferClients,
 		banking:         banking,
+		currency:        currency,
 		log:             log,
 	}
 }
