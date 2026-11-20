@@ -194,7 +194,7 @@ func (p *PgStore) notFoundOrInvalidStatement(ctx context.Context, tenantID, stat
 // ErrStatementBalanceMismatch, the same fail-closed posture as every other
 // evidence-integrity check in this service, so a caller cannot retry their
 // way past a bad statement by calling AcceptStatement directly.
-func (p *PgStore) ValidateStatement(ctx context.Context, tenantID, statementID string) error {
+func (p *PgStore) ValidateStatement(ctx context.Context, tenantID, statementID, actorPrincipalID, correlationID string) error {
 	var mismatchReason string
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
 		var opening, closing float64
@@ -222,7 +222,7 @@ func (p *PgStore) ValidateStatement(ctx context.Context, tenantID, statementID s
 			if tag.RowsAffected() == 0 {
 				return domain.ErrInvalidStatementTransition
 			}
-			return nil
+			return p.enqueueStatementQuarantinedEvent(ctx, tx, tenantID, statementID, mismatchReason, actorPrincipalID, correlationID)
 		}
 		tag, err := tx.Exec(ctx, `UPDATE bank_statements SET status='VALIDATING' WHERE statement_id=$1 AND tenant_id=$2 AND status='RECEIVED'`, statementID, tenantID)
 		if err != nil {
@@ -242,24 +242,84 @@ func (p *PgStore) ValidateStatement(ctx context.Context, tenantID, statementID s
 	return nil
 }
 
-func (p *PgStore) AcceptStatement(ctx context.Context, tenantID, statementID string) error {
-	tag, err := p.execWithTenant(ctx, `UPDATE bank_statements SET status='ACCEPTED' WHERE statement_id=$1 AND tenant_id=$2 AND status='VALIDATING'`, statementID, tenantID)
+// statementWithConnectionSQL loads one statement joined to its connection
+// for the fields that live only on bank_connections (legal_entity_id,
+// bank_account_id, currency) — BNK-08's downstream consumer needs these to
+// key a cash-position snapshot, and bank_statements itself carries neither.
+const statementWithConnectionSQL = `
+	SELECT s.statement_id, s.connection_id, s.tenant_id, s.opening_balance, s.closing_balance, s.statement_date,
+	       c.legal_entity_id, c.bank_account_id, c.currency
+	FROM bank_statements s
+	JOIN bank_connections c ON c.connection_id = s.connection_id
+	WHERE s.statement_id = $1 AND s.tenant_id = $2`
+
+// AcceptStatement is BNK-03's terminal "this statement's balances are now
+// authoritative" transition. It enqueues BankStatementAccepted in the same
+// transaction as the status flip — the one event BNK-08 Cash Position
+// depends on to ever see a real, non-zero bank balance.
+func (p *PgStore) AcceptStatement(ctx context.Context, tenantID, statementID, actorPrincipalID, correlationID string) error {
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE bank_statements SET status='ACCEPTED' WHERE statement_id=$1 AND tenant_id=$2 AND status='VALIDATING'`, statementID, tenantID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidStatementTransition
+		}
+		var ev domain.BankStatementAcceptedEvent
+		if err := tx.QueryRow(ctx, statementWithConnectionSQL, statementID, tenantID).Scan(
+			&ev.StatementID, &ev.ConnectionID, &ev.TenantID, &ev.OpeningBalance, &ev.ClosingBalance, &ev.StatementDate,
+			&ev.LegalEntityID, &ev.BankAccountID, &ev.Currency); err != nil {
+			return err
+		}
+		ev.AcceptedAt = time.Now().UTC()
+		return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.bank-statement.accepted", "banking.statement.accepted",
+			"bank-statement", ev.StatementID, tenantID, ev.LegalEntityID, actorPrincipalID, correlationID, ev)
+	})
 	if err != nil {
+		if errors.Is(err, domain.ErrInvalidStatementTransition) {
+			return p.notFoundOrInvalidStatement(ctx, tenantID, statementID)
+		}
 		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return p.notFoundOrInvalidStatement(ctx, tenantID, statementID)
 	}
 	return nil
 }
 
-func (p *PgStore) QuarantineStatement(ctx context.Context, tenantID, statementID, reason string) error {
-	tag, err := p.execWithTenant(ctx, `UPDATE bank_statements SET status='QUARANTINED', quarantine_reason=$3 WHERE statement_id=$1 AND tenant_id=$2 AND status IN ('RECEIVED','VALIDATING')`, statementID, tenantID, reason)
-	if err != nil {
+// enqueueStatementQuarantinedEvent loads just enough connection context to
+// shape BankStatementQuarantined and enqueues it inside the caller's own
+// transaction. Shared by ValidateStatement's auto-quarantine path and the
+// explicit QuarantineStatement command — both already hold a row lock on
+// the statement they just transitioned.
+func (p *PgStore) enqueueStatementQuarantinedEvent(ctx context.Context, tx pgx.Tx, tenantID, statementID, reason, actorPrincipalID, correlationID string) error {
+	var ev domain.BankStatementQuarantinedEvent
+	ev.QuarantineReason = reason
+	if err := tx.QueryRow(ctx, `
+		SELECT s.statement_id, s.connection_id, s.tenant_id, c.legal_entity_id, c.bank_account_id
+		FROM bank_statements s JOIN bank_connections c ON c.connection_id = s.connection_id
+		WHERE s.statement_id=$1 AND s.tenant_id=$2`, statementID, tenantID).
+		Scan(&ev.StatementID, &ev.ConnectionID, &ev.TenantID, &ev.LegalEntityID, &ev.BankAccountID); err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return p.notFoundOrInvalidStatement(ctx, tenantID, statementID)
+	return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.bank-statement.quarantined", "banking.statement.quarantined",
+		"bank-statement", ev.StatementID, tenantID, ev.LegalEntityID, actorPrincipalID, correlationID, ev)
+}
+
+func (p *PgStore) QuarantineStatement(ctx context.Context, tenantID, statementID, reason, actorPrincipalID, correlationID string) error {
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE bank_statements SET status='QUARANTINED', quarantine_reason=$3 WHERE statement_id=$1 AND tenant_id=$2 AND status IN ('RECEIVED','VALIDATING')`, statementID, tenantID, reason)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidStatementTransition
+		}
+		return p.enqueueStatementQuarantinedEvent(ctx, tx, tenantID, statementID, reason, actorPrincipalID, correlationID)
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidStatementTransition) {
+			return p.notFoundOrInvalidStatement(ctx, tenantID, statementID)
+		}
+		return err
 	}
 	return nil
 }

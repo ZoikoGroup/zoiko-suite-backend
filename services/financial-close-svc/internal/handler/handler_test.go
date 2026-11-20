@@ -82,10 +82,6 @@ type stubStore struct {
 	approveFXErr    error
 	markFXPostedErr error
 
-	migrationBatches       map[string]*domain.MigrationBatch
-	createMigrationErr     error
-	transitionMigrationErr error
-
 	snapshots             map[string]*domain.FinancialSnapshot
 	createSnapshotErr     error
 	transitionSnapshotErr error
@@ -144,7 +140,6 @@ func newStubStore() *stubStore {
 		allocationRules:        make(map[string]*domain.AllocationRule),
 		allocationRuns:         make(map[string]*domain.AllocationRun),
 		fxRuns:                 make(map[string]*domain.FXRevaluationRun),
-		migrationBatches:       make(map[string]*domain.MigrationBatch),
 		snapshots:              make(map[string]*domain.FinancialSnapshot),
 		projectionStatus:       make(map[string]*domain.LineageProjectionStatus),
 	}
@@ -1289,128 +1284,6 @@ func (s *stubStore) MarkFXRevaluationPosted(_ context.Context, runID, _, journal
 	return nil
 }
 
-func (s *stubStore) CreateMigrationBatch(_ context.Context, b *domain.MigrationBatch) error {
-	if s.createMigrationErr != nil {
-		return s.createMigrationErr
-	}
-	cp := *b
-	s.migrationBatches[b.BatchID] = &cp
-	return nil
-}
-
-func (s *stubStore) GetMigrationBatchBySourceSystem(_ context.Context, legalEntityID, fiscalPeriod, sourceSystemName string) (*domain.MigrationBatch, error) {
-	for _, b := range s.migrationBatches {
-		if b.LegalEntityID == legalEntityID && b.FiscalPeriod == fiscalPeriod && b.SourceSystemName == sourceSystemName {
-			cp := *b
-			return &cp, nil
-		}
-	}
-	return nil, domain.ErrMigrationBatchNotFound
-}
-
-func (s *stubStore) GetMigrationBatch(_ context.Context, batchID string) (*domain.MigrationBatch, error) {
-	b, ok := s.migrationBatches[batchID]
-	if !ok {
-		return nil, domain.ErrMigrationBatchNotFound
-	}
-	cp := *b
-	return &cp, nil
-}
-
-func (s *stubStore) transitionMigration(batchID, fromStatus, toStatus string) error {
-	if s.transitionMigrationErr != nil {
-		return s.transitionMigrationErr
-	}
-	b, ok := s.migrationBatches[batchID]
-	if !ok {
-		return domain.ErrMigrationBatchNotFound
-	}
-	if b.Status != fromStatus {
-		return domain.ErrInvalidMigrationBatchTransition
-	}
-	b.Status = toStatus
-	return nil
-}
-
-func (s *stubStore) MarkMigrationBatchValidated(_ context.Context, batchID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusLoaded, domain.MigrationBatchStatusValidated); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].ValidatedAt = &at
-	return nil
-}
-
-func (s *stubStore) QuarantineMigrationBatch(_ context.Context, batchID, fromStatus, reason string) error {
-	if err := s.transitionMigration(batchID, fromStatus, domain.MigrationBatchStatusQuarantined); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].QuarantineReason = &reason
-	return nil
-}
-
-func (s *stubStore) ApproveMigrationBatch(_ context.Context, batch *domain.MigrationBatch, principalID, key, hash string, at time.Time) (bool, error) {
-	if id, replay, err := s.lookupClaim(key, "ApproveMigrationBatch", hash); err != nil || replay {
-		if replay {
-			if found := s.migrationBatches[id]; found != nil {
-				*batch = *found
-			}
-		}
-		return replay, err
-	}
-	if err := s.transitionMigration(batch.BatchID, domain.MigrationBatchStatusValidated, domain.MigrationBatchStatusApproved); err != nil {
-		return false, err
-	}
-	s.migrationBatches[batch.BatchID].ApprovedAt, s.migrationBatches[batch.BatchID].ApprovedByPrincipalID = &at, &principalID
-	*batch = *s.migrationBatches[batch.BatchID]
-	s.recordClaim(key, "ApproveMigrationBatch", hash, batch.BatchID)
-	return false, nil
-}
-
-func (s *stubStore) MarkMigrationBatchPosted(_ context.Context, batchID, journalID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusApproved, domain.MigrationBatchStatusPosted); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].JournalID, s.migrationBatches[batchID].PostedAt = &journalID, &at
-	return nil
-}
-
-func (s *stubStore) MarkMigrationBatchReconciled(_ context.Context, batchID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusPosted, domain.MigrationBatchStatusReconciled); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].ReconciledAt = &at
-	return nil
-}
-
-func (s *stubStore) CertifyMigrationBatch(_ context.Context, batch *domain.MigrationBatch, principalID, reason, key, hash string, at time.Time) (bool, error) {
-	if id, replay, err := s.lookupClaim(key, "CertifyMigrationBatch", hash); err != nil || replay {
-		if replay {
-			if found := s.migrationBatches[id]; found != nil {
-				*batch = *found
-			}
-		}
-		return replay, err
-	}
-	if err := s.transitionMigration(batch.BatchID, domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified); err != nil {
-		return false, err
-	}
-	b := s.migrationBatches[batch.BatchID]
-	b.CertifiedAt, b.CertifiedByPrincipalID, b.CertificationReason = &at, &principalID, &reason
-	*batch = *b
-	s.recordClaim(key, "CertifyMigrationBatch", hash, batch.BatchID)
-	return false, nil
-}
-
-func (s *stubStore) ListQuarantinedMigrationBatches(_ context.Context, legalEntityID string) ([]domain.MigrationBatch, error) {
-	var out []domain.MigrationBatch
-	for _, b := range s.migrationBatches {
-		if b.LegalEntityID == legalEntityID && b.Status == domain.MigrationBatchStatusQuarantined {
-			out = append(out, *b)
-		}
-	}
-	return out, nil
-}
-
 func (s *stubStore) CreateFinancialSnapshot(_ context.Context, snap *domain.FinancialSnapshot) error {
 	if s.createSnapshotErr != nil {
 		return s.createSnapshotErr
@@ -1660,11 +1533,6 @@ type stubClients struct {
 	trialBalances                map[string]float64
 	trialBalErr                  error
 
-	checkARInvoiceErr  error
-	checkAPInvoiceErr  error
-	existingARInvoices map[string]bool // "customerID|invoiceNumber" -> exists
-	existingAPInvoices map[string]bool // "vendorID|invoiceNumber" -> exists
-
 	controlAccountCodes  map[string]string // mapping key -> account code
 	mappingErr           error
 	apSubledgerTotal     float64
@@ -1721,11 +1589,6 @@ type stubClients struct {
 	lastMultiLegalEntity string
 	lastMultiPeriod      string
 	postMultiLineCalls   int
-
-	// ACC-17 reconciliation read-back.
-	postedJournal   *domain.PostedJournal
-	getJournalErr   error
-	getJournalCalls int
 }
 
 func (c *stubClients) GetUnpostedJournalsCount(_ context.Context, _, _, _ string) (int, error) {
@@ -1755,7 +1618,7 @@ func (c *stubClients) CompileTrialBalanceDecimal(_ context.Context, _, _, _, _ s
 	}, nil
 }
 
-// ListChartOfAccounts is the one chart read ACC-09/10/17 now make. Without an
+// ListChartOfAccounts is the one chart read ACC-09/10 now make. Without an
 // explicit chartOfAccounts it is built from the per-account fixtures the
 // tests already declare (accountStatuses, accountTypes), and their error
 // fixtures become a failed listing — the GL outage they always simulated.
@@ -1786,21 +1649,6 @@ func (c *stubClients) ListChartOfAccounts(_ context.Context, _, _ string) ([]cli
 	return out, nil
 }
 
-// GetPostedJournal reads back postedJournal when a test sets one; otherwise
-// the journal exactly as the last PostMultiLineJournal sent it — what a
-// healthy ledger would hold.
-func (c *stubClients) GetPostedJournal(_ context.Context, _, journalID string) (*domain.PostedJournal, error) {
-	c.getJournalCalls++
-	if c.getJournalErr != nil {
-		return nil, c.getJournalErr
-	}
-	if c.postedJournal != nil {
-		return c.postedJournal, nil
-	}
-	return &domain.PostedJournal{JournalID: journalID, Status: domain.GLJournalStatusFinalized, LegalEntityID: c.lastMultiLegalEntity,
-		FiscalPeriod: c.lastMultiPeriod, Lines: c.lastMultiLines}, nil
-}
-
 func (c *stubClients) ListBankAccounts(_ context.Context, _, _, _ string) ([]domain.BankAccountRef, error) {
 	c.bankCalls++
 	return c.bankAccounts, c.bankAccountsErr
@@ -1817,19 +1665,6 @@ func (c *stubClients) GetPostingBacklog(_ context.Context, _, _, _ string, cutof
 	return c.backlog, c.backlogErr
 }
 
-func (c *stubClients) CheckARInvoiceExists(_ context.Context, _, _, customerID, invoiceNumber string) (bool, error) {
-	if c.checkARInvoiceErr != nil {
-		return false, c.checkARInvoiceErr
-	}
-	return c.existingARInvoices[customerID+"|"+invoiceNumber], nil
-}
-
-func (c *stubClients) CheckAPInvoiceExists(_ context.Context, _, _, vendorID, invoiceNumber string) (bool, error) {
-	if c.checkAPInvoiceErr != nil {
-		return false, c.checkAPInvoiceErr
-	}
-	return c.existingAPInvoices[vendorID+"|"+invoiceNumber], nil
-}
 func (c *stubClients) UploadCloseEvidence(_ context.Context, _, _, _ string, _ map[string]float64, _ string) (string, error) {
 	if c.uploadErr != nil {
 		return "", c.uploadErr
@@ -4132,316 +3967,6 @@ func TestReversePriorRevaluation_NegatesPriorAdjustments(t *testing.T) {
 	}
 	if len(reversal.Items) != 1 || reversal.Items[0].AdjustmentAmount != -200.00 {
 		t.Fatalf("expected negated adjustment -200.00, got %+v", reversal.Items)
-	}
-}
-
-// ── ACC-17 (Opening Balance & Migration) ────────────────────────────────────────
-
-func balancedMigrationEntries() []domain.MigrationCrosswalkEntry {
-	return []domain.MigrationCrosswalkEntry{
-		{SourceReferenceID: "SRC-1", SourceAccountCode: "LEGACY-CASH", TargetAccountCode: "1000-Cash", DebitAmount: 10000.00},
-		{SourceReferenceID: "SRC-2", SourceAccountCode: "LEGACY-EQUITY", TargetAccountCode: "3000-OpeningEquity", CreditAmount: 10000.00},
-	}
-}
-
-func createValidatedMigrationBatch(t *testing.T, s *stubStore, cl *stubClients, r chi.Router) string {
-	t.Helper()
-	if cl.accountStatuses == nil {
-		cl.accountStatuses = map[string]string{}
-	}
-	cl.accountStatuses["1000-Cash"] = "ACTIVE"
-	cl.accountStatuses["3000-OpeningEquity"] = "ACTIVE"
-
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:abc123",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 10000.00, ExpectedTotalCredits: 10000.00,
-		Entries: balancedMigrationEntries(),
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("create failed: %d %s", rr.Code, rr.Body.String())
-	}
-	var batch domain.MigrationBatch
-	_ = json.NewDecoder(rr.Body).Decode(&batch)
-
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1"); rr.Code != http.StatusOK {
-		t.Fatalf("validate failed: %d %s", rr.Code, rr.Body.String())
-	}
-	return batch.BatchID
-}
-
-func TestCreateMigrationBatch_DuplicateSourceReference_Returns400(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
-		ExpectedRowCount: 2, Entries: []domain.MigrationCrosswalkEntry{
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 100},
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "3000-Equity", CreditAmount: 100},
-		},
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestCreateMigrationBatch_Idempotent_ReturnsSameBatch(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:abc",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 10000, Entries: balancedMigrationEntries(),
-	}
-	first := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	if first.Code != http.StatusCreated {
-		t.Fatalf("first create failed: %d %s", first.Code, first.Body.String())
-	}
-	var firstBatch domain.MigrationBatch
-	_ = json.NewDecoder(first.Body).Decode(&firstBatch)
-
-	replay := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	if replay.Code != http.StatusOK {
-		t.Fatalf("expected 200 on replay got %d: %s", replay.Code, replay.Body.String())
-	}
-	var replayBatch domain.MigrationBatch
-	_ = json.NewDecoder(replay.Body).Decode(&replayBatch)
-	if replayBatch.BatchID != firstBatch.BatchID {
-		t.Errorf("expected the same batch on replay, got a different batch_id")
-	}
-}
-
-func TestValidateOpeningBalances_UnbalancedTB_QuarantinesBatch(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "3000-Equity": "ACTIVE"}}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 9000,
-		Entries: []domain.MigrationCrosswalkEntry{
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 10000},
-			{SourceReferenceID: "SRC-2", TargetAccountCode: "3000-Equity", CreditAmount: 9000}, // does not balance
-		},
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	var batch domain.MigrationBatch
-	_ = json.NewDecoder(rr.Body).Decode(&batch)
-
-	validateRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1")
-	if validateRR.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", validateRR.Code, validateRR.Body.String())
-	}
-	stored, _ := s.GetMigrationBatch(context.Background(), batch.BatchID)
-	if stored.Status != domain.MigrationBatchStatusQuarantined {
-		t.Errorf("expected QUARANTINED, got %q", stored.Status)
-	}
-}
-
-func TestValidateOpeningBalances_SuspenseAccountTargeted_QuarantinesBatch(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "9999-Suspense": "ACTIVE"}}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
-		Entries: []domain.MigrationCrosswalkEntry{
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 500},
-			{SourceReferenceID: "SRC-2", TargetAccountCode: "9999-Suspense", CreditAmount: 500}, // forced plug
-		},
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	var batch domain.MigrationBatch
-	_ = json.NewDecoder(rr.Body).Decode(&batch)
-
-	validateRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1")
-	if validateRR.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", validateRR.Code, validateRR.Body.String())
-	}
-}
-
-func TestValidateOpeningBalances_ControlTotalsMismatch_QuarantinesBatch(t *testing.T) {
-	// Row counts and both sides balance internally, but the loaded totals
-	// don't match what the SOURCE system itself declared — the deeper
-	// version of "values differ."
-	s := newStubStore()
-	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "3000-Equity": "ACTIVE"}}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 99999.00, ExpectedTotalCredits: 99999.00, // source declared this
-		Entries: []domain.MigrationCrosswalkEntry{
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 10000},
-			{SourceReferenceID: "SRC-2", TargetAccountCode: "3000-Equity", CreditAmount: 10000}, // but this is what actually loaded
-		},
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	var batch domain.MigrationBatch
-	_ = json.NewDecoder(rr.Body).Decode(&batch)
-
-	validateRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1")
-	if validateRR.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", validateRR.Code, validateRR.Body.String())
-	}
-}
-
-// TestApproveMigrationBatch_RetryUnderSameKeyReplays and
-// TestCertifyMigrationBatch_RetryUnderSameKeyReplays are the ACC-17 mirror of
-// the ACC-07/08/09/10 lifecycle tests above (SPEC_DEVIATIONS A11).
-func TestApproveMigrationBatch_RetryUnderSameKeyReplays(t *testing.T) {
-	s := newStubStore()
-	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
-		Status: domain.MigrationBatchStatusValidated, CreatedByPrincipalID: "preparer-1"}
-	r := newRouter(s, &stubAuthZ{}, &stubClients{})
-
-	key := uuid.NewString()
-	first := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/approve", nil, "approver-1", testTenantID, key)
-	if first.Code != http.StatusOK {
-		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
-	}
-	retry := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/approve", nil, "approver-1", testTenantID, key)
-	if retry.Code != http.StatusOK {
-		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
-	}
-	var replayed domain.MigrationBatch
-	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
-		t.Fatal(err)
-	}
-	if replayed.Status != domain.MigrationBatchStatusApproved {
-		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
-	}
-}
-
-func TestCertifyMigrationBatch_RetryUnderSameKeyReplays(t *testing.T) {
-	s := newStubStore()
-	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
-		Status: domain.MigrationBatchStatusReconciled, CreatedByPrincipalID: "preparer-1"}
-	r := newRouter(s, &stubAuthZ{}, &stubClients{})
-
-	certReq := domain.CertifyMigrationBatchRequest{Reason: "cutover signed"}
-	key := uuid.NewString()
-	first := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/certify", certReq, "certifier-1", testTenantID, key)
-	if first.Code != http.StatusOK {
-		t.Fatalf("first certify: %d %s", first.Code, first.Body.String())
-	}
-	retry := doReqKeyed(r, http.MethodPost, "/v1/migration-batches/batch-1/certify", certReq, "certifier-1", testTenantID, key)
-	if retry.Code != http.StatusOK {
-		t.Fatalf("retried certify under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
-	}
-	var replayed domain.MigrationBatch
-	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
-		t.Fatal(err)
-	}
-	if replayed.Status != domain.MigrationBatchStatusCertified {
-		t.Fatalf("replay status = %q, want CERTIFIED", replayed.Status)
-	}
-}
-
-func TestApproveMigrationBatch_UsesDistinctAuthorizationAction(t *testing.T) {
-	s := newStubStore()
-	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1", Status: domain.MigrationBatchStatusValidated}
-	var seenAction string
-	authz := &recordingAuthZ{onCheck: func(_, _, action string) error {
-		seenAction = action
-		return domain.ErrAuthorizationDenied
-	}}
-	h := handler.New(s, authz, &stubClients{}, testSigningKey, zap.NewNop())
-	rt := chi.NewRouter()
-	rt.Use(middleware.TenantContext())
-	handler.RegisterRoutes(rt, h)
-	rr := doReq(rt, http.MethodPost, "/v1/migration-batches/batch-1/approve", nil, "approver-1")
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
-	}
-	if seenAction != "MIGRATION_BATCH_APPROVE" {
-		t.Errorf("expected MIGRATION_BATCH_APPROVE, got %q", seenAction)
-	}
-}
-
-func TestCommitOpeningPosting_Replay_DoesNotRepost(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := createValidatedMigrationBatch(t, s, cl, r)
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
-	}
-
-	first := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if first.Code != http.StatusOK {
-		t.Fatalf("first commit failed: %d %s", first.Code, first.Body.String())
-	}
-	if cl.postMultiLineCalls != 1 {
-		t.Fatalf("expected 1 journal post, got %d", cl.postMultiLineCalls)
-	}
-
-	replay := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if replay.Code != http.StatusOK {
-		t.Fatalf("expected 200 on replay got %d: %s", replay.Code, replay.Body.String())
-	}
-	if cl.postMultiLineCalls != 1 {
-		t.Fatalf("expected still only 1 journal post after replay, got %d", cl.postMultiLineCalls)
-	}
-	var posted domain.MigrationBatch
-	_ = json.NewDecoder(replay.Body).Decode(&posted)
-	if posted.Status != domain.MigrationBatchStatusReconciled {
-		t.Errorf("expected RECONCILED after commit, got %q", posted.Status)
-	}
-}
-
-func TestCommitOpeningPosting_LockedPeriod_Returns422AndDoesNotPost(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := createValidatedMigrationBatch(t, s, cl, r)
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
-	}
-	s.periods["fp-locked"] = &domain.FiscalPeriod{FiscalPeriodID: "fp-locked", TenantID: testTenantID, LegalEntityID: "le-1", PeriodName: "2026-01", CloseStatus: "LOCKED"}
-
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if rr.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", rr.Code, rr.Body.String())
-	}
-	if cl.postMultiLineCalls != 0 {
-		t.Errorf("expected no journal posted into a LOCKED period, got %d calls", cl.postMultiLineCalls)
-	}
-}
-
-func TestCertifyMigrationAccounting_RequiresReason(t *testing.T) {
-	s := newStubStore()
-	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1", Status: domain.MigrationBatchStatusReconciled}
-	r := newRouter(s, &stubAuthZ{}, &stubClients{})
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/batch-1/certify", domain.CertifyMigrationBatchRequest{}, "certifier-1")
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestFullMigrationLifecycle_ReachesCertified(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := createValidatedMigrationBatch(t, s, cl, r)
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
-	}
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1"); rr.Code != http.StatusOK {
-		t.Fatalf("commit failed: %d %s", rr.Code, rr.Body.String())
-	}
-	certifyRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/certify", domain.CertifyMigrationBatchRequest{Reason: "source-to-target reconciled and signed off"}, "certifier-1")
-	if certifyRR.Code != http.StatusOK {
-		t.Fatalf("certify failed: %d %s", certifyRR.Code, certifyRR.Body.String())
-	}
-	var final domain.MigrationBatch
-	_ = json.NewDecoder(certifyRR.Body).Decode(&final)
-	if final.Status != domain.MigrationBatchStatusCertified {
-		t.Errorf("expected CERTIFIED, got %q", final.Status)
 	}
 }
 

@@ -1,15 +1,37 @@
+# BUILD CONTEXT IS services/, NOT THIS DIRECTORY:
+#   docker build -f migration-integrity-svc/Dockerfile services/
+# go.mod replaces zoiko.io/eventing with ../eventing, and Docker can only
+# COPY from inside the build context -- matching general-ledger-svc's
+# Dockerfile, which has the same replace directive and the same build-context
+# requirement. main independently added a builder stage for this service
+# (PR #262) but kept the old single-directory context, which cannot resolve
+# ../eventing; this keeps that fix's intent (give the service a real builder
+# stage) while using the build-context-correct form.
+
+# ─── Stage 1: builder ─────────────────────────────────────────────────────────
 FROM golang:1.25-alpine AS builder
 
-WORKDIR /app
+RUN apk add --no-cache git ca-certificates
 
-COPY go.mod go.sum ./
+WORKDIR /build/migration-integrity-svc
+
+COPY eventing/ /build/eventing/
+COPY migration-integrity-svc/go.mod migration-integrity-svc/go.sum ./
 RUN go mod download
 
-COPY . .
+COPY migration-integrity-svc/ ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /server ./cmd/server
-RUN CGO_ENABLED=0 GOOS=linux go build -o /healthcheck ./cmd/healthcheck
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /server \
+    ./cmd/server/
 
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /healthcheck \
+    ./cmd/healthcheck/
+
+# ─── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM alpine:3.19
 
 RUN apk add --no-cache ca-certificates tzdata

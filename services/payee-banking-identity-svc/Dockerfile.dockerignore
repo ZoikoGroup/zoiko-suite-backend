@@ -1,4 +1,6 @@
-# Build context is services/ (see Dockerfile).
+# Build context is services/ (see Dockerfile). Send only what the build reads.
 *
-!eventing
 !payee-banking-identity-svc
+!eventing
+payee-banking-identity-svc/deployments
+**/*_test.go

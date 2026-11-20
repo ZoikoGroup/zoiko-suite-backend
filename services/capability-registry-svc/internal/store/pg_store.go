@@ -34,6 +34,8 @@ const (
 	legacyReleaseStateChanged          = "capability_release.state_changed"
 	eventCapabilityClaimCreated        = "com.zoikosuite.platform.capability-claim.created"
 	legacyCapabilityClaimCreated       = "capability_claim.created"
+	eventCapabilityClaimDecided        = "com.zoikosuite.platform.capability-claim.decided"
+	legacyCapabilityClaimDecided       = "capability_claim.decided"
 
 	// aggregateCapability is the aggregate every event is about. Market
 	// releases, integration capabilities, releases and claims are children
@@ -92,6 +94,13 @@ type Store interface {
 	CreateCapabilityClaim(ctx context.Context, c *domain.CapabilityClaim, claim domain.IdempotencyClaim) error
 	ListClaimsByCapability(ctx context.Context, capabilityID string) ([]domain.CapabilityClaim, error)
 	GetCapabilityClaimByID(ctx context.Context, claimID string) (*domain.CapabilityClaim, error)
+
+	// DecideCapabilityClaim is Gap 1's maker-checker decision step. Self-
+	// approval blocking (deciderPrincipalID must differ from the claim's
+	// WordingOwnerPrincipalID) is enforced by the handler before this is
+	// invoked — the store layer alone can't distinguish "blocked" from
+	// "already decided", same as ai-governance-svc's DecideAutomationAction.
+	DecideCapabilityClaim(ctx context.Context, claimID, decision, deciderPrincipalID string, decidedAt time.Time, claim domain.IdempotencyClaim) error
 
 	// ResolveCapability deliberately takes no tenant argument. The five
 	// registry tables are platform-scope reference data (SPEC_DEVIATIONS B12):
@@ -480,11 +489,11 @@ func (s *PgStore) CreateRelease(ctx context.Context, r *domain.Release, claim do
 		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO releases (
-				release_id, capability_id, state, reason, effective_from,
-				created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`, r.ReleaseID, r.CapabilityID, string(r.State), r.Reason, r.EffectiveFrom,
-			r.CreatedAt, r.CreatedByPrincipalID,
+				release_id, capability_id, state, reason, reconciliation_procedure_ref,
+				effective_from, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`, r.ReleaseID, r.CapabilityID, string(r.State), r.Reason, r.ReconciliationProcedureRef,
+			r.EffectiveFrom, r.CreatedAt, r.CreatedByPrincipalID,
 		)
 		if err != nil {
 			if isForeignKeyViolation(err) || isInvalidTextRepresentation(err) {
@@ -500,12 +509,12 @@ func (s *PgStore) GetReleaseByID(ctx context.Context, releaseID string) (*domain
 	var r domain.Release
 	var state string
 	err := s.pool.QueryRow(ctx, `
-		SELECT release_id, capability_id, state, reason, effective_from,
-		       created_at, created_by_principal_id
+		SELECT release_id, capability_id, state, reason, reconciliation_procedure_ref,
+		       effective_from, created_at, created_by_principal_id
 		FROM releases WHERE release_id = $1
 	`, releaseID).Scan(
-		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.EffectiveFrom,
-		&r.CreatedAt, &r.CreatedByPrincipalID,
+		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.ReconciliationProcedureRef,
+		&r.EffectiveFrom, &r.CreatedAt, &r.CreatedByPrincipalID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrReleaseNotFound
@@ -526,13 +535,13 @@ func (s *PgStore) GetCurrentRelease(ctx context.Context, capabilityID string) (*
 	var r domain.Release
 	var state string
 	err := s.pool.QueryRow(ctx, `
-		SELECT release_id, capability_id, state, reason, effective_from,
-		       created_at, created_by_principal_id
+		SELECT release_id, capability_id, state, reason, reconciliation_procedure_ref,
+		       effective_from, created_at, created_by_principal_id
 		FROM releases WHERE capability_id = $1
 		ORDER BY effective_from DESC, created_at DESC, release_id DESC LIMIT 1
 	`, capabilityID).Scan(
-		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.EffectiveFrom,
-		&r.CreatedAt, &r.CreatedByPrincipalID,
+		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.ReconciliationProcedureRef,
+		&r.EffectiveFrom, &r.CreatedAt, &r.CreatedByPrincipalID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrReleaseNotFound
@@ -549,13 +558,18 @@ func (s *PgStore) CreateCapabilityClaim(ctx context.Context, c *domain.Capabilit
 		if err := claimIdempotency(ctx, tx, claim); err != nil {
 			return err
 		}
+		if c.ApprovalStatus == "" {
+			c.ApprovalStatus = string(domain.ClaimApprovalPending)
+		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO capability_claims (
 				claim_id, capability_id, claim_text, market_scope, wording_owner_principal_id,
-				approved_by_principal_id, expiry_review_date, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				approval_status, approved_by_principal_id, approved_at, expiry_review_date,
+				created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		`, c.ClaimID, c.CapabilityID, c.ClaimText, c.MarketScope, c.WordingOwnerPrincipalID,
-			c.ApprovedByPrincipalID, c.ExpiryReviewDate, c.CreatedAt, c.CreatedByPrincipalID,
+			c.ApprovalStatus, c.ApprovedByPrincipalID, c.ApprovedAt, c.ExpiryReviewDate,
+			c.CreatedAt, c.CreatedByPrincipalID,
 		)
 		if err != nil {
 			if isForeignKeyViolation(err) || isInvalidTextRepresentation(err) {
@@ -571,11 +585,13 @@ func (s *PgStore) GetCapabilityClaimByID(ctx context.Context, claimID string) (*
 	var c domain.CapabilityClaim
 	err := s.pool.QueryRow(ctx, `
 		SELECT claim_id, capability_id, claim_text, market_scope, wording_owner_principal_id,
-		       approved_by_principal_id, expiry_review_date, created_at, created_by_principal_id
+		       approval_status, approved_by_principal_id, approved_at, expiry_review_date,
+		       created_at, created_by_principal_id
 		FROM capability_claims WHERE claim_id = $1
 	`, claimID).Scan(
 		&c.ClaimID, &c.CapabilityID, &c.ClaimText, &c.MarketScope, &c.WordingOwnerPrincipalID,
-		&c.ApprovedByPrincipalID, &c.ExpiryReviewDate, &c.CreatedAt, &c.CreatedByPrincipalID,
+		&c.ApprovalStatus, &c.ApprovedByPrincipalID, &c.ApprovedAt, &c.ExpiryReviewDate,
+		&c.CreatedAt, &c.CreatedByPrincipalID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrClaimNotFound
@@ -586,7 +602,8 @@ func (s *PgStore) GetCapabilityClaimByID(ctx context.Context, claimID string) (*
 func (s *PgStore) ListClaimsByCapability(ctx context.Context, capabilityID string) ([]domain.CapabilityClaim, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT claim_id, capability_id, claim_text, market_scope, wording_owner_principal_id,
-		       approved_by_principal_id, expiry_review_date, created_at, created_by_principal_id
+		       approval_status, approved_by_principal_id, approved_at, expiry_review_date,
+		       created_at, created_by_principal_id
 		FROM capability_claims WHERE capability_id = $1
 		ORDER BY created_at DESC
 	`, capabilityID)
@@ -600,13 +617,51 @@ func (s *PgStore) ListClaimsByCapability(ctx context.Context, capabilityID strin
 		var c domain.CapabilityClaim
 		if err := rows.Scan(
 			&c.ClaimID, &c.CapabilityID, &c.ClaimText, &c.MarketScope, &c.WordingOwnerPrincipalID,
-			&c.ApprovedByPrincipalID, &c.ExpiryReviewDate, &c.CreatedAt, &c.CreatedByPrincipalID,
+			&c.ApprovalStatus, &c.ApprovedByPrincipalID, &c.ApprovedAt, &c.ExpiryReviewDate,
+			&c.CreatedAt, &c.CreatedByPrincipalID,
 		); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// DecideCapabilityClaim is Gap 1's maker-checker UPDATE: it only succeeds
+// against a claim still PENDING, so a second decision on an already-decided
+// claim (including a second attempt by the same decider) is refused, not
+// silently re-applied. The WHERE predicate is the enforcement point; the
+// handler's self-approval check runs earlier, against the fetched row's real
+// WordingOwnerPrincipalID.
+func (s *PgStore) DecideCapabilityClaim(ctx context.Context, claimID, decision, deciderPrincipalID string, decidedAt time.Time, claim domain.IdempotencyClaim) error {
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		if err := claimIdempotency(ctx, tx, claim); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE capability_claims
+			SET approval_status = $1, approved_by_principal_id = $2, approved_at = $3
+			WHERE claim_id = $4 AND approval_status = 'PENDING'
+		`, decision, deciderPrincipalID, decidedAt, claimID)
+		if err != nil {
+			return fmt.Errorf("update capability claim decision: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrClaimDecisionInvalid
+		}
+		var capabilityID string
+		if err := tx.QueryRow(ctx, `SELECT capability_id::text FROM capability_claims WHERE claim_id = $1`, claimID).
+			Scan(&capabilityID); err != nil {
+			return fmt.Errorf("lookup capability claim parent: %w", err)
+		}
+		return s.enqueueEvent(ctx, tx, eventCapabilityClaimDecided, legacyCapabilityClaimDecided, capabilityID, claim,
+			map[string]string{
+				"claim_id":                claimID,
+				"capability_id":           capabilityID,
+				"decision":                decision,
+				"decided_by_principal_id": deciderPrincipalID,
+			})
+	})
 }
 
 // ResolveCapability composes this service's own three dimensions into the

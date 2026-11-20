@@ -121,6 +121,13 @@ type MigrationJob struct {
 	IntegrityScoreThreshold float64          `json:"integrity_score_threshold"`
 	BlockerCount            int              `json:"blocker_count"`
 	Status                  JobStatus        `json:"status"`
+	// SourceExtractID/Version bind this job to the immutable SourceExtract it
+	// validated against (ZS-MIG-001 MIG-INV-03), when the caller registered
+	// one -- see ValidateMigrationRequest.SourceExtractID. Both are blank for
+	// a job validated the pre-existing way, directly against submitted
+	// records with no extract on file.
+	SourceExtractID         string           `json:"source_extract_id,omitempty"`
+	SourceExtractVersion    int              `json:"source_extract_version,omitempty"`
 	IntegrityChecks         []IntegrityCheck `json:"integrity_checks,omitempty"`
 	AuditEntries            []AuditEntry     `json:"audit_entries,omitempty"`
 	StartedAt               *time.Time       `json:"started_at,omitempty"`
@@ -194,6 +201,18 @@ type ValidateMigrationRequest struct {
 	// run's quarantine items. Required: every audit entry carries an owner
 	// (MIG-INV-12), and an MQ0 can only be resolved by its owner.
 	ExceptionOwnerID string `json:"exception_owner_id"`
+
+	// SourceExtractID, when provided, is a registered, immutable
+	// SourceExtract's id (not its business extract_id) this validation run
+	// checks against (MIG-INV-03). Optional, for backward compatibility: a
+	// caller that omits it validates the submitted records directly, exactly
+	// as this endpoint behaved before SourceExtract existed. When provided,
+	// the handler requires the extract's legal_entity_id to match
+	// LegalEntityID and its RecordCount to match len(Records) -- the frozen
+	// extract and what is being validated against it must be the same
+	// population, or a retry could silently validate different records under
+	// the same extract's name.
+	SourceExtractID string `json:"source_extract_id,omitempty"`
 }
 
 // RemediateRequest is the body of

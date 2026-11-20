@@ -133,14 +133,43 @@ func TestMigration000005_BackfillsLegacyRowsAndReverses(t *testing.T) {
 		_, err = pool.Exec(ctx, string(b))
 		require.NoError(t, err, path)
 	}
+	// Migrations after 000005 (000006 batch refs, 000007 identity crosswalk,
+	// 000008 certificates) add their own tables and touch neither
+	// migration_audit_entries' taxonomy columns nor migration_jobs'
+	// blocker_count -- this test's "legacy pre-000005 state" setup and its
+	// down/up/down assertions on the taxonomy columns stay valid without
+	// them, so they are deliberately skipped (not applied, not fatal) rather
+	// than extending this scratch DB's schema for no reason this test cares
+	// about. A migration that DOES touch those columns/tables still needs a
+	// human decision here, which is why this stays an explicit skip-list
+	// check rather than a silent "ignore everything past 000005".
+	skippedAfter005 := map[string]bool{
+		"000006_migration_batch_refs.up.sql":   true,
+		"000007_identity_crosswalk.up.sql":     true,
+		"000008_migration_certificates.up.sql": true,
+		// 000009-000011 add MigrationProgram, SourceExtract and the
+		// migration_jobs source-extract reference -- none of it touches
+		// migration_audit_entries' severity/reason_family columns this
+		// test backfills, so they are irrelevant to (and, for 000011,
+		// would require a migration_source_extracts row to satisfy its FK
+		// on an already-inserted job if applied here, which this isolated
+		// 000005-only scenario never creates).
+		"000009_migration_programs.up.sql":         true,
+		"000010_migration_source_extracts.up.sql":  true,
+		"000011_migration_jobs_extract_ref.up.sql": true,
+	}
 	var up5 string
 	for _, f := range files {
-		if strings.Contains(filepath.Base(f), "000005_") {
+		base := filepath.Base(f)
+		if strings.Contains(base, "000005_") {
 			up5 = f
 			continue
 		}
-		if filepath.Base(f) > "000005" {
-			t.Fatalf("migration %s after 000005: extend this test to stop at 000004", f)
+		if base > "000005" {
+			if skippedAfter005[base] {
+				continue
+			}
+			t.Fatalf("migration %s after 000005 is not in skippedAfter005 -- decide whether it needs applying here, or add it to the skip list with why", f)
 		}
 		exec(f)
 	}

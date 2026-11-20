@@ -129,7 +129,7 @@ func TestEventingOutbox_EveryWriteEnqueuesOneEvent(t *testing.T) {
 		{eventCapabilityClaimCreated, legacyCapabilityClaimCreated, func(c domain.IdempotencyClaim) error {
 			return store.CreateCapabilityClaim(ctx, &domain.CapabilityClaim{
 				ClaimID: uuid.NewString(), CapabilityID: capability.CapabilityID, ClaimText: "outbox claim",
-				WordingOwnerPrincipalID: "owner", ApprovedByPrincipalID: "approver",
+				WordingOwnerPrincipalID: "owner", ApprovalStatus: string(domain.ClaimApprovalPending),
 				CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "idempotency-test-principal",
 			}, c)
 		}, "CreateCapabilityClaim"},

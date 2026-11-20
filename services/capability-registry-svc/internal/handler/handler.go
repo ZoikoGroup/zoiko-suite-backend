@@ -17,6 +17,7 @@ import (
 
 	authzpkg "zoiko.io/capability-registry-svc/internal/authz"
 	"zoiko.io/capability-registry-svc/internal/domain"
+	jurisdictionpkg "zoiko.io/capability-registry-svc/internal/jurisdiction"
 	"zoiko.io/capability-registry-svc/internal/store"
 )
 
@@ -32,6 +33,10 @@ const (
 	IntegrationHealthUpdate     = "INTEGRATION_HEALTH_UPDATE"
 	ReleaseStateSet             = "RELEASE_STATE_SET"
 	CapabilityClaimCreate       = "CAPABILITY_CLAIM_CREATE"
+
+	// CapabilityClaimDecide gates the Gap 1 maker-checker decision step —
+	// approving or rejecting a claim a *different* principal proposed.
+	CapabilityClaimDecide = "CAPABILITY_CLAIM_DECIDE"
 
 	// Read actions, same CREATE/READ naming convention as above. Added per
 	// the 2026-10-05 re-audit: GetCapability, ListIntegrationCapabilities,
@@ -56,14 +61,23 @@ type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
-type Handler struct {
-	store  store.Store
-	authz  AuthzChecker
-	logger *zap.Logger
+// JurisdictionValidator validates a market_code against the real
+// jurisdiction/market taxonomy (Gap 3 fix) before it is persisted on a
+// market_releases row. See internal/jurisdiction for the production HTTP
+// implementation against jurisdiction-rules-svc.
+type JurisdictionValidator interface {
+	ValidateExists(ctx context.Context, marketCode string) error
 }
 
-func New(st store.Store, az AuthzChecker, logger *zap.Logger) *Handler {
-	return &Handler{store: st, authz: az, logger: logger}
+type Handler struct {
+	store        store.Store
+	authz        AuthzChecker
+	jurisdiction JurisdictionValidator
+	logger       *zap.Logger
+}
+
+func New(st store.Store, az AuthzChecker, jv JurisdictionValidator, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, jurisdiction: jv, logger: logger}
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -175,6 +189,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/release-state", h.SetReleaseState)
 		r.Post("/{id}/claims", h.CreateCapabilityClaim)
 		r.Get("/{id}/claims", h.ListCapabilityClaims)
+		r.Post("/{id}/claims/{claimId}/decision", h.DecideCapabilityClaim)
 	})
 	r.Put("/v1/integration-capabilities/{id}/health", h.UpdateIntegrationHealth)
 	r.Get("/v1/capability-resolution/{capabilityCode}", h.ResolveCapability)
@@ -289,6 +304,26 @@ func (h *Handler) CreateMarketRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.authorize(w, r, principalID, MarketReleaseCreate) {
 		return
+	}
+
+	// Gap 3 fix: market_code must name a real, known jurisdiction — doc7
+	// §Q1's jurisdiction/entity/language gating, not just a non-empty
+	// string. Fail-closed: an unreachable jurisdiction-rules-svc rejects
+	// the write (503), it never silently accepts an unvalidated code.
+	if err := h.jurisdiction.ValidateExists(r.Context(), req.MarketCode); err != nil {
+		switch {
+		case errors.Is(err, jurisdictionpkg.ErrMarketCodeNotFound):
+			writeError(w, http.StatusBadRequest, "market_code is not a known jurisdiction code: "+req.MarketCode)
+			return
+		case errors.Is(err, jurisdictionpkg.ErrServiceUnavailable):
+			h.logger.Error("jurisdiction validation unavailable — failing closed", zap.String("market_code", req.MarketCode))
+			writeError(w, http.StatusServiceUnavailable, "jurisdiction validation service unavailable")
+			return
+		default:
+			h.logger.Error("jurisdiction validation failed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "jurisdiction validation failed")
+			return
+		}
 	}
 
 	m := &domain.MarketRelease{
@@ -447,6 +482,23 @@ func (h *Handler) UpdateIntegrationHealth(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, response)
 }
 
+// SetReleaseState holds the two emergency-style transitions
+// (INCIDENT_RESTRICTED, DISABLED) to the same rigor doc7 §32.1's kill-switch
+// doctrine requires elsewhere in this platform (Gap 2 fix, 2026-11-19):
+// kill-switch-registry-svc requires a non-empty reconciliation_procedure_ref
+// on every engage, because a kill switch that can be flipped with no
+// recorded plan for how it gets turned back off safely is not a real
+// incident control. This service's own Release.State had none of that —
+// the same one permission and an optional free-text reason covered both a
+// routine GA promotion and an emergency incident restriction.
+//
+// This is deliberately a LOCAL control, not a call out to
+// kill-switch-registry-svc: that service answers a different, genuinely
+// cross-cutting question ("must this class of action be stopped right now"
+// across plane/domain/provider/tenant scopes), while this one is "is this
+// one capability operationally enabled" (capability_id-scoped only, per the
+// domain package's doc comment). Routine GA/BETA/PILOT/INTERNAL promotions
+// are explicitly exempt from both requirements — they are not incidents.
 func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 	capabilityID := chi.URLParam(r, "id")
 	var req domain.SetReleaseStateRequest
@@ -461,6 +513,16 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 	if !domain.ReleaseState(req.State).Valid() {
 		writeError(w, http.StatusBadRequest, "state must be one of GA, BETA, PILOT, INTERNAL, DISABLED, INCIDENT_RESTRICTED")
 		return
+	}
+	if domain.IsEmergencyReleaseState(domain.ReleaseState(req.State)) {
+		if strings.TrimSpace(req.Reason) == "" {
+			writeError(w, http.StatusBadRequest, "reason is required for INCIDENT_RESTRICTED and DISABLED transitions")
+			return
+		}
+		if strings.TrimSpace(req.ReconciliationProcedureRef) == "" {
+			writeError(w, http.StatusBadRequest, "reconciliation_procedure_ref is required for INCIDENT_RESTRICTED and DISABLED transitions")
+			return
+		}
 	}
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -482,6 +544,9 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 	if req.Reason != "" {
 		rel.Reason = &req.Reason
 	}
+	if req.ReconciliationProcedureRef != "" {
+		rel.ReconciliationProcedureRef = &req.ReconciliationProcedureRef
+	}
 	claim, ok := buildClaim(w, r, principalID, "SetReleaseState", rel.ReleaseID, http.StatusCreated, rel, raw)
 	if !ok {
 		return
@@ -501,6 +566,12 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, rel)
 }
 
+// CreateCapabilityClaim is the "propose" half of Gap 1's maker-checker
+// split. It no longer accepts wording_owner_principal_id or
+// approved_by_principal_id as free text: the wording owner is always the
+// authenticated caller making this request, and nobody can be recorded as
+// having approved a claim that was just created. Approval is a separate,
+// later call (DecideCapabilityClaim) by a different authenticated principal.
 func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) {
 	capabilityID := chi.URLParam(r, "id")
 	var req domain.CreateCapabilityClaimRequest
@@ -508,12 +579,8 @@ func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if req.ClaimText == "" || req.WordingOwnerPrincipalID == "" || req.ApprovedByPrincipalID == "" {
-		writeError(w, http.StatusBadRequest, "claim_text, wording_owner_principal_id, and approved_by_principal_id are required")
-		return
-	}
-	if req.WordingOwnerPrincipalID == req.ApprovedByPrincipalID {
-		writeError(w, http.StatusBadRequest, "wording_owner_principal_id and approved_by_principal_id must be distinct principals (segregation of duties)")
+	if req.ClaimText == "" {
+		writeError(w, http.StatusBadRequest, "claim_text is required")
 		return
 	}
 
@@ -526,11 +593,13 @@ func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) 
 	}
 
 	c := &domain.CapabilityClaim{
-		ClaimID:                 uuid.NewString(),
-		CapabilityID:            capabilityID,
-		ClaimText:               req.ClaimText,
-		WordingOwnerPrincipalID: req.WordingOwnerPrincipalID,
-		ApprovedByPrincipalID:   req.ApprovedByPrincipalID,
+		ClaimID:      uuid.NewString(),
+		CapabilityID: capabilityID,
+		ClaimText:    req.ClaimText,
+		// The wording owner is the creator, always — never a free-text value
+		// supplied by the caller. See the domain.CapabilityClaim doc comment.
+		WordingOwnerPrincipalID: principalID,
+		ApprovalStatus:          string(domain.ClaimApprovalPending),
 		CreatedAt:               time.Now().UTC(),
 		CreatedByPrincipalID:    principalID,
 	}
@@ -562,6 +631,72 @@ func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusCreated, c)
+}
+
+// DecideCapabilityClaim is the "approve"/"reject" half of Gap 1's
+// maker-checker split — doc7 §C2's actual segregation-of-duties guarantee.
+// It fetches the existing claim first so the self-approval check below
+// compares against the real wording owner, not a value the caller supplies;
+// the same ordering (fetch, then authorize, then compare principals)
+// ai-governance-svc's DecideAutomationAction uses for the same reason.
+func (h *Handler) DecideCapabilityClaim(w http.ResponseWriter, r *http.Request) {
+	claimID := chi.URLParam(r, "claimId")
+	var req domain.DecideCapabilityClaimRequest
+	raw, ok := readRawBody(w, r, &req)
+	if !ok {
+		return
+	}
+	if req.Decision != string(domain.ClaimApprovalApproved) && req.Decision != string(domain.ClaimApprovalRejected) {
+		writeError(w, http.StatusBadRequest, "decision must be APPROVED or REJECTED")
+		return
+	}
+
+	existing, err := h.store.GetCapabilityClaimByID(r.Context(), claimID)
+	if err != nil {
+		if errors.Is(err, domain.ErrClaimNotFound) {
+			writeError(w, http.StatusNotFound, "capability claim not found")
+			return
+		}
+		h.logger.Error("fetch capability claim for decision failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to fetch capability claim")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, CapabilityClaimDecide) {
+		return
+	}
+	if principalID == existing.WordingOwnerPrincipalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalBlocked.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	decided := *existing
+	decided.ApprovalStatus = req.Decision
+	decided.ApprovedByPrincipalID = &principalID
+	decided.ApprovedAt = &now
+
+	claim, ok := buildClaim(w, r, principalID, "DecideCapabilityClaim", claimID, http.StatusOK, &decided, raw)
+	if !ok {
+		return
+	}
+	if err := h.store.DecideCapabilityClaim(r.Context(), claimID, req.Decision, principalID, now, claim); err != nil {
+		if finishOrReplay(w, err) {
+			return
+		}
+		if errors.Is(err, domain.ErrClaimDecisionInvalid) {
+			writeError(w, http.StatusConflict, "capability claim is not pending a decision")
+			return
+		}
+		h.logger.Error("decide capability claim failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to decide capability claim")
+		return
+	}
+	writeJSON(w, http.StatusOK, &decided)
 }
 
 func (h *Handler) ListCapabilityClaims(w http.ResponseWriter, r *http.Request) {

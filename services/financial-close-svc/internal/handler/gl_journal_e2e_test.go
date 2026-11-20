@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -116,31 +115,6 @@ func TestPostingPaths_AgainstRealGeneralLedger(t *testing.T) {
 		var run domain.FXRevaluationRun
 		_ = json.NewDecoder(rr.Body).Decode(&run)
 		assertGLJournal(t, glURL, tenant, *run.JournalID, "FINALIZED", "ADJUSTMENT", "2026-01-31")
-	})
-
-	// Posts, then reads the journal back from GL and reconciles it against the
-	// crosswalk (ACC-17's B6 reconciliation) — RECONCILED only if GL holds
-	// exactly what was sent.
-	t.Run("ACC-17 opening balances post and reconcile", func(t *testing.T) {
-		s := newStubStore()
-		r := newE2ERouter(s)
-		batchID := uuid.NewString()
-		approver := "approver-1"
-		s.migrationBatches[batchID] = &domain.MigrationBatch{CurrencyCode: testCurrency, BatchID: batchID, TenantID: tenant,
-			LegalEntityID: entity, FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:e2e",
-			ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 10000,
-			Status: domain.MigrationBatchStatusApproved, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
-			ApprovedByPrincipalID: &approver, Entries: balancedMigrationEntries()}
-		rr := doReqAs(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1", tenant)
-		if rr.Code != http.StatusOK {
-			t.Fatalf("commit: %d %s", rr.Code, rr.Body.String())
-		}
-		var batch domain.MigrationBatch
-		_ = json.NewDecoder(rr.Body).Decode(&batch)
-		if batch.Status != domain.MigrationBatchStatusReconciled || batch.JournalID == nil {
-			t.Fatalf("expected RECONCILED with a journal, got %s", batch.Status)
-		}
-		assertGLJournal(t, glURL, tenant, *batch.JournalID, "FINALIZED", "OPENING", "2026-01-31")
 	})
 }
 

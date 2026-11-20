@@ -84,19 +84,19 @@ func TestBNK03_StatementLifecycle_CAS_Transitions(t *testing.T) {
 	stmtID := result.Statement.StatementID
 
 	// Accepting before validation must be rejected.
-	if err := s.AcceptStatement(ctx, "tenant-bnk03-b", stmtID); err != domain.ErrInvalidStatementTransition {
+	if err := s.AcceptStatement(ctx, "tenant-bnk03-b", stmtID, "actor", "corr"); err != domain.ErrInvalidStatementTransition {
 		t.Fatalf("expected ErrInvalidStatementTransition accepting a RECEIVED statement, got %v", err)
 	}
 
-	if err := s.ValidateStatement(ctx, "tenant-bnk03-b", stmtID); err != nil {
+	if err := s.ValidateStatement(ctx, "tenant-bnk03-b", stmtID, "actor", "corr"); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	if err := s.AcceptStatement(ctx, "tenant-bnk03-b", stmtID); err != nil {
+	if err := s.AcceptStatement(ctx, "tenant-bnk03-b", stmtID, "actor", "corr"); err != nil {
 		t.Fatalf("accept: %v", err)
 	}
 
 	// Terminal: re-validating an ACCEPTED statement must be rejected.
-	if err := s.ValidateStatement(ctx, "tenant-bnk03-b", stmtID); err != domain.ErrInvalidStatementTransition {
+	if err := s.ValidateStatement(ctx, "tenant-bnk03-b", stmtID, "actor", "corr"); err != domain.ErrInvalidStatementTransition {
 		t.Fatalf("expected ErrInvalidStatementTransition re-validating an ACCEPTED statement, got %v", err)
 	}
 
@@ -147,7 +147,7 @@ func TestBNK03_ValidateStatement_MatchingBalance_ValidatesCleanly(t *testing.T) 
 		t.Fatalf("ingest: %v", err)
 	}
 
-	if err := s.ValidateStatement(ctx, "tenant-bnk03-balance-ok", result.Statement.StatementID); err != nil {
+	if err := s.ValidateStatement(ctx, "tenant-bnk03-balance-ok", result.Statement.StatementID, "actor", "corr"); err != nil {
 		t.Fatalf("expected clean validation with matching balances, got %v", err)
 	}
 
@@ -183,7 +183,7 @@ func TestBNK03_ValidateStatement_BrokenBalance_AutoQuarantines(t *testing.T) {
 		t.Fatalf("ingest: %v", err)
 	}
 
-	if err := s.ValidateStatement(ctx, "tenant-bnk03-balance-bad", result.Statement.StatementID); err != domain.ErrStatementBalanceMismatch {
+	if err := s.ValidateStatement(ctx, "tenant-bnk03-balance-bad", result.Statement.StatementID, "actor", "corr"); err != domain.ErrStatementBalanceMismatch {
 		t.Fatalf("expected ErrStatementBalanceMismatch, got %v", err)
 	}
 
@@ -200,7 +200,7 @@ func TestBNK03_ValidateStatement_BrokenBalance_AutoQuarantines(t *testing.T) {
 
 	// AcceptStatement must still be impossible — there is no way to
 	// bypass the auto-quarantine by calling accept directly.
-	if err := s.AcceptStatement(ctx, "tenant-bnk03-balance-bad", result.Statement.StatementID); err != domain.ErrInvalidStatementTransition {
+	if err := s.AcceptStatement(ctx, "tenant-bnk03-balance-bad", result.Statement.StatementID, "actor", "corr"); err != domain.ErrInvalidStatementTransition {
 		t.Fatalf("expected ErrInvalidStatementTransition accepting a QUARANTINED statement, got %v", err)
 	}
 }
@@ -554,7 +554,7 @@ func TestBNK03_ReprocessQuarantinedStatement_AllowsOnlyNarrowReset(t *testing.T)
 		t.Fatalf("ingest: %v", err)
 	}
 	stmtID := result.Statement.StatementID
-	if err := s.ValidateStatement(ctx, "tenant-bnk03-reprocess", stmtID); err != domain.ErrStatementBalanceMismatch {
+	if err := s.ValidateStatement(ctx, "tenant-bnk03-reprocess", stmtID, "actor", "corr"); err != domain.ErrStatementBalanceMismatch {
 		t.Fatalf("expected balance mismatch, got %v", err)
 	}
 
@@ -571,7 +571,7 @@ func TestBNK03_ReprocessQuarantinedStatement_AllowsOnlyNarrowReset(t *testing.T)
 
 	// Quarantine it again, then prove the narrow exception cannot be used
 	// to smuggle in a field edit.
-	if err := s.ValidateStatement(ctx, "tenant-bnk03-reprocess", stmtID); err != domain.ErrStatementBalanceMismatch {
+	if err := s.ValidateStatement(ctx, "tenant-bnk03-reprocess", stmtID, "actor", "corr"); err != domain.ErrStatementBalanceMismatch {
 		t.Fatalf("expected second balance mismatch, got %v", err)
 	}
 	if _, err := admin.Exec(ctx, `UPDATE bank_statements SET status='RECEIVED', quarantine_reason='', opening_balance=0 WHERE statement_id=$1`, stmtID); err == nil {

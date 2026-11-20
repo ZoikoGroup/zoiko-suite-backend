@@ -125,10 +125,13 @@ func TestPgStoreResolveCapability_ReleaseTieBreakerIsDeterministic(t *testing.T)
 		"tenant-resolve", "SetReleaseState", "release-tie-old", "release-tie-old", older.ReleaseID)); err != nil {
 		t.Fatalf("create older release: %v", err)
 	}
+	disabledReason := "resolve tie-breaker test"
+	disabledRef := "RUNBOOK-RESOLVE-TIE"
 	newer := &domain.Release{
 		ReleaseID: uuid.NewString(), CapabilityID: capability.CapabilityID,
-		State: domain.ReleaseStateDisabled, EffectiveFrom: effectiveFrom,
-		CreatedAt: effectiveFrom.Add(2 * time.Second), CreatedByPrincipalID: "resolve-test-principal",
+		State: domain.ReleaseStateDisabled, Reason: &disabledReason, ReconciliationProcedureRef: &disabledRef,
+		EffectiveFrom: effectiveFrom,
+		CreatedAt:     effectiveFrom.Add(2 * time.Second), CreatedByPrincipalID: "resolve-test-principal",
 	}
 	if err := store.CreateRelease(ctx, newer, testIdempotencyClaim(
 		"tenant-resolve", "SetReleaseState", "release-tie-new", "release-tie-new", newer.ReleaseID)); err != nil {

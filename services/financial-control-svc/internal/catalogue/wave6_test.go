@@ -17,7 +17,7 @@ func TestWave6_FiveSingleSidedNoPeriodControls(t *testing.T) {
 	want := map[string][2]string{
 		"FIN-CTRL-033": {SysDataIngestion, domain.KindArithmetic},
 		"FIN-CTRL-037": {SysTaxAuthority, domain.KindExceptionScan},
-		"FIN-CTRL-038": {SysFinancialClose, domain.KindArithmetic},
+		"FIN-CTRL-038": {SysGL, domain.KindArithmetic},
 		"FIN-CTRL-044": {SysTreasury, domain.KindExceptionScan},
 		"FIN-CTRL-045": {SysPayeeBanking, domain.KindExceptionScan},
 	}

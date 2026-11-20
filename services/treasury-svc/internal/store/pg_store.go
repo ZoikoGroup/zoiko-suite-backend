@@ -353,6 +353,35 @@ func (s *PgStore) CreateCashBalance(ctx context.Context, bal *domain.CashBalance
 	})
 }
 
+// InTx implements zoiko.io/eventing/inbox.TxRunner, so PgStore can serve
+// directly as the transaction runner the BankStatementAccepted consumer's
+// inbox needs — same app.tenant_id RLS convention as withRLS, just exposed
+// to a caller outside this package that must run its own effect (writing
+// the real cash_balances row) and the inbox's own receipt write in one
+// transaction.
+func (s *PgStore) InTx(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
+	return s.withRLS(ctx, tenantID, fn)
+}
+
+// CreateCashBalanceInTx is CreateCashBalance's same insert, run inside a
+// transaction the caller already owns (the inbox's) instead of opening its
+// own — see the inbox.Handler doc comment: a handler must do every write
+// through the transaction it is handed, never borrow a second pool
+// connection. tenantID/CreatedAt are not re-derived from context here
+// because the inbox transaction's app.tenant_id was already set by InTx
+// above from the event's own tenant_id, and RLS enforces it regardless of
+// what the caller passes as bal.TenantID.
+func (s *PgStore) CreateCashBalanceInTx(ctx context.Context, tx pgx.Tx, bal *domain.CashBalance) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO cash_balances (
+			balance_id, tenant_id, bank_account_id, ledger_balance,
+			available_balance, as_of_timestamp, correlation_id, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+	`, bal.BalanceID, bal.TenantID, bal.BankAccountID, bal.LedgerBalance.OrZero(),
+		bal.AvailableBalance.OrZero(), bal.AsOfTimestamp, bal.CorrelationID)
+	return err
+}
+
 // GetLatestCashBalance retrieves the latest cash balance snapshot for a bank account.
 func (s *PgStore) GetLatestCashBalance(ctx context.Context, bankAccountID string) (*domain.CashBalance, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)

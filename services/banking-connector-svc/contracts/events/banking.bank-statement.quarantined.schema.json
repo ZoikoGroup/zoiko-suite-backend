@@ -1,0 +1,32 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.bank-statement.quarantined (banking-connector-svc, schema 1.0.0). domain.BankStatementQuarantinedEvent — enqueued at both points that already transition a statement to QUARANTINED: ValidateStatement's balance-mismatch auto-quarantine and the explicit QuarantineStatement command.",
+  "properties": {
+    "statement_id": {
+      "type": "string"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "bank_account_id": {
+      "type": "string"
+    },
+    "quarantine_reason": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "statement_id",
+    "connection_id",
+    "tenant_id",
+    "legal_entity_id",
+    "bank_account_id",
+    "quarantine_reason"
+  ],
+  "type": "object"
+}

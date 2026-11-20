@@ -235,8 +235,9 @@ services:
   # ── 06. Migration Integrity Service ──────────────────────────────────────
   migration-integrity-svc:
     build:
-      context: ../services/migration-integrity-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: migration-integrity-svc/Dockerfile
     container_name: migration-integrity-svc-p6
     ports:
       - "8139:8139"
