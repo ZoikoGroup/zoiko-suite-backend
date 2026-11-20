@@ -106,7 +106,7 @@ the same set. There is no `DRAFT` state and no command that creates one.
 Adding `DRAFT` without a draft command would create an unreachable state, so
 this is recorded rather than papered over.
 
-### A3. Active legacy routes remain an alternate commercial path
+### A3. Active legacy routes remain an alternate commercial path — mostly closed 2026-11-20
 
 The non-bypassable invariants say:
 
@@ -119,30 +119,123 @@ The non-bypassable invariants say:
 > “COM-03 is the sole runtime entitlement decision service for commercial plan
 > access/limits. Clients may display entitlements but cannot self-assert them.”
 
-The following legacy routes are still mounted and tested, alongside the
-canonical COM-02/03/04 surfaces:
+**Retired.** The following are no longer mounted — `RegisterSubscriptionRoutes`
+registers only the `/v1/price-catalogs` and `/v1/plans` GET/retired-write
+routes now, and `RegisterRoutes` registers only `/v1/commercial-accounts`:
 
-- `/v1/subscriptions` — `CreateSubscription`, `ResolveEntitlement`,
-  `RecordUsageEvent`, `SetSubscriptionStatus`, `CreateEvaluationProgram`.
-  `ResolveEntitlement` reads legacy plan/overlay limits directly, so it is a
-  second runtime decision path. `RecordUsageEvent` writes
-  `commercial_usage_meter_events` without COM-04 meter registration,
-  statement freeze or adjustment lineage. `SetSubscriptionStatus` uses the
-  legacy status enum (including `PAST_DUE` and `RESTRICTED`), which mixes
-  lifecycle, billing health and entitlement state that §6 keeps orthogonal.
-- `/v1/subscription-change-requests` — legacy preview/confirm change path.
-- `/v1/contract-entitlement-overlays` — creates an overlay that the legacy
-  resolver reads; it is not a COM-03 restriction and does not go through the
+- `/v1/subscriptions` — `CreateSubscription`, `GetSubscription`,
+  `ResolveEntitlement`, `RecordUsageEvent`, `SetSubscriptionStatus`,
+  `ListStatusEvents`, `CreateEvaluationProgram`. `ResolveEntitlement` was a
+  second runtime entitlement decision path reading legacy plan/overlay limits
+  directly — exactly what the COM-03-is-sole-decision-service invariant
+  forbids. `RecordUsageEvent` wrote `commercial_usage_meter_events` without
+  COM-04 meter registration, statement freeze or adjustment lineage.
+  `SetSubscriptionStatus` used the legacy status enum (including `PAST_DUE`
+  and `RESTRICTED`), mixing lifecycle, billing health and entitlement state
+  that §6 keeps orthogonal.
+- `/v1/subscription-change-requests` — `PreviewSubscriptionChange`,
+  `ConfirmSubscriptionChange`.
+- `/v1/contract-entitlement-overlays` — `CreateOverlay`. Fed the legacy
+  resolver above; not a COM-03 restriction and never went through the
   canonical recompute.
-- `/v1/billing-source-transfers` — legacy transfer path.
-- `/v1/commercial-accounts` and `/v1/memberships` — legacy account/membership
-  lifecycle commands.
+- `/v1/billing-source-transfers` — `TransferBillingSource`.
+- `/v1/memberships` (and `GET /v1/organizations/{id}/memberships`) —
+  `CreateMembership`, `GetMembership`, `ListMemberships`,
+  `DeactivateMembership`. Unlike the rest of this list this one isn't an
+  entitlement-decision bypass; it was retired because it's the same
+  "legacy, chunk-based, superseded surface" class as the others and a repo-
+  and frontend-wide search found no caller.
 
-The `/v1/price-catalogs` and `/v1/plans` write routes are deliberately retired
-through `retiredCatalogWrite`; they are not active COM-01 bypasses. The
-remaining routes were not retired in this pass because existing tests and
-callers depend on them. Retiring them requires a consumer migration plan and
-is the main structural follow-up from this survey.
+Verification before deletion: grepped this repo and the frontend
+(`zoiko_suite_frontend/suite_frontend/zoiko-suite-frontend-platform`) for the
+literal paths above — no match outside this service's own handler/test code.
+identity-context-svc's `ResolveEntitlementContext`
+(`internal/upstream/entitlement_client.go`) was the one service-to-service
+candidate; it calls the canonical `GET /v1/commercial/entitlements/effective`,
+not the legacy `ResolveEntitlement` handler — confirmed by reading the file.
+gateway-auth-svc's `internal/commercial/client.go` calls
+`GET /v1/commercial-accounts/by-organization/{id}` and
+`GET /v1/commercial-accounts/{id}/subscription` — neither of those exact
+paths was ever registered by this service (no `/by-organization/` or
+`/{id}/subscription` sub-route existed before or after this change), so that
+client was already calling endpoints that 404 today; this change does not
+affect it either way.
+
+**Deliberately left in place — a real dependency, not an oversight:**
+
+- `POST /v1/commercial-accounts` (`CreateCommercialAccount`) and
+  `GET /v1/commercial-accounts/{id}` (`GetCommercialAccount`) are **not**
+  retired, even though the original version of this note listed them for
+  removal alongside memberships. Canonical COM-02 depends on them: `PUT
+  /v1/commercial/accounts/{id}/market` (`SetAccountMarket`) and `POST
+  /v1/commercial/subscriptions:start` (`StartSubscription`) both read the
+  `commercial_accounts` table directly (`internal/store/com02_subscription_store.go`
+  — `SetAccountMarket`'s `UPDATE commercial_accounts ... WHERE
+  commercial_account_id = $1` and `StartSubscription`'s `SELECT
+  organization_id, billing_currency_code, status, market_code FROM
+  commercial_accounts ... FOR UPDATE`), and both fail closed with
+  `ErrCommercialAccountNotFound`/`ErrAccountNotActive`/`ErrAccountMarketNotSet`
+  when the row doesn't already exist. `CreateCommercialAccount` is the only
+  code path in this service that inserts into `commercial_accounts`. Removing
+  it would make it impossible to onboard a new commercial account at all —
+  canonical COM-02 subscription sales would have no account to attach to.
+  This is exactly the "surviving capability reads data only a legacy route
+  wrote" case this pass was told to check for, not a bypass of the
+  entitlement invariant (creating/reading an account record isn't an
+  entitlement decision), so it stays. Flagging this explicitly since the
+  routes were initially assumed retirable along with memberships.
+- The underlying tables for everything retired above
+  (`commercial_subscriptions`, `evaluation_programs`,
+  `contract_entitlement_overlays`, `commercial_usage_meter_events`,
+  `subscription_change_requests`, `billing_source_transfers`,
+  `subscription_status_events`, `memberships`) are **not** dropped — no
+  down-migration touches them. Two reasons: (1) existing rows are real
+  customer history that must survive, and (2) migration 000007's
+  `reject_legacy_subscription_over_com02` trigger on the canonical
+  `subscriptions` table still queries `commercial_subscriptions` to refuse
+  selling a COM-02 subscription to an account that already holds a live
+  legacy one (`TestSubscription_MutuallyExclusiveWithDoc7Subscriptions`,
+  `internal/store/com02_subscription_store_test.go`) — a real, still-active
+  coupling between the canonical and legacy subscription models.
+- `store.Store` still declares, and `PgStore` still implements,
+  `CreateSubscription`, `GetSubscription`, `ResolveEntitlement`,
+  `RecordUsageEvent`, `TransitionSubscriptionStatus`,
+  `ListStatusEventsBySubscription`, `CreateEvaluationProgram`,
+  `GetEvaluationProgramBySubscription`, `CreateOverlay`,
+  `CreateChangeRequest`, `GetChangeRequest`, `ApplyChangeRequest`,
+  `CreateBillingSourceTransfer`, `UpdateSubscriptionPlan`,
+  `CreateMembership`, `GetMembership`, `ListMemberships`,
+  `DeactivateMembership`. None of these is reachable over HTTP any more —
+  only the `internal/handler` methods and route registrations that called
+  them are gone. They stay at the store layer because
+  `internal/store/rls_test.go` uses them, over a real
+  `NOSUPERUSER NOBYPASSRLS` Postgres role, to prove migration 000005's
+  row-level-security policies on these same tables still isolate tenants
+  correctly. Deleting the Go methods to match the HTTP retirement would have
+  forced either dropping that RLS regression coverage or rewriting it against
+  raw SQL — out of scope for an HTTP-surface retirement, and lower-value than
+  just leaving inert, unreachable persistence code in place. (Compare the
+  `financial-close-svc` migration-batch retirement: same principle — delete
+  the reachable bypass, don't delete a capability something else still reads.)
+- The domain `Request` DTOs that existed only to decode JSON for the removed
+  HTTP handlers (`CreateSubscriptionRequest`, `CreateMembershipRequest`,
+  `CreateEvaluationProgramRequest`, `CreateOverlayRequest`,
+  `RecordUsageEventRequest`, `SetSubscriptionStatusRequest`,
+  `TransferBillingSourceRequest`, `PreviewChangeRequest`) were removed — they
+  had no other reference once the handlers were gone. The domain structs the
+  store layer actually persists (`CommercialSubscription`, `UsageMeterEvent`,
+  `EvaluationProgram`, `ContractEntitlementOverlay`,
+  `SubscriptionChangeRequest`, `BillingSourceTransfer`,
+  `SubscriptionStatusEvent`, `Membership`, `ResolvedEntitlement`, etc.) were
+  left alone since the store methods above still use them.
+
+The `/v1/price-catalogs` and `/v1/plans` write routes remain retired through
+`retiredCatalogWrite` (unchanged by this pass); their GET routes stay for the
+same reason as before — existing legacy subscriptions still reference plans.
+
+Commit: `e5dbe0bb` on `satyaprakash-changes` ("commercial-account-svc: retire
+legacy entitlement-bypass HTTP routes (A3)") for the route/handler/test/
+domain removal; this SPEC_DEVIATIONS.md update is the following commit.
 
 ### A4. Command idempotency and outbox coverage is incomplete — partially closed 2026-11-07
 
