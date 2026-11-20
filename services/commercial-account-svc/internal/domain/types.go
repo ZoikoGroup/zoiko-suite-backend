@@ -87,14 +87,6 @@ type Membership struct {
 	CreatedByPrincipalID string           `json:"created_by_principal_id"`
 }
 
-type CreateMembershipRequest struct {
-	PrincipalID    string `json:"principal_id"`
-	OrganizationID string `json:"organization_id"`
-	WorkspaceID    string `json:"workspace_id,omitempty"`
-	LegalEntityID  string `json:"legal_entity_id,omitempty"`
-	CorrelationID  string `json:"correlation_id"`
-}
-
 // ── errors ───────────────────────────────────────────────────────────────────
 
 type errorString string

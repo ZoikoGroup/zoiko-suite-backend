@@ -129,15 +129,6 @@ type CommercialSubscription struct {
 	CreatedByPrincipalID     string             `json:"created_by_principal_id"`
 }
 
-// SetSubscriptionStatusRequest drives the dunning state machine — the
-// caller (e.g. a payment webhook handler) names the target status; the
-// service validates it against ValidSubscriptionStatusTransitions.
-type SetSubscriptionStatusRequest struct {
-	NewStatus     string `json:"new_status"`
-	Reason        string `json:"reason,omitempty"`
-	CorrelationID string `json:"correlation_id"`
-}
-
 // BillingSourceTransfer is doc7 §P3's effective-dated commercial transfer
 // record for a standalone <-> Zoiko One migration — never a silent swap.
 type BillingSourceTransfer struct {
@@ -154,21 +145,6 @@ type BillingSourceTransfer struct {
 	CreatedByPrincipalID  string    `json:"created_by_principal_id"`
 }
 
-// TransferBillingSourceRequest performs the transfer atomically: optionally
-// cancels OldSubscriptionID and creates a fresh subscription on
-// NewBillingSource for the SAME plan (or TargetPlanID if given), all in one
-// transaction — the existing "one non-terminal subscription per account"
-// constraint (migration 000002) is what actually makes double-billing
-// structurally impossible here, not application-level care alone.
-type TransferBillingSourceRequest struct {
-	CommercialAccountID string   `json:"commercial_account_id"`
-	OldSubscriptionID   string   `json:"old_subscription_id,omitempty"`
-	NewBillingSource    string   `json:"new_billing_source"`
-	TargetPlanID        string   `json:"target_plan_id,omitempty"` // defaults to old subscription's plan if omitted
-	CreditAmount        *float64 `json:"credit_amount,omitempty"`
-	CorrelationID       string   `json:"correlation_id"`
-}
-
 // SubscriptionStatusEvent is the append-only dunning/status-transition
 // audit trail doc7 §O3 requires ("restoration is logged").
 type SubscriptionStatusEvent struct {
@@ -179,21 +155,6 @@ type SubscriptionStatusEvent struct {
 	Reason               *string   `json:"reason,omitempty"`
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
-}
-
-type CreateSubscriptionRequest struct {
-	CommercialAccountID string `json:"commercial_account_id"`
-	PlanID              string `json:"plan_id"`
-	// StartAsEvaluation starts the subscription in EVALUATION rather than
-	// ACTIVE — pair with a subsequent CreateEvaluationProgram call. Doc7
-	// §B3: no free trial is assumed without explicit terms, so a bare
-	// EVALUATION subscription with no evaluation_programs row is a real,
-	// deliberately unusual state a caller can end up in if they skip that
-	// second call — not silently converted to a trial for them.
-	StartAsEvaluation bool `json:"start_as_evaluation,omitempty"`
-	// BillingSource defaults to DIRECT when omitted.
-	BillingSource string `json:"billing_source,omitempty"`
-	CorrelationID string `json:"correlation_id"`
 }
 
 // EvaluationProgram is the trial terms doc7 §B3 requires before any
@@ -209,15 +170,6 @@ type EvaluationProgram struct {
 	ExpiresAt            time.Time `json:"expires_at"`
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
-}
-
-type CreateEvaluationProgramRequest struct {
-	SubscriptionID   string `json:"subscription_id"`
-	DurationDays     int    `json:"duration_days"`
-	PaymentRequired  bool   `json:"payment_required,omitempty"`
-	ConversionPolicy string `json:"conversion_policy"`
-	ExpiryAction     string `json:"expiry_action"`
-	CorrelationID    string `json:"correlation_id"`
 }
 
 // ContractEntitlementOverlay overrides one metric's limit for one commercial
@@ -236,17 +188,6 @@ type ContractEntitlementOverlay struct {
 	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
 }
 
-type CreateOverlayRequest struct {
-	CommercialAccountID   string `json:"commercial_account_id"`
-	MetricType            string `json:"metric_type"`
-	OverrideLimitValue    *int64 `json:"override_limit_value,omitempty"`
-	LegalReference        string `json:"legal_reference,omitempty"`
-	EffectiveFrom         string `json:"effective_from"`
-	EffectiveTo           string `json:"effective_to,omitempty"`
-	ApprovedByPrincipalID string `json:"approved_by_principal_id"`
-	CorrelationID         string `json:"correlation_id"`
-}
-
 // UsageMeterEvent is a Plane-1 metering fact, doc7 §B7/§N3: operational
 // telemetry is not commercial consent — this ledger, not raw telemetry, is
 // what a catalog rate/allowance is ever applied against. UsageEventID is the
@@ -263,14 +204,6 @@ type UsageMeterEvent struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-type RecordUsageEventRequest struct {
-	UsageEventID   string  `json:"usage_event_id"`
-	SubscriptionID string  `json:"subscription_id"`
-	MetricType     string  `json:"metric_type"`
-	Quantity       float64 `json:"quantity"`
-	SourceService  string  `json:"source_service"`
-}
-
 // SubscriptionChangeRequest is the persisted quote/preview step doc7 §B4-B5
 // requires before an upgrade/downgrade actually changes entitlement.
 type SubscriptionChangeRequest struct {
@@ -282,13 +215,6 @@ type SubscriptionChangeRequest struct {
 	RequestedByPrincipalID string     `json:"requested_by_principal_id"`
 	CreatedAt              time.Time  `json:"created_at"`
 	AppliedAt              *time.Time `json:"applied_at,omitempty"`
-}
-
-type PreviewChangeRequest struct {
-	SubscriptionID string `json:"subscription_id"`
-	TargetPlanID   string `json:"target_plan_id"`
-	EffectiveAt    string `json:"effective_at,omitempty"`
-	CorrelationID  string `json:"correlation_id"`
 }
 
 // ResolvedEntitlement is the answer to "what may this subscription's account

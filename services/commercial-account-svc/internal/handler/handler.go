@@ -29,9 +29,6 @@ const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 const (
 	CommercialAccountCreate = "COMMERCIAL_ACCOUNT_CREATE"
 	CommercialAccountRead   = "COMMERCIAL_ACCOUNT_READ"
-	MembershipCreate        = "MEMBERSHIP_CREATE"
-	MembershipRead          = "MEMBERSHIP_READ"
-	MembershipDeactivate    = "MEMBERSHIP_DEACTIVATE"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -107,17 +104,22 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	return true
 }
 
+// Retired (SPEC_DEVIATIONS.md A3, ZS-SVC-Q-001): /v1/memberships and its
+// CreateMembership/GetMembership/ListMemberships/DeactivateMembership HTTP
+// handlers are gone. Nothing in the canonical COM-01-05 surface reads or
+// writes the memberships table, and no real caller (this repo, the frontend,
+// or another service) was found referencing these paths — see the A3
+// closure note for the verification. The memberships table and its RLS
+// policy (migration 000005) are left in place; store.Store still declares
+// CreateMembership/GetMembership/ListMemberships/DeactivateMembership and
+// PgStore still implements them, because internal/store/rls_test.go uses
+// them to exercise that policy against a real Postgres role. They are simply
+// no longer reachable over HTTP.
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/commercial-accounts", func(r chi.Router) {
 		r.Post("/", h.CreateCommercialAccount)
 		r.Get("/{id}", h.GetCommercialAccount)
 	})
-	r.Route("/v1/memberships", func(r chi.Router) {
-		r.Post("/", h.CreateMembership)
-		r.Get("/{id}", h.GetMembership)
-		r.Delete("/{id}", h.DeactivateMembership)
-	})
-	r.Get("/v1/organizations/{organizationID}/memberships", h.ListMemberships)
 }
 
 func (h *Handler) CreateCommercialAccount(w http.ResponseWriter, r *http.Request) {
@@ -198,155 +200,6 @@ func (h *Handler) GetCommercialAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, acct)
-}
-
-func (h *Handler) CreateMembership(w http.ResponseWriter, r *http.Request) {
-	var req domain.CreateMembershipRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.PrincipalID == "" || req.OrganizationID == "" {
-		writeError(w, http.StatusBadRequest, "principal_id and organization_id are required")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, req.OrganizationID, MembershipCreate) {
-		return
-	}
-
-	m := &domain.Membership{
-		MembershipID:         uuid.NewString(),
-		PrincipalID:          req.PrincipalID,
-		OrganizationID:       req.OrganizationID,
-		Status:               domain.MembershipStatusActive,
-		EffectiveFrom:        time.Now().UTC(),
-		CreatedAt:            time.Now().UTC(),
-		CreatedByPrincipalID: principalID,
-	}
-	if req.WorkspaceID != "" {
-		m.WorkspaceID = &req.WorkspaceID
-	}
-	if req.LegalEntityID != "" {
-		m.LegalEntityID = &req.LegalEntityID
-	}
-
-	if err := h.store.CreateMembership(r.Context(), m); err != nil {
-		h.logger.Error("create membership failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to create membership")
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, m)
-}
-
-// GetMembership reads one membership, scoped to the verified tenant.
-//
-// Authz is now gated on MEMBERSHIP_READ. The membership is fetched first
-// (store is tenant-scoped so a foreign tenant's membership is 404), then
-// the check is made against the membership's OWN organization_id.
-func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requireTenant(w, r, ""); !ok {
-		return
-	}
-	id := chi.URLParam(r, "id")
-	m, err := h.store.GetMembership(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, domain.ErrMembershipNotFound) {
-			writeError(w, http.StatusNotFound, "membership not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get membership")
-		return
-	}
-	if !h.authorize(w, r, principalID, m.OrganizationID, MembershipRead) {
-		return
-	}
-	writeJSON(w, http.StatusOK, m)
-}
-
-// ListMemberships lists the verified tenant's own memberships, authorized by
-// MEMBERSHIP_READ (tracker row 84b).
-//
-// The {organizationID} path segment is kept for URL compatibility but is
-// no longer what drives the query: it must AGREE with the verified
-// X-Tenant-Id, and the store always filters by the context tenant.
-// MEMBERSHIP_READ authorization is checked against the verified tenant ID
-// (the organization scope), not the path parameter — eliminates the
-// any-caller-can-enumerate-any-org gap.
-func (h *Handler) ListMemberships(w http.ResponseWriter, r *http.Request) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	tenantID, ok := h.requireTenant(w, r, chi.URLParam(r, "organizationID"))
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, tenantID, MembershipRead) {
-		return
-	}
-	memberships, err := h.store.ListMemberships(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list memberships")
-		return
-	}
-	if memberships == nil {
-		memberships = []domain.Membership{}
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"memberships": memberships, "total": len(memberships)})
-}
-
-// DeactivateMembership ends a membership per doc7 §A6: access ends, but the
-// row is never deleted — historical attribution (who was a member, when)
-// must survive removal.
-func (h *Handler) DeactivateMembership(w http.ResponseWriter, r *http.Request) {
-	// The store's GetMembership is tenant-scoped, so a foreign membership
-	// already fails closed here as a 404. requireTenant is still worth
-	// running first: without it a header-less caller gets "membership not
-	// found" for a membership that does exist, which is a misleading answer
-	// to a request that should simply have been refused.
-	if _, ok := h.requireTenant(w, r, ""); !ok {
-		return
-	}
-	id := chi.URLParam(r, "id")
-
-	existing, err := h.store.GetMembership(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, domain.ErrMembershipNotFound) {
-			writeError(w, http.StatusNotFound, "membership not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to fetch membership")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, existing.OrganizationID, MembershipDeactivate) {
-		return
-	}
-
-	if err := h.store.DeactivateMembership(r.Context(), id, existing.OrganizationID); err != nil {
-		if errors.Is(err, domain.ErrMembershipNotFound) {
-			writeError(w, http.StatusConflict, "membership already deactivated or not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to deactivate membership")
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deactivated"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
