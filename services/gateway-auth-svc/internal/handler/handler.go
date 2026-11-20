@@ -46,6 +46,9 @@ type Handler struct {
 	// revocation checks each verified envelope's session at
 	// identity-context-svc (AU-01). Nil skips the check (ENV=local only).
 	revocation *idenv.Revocation
+
+	// authFailureLimiter throttles repeated authentication failures per client IP.
+	authFailureLimiter *admission.Limiter
 }
 
 // DomainMetrics records the outcomes this service's HTTP metrics cannot
@@ -119,6 +122,7 @@ func New(
 		log:         log,
 		metrics:     nopMetrics{},
 		rec:         admission.NewRecorder(1024, 0, nil),
+		authFailureLimiter: admission.NewLimiter(cfg.RateAuthFailurePerSecond, cfg.RateAuthFailureBurst, 65536, nil),
 	}
 }
 
@@ -255,6 +259,17 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, jwks.ErrKeyNotFound):
 			h.metrics.JWKSError("key_lookup")
 		}
+		// Rate-limit repeated auth failures per client IP.
+		if h.authFailureLimiter != nil && h.authFailureLimiter.Enabled() {
+			if ok, retryAfter := h.authFailureLimiter.Allow(h.clientIP(r)); !ok {
+				h.metrics.VerifyDecision(outcomeRateLimited)
+				h.refuse(w, r, rc, refusal{
+					outcome: outcomeRateLimited, code: "rate_limited", status: http.StatusTooManyRequests,
+					detail: "too many authentication failures", retryable: true, retryAfter: int(retryAfter.Seconds()),
+				})
+				return
+			}
+		}
 		h.log.Info("gateway rejected request",
 			zap.Error(err),
 			zap.String("forwarded_uri", r.Header.Get("X-Forwarded-Uri")),
@@ -273,6 +288,17 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			zap.String("tenant_id", claims.TenantID),
 			zap.String("forwarded_uri", r.Header.Get("X-Forwarded-Uri")),
 		)
+		// Rate-limit repeated auth failures per client IP.
+		if h.authFailureLimiter != nil && h.authFailureLimiter.Enabled() {
+			if ok, retryAfter := h.authFailureLimiter.Allow(h.clientIP(r)); !ok {
+				h.metrics.VerifyDecision(outcomeRateLimited)
+				h.refuse(w, r, rc, refusal{
+					outcome: outcomeRateLimited, code: "rate_limited", status: http.StatusTooManyRequests,
+					detail: "too many authentication failures", retryable: true, retryAfter: int(retryAfter.Seconds()),
+				})
+				return
+			}
+		}
 		h.refuseAuth(w, r, rc, outcomeIncompleteClaims, "the credential could not be verified")
 		return
 	}
@@ -349,9 +375,9 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		h.clientIP(r), r.Method+" "+r.Header.Get("X-Forwarded-Uri"),
 		// No resource-classification registry exists on this platform yet
 		// (see docs/architecture/full-architecture-gap-analysis.md #16) —
-		// MEDIUM is an explicit, honestly-labeled placeholder floor, not a
-		// real per-resource sensitivity lookup.
-		"MEDIUM",
+		// CARTA_RESOURCE_SENSITIVITY is an explicit, honestly-labeled
+		// placeholder floor, not a real per-resource sensitivity lookup.
+		h.cfg.CartaResourceSensitivity,
 	)
 
 	// AU-23 (decision 21 Oct 2026): carta-svc configured but silent fails
