@@ -33,6 +33,7 @@ import (
 	"zoiko.io/treasury-svc/internal/mtls"
 	"zoiko.io/treasury-svc/internal/store"
 	"zoiko.io/treasury-svc/internal/telemetry"
+	"zoiko.io/treasury-svc/internal/tokenization"
 	"zoiko.io/eventing/inbox"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
@@ -47,6 +48,10 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		_, _ = os.Stderr.WriteString("fatal: failed to load config: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+	if err := cfg.Validate(); err != nil {
+		_, _ = os.Stderr.WriteString("fatal: invalid configuration: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 
@@ -167,6 +172,23 @@ func main() {
 		currencyClient = currency.New(cfg.CurrencyRegistryURL)
 	}
 
+	// BNK-01's real account-identifier tokenization. TOKENIZATION_ENFORCED
+	// decides only whether NEW/ROTATED identifiers are tokenized. Reading an
+	// already-tokenized account's full number (the privileged
+	// GetBankAccountNumber route) needs the client regardless of that flag
+	// — an account tokenized while enforcement was on stays tokenized after
+	// it is turned back off — so the client is built whenever a service URL
+	// is configured. Building it makes no call; nothing reaches
+	// key-management-svc until a write is enforced or a tokenized account
+	// is read in full.
+	var tokenizer tokenization.Tokenizer
+	if cfg.TokenizationServiceURL != "" {
+		tokenizer = tokenization.NewClient(cfg.TokenizationServiceURL)
+	}
+	if cfg.TokenizationEnforced {
+		log.Info("bank account identifier tokenization enforced", zap.String("tokenization_service_url", cfg.TokenizationServiceURL))
+	}
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -185,7 +207,8 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, authzClient, clientsWrapper, transferClients, bankingConnectorClient, log, currencyClient)
+	h := handler.New(pgStore, authzClient, clientsWrapper, transferClients, bankingConnectorClient, log, currencyClient).
+		WithTokenization(tokenizer, cfg.TokenizationEnforced)
 	handler.RegisterRoutes(r, h)
 
 	// ── 4c. BankStatementAccepted consumer (BNK-08) ─────────────────────────

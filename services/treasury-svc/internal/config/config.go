@@ -76,6 +76,42 @@ type Config struct {
 
 	// OTELExporterEndpoint is where telemetry sends trace data.
 	OTELExporterEndpoint string
+
+	// TokenizationEnforced turns on real server-side tokenization (via
+	// key-management-svc) of bank account numbers at write time (Security
+	// Standard §14, S3 Restricted; internal/tokenization) — BNK-01's own
+	// "Security/KMS/Tokenization" dependency and RotateAccountIdentifierToken
+	// command. Disabled by default: while false, RegisterBankAccount and
+	// RotateAccountIdentifierToken behave EXACTLY as before — the caller's
+	// own MaskedAccountNumber/NewMaskedAccountNumber string is stored as
+	// given, a documented known gap (SPEC_DEVIATIONS), not a fix. Same
+	// migration-state-with-an-end convention as banking-connector-svc's and
+	// payee-banking-identity-svc's identical flag.
+	TokenizationEnforced   bool
+	TokenizationServiceURL string
+
+	tokenizationEnforcedRaw string
+}
+
+// Validate reports configuration the service must not start with.
+//
+// TOKENIZATION_ENFORCED is parsed strictly, the same way
+// banking-connector-svc's and payee-banking-identity-svc's identical flag
+// is: AUTHZ_MTLS_ENABLED-style parsing (== "true") would read a typo such as
+// "True" or "yes" as false and silently store raw account numbers on a
+// deployment that asked for tokenization; for a protection flag that is
+// fail-open, so anything other than "true", "false" or unset refuses to
+// start.
+func (c *Config) Validate() error {
+	switch c.tokenizationEnforcedRaw {
+	case "", "false", "true":
+	default:
+		return fmt.Errorf("TOKENIZATION_ENFORCED must be \"true\" or \"false\", got %q", c.tokenizationEnforcedRaw)
+	}
+	if c.TokenizationEnforced && c.TokenizationServiceURL == "" {
+		return fmt.Errorf("TOKENIZATION_ENFORCED is true but TOKENIZATION_SERVICE_URL is empty")
+	}
+	return nil
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -153,6 +189,9 @@ func Load() (*Config, error) {
 		BankingConnectorServiceURL: env("BANKING_CONNECTOR_SERVICE_URL", "http://banking-connector-svc:8145"),
 		CurrencyRegistryURL:        env("CURRENCY_REGISTRY_URL", "http://currency-registry-svc:8172"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		TokenizationEnforced:    os.Getenv("TOKENIZATION_ENFORCED") == "true",
+		TokenizationServiceURL:  env("TOKENIZATION_SERVICE_URL", "http://key-management-svc:8143"),
+		tokenizationEnforcedRaw: os.Getenv("TOKENIZATION_ENFORCED"),
 	}, nil
 }
 
