@@ -976,13 +976,76 @@ func (s *PgStore) ReopenWindow(ctx context.Context, statementID, actor, reason s
 			WHERE statement_id = $1 AND status = 'ACCEPTED'`, statementID, replacementID); err != nil {
 			return err
 		}
+		// A9: usage_adjustments that targeted the superseded statement must
+		// carry forward too, or recertifying the replacement reproduces the
+		// raw event total but silently drops its adjustment lineage.
+		// usage_adjustments rows are immutable (trg_usage_adjustments_immutable),
+		// so "re-home" cannot mean UPDATE target_statement_id in place — it
+		// means a fresh adjustment row per original, re-targeting the
+		// replacement, the same way CreateUsageAdjustment/registerLateEvent
+		// create one. The original rows are untouched: they stay exactly as
+		// they were, evidence of what the superseded statement actually had.
+		rows, err := tx.Query(ctx, `SELECT `+usageAdjustmentColumns+` FROM usage_adjustments WHERE target_statement_id = $1`, statementID)
+		if err != nil {
+			return err
+		}
+		var carried []domain.UsageAdjustment
+		for rows.Next() {
+			a, serr := scanUsageAdjustment(rows)
+			if serr != nil {
+				rows.Close()
+				return serr
+			}
+			carried = append(carried, *a)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+		for _, a := range carried {
+			dimJSON, merr := json.Marshal(a.Dimensions)
+			if merr != nil {
+				return fmt.Errorf("marshal dimensions: %w", merr)
+			}
+			newID := domain.NewCommercialID(domain.PrefixUsageAdjustment)
+			if _, err := tx.Exec(ctx, `INSERT INTO usage_adjustments (adjustment_id, origin_statement_id,
+				target_statement_id, meter_key, source_usage_event_id, quantity, occurred_at, dimensions, reason,
+				created_at, created_by_principal_id)
+				VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, $9, $10, $11)`,
+				newID, a.OriginStatementID, replacementID, a.MeterKey, a.SourceUsageEventID, a.Quantity,
+				a.OccurredAt, dimJSON, "reopen: carried forward from "+a.AdjustmentID+" ("+a.Reason+")", now, actor); err != nil {
+				return err
+			}
+		}
+		// Recompute the replacement's accumulators from what is actually on
+		// it after re-homing, instead of leaving the zero-value INSERT gave
+		// it. Quarantined events are not re-homed (unchanged from before this
+		// fix), so quarantined_count is computed, not assumed, and happens to
+		// be zero unless a future change starts re-homing them too.
+		// event_count also counts each carried-forward adjustment, the same
+		// way bumpStatement's accepted branch already counts a live
+		// CreateUsageAdjustment/registerLateEvent landing on an open
+		// statement — event_count has never meant "raw usage_event_records
+		// rows only" anywhere else in this file.
+		var eventCount, quarantinedCount int
+		if err := tx.QueryRow(ctx, `SELECT
+				COUNT(*) FILTER (WHERE status = 'ACCEPTED'),
+				COUNT(*) FILTER (WHERE status = 'QUARANTINED')
+			FROM usage_event_records WHERE statement_id = $1`, replacementID).Scan(&eventCount, &quarantinedCount); err != nil {
+			return err
+		}
+		eventCount += len(carried)
+		if _, err := tx.Exec(ctx, `UPDATE usage_statements SET event_count = $2, quarantined_count = $3
+			WHERE statement_id = $1`, replacementID, eventCount, quarantinedCount); err != nil {
+			return err
+		}
 		got, org, err := loadStatementForEvent(ctx, tx, replacementID)
 		if err != nil {
 			return err
 		}
 		out = got
 		return s.emit(ctx, tx, "usage.window_reopened", "usage_statement", statementID, org, actor, map[string]any{"superseded_statement_id": statementID,
-			"replacement_statement_id": replacementID, "reason": reason, "actor_id": actor})
+			"replacement_statement_id": replacementID, "reason": reason, "actor_id": actor, "carried_adjustments": len(carried)})
 	})
 	return out, err
 }
