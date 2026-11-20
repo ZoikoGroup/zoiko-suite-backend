@@ -69,7 +69,7 @@ func TestChangeHomeRegion_AppliesAtomicallyWithEvidence(t *testing.T) {
 		f.policyID).Scan(&got))
 	assert.Equal(t, region, got, "the home-region pointer moved")
 
-	history, err := f.s.ListTenantLifecycleHistory(f.ctx, f.tenantID)
+	history, _, err := f.s.ListTenantLifecycleHistory(f.ctx, f.tenantID, 50, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, history)
 	assert.Equal(t, domain.TenantCommandChangeHomeRegion, history[0].CommandName)

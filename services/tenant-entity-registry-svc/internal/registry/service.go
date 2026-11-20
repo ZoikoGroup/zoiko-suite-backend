@@ -683,18 +683,21 @@ func (s *Service) GetWorkspace(ctx context.Context, workspaceID string) (*domain
 }
 
 // ListWorkspaces returns all workspaces for a tenant.
-func (s *Service) ListWorkspaces(ctx context.Context, tenantID string) ([]*domain.Workspace, error) {
+func (s *Service) ListWorkspaces(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.Workspace, string, error) {
 	if err := s.assertTenantScope(ctx, tenantID); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	workspaces, err := s.store.ListWorkspacesByTenant(ctx, tenantID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	workspaces, next, err := s.store.ListWorkspacesByTenant(ctx, tenantID, limit, cursor)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if workspaces == nil {
 		workspaces = []*domain.Workspace{}
 	}
-	return workspaces, nil
+	return workspaces, next, nil
 }
 
 // GetEntity retrieves a legal entity by ID. Returns ErrNotFound if absent.
@@ -710,13 +713,16 @@ func (s *Service) GetEntity(ctx context.Context, legalEntityID string) (*domain.
 }
 
 // ListEntities returns all legal entities for a tenant.
-func (s *Service) ListEntities(ctx context.Context, tenantID string) ([]*domain.LegalEntity, error) {
+func (s *Service) ListEntities(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.LegalEntity, string, error) {
 	if err := s.assertTenantScope(ctx, tenantID); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	entities, err := s.store.ListEntitiesByTenant(ctx, tenantID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	entities, next, err := s.store.ListEntitiesByTenant(ctx, tenantID, limit, cursor)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// Never null — a caller iterating the JSON array must not get a null
 	// where an empty list is meant. Verified live: this endpoint returned
@@ -724,7 +730,7 @@ func (s *Service) ListEntities(ctx context.Context, tenantID string) ([]*domain.
 	if entities == nil {
 		entities = []*domain.LegalEntity{}
 	}
-	return entities, nil
+	return entities, next, nil
 }
 
 // UpdateEntity applies a partial update to a legal entity.
@@ -949,8 +955,11 @@ func (s *Service) EndDateHierarchy(
 }
 
 // ListHierarchies returns all effective-dated hierarchy records for an entity.
-func (s *Service) ListHierarchies(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error) {
-	return s.store.ListHierarchiesByEntity(ctx, legalEntityID)
+func (s *Service) ListHierarchies(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.EntityHierarchy, string, error) {
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	return s.store.ListHierarchiesByEntity(ctx, legalEntityID, limit, cursor)
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,8 +1017,11 @@ func (s *Service) AssignJurisdiction(
 }
 
 // ListJurisdictions returns all effective-dated jurisdiction assignments for an entity.
-func (s *Service) ListJurisdictions(ctx context.Context, legalEntityID string) ([]*domain.EntityJurisdictionAssignment, error) {
-	return s.store.ListJurisdictionAssignments(ctx, legalEntityID)
+func (s *Service) ListJurisdictions(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.EntityJurisdictionAssignment, string, error) {
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	return s.store.ListJurisdictionAssignments(ctx, legalEntityID, limit, cursor)
 }
 
 // EndDateJurisdictionAssignment closes a jurisdiction assignment.
@@ -1111,8 +1123,11 @@ func (s *Service) GetResidencyRegion(ctx context.Context, regionID string) (*dom
 }
 
 // ListResidencyRegions returns all active residency regions.
-func (s *Service) ListResidencyRegions(ctx context.Context) ([]*domain.ResidencyRegion, error) {
-	return s.store.ListResidencyRegions(ctx)
+func (s *Service) ListResidencyRegions(ctx context.Context, limit int, cursor string) ([]*domain.ResidencyRegion, string, error) {
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	return s.store.ListResidencyRegions(ctx, limit, cursor)
 }
 
 // ResolveTenantRegion is the real tenant-to-region lookup for the Global
@@ -1244,10 +1259,13 @@ func (s *Service) GetTaxIdentityBundle(ctx context.Context, bundleID string) (*d
 // Sensitive (RESTRICTED / CONFIDENTIAL) bundles are omitted unless the caller
 // passes the scoped-access gate. Omitted rather than failing the whole list:
 // a caller entitled to the ordinary bundles should still get them.
-func (s *Service) ListTaxIdentityBundles(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error) {
-	all, err := s.store.ListTaxIdentityBundlesByEntity(ctx, legalEntityID)
+func (s *Service) ListTaxIdentityBundles(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.TaxIdentityBundle, string, error) {
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	all, next, err := s.store.ListTaxIdentityBundlesByEntity(ctx, legalEntityID, limit, cursor)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var permitted *bool
 	out := make([]*domain.TaxIdentityBundle, 0, len(all))
@@ -1263,7 +1281,7 @@ func (s *Service) ListTaxIdentityBundles(ctx context.Context, legalEntityID stri
 		}
 		out = append(out, b)
 	}
-	return out, nil
+	return out, next, nil
 }
 
 // TransitionTaxIdentityBundleStatus applies a status transition on a bundle header.
@@ -1282,6 +1300,16 @@ func (s *Service) TransitionTaxIdentityBundleStatus(
 		return err
 	}
 	return s.store.TransitionTaxIdentityBundleStatus(ctx, bundleID, req.NewStatus, domain.PrincipalFromContext(ctx), req.CorrelationID)
+}
+
+// GetRegistrySummary returns KPIs for the console header.
+func (s *Service) GetRegistrySummary(ctx context.Context, tenantID string) (*domain.RegistrySummary, error) {
+	if err := s.assertTenantScope(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	// Purpose limitation: the summary is for the console operator who runs the
+	// tenant, so the standard tenant scope check is sufficient.
+	return s.store.GetRegistrySummary(ctx, tenantID)
 }
 
 // ---------------------------------------------------------------------------

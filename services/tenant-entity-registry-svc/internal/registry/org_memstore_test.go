@@ -165,12 +165,12 @@ func (m *memStore) ChangeDefaultLocale(_ context.Context, tenantID, locale, time
 	return t, nil
 }
 
-func (m *memStore) ListTenantLifecycleHistory(_ context.Context, tenantID string) ([]*domain.TenantLifecycleEvent, error) {
+func (m *memStore) ListTenantLifecycleHistory(_ context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantLifecycleEvent, string, error) {
 	out := m.org().lifecycle[tenantID]
 	if out == nil {
-		return []*domain.TenantLifecycleEvent{}, nil
+		return []*domain.TenantLifecycleEvent{}, "", nil
 	}
-	return out, nil
+	return out, "", nil
 }
 
 func (m *memStore) GetTenantDefaults(_ context.Context, tenantID string) (*domain.TenantDefaults, error) {
@@ -217,7 +217,7 @@ func (m *memStore) ResolveTenantByHost(_ context.Context, hostname string) (*dom
 	}, nil
 }
 
-func (m *memStore) ListTenantHostBindings(_ context.Context, tenantID string) ([]*domain.TenantHostBinding, error) {
+func (m *memStore) ListTenantHostBindings(_ context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantHostBinding, string, error) {
 	out := []*domain.TenantHostBinding{}
 	for _, b := range m.org().hostBindings {
 		if b.TenantID == tenantID {
@@ -225,7 +225,7 @@ func (m *memStore) ListTenantHostBindings(_ context.Context, tenantID string) ([
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Hostname < out[j].Hostname })
-	return out, nil
+	return out, "", nil
 }
 
 // ── ORG-03: profile versions ────────────────────────────────────────────────
@@ -305,12 +305,12 @@ func inForceAt(versions []*domain.LegalEntityProfileVersion, t time.Time) *domai
 	return best
 }
 
-func (m *memStore) ListEntityProfileVersions(_ context.Context, legalEntityID string) ([]*domain.LegalEntityProfileVersion, error) {
+func (m *memStore) ListEntityProfileVersions(_ context.Context, legalEntityID string, limit int, cursor string) ([]*domain.LegalEntityProfileVersion, string, error) {
 	src := m.org().profileVersions[legalEntityID]
 	out := make([]*domain.LegalEntityProfileVersion, len(src))
 	copy(out, src)
 	sort.Slice(out, func(i, j int) bool { return out[i].VersionNumber > out[j].VersionNumber })
-	return out, nil
+	return out, "", nil
 }
 
 func (m *memStore) GetEntityProfileAsOf(_ context.Context, legalEntityID string, asOf time.Time) (*domain.EntityAsOf, error) {
@@ -378,7 +378,7 @@ func (m *memStore) RecordRegistryConflict(_ context.Context, c *domain.EntityReg
 	return nil
 }
 
-func (m *memStore) ListRegistryConflicts(_ context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error) {
+func (m *memStore) ListRegistryConflicts(_ context.Context, openOnly bool, limit int, cursor string) ([]*domain.EntityRegistryConflict, string, error) {
 	out := []*domain.EntityRegistryConflict{}
 	for _, c := range m.org().conflicts {
 		if openOnly && c.Status != domain.RegistryConflictOpen {
@@ -387,7 +387,21 @@ func (m *memStore) ListRegistryConflicts(_ context.Context, openOnly bool) ([]*d
 		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ConflictID < out[j].ConflictID })
-	return out, nil
+	return out, "", nil
+}
+
+func (m *memStore) GetRegistrySummary(_ context.Context, tenantID string) (*domain.RegistrySummary, error) {
+	_, ok := m.tenants[tenantID]
+	if !ok {
+		return nil, nil
+	}
+	return &domain.RegistrySummary{
+		ActiveTenants:             1,
+		ActiveLegalEntities:       len(m.entities),
+		ApprovalsAwaitingDecision: 0,
+		OpenRegistryConflicts:     0,
+		OpenPartyResolutionCases:  0,
+	}, nil
 }
 
 func (m *memStore) ResolveRegistryConflict(_ context.Context, conflictID string, status domain.RegistryConflictStatus, note, actorID string) error {

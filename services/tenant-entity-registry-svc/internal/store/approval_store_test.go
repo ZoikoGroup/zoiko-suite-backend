@@ -104,7 +104,7 @@ func TestApprovalStore_ApprovalAndCommandCommitTogether(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.ApprovalApproved, approvalStatus(t, f, a.ApprovalRequestID))
 
-	history, err := f.s.ListTenantLifecycleHistory(f.ctx, f.tenantID)
+	history, _, err := f.s.ListTenantLifecycleHistory(f.ctx, f.tenantID, 50, "")
 	require.NoError(t, err)
 	require.Len(t, history, 1)
 	require.NotNil(t, history[0].ApprovalRequestID)
@@ -123,7 +123,7 @@ func TestApprovalStore_FailedCommandRollsTheApprovalBack(t *testing.T) {
 	require.ErrorIs(t, err, registry.ErrConflict)
 	assert.Equal(t, domain.ApprovalPending, approvalStatus(t, f, a.ApprovalRequestID),
 		"an approval must never read APPROVED for a command that did not run")
-	history, _ := f.s.ListTenantLifecycleHistory(f.ctx, f.tenantID)
+	history, _, _ := f.s.ListTenantLifecycleHistory(f.ctx, f.tenantID, 50, "")
 	assert.Empty(t, history)
 }
 
@@ -157,7 +157,7 @@ func TestApprovalStore_ExpiredRequestCannotBeApprovedAndDoesNotBlock(t *testing.
 		ApprovalRequestID: a.ApprovalRequestID, TenantID: f.tenantID, DecidedByPrincipalID: pApprover,
 	}, domain.ApprovalApproved), registry.ErrApprovalNotPending)
 
-	pending, err := f.s.ListApprovalRequests(f.ctx, true)
+	pending, _, err := f.s.ListApprovalRequests(f.ctx, true, 50, "")
 	require.NoError(t, err)
 	assert.Empty(t, pending, "an expired request is not awaiting anyone")
 
@@ -280,7 +280,7 @@ func TestApprovalStore_AnotherTenantCannotReadAnApproval(t *testing.T) {
 	got, err := f.s.GetApprovalRequest(other, a.ApprovalRequestID)
 	require.NoError(t, err)
 	assert.Nil(t, got)
-	list, err := f.s.ListApprovalRequests(other, false)
+	list, _, err := f.s.ListApprovalRequests(other, false, 50, "")
 	require.NoError(t, err)
 	assert.Empty(t, list)
 }

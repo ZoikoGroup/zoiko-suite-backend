@@ -17,8 +17,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
@@ -97,9 +99,25 @@ func (s *PgStore) GetApprovalRequest(ctx context.Context, id string) (*domain.Ap
 }
 
 // ListApprovalRequests lists the caller's tenant's requests, newest first.
-func (s *PgStore) ListApprovalRequests(ctx context.Context, pendingOnly bool) ([]*domain.ApprovalRequest, error) {
+func (s *PgStore) ListApprovalRequests(ctx context.Context, pendingOnly bool, limit int, cursor string) ([]*domain.ApprovalRequest, string, error) {
 	tid := domain.TenantFromContext(ctx)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterRequested *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterRequested, afterID = &d, id
+	}
+
 	out := []*domain.ApprovalRequest{}
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		q := `SELECT ` + approvalColumns + ` FROM approval_requests WHERE tenant_id = $1`
 		if pendingOnly {
@@ -107,8 +125,10 @@ func (s *PgStore) ListApprovalRequests(ctx context.Context, pendingOnly bool) ([
 			// it is not awaiting anyone and is not shown as if it were.
 			q += ` AND status = 'PENDING' AND expires_at > NOW()`
 		}
-		q += ` ORDER BY requested_at DESC, approval_request_id DESC`
-		rows, err := tx.Query(ctx, q, tid)
+		q += `
+			 AND ($2::timestamptz IS NULL OR (requested_at, approval_request_id) < ($2::timestamptz, $3::uuid))
+			 ORDER BY requested_at DESC, approval_request_id DESC LIMIT $4`
+		rows, err := tx.Query(ctx, q, tid, afterRequested, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -118,11 +138,16 @@ func (s *PgStore) ListApprovalRequests(ctx context.Context, pendingOnly bool) ([
 			if err != nil {
 				return err
 			}
+			if len(out) == limit {
+				last := out[len(out)-1]
+				next = last.RequestedAt.UTC().Format(time.RFC3339) + "|" + last.ApprovalRequestID
+				break
+			}
 			out = append(out, a)
 		}
 		return rows.Err()
 	})
-	return out, err
+	return out, next, err
 }
 
 // LatestApprovalForSubject returns the newest request for a subject.

@@ -176,7 +176,7 @@ func TestExecuteTenantCommand_WritesLifecycleEvidence(t *testing.T) {
 	}, nil)
 	require.NoError(t, err)
 
-	history, err := f.s.ListTenantLifecycleHistory(f.ctx, f.tenantID)
+	history, _, err := f.s.ListTenantLifecycleHistory(f.ctx, f.tenantID, 50, "")
 	require.NoError(t, err)
 	require.Len(t, history, 1)
 
@@ -222,7 +222,7 @@ func TestAmendLegalProfile_HistoricalReadResolvesTheOriginalName(t *testing.T) {
 		"a read as-of the date the financial history was booked must give the name it was booked under")
 
 	// The superseded row is closed, not deleted.
-	versions, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID)
+	versions, _, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID, 50, "")
 	require.NoError(t, err)
 	require.Len(t, versions, 2)
 	v1 := versions[1]
@@ -291,7 +291,7 @@ func TestAmendLegalProfile_PredatingEveryVersionEndsWhereTheFirstBegins(t *testi
 	}, 1, nil)
 	require.NoError(t, err)
 
-	versions, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID)
+	versions, _, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID, 50, "")
 	require.NoError(t, err)
 	require.Len(t, versions, 2)
 	require.NotNil(t, versions[0].EffectiveTo, "the new version must not stay open-ended")
@@ -330,7 +330,7 @@ func TestAmendLegalProfile_SameInstantAmendmentSupersedesInRecordTime(t *testing
 	require.NoError(t, err)
 	assert.Equal(t, "Corrected Rename Ltd", now.Profile.LegalName, "the later correction wins the shared interval")
 
-	versions, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID)
+	versions, _, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID, 50, "")
 	require.NoError(t, err)
 	require.Len(t, versions, 3, "the corrected version is kept, not deleted")
 	assert.NotNil(t, versions[1].SupersededAt, "and marked superseded in record time")
@@ -403,7 +403,7 @@ func TestRegistryConflict_QuarantineRoundTripAndSingleResolution(t *testing.T) {
 		DetectedByPrincipalID: "p-detect",
 	}))
 
-	open, err := f.s.ListRegistryConflicts(f.ctx, true)
+	open, _, err := f.s.ListRegistryConflicts(f.ctx, true, 50, "")
 	require.NoError(t, err)
 	require.Len(t, open, 1)
 	assert.Equal(t, "Impostor Ltd", open[0].AttemptedPayload["legal_name"],
@@ -416,7 +416,7 @@ func TestRegistryConflict_QuarantineRoundTripAndSingleResolution(t *testing.T) {
 	require.ErrorIs(t, f.s.ResolveRegistryConflict(f.ctx, conflictID,
 		domain.RegistryConflictDismissed, "second opinion", "p-other"), registry.ErrConflict)
 
-	stillOpen, err := f.s.ListRegistryConflicts(f.ctx, true)
+	stillOpen, _, err := f.s.ListRegistryConflicts(f.ctx, true, 50, "")
 	require.NoError(t, err)
 	assert.Empty(t, stillOpen)
 }
@@ -578,26 +578,26 @@ func TestORGTables_ForceRowLevelSecurityIsOn(t *testing.T) {
 func TestORGTables_ReadsAreScopedToTheCallersTenant(t *testing.T) {
 	f := newORGFixture(t)
 
-	// Everything written above belongs to f.tenantID. A context carrying a
-	// different tenant must see none of it — the explicit WHERE tenant_id
-	// predicate, which is this service's actual isolation guarantee.
-	foreign := domain.WithTenant(context.Background(), uuid.New().String())
+// Everything written above belongs to f.tenantID. A context carrying a
+// different tenant must see none of it — the explicit WHERE tenant_id
+// predicate, which is this service's actual isolation guarantee.
+foreign := domain.WithTenant(context.Background(), uuid.New().String())
 
-	history, err := f.s.ListTenantLifecycleHistory(foreign, f.tenantID)
-	require.NoError(t, err)
-	assert.Empty(t, history)
+history, _, err := f.s.ListTenantLifecycleHistory(foreign, f.tenantID, 50, "")
+require.NoError(t, err)
+assert.Empty(t, history)
 
-	versions, err := f.s.ListEntityProfileVersions(foreign, f.entityID)
-	require.NoError(t, err)
-	assert.Empty(t, versions, "another tenant must not read this entity's profile history")
+versions, _, err := f.s.ListEntityProfileVersions(foreign, f.entityID, 50, "")
+require.NoError(t, err)
+assert.Empty(t, versions, "another tenant must not read this entity's profile history")
 
-	conflicts, err := f.s.ListRegistryConflicts(foreign, false)
-	require.NoError(t, err)
-	assert.Empty(t, conflicts)
+conflicts, _, err := f.s.ListRegistryConflicts(foreign, false, 50, "")
+require.NoError(t, err)
+assert.Empty(t, conflicts)
 
-	defaults, err := f.s.GetTenantDefaults(foreign, f.tenantID)
-	require.NoError(t, err)
-	assert.Nil(t, defaults)
+defaults, err := f.s.GetTenantDefaults(foreign, f.tenantID)
+require.NoError(t, err)
+assert.Nil(t, defaults)
 }
 
 // ---------------------------------------------------------------------------
@@ -626,12 +626,12 @@ func TestUnscopedRead_IsNotFoundRatherThanAServerError(t *testing.T) {
 		},
 
 		"ListEntityProfileVersions": func() error {
-			_, err := f.s.ListEntityProfileVersions(unscoped, f.entityID)
+			_, _, err := f.s.ListEntityProfileVersions(unscoped, f.entityID, 50, "")
 			return err
 		},
 
 		"ListRegistryConflicts": func() error {
-			_, err := f.s.ListRegistryConflicts(unscoped, false)
+			_, _, err := f.s.ListRegistryConflicts(unscoped, false, 50, "")
 			return err
 		},
 		"GetEntityProfileAsOf": func() error {

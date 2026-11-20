@@ -217,7 +217,7 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 
 	// Query AS TENANT A. This is the actual test: does RLS hide tenant B's row?
 	ctxAsA := domain.WithTenant(ctx, tenantA)
-	entities, err := s.ListEntitiesByTenant(ctxAsA, tenantA)
+	entities, _, err := s.ListEntitiesByTenant(ctxAsA, tenantA, 50, "")
 	if err != nil {
 		t.Fatalf("ListEntitiesByTenant failed: %v", err)
 	}

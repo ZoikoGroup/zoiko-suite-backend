@@ -35,11 +35,16 @@ type Store interface {
 	GetTenantByID(ctx context.Context, tenantID string) (*domain.Tenant, error)
 	TransitionTenantLifecycle(ctx context.Context, tenantID string, newState domain.TenantLifecycleState, actorID, correlationID string) error
 
+	// GetRegistrySummary returns KPIs for the console header: active tenants,
+	// active legal entities, approvals awaiting decision, open registry conflicts,
+	// and open party resolution cases. Scoped to the caller's tenant.
+	GetRegistrySummary(ctx context.Context, tenantID string) (*domain.RegistrySummary, error)
+
 	// ── LegalEntity ─────────────────────────────────────────────────────────
 
 	CreateEntity(ctx context.Context, e *domain.LegalEntity) error
 	GetEntityByID(ctx context.Context, legalEntityID string) (*domain.LegalEntity, error)
-	ListEntitiesByTenant(ctx context.Context, tenantID string) ([]*domain.LegalEntity, error)
+	ListEntitiesByTenant(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.LegalEntity, string, error)
 	UpdateEntity(ctx context.Context, legalEntityID string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error)
 	// TransitionEntityStatus atomically applies an entity_status transition.
 	// The UPDATE uses WHERE entity_status = ANY($allowedPriorStates) so the state
@@ -54,7 +59,7 @@ type Store interface {
 
 	CreateWorkspace(ctx context.Context, w *domain.Workspace) error
 	GetWorkspaceByID(ctx context.Context, workspaceID string) (*domain.Workspace, error)
-	ListWorkspacesByTenant(ctx context.Context, tenantID string) ([]*domain.Workspace, error)
+	ListWorkspacesByTenant(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.Workspace, string, error)
 	UpdateWorkspace(ctx context.Context, workspaceID string, req domain.UpdateWorkspaceRequest) (*domain.Workspace, error)
 	// TransitionWorkspaceStatus applies an archive or restore as a single
 	// guarded UPDATE, the same shape as TransitionEntityStatus.
@@ -68,7 +73,7 @@ type Store interface {
 
 	CreateHierarchy(ctx context.Context, h *domain.EntityHierarchy) error
 	EndDateHierarchy(ctx context.Context, hierarchyID string, endDate time.Time, actorID, correlationID string) error
-	ListHierarchiesByEntity(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error)
+	ListHierarchiesByEntity(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.EntityHierarchy, string, error)
 	// GetHierarchyByID returns one relationship, or (nil, nil) if absent. Read
 	// before an end-date so the command is authorized at the entities it
 	// changes.
@@ -77,7 +82,7 @@ type Store interface {
 	// ── EntityJurisdictionAssignment ────────────────────────────────────────
 
 	CreateJurisdictionAssignment(ctx context.Context, a *domain.EntityJurisdictionAssignment) error
-	ListJurisdictionAssignments(ctx context.Context, legalEntityID string) ([]*domain.EntityJurisdictionAssignment, error)
+	ListJurisdictionAssignments(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.EntityJurisdictionAssignment, string, error)
 	EndDateJurisdictionAssignment(ctx context.Context, assignmentID string, endDate time.Time, actorID, correlationID string) error
 	// GetJurisdictionAssignmentByID returns one assignment, or (nil, nil) if
 	// absent. Read before an end-date, as GetHierarchyByID.
@@ -91,13 +96,13 @@ type Store interface {
 	// ── ResidencyRegion (read-only — IaC-managed) ───────────────────────────
 
 	GetResidencyRegionByID(ctx context.Context, regionID string) (*domain.ResidencyRegion, error)
-	ListResidencyRegions(ctx context.Context) ([]*domain.ResidencyRegion, error)
+	ListResidencyRegions(ctx context.Context, limit int, cursor string) ([]*domain.ResidencyRegion, string, error)
 
 	// ── TaxIdentityBundle ───────────────────────────────────────────────────
 
 	CreateTaxIdentityBundle(ctx context.Context, b *domain.TaxIdentityBundle) error
 	GetTaxIdentityBundleByID(ctx context.Context, bundleID string) (*domain.TaxIdentityBundle, error)
-	ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error)
+	ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.TaxIdentityBundle, string, error)
 	// TransitionTaxIdentityBundleStatus applies a status transition on a bundle header.
 	// Must be idempotent.
 	TransitionTaxIdentityBundleStatus(ctx context.Context, bundleID string, newStatus domain.TaxIdentityBundleStatus, actorID, correlationID string) error
@@ -229,7 +234,7 @@ type ORGStore interface {
 
 	// ── ORG-02: read surfaces ───────────────────────────────────────────────
 
-	ListTenantLifecycleHistory(ctx context.Context, tenantID string) ([]*domain.TenantLifecycleEvent, error)
+	ListTenantLifecycleHistory(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantLifecycleEvent, string, error)
 	GetTenantDefaults(ctx context.Context, tenantID string) (*domain.TenantDefaults, error)
 
 	// ── ORG-02: host bindings (ResolveTenantByHost, §8 NP3) ─────────────────
@@ -239,13 +244,13 @@ type ORGStore interface {
 	// that establishes which tenant a request belongs to. Returns (nil, nil)
 	// for an unknown hostname.
 	ResolveTenantByHost(ctx context.Context, hostname string) (*domain.ResolvedTenantByHost, error)
-	ListTenantHostBindings(ctx context.Context, tenantID string) ([]*domain.TenantHostBinding, error)
+	ListTenantHostBindings(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantHostBinding, string, error)
 
 	// ── ORG-03: profile versions ────────────────────────────────────────────
 
 	CreateInitialProfileVersion(ctx context.Context, v *domain.LegalEntityProfileVersion) error
 	AmendLegalProfile(ctx context.Context, legalEntityID string, next *domain.LegalEntityProfileVersion, expectedVersion int64, ev *outbox.Record) (*domain.LegalEntityProfileVersion, error)
-	ListEntityProfileVersions(ctx context.Context, legalEntityID string) ([]*domain.LegalEntityProfileVersion, error)
+	ListEntityProfileVersions(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.LegalEntityProfileVersion, string, error)
 	GetEntityProfileAsOf(ctx context.Context, legalEntityID string, asOf time.Time) (*domain.EntityAsOf, error)
 	FindEntitiesByRegistryNumber(ctx context.Context, registrationNumber, jurisdictionID string) ([]*domain.LegalEntity, error)
 
@@ -255,7 +260,7 @@ type ORGStore interface {
 	// registry identity in this jurisdiction, or (nil, nil) if there is none.
 	FindActiveEntityByRegistry(ctx context.Context, registrationNumber, jurisdictionID string) (*domain.LegalEntity, error)
 	RecordRegistryConflict(ctx context.Context, c *domain.EntityRegistryConflict) error
-	ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error)
+	ListRegistryConflicts(ctx context.Context, openOnly bool, limit int, cursor string) ([]*domain.EntityRegistryConflict, string, error)
 	ResolveRegistryConflict(ctx context.Context, conflictID string, status domain.RegistryConflictStatus, note, actorID string) error
 	// GetRegistryConflict returns one conflict, or (nil, nil) if absent.
 	GetRegistryConflict(ctx context.Context, conflictID string) (*domain.EntityRegistryConflict, error)
@@ -279,7 +284,7 @@ type ApprovalStore interface {
 	GetApprovalRequest(ctx context.Context, approvalRequestID string) (*domain.ApprovalRequest, error)
 	// ListApprovalRequests lists the caller's tenant's requests, newest first.
 	// pendingOnly excludes decided and expired ones.
-	ListApprovalRequests(ctx context.Context, pendingOnly bool) ([]*domain.ApprovalRequest, error)
+	ListApprovalRequests(ctx context.Context, pendingOnly bool, limit int, cursor string) ([]*domain.ApprovalRequest, string, error)
 	// LatestApprovalForSubject returns the most recent request for a subject,
 	// or (nil, nil) if there has never been one.
 	LatestApprovalForSubject(ctx context.Context, subjectType domain.ApprovalSubjectType, subjectID string) (*domain.ApprovalRequest, error)
@@ -359,5 +364,5 @@ type OwnershipStore interface {
 		endDate time.Time, endedBy, reason, evidenceRef, correlationID string) (*domain.OwnershipRelationship, error)
 	// ListOwnershipInForceAt returns the relationships part of the group
 	// structure at asOf (see the store for what counts).
-	ListOwnershipInForceAt(ctx context.Context, asOf time.Time) ([]domain.OwnershipRelationship, error)
+	ListOwnershipInForceAt(ctx context.Context, asOf time.Time, limit int, cursor string) ([]domain.OwnershipRelationship, string, error)
 }

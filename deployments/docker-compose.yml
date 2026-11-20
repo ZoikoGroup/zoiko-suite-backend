@@ -401,7 +401,7 @@ services:
       - "--entrypoints.websecure.address=:443"
       - "--entrypoints.websecure.http.tls=true"
       # Global rate limit: 1000 req/s burst 2000 (adjust for production)
-      - "--entrypoints.websecure.http.middlewares=ratelimit@file,buffering@file,security-headers@file,compress@file"
+      - "--entrypoints.websecure.http.middlewares=ratelimit@file,buffering@file,security-headers@file,compress@file,preserve-host@file"
       # TLS: self-signed cert for local dev (generated on first run, persisted in volume)
       - "--certificatesresolvers.local.acme.tlschallenge=true"
       - "--certificatesresolvers.local.acme.email=dev@zoiko.local"
@@ -915,10 +915,8 @@ services:
     environment:
       # Identity gate (X-R3): a presented signed envelope is verified and its
       # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
-      # warn here: the services outside Groups 1-2 that read entities forward
-      # the principal but not the envelope. The gateway's tenant-context calls
-      # come over mTLS as a peer. The code default outside local is require.
-      IDENTITY_VERIFY: "${TENANT_REGISTRY_IDENTITY_VERIFY:-warn}"
+      # strict: enforce envelope verification; reject requests without valid envelope
+      IDENTITY_VERIFY: "${TENANT_REGISTRY_IDENTITY_VERIFY:-strict}"
       IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"

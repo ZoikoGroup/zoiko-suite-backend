@@ -38,9 +38,9 @@ func (s *stubSvc) ChangeDefaultLocale(_ context.Context, id string, req domain.C
 	return &domain.Tenant{TenantID: id, PrimaryLocale: req.PrimaryLocale}, s.err
 }
 
-func (s *stubSvc) ListTenantLifecycleHistory(_ context.Context, id string) ([]*domain.TenantLifecycleEvent, error) {
+func (s *stubSvc) ListTenantLifecycleHistory(_ context.Context, id string, limit int, cursor string) ([]*domain.TenantLifecycleEvent, string, error) {
 	s.gotID = id
-	return []*domain.TenantLifecycleEvent{{TenantID: id, ToState: domain.TenantLifecycleActive}}, s.err
+	return []*domain.TenantLifecycleEvent{{TenantID: id, ToState: domain.TenantLifecycleActive}}, "", s.err
 }
 
 func (s *stubSvc) GetTenantDefaults(_ context.Context, id string) (*domain.TenantDefaults, error) {
@@ -59,9 +59,9 @@ func (s *stubSvc) ChangeHomeRegion(_ context.Context, id string, req domain.Chan
 	return s.err
 }
 
-func (s *stubSvc) ListTenantHostBindings(_ context.Context, id string) ([]*domain.TenantHostBinding, error) {
+func (s *stubSvc) ListTenantHostBindings(_ context.Context, id string, limit int, cursor string) ([]*domain.TenantHostBinding, string, error) {
 	s.gotID = id
-	return []*domain.TenantHostBinding{{TenantID: id}}, s.err
+	return []*domain.TenantHostBinding{{TenantID: id}}, "", s.err
 }
 
 func (s *stubSvc) ResolveTenantByHost(_ context.Context, hostname string) (*domain.ResolvedTenantByHost, error) {
@@ -99,9 +99,9 @@ func (s *stubSvc) ChangeRegisteredOffice(_ context.Context, id string, req domai
 	return &domain.LegalEntityProfileVersion{LegalEntityID: id, VersionNumber: 2}, s.err
 }
 
-func (s *stubSvc) ListEntityVersions(_ context.Context, id string) ([]*domain.LegalEntityProfileVersion, error) {
+func (s *stubSvc) ListEntityVersions(_ context.Context, id string, limit int, cursor string) ([]*domain.LegalEntityProfileVersion, string, error) {
 	s.gotID = id
-	return []*domain.LegalEntityProfileVersion{{LegalEntityID: id, VersionNumber: 1}}, s.err
+	return []*domain.LegalEntityProfileVersion{{LegalEntityID: id, VersionNumber: 1}}, "", s.err
 }
 
 func (s *stubSvc) GetLegalEntityAsOf(_ context.Context, id string, asOf time.Time) (*domain.EntityAsOf, error) {
@@ -116,9 +116,9 @@ func (s *stubSvc) FindByRegistryNumber(_ context.Context, registrationNumber, ju
 	return []*domain.LegalEntity{{LegalEntityID: entityID}}, s.err
 }
 
-func (s *stubSvc) ListRegistryConflicts(_ context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error) {
+func (s *stubSvc) ListRegistryConflicts(_ context.Context, openOnly bool, limit int, cursor string) ([]*domain.EntityRegistryConflict, string, error) {
 	s.gotOpenOnly = openOnly
-	return []*domain.EntityRegistryConflict{{ConflictID: "conflict-1"}}, s.err
+	return []*domain.EntityRegistryConflict{{ConflictID: "conflict-1"}}, "", s.err
 }
 
 func (s *stubSvc) ResolveRegistryConflict(_ context.Context, id string, _ domain.ResolveRegistryConflictRequest) error {
@@ -128,8 +128,8 @@ func (s *stubSvc) ResolveRegistryConflict(_ context.Context, id string, _ domain
 
 // ── Verified maker-checker ──────────────────────────────────────────────────
 
-func (s *stubSvc) ListApprovalRequests(context.Context, bool) ([]*domain.ApprovalRequest, error) {
-	return []*domain.ApprovalRequest{}, s.err
+func (s *stubSvc) ListApprovalRequests(_ context.Context, pendingOnly bool, limit int, cursor string) ([]*domain.ApprovalRequest, string, error) {
+	return []*domain.ApprovalRequest{}, "", s.err
 }
 
 func (s *stubSvc) GetApprovalRequest(_ context.Context, id string) (*domain.ApprovalRequest, error) {

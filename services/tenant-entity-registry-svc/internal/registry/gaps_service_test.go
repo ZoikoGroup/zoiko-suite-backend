@@ -433,7 +433,7 @@ func TestSensitiveTaxBundle_NeedsPermissionAndPurpose(t *testing.T) {
 	noPurpose := tenantCtx(gapsTenant)
 	_, err := svc.GetTaxIdentityBundle(noPurpose, "b-r")
 	require.ErrorIs(t, err, registry.ErrUnauthorized)
-	list, err := svc.ListTaxIdentityBundles(noPurpose, "e0000000-0000-4000-8000-00000000001e")
+	list, _, err := svc.ListTaxIdentityBundles(noPurpose, "e0000000-0000-4000-8000-00000000001e", 50, "")
 	require.NoError(t, err)
 	require.Len(t, list, 1, "the sensitive bundle is omitted, the ordinary one is not")
 	assert.Equal(t, "b-i", list[0].TaxIdentityBundleID)
@@ -442,7 +442,7 @@ func TestSensitiveTaxBundle_NeedsPermissionAndPurpose(t *testing.T) {
 	b, err := svc.GetTaxIdentityBundle(withPurpose, "b-r")
 	require.NoError(t, err)
 	assert.Equal(t, "b-r", b.TaxIdentityBundleID)
-	list, _ = svc.ListTaxIdentityBundles(withPurpose, "e0000000-0000-4000-8000-00000000001e")
+	list, _, _ = svc.ListTaxIdentityBundles(withPurpose, "e0000000-0000-4000-8000-00000000001e", 50, "")
 	assert.Len(t, list, 2)
 
 	// Purpose without the permission is not enough.

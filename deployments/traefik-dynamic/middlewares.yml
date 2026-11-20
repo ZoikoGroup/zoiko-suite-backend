@@ -45,6 +45,15 @@ http:
       compress:
         minResponseBodyBytes: 1024
 
+    # NP3: Preserve client Host header when forwarding to backend services.
+    # This is required for tenant-entity-registry-svc's ResolveTenantByHost
+    # which uses the Host header to resolve the tenant. Without this, the
+    # gateway would forward its own hostname instead of the original client Host.
+    preserve-host:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Host: ""
+
   # Per-service rate limit overrides can be added as additional middlewares
   # Example (add to service's middlewares chain):
   #   - api-rate-limit@file

@@ -56,7 +56,7 @@ func (m *memStore) GetApprovalRequest(_ context.Context, id string) (*domain.App
 	return &cp, nil
 }
 
-func (m *memStore) ListApprovalRequests(ctx context.Context, pendingOnly bool) ([]*domain.ApprovalRequest, error) {
+func (m *memStore) ListApprovalRequests(ctx context.Context, pendingOnly bool, limit int, cursor string) ([]*domain.ApprovalRequest, string, error) {
 	tid := domain.TenantFromContext(ctx)
 	now := time.Now().UTC()
 	out := []*domain.ApprovalRequest{}
@@ -71,7 +71,7 @@ func (m *memStore) ListApprovalRequests(ctx context.Context, pendingOnly bool) (
 		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].RequestedAt.After(out[j].RequestedAt) })
-	return out, nil
+	return out, "", nil
 }
 
 func (m *memStore) LatestApprovalForSubject(_ context.Context, st domain.ApprovalSubjectType, subjectID string) (*domain.ApprovalRequest, error) {

@@ -369,12 +369,12 @@ func TestOwnership_EndRefusals(t *testing.T) {
 	})
 }
 
-func (m *memStore) ListOwnershipInForceAt(_ context.Context, asOf time.Time) ([]domain.OwnershipRelationship, error) {
+func (m *memStore) ListOwnershipInForceAt(_ context.Context, asOf time.Time, limit int, cursor string) ([]domain.OwnershipRelationship, string, error) {
 	var out []domain.OwnershipRelationship
 	for _, r := range m.ownership {
 		if domain.InForceAt(*r, asOf) {
 			out = append(out, *r)
 		}
 	}
-	return out, nil
+	return out, "", nil
 }

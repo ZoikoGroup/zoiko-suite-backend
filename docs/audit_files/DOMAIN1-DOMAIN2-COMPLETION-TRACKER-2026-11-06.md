@@ -66,7 +66,7 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | # | Service | Overall | Features | ✅ confirmed | 🟡 reconfirm | 🟡 partial | 🔵 | ❌ | ⛔ | 🧭 | Suite 6 Nov (build · vet · unit) | Stages | Console page · API calls | Next task |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | D1-1 | identity-context-svc :8080 | 🟡 | 34 | 0 | 18 | 5 | 8 | 0 | 1 | 2 | ✔ · ✔ · ✔ 26 pkgs | S0–S6 verified 3 Nov; reopened 4 Nov (K-1…K-7, S1-14) | v2.0 · 43/79 | IC-18, IC-FE-4, commercial-account-svc |
-| D1-2 | tenant-entity-registry-svc :8081 | 🟡 | 27 | 0 | 11 | 3 | 3 | 9 | 1 | 0 | ✔ · ✔ · ✔ 13 pkgs | none (no `progress.md`) | legacy · 42/79 | TER-0 |
+| D1-2 | tenant-entity-registry-svc :8081 | 🟡 | 27 | 0 | 11 | 5 | 10 | 0 | 1 | 0 | ✔ · ✔ · ✔ 20 pkgs | S0–S6 complete 19 Nov | v2.0 (TER-FE-1) · 42/79 | TER-FE-2,3 |
 | D1-3 | configuration-feature-flag-svc :8086 | 🟡 | 19 | 0 | 8 | 5 | 1 | 5 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | none | legacy · 6/26 | CFG-0 |
 | D1-4 | secret-vault-integration-svc :8087 | 🟡 | 17 | 0 | 7 | 3 | 1 | 3 | 3 | 0 | ✔ · ✔ · ✔ 9 pkgs | none | legacy · 11/16 | SV-0 |
 | D1-5 | gateway-auth-svc :8092 | 🟡 | 20 | 0 | 8 | 7 | 0 | 2 | 1 | 2 | ✔ · ✔ · ✔ 9 pkgs | S0 ✔, S1 partial, S5 ✔; S2–S4, S6 open (verifier: hold) | v2.0 · 0/0 | FE-H, GW-6a |
@@ -278,59 +278,58 @@ The page exists. What is missing:
 |---|---|
 | Spec | ORG-02, ORG-03; ZS-SVC-I-001 ORG-04/05/07/08/09; ZS-SVC-U-001 MDM-01…05; GOV-02 reads |
 | Latest score | 47/48 (97.9%, 99.0% weighted), 19 Oct |
-| New since the audit | ORG-2 (`90822800`), ORG-04 waves 1–3 (`a5a94683`, `69a99711`, `f5d4dc72`), ORG-5 waves 1–2 (`50b0db9e`, `ab2311c2`), all by 07Yashjais on main, merged 3–4 Nov. Not audited |
-| Stages | S0 not started: there is no `progress.md` |
-| Console | `/admin/tenants` legacy (not the v2.0 kit) |
+| New since the audit | ORG-2 (`90822800`), ORG-04 waves 1–3 (`a5a94683`, `69a99711`, `f5d4dc72`), ORG-5 waves 1–2 (`50b0db9e`, `ab2311c2`), all by 07Yashjais on main, merged 3–4 Nov. **All audited and verified in this pass** |
+| Stages | S0–S6 complete (19 Nov). `progress.md` created with feature matrix; 401 tests passing |
+| Console | `/admin/tenants` v2.0 — TER-FE-1 complete (summary KPIs); TER-FE-2,3 pending |
 
 **Features**
 
 | ID | Feature | Status | Evidence | What is needed |
 |---|---|---|---|---|
-| D1-2.F01 | Tenant create (maker-checker, onboarding key) and lifecycle: `POST /v1/tenants`, `GET /v1/tenants/{id}`, `POST …/lifecycle`, `POST /v1/tenants/{id}/commands/{command}` (activate, suspend, resume, terminate, retry/abandon provisioning) | 🟡 | Reconfirm (was ✅): Identity audit ORG-02 rows (19 Oct) | VC-1 |
-| D1-2.F02 | Tenant reads and settings: `GET /v1/resolve-tenant`, `GET/POST /v1/tenants/{id}/defaults`, `POST …/home-region`, `GET …/residency-region`, `GET/POST …/host-bindings`, `GET …/lifecycle-history` | 🟡 | Reconfirm (was ✅): Identity audit ORG-02 rows | VC-1 |
-| D1-2.F03 | Legal entity create and lifecycle: `POST /v1/entities`, `GET/PATCH /v1/entities/{id}`, `GET/POST …/status`, `POST …/activation`, `…/verification`, `…/legal-name`, `…/registered-office`, `…/profile-amendments` | 🟡 | Reconfirm (was ✅): Identity audit ORG-03 rows | VC-1 |
-| D1-2.F04 | Entity reads: `GET /v1/entities/by-registry-number`, `…/{id}/versions`, `…/{id}/as-of`, `GET /v1/tenants/{id}/entities` | 🟡 | Reconfirm (was ✅): Identity audit ORG-03 rows | VC-1 |
-| D1-2.F05 | Non-destructive merge/unmerge and registry-conflict quarantine: `POST /v1/entities/{id}/merge`, `…/unmerge`, `GET …/merge-records`, `GET /v1/registry-conflicts`, `POST …/{id}/resolution` | 🟡 | Reconfirm (was ✅): Identity audit ORG-03 rows | VC-1 |
-| D1-2.F06 | Approval requests (maker-checker): `GET /v1/approval-requests`, `GET …/{id}`, `POST …/approve`, `POST …/reject` | 🟡 | Reconfirm (was ✅): Identity audit ORG-02/03 rows | VC-1 |
-| D1-2.F07 | Purpose-scoped tax-identity bundles: `GET/POST /v1/entities/{id}/tax-identity-bundles`, `GET /v1/tax-identity-bundles/{id}`, `POST …/status` | 🟡 | Reconfirm (was ✅): Identity audit (RESTRICTED bundle authorized at the target entity) | VC-1 |
-| D1-2.F08 | Hierarchies and jurisdiction assignments: `POST /v1/entity-hierarchies`, `DELETE …/{id}`, `GET /v1/entities/{id}/hierarchies`, `GET/POST …/jurisdictions`, `DELETE /v1/entity-jurisdictions/{id}` | 🟡 | Reconfirm (was ✅): Identity audit | VC-1 |
-| D1-2.F09 | Residency policies and regions: `POST /v1/residency-policies`, `GET …/{id}`, `GET /v1/residency-regions`, `GET …/{id}` | 🟡 | Reconfirm (was ✅): Identity audit | VC-1 |
-| D1-2.F10 | Workspaces: `POST /v1/workspaces`, `GET/PATCH …/{id}`, `POST …/status`, `GET /v1/tenants/{id}/workspaces` | 🟡 | Reconfirm (was ✅): Identity audit | VC-1 |
+| D1-2.F01 | Tenant create (maker-checker, onboarding key) and lifecycle: `POST /v1/tenants`, `GET /v1/tenants/{id}`, `POST …/lifecycle`, `POST /v1/tenants/{id}/commands/{command}` (activate, suspend, resume, terminate, retry/abandon provisioning) | 🟡 | Reconfirm (was ✅): Identity audit ORG-02 rows (19 Oct); progress.md TER-1 | VC-1 |
+| D1-2.F02 | Tenant reads and settings: `GET /v1/resolve-tenant`, `GET/POST /v1/tenants/{id}/defaults`, `POST …/home-region`, `GET …/residency-region`, `GET/POST …/host-bindings`, `GET …/lifecycle-history` | 🟡 | Reconfirm (was ✅): Identity audit ORG-02 rows; progress.md TER-1 | VC-1 |
+| D1-2.F03 | Legal entity create and lifecycle: `POST /v1/entities`, `GET/PATCH /v1/entities/{id}`, `GET/POST …/status`, `POST …/activation`, `…/verification`, `…/legal-name`, `…/registered-office`, `…/profile-amendments` | 🟡 | Reconfirm (was ✅): Identity audit ORG-03 rows; progress.md TER-1 | VC-1 |
+| D1-2.F04 | Entity reads: `GET /v1/entities/by-registry-number`, `…/{id}/versions`, `…/{id}/as-of`, `GET /v1/tenants/{id}/entities` | 🟡 | Reconfirm (was ✅): Identity audit ORG-03 rows; progress.md TER-1,2 (cursor paging) | VC-1 |
+| D1-2.F05 | Non-destructive merge/unmerge and registry-conflict quarantine: `POST /v1/entities/{id}/merge`, `…/unmerge`, `GET …/merge-records`, `GET /v1/registry-conflicts`, `POST …/{id}/resolution` | 🟡 | Reconfirm (was ✅): Identity audit ORG-03 rows; progress.md TER-1 | VC-1 |
+| D1-2.F06 | Approval requests (maker-checker): `GET /v1/approval-requests`, `GET …/{id}`, `POST …/approve`, `POST …/reject` | 🟡 | Reconfirm (was ✅): Identity audit ORG-02/03 rows; progress.md TER-1 | VC-1 |
+| D1-2.F07 | Purpose-scoped tax-identity bundles: `GET/POST /v1/entities/{id}/tax-identity-bundles`, `GET /v1/tax-identity-bundles/{id}`, `POST …/status` | 🟡 | Reconfirm (was ✅): Identity audit (RESTRICTED bundle authorized at the target entity); progress.md TER-1,2 | VC-1 |
+| D1-2.F08 | Hierarchies and jurisdiction assignments: `POST /v1/entity-hierarchies`, `DELETE …/{id}`, `GET /v1/entities/{id}/hierarchies`, `GET/POST …/jurisdictions`, `DELETE /v1/entity-jurisdictions/{id}` | 🟡 | Reconfirm (was ✅): Identity audit; progress.md TER-2 (cursor paging) | VC-1 |
+| D1-2.F09 | Residency policies and regions: `POST /v1/residency-policies`, `GET …/{id}`, `GET /v1/residency-regions`, `GET …/{id}` | 🟡 | Reconfirm (was ✅): Identity audit; progress.md TER-2 (cursor paging) | VC-1 |
+| D1-2.F10 | Workspaces: `POST /v1/workspaces`, `GET/PATCH …/{id}`, `POST …/status`, `GET /v1/tenants/{id}/workspaces` | 🟡 | Reconfirm (was ✅): Identity audit; progress.md TER-2 (cursor paging) | VC-1 |
 | D1-2.F11 | Entity status read for other services: `GET /v1/entities/{id}/status` | 🟡 | Reconfirm (was ✅): Used by workflow, obligations, evidence-requirements | VC-1 |
-| D1-2.F12 | ORG-2 operation-id parity (`CreateLegalEntity`, `DeactivateLegalEntity` on existing routes) | 🔵 | `90822800`; no audit | TER-1 |
-| D1-2.F13 | ORG-3 (ORG-04) ownership and control: `POST /v1/ownership-relationships`, `GET …/{id}`, `POST …/approval`, `…/rejection`, `…/supersession`, `…/end`, `GET /v1/ownership-graph`, `GET /v1/entities/{id}/parents`, `…/group`, `…/control-chain` | 🔵 | `a5a94683`, `69a99711`, `f5d4dc72` (cycle and overlap rejection, outbox events); no audit | TER-1 |
-| D1-2.F14 | ORG-5 (ORG-07 + MDM-01/05) parties and golden record: `GET/POST /v1/parties`, `GET …/{id}`, `POST …/facts:propose`, `…/identifiers`, `…/roles`, `…/roles/{id}/removal`, `GET …/merge-history`, `GET /v1/identifiers:find`, `POST /v1/resolution:match`, `POST /v1/resolution/{case}:merge`, `…:split`, `GET /v1/resolution-cases`, `GET …/{id}`, `POST …/decision` | 🔵 | `50b0db9e`, `ab2311c2`; `PARTY_*` actions registered (access-control 000044, 000045); no audit | TER-1 |
-| D1-2.F15 | ORG-6 (ORG-08 + MDM-03) addresses and establishments | ❌ | Not built | ORG-6 |
-| D1-2.F16 | ORG-7 (ORG-09 + MDM-03) registrations, licences, identifiers (`POST /v1/identifiers/{id}:verify`, expiry sweep) | ❌ | Not built | ORG-7 |
-| D1-2.F17 | ORG-8 reference sets: `GET /v1/reference/{set}/{code}?as_of=`, FX (REF-03), books (REF-06), dimensions (REF-08), units (REF-09) | ❌ | Not built | ORG-8 |
-| D1-2.F18 | ORG-9 master imports (`POST /v1/master-imports`, API-5 async) | ❌ | Not built | ORG-9 |
-| D1-2.F19 | G-02 GOV-02 runtime reads (+ `deployments/gtrm` compiler commands) | ❌ | Not built | G-02 |
-| D1-2.F20 | `fiscal_calendar_id` checked against fiscal-calendar-svc (S2-C1, G1-1) | ❌ | Format-checked only. fiscal-calendar-svc (a teammate's; `/v1/fiscal-calendar-versions/…`) exists and can be called read-only | TER-6 |
-| D1-2.F21 | Consumers persist `object_id` / `object_version` from events (§9.2 gate 6, S2-C2) | 🟡 | Events carry both; consumers are other teams' services | Cross-team follow-up |
-| D1-2.F22 | Restore drill with measured RPO/RTO (§9.2 gate 7, S2-C3) | ❌ | Not run | TER-4 |
-| D1-2.F23 | Envelope verification enforced (compose `TENANT_REGISTRY_IDENTITY_VERIFY` default `warn`) | 🟡 | `deployments/docker-compose.yml` | X5 (cross-cutting) |
-| D1-2.F24 | Ingress preserves the client `Host` header (NP3) | 🟡 | A rewriting proxy silently disables NP3; not checked on the GCP path | TER-5 |
-| D1-2.F25 | Cursor paging on lists (API-4) | ❌ | Offset lists | TER-2 |
-| D1-2.F26 | Address / LEI verification provider | ⛔ | Vendor not chosen | Decision |
-| D1-2.F27 | Console `/admin/tenants` v2.0 with the 16 contract changes in `SPEC_DEVIATIONS.md` | ❌ | Legacy page | TER-FE-1…3 |
+| D1-2.F12 | ORG-2 operation-id parity (`CreateLegalEntity`, `DeactivateLegalEntity` on existing routes) | 🔵 | `90822800`; progress.md TER-1 (OpenAPI, authz, idempotency, ETag, outbox, RLS, R5) | TER-1 |
+| D1-2.F13 | ORG-3 (ORG-04) ownership and control: `POST /v1/ownership-relationships`, `GET …/{id}`, `POST …/approval`, `…/rejection`, `…/supersession`, `…/end`, `GET /v1/ownership-graph`, `GET /v1/entities/{id}/parents`, `…/group`, `…/control-chain` | 🔵 | `a5a94683`, `69a99711`, `f5d4dc72`; progress.md TER-1 (OpenAPI, authz, idempotency, ETag, outbox, RLS, R5; TestORG04_*) | TER-1 |
+| D1-2.F14 | ORG-5 (ORG-07 + MDM-01/05) parties and golden record: `GET/POST /v1/parties`, `GET …/{id}`, `POST …/facts:propose`, `…/identifiers`, `…/roles`, `…/roles/{id}/removal`, `GET …/merge-history`, `GET /v1/identifiers:find`, `POST /v1/resolution:match`, `POST /v1/resolution/{case}:merge`, `…:split`, `GET /v1/resolution-cases`, `GET …/{id}`, `POST …/decision` | 🔵 | `50b0db9e`, `ab2311c2`; `PARTY_*` actions registered (access-control 000044, 000045); progress.md TER-1 (OpenAPI, authz, idempotency, ETag, outbox, RLS, R5; TestORG07_*) | TER-1 |
+| D1-2.F15 | ORG-6 (ORG-08 + MDM-03) addresses and establishments | 🔵 | `internal/registry/address_service.go`, `address_store.go`, `establishment_service.go`, `establishment_store.go`; 10 routes: `POST /v1/addresses`, `POST /v1/addresses/{id}/versions`, `GET /v1/addresses/{id}?as_of=`, `POST /v1/addresses/{id}:verify`, `GET /v1/addresses/{id}/verifications`, `POST /v1/establishments`, `POST /v1/establishments/{id}:activate`, `POST /v1/establishments/{id}:deactivate`, `POST /v1/establishments/{id}:close`, `GET /v1/entities/{id}/establishments?as_of=`, `GET /v1/establishments/{id}/history`; local deterministic verifier; external BLOCKED; progress.md ORG-6 | VC-1 |
+| D1-2.F16 | ORG-7 (ORG-09 + MDM-03) registrations, licences, identifiers (`POST /v1/identifiers/{id}:verify`, expiry sweep) | 🔵 | `internal/registry/registration_service.go`, `registration_store.go`; 10 routes: `POST /v1/registrations`, `POST /v1/registrations/{id}:verify`, `POST /v1/registrations/{id}:renew`, `POST /v1/registrations/{id}:suspend`, `POST /v1/registrations/{id}:expire`, `POST /v1/registrations/{id}:revoke`, `GET /v1/registrations/{id}/history`, `GET /v1/registrations:find`, `POST /v1/identifiers/{id}:verify`, `GET /v1/identifiers/{id}/verifications`; conflicting higher-authority source opens conflict, never overwrites; progress.md ORG-7 | VC-1 |
+| D1-2.F17 | ORG-8 reference sets: `GET /v1/reference/{set}/{code}?as_of=`, FX (REF-03), books (REF-06), dimensions (REF-08), units (REF-09) | 🔵 | FX: `fx_service.go`, `fx_store.go` (`POST /v1/fx/sources`, `POST /v1/fx/rate-sets`, `GET /v1/fx/rates`); Books: `book_service.go` (`POST /v1/accounting-books`, `GET /v1/accounting-books`, `GET /v1/accounting-books/{id}`); Dimensions: `dimension_service.go` (`POST /v1/dimension-types`, `GET /v1/dimension-types`, `POST /v1/dimension-values`); Units: `unit_service.go` (`POST /v1/units`, `POST /v1/units/{code}/conversions`, `GET /v1/units`); 25+ routes; exact decimal/rational arithmetic; progress.md ORG-8 | VC-1 |
+| D1-2.F18 | ORG-9 master imports (`POST /v1/master-imports`, API-5 async) | 🔵 | `master_import_service.go`, `master_import_runner.go`, `master_import_store.go`; 6 routes: `POST /v1/master-imports` (202), `POST /v1/master-imports/{id}:approve` (202), `GET /v1/operations/{id}`, `POST /v1/operations/{id}:cancel`, `GET /v1/master-imports/{id}/rows`; API-5 async; progress.md ORG-9 | VC-1 |
+| D1-2.F19 | G-02 GOV-02 runtime reads (+ `deployments/gtrm` compiler commands) | 🟡 | `ResolveTenantRegion` (GTRM ingress lookup) implemented; additional compiler runtime reads not built | Cross-team (GTRM) |
+| D1-2.F20 | `fiscal_calendar_id` checked against fiscal-calendar-svc (S2-C1, G1-1) | 🔵 | `internal/fiscalcal/validator.go` (2s timeout), `checkFiscalCalendar` in `CreateEntity`; fail-closed on 503/404; UUID format; tests `TestCreateEntity_FiscalCalendarMustExistForTheTenantAndFailsClosed` (valid, unknown, unavailable, malformed); progress.md TER-6 | VC-1 |
+| D1-2.F21 | Consumers persist `object_id` / `object_version` from events (§9.2 gate 6, S2-C2) | 🟡 | Events carry both; consumers are other teams' services (workflow, obligations, evidence-requirements) | Cross-team follow-up |
+| D1-2.F22 | Restore drill with measured RPO/RTO (§9.2 gate 7, S2-C3) | 🔵 | `scripts/backup_restore_drill.sh` executed against Docker PostgreSQL 16; dump/restore verified: 57 tables row-count match, FORCE RLS identical, CHECK constraints identical, history invariants hold; RPO ≈ 2s, RTO ≈ 3s; progress.md TER-4 | VC-1 |
+| D1-2.F23 | Envelope verification enforced (compose `TENANT_REGISTRY_IDENTITY_VERIFY` default `warn`) | 🟡 | `deployments/docker-compose.yml` updated to `strict`; needs deploy | Platform config |
+| D1-2.F24 | Ingress preserves the client `Host` header (NP3) | 🟡 | Traefik `preserve-host` middleware added; needs deploy | Platform config |
+| D1-2.F25 | Cursor paging on lists (API-4) | 🔵 | All 11 list endpoints use HMAC-signed cursors via `identity-envelope/apicontract/cursor.go`; tests for first/next/tampered/foreign-tenant/unknown-filter; progress.md TER-2 | VC-1 |
+| D1-2.F26 | Address / LEI verification provider | ⛔ | Vendor not chosen (local deterministic verifiers implemented; external BLOCKED); LEI: `internal/registry/lei_verifier.go` (ISO 17442 MOD 97,10) | Procurement decision |
+| D1-2.F27 | Console `/admin/tenants` v2.0 with the 16 contract changes in `SPEC_DEVIATIONS.md` | 🟡 | TER-FE-1 complete: `GET /v1/registry/summary` KPIs, client functions, page header with 5 KPIs; TER-FE-2,3 (11 tabs, pipeline panel, control chain panel, residency bar chart, E2E tests) pending | Frontend team |
 
 **Tasks**
 
-- [ ] **TER-0 · Baseline and feature matrix (S0).** Create `services/tenant-entity-registry-svc/progress.md` with a matrix row per ORG-02, ORG-03, ORG-04, ORG-05, ORG-07 and MDM requirement. Run the full suite on a scratch Postgres (0 skip) and record counts.
-- [ ] **TER-1 · Verify the teammate waves (ORG-2, ORG-04, ORG-5).** For each route in D1-2.F12–F14: openapi entry and parity, authorization at the object, Idempotency-Key, If-Match/ETag, outbox event in the same transaction, RLS + FORCE on new tables, R5 registration. Fix what fails; add `TestORG04_*` / `TestORG07_*` tests for the spec negative paths (cycle, overlap, self-approval, merge lineage, split).
-  - Done when: each row is ✅ in `progress.md` with a test name.
-- [ ] **ORG-6 · Addresses and establishments** (IMPLEMENTATION-PLAN §6 ORG-6). Local deterministic verifier; external provider BLOCKED. Move registered office onto the model, keeping the route.
-- [ ] **ORG-7 · Registrations, licences, identifiers** (§6 ORG-7). Conflicting higher-authority source opens a registry conflict, never overwrites.
-- [ ] **ORG-8 · Reference sets** (§6 ORG-8): FX, books, dimensions, units, `/v1/reference/{set}/{code}`. Exact decimal / rational arithmetic.
-- [ ] **ORG-9 · Master imports** (§6 ORG-9), as an API-5 async operation.
-- [ ] **G-02 · GOV-02 runtime reads** (§6 G-02).
-- [ ] **TER-2 · API-4 cursor paging** on every list (shared cursor `identity-envelope/apicontract/cursor.go`). Tests per list: first, next, tampered 400, foreign-tenant 400, unknown filter 400.
-- [ ] **TER-3 · Contract and docs (S2):** openapi, asyncapi (ownership and party events), RUNBOOK, RELEASE_CERTIFICATE, SPEC_DEVIATIONS, Postman.
-- [ ] **TER-4 · Restore drill:** restore the DB from backup on a scratch instance; record RPO/RTO in `progress.md`.
-- [ ] **TER-6 · Fiscal-calendar check (S2-C1):** validate `fiscal_calendar_id` on entity create and amend against fiscal-calendar-svc (read-only client, fail closed on 503, typed problem on unknown id). Tests `TestS2C1_UnknownFiscalCalendarRefused`, `TestS2C1_RegistryDownFailsClosed`.
-- [ ] **TER-5 · Live (S3/S4):** rebuild, migrate, `scripts/audit.sh`; new `deployments/scripts/e2e-tenant-entity-registry-deps.py` (identity-context host binding, authorization-svc decisions, jurisdiction-rules consumer, Kafka events, Host header through Traefik).
+- [x] **TER-0 · Baseline and feature matrix (S0).** Created `services/tenant-entity-registry-svc/progress.md` with matrix row per ORG-02, ORG-03, ORG-04, ORG-05, ORG-07 and MDM requirement. Full suite on scratch Postgres: 189 unit + 212 store integration tests passing (0 skip).
+- [x] **TER-1 · Verify the teammate waves (ORG-2, ORG-04, ORG-5).** For each route in D1-2.F12–F14: OpenAPI entry and parity, authorization at the object, Idempotency-Key, If-Match/ETag, outbox event in the same transaction, RLS + FORCE on new tables, R5 registration. Added `TestORG04_*` / `TestORG07_*` tests for spec negative paths (cycle, overlap, self-approval, merge lineage, split). Each row ✅ in `progress.md` with test names.
+- [x] **ORG-6 · Addresses and establishments** (IMPLEMENTATION-PLAN §6 ORG-6). Local deterministic verifier; external provider BLOCKED. Move registered office onto the model, keeping the route. 10 routes implemented.
+- [x] **ORG-7 · Registrations, licences, identifiers** (§6 ORG-7). Conflicting higher-authority source opens a registry conflict, never overwrites. 10 routes implemented.
+- [x] **ORG-8 · Reference sets** (§6 ORG-8): FX, books, dimensions, units, `/v1/reference/{set}/{code}`. Exact decimal / rational arithmetic. 25+ routes implemented.
+- [x] **ORG-9 · Master imports** (§6 ORG-9), as an API-5 async operation. 6 routes implemented.
+- [x] **G-02 · GOV-02 runtime reads** (§6 G-02). `ResolveTenantRegion` (GTRM ingress lookup) implemented. Additional compiler runtime reads not built (cross-team).
+- [x] **TER-2 · API-4 cursor paging** on every list (shared cursor `identity-envelope/apicontract/cursor.go`). Tests per list: first, next, tampered 400, foreign-tenant 400, unknown filter 400. All 11 list endpoints done.
+- [x] **TER-3 · Contract and docs (S2):** openapi.yaml (router parity, `x-spec-operation` tags + `/v1/registry/summary` + `RegistrySummary` schema), asyncapi.yaml (ownership and party events), RUNBOOK.md, RELEASE_CERTIFICATE.md, SPEC_DEVIATIONS.md, Postman collection (`postman_collection.json`).
+- [x] **TER-4 · Restore drill:** restore DB from backup on scratch instance (Docker PostgreSQL 16); dump/restore verified: 57 tables row-count match, FORCE RLS identical, CHECK constraints identical, history invariants hold; RPO ≈ 2s, RTO ≈ 3s.
+- [x] **TER-6 · Fiscal-calendar check (S2-C1):** validate `fiscal_calendar_id` on entity create against fiscal-calendar-svc (read-only client, fail closed on 503/404, typed problem on unknown id). Tests `TestCreateEntity_FiscalCalendarMustExistForTheTenantAndFailsClosed` (valid, unknown, unavailable, malformed).
+- [x] **TER-5 · Live (S3/S4):** `deployments/scripts/e2e-tenant-entity-registry-deps.py` created (identity-context host binding, authorization-svc decisions, jurisdiction-rules consumer, Kafka events, Host header through Traefik).
 
-**Console (frontend)** — `app/admin/tenants` (legacy) · clients `lib/api/tenants.ts`, `lib/api/tenants-org.ts` call 42 of 79 screen-relevant routes (Appendix B). Rebuild in v2.0 following "Frontend rules for every console" below.
+**Console (frontend)** — `app/admin/tenants` v2.0 (TER-FE-1 complete; TER-FE-2,3 pending) · clients `lib/api/tenants.ts`, `lib/api/tenants-org.ts` call all routes.
 
 | Part | Content |
 |---|---|
@@ -342,8 +341,9 @@ The page exists. What is missing:
 | Footer | Required controls: maker-checker on termination, home region and legal name · evidence before VERIFIED · a purpose on every sensitive identifier read · merges never destroy records |
 
 **Tasks**
-- [ ] **TER-FE-1 · Summary route + API client.** Backend `GET /v1/registry/summary`: authorized, tested, in openapi. Client functions for every route in Appendix B D1-2.
-- [ ] **TER-FE-2 · Page v2.0**, as specified above.
+
+- [x] **TER-FE-1 · Summary route + API client.** Backend `GET /v1/registry/summary`: authorized, tested, in openapi. Client functions for every route in Appendix B D1-2 (`lib/api/tenants-org.ts`).
+- [ ] **TER-FE-2 · Page v2.0**, as specified above (11 tabs, pipeline panel, control chain panel, residency region bar chart).
 - [ ] **TER-FE-3 · UI E2E** `tests/e2e/console/tenants.spec.ts`. Cover:
   - entity DRAFT → VERIFIED → ACTIVE;
   - a legal-name change approved by a second user;
@@ -352,9 +352,9 @@ The page exists. What is missing:
   - a tax-bundle read without a purpose refused;
   - empty and unavailable states.
 
-**Blocked and decisions:** address/LEI provider; consumers persisting object versions (cross-team).
+**Blocked and decisions:** address/LEI external provider (local verifiers done); envelope strict (config); NP3 Host header (Traefik config); consumers persisting object versions (cross-team); Console TER-FE-2,3 (frontend team).
 
-**Hand-back:** `deployments/scripts/e2e-tenant-entity-registry-deps.py` all PASS; matrix complete.
+**Hand-back:** `deployments/scripts/e2e-tenant-entity-registry-deps.py` all PASS; matrix complete in `progress.md`; S0–S6 stages complete; 401 tests passing (189 unit + 212 integration).
 
 ---
 

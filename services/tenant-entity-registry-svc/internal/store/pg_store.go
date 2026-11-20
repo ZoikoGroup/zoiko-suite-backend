@@ -28,8 +28,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -385,11 +387,26 @@ func (s *PgStore) GetEntityByID(ctx context.Context, legalEntityID string) (*dom
 	return &e, err
 }
 
-func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]*domain.LegalEntity, error) {
-	s.log.Debug("store.ListEntitiesByTenant", zap.String("tenant_id", tenantID))
+func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.LegalEntity, string, error) {
+	s.log.Debug("store.ListEntitiesByTenant", zap.String("tenant_id", tenantID), zap.Int("limit", limit))
 	tid := tenantFromCtxOrFallback(ctx, tenantID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterCreated *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterCreated, afterID = &d, id
+	}
 
 	var results []*domain.LegalEntity
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
 			SELECT legal_entity_id, tenant_id, entity_code, legal_name, trading_name,
@@ -401,8 +418,10 @@ func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]
 			       verified_by_principal_id, verified_at, verification_evidence_ref,
 			       merged_into_legal_entity_id, merged_at
 			FROM legal_entities WHERE tenant_id = $1
+			AND ($2::timestamptz IS NULL OR (created_at, legal_entity_id) < ($2::timestamptz, $3::uuid))
+			ORDER BY created_at ASC, legal_entity_id ASC LIMIT $4
 		`
-		rows, err := tx.Query(ctx, query, tenantID)
+		rows, err := tx.Query(ctx, query, tid, afterCreated, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -422,11 +441,16 @@ func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]
 			); err != nil {
 				return err
 			}
+			if len(results) == limit {
+				last := results[len(results)-1]
+				next = last.CreatedAt.UTC().Format(time.RFC3339) + "|" + last.LegalEntityID
+				break
+			}
 			results = append(results, &e)
 		}
 		return rows.Err()
 	})
-	return results, err
+	return results, next, err
 }
 
 func (s *PgStore) CreateWorkspace(ctx context.Context, w *domain.Workspace) error {
@@ -616,11 +640,26 @@ func (s *PgStore) TransitionWorkspaceStatus(
 	return rowsAffected, domain.WorkspaceStatus(previous), nil
 }
 
-func (s *PgStore) ListWorkspacesByTenant(ctx context.Context, tenantID string) ([]*domain.Workspace, error) {
-	s.log.Debug("store.ListWorkspacesByTenant", zap.String("tenant_id", tenantID))
+func (s *PgStore) ListWorkspacesByTenant(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.Workspace, string, error) {
+	s.log.Debug("store.ListWorkspacesByTenant", zap.String("tenant_id", tenantID), zap.Int("limit", limit))
 	tid := tenantFromCtxOrFallback(ctx, tenantID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterCreated *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterCreated, afterID = &d, id
+	}
 
 	var results []*domain.Workspace
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
 			SELECT workspace_id, tenant_id, legal_entity_id, name, business_unit,
@@ -628,8 +667,10 @@ func (s *PgStore) ListWorkspacesByTenant(ctx context.Context, tenantID string) (
 			       created_at, updated_at, created_by_principal_id, updated_by_principal_id,
 			       record_version
 			FROM workspaces WHERE tenant_id = $1
+			AND ($2::timestamptz IS NULL OR (created_at, workspace_id) < ($2::timestamptz, $3::uuid))
+			ORDER BY created_at ASC, workspace_id ASC LIMIT $4
 		`
-		rows, err := tx.Query(ctx, query, tenantID)
+		rows, err := tx.Query(ctx, query, tid, afterCreated, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -645,11 +686,16 @@ func (s *PgStore) ListWorkspacesByTenant(ctx context.Context, tenantID string) (
 			); err != nil {
 				return err
 			}
+			if len(results) == limit {
+				last := results[len(results)-1]
+				next = last.CreatedAt.UTC().Format(time.RFC3339) + "|" + last.WorkspaceID
+				break
+			}
 			results = append(results, &w)
 		}
 		return rows.Err()
 	})
-	return results, err
+	return results, next, err
 }
 
 // UpdateEntity applies a partial update to mutable non-governance fields
@@ -891,11 +937,26 @@ func (s *PgStore) GetHierarchyByID(ctx context.Context, hierarchyID string) (*do
 	return &h, nil
 }
 
-func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error) {
-	s.log.Debug("store.ListHierarchiesByEntity", zap.String("legal_entity_id", legalEntityID))
+func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.EntityHierarchy, string, error) {
+	s.log.Debug("store.ListHierarchiesByEntity", zap.String("legal_entity_id", legalEntityID), zap.Int("limit", limit))
 	tid := domain.TenantFromContext(ctx)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterCreated *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterCreated, afterID = &d, id
+	}
 
 	var results []*domain.EntityHierarchy
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
 			SELECT hierarchy_id, tenant_id, parent_legal_entity_id, child_legal_entity_id,
@@ -903,8 +964,10 @@ func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID str
 			       created_by_principal_id, updated_by_principal_id, record_version
 			FROM entity_hierarchies
 			WHERE (parent_legal_entity_id = $1 OR child_legal_entity_id = $1) AND tenant_id = $2
+			AND ($3::timestamptz IS NULL OR (created_at, hierarchy_id) < ($3::timestamptz, $4::uuid))
+			ORDER BY created_at ASC, hierarchy_id ASC LIMIT $5
 		`
-		rows, err := tx.Query(ctx, query, legalEntityID, tid)
+		rows, err := tx.Query(ctx, query, legalEntityID, tid, afterCreated, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -919,11 +982,16 @@ func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID str
 			); err != nil {
 				return err
 			}
+			if len(results) == limit {
+				last := results[len(results)-1]
+				next = last.CreatedAt.UTC().Format(time.RFC3339) + "|" + last.HierarchyID
+				break
+			}
 			results = append(results, &h)
 		}
 		return rows.Err()
 	})
-	return results, err
+	return results, next, err
 }
 
 // ---------------------------------------------------------------------------
@@ -959,19 +1027,36 @@ func (s *PgStore) CreateJurisdictionAssignment(ctx context.Context, a *domain.En
 	})
 }
 
-func (s *PgStore) ListJurisdictionAssignments(ctx context.Context, legalEntityID string) ([]*domain.EntityJurisdictionAssignment, error) {
-	s.log.Debug("store.ListJurisdictionAssignments", zap.String("legal_entity_id", legalEntityID))
+func (s *PgStore) ListJurisdictionAssignments(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.EntityJurisdictionAssignment, string, error) {
+	s.log.Debug("store.ListJurisdictionAssignments", zap.String("legal_entity_id", legalEntityID), zap.Int("limit", limit))
 	tid := domain.TenantFromContext(ctx)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterCreated *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterCreated, afterID = &d, id
+	}
 
 	var results []*domain.EntityJurisdictionAssignment
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
 			SELECT assignment_id, tenant_id, legal_entity_id, jurisdiction_id, assignment_type,
 			       effective_from, effective_to, source_basis, created_at, updated_at,
 			       created_by_principal_id, updated_by_principal_id, record_version
 			FROM entity_jurisdiction_assignments WHERE legal_entity_id = $1 AND tenant_id = $2
+			AND ($3::timestamptz IS NULL OR (created_at, assignment_id) < ($3::timestamptz, $4::uuid))
+			ORDER BY created_at ASC, assignment_id ASC LIMIT $5
 		`
-		rows, err := tx.Query(ctx, query, legalEntityID, tid)
+		rows, err := tx.Query(ctx, query, legalEntityID, tid, afterCreated, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -986,11 +1071,16 @@ func (s *PgStore) ListJurisdictionAssignments(ctx context.Context, legalEntityID
 			); err != nil {
 				return err
 			}
+			if len(results) == limit {
+				last := results[len(results)-1]
+				next = last.CreatedAt.UTC().Format(time.RFC3339) + "|" + last.AssignmentID
+				break
+			}
 			results = append(results, &a)
 		}
 		return rows.Err()
 	})
-	return results, err
+	return results, next, err
 }
 
 // GetJurisdictionAssignmentByID returns one assignment, or (nil, nil) when it
@@ -1135,18 +1225,36 @@ func (s *PgStore) GetResidencyRegionByID(ctx context.Context, regionID string) (
 	return &r, err
 }
 
-func (s *PgStore) ListResidencyRegions(ctx context.Context) ([]*domain.ResidencyRegion, error) {
-	s.log.Debug("store.ListResidencyRegions")
+func (s *PgStore) ListResidencyRegions(ctx context.Context, limit int, cursor string) ([]*domain.ResidencyRegion, string, error) {
+	s.log.Debug("store.ListResidencyRegions", zap.Int("limit", limit))
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterCreated *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterCreated, afterID = &d, id
+	}
+
 	var results []*domain.ResidencyRegion
+	var next string
 	query := `
 		SELECT residency_region_id, region_code, region_name, cloud_provider,
 		       country_code, sovereign_flag, active_flag,
 		       created_at, updated_at, created_by_principal_id, updated_by_principal_id
-		FROM residency_regions WHERE active_flag = true ORDER BY region_code
+		FROM residency_regions WHERE active_flag = true
+		AND ($1::timestamptz IS NULL OR (created_at, residency_region_id) < ($1::timestamptz, $2::uuid))
+		ORDER BY created_at ASC, residency_region_id ASC LIMIT $3
 	`
-	rows, err := s.pool.Query(ctx, query)
+	rows, err := s.pool.Query(ctx, query, afterCreated, nullUUID(afterID), limit+1)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
 
@@ -1157,11 +1265,16 @@ func (s *PgStore) ListResidencyRegions(ctx context.Context) ([]*domain.Residency
 			&r.CountryCode, &r.SovereignFlag, &r.ActiveFlag,
 			&r.CreatedAt, &r.UpdatedAt, &r.CreatedByPrincipalID, &r.UpdatedByPrincipalID,
 		); err != nil {
-			return nil, err
+			return nil, "", err
+		}
+		if len(results) == limit {
+			last := results[len(results)-1]
+			next = last.CreatedAt.UTC().Format(time.RFC3339) + "|" + last.ResidencyRegionID
+			break
 		}
 		results = append(results, &r)
 	}
-	return results, rows.Err()
+	return results, next, rows.Err()
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,11 +1338,26 @@ func (s *PgStore) GetTaxIdentityBundleByID(ctx context.Context, bundleID string)
 	return &b, err
 }
 
-func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error) {
-	s.log.Debug("store.ListTaxIdentityBundlesByEntity", zap.String("legal_entity_id", legalEntityID))
+func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.TaxIdentityBundle, string, error) {
+	s.log.Debug("store.ListTaxIdentityBundlesByEntity", zap.String("legal_entity_id", legalEntityID), zap.Int("limit", limit))
 	tid := domain.TenantFromContext(ctx)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterCreated *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterCreated, afterID = &d, id
+	}
 
 	var results []*domain.TaxIdentityBundle
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
 			SELECT tax_identity_bundle_id, tenant_id, legal_entity_id, jurisdiction_id, status,
@@ -1237,8 +1365,10 @@ func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntit
 			       created_by_principal_id, updated_by_principal_id, data_classification,
 			       record_version
 			FROM tax_identity_bundles WHERE legal_entity_id = $1 AND tenant_id = $2
+			AND ($3::timestamptz IS NULL OR (created_at, tax_identity_bundle_id) < ($3::timestamptz, $4::uuid))
+			ORDER BY created_at ASC, tax_identity_bundle_id ASC LIMIT $5
 		`
-		rows, err := tx.Query(ctx, query, legalEntityID, tid)
+		rows, err := tx.Query(ctx, query, legalEntityID, tid, afterCreated, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -1254,11 +1384,16 @@ func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntit
 			); err != nil {
 				return err
 			}
+			if len(results) == limit {
+				last := results[len(results)-1]
+				next = last.CreatedAt.UTC().Format(time.RFC3339) + "|" + last.TaxIdentityBundleID
+				break
+			}
 			results = append(results, &b)
 		}
 		return rows.Err()
 	})
-	return results, err
+	return results, next, err
 }
 
 func (s *PgStore) TransitionTaxIdentityBundleStatus(ctx context.Context, bundleID string, newStatus domain.TaxIdentityBundleStatus, actorID, correlationID string) error {

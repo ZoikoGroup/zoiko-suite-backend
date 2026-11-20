@@ -136,7 +136,7 @@ func TestLEIStore_SchemaRefusesMalformedOrBareLEIs(t *testing.T) {
 	assert.Contains(t, err.Error(), "lepv_lei_status_known")
 	require.NoError(t, insert("5493001KJTIIGC8Y1R12", "GLEIF", "ISSUED"))
 
-	versions, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID)
+	versions, _, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID, 50, "")
 	require.NoError(t, err)
 	require.NotNil(t, versions[0].LEI)
 	assert.Equal(t, "5493001KJTIIGC8Y1R12", *versions[0].LEI)

@@ -115,8 +115,8 @@ func (m *memStore) GetEntityByID(_ context.Context, id string) (*domain.LegalEnt
 	}
 	return e, nil
 }
-func (m *memStore) ListEntitiesByTenant(_ context.Context, _ string) ([]*domain.LegalEntity, error) {
-	return []*domain.LegalEntity{}, nil
+func (m *memStore) ListEntitiesByTenant(_ context.Context, _ string, limit int, cursor string) ([]*domain.LegalEntity, string, error) {
+	return []*domain.LegalEntity{}, "", nil
 }
 func (m *memStore) UpdateEntity(_ context.Context, id string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error) {
 	m.lastUpdateActor = req.ActorPrincipalID // record for assertion in tests
@@ -177,8 +177,8 @@ func (m *memStore) GetWorkspaceByID(_ context.Context, id string) (*domain.Works
 	}
 	return w, nil
 }
-func (m *memStore) ListWorkspacesByTenant(_ context.Context, _ string) ([]*domain.Workspace, error) {
-	return []*domain.Workspace{}, nil
+func (m *memStore) ListWorkspacesByTenant(_ context.Context, _ string, limit int, cursor string) ([]*domain.Workspace, string, error) {
+	return []*domain.Workspace{}, "", nil
 }
 func (m *memStore) UpdateWorkspace(_ context.Context, id string, req domain.UpdateWorkspaceRequest) (*domain.Workspace, error) {
 	w, ok := m.workspaces[id]
@@ -233,14 +233,14 @@ func (m *memStore) CreateHierarchy(_ context.Context, _ *domain.EntityHierarchy)
 func (m *memStore) EndDateHierarchy(_ context.Context, _ string, _ time.Time, _, _ string) error {
 	return nil
 }
-func (m *memStore) ListHierarchiesByEntity(_ context.Context, _ string) ([]*domain.EntityHierarchy, error) {
-	return []*domain.EntityHierarchy{}, nil
+func (m *memStore) ListHierarchiesByEntity(_ context.Context, _ string, limit int, cursor string) ([]*domain.EntityHierarchy, string, error) {
+	return []*domain.EntityHierarchy{}, "", nil
 }
 func (m *memStore) CreateJurisdictionAssignment(_ context.Context, _ *domain.EntityJurisdictionAssignment) error {
 	return nil
 }
-func (m *memStore) ListJurisdictionAssignments(_ context.Context, _ string) ([]*domain.EntityJurisdictionAssignment, error) {
-	return []*domain.EntityJurisdictionAssignment{}, nil
+func (m *memStore) ListJurisdictionAssignments(_ context.Context, _ string, limit int, cursor string) ([]*domain.EntityJurisdictionAssignment, string, error) {
+	return []*domain.EntityJurisdictionAssignment{}, "", nil
 }
 func (m *memStore) EndDateJurisdictionAssignment(_ context.Context, _ string, _ time.Time, _, _ string) error {
 	return nil
@@ -272,8 +272,8 @@ func (m *memStore) GetResidencyRegionByID(_ context.Context, id string) (*domain
 	}
 	return nil, nil
 }
-func (m *memStore) ListResidencyRegions(_ context.Context) ([]*domain.ResidencyRegion, error) {
-	return []*domain.ResidencyRegion{}, nil
+func (m *memStore) ListResidencyRegions(_ context.Context, limit int, cursor string) ([]*domain.ResidencyRegion, string, error) {
+	return []*domain.ResidencyRegion{}, "", nil
 }
 func (m *memStore) CreateTaxIdentityBundle(_ context.Context, b *domain.TaxIdentityBundle) error {
 	m.bundles[b.TaxIdentityBundleID] = b
@@ -286,14 +286,14 @@ func (m *memStore) GetTaxIdentityBundleByID(_ context.Context, id string) (*doma
 	}
 	return b, nil
 }
-func (m *memStore) ListTaxIdentityBundlesByEntity(_ context.Context, id string) ([]*domain.TaxIdentityBundle, error) {
+func (m *memStore) ListTaxIdentityBundlesByEntity(_ context.Context, id string, limit int, cursor string) ([]*domain.TaxIdentityBundle, string, error) {
 	out := []*domain.TaxIdentityBundle{}
 	for _, b := range m.bundles {
 		if b.LegalEntityID == id {
 			out = append(out, b)
 		}
 	}
-	return out, nil
+	return out, "", nil
 }
 func (m *memStore) TransitionTaxIdentityBundleStatus(_ context.Context, id string, status domain.TaxIdentityBundleStatus, _, _ string) error {
 	if b, ok := m.bundles[id]; ok {
@@ -552,7 +552,7 @@ func TestCrossTenantReadsAreRefused(t *testing.T) {
 	})
 
 	t.Run("ListEntities", func(t *testing.T) {
-		_, err := svc.ListEntities(attacker, victim.TenantID)
+		_, _, err := svc.ListEntities(attacker, victim.TenantID, 50, "")
 		require.ErrorIs(t, err, registry.ErrNotFound)
 	})
 
@@ -581,7 +581,7 @@ func TestListEntitiesReturnsEmptyArrayNotNil(t *testing.T) {
 	svc, ms := baseSvc(t)
 	ms.tenants["tenant-a"] = &domain.Tenant{TenantID: "tenant-a"}
 
-	got, err := svc.ListEntities(tenantCtx("tenant-a"), "tenant-a")
+	got, _, err := svc.ListEntities(tenantCtx("tenant-a"), "tenant-a", 50, "")
 	require.NoError(t, err)
 	assert.NotNil(t, got, "an empty entity list must serialise as [], never null")
 	assert.Empty(t, got)

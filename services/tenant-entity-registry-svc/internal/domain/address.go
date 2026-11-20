@@ -328,6 +328,29 @@ type PartyAddress struct {
 	Version *AddressVersion `json:"version"`
 }
 
+// LEIObservation is one LEI verification observation.
+type LEIObservation struct {
+	LEI           string             `json:"lei"`
+	Verifier      string             `json:"verifier"`
+	Result        VerificationResult `json:"result"`
+	Confidence    float64            `json:"confidence"`
+	Findings      []string           `json:"findings"`
+	ObservedBy    string             `json:"observed_by,omitempty"`
+	ObservedAt    time.Time          `json:"observed_at"`
+}
+
+// LEIVerification is a recorded LEI verification.
+type LEIVerification struct {
+	VerificationID string       `json:"verification_id"`
+	LEI            string       `json:"lei"`
+	Verifier       string       `json:"verifier"`
+	Result         VerificationResult `json:"result"`
+	Confidence     float64      `json:"confidence"`
+	Findings       []string     `json:"findings"`
+	ObservedBy     string       `json:"observed_by"`
+	ObservedAt     time.Time    `json:"observed_at"`
+}
+
 var addressAbbrev = map[string]string{
 	"STREET": "ST", "ROAD": "RD", "AVENUE": "AVE", "BOULEVARD": "BLVD", "DRIVE": "DR", "LANE": "LN",
 	"COURT": "CT", "SQUARE": "SQ", "PLACE": "PL", "SUITE": "STE", "FLOOR": "FL", "BUILDING": "BLDG",
