@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -201,7 +200,6 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/ai-runs", func(r chi.Router) {
 		r.Post("/", h.CreateAIRun)
-		r.Get("/", h.ListAIRuns)
 		r.Get("/{id}", h.GetAIRun)
 	})
 	r.Route("/v1/action-risk-classifications", func(r chi.Router) {
@@ -634,33 +632,6 @@ func (h *Handler) GetAIRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a)
-}
-
-// ListAIRuns lists the caller tenant's AI runs, newest first. `limit` is
-// 1 to 200 (default 50); anything else is refused rather than clamped.
-func (h *Handler) ListAIRuns(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requireTenant(w, r, ""); !ok {
-		return
-	}
-	limit := 50
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > 200 {
-			writeError(w, http.StatusBadRequest, "limit must be a whole number from 1 to 200")
-			return
-		}
-		limit = n
-	}
-	runs, err := h.store.ListAIRuns(r.Context(), limit)
-	if err != nil {
-		h.logger.Error("list ai runs failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to list ai runs")
-		return
-	}
-	if runs == nil {
-		runs = []domain.AIRun{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ai_runs": runs, "count": len(runs)})
 }
 
 func (h *Handler) SetActionRiskClassification(w http.ResponseWriter, r *http.Request) {

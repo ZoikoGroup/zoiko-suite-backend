@@ -26,8 +26,6 @@ func isUniqueViolation(err error) bool {
 type Store interface {
 	CreateAIRun(ctx context.Context, a *domain.AIRun) error
 	GetAIRun(ctx context.Context, aiRunID string) (*domain.AIRun, error)
-	// ListAIRuns returns the caller tenant's runs, newest first, at most limit.
-	ListAIRuns(ctx context.Context, limit int) ([]domain.AIRun, error)
 
 	SetActionRiskClassification(ctx context.Context, c *domain.ActionRiskClassification) error
 	GetActionRiskClassification(ctx context.Context, actionType string) (*domain.ActionRiskClassification, error)
@@ -251,47 +249,6 @@ func (s *PgStore) GetAIRun(ctx context.Context, aiRunID string) (*domain.AIRun, 
 	a.SourceRefs = unmarshalStrings(sourceRefs)
 	a.EvidenceRefs = unmarshalStrings(evidenceRefs)
 	return &a, nil
-}
-
-func (s *PgStore) ListAIRuns(ctx context.Context, limit int) ([]domain.AIRun, error) {
-	var list []domain.AIRun
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT ai_run_id, tenant_id, run_type, model_id, prompt_version, tool_version,
-			       source_refs, evidence_refs, confidence, limitation, uncertainty_state,
-			       recommended_action, audit_id, created_at, created_by_principal_id
-			FROM ai_runs
-			WHERE tenant_id = $1
-			ORDER BY created_at DESC
-			LIMIT $2
-		`, middleware.TenantFromContext(ctx), limit)
-		if err != nil {
-			return fmt.Errorf("list ai runs: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var a domain.AIRun
-			var runType, uncertaintyState string
-			var sourceRefs, evidenceRefs []byte
-			if err := rows.Scan(
-				&a.AIRunID, &a.TenantID, &runType, &a.ModelID, &a.PromptVersion, &a.ToolVersion,
-				&sourceRefs, &evidenceRefs, &a.Confidence, &a.Limitation, &uncertaintyState,
-				&a.RecommendedAction, &a.AuditID, &a.CreatedAt, &a.CreatedByPrincipalID,
-			); err != nil {
-				return fmt.Errorf("scan ai run: %w", err)
-			}
-			a.RunType = domain.AIRunType(runType)
-			a.UncertaintyState = domain.UncertaintyState(uncertaintyState)
-			a.SourceRefs = unmarshalStrings(sourceRefs)
-			a.EvidenceRefs = unmarshalStrings(evidenceRefs)
-			list = append(list, a)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return list, nil
 }
 
 func (s *PgStore) SetActionRiskClassification(ctx context.Context, c *domain.ActionRiskClassification) error {

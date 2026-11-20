@@ -95,16 +95,6 @@ func (s *stubStore) GetAIRun(ctx context.Context, id string) (*domain.AIRun, err
 	return nil, domain.ErrAIRunNotFound
 }
 
-func (s *stubStore) ListAIRuns(ctx context.Context, limit int) ([]domain.AIRun, error) {
-	var out []domain.AIRun
-	for _, a := range s.aiRuns {
-		if a.TenantID == middleware.TenantFromContext(ctx) && len(out) < limit {
-			out = append(out, *a)
-		}
-	}
-	return out, nil
-}
-
 func (s *stubStore) SetActionRiskClassification(_ context.Context, c *domain.ActionRiskClassification) error {
 	s.classifications[c.ActionType] = c
 	return nil
