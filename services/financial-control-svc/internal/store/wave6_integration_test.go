@@ -20,7 +20,7 @@ import (
 )
 
 var wave6Pops = map[string]string{
-	catalogue.SysFinancialClose: "migration-batch-tieout",
+	catalogue.SysGL: "migration-batch-tieout",
 	catalogue.SysTaxAuthority:   "unacknowledged-filings",
 	catalogue.SysPayeeBanking:   "destination-changes",
 	catalogue.SysTreasury:       "bank-account-ownership",
@@ -130,10 +130,10 @@ func TestWave6_OpeningBalanceTieOut_TiesAndDetectsEachBreak(t *testing.T) {
 	w := newWave6(t)
 	sc := scope(`{"batch_id":"b1"}`)
 
-	w.src.set(catalogue.SysFinancialClose, "migration-batch-tieout", "wm", tieout("1000.00", "1000.00", "4", "1000.00", "1000.00", "4"))
+	w.src.set(catalogue.SysGL, "migration-batch-tieout", "wm", tieout("1000.00", "1000.00", "4", "1000.00", "1000.00", "4"))
 	_, final := w.run("FIN-CTRL-038", sc)
 	assert.Equal(t, domain.ResultPass, final.ResultState)
-	assert.Equal(t, "b1", w.src.lastQuery(catalogue.SysFinancialClose).Get("batch_id"))
+	assert.Equal(t, "b1", w.src.lastQuery(catalogue.SysGL).Get("batch_id"))
 
 	cases := map[string]domain.PopulationRecord{
 		"debits":  tieout("1000.00", "1000.00", "4", "999.99", "1000.00", "4"),
@@ -141,7 +141,7 @@ func TestWave6_OpeningBalanceTieOut_TiesAndDetectsEachBreak(t *testing.T) {
 		"rows":    tieout("1000.00", "1000.00", "4", "1000.00", "1000.00", "3"),
 	}
 	for name, rec := range cases {
-		w.src.set(catalogue.SysFinancialClose, "migration-batch-tieout", "wm", rec)
+		w.src.set(catalogue.SysGL, "migration-batch-tieout", "wm", rec)
 		run, final := w.run("FIN-CTRL-038", sc)
 		assert.Equal(t, domain.ResultFail, final.ResultState, name)
 		ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
@@ -150,7 +150,7 @@ func TestWave6_OpeningBalanceTieOut_TiesAndDetectsEachBreak(t *testing.T) {
 	}
 
 	// Declared totals that are themselves unbalanced fail the balance equation.
-	w.src.set(catalogue.SysFinancialClose, "migration-batch-tieout", "wm", tieout("900.00", "1000.00", "4", "900.00", "1000.00", "4"))
+	w.src.set(catalogue.SysGL, "migration-batch-tieout", "wm", tieout("900.00", "1000.00", "4", "900.00", "1000.00", "4"))
 	_, final = w.run("FIN-CTRL-038", sc)
 	assert.Equal(t, domain.ResultFail, final.ResultState)
 

@@ -102,11 +102,20 @@ Checked against code and schema, not comments:
   caller. A missing rate or a non-ASSET/LIABILITY account is refused. Posting
   is idempotent on status. A reversal is a new run that negates the recorded
   items.
-- **ACC-17 validation.** Validation quarantines a batch, with a persisted
-  reason, on an imbalance, a control-total mismatch, an unknown or inactive
-  target account, a suspense-named target, or an open AR/AP item that already
-  exists in subledger history. Create is idempotent on the source system.
-  Crosswalk rows are append-only.
+- **ACC-17 (retired here, 2026-11-18).** This service's own migration-batch
+  write side (`/v1/migration-batches` create/validate/approve/commit/
+  certify) and read side (`GET /v1/control-populations/migration-batch-tieout`)
+  are removed. The real migration posting path is now general-ledger-svc's
+  own kernel (`internal/kernel/migration.go`), driven by
+  migration-integrity-svc (commits `72e85124`/`8e46ff3f`/`7cbc33fe`/
+  `dc49e781`), and the one real reader of the tieout population
+  (financial-control-svc's `FIN-CTRL-038`) now reads the equivalent
+  population from general-ledger-svc instead (commits `8a274de2`/
+  `a04fd131`). See A9 for the full history and rationale. The
+  `migration_batches`/`migration_crosswalk_entries` tables and their
+  migrations are left in place (dead, unused, harmless) — nothing writes to
+  them anymore, but dropping a real migration history is not worth the risk
+  for a cleanup that doesn't require it.
 - **ACC-18.** Lineage edges, verifications and quarantines are append-only,
   with unique keys. `GetLineageAsOf` is a stable point-in-time read. A
   quarantine needs a reason and is still counted. The Kafka consumer records
@@ -482,14 +491,58 @@ real (B6, B1). Still open:
 - **Certification is not tied to a migration certificate.** It records a
   certifier and a reason only; see migration-integrity-svc A3.
 - **Two concurrent creates for one source system** — closed 2026-11-06. The
-  store's `mapPgError` now recognizes a unique-violation on `migration_batches`
+  store's `mapPgError` recognized a unique-violation on `migration_batches`
   (`domain.ErrMigrationBatchRaceLost`) and `CreateMigrationAccountingBatch`
-  re-reads and answers the actual winner (200) instead of a 503 that told the
-  loser to retry a request that would just lose again. Evidence:
-  `internal/store/migration_batch_race_integration_test.go` (real-Postgres:
-  a genuine concurrent-style insert against the live UNIQUE constraint),
-  `internal/handler/acc17_open_item_test.go`
-  (`TestCreateMigrationAccountingBatch_ConcurrentCreateLoses_ReturnsWinner`).
+  re-read and answered the actual winner (200) instead of a 503 that told the
+  loser to retry a request that would just lose again. (This whole write side
+  is retired — see the note below.)
+
+**Update (2026-11-18, retirement).** This service's ACC-17 migration-batch
+capability — everything above in this section — is retired. It was always a
+parallel, service-local implementation of what general-ledger-svc's own
+migration kernel does properly: the write side
+(`/v1/migration-batches` create → validate → approve → commit → certify,
+`internal/handler/handler.go`, `internal/store/pg_store.go`) had zero real
+callers (confirmed before removal: nothing in the platform posted a batch
+through this service), and the read side
+(`GET /v1/control-populations/migration-batch-tieout`,
+`internal/handler/control_population.go`,
+`internal/store/control_population.go`) had exactly one real consumer,
+financial-control-svc's `FIN-CTRL-038` control, which now reads the
+equivalent population from general-ledger-svc instead.
+
+What replaced it:
+
+- general-ledger-svc grew its own migration kernel
+  (`internal/kernel/migration.go`) and the matching
+  `migration-batch-tieout` control population
+  (`internal/handler/control_population_migration_tieout.go`,
+  `internal/store/control_population_migration_tieout.go`) — commit
+  `a04fd131`.
+- migration-integrity-svc now owns batch-ref, identity-crosswalk and
+  certificate schema (commit `72e85124`), promotes validated batches into
+  general-ledger-svc's kernel and issues certificates (commit `8e46ff3f`),
+  with its Dockerfile fixed so it actually builds (commit `7cbc33fe`), and a
+  minimal compose slice to run it against general-ledger-svc (commit
+  `dc49e781`).
+- financial-control-svc's `FIN-CTRL-038` (`services/financial-control-svc/
+  internal/catalogue/wave6.go`) was repointed from this service's
+  `SysFinancialClose` population to general-ledger-svc's `SysGL` one —
+  commit `8a274de2` — proven end-to-end with both a matched case and a real
+  mismatch-detection case against the new population (commit `a04fd131`).
+
+What stayed, deliberately: the `migration_batches` and
+`migration_crosswalk_entries` tables and their migrations
+(`000009_add_migration_accounting`, `000023_migration_batch_idempotency`,
+and the `migration_batches`-touching parts of `000021_acc_controls_
+hardening`/`000022_journal_currency`) are left in the schema. Nothing writes
+to them anymore — that would require a destructive down-migration against a
+real migration history, which is not worth the risk for a cleanup that does
+not need it. A dead, unused table is harmless and reversible; a dropped
+column or table in production migration history is not. ACC-18's
+`ListPostedJournalRefs` still reads `migration_batches` as one of its UNION
+sources, for whatever rows already exist there from before this retirement —
+that query is untouched by this change.
 
 ### A10. ACC-18 lineage is one hop and has no report-fact trace
 

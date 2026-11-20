@@ -14,6 +14,9 @@
       "messages": {
         "created": {
           "$ref": "#/components/messages/capability-claim.created"
+        },
+        "decided": {
+          "$ref": "#/components/messages/capability-claim.decided"
         }
       }
     },
@@ -57,6 +60,18 @@
         "summary": "Capability Claim: created.",
         "title": "capability-claim created",
         "x-zoiko-event-type": "com.zoikosuite.platform.capability-claim.created",
+        "x-zoiko-origin": "extension"
+      },
+      "capability-claim.decided": {
+        "contentType": "application/json",
+        "description": "Producer: Capability Registry Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Platform (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.platform.capability-claim.decided",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Capability Claim: decided.",
+        "title": "capability-claim decided",
+        "x-zoiko-event-type": "com.zoikosuite.platform.capability-claim.decided",
         "x-zoiko-origin": "extension"
       },
       "capability-release.state-changed": {
@@ -262,6 +277,9 @@
       "messages": [
         {
           "$ref": "#/channels/capability-claim/messages/created"
+        },
+        {
+          "$ref": "#/channels/capability-claim/messages/decided"
         }
       ],
       "summary": "Publish capability-claim facts after the authoritative commit (transactional outbox)."

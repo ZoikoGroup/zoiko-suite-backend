@@ -167,10 +167,11 @@ func (h *BNK0304Handler) statementIDAndTenant(r *http.Request) (statementID, ten
 
 func (h *BNK0304Handler) ValidateStatement(w http.ResponseWriter, r *http.Request) {
 	id, tenantID := h.statementIDAndTenant(r)
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-	if err := h.bnk0304Store.ValidateStatement(r.Context(), tenantID, id); err != nil {
+	if err := h.bnk0304Store.ValidateStatement(r.Context(), tenantID, id, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		if errors.Is(err, domain.ErrStatementBalanceMismatch) {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"statement_id": id, "status": domain.StatementQuarantine, "reason": err.Error()})
 			return
@@ -183,10 +184,11 @@ func (h *BNK0304Handler) ValidateStatement(w http.ResponseWriter, r *http.Reques
 
 func (h *BNK0304Handler) AcceptStatement(w http.ResponseWriter, r *http.Request) {
 	id, tenantID := h.statementIDAndTenant(r)
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-	if err := h.bnk0304Store.AcceptStatement(r.Context(), tenantID, id); err != nil {
+	if err := h.bnk0304Store.AcceptStatement(r.Context(), tenantID, id, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.writeStatementErr(w, err)
 		return
 	}
@@ -195,12 +197,13 @@ func (h *BNK0304Handler) AcceptStatement(w http.ResponseWriter, r *http.Request)
 
 func (h *BNK0304Handler) QuarantineStatement(w http.ResponseWriter, r *http.Request) {
 	id, tenantID := h.statementIDAndTenant(r)
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	var req reasonBody
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if err := h.bnk0304Store.QuarantineStatement(r.Context(), tenantID, id, req.Reason); err != nil {
+	if err := h.bnk0304Store.QuarantineStatement(r.Context(), tenantID, id, req.Reason, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.writeStatementErr(w, err)
 		return
 	}

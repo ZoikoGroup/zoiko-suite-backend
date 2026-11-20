@@ -1,0 +1,4 @@
+DROP TRIGGER IF EXISTS trg_migration_source_extracts_no_truncate ON migration_source_extracts;
+DROP TRIGGER IF EXISTS trg_migration_source_extracts_append_only ON migration_source_extracts;
+DROP FUNCTION IF EXISTS migration_source_extract_forbid_mutation();
+DROP TABLE IF EXISTS migration_source_extracts;

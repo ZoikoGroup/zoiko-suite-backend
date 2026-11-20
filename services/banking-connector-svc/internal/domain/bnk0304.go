@@ -77,6 +77,39 @@ type IngestStatementResult struct {
 	Created   bool            `json:"created"`
 }
 
+// BankStatementAcceptedEvent is BNK-03's spec-required
+// BankStatementAccepted event payload (ZS-SVC-E-001 BNK-03). It is the
+// first real signal downstream consumers (BNK-08 Cash Position) get that a
+// statement's closing_balance is now authoritative bank evidence for an
+// account/period — never time.Now(), the as-of date is the statement's own
+// StatementDate, because freshness must be judged against when the SOURCE
+// data is from, not when the event happened to be processed.
+type BankStatementAcceptedEvent struct {
+	StatementID    string    `json:"statement_id"`
+	ConnectionID   string    `json:"connection_id"`
+	TenantID       string    `json:"tenant_id"`
+	LegalEntityID  string    `json:"legal_entity_id"`
+	BankAccountID  string    `json:"bank_account_id"`
+	ClosingBalance float64   `json:"closing_balance"`
+	OpeningBalance float64   `json:"opening_balance"`
+	Currency       string    `json:"currency"`
+	StatementDate  time.Time `json:"statement_date"`
+	AcceptedAt     time.Time `json:"accepted_at"`
+}
+
+// BankStatementQuarantinedEvent is BNK-03's BankStatementQuarantined event
+// payload — enqueued at the two points that already transition a statement
+// to QUARANTINED (the balance-mismatch auto-quarantine in ValidateStatement
+// and the explicit QuarantineStatement command).
+type BankStatementQuarantinedEvent struct {
+	StatementID    string `json:"statement_id"`
+	ConnectionID   string `json:"connection_id"`
+	TenantID       string `json:"tenant_id"`
+	LegalEntityID  string `json:"legal_entity_id"`
+	BankAccountID  string `json:"bank_account_id"`
+	QuarantineReason string `json:"quarantine_reason"`
+}
+
 // BNK-04 Transaction Normalization. NORMALIZED is the steady state;
 // QUARANTINED means a mapping_exceptions row is open against this line
 // instead; SUPERSEDED is terminal — see migration 004's

@@ -96,6 +96,14 @@ type KafkaConfig struct {
 	Brokers []string
 	GroupID string
 	Topic   string
+
+	// BankStatementEventsTopic and BankStatementConsumerGroupID are
+	// treasury-svc's first event CONSUMER (BNK-08's BankStatementAccepted
+	// listener) — mirrors bank-reconciliation-svc's own
+	// PaymentStatusEventsTopic/ConflictConsumerGroupID split from its
+	// outbox-producer Topic above.
+	BankStatementEventsTopic    string
+	BankStatementConsumerGroupID string
 }
 
 // Load reads configuration from environment variables.
@@ -117,9 +125,11 @@ func Load() (*Config, error) {
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
 		Kafka: KafkaConfig{
-			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
-			GroupID: env("KAFKA_GROUP_ID", "treasury-svc"),
-			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.treasury.events"),
+			Brokers:                      strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			GroupID:                      env("KAFKA_GROUP_ID", "treasury-svc"),
+			Topic:                        env("KAFKA_EVENTS_TOPIC", "zoiko.treasury.events"),
+			BankStatementEventsTopic:     env("BANK_STATEMENT_EVENTS_TOPIC", "zoiko.banking.connector.events"),
+			BankStatementConsumerGroupID: env("BANK_STATEMENT_CONSUMER_GROUP_ID", "treasury-svc-cash-position"),
 		},
 		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",

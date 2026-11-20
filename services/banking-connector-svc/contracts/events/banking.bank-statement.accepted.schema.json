@@ -1,0 +1,50 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.bank-statement.accepted (banking-connector-svc, schema 1.0.0). domain.BankStatementAcceptedEvent — the first real signal treasury-svc's BNK-08 Cash Position consumes to replace its dead 0.00 bank-balance placeholder with a real one. statement_date is the as-of date of the closing_balance it reports, never the time the event happened to be processed.",
+  "properties": {
+    "statement_id": {
+      "type": "string"
+    },
+    "connection_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "bank_account_id": {
+      "type": "string"
+    },
+    "closing_balance": {
+      "type": "number"
+    },
+    "opening_balance": {
+      "type": "number"
+    },
+    "currency": {
+      "type": "string"
+    },
+    "statement_date": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "accepted_at": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "statement_id",
+    "connection_id",
+    "tenant_id",
+    "legal_entity_id",
+    "bank_account_id",
+    "closing_balance",
+    "opening_balance",
+    "currency",
+    "statement_date",
+    "accepted_at"
+  ],
+  "type": "object"
+}

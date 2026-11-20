@@ -7,11 +7,12 @@ import (
 )
 
 type Config struct {
-	Port             string
-	DatabaseURL      string
-	KafkaBrokers     string
-	KafkaEventsTopic string
-	AuthzServiceURL  string
+	Port                   string
+	DatabaseURL            string
+	KafkaBrokers           string
+	KafkaEventsTopic       string
+	AuthzServiceURL        string
+	JurisdictionServiceURL string
 
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
@@ -50,6 +51,12 @@ func Load() (*Config, error) {
 		KafkaBrokers:         getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
 		KafkaEventsTopic:     getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.capability-registry.events"),
 		AuthzServiceURL:      getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		// JURISDICTION_RULES_URL is the established env var name this
+		// platform's other services already use for the same dependency
+		// (obligations-svc, tenant-entity-registry-svc, tax-determination-svc,
+		// authorization-svc) — kept consistent here rather than inventing a
+		// new name. Port 8082 is jurisdiction-rules-svc's own.
+		JurisdictionServiceURL: getEnvOrDefault("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
 
 		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnvOrDefault("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

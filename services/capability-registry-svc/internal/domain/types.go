@@ -208,46 +208,112 @@ func (s IntegrationHealthStatus) Valid() bool {
 // Release is the capability's current operational state — e.g. flipped to
 // INCIDENT_RESTRICTED during an incident without touching market approval
 // or commercial entitlement at all (doc7 §32.1 kill-switch doctrine).
+//
+// Gap 2 fix (2026-11-19): ReconciliationProcedureRef is required by the
+// handler for the two emergency-style transitions (INCIDENT_RESTRICTED,
+// DISABLED) — never for the routine GA/BETA/PILOT/INTERNAL promotions. This
+// mirrors kill-switch-registry-svc's own required-on-engage field (same
+// name, same non-empty validation) without calling out to that service:
+// this is a local, capability-scoped control, not the cross-cutting
+// plane/domain/provider/tenant kill switch that service owns. See the
+// handler doc comment on SetReleaseState for why.
 type Release struct {
-	ReleaseID            string       `json:"release_id"`
-	CapabilityID         string       `json:"capability_id"`
-	State                ReleaseState `json:"state"`
-	Reason               *string      `json:"reason,omitempty"`
-	EffectiveFrom        time.Time    `json:"effective_from"`
-	CreatedAt            time.Time    `json:"created_at"`
-	CreatedByPrincipalID string       `json:"created_by_principal_id"`
+	ReleaseID                  string       `json:"release_id"`
+	CapabilityID               string       `json:"capability_id"`
+	State                      ReleaseState `json:"state"`
+	Reason                     *string      `json:"reason,omitempty"`
+	ReconciliationProcedureRef *string      `json:"reconciliation_procedure_ref,omitempty"`
+	EffectiveFrom              time.Time    `json:"effective_from"`
+	CreatedAt                  time.Time    `json:"created_at"`
+	CreatedByPrincipalID       string       `json:"created_by_principal_id"`
 }
 
+// SetReleaseStateRequest: Reason and ReconciliationProcedureRef are both
+// required by the handler when State is INCIDENT_RESTRICTED or DISABLED
+// (Gap 2) — optional for every other, routine state.
 type SetReleaseStateRequest struct {
-	State         string `json:"state"`
-	Reason        string `json:"reason,omitempty"`
-	CorrelationID string `json:"correlation_id"`
+	State                      string `json:"state"`
+	Reason                     string `json:"reason,omitempty"`
+	ReconciliationProcedureRef string `json:"reconciliation_procedure_ref,omitempty"`
+	CorrelationID              string `json:"correlation_id"`
+}
+
+// IsEmergencyReleaseState reports whether s is one of the two emergency-style
+// transitions Gap 2 holds to kill-switch rigor (required reason +
+// reconciliation_procedure_ref) — INCIDENT_RESTRICTED and DISABLED. GA,
+// BETA, PILOT and INTERNAL are routine promotions and stay exempt.
+func IsEmergencyReleaseState(s ReleaseState) bool {
+	return s == ReleaseStateIncidentRestricted || s == ReleaseStateDisabled
+}
+
+// ClaimApprovalStatus is capability_claims' own maker-checker state — added
+// 2026-11-19 (Gap 1 fix) alongside the removal of the free-text
+// wording_owner/approved_by fields that used to stand in for a real SoD
+// check. A claim is PENDING from creation until a *different* authenticated
+// principal decides it.
+type ClaimApprovalStatus string
+
+const (
+	ClaimApprovalPending  ClaimApprovalStatus = "PENDING"
+	ClaimApprovalApproved ClaimApprovalStatus = "APPROVED"
+	ClaimApprovalRejected ClaimApprovalStatus = "REJECTED"
+)
+
+func (s ClaimApprovalStatus) Valid() bool {
+	switch s {
+	case ClaimApprovalPending, ClaimApprovalApproved, ClaimApprovalRejected:
+		return true
+	}
+	return false
 }
 
 // CapabilityClaim is what marketing/sales may say about a capability's
 // availability — doc7 §C2: "Public claim service consumes only claim_registry
 // entries linked to release evidence, market scope, wording owner, approval
 // and expiry/review date." Roadmap state is never itself a public claim.
+//
+// Gap 1 fix (2026-11-19): WordingOwnerPrincipalID is no longer free text
+// supplied by the caller — it is always the authenticated principal who
+// created the claim (CreatedByPrincipalID). ApprovedByPrincipalID is now
+// populated only by a later, separate decision call
+// (Handler.DecideCapabilityClaim), made by a different authenticated
+// principal — the same proposer/decider split
+// ai-governance-svc's automation_actions and policy_change_approvals use for
+// every other maker-checker control in this platform. The old "two free-text
+// fields that merely differ" check proved nothing about who actually made
+// either call; this does.
 type CapabilityClaim struct {
 	ClaimID                 string     `json:"claim_id"`
 	CapabilityID            string     `json:"capability_id"`
 	ClaimText               string     `json:"claim_text"`
 	MarketScope             *string    `json:"market_scope,omitempty"`
 	WordingOwnerPrincipalID string     `json:"wording_owner_principal_id"`
-	ApprovedByPrincipalID   string     `json:"approved_by_principal_id"`
+	ApprovalStatus          string     `json:"approval_status"` // PENDING | APPROVED | REJECTED
+	ApprovedByPrincipalID   *string    `json:"approved_by_principal_id,omitempty"`
+	ApprovedAt              *time.Time `json:"approved_at,omitempty"`
 	ExpiryReviewDate        *time.Time `json:"expiry_review_date,omitempty"`
 	CreatedAt               time.Time  `json:"created_at"`
 	CreatedByPrincipalID    string     `json:"created_by_principal_id"`
 }
 
+// CreateCapabilityClaimRequest no longer accepts wording_owner_principal_id
+// or approved_by_principal_id — see the CapabilityClaim doc comment. The
+// wording owner is always the caller who creates the claim; nobody can be
+// recorded as having approved a claim at creation time any more.
 type CreateCapabilityClaimRequest struct {
-	CapabilityID            string `json:"capability_id"`
-	ClaimText               string `json:"claim_text"`
-	MarketScope             string `json:"market_scope,omitempty"`
-	WordingOwnerPrincipalID string `json:"wording_owner_principal_id"`
-	ApprovedByPrincipalID   string `json:"approved_by_principal_id"`
-	ExpiryReviewDate        string `json:"expiry_review_date,omitempty"`
-	CorrelationID           string `json:"correlation_id"`
+	CapabilityID     string `json:"capability_id"`
+	ClaimText        string `json:"claim_text"`
+	MarketScope      string `json:"market_scope,omitempty"`
+	ExpiryReviewDate string `json:"expiry_review_date,omitempty"`
+	CorrelationID    string `json:"correlation_id"`
+}
+
+// DecideCapabilityClaimRequest is the separate approval/rejection step. The
+// handler refuses it fail-closed when the deciding principal is the claim's
+// own WordingOwnerPrincipalID (ErrSelfApprovalBlocked below).
+type DecideCapabilityClaimRequest struct {
+	Decision      string `json:"decision"` // APPROVED | REJECTED
+	CorrelationID string `json:"correlation_id"`
 }
 
 // CapabilityResolution is the answer to doc7 §C1: "Can the UI infer
@@ -279,6 +345,23 @@ var (
 	ErrReleaseNotFound               = errorString("release not found")
 	ErrClaimNotFound                 = errorString("capability claim not found")
 	ErrConflict                      = errorString("conflict: capability_code already exists")
+
+	// ErrSelfApprovalBlocked is Gap 1's mandatory self-approval block, the
+	// same doctrine ai-governance-svc enforces on automation_actions and
+	// policy_change_approvals: the principal deciding a capability claim must
+	// differ from the principal who created it (the wording owner).
+	ErrSelfApprovalBlocked = errorString("self-approval is blocked: approver must differ from the claim's wording owner")
+
+	// ErrClaimDecisionInvalid covers both "claim is not PENDING any more" and
+	// a lost race on the same decision — the store layer can't distinguish
+	// them from a single UPDATE's zero rows affected, same as
+	// ai-governance-svc's ErrInvalidDecision.
+	ErrClaimDecisionInvalid = errorString("capability claim is not pending a decision")
+
+	// ErrMarketCodeNotFound / ErrJurisdictionServiceUnavailable back Gap 3's
+	// market_code validation against jurisdiction-rules-svc.
+	ErrMarketCodeNotFound             = errorString("market_code is not a known jurisdiction code")
+	ErrJurisdictionServiceUnavailable = errorString("jurisdiction-rules-svc unavailable")
 
 	// ErrIdempotencyKeyReused is INV-08's replay-safety guarantee: the same
 	// (operation, principal_id, idempotency_key) was already claimed by a

@@ -48,9 +48,9 @@ type ControlPopulationStore interface {
 // synchronously.
 type BNK0304Store interface {
 	IngestStatement(ctx context.Context, tenantID string, req domain.IngestStatementLinesRequest, actorPrincipalID, correlationID string) (*domain.IngestStatementResult, error)
-	ValidateStatement(ctx context.Context, tenantID, statementID string) error
-	AcceptStatement(ctx context.Context, tenantID, statementID string) error
-	QuarantineStatement(ctx context.Context, tenantID, statementID, reason string) error
+	ValidateStatement(ctx context.Context, tenantID, statementID, actorPrincipalID, correlationID string) error
+	AcceptStatement(ctx context.Context, tenantID, statementID, actorPrincipalID, correlationID string) error
+	QuarantineStatement(ctx context.Context, tenantID, statementID, reason, actorPrincipalID, correlationID string) error
 	ReprocessQuarantinedStatement(ctx context.Context, tenantID, statementID string) error
 	NormalizeTransaction(ctx context.Context, params domain.NormalizeTransactionParams) (*domain.NormalizeTransactionResult, error)
 	ReNormalizeTransaction(ctx context.Context, params domain.ReNormalizeTransactionParams) (*domain.CanonicalTransaction, error)

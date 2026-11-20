@@ -16,13 +16,13 @@ import (
 )
 
 // bnk02Columns is every connection read's projection. The last two columns
-// are the connection's account-number token row (migration 010), or '' when
+// are the connection's account-number token row (migration 010), or ” when
 // it has none — the read-precedence rule's input (domain.BankConnection.
 // Tokenized). They are correlated subqueries on the unaliased table name, so
 // the same projection works in SELECT ... FROM bank_connections and in
 // INSERT/UPDATE bank_connections ... RETURNING alike.
 const bnk02Columns = `
-	connection_id, tenant_id, legal_entity_id, bank_name, bic, account_number, currency, status, created_at, updated_at,
+	connection_id, tenant_id, legal_entity_id, bank_name, bic, COALESCE(account_number, ''), currency, status, created_at, updated_at,
 	bank_account_id, provider_ref, consent_scope, token_lease_ref, token_expires_at, health_status, region,
 	COALESCE((SELECT t.account_number_token FROM bank_connection_account_tokens t
 		WHERE t.connection_id = bank_connections.connection_id), ''),

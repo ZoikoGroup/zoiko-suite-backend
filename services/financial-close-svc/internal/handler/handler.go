@@ -159,22 +159,11 @@ type Store interface {
 	// (SPEC_DEVIATIONS A12) in the same transaction.
 	MarkFXRevaluationPosted(ctx context.Context, runID, legalEntityID, journalID, principalID string, at time.Time, correlationID string) error
 
-	// ACC-17 (Opening Balance & Migration) — see domain.MigrationBatch's
-	// doc comment for the authority boundary these implement.
-	CreateMigrationBatch(ctx context.Context, b *domain.MigrationBatch) error
-	GetMigrationBatchBySourceSystem(ctx context.Context, legalEntityID, fiscalPeriod, sourceSystemName string) (*domain.MigrationBatch, error)
-	GetMigrationBatch(ctx context.Context, batchID string) (*domain.MigrationBatch, error)
-	MarkMigrationBatchValidated(ctx context.Context, batchID string, at time.Time) error
-	QuarantineMigrationBatch(ctx context.Context, batchID, fromStatus, reason string) error
-	// Approve/Certify claim the caller's Idempotency-Key (SPEC_DEVIATIONS
-	// A11); Commit's own RECONCILED/CERTIFIED/POSTED switch covers Post, and
-	// Validate is deliberately not claimed — see internal/store's doc
-	// comment on CommandApproveMigrationBatch/CommandCertifyMigrationBatch.
-	ApproveMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
-	MarkMigrationBatchPosted(ctx context.Context, batchID, journalID string, at time.Time) error
-	MarkMigrationBatchReconciled(ctx context.Context, batchID string, at time.Time) error
-	CertifyMigrationBatch(ctx context.Context, batch *domain.MigrationBatch, principalID, reason, idempotencyKey, requestHash string, at time.Time) (replay bool, err error)
-	ListQuarantinedMigrationBatches(ctx context.Context, legalEntityID string) ([]domain.MigrationBatch, error)
+	// ACC-17's migration-batch write side (CreateMigrationBatch,
+	// ApproveMigrationBatch, CertifyMigrationBatch, etc.) was retired here —
+	// see SPEC_DEVIATIONS.md A9. The real migration posting path is now
+	// general-ledger-svc's own kernel (internal/kernel/migration.go), driven
+	// by migration-integrity-svc.
 
 	// ACC-16 (Signed Financial Snapshot) — see domain.FinancialSnapshot's
 	// doc comment for the authority boundary these implement.
@@ -231,11 +220,10 @@ type Clients interface {
 	GetPostingBacklog(ctx context.Context, tenantID, principalID, legalEntityID string, cutoff time.Time) (domain.PostingBacklog, error)
 	ListBankAccounts(ctx context.Context, tenantID, principalID, legalEntityID string) ([]domain.BankAccountRef, error)
 	GetBankReconciliationStatus(ctx context.Context, tenantID, principalID, legalEntityID string, start, end time.Time) ([]domain.BankAccountReconStatus, error)
-	// CheckARInvoiceExists/CheckAPInvoiceExists back ACC-17's own closure
-	// of "Open AR included both in history and opening state" — see their
-	// doc comments in internal/clients.
-	CheckARInvoiceExists(ctx context.Context, tenantID, legalEntityID, customerID, invoiceNumber string) (bool, error)
-	CheckAPInvoiceExists(ctx context.Context, tenantID, legalEntityID, vendorID, invoiceNumber string) (bool, error)
+	// CheckARInvoiceExists/CheckAPInvoiceExists/GetPostedJournal, ACC-17's own
+	// closure of "Open AR included both in history and opening state" and its
+	// source-to-target reconciliation read, were retired with ACC-17's
+	// migration-batch write side — see SPEC_DEVIATIONS.md A9.
 	UploadCloseEvidence(ctx context.Context, tenantID, legalEntityID, periodName string, trialBalance map[string]float64, principalID string) (string, error)
 	// GetControlAccountCode resolves an ACC-06 caller-declared mapping key to
 	// the real chart-registered account code it currently names, via GL's
@@ -271,15 +259,12 @@ type Clients interface {
 	// duplicates" — see its doc comment in internal/clients.
 	ReverseGLJournal(ctx context.Context, tenantID, principalID, legalEntityID, journalID, reason, correlationID string) (reversingJournalID string, err error)
 	// PostAllocationJournal backs ACC-09 — see its doc comment in
-	// internal/clients. Account status/type checks for ACC-09/10/17 read
+	// internal/clients. Account status/type checks for ACC-09/10 read
 	// ListChartOfAccounts once per command (see chartIndex).
 	PostAllocationJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, sourceAccountCode string, sourceAmount float64, debitLines []domain.AllocationJournalLine, meta domain.GLJournalMeta) (journalID string, err error)
-	// PostMultiLineJournal backs ACC-10 and ACC-17 — see its doc comment in
+	// PostMultiLineJournal backs ACC-10 — see its doc comment in
 	// internal/clients.
 	PostMultiLineJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description string, lines []domain.JournalLineInput, meta domain.GLJournalMeta) (journalID string, err error)
-	// GetPostedJournal backs ACC-17's source-to-target reconciliation — see
-	// its doc comment in internal/clients.
-	GetPostedJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error)
 }
 
 const (
@@ -370,17 +355,9 @@ const (
 	actionFXRevaluationPost    = "FX_REVALUATION_POST"
 	actionFXRevaluationView    = "FX_REVALUATION_VIEW"
 
-	// ACC-17 (Opening Balance & Migration) actions. Approve and Certify
-	// are each their own action — segregation of duties again, and
-	// certification is the final, most sensitive sign-off in the whole
-	// pipeline, so it is deliberately its own grant, separate even from
-	// approval.
-	actionMigrationBatchCreate   = "MIGRATION_BATCH_CREATE"
-	actionMigrationBatchValidate = "MIGRATION_BATCH_VALIDATE"
-	actionMigrationBatchApprove  = "MIGRATION_BATCH_APPROVE"
-	actionMigrationBatchCommit   = "MIGRATION_BATCH_COMMIT"
-	actionMigrationBatchCertify  = "MIGRATION_BATCH_CERTIFY"
-	actionMigrationBatchView     = "MIGRATION_BATCH_VIEW"
+	// ACC-17's migration-batch actions (MIGRATION_BATCH_CREATE/VALIDATE/
+	// APPROVE/COMMIT/CERTIFY/VIEW) were retired along with its handlers —
+	// see SPEC_DEVIATIONS.md A9.
 
 	// ACC-16 (Signed Financial Snapshot) actions. Seal, Certify and
 	// Supersede are each their own action — the same escalating
@@ -545,7 +522,6 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.AddCloseRequirement)
 		r.Post("/{id}/remove", h.RemoveCloseRequirement)
 	})
-	r.Get("/v1/control-populations/migration-batch-tieout", h.GetMigrationBatchTieoutPopulation)
 	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
 	r.Route("/v1/close/periods", func(r chi.Router) {
 		r.Post("/", h.CreateFiscalPeriod)
@@ -624,15 +600,6 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}", h.GetFXRevaluation)
 		r.Post("/{id}/approve", h.ApproveRevaluation)
 		r.Post("/{id}/post", h.PostRevaluation)
-	})
-	r.Route("/v1/migration-batches", func(r chi.Router) {
-		r.Post("/", h.CreateMigrationAccountingBatch)
-		r.Get("/exceptions", h.GetMigrationExceptions)
-		r.Get("/{id}", h.GetMigrationBatchHandler)
-		r.Post("/{id}/validate", h.ValidateOpeningBalances)
-		r.Post("/{id}/approve", h.ApproveMigrationBatchHandler)
-		r.Post("/{id}/commit", h.CommitOpeningPosting)
-		r.Post("/{id}/certify", h.CertifyMigrationAccounting)
 	})
 	r.Route("/v1/financial-snapshots", func(r chi.Router) {
 		r.Post("/", h.CreateFinancialSnapshot)
@@ -4333,575 +4300,12 @@ func (h *Handler) writeFXRevaluationErr(w http.ResponseWriter, err error) {
 	}
 }
 
-// ── ACC-17 (Opening Balance & Migration) ──────────────────────────────────────────
-//
-// "owns Migration accounting batch/crosswalk/certification. Must never
-// own: Bypass of ACC-04/05" — opening balances always post through GL's
-// real Create/Validate/Post journal lifecycle and this service's own real
-// period status, exactly like every other capability. There is no
-// separate "bulk import" path.
-
-// CreateMigrationAccountingBatch loads a batch's crosswalk entries
-// synchronously (Planned collapses into LOADED — see domain package doc
-// comment). Idempotent on (legal_entity_id, fiscal_period,
-// source_system_name): a retried create for the same source system and
-// period returns the EXISTING batch.
-func (h *Handler) CreateMigrationAccountingBatch(w http.ResponseWriter, r *http.Request) {
-	var req domain.CreateMigrationBatchRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if req.LegalEntityID == "" || req.FiscalPeriod == "" || req.SourceSystemName == "" || req.SourceExtractHash == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields",
-			"legal_entity_id, fiscal_period, source_system_name and source_extract_hash are required")
-		return
-	}
-	if !requireCurrencyCode(w, req.CurrencyCode) {
-		return
-	}
-	if len(req.Entries) == 0 {
-		writeError(w, http.StatusBadRequest, "no_entries", string(domain.ErrNoMigrationEntries))
-		return
-	}
-	seen := make(map[string]bool, len(req.Entries))
-	for _, e := range req.Entries {
-		if seen[e.SourceReferenceID] {
-			writeError(w, http.StatusBadRequest, "duplicate_source_reference", string(domain.ErrDuplicateSourceReference)+": "+e.SourceReferenceID)
-			return
-		}
-		seen[e.SourceReferenceID] = true
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionMigrationBatchCreate); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	if existing, err := h.store.GetMigrationBatchBySourceSystem(r.Context(), req.LegalEntityID, req.FiscalPeriod, req.SourceSystemName); err == nil {
-		writeJSON(w, http.StatusOK, existing)
-		return
-	} else if !errors.Is(err, domain.ErrMigrationBatchNotFound) {
-		h.log.Error("CreateMigrationAccountingBatch: failed to check for an existing batch", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-
-	entries := make([]domain.MigrationCrosswalkEntry, len(req.Entries))
-	for i, e := range req.Entries {
-		entries[i] = domain.MigrationCrosswalkEntry{
-			EntryID:             uuid.NewString(),
-			SourceReferenceID:   e.SourceReferenceID,
-			SourceAccountCode:   e.SourceAccountCode,
-			TargetAccountCode:   e.TargetAccountCode,
-			DebitAmount:         e.DebitAmount,
-			CreditAmount:        e.CreditAmount,
-			SourceReferenceType: e.SourceReferenceType,
-			PartyID:             e.PartyID,
-		}
-	}
-	batch := &domain.MigrationBatch{
-		BatchID:              uuid.NewString(),
-		TenantID:             tenantID,
-		LegalEntityID:        req.LegalEntityID,
-		FiscalPeriod:         req.FiscalPeriod,
-		SourceSystemName:     req.SourceSystemName,
-		SourceExtractHash:    req.SourceExtractHash,
-		ExpectedRowCount:     req.ExpectedRowCount,
-		ExpectedTotalDebits:  req.ExpectedTotalDebits,
-		ExpectedTotalCredits: req.ExpectedTotalCredits,
-		CurrencyCode:         req.CurrencyCode,
-		Status:               domain.MigrationBatchStatusLoaded,
-		CreatedAt:            time.Now().UTC(),
-		CreatedByPrincipalID: principalID,
-		Entries:              entries,
-	}
-	if err := h.store.CreateMigrationBatch(r.Context(), batch); err != nil {
-		if errors.Is(err, domain.ErrMigrationBatchRaceLost) {
-			// A concurrent create for the same source system won the race
-			// (SPEC_DEVIATIONS A9); answer with that winner instead of a 503
-			// that tells a loser to retry a request that would just lose again.
-			existing, getErr := h.store.GetMigrationBatchBySourceSystem(r.Context(), req.LegalEntityID, req.FiscalPeriod, req.SourceSystemName)
-			if getErr != nil {
-				h.log.Error("CreateMigrationAccountingBatch: lost the create race but could not load the winner", zap.Error(getErr))
-				writeError(w, http.StatusServiceUnavailable, "store_unavailable", getErr.Error())
-				return
-			}
-			writeJSON(w, http.StatusOK, existing)
-			return
-		}
-		h.log.Error("failed to create migration batch", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, batch)
-}
-
-// ValidateOpeningBalances enforces three of the spec's own negative
-// paths, in order, quarantining the batch (with a permanent, evidenced
-// reason) on the first one it finds rather than merely answering an
-// ephemeral HTTP error while the batch stays silently stuck:
-//  1. "Non-monetary"/invalid target accounts — every target_account_code
-//     must resolve to a real, ACTIVE GL account.
-//  2. "Opening TB forced with suspense plug" — no target account may name
-//     itself a suspense account, AND total debits must equal total
-//     credits exactly with no plug.
-//  3. "Source-target row counts match but values differ" — the loaded
-//     entries must match the SOURCE system's own declared control totals
-//     (row count, total debits, total credits), independently declared
-//     at CreateMigrationAccountingBatch time.
-func (h *Handler) ValidateOpeningBalances(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	batch, err := h.store.GetMigrationBatch(r.Context(), id)
-	if err != nil {
-		h.writeMigrationErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, batch.LegalEntityID, actionMigrationBatchValidate); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-	if batch.Status != domain.MigrationBatchStatusLoaded {
-		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidMigrationBatchTransition))
-		return
-	}
-
-	// One chart read for the whole batch, not one GL call per entry: the
-	// target-account check below runs for every crosswalk row.
-	chart, err := h.chartIndex(r.Context(), tenantID, principalID)
-	if err != nil {
-		h.log.Error("ValidateOpeningBalances: failed to read the chart of accounts", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
-		return
-	}
-
-	var totalDebits, totalCredits float64
-	for _, e := range batch.Entries {
-		totalDebits = roundCents(totalDebits + e.DebitAmount)
-		totalCredits = roundCents(totalCredits + e.CreditAmount)
-
-		if strings.Contains(strings.ToUpper(e.TargetAccountCode), "SUSPENSE") {
-			h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrSuspenseAccountNotAllowed)+": "+e.TargetAccountCode)
-			writeError(w, http.StatusUnprocessableEntity, "suspense_account_not_allowed", string(domain.ErrSuspenseAccountNotAllowed)+": "+e.TargetAccountCode)
-			return
-		}
-		acc, found := chart[e.TargetAccountCode]
-		if !found {
-			h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode)
-			writeError(w, http.StatusUnprocessableEntity, "target_account_invalid", string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode)
-			return
-		}
-		if acc.Status != "ACTIVE" {
-			h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode+" is not ACTIVE")
-			writeError(w, http.StatusUnprocessableEntity, "target_account_invalid", string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode+" is not ACTIVE")
-			return
-		}
-
-		// The spec's own negative path, "Open AR included both in history
-		// and opening state" — only checked for entries the caller flagged
-		// as a real open AR/AP item; an ordinary GL balance line has no
-		// subledger history to double-book against.
-		if e.SourceReferenceType != nil {
-			if e.PartyID == nil || *e.PartyID == "" {
-				h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrPartyIDRequiredForOpenItem)+": "+e.SourceReferenceID)
-				writeError(w, http.StatusUnprocessableEntity, "party_id_required", string(domain.ErrPartyIDRequiredForOpenItem)+": "+e.SourceReferenceID)
-				return
-			}
-			var exists bool
-			var checkErr error
-			switch *e.SourceReferenceType {
-			case domain.MigrationCrosswalkTypeAROpenItem:
-				exists, checkErr = h.clients.CheckARInvoiceExists(r.Context(), tenantID, batch.LegalEntityID, *e.PartyID, e.SourceReferenceID)
-			case domain.MigrationCrosswalkTypeAPOpenItem:
-				exists, checkErr = h.clients.CheckAPInvoiceExists(r.Context(), tenantID, batch.LegalEntityID, *e.PartyID, e.SourceReferenceID)
-			}
-			if checkErr != nil {
-				h.log.Error("ValidateOpeningBalances: failed to check open item against subledger history", zap.Error(checkErr))
-				writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", checkErr.Error())
-				return
-			}
-			if exists {
-				h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrOpenItemAlreadyExistsInHistory)+": "+e.SourceReferenceID)
-				writeError(w, http.StatusUnprocessableEntity, "open_item_already_exists_in_history", string(domain.ErrOpenItemAlreadyExistsInHistory)+": "+e.SourceReferenceID)
-				return
-			}
-		}
-	}
-
-	if totalDebits != totalCredits {
-		h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrOpeningTBDoesNotBalance))
-		writeError(w, http.StatusUnprocessableEntity, "opening_tb_does_not_balance", string(domain.ErrOpeningTBDoesNotBalance))
-		return
-	}
-	if len(batch.Entries) != batch.ExpectedRowCount || totalDebits != roundCents(batch.ExpectedTotalDebits) || totalCredits != roundCents(batch.ExpectedTotalCredits) {
-		h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrControlTotalsMismatch))
-		writeError(w, http.StatusUnprocessableEntity, "control_totals_mismatch", string(domain.ErrControlTotalsMismatch))
-		return
-	}
-
-	now := time.Now().UTC()
-	if err := h.store.MarkMigrationBatchValidated(r.Context(), id, now); err != nil {
-		h.writeMigrationErr(w, err)
-		return
-	}
-	batch.Status, batch.ValidatedAt = domain.MigrationBatchStatusValidated, &now
-	writeJSON(w, http.StatusOK, batch)
-}
-
-// quarantineMigrationBatch is best-effort: the caller is about to answer
-// the real validation failure regardless, and a failure to persist the
-// QUARANTINED transition itself is logged, not allowed to mask the
-// original, more important error.
-func (h *Handler) quarantineMigrationBatch(ctx context.Context, batchID, reason string) {
-	if err := h.store.QuarantineMigrationBatch(ctx, batchID, domain.MigrationBatchStatusLoaded, reason); err != nil {
-		h.log.Error("failed to record migration batch quarantine", zap.String("batch_id", batchID), zap.Error(err))
-	}
-}
-
-// ApproveMigrationBatchHandler — the approver may not be the batch's preparer
-// (migration 000021's sod_migration_approver_independent).
-func (h *Handler) ApproveMigrationBatchHandler(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	idempotencyKey, ok := requireIdempotencyKey(w, r)
-	if !ok {
-		return
-	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requireTenant(w, r); !ok {
-		return
-	}
-	batch, err := h.store.GetMigrationBatch(r.Context(), id)
-	if err != nil {
-		h.writeMigrationErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, batch.LegalEntityID, actionMigrationBatchApprove); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-	if batch.CreatedByPrincipalID == principalID {
-		writeSelfApproval(w)
-		return
-	}
-	now := time.Now().UTC()
-	requestHash := requestFingerprint(struct{ BatchID string }{id})
-	if _, err := h.store.ApproveMigrationBatch(r.Context(), batch, principalID, idempotencyKey, requestHash, now); err != nil {
-		h.writeMigrationErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, batch)
-}
-
-// CommitOpeningPosting is idempotent — the spec's own negative path,
-// "Commit repeated after timeout": a batch already POSTED (or beyond)
-// never posts a second journal.
-//
-// Reconciliation runs immediately after a successful post, rather than as a
-// separately-triggered step, and it is a real one: ACC-17 "No production
-// acceptance without source-to-target reconciliation". The journal is read
-// back from general-ledger-svc and compared, account by account, with the
-// batch's own crosswalk (which validation already tied to the source's
-// declared control totals). Only a match moves the batch to RECONCILED, the
-// one state CertifyMigrationAccounting accepts. A mismatch quarantines the
-// batch with the discrepancy as its reason. If the journal cannot be read
-// back, the batch stays POSTED and a repeated commit retries the
-// reconciliation — it never posts again.
-func (h *Handler) CommitOpeningPosting(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	batch, err := h.store.GetMigrationBatch(r.Context(), id)
-	if err != nil {
-		h.writeMigrationErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, batch.LegalEntityID, actionMigrationBatchCommit); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-	switch batch.Status {
-	case domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified:
-		writeJSON(w, http.StatusOK, batch)
-		return
-	case domain.MigrationBatchStatusPosted:
-		// Posted by an earlier attempt whose reconciliation did not finish.
-		h.reconcileMigrationBatch(w, r, tenantID, batch)
-		return
-	case domain.MigrationBatchStatusApproved:
-	default:
-		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidMigrationBatchTransition))
-		return
-	}
-
-	fp, err := h.store.GetFiscalPeriodByName(r.Context(), batch.LegalEntityID, batch.FiscalPeriod)
-	if err != nil && !errors.Is(err, domain.ErrFiscalPeriodNotFound) {
-		h.log.Error("CommitOpeningPosting: failed to check period status", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-	// Opening balances are ordinary postings, not close journals: only into an
-	// open period or a reopen window.
-	if fp != nil && !fp.OrdinaryPostingAllowed(time.Now().UTC()) {
-		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrMigrationPeriodLocked))
-		return
-	}
-	meta, err := glJournalMeta(fp, batch.FiscalPeriod, batch.CurrencyCode, domain.GLJournalTypeOpening, domain.GLJournalPurposeOpeningBalance)
-	if err != nil {
-		h.writeJournalMetaErr(w, err)
-		return
-	}
-
-	lines := make([]domain.JournalLineInput, len(batch.Entries))
-	for i, e := range batch.Entries {
-		lines[i] = domain.JournalLineInput{AccountCode: e.TargetAccountCode, DebitAmount: e.DebitAmount, CreditAmount: e.CreditAmount}
-	}
-	description := "Opening balance migration from " + batch.SourceSystemName + " — " + batch.FiscalPeriod
-	journalID, err := h.clients.PostMultiLineJournal(r.Context(), tenantID, batch.LegalEntityID, batch.FiscalPeriod, batch.BatchID, principalID, description, lines, meta)
-	if err != nil {
-		h.log.Error("CommitOpeningPosting: journal posting failed", zap.String("batch_id", id), zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
-		return
-	}
-
-	now := time.Now().UTC()
-	if err := h.store.MarkMigrationBatchPosted(r.Context(), id, journalID, now); err != nil {
-		h.log.Error("opening balances posted but the batch could not be marked POSTED",
-			zap.String("batch_id", id), zap.String("journal_id", journalID), zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "batch_not_recorded",
-			"the opening balance journal IS posted to general-ledger-svc ("+journalID+"), but the batch could not be marked POSTED.")
-		return
-	}
-	h.recordLineageEdge(r.Context(), batch.LegalEntityID, "migration_batch", batch.BatchID, "journal", journalID)
-
-	batch.Status, batch.JournalID, batch.PostedAt = domain.MigrationBatchStatusPosted, &journalID, &now
-	h.reconcileMigrationBatch(w, r, tenantID, batch)
-}
-
-// reconcileMigrationBatch proves a POSTED batch's journal against its
-// crosswalk and answers the commit. See CommitOpeningPosting.
-func (h *Handler) reconcileMigrationBatch(w http.ResponseWriter, r *http.Request, tenantID string, batch *domain.MigrationBatch) {
-	journalID := derefString(batch.JournalID)
-	journal, err := h.clients.GetPostedJournal(r.Context(), tenantID, journalID)
-	if err != nil {
-		h.log.Error("opening balances posted but the journal could not be read back to reconcile",
-			zap.String("batch_id", batch.BatchID), zap.String("journal_id", journalID), zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "reconciliation_unavailable",
-			"the opening balance journal IS posted ("+journalID+") but could not be read back from general-ledger-svc to reconcile it; "+
-				"the batch stays POSTED and cannot be certified — repeat the commit to retry the reconciliation (it will not post again)")
-		return
-	}
-	if discrepancy := migrationReconciliationDiscrepancy(batch, journal); discrepancy != "" {
-		reason := string(domain.ErrReconciliationMismatch) + ": " + discrepancy
-		if err := h.store.QuarantineMigrationBatch(r.Context(), batch.BatchID, domain.MigrationBatchStatusPosted, reason); err != nil {
-			h.log.Error("failed to record migration batch reconciliation quarantine", zap.String("batch_id", batch.BatchID), zap.Error(err))
-		}
-		writeError(w, http.StatusUnprocessableEntity, "migration_reconciliation_failed", reason)
-		return
-	}
-	if err := h.store.MarkMigrationBatchReconciled(r.Context(), batch.BatchID, time.Now().UTC()); err != nil && !errors.Is(err, domain.ErrInvalidMigrationBatchTransition) {
-		h.log.Error("migration batch reconciled but RECONCILED could not be recorded", zap.String("batch_id", batch.BatchID), zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-
-	full, err := h.store.GetMigrationBatch(r.Context(), batch.BatchID)
-	if err != nil {
-		h.log.Error("CommitOpeningPosting: failed to reload reconciled batch", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, full)
-}
-
-// migrationReconciliationDiscrepancy compares the journal the ledger holds
-// with the batch's crosswalk: posted, in the batch's entity and period, and
-// for every account the same debit and credit totals, with no account on one
-// side only. Empty means reconciled. The first discrepancy in account order
-// is named, so the quarantine reason is deterministic.
-func migrationReconciliationDiscrepancy(batch *domain.MigrationBatch, journal *domain.PostedJournal) string {
-	if journal.Status != domain.GLJournalStatusFinalized {
-		return fmt.Sprintf("journal %s is %s, not %s", journal.JournalID, journal.Status, domain.GLJournalStatusFinalized)
-	}
-	if journal.LegalEntityID != batch.LegalEntityID || journal.FiscalPeriod != batch.FiscalPeriod {
-		return fmt.Sprintf("journal %s is booked to %s/%s, not the batch's %s/%s",
-			journal.JournalID, journal.LegalEntityID, journal.FiscalPeriod, batch.LegalEntityID, batch.FiscalPeriod)
-	}
-	type sides struct{ debit, credit float64 }
-	expected, actual := map[string]sides{}, map[string]sides{}
-	for _, e := range batch.Entries {
-		s := expected[e.TargetAccountCode]
-		expected[e.TargetAccountCode] = sides{roundCents(s.debit + e.DebitAmount), roundCents(s.credit + e.CreditAmount)}
-	}
-	for _, l := range journal.Lines {
-		s := actual[l.AccountCode]
-		actual[l.AccountCode] = sides{roundCents(s.debit + l.DebitAmount), roundCents(s.credit + l.CreditAmount)}
-	}
-	codes := make([]string, 0, len(expected)+len(actual))
-	for code := range expected {
-		codes = append(codes, code)
-	}
-	for code := range actual {
-		if _, ok := expected[code]; !ok {
-			codes = append(codes, code)
-		}
-	}
-	sort.Strings(codes)
-	for _, code := range codes {
-		want, inBatch := expected[code]
-		got, inJournal := actual[code]
-		switch {
-		case !inJournal:
-			return fmt.Sprintf("account %s is in the crosswalk (Dr %.2f / Cr %.2f) but not in journal %s", code, want.debit, want.credit, journal.JournalID)
-		case !inBatch:
-			return fmt.Sprintf("journal %s posts to account %s (Dr %.2f / Cr %.2f), which is not in the crosswalk", journal.JournalID, code, got.debit, got.credit)
-		case want != got:
-			return fmt.Sprintf("account %s: crosswalk Dr %.2f / Cr %.2f, journal %s Dr %.2f / Cr %.2f",
-				code, want.debit, want.credit, journal.JournalID, got.debit, got.credit)
-		}
-	}
-	return ""
-}
-
-func (h *Handler) CertifyMigrationAccounting(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	idempotencyKey, ok := requireIdempotencyKey(w, r)
-	if !ok {
-		return
-	}
-	var req domain.CertifyMigrationBatchRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if req.Reason == "" {
-		writeError(w, http.StatusBadRequest, "reason_required", "reason is required to certify a migration batch")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requireTenant(w, r); !ok {
-		return
-	}
-	batch, err := h.store.GetMigrationBatch(r.Context(), id)
-	if err != nil {
-		h.writeMigrationErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, batch.LegalEntityID, actionMigrationBatchCertify); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-	// ACC-17: "Migration preparer cannot certify own material cutover" (also
-	// migration 000021's sod_migration_certifier_independent).
-	if batch.CreatedByPrincipalID == principalID {
-		writeSelfApproval(w)
-		return
-	}
-	now := time.Now().UTC()
-	requestHash := requestFingerprint(struct {
-		BatchID string
-		Req     domain.CertifyMigrationBatchRequest
-	}{id, req})
-	if _, err := h.store.CertifyMigrationBatch(r.Context(), batch, principalID, req.Reason, idempotencyKey, requestHash, now); err != nil {
-		h.writeMigrationErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, batch)
-}
-
-func (h *Handler) GetMigrationBatchHandler(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requireTenant(w, r); !ok {
-		return
-	}
-	batch, err := h.store.GetMigrationBatch(r.Context(), id)
-	if err != nil {
-		h.writeMigrationErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, batch.LegalEntityID, actionMigrationBatchView); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, batch)
-}
-
-func (h *Handler) GetMigrationExceptions(w http.ResponseWriter, r *http.Request) {
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	if legalEntityID == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
-		return
-	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requireTenant(w, r); !ok {
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionMigrationBatchView); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-	list, err := h.store.ListQuarantinedMigrationBatches(r.Context(), legalEntityID)
-	if err != nil {
-		h.log.Error("GetMigrationExceptions: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-	if list == nil {
-		list = []domain.MigrationBatch{}
-	}
-	writeJSON(w, http.StatusOK, list)
-}
-
-func (h *Handler) writeMigrationErr(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, domain.ErrMigrationBatchNotFound):
-		writeError(w, http.StatusNotFound, "migration_batch_not_found", "")
-	case errors.Is(err, domain.ErrInvalidMigrationBatchTransition):
-		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidMigrationBatchTransition))
-	case errors.Is(err, domain.ErrSelfApproval):
-		writeSelfApproval(w)
-	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
-		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
-	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
-		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
-	default:
-		h.log.Error("migration batch store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-	}
-}
+// ACC-17's migration-batch write side (CreateMigrationAccountingBatch,
+// ApproveMigrationBatchHandler, CommitOpeningPosting, CertifyMigrationAccounting,
+// GetMigrationBatchHandler, GetMigrationExceptions, etc.) was retired here —
+// see SPEC_DEVIATIONS.md A9. The real migration posting path is now
+// general-ledger-svc's own kernel (internal/kernel/migration.go), driven by
+// migration-integrity-svc.
 
 // ── ACC-16 (Signed Financial Snapshot) ────────────────────────────────────────────
 //
