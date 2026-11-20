@@ -432,7 +432,7 @@ does not reproduce the original certified total plus its adjustment lineage.
 The original is preserved, but the replacement's evidence is incomplete.
 This is a structural reopen/adjustment carry-forward gap.
 
-### A10. COM-05 never rates `ONE_TIME` or `DISCOUNT` components
+### A10. COM-05 never rated `ONE_TIME` or `DISCOUNT` components — closed 2026-11-20
 
 §4.5 requires:
 
@@ -453,12 +453,22 @@ and §4.1 defines:
 > “Discount/credit | type, value/cap, duration, eligibility, approval | Never
 > embedded as mutable invoice-line override.”
 
-`RateInvoiceBasis` rates only `RECURRING_FIXED`, `PER_UNIT` and `METERED`
-components. Its own comment says: “ONE_TIME and DISCOUNT components are not
-rated here (out of scope for this part of COM-05).” Approved discounts and
-one-time charges can be stored on a price version and approved on a
-subscription, but they never reach an invoice candidate. This is a material
-COM-05 rating gap.
+**Closed.** `RateInvoiceBasis` previously rated only `RECURRING_FIXED`,
+`PER_UNIT` and `METERED` components, with its own comment recording
+`ONE_TIME` and `DISCOUNT` as out of scope. Approved discounts and one-time
+charges could be stored on a price version and approved on a subscription,
+but never reached an invoice candidate — a material COM-05 rating gap at the
+time this register was first written.
+
+This is fixed: `RateInvoiceBasis` now also rates `ONE_TIME` components
+(explicit trigger/evidence, no hidden recurring conversion) and `DISCOUNT`
+components (bound policy version, eligibility, cap/duration), and
+`GenerateInvoiceCandidate` wires the approved discount/one-time facts
+through to the invoice candidate. See commits `b598d63e`
+("commercial-account-svc: add schema for ONE_TIME/DISCOUNT invoice lines"),
+`65e2ad0e` ("commercial-account-svc: rate ONE_TIME and DISCOUNT components
+onto invoices") and `7743d42a` ("commercial-account-svc: wire ONE_TIME/
+DISCOUNT facts into GenerateInvoiceCandidate"), all on `satyaprakash-changes`.
 
 ### A11. COM-05 collection health is incomplete
 
@@ -579,12 +589,14 @@ review of every restriction consumer.
   read tenant tax configuration. This matches §4.5's “merchant tax result”
   input and §5's dedicated seller tax context, but a reviewer could require
   a stronger tax-service integration or an amount-versus-rate check.
-- **B13. COM-05 discount/one-time rating was deferred.** A10 records the gap.
-  Rating a discount requires a bound discount policy version and an
-  eligibility decision; rating a one-time charge requires an explicit trigger
-  and evidence. Neither binding exists yet, so adding a line item from the
-  component alone would create an unsupported charge. This needs a separate
-  COM-05 rating extension.
+- **B13. COM-05 discount/one-time rating was deferred — closed 2026-11-20.**
+  A10 recorded the gap: rating a discount requires a bound discount policy
+  version and an eligibility decision; rating a one-time charge requires an
+  explicit trigger and evidence; neither binding existed at the time, so
+  adding a line item from the component alone would have created an
+  unsupported charge. Commits `b598d63e`/`65e2ad0e`/`7743d42a` added that
+  binding and wired it through `RateInvoiceBasis`/`GenerateInvoiceCandidate`;
+  see A10.
 - **B14. Dunning `SUSPENDED` uses the existing `RESTRICTED` level.** A12
   records the gap. The current `RestrictionLevel` has no `DENY`, and adding
   one requires a schema migration plus a review of every restriction
