@@ -248,8 +248,18 @@ const (
 	MatchRuleTargetJournalNotFinalized  = "TARGET_JOURNAL_NOT_FINALIZED"
 	MatchRuleCurrencyUnverifiable       = "CURRENCY_UNVERIFIABLE"
 	MatchRuleCurrencyMismatch           = "CURRENCY_MISMATCH"
-	MatchRuleAmountMismatch             = "AMOUNT_MISMATCH"
-	MatchRuleGroupRelationshipLost      = "GROUP_RELATIONSHIP_LOST"
+	// MatchRuleNoIntercompanyLines is SPEC_DEVIATIONS A5's line-level match:
+	// the target journal exists, belongs to the right entity, is FINALIZED
+	// and carries the right currency, but none of its lines post to an
+	// account general-ledger-svc's chart classifies IsIntercompanyAccount.
+	// There is nothing to compare the pair's amount against, so this is a
+	// MISMATCH the same way CURRENCY_MISMATCH is — a real accounting fact,
+	// not a retryable error — checked after the four journal-level checks
+	// and before the amount comparison, which it would otherwise make
+	// meaningless.
+	MatchRuleNoIntercompanyLines   = "NO_INTERCOMPANY_LINES"
+	MatchRuleAmountMismatch        = "AMOUNT_MISMATCH"
+	MatchRuleGroupRelationshipLost = "GROUP_RELATIONSHIP_LOST"
 
 	// Source-side rules: the same four checks MatchIntercompany runs on the
 	// target, run on the source journal when the pair is created
@@ -416,4 +426,11 @@ var (
 	// entities no longer share an open group relationship as of the match
 	// attempt, per tenant-entity-registry-svc's own EntityHierarchy record.
 	ErrGroupRelationshipLost = errorString("source and target legal entities no longer share an open group relationship")
+
+	// ErrNoIntercompanyLines is SPEC_DEVIATIONS A5's new negative path: the
+	// target journal passed its four journal-level checks, but none of its
+	// lines post to an account general-ledger-svc's chart of accounts
+	// classifies IsIntercompanyAccount, so there is no line to compare the
+	// pair's amount against.
+	ErrNoIntercompanyLines = errorString("target journal has no line posted to an account classified as intercompany")
 )

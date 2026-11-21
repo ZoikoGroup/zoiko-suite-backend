@@ -434,7 +434,9 @@ func TestMatchEntry_HappyPath(t *testing.T) {
 			JournalID:     "target-j-001",
 			LegalEntityID: "le-uk",
 			Status:        "FINALIZED", CurrencyCode: "USD",
-			Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000"}},
+			// IsIntercompanyAccount: true — SPEC_DEVIATIONS A5 now compares
+			// only the journal's intercompany-designated line(s).
+			Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000", IsIntercompanyAccount: true}},
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, leg)
@@ -472,7 +474,7 @@ func TestMatchEntry_MismatchNotRecorded_Is503(t *testing.T) {
 	s.updateMatchErr = errors.New("connection reset")
 	leg := &stubLedger{journal: &ledger.JournalDetail{
 		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED", CurrencyCode: "USD",
-		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "4000"}}, // amount mismatch
+		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "4000", IsIntercompanyAccount: true}}, // amount mismatch
 	}}
 	r := newRouter(s, &stubAuthZ{}, leg)
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-1/match", map[string]any{
@@ -504,7 +506,7 @@ func TestMatchEntry_StatusMovedSinceRead_Is422(t *testing.T) {
 	s.updateMatchErr = domain.ErrInvalidPairTransition
 	leg := &stubLedger{journal: &ledger.JournalDetail{
 		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED", CurrencyCode: "USD",
-		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000"}},
+		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000", IsIntercompanyAccount: true}},
 	}}
 	r := newRouter(s, &stubAuthZ{}, leg)
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-1/match", map[string]any{

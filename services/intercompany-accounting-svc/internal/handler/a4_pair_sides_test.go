@@ -103,7 +103,10 @@ func seedPair(s *stubStoreReal, amount domain.Decimal, cur string, cpAmount doma
 func journal(cur string, amount domain.Decimal) *stubLedger {
 	return &stubLedger{journal: &ledger.JournalDetail{
 		JournalID: "j-tgt", LegalEntityID: "le-uk", Status: "FINALIZED", CurrencyCode: cur,
-		Lines: []ledger.JournalLine{{AccountCode: "2300", CreditAmount: amount}},
+		// IsIntercompanyAccount: true — SPEC_DEVIATIONS A5 now compares only
+		// a journal's intercompany-designated line(s); every test using this
+		// helper needs its one line to be that line.
+		Lines: []ledger.JournalLine{{AccountCode: "2300", CreditAmount: amount, IsIntercompanyAccount: true}},
 	}}
 }
 

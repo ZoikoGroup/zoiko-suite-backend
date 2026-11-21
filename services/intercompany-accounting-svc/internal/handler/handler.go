@@ -575,11 +575,14 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The journal amount is the larger of its total debits and total
-	// credits (SPEC_DEVIATIONS A5), summed exactly. Read before the checks'
-	// outcome is recorded so every attempt records what the journal held,
-	// whichever rule fails.
-	journalAmount, err := journalTotal(journal)
+	// The journal amount is the larger of total debits and total credits
+	// across only the lines general-ledger-svc's chart of accounts
+	// classifies IsIntercompanyAccount (SPEC_DEVIATIONS A5) — not the whole
+	// journal, which would also pull in an unrelated line (tax, a
+	// third-party leg) and let a journal of the right total but the wrong
+	// accounts match. Read before the checks' outcome is recorded so every
+	// attempt records what the journal held, whichever rule fails.
+	journalAmount, hasIntercompanyLines, err := intercompanyLineTotal(journal)
 	if err != nil {
 		h.log.Error("general-ledger-svc returned an unreadable journal amount", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "gl_query_failed", err.Error())
@@ -598,10 +601,22 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The target journal's amount must match the expected counterparty
-	// amount, compared exactly (big.Rat) within matchTolerance.
+	// No line of the target journal posts to an account the chart
+	// classifies intercompany: there is nothing to compare the pair's
+	// amount against. A real accounting fact — the journal is real and
+	// FINALIZED, it simply isn't an intercompany entry — so this is a
+	// MISMATCH, not a 503 the caller would retry identically.
+	if !hasIntercompanyLines {
+		reason := fmt.Sprintf("no_intercompany_lines: target journal %s has no line posted to an account classified as intercompany", req.TargetJournalID)
+		h.recordMismatch(w, r, entry, attempt, idempotencyKey, domain.MatchRuleNoIntercompanyLines, reason)
+		return
+	}
+
+	// The target journal's intercompany-line amount must match the
+	// expected counterparty amount, compared exactly (big.Rat) within
+	// matchTolerance.
 	if diff := new(big.Rat).Sub(journalAmount, expected); diff.Abs(diff).Cmp(matchTolerance) > 0 {
-		reason := fmt.Sprintf("amount_mismatch: expected counterparty amount %s %s != journal amount %s %s",
+		reason := fmt.Sprintf("amount_mismatch: expected counterparty amount %s %s != journal's intercompany-line amount %s %s",
 			domain.CanonicalAmount(expected), entry.CounterpartyCurrencyCode, domain.CanonicalAmount(journalAmount), journal.CurrencyCode)
 		h.recordMismatch(w, r, entry, attempt, idempotencyKey, domain.MatchRuleAmountMismatch, reason)
 		return
@@ -787,6 +802,14 @@ func (h *Handler) checkJournal(ctx context.Context, tenantID, journalID string, 
 // journalTotal is the larger of the journal's total debits and total
 // credits, summed exactly. An absent line amount counts as zero, as it did
 // when lines were decoded into float64.
+//
+// Used only for the create-time source-journal observation (A6's
+// checkSourceJournal, below): that call never compares the amount it
+// observes (B12 — "comparing the source journal's total here would reject
+// journals A5 knows are approximated... Source amount verification belongs
+// with A5"), so it is intentionally left as the whole-journal figure it
+// always was rather than switched to intercompanyLineTotal, which is
+// MatchEntry's own comparison basis, not an evidence-recording default.
 func journalTotal(j *ledger.JournalDetail) (*big.Rat, error) {
 	var debits, credits []string
 	for _, l := range j.Lines {
@@ -809,6 +832,58 @@ func journalTotal(j *ledger.JournalDetail) (*big.Rat, error) {
 		return totalCredit, nil
 	}
 	return totalDebit, nil
+}
+
+// intercompanyLineTotal is the larger of total debits and total credits
+// across only the journal's lines general-ledger-svc's chart of accounts
+// classifies IsIntercompanyAccount (SPEC_DEVIATIONS A5), summed exactly. An
+// absent line amount counts as zero, as it did when lines were decoded into
+// float64.
+//
+// found is false when the journal has no intercompany-designated line at
+// all — a journal that never carries one (an ordinary local entry someone
+// named by mistake) and a journal whose intercompany line the chart has
+// since reclassified both land here the same way: there is nothing to
+// compare the pair's amount against, which the caller turns into a
+// MISMATCH (MatchRuleNoIntercompanyLines) rather than treating the journal
+// total as a stand-in for it.
+//
+// Multiple intercompany-designated lines are summed, not matched against
+// only the first: this is the direct, line-scoped generalisation of what
+// the journal-total comparison already did (sum every debit, sum every
+// credit, take the larger), restricted to the lines the chart actually
+// designates intercompany rather than every line in the journal. A journal
+// that splits one intercompany position across several lines (e.g. by
+// dimension) still nets to the position's real total.
+func intercompanyLineTotal(j *ledger.JournalDetail) (total *big.Rat, found bool, err error) {
+	var debits, credits []string
+	for _, l := range j.Lines {
+		if !l.IsIntercompanyAccount {
+			continue
+		}
+		found = true
+		if l.DebitAmount != "" {
+			debits = append(debits, string(l.DebitAmount))
+		}
+		if l.CreditAmount != "" {
+			credits = append(credits, string(l.CreditAmount))
+		}
+	}
+	if !found {
+		return big.NewRat(0, 1), false, nil
+	}
+	totalDebit, err := domain.SumAmounts(debits)
+	if err != nil {
+		return nil, true, err
+	}
+	totalCredit, err := domain.SumAmounts(credits)
+	if err != nil {
+		return nil, true, err
+	}
+	if totalCredit.Cmp(totalDebit) > 0 {
+		return totalCredit, true, nil
+	}
+	return totalDebit, true, nil
 }
 
 // newMatchAttempt starts the evidence for one match attempt: what each side
