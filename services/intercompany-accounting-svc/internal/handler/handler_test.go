@@ -50,6 +50,8 @@ type stubStoreReal struct {
 	cpErr   error
 	cpCalls int
 	cpQuery domain.ControlPopulationQuery
+
+	tolerancePolicies map[string]*domain.TolerancePolicyVersion
 }
 
 func newStubStoreReal() *stubStoreReal {
@@ -183,6 +185,60 @@ func (s *stubStoreReal) ListMatchAttempts(_ context.Context, id string) ([]domai
 
 func (s *stubStoreReal) ListTransitions(_ context.Context, id string) ([]domain.PairTransition, error) {
 	return s.transitions[id], nil
+}
+
+func (s *stubStoreReal) PublishTolerancePolicy(_ context.Context, tenantID string, v *domain.TolerancePolicyVersion) (*domain.TolerancePolicyVersion, error) {
+	if s.tolerancePolicies == nil {
+		s.tolerancePolicies = map[string]*domain.TolerancePolicyVersion{}
+	}
+	key := tenantID + "/" + fmtInt(v.PolicyVersion)
+	if _, exists := s.tolerancePolicies[key]; exists {
+		return nil, domain.ErrTolerancePolicyVersionExists
+	}
+	cp := *v
+	cp.TenantID = tenantID
+	s.tolerancePolicies[key] = &cp
+	return &cp, nil
+}
+
+func (s *stubStoreReal) ResolveTolerancePolicy(_ context.Context, tenantID string, at time.Time) (int, domain.Decimal, error) {
+	best := -1
+	var bestTolerance domain.Decimal
+	var bestEffective time.Time
+	for _, p := range s.tolerancePolicies {
+		if p.TenantID != tenantID || p.EffectiveFrom.After(at) {
+			continue
+		}
+		if best == -1 || p.EffectiveFrom.After(bestEffective) || (p.EffectiveFrom.Equal(bestEffective) && p.PolicyVersion > best) {
+			best, bestTolerance, bestEffective = p.PolicyVersion, p.Tolerance, p.EffectiveFrom
+		}
+	}
+	if best == -1 {
+		return 0, "0.001", nil
+	}
+	return best, bestTolerance, nil
+}
+
+func fmtInt(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
 }
 
 // Compile-time proof the stub still satisfies the contract the handler

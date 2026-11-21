@@ -296,6 +296,15 @@ type MatchAttempt struct {
 
 	ExaminedJournalIDs []string `json:"examined_journal_ids"`
 	Tolerance          Decimal  `json:"tolerance"`
+	// ToleranceVersion is the intercompany_tolerance_policy_versions version
+	// this attempt's Tolerance was resolved from (A5's tolerance/matching-
+	// policy gap, SPEC_DEVIATIONS B15). 0 means the fixed pre-governance
+	// 0.001, used when the tenant has never published a version effective by
+	// the time of this attempt — never a stored row, so a tenant that has
+	// not opted into tolerance governance sees no behavior change. Recorded
+	// once, at the attempt, and never revised: publishing a later version
+	// never changes what an earlier attempt is understood to have compared.
+	ToleranceVersion int `json:"tolerance_version"`
 
 	// FiscalPeriod is the pair's period at the time of the attempt.
 	FiscalPeriod  *string   `json:"fiscal_period,omitempty"`
@@ -344,6 +353,39 @@ type PairTransition struct {
 	Actor               string    `json:"actor"`
 	CorrelationID       *string   `json:"correlation_id,omitempty"`
 	OccurredAt          time.Time `json:"occurred_at"`
+}
+
+// TolerancePolicyVersion is a governed, versioned tolerance for comparing a
+// target journal's intercompany-line amount to a pair's expected
+// counterparty amount (A5's other named gap, B15's deferred half). It does
+// not change the tolerance's value — the spec gives no different number and
+// none is invented here (migration 000011 seeds nothing; the fixed 0.001
+// keeps applying, as tolerance_version 0, until a tenant actually publishes
+// one) — it turns a fixed literal into who may set it, when it takes
+// effect, and which version a historical match attempt was evaluated under.
+// Published explicitly, by tenant, and never edited: a later publish never
+// changes an earlier attempt's recorded tolerance_version (append-only,
+// migration 000007's reject_immutable_row trigger).
+type TolerancePolicyVersion struct {
+	TenantID             string    `json:"tenant_id"`
+	PolicyVersion        int       `json:"policy_version"`
+	Tolerance            Decimal   `json:"tolerance"`
+	EffectiveFrom        time.Time `json:"effective_from"`
+	Reason               string    `json:"reason"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+// PublishTolerancePolicyRequest is PublishTolerancePolicy's request body. The
+// caller chooses PolicyVersion explicitly (not a SERIAL): a replayed publish
+// for the same version is then a natural conflict/no-op, the same posture
+// commercial-account-svc's entitlement_policy_versions already takes for the
+// same reason.
+type PublishTolerancePolicyRequest struct {
+	PolicyVersion int       `json:"policy_version"`
+	Tolerance     string    `json:"tolerance"`
+	EffectiveFrom time.Time `json:"effective_from"`
+	Reason        string    `json:"reason"`
 }
 
 type errorString string
@@ -420,6 +462,13 @@ var (
 	// ErrEntityRegistryUnavailable is returned when tenant-entity-registry-svc
 	// cannot be reached to check group relationship state.
 	ErrEntityRegistryUnavailable = errorString("tenant-entity-registry-svc unavailable")
+
+	// ErrTolerancePolicyVersionExists: a tolerance policy version is
+	// explicit and immutable (append-only); publishing the same
+	// policy_version for this tenant a second time with different content
+	// is refused rather than silently reused — see PublishTolerancePolicy.
+	ErrTolerancePolicyVersionExists = errorString("a tolerance policy version with that number already exists for this tenant")
+	ErrInvalidTolerancePolicy       = errorString("policy_version (>=1), tolerance (a non-negative decimal), effective_from and reason are all required")
 
 	// ErrGroupRelationshipLost is the spec's own negative path, "Entity
 	// loses group relationship mid-period": the source and target legal
