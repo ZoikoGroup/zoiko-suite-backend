@@ -319,7 +319,7 @@ replay-load wiring checked individually.
   (real Postgres: a retry under the same key with a different
   `sale_enabled` value still replays the original row).
 
-### A5. COM-03 policy publication invalidates globally, not per tenant
+### A5. COM-03 policy publication invalidates globally, not per tenant — closed 2026-11-21
 
 §4.3 says:
 
@@ -331,15 +331,76 @@ and §9 requires:
 > “09 | Downgrade scheduled but high-tier feature remains usable after
 > effective time | COM-03 revokes/limits at boundary; stale cache invalidated.”
 
-`PublishEntitlementPolicy` writes one outbox event with aggregate
-`entitlement_policy` / `grace-policy`. It does not recompute or emit an
-`entitlement_snapshot.changed` event for each affected tenant. The canonical
-`Evaluate` path is safe because it computes fresh, but a cache-fronted caller
-must invalidate the entire policy cache rather than a tenant's snapshot. There
-is no per-capability cache-revocation SLO or freshness metadata in the
-service, because there is no cached decision path to measure. This is
-fail-safe for the service's own reads but weaker than the per-tenant
-invalidation implied by the event contract.
+**Closed.** `PublishEntitlementPolicy` previously wrote only one outbox event
+with aggregate `entitlement_policy` / `grace-policy`. It never recomputed or
+emitted an `entitlement_snapshot.changed` event for each affected tenant, so a
+cache-fronted caller only got a correct per-tenant signal by coincidence of
+its own TTL expiring, not a real push.
+
+`entitlement_policy_versions` (migration 000010) is a single, global,
+platform-scoped ended-access grace policy — it names no organization and no
+capability. The only organizations a given policy version can actually
+change the answer for are those with no live subscription whose most recent
+one has already ended (`loadMostRecentlyEnded`); an organization with a live
+subscription is unaffected by it regardless of its content.
+
+Discovering that set safely was the real difficulty. `PublishEntitlementPolicy`
+runs on the seller plane with no tenant scope, and `subscriptions` (migration
+000007) carries only a bare `tenant_isolation_policy` — deliberately, with no
+seller- or boundary-worker bypass of its own (see the `declareOrgForSellerPlane`
+comment in `internal/store/com04_usage_store.go`, which documents this same
+fact for a different COM-04 read). Widening that policy to let the seller
+plane read live tenant subscription data in general would have been a far
+bigger surface than this one feature needs, and was rejected.
+
+Instead (migration 000024):
+
+1. `ended_subscription_index` is a new, narrow, durable table — one row per
+   organization whose most recent subscription currently has an `ends_at`
+   set — kept current by a trigger on `subscriptions` itself (`AFTER INSERT
+   OR UPDATE OF ends_at`). That is the exact column `setEndsAt` already
+   maintains for every real lifecycle transition this service has (`CancelNow`,
+   a scheduled cancellation taking effect, trial/term expiry, reactivation
+   clearing it back to `NULL`). The write happens inside the owning tenant's
+   own transaction — the same one that already calls `setEndsAt` — so it is
+   RLS-legal without any cross-tenant read ever happening. A migration-embedded
+   backfill (idempotent, `ON CONFLICT` upsert recomputed from current
+   `subscriptions` state) covers organizations that already ended before this
+   index existed, following this service's only existing backfill convention
+   (000009's `subscription_boundary_queue` backfill).
+2. `PublishEntitlementPolicy`'s own transaction reads this index — never
+   `subscriptions` directly — to enqueue one `entitlement_invalidation_queue`
+   row per organization whose indexed `ends_at` is at or before the policy's
+   own `effective_from`, in the same transaction as the policy write (same
+   durability as every other command in this service).
+3. A worker (`ProcessNextEntitlementInvalidation`), shaped exactly like
+   `subscription_boundary_queue`'s `ProcessNextBoundary` (`SKIP LOCKED`,
+   claim-one-row-per-transaction, backoff, parked `FAILED` after repeated
+   failure, run by `boundary.Worker` through a one-method adapter so the
+   existing ticker/batch machinery is reused rather than duplicated), drains
+   that queue and turns each row into the real per-tenant
+   `entitlement_snapshot.changed` event through the existing
+   `recomputeEntitlementsBatchTx` path — the same event `CreateSnapshot`,
+   `RecomputeEntitlements` and the boundary worker's own B2 remediation
+   already produce, not a new one-off event shape.
+
+`entitlement_invalidation_queue` itself is platform-only bookkeeping, not
+tenant data — no organization ever reads its own rows there — so unlike
+`subscription_boundary_queue` its RLS has no per-organization branch at all:
+only the seller plane (the writer) and the `boundary_worker` plane (the new
+worker) may see it.
+
+*Verification* (`internal/store/com03_entitlement_invalidation_store_test.go`,
+real Postgres as the NOSUPERUSER NOBYPASSRLS role):
+`TestEntitlement_PublishPolicyInvalidatesOnlyGenuinelyEndedOrgs` publishes a
+policy after one organization's subscription has genuinely ended (`CancelNow`)
+while a second, unrelated organization's subscription is still active, and
+proves `entitlement_invalidation_queue` holds exactly one row — the ended
+organization, carrying the published policy's own version — then drains it
+and proves the real `entitlement_snapshot.changed` outbox event lands for
+that organization only, with no new event for the still-active one.
+`TestEntitlement_InvalidationQueueHasNoDefaultVisibility` proves a plain
+connection with no plane/tenant declared sees zero rows in either new table.
 
 ### A6. Replay for evidence commands returns current state, not the original result
 

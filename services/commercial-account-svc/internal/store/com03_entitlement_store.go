@@ -734,6 +734,15 @@ func (s *PgStore) PublishEntitlementPolicy(ctx context.Context, p *domain.Entitl
 			p.PolicyVersion, p.EndedOutcome, p.EndedReadOnlyDays, p.EffectiveFrom, p.Reason, p.CreatedAt, p.CreatedByPrincipalID); err != nil {
 			return err
 		}
+		// A5: enqueue the real per-tenant invalidation signal for exactly the
+		// organizations this policy version can actually change the answer
+		// for — those with no live subscription whose most recent one has
+		// already ended at or before this policy's own effective_from. See
+		// migration 000024 for why ended_subscription_index (never
+		// `subscriptions` itself) is the safe read here.
+		if err := enqueueEntitlementInvalidations(ctx, tx, p.PolicyVersion, p.EffectiveFrom); err != nil {
+			return err
+		}
 		out = p
 		return s.emit(ctx, tx, "entitlement_policy.published", "entitlement_policy", "grace-policy", PlatformScopeID, claim.PrincipalID, p)
 	})
@@ -773,4 +782,140 @@ func (s *PgStore) GetEntitlementPolicy(ctx context.Context, now time.Time) (*dom
 		return err
 	})
 	return out, err
+}
+
+// ── Entitlement invalidation queue (A5) ──────────────────────────────────────
+//
+// PublishEntitlementPolicy enqueues one row per organization its new policy
+// version can actually change the answer for (migration 000024); a worker
+// shaped exactly like subscription_boundary_queue's ProcessNextBoundary
+// drains the queue and turns each row into the real per-tenant
+// entitlement_snapshot.changed event through the existing
+// recomputeEntitlementsBatchTx path — the same event CreateSnapshot,
+// RecomputeEntitlements and the boundary worker's own B2 remediation already
+// produce, not a new one-off event shape invented for this gap.
+
+// enqueueEntitlementInvalidations reads ended_subscription_index — never
+// `subscriptions` itself, which has no seller-plane bypass — for every
+// organization whose most recently ended subscription's ends_at is at or
+// before this policy version's own effective_from, and queues one
+// invalidation per organization. Called inside PublishEntitlementPolicy's own
+// transaction, so the enqueue has the same durability as the policy write
+// and the same idempotency guard (a replay never reaches this code: it
+// returns via claimIdempotency before the policy row, and so this call, is
+// ever reached a second time).
+func enqueueEntitlementInvalidations(ctx context.Context, tx pgx.Tx, policyVersion int, effectiveFrom time.Time) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO entitlement_invalidation_queue (organization_id, policy_version, due_at, next_attempt_at)
+		SELECT organization_id, $1, $2, $2
+		  FROM ended_subscription_index
+		 WHERE ends_at <= $2
+		ON CONFLICT (organization_id, policy_version) DO NOTHING`,
+		policyVersion, effectiveFrom)
+	return err
+}
+
+const (
+	entitlementInvalidationWorkerActor = "system:entitlement-invalidation-worker"
+	entitlementInvalidationMaxAttempts = 10
+)
+
+type entitlementInvalidationItem struct {
+	id            string
+	org           string
+	policyVersion int
+	attempts      int
+}
+
+// entitlementInvalidationBackoff doubles from one minute up to an hour, the
+// same shape as boundaryBackoff.
+func entitlementInvalidationBackoff(attempts int) time.Duration {
+	d := time.Minute << attempts
+	if d > time.Hour || d <= 0 {
+		return time.Hour
+	}
+	return d
+}
+
+// ProcessNextEntitlementInvalidation claims one due entitlement_invalidation_queue
+// row and processes it, all in one transaction: SKIP LOCKED lets any number
+// of workers run side by side without two ever taking the same item, the
+// same shape as ProcessNextBoundary. It reports whether an item was found; a
+// failure is recorded against the item with a backoff (and parked as FAILED
+// after entitlementInvalidationMaxAttempts) so one bad item never blocks the
+// queue behind it.
+func (s *PgStore) ProcessNextEntitlementInvalidation(ctx context.Context, now time.Time) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.commercial_plane', 'boundary_worker', true)"); err != nil {
+		return false, err
+	}
+	var it entitlementInvalidationItem
+	err = tx.QueryRow(ctx, `
+		SELECT invalidation_id::text, organization_id::text, policy_version, attempts
+		FROM entitlement_invalidation_queue
+		WHERE status = 'PENDING' AND next_attempt_at <= $1
+		ORDER BY next_attempt_at, invalidation_id
+		LIMIT 1 FOR UPDATE SKIP LOCKED`, now).Scan(&it.id, &it.org, &it.policyVersion, &it.attempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// declareOrgForSellerPlane's own mechanism: this organization is the only
+	// one this transaction now needs, and RLS throughout (subscriptions,
+	// commercial_restrictions, eventing_outbox) admits a boundary_worker-plane
+	// transaction that has also declared this tenant.
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", it.org); err != nil {
+		return false, err
+	}
+
+	// The decision is always computed fresh (never cached), so recomputing
+	// here is correct even if the organization's state moved on between
+	// enqueue and processing (e.g. it started a new subscription since) —
+	// recomputeEntitlementsBatchTx reloads the basis, restrictions and
+	// effective policy at `now` itself; this call's only job is to make that
+	// fresh decision durable and emit the real per-tenant signal.
+	_, perr := s.recomputeEntitlementsTx(ctx, tx, it.org, entitlementInvalidationWorkerActor, now)
+	if perr == nil {
+		_, perr = tx.Exec(ctx, `UPDATE entitlement_invalidation_queue SET status = 'DONE', processed_at = $2, outcome = $3
+			WHERE invalidation_id = $1::uuid`, it.id, now, "EVENT_PUBLISHED")
+	}
+	if perr == nil {
+		if perr = tx.Commit(ctx); perr == nil {
+			return true, nil
+		}
+	}
+	_ = tx.Rollback(ctx)
+	if rerr := s.recordEntitlementInvalidationFailure(ctx, it, perr, now); rerr != nil {
+		return true, fmt.Errorf("entitlement invalidation %s failed (%v) and the failure could not be recorded: %w", it.id, perr, rerr)
+	}
+	return true, fmt.Errorf("entitlement invalidation %s: %w", it.id, perr)
+}
+
+func (s *PgStore) recordEntitlementInvalidationFailure(ctx context.Context, it entitlementInvalidationItem, cause error, now time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.commercial_plane', 'boundary_worker', true)"); err != nil {
+		return err
+	}
+	attempts := it.attempts + 1
+	if attempts >= entitlementInvalidationMaxAttempts {
+		_, err = tx.Exec(ctx, `UPDATE entitlement_invalidation_queue SET attempts = $2, last_error = $3, status = 'FAILED',
+			processed_at = $4, outcome = 'FAILED' WHERE invalidation_id = $1::uuid`, it.id, attempts, cause.Error(), now)
+	} else {
+		_, err = tx.Exec(ctx, `UPDATE entitlement_invalidation_queue SET attempts = $2, last_error = $3, next_attempt_at = $4
+			WHERE invalidation_id = $1::uuid`, it.id, attempts, cause.Error(), now.Add(entitlementInvalidationBackoff(attempts)))
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

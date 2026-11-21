@@ -34,6 +34,17 @@ import (
 // name — this service's mTLS identity is infrastructure, not tenant data.
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
+// entitlementInvalidationProcessor adapts PgStore.ProcessNextEntitlementInvalidation
+// to boundary.Processor (which the package hardwires to the method name
+// ProcessNextBoundary), so the entitlement invalidation queue can reuse the
+// same ticker/batch/SKIP-LOCKED worker machinery as the subscription
+// boundary queue without duplicating it.
+type entitlementInvalidationProcessor struct{ s *store.PgStore }
+
+func (e entitlementInvalidationProcessor) ProcessNextBoundary(ctx context.Context, now time.Time) (bool, error) {
+	return e.s.ProcessNextEntitlementInvalidation(ctx, now)
+}
+
 func main() {
 	logger, err := telemetry.NewLogger("commercial-account-svc")
 	if err != nil {
@@ -141,6 +152,14 @@ func main() {
 	// and publishes events for versions as they take effect. Safe to run in
 	// every replica: items are claimed with FOR UPDATE SKIP LOCKED.
 	go boundary.NewWorker(pgStore, 30*time.Second, 200, logger).Start(relayCtx)
+
+	// Entitlement invalidation worker (A5, SPEC_DEVIATIONS.md): drains
+	// entitlement_invalidation_queue, the per-organization fan-out
+	// PublishEntitlementPolicy writes, and turns each row into the real
+	// per-tenant entitlement_snapshot.changed event. Reuses boundary.Worker's
+	// ticker/batch/SKIP-LOCKED shape through a one-method adapter, the same
+	// safe-in-every-replica posture as the boundary worker above.
+	go boundary.NewWorker(entitlementInvalidationProcessor{pgStore}, 30*time.Second, 200, logger).Start(relayCtx)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

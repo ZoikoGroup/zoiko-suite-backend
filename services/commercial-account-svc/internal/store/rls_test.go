@@ -70,6 +70,8 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS usage_adjustments, usage_event_records, usage_statements, meter_definitions CASCADE;
 		DROP FUNCTION IF EXISTS enforce_usage_event_correct_only(), enforce_usage_statement_lifecycle(),
 			enforce_meter_definition_retire_only() CASCADE;
+		DROP TABLE IF EXISTS entitlement_invalidation_queue, ended_subscription_index CASCADE;
+		DROP FUNCTION IF EXISTS index_subscription_ends_at() CASCADE;
 		DROP TABLE IF EXISTS entitlement_snapshots CASCADE;
 		DROP TABLE IF EXISTS commercial_restrictions, entitlement_policy_versions CASCADE;
 		DROP FUNCTION IF EXISTS enforce_restriction_lift_only(), reject_immutable_row() CASCADE;
