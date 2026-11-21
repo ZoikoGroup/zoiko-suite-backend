@@ -1272,7 +1272,7 @@ func (s *PgStore) GetTrialBalance(ctx context.Context, tenantID, snapshotID stri
 // ── ACC-01 Chart of Accounts ─────────────────────────────────────────────────
 
 const accountColumns = `account_id, tenant_id, account_code, account_name, account_type,
-	parent_account_id, is_control_account, direct_posting_restricted, status,
+	parent_account_id, is_control_account, direct_posting_restricted, is_intercompany_account, status,
 	created_at, created_by_principal_id, version`
 
 func scanAccount(row pgx.Row) (*domain.Account, error) {
@@ -1280,7 +1280,7 @@ func scanAccount(row pgx.Row) (*domain.Account, error) {
 	var accountType, status string
 	if err := row.Scan(
 		&a.AccountID, &a.TenantID, &a.AccountCode, &a.AccountName, &accountType,
-		&a.ParentAccountID, &a.IsControlAccount, &a.DirectPostingRestricted, &status,
+		&a.ParentAccountID, &a.IsControlAccount, &a.DirectPostingRestricted, &a.IsIntercompanyAccount, &status,
 		&a.CreatedAt, &a.CreatedByPrincipalID, &a.Version,
 	); err != nil {
 		return nil, err
@@ -1292,7 +1292,7 @@ func scanAccount(row pgx.Row) (*domain.Account, error) {
 
 const accountVersionColumns = `account_version_id, tenant_id, account_id, account_code,
 	version, account_name, account_type, parent_account_id, is_control_account,
-	direct_posting_restricted, status, effective_from, effective_to, change_kind,
+	direct_posting_restricted, is_intercompany_account, status, effective_from, effective_to, change_kind,
 	COALESCE(change_reason, ''), evidence_refs, created_at, created_by_principal_id,
 	COALESCE(source_policy_ref, '')`
 
@@ -1302,7 +1302,7 @@ func scanAccountVersion(row pgx.Row) (*domain.AccountVersion, error) {
 	if err := row.Scan(
 		&v.AccountVersionID, &v.TenantID, &v.AccountID, &v.AccountCode,
 		&v.Version, &v.AccountName, &accountType, &v.ParentAccountID, &v.IsControlAccount,
-		&v.DirectPostingRestricted, &v.Status, &v.EffectiveFrom, &v.EffectiveTo, &v.ChangeKind,
+		&v.DirectPostingRestricted, &v.IsIntercompanyAccount, &v.Status, &v.EffectiveFrom, &v.EffectiveTo, &v.ChangeKind,
 		&v.ChangeReason, &v.EvidenceRefs, &v.CreatedAt, &v.CreatedByPrincipalID,
 		&v.SourcePolicyRef,
 	); err != nil {
@@ -1320,13 +1320,13 @@ func insertAccountVersion(ctx context.Context, tx pgx.Tx, v *domain.AccountVersi
 		INSERT INTO account_versions (
 			account_version_id, tenant_id, account_id, account_code, version,
 			account_name, account_type, parent_account_id, is_control_account,
-			direct_posting_restricted, status, effective_from, effective_to,
+			direct_posting_restricted, is_intercompany_account, status, effective_from, effective_to,
 			change_kind, change_reason, evidence_refs, created_at, created_by_principal_id,
 			source_policy_ref
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 	`, v.AccountVersionID, v.TenantID, v.AccountID, v.AccountCode, v.Version,
 		v.AccountName, string(v.AccountType), v.ParentAccountID, v.IsControlAccount,
-		v.DirectPostingRestricted, v.Status, v.EffectiveFrom, v.EffectiveTo,
+		v.DirectPostingRestricted, v.IsIntercompanyAccount, v.Status, v.EffectiveFrom, v.EffectiveTo,
 		v.ChangeKind, nullableString(v.ChangeReason), v.EvidenceRefs, v.CreatedAt, v.CreatedByPrincipalID,
 		nullableString(v.SourcePolicyRef))
 	return mapPgError(err)
@@ -1359,6 +1359,7 @@ func accountVersionFromAccount(a *domain.Account, version int64, effectiveFrom t
 		ParentAccountID:         a.ParentAccountID,
 		IsControlAccount:        a.IsControlAccount,
 		DirectPostingRestricted: a.DirectPostingRestricted,
+		IsIntercompanyAccount:   a.IsIntercompanyAccount,
 		Status:                  a.Status,
 		EffectiveFrom:           effectiveFrom,
 		ChangeKind:              changeKind,
@@ -1394,11 +1395,11 @@ func (s *PgStore) CreateAccount(ctx context.Context, a *domain.Account) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO chart_of_accounts (
 				account_id, tenant_id, account_code, account_name, account_type,
-				parent_account_id, is_control_account, direct_posting_restricted, status,
+				parent_account_id, is_control_account, direct_posting_restricted, is_intercompany_account, status,
 				created_at, created_by_principal_id, version
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		`, a.AccountID, tenantID, a.AccountCode, a.AccountName, string(a.AccountType),
-			a.ParentAccountID, a.IsControlAccount, a.DirectPostingRestricted, a.Status,
+			a.ParentAccountID, a.IsControlAccount, a.DirectPostingRestricted, a.IsIntercompanyAccount, a.Status,
 			a.CreatedAt, a.CreatedByPrincipalID, a.Version)
 		if err != nil {
 			return mapPgError(err)
@@ -1682,6 +1683,7 @@ func (s *PgStore) ApproveAccountChange(ctx context.Context, tenantID, changeID, 
 			updated.ParentAccountID = change.Amendment.ParentAccountID
 			updated.IsControlAccount = change.Amendment.IsControlAccount
 			updated.DirectPostingRestricted = change.Amendment.DirectPostingRestricted
+			updated.IsIntercompanyAccount = change.Amendment.IsIntercompanyAccount
 			updated.Status = change.Amendment.Status
 		default:
 			return fmt.Errorf("account change %s has unknown change_kind %q", changeID, changeKind)
@@ -1698,10 +1700,10 @@ func (s *PgStore) ApproveAccountChange(ctx context.Context, tenantID, changeID, 
 		tag, err := tx.Exec(ctx, `
 			UPDATE chart_of_accounts
 			SET account_name = $1, account_type = $2, parent_account_id = $3,
-			    is_control_account = $4, direct_posting_restricted = $5, status = $6, version = $7
-			WHERE tenant_id = $8 AND account_code = $9 AND version = $10
+			    is_control_account = $4, direct_posting_restricted = $5, is_intercompany_account = $6, status = $7, version = $8
+			WHERE tenant_id = $9 AND account_code = $10 AND version = $11
 		`, updated.AccountName, string(updated.AccountType), updated.ParentAccountID,
-			updated.IsControlAccount, updated.DirectPostingRestricted, updated.Status,
+			updated.IsControlAccount, updated.DirectPostingRestricted, updated.IsIntercompanyAccount, updated.Status,
 			updated.Version, tenantID, change.AccountCode, cur.Version)
 		if err != nil {
 			return mapPgError(err)
@@ -1829,9 +1831,17 @@ func (s *PgStore) AmendAccountVersion(
 		updated.ParentAccountID = a.ParentAccountID
 		updated.IsControlAccount = a.IsControlAccount
 		updated.DirectPostingRestricted = a.DirectPostingRestricted
+		updated.IsIntercompanyAccount = a.IsIntercompanyAccount
 		updated.Status = a.Status
 
-		if cur.IsControlAccount || updated.IsControlAccount {
+		// Material-change gate (SPEC_DEVIATIONS A4/B16 of this service,
+		// extended for intercompany-accounting-svc's own A5): a control
+		// account on either side of the change already requires the second
+		// principal. IsIntercompanyAccount changing — on either side — is
+		// the same kind of high-risk reclassification (it would silently
+		// move a line in or out of intercompany-accounting-svc's
+		// line-level match) and gets the same gate, not a parallel one.
+		if cur.IsControlAccount || updated.IsControlAccount || cur.IsIntercompanyAccount != updated.IsIntercompanyAccount {
 			if strings.TrimSpace(reason) == "" {
 				return domain.ErrAccountChangeReasonRequired
 			}
@@ -1874,11 +1884,11 @@ func (s *PgStore) AmendAccountVersion(
 		tag, err := tx.Exec(ctx, `
 			UPDATE chart_of_accounts
 			SET account_name = $1, account_type = $2, parent_account_id = $3,
-			    is_control_account = $4, direct_posting_restricted = $5,
-			    status = $6, version = $7
-			WHERE tenant_id = $8 AND account_code = $9 AND version = $10
+			    is_control_account = $4, direct_posting_restricted = $5, is_intercompany_account = $6,
+			    status = $7, version = $8
+			WHERE tenant_id = $9 AND account_code = $10 AND version = $11
 		`, updated.AccountName, string(updated.AccountType), updated.ParentAccountID,
-			updated.IsControlAccount, updated.DirectPostingRestricted, updated.Status,
+			updated.IsControlAccount, updated.DirectPostingRestricted, updated.IsIntercompanyAccount, updated.Status,
 			updated.Version, tenantID, accountCode, cur.Version)
 		if err != nil {
 			return mapPgError(err)
@@ -2946,7 +2956,13 @@ func (s *PgStore) ReparentAccount(
 			return domain.ErrAccountEffectiveDate
 		}
 
-		if cur.IsControlAccount || parentIsControl {
+		// Same gate as AmendAccountVersion, extended the same way: reparenting
+		// an account already classified IsIntercompanyAccount is a material
+		// hierarchy change for the same reason a control account's reparent
+		// is — it changes where that account sits without touching the flag
+		// itself, so it belongs here, not folded into "flag is changing"
+		// (reparent never changes the flag).
+		if cur.IsControlAccount || parentIsControl || cur.IsIntercompanyAccount {
 			if strings.TrimSpace(reason) == "" {
 				return domain.ErrAccountChangeReasonRequired
 			}

@@ -795,7 +795,39 @@ func (h *Handler) GetJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "journal_not_found", "")
 		return
 	}
+	if !h.resolveIntercompanyLines(w, r, header.TenantID, lines) {
+		return
+	}
 	writeJSON(w, http.StatusOK, domain.JournalWithLines{JournalHeader: *header, Lines: lines})
+}
+
+// resolveIntercompanyLines sets IsIntercompanyAccount on each line from the
+// current chart of accounts (ACC-01's IsIntercompanyAccount) — ACC-11 §14's
+// "Server-resolved: intercompany accounts", read by intercompany-accounting-svc's
+// MatchEntry off this same GetJournal response (SPEC_DEVIATIONS A5) rather
+// than a separate endpoint this service does not otherwise expose. It reuses
+// the same GetAccountByCode call and the same "unregistered code passes
+// through" posture checkAccountRestrictions already uses: an account code
+// the chart has never heard of resolves to false, not an error. Writes its
+// own HTTP response and returns false only on a genuine store outage.
+func (h *Handler) resolveIntercompanyLines(w http.ResponseWriter, r *http.Request, tenantID string, lines []domain.JournalLine) bool {
+	cache := map[string]bool{}
+	for i := range lines {
+		code := lines[i].AccountCode
+		isIC, ok := cache[code]
+		if !ok {
+			acct, err := h.store.GetAccountByCode(r.Context(), tenantID, code)
+			if err != nil && !errors.Is(err, domain.ErrAccountNotFound) {
+				h.log.Error("GetJournal: intercompany-account resolution unavailable", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+				return false
+			}
+			isIC = acct != nil && acct.IsIntercompanyAccount
+			cache[code] = isIC
+		}
+		lines[i].IsIntercompanyAccount = isIC
+	}
+	return true
 }
 
 // ── GET /v1/journals ──────────────────────────────────────────────────────────
@@ -984,6 +1016,7 @@ func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
 		ParentAccountID:         req.ParentAccountID,
 		IsControlAccount:        req.IsControlAccount,
 		DirectPostingRestricted: req.DirectPostingRestricted,
+		IsIntercompanyAccount:   req.IsIntercompanyAccount,
 		Status:                  "ACTIVE",
 		CreatedAt:               time.Now().UTC(),
 		CreatedByPrincipalID:    principalID,
@@ -1072,6 +1105,9 @@ func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.DirectPostingRestricted != nil {
 		updated.DirectPostingRestricted = *req.DirectPostingRestricted
+	}
+	if req.IsIntercompanyAccount != nil {
+		updated.IsIntercompanyAccount = *req.IsIntercompanyAccount
 	}
 
 	effectiveFrom := time.Now().UTC()

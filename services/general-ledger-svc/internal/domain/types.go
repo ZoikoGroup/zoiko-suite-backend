@@ -308,6 +308,16 @@ type JournalLine struct {
 	TaxCode            *string `json:"tax_code,omitempty"`
 	TaxLogicSnapshotID *string `json:"tax_logic_snapshot_id,omitempty"`
 
+	// IsIntercompanyAccount is resolved and set only on GetJournal's
+	// response (handler.GetJournal), never read back from journal_lines
+	// itself: it is a derived fact about the line's AccountCode in the
+	// current chart of accounts (ACC-01's IsIntercompanyAccount), not a
+	// property stored with the line. Every other reader of JournalLine
+	// (CreateJournal, reversal construction, etc.) leaves this at its zero
+	// value and is unaffected. Intercompany-accounting-svc's MatchEntry
+	// (SPEC_DEVIATIONS A5) is the consumer this exists for.
+	IsIntercompanyAccount bool `json:"is_intercompany_account,omitempty"`
+
 	// Dimensions is ACC-03's "dimensions" input — cost centre, project,
 	// department, product, or whatever analysis axes the tenant posts against.
 	//
@@ -461,6 +471,15 @@ type Account struct {
 	IsControlAccount        bool `json:"is_control_account"`
 	DirectPostingRestricted bool `json:"direct_posting_restricted"`
 
+	// IsIntercompanyAccount is ACC-11's "Server-resolved: intercompany
+	// accounts" designation (SPEC_DEVIATIONS A5 of intercompany-accounting-svc):
+	// a chart-of-accounts classification, independent of IsControlAccount,
+	// that marks an account as one whose journal lines represent an
+	// intercompany position. It mirrors IsControlAccount's exact shape —
+	// same field kind, same maker-checker protection on change (see
+	// AmendAccountVersion/ReparentAccount) — rather than a new mechanism.
+	IsIntercompanyAccount bool `json:"is_intercompany_account"`
+
 	Status               string    `json:"status"` // ACTIVE | INACTIVE
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
@@ -478,6 +497,7 @@ type CreateAccountRequest struct {
 	ParentAccountID         *string     `json:"parent_account_id,omitempty"`
 	IsControlAccount        bool        `json:"is_control_account,omitempty"`
 	DirectPostingRestricted bool        `json:"direct_posting_restricted,omitempty"`
+	IsIntercompanyAccount   bool        `json:"is_intercompany_account,omitempty"`
 }
 
 // AccountVersion is one immutable row of ACC-01's AccountHierarchyVersion
@@ -496,6 +516,7 @@ type AccountVersion struct {
 	ParentAccountID         *string     `json:"parent_account_id,omitempty"`
 	IsControlAccount        bool        `json:"is_control_account"`
 	DirectPostingRestricted bool        `json:"direct_posting_restricted"`
+	IsIntercompanyAccount   bool        `json:"is_intercompany_account"`
 	Status                  string      `json:"status"`
 	EffectiveFrom           time.Time   `json:"effective_from"`
 	EffectiveTo             *time.Time  `json:"effective_to,omitempty"`
@@ -571,6 +592,7 @@ type AmendAccountVersionRequest struct {
 	ParentAccountIDSet      bool           `json:"-"`
 	IsControlAccount        *bool          `json:"is_control_account,omitempty"`
 	DirectPostingRestricted *bool          `json:"direct_posting_restricted,omitempty"`
+	IsIntercompanyAccount   *bool          `json:"is_intercompany_account,omitempty"`
 	Reason                  string         `json:"reason,omitempty"`
 	EvidenceRefs            []string       `json:"evidence_refs,omitempty"`
 	SourcePolicyRef         string         `json:"source_policy_ref,omitempty"`
