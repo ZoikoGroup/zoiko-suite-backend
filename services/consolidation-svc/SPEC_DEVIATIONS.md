@@ -23,60 +23,50 @@ post → reverse, with maker-checker, a status guard on every transition, and
 reversal through ACC-04). ACC-13 is one synchronous call that sums live GL
 journals per account, subtracts the intercompany lines of in-scope matched
 pairs (A2/B9) and writes signed snapshots; none of the run's governance (input lock, translation,
-ownership, review, certification, supersession) exists. Most importantly, the
-adjustment posting path writes into the group entity's own ledger book (A1).
+ownership, review, certification, supersession) exists.
 Roughly 55% of ACC-12 and 20% of ACC-13; about 35% overall.
 
-**Book-separation boundary: VIOLATED in code.** `PostConsolidationAdjustment`
-posts to general-ledger-svc as an ordinary entity journal — see A1. Today the
-call fails before anything is written, because general-ledger-svc rejects the
-request body (400), so nothing reaches a ledger through this path at present.
-That is an accident of contract drift, not a control. Between 2026-09-07
-(`b5a2b984`, posting path added) and 2026-09-30 (`ddfa4015`, GL started
-requiring `transaction_currency`/`document_date`) the body was accepted, so
-any environment that posted an adjustment in that window may hold
-consolidation entries in a group entity's statutory ledger.
+**Book-separation boundary: CLOSED in code (A1; see B12).** `PostConsolidationAdjustment` no
+longer posts to general-ledger-svc as an ordinary entity journal: `clients.PostConsolidationAdjustmentJournal`
+(`internal/clients/clients.go`) now calls general-ledger-svc's dedicated, book-separated consolidation-adjustments
+kernel subsystem — `GET /v1/consolidation-groups?parent_entity_id=...`, `POST
+/v1/consolidation-groups/{id}/adjustments`, `POST /v1/consolidation-adjustments/{id}/approve` — which requires a
+real `group_book_id` (`consolidation_groups.group_book_id`, `internal/kernel/consol_service.go`) and applies the
+adjustment only inside that group's own accounting book; it is never written into `journal_headers` as the group
+entity's statutory journal. Fixed by `05c75479` ("fix(consolidation): post adjustments to the group book, never
+an entity ledger", 2026-10-26). See B12 below for the full account of what changed.
+
+**Historical-only: between 2026-09-07 (`b5a2b984`, the posting path added) and 2026-09-30 (`ddfa4015`, GL started
+requiring `transaction_currency`/`document_date`), the OLD, now-replaced posting path was live and its request body
+was accepted**, so any environment that posted a consolidation adjustment in that window may hold a consolidation
+entry sitting in a group entity's statutory ledger from before the fix. This is not a current-code risk — the code
+path that could do this no longer exists — but it motivates a one-time check of real environments' data. See
+`cmd/consol-adjustment-contamination-scan` in general-ledger-svc for a read-only diagnostic that finds candidate
+journals matching that old path's shape (also noted as "Still open" under B12).
 
 ## A. Not implemented / weaker than the spec
 
 - **A1. Consolidation adjustments post into the group entity's statutory
-  ledger (authority-boundary violation).** Code path:
+  ledger (authority-boundary violation). — Closed (B12).** This entry
+  described the code as it stood at this file's first survey (2026-10-17):
   `handler.PostConsolidationAdjustment` → `clients.PostConsolidationAdjustmentJournal`
-  → `POST {GL}/v1/postings/events` with `legal_entity_id =
-  group_legal_entity_id` and **no book identifier**.
-  general-ledger-svc's `PostAccountingEventRequest` has no `book_id` field;
-  the journal is created with `book_id` NULL and its ledger entries with
-  `book_id = ''` — the same scope as every other journal of that legal
-  entity. The "group legal entity" is a real legal entity (typically the
-  parent company), so elimination and top-side lines land in its statutory
-  general ledger, trial balance and close. The store-level guard
-  `GroupEntityHasRun`, named for the negative path "Adjustment targets
-  statutory book", does not separate books: it only checks that the entity was
-  once named as a run's group, and a run row is written before any input is
-  fetched, so starting a run (even one that fails) for any entity the caller
-  is authorized on makes that entity a valid target. Knock-on effect:
-  `FetchTrialBalance` reads every FINALIZED journal of an entity with no book
-  filter, so when the parent is also one of the run's children (the normal
-  case) a posted adjustment would come back as entity input and be counted
-  twice.
-
-  *Why it was not fixed here:* the fix needs a decision and work outside this
-  service. There is no consolidation book on the platform:
-  general-ledger-svc's envelope keeps `book_id` NotRequired because "REF-06
-  Accounting Book / Ledger Basis" does not exist, so no book can be issued or
-  validated. Options for whoever scopes it: (a) a governed consolidation book
-  per group in ACC-04/05 (add `book_id` to `PostAccountingEventRequest`,
-  require it for a consolidation source, exclude consolidation books from
-  entity TB, close and `GET /v1/journals` by default); or (b) keep
-  consolidation entries entirely inside this service as its own append-only
-  consolidation journal, never posted to general-ledger-svc, applied by
-  ApplyAdjustments (A8). Either way, until then `PostConsolidationAdjustment`
-  should be disabled (fail closed) rather than repaired. **Do not "fix" the
-  current 400 by adding `transaction_currency`/`document_date` to the request:
-  that would switch the violation on.** Also needed: a test that an adjustment
-  can never target a book that is an entity's statutory book (§27 test 23),
-  and a check of every environment for journals with `source_event_id` equal
-  to a `consolidation_adjustment_id` (the 2026-09 window above).
+  → `POST {GL}/v1/postings/events` with `legal_entity_id = group_legal_entity_id`
+  and no book identifier, so elimination and top-side lines landed in the
+  group entity's own statutory general ledger, trial balance and close — the
+  store-level guard `GroupEntityHasRun` did not separate books, and
+  `FetchTrialBalance`'s knock-on double-count applied. That code path no
+  longer exists. `05c75479` ("fix(consolidation): post adjustments to the
+  group book, never an entity ledger", 2026-10-26) replaced it with the
+  group-book subsystem described in B12 below: a real `group_book_id`
+  (`consolidation_groups.group_book_id`) now exists, general-ledger-svc's
+  kernel applies every approved group adjustment only inside that book, and
+  nothing is written into an entity's statutory journal through this path.
+  The only thing this closure does not do is retroactively find or move
+  entries a real environment may already have posted into a statutory ledger
+  during the historical exposure window named at the top of this file
+  (2026-09-07 to 2026-09-30) — see B12's "Still open" note and
+  general-ledger-svc's `cmd/consol-adjustment-contamination-scan`, a
+  read-only diagnostic built for exactly that one-time check.
 - **A2. Elimination ignores the run's scope. — Closed (B9).** `StartRun`
   used to fetch every eliminable (MATCHED or CLOSED, B6) intercompany entry
   in the **tenant** and subtract every line of both journals from the group
@@ -554,3 +544,8 @@ consolidation entries in a group entity's statutory ledger.
   - *Still open.* Entries posted between 2026-09-07 and 2026-09-30 into a group entity's statutory ledger (see the top of this file)
     are not found or moved by this change. The group adjustment is approved by forwarding the recorded approver's principal id on an
     internal call, as every other call here forwards its caller.
+  - *One-time data check.* general-ledger-svc's `cmd/consol-adjustment-contamination-scan` (read-only; see its doc comment and
+    `internal/store/consol_adjustment_contamination_scan.go`) finds candidate journals matching the shape the old `/v1/postings/events`
+    path would have produced in a real environment: no `accounting_book_id`, a caller-declared `source_event_id`, on a legal entity
+    that is a consolidation group's reporting entity, inside the 2026-09-07..2026-09-30 window, with no matching
+    `consolidation_adjustments.source_ref`. It reports candidates for manual review, not a final verdict, and writes nothing.
