@@ -90,6 +90,14 @@ func (s *usageStub) GetLateEvents(ctx context.Context, sub string) ([]domain.Usa
 	s.rec(ctx, "GetLateEvents")
 	return nil, s.err
 }
+func (s *usageStub) GetPendingLateAdjustments(ctx context.Context, sub string) ([]domain.PendingLateAdjustment, error) {
+	s.rec(ctx, "GetPendingLateAdjustments")
+	return nil, s.err
+}
+func (s *usageStub) ProcessNextPendingLateAdjustment(ctx context.Context, now time.Time) (bool, error) {
+	s.rec(ctx, "ProcessNextPendingLateAdjustment")
+	return false, s.err
+}
 func (s *usageStub) GetDedupStatus(ctx context.Context, meterKey, id string) (*domain.UsageEventRecord, error) {
 	s.rec(ctx, "GetDedupStatus")
 	return s.event, s.dedupErr

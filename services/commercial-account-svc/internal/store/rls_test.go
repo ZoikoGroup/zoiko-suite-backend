@@ -67,6 +67,8 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS invoice_lines, invoice_candidate_lines, platform_commercial_invoices,
 			invoice_candidates, invoice_number_counters, billing_accounts CASCADE;
 		DROP FUNCTION IF EXISTS enforce_invoice_candidate_lifecycle() CASCADE;
+		DROP TABLE IF EXISTS pending_late_adjustments CASCADE;
+		DROP FUNCTION IF EXISTS enforce_pending_late_adjustment_lifecycle() CASCADE;
 		DROP TABLE IF EXISTS usage_adjustments, usage_event_records, usage_statements, meter_definitions CASCADE;
 		DROP FUNCTION IF EXISTS enforce_usage_event_correct_only(), enforce_usage_statement_lifecycle(),
 			enforce_meter_definition_retire_only() CASCADE;

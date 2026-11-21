@@ -243,6 +243,46 @@ func Aggregate(m MeterDefinition, events []AcceptedEvent) string {
 	return "0"
 }
 
+// PendingLateAdjustmentStatus is pending_late_adjustments.status (migration
+// 000025, A8): a late event whose target statement did not exist yet stays
+// PENDING, retried by the worker with no terminal failure or expiry, until
+// a valid target exists and it is ATTACHED.
+type PendingLateAdjustmentStatus string
+
+const (
+	PendingLateAdjustmentPending  PendingLateAdjustmentStatus = "PENDING"
+	PendingLateAdjustmentAttached PendingLateAdjustmentStatus = "ATTACHED"
+)
+
+// PendingLateAdjustment is a late usage fact registerLateEvent could not
+// immediately carry into a target statement (A8's two real gaps: the origin
+// term's own statement is still FROZEN with nothing later open yet, or the
+// subscription has no term covering "now"). It records everything the
+// eventual usage_adjustments row needs, so the fact survives until a worker
+// finds a valid target and attaches it — never silently dropped by the
+// transaction rollback the pre-A8 behavior caused.
+type PendingLateAdjustment struct {
+	PendingID            string                      `json:"pending_id"`
+	OrganizationID       string                      `json:"organization_id"`
+	SubscriptionID       string                      `json:"subscription_id"`
+	MeterKey             string                      `json:"meter_key"`
+	MeterVersion         int                         `json:"meter_version"`
+	OriginStatementID    string                      `json:"origin_statement_id"`
+	OriginTermNo         int                         `json:"origin_term_no"`
+	SourceUsageEventID   string                      `json:"source_usage_event_id"`
+	Quantity             string                      `json:"quantity"`
+	OccurredAt           time.Time                   `json:"occurred_at"`
+	Dimensions           map[string]string           `json:"dimensions"`
+	Reason               string                      `json:"reason"`
+	CreatedAt            time.Time                   `json:"created_at"`
+	Attempts             int                         `json:"attempts"`
+	LastError            *string                     `json:"last_error,omitempty"`
+	NextAttemptAt        time.Time                   `json:"next_attempt_at"`
+	Status               PendingLateAdjustmentStatus `json:"status"`
+	AttachedAt           *time.Time                  `json:"attached_at,omitempty"`
+	AttachedAdjustmentID *string                     `json:"attached_adjustment_id,omitempty"`
+}
+
 var (
 	ErrMeterDefinitionNotFound     = errorString("meter definition not found")
 	ErrMeterDefinitionExists       = errorString("this meter key already has a version at that number")

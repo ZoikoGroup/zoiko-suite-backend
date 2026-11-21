@@ -448,7 +448,7 @@ an event in a frozen or certified statement. The result is that the canonical
 requires once the window has closed. This was left in place because the
 existing tests explicitly assert the rejection; it remains an open A-item.
 
-### A8. COM-04 late events cannot always create an adjustment
+### A8. COM-04 late events cannot always create an adjustment — closed (B18)
 
 The automatic late path in `registerLateEvent`:
 
@@ -476,6 +476,25 @@ adjustment, not mutation.” The service currently needs a later open term to
 represent the adjustment. A durable late-event inbox with a pending
 adjustment that can be attached when a target exists would be the structural
 fix.
+
+**Closed.** Migration 000025 adds `pending_late_adjustments`, shaped like this
+service's other durable queues (`subscription_boundary_queue`,
+`entitlement_invalidation_queue`): when neither case above can find a target
+in the same transaction, `registerLateEvent` now persists the late event's
+full data there (instead of returning an error that rolled back the whole
+transaction, including the late `usage_event_records` row itself) and
+commits normally. `ProcessNextPendingLateAdjustment`
+(`internal/store/com04_pending_late_adjustments.go`), wired into
+`cmd/server/main.go` with the same ticker/batch/SKIP-LOCKED shape as the
+other two queues, re-resolves a target at its OWN "now" on every pass — not
+the original `observedAt` — and attaches the adjustment the moment one
+exists, through the exact same creation logic (`createLateAdjustment`)
+`registerLateEvent` already used for the case that worked immediately. See
+B18 for the real re-attachment moment this uncovered and the no-expiry
+decision. Tests:
+`internal/store/com04_pending_late_adjustments_test.go` —
+`TestUsage_PendingLateAdjustment_SameTermFrozen_AttachesOnceANewTermOpens`
+and `TestUsage_PendingLateAdjustment_PostFinalTerm_StaysPendingIndefinitely`.
 
 ### A9. COM-04 `ReopenWindow` does not carry adjustments or counts
 
@@ -771,3 +790,27 @@ review of every restriction consumer.
     - Three deliberate breakages were each caught: the pilot tenant
       reverted, the seller-plane clause removed, and the statement
       organization dropped.
+- **B18. The pending-late-adjustment queue has no terminal/expiry state, and
+  re-attachment re-resolves at the worker's own "now".** Changed in this
+  pass (A8). Two decisions a reviewer could reverse:
+  - *No expiry.* §4.4/§9 negative path #18 say only "create prospective
+    adjustment"; nothing says a late correction ever expires. A subscription
+    that has permanently ended (no further term will ever open) therefore
+    leaves its pending item PENDING forever rather than FAILED/discarded —
+    the literal reading, chosen over inventing an expiry the spec does not
+    state. `attempts`/`last_error`/`next_attempt_at` still advance on every
+    no-target drain, so the retry history is real evidence, not a silent
+    no-op.
+  - *Re-attachment moment.* The structural fix note in A8 (and the task that
+    implemented it) first assumed certifying the FROZEN origin statement
+    would be the trigger. It is not: certifying the origin changes nothing
+    about whether a window LATER than it is open. The real trigger is a
+    later term opening — `resolveTerm`/`findOrCreateOpenStatement` are
+    re-run at the worker's `now` (its own call time) on every pass, not the
+    original `observedAt`, so a renewal that happens after the item was
+    queued is picked up on the very next drain.
+  - *Manual check:*
+    `internal/store/com04_pending_late_adjustments_test.go` proves both: the
+    same-term case stays PENDING across a certify-only step and only attaches
+    once a renewal opens term2; the post-final-term case stays PENDING across
+    repeated drains with no renewal at all.

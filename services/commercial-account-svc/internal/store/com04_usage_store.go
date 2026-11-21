@@ -36,6 +36,14 @@ type UsageStore interface {
 	ExplainAggregation(ctx context.Context, statementID string) ([]domain.UsageEventRecord, error)
 	GetLateEvents(ctx context.Context, subscriptionID string) ([]domain.UsageEventRecord, error)
 	GetDedupStatus(ctx context.Context, meterKey, usageEventID string) (*domain.UsageEventRecord, error)
+
+	// GetPendingLateAdjustments is A8's durable-inbox evidence read (migration
+	// 000025): every late event registerLateEvent could not immediately
+	// attach to a target statement, pending or already attached.
+	GetPendingLateAdjustments(ctx context.Context, subscriptionID string) ([]domain.PendingLateAdjustment, error)
+	// ProcessNextPendingLateAdjustment drains that queue one item at a time;
+	// see com04_pending_late_adjustments.go.
+	ProcessNextPendingLateAdjustment(ctx context.Context, now time.Time) (bool, error)
 }
 
 var _ UsageStore = (*PgStore)(nil)
@@ -436,6 +444,13 @@ func bumpStatement(ctx context.Context, tx pgx.Tx, statementID *string, quantity
 // open window for the same subscription+meter, or into a freshly opened one
 // resolved from the subscription's term at the caller's now (observedAt) if
 // none is open yet.
+//
+// A8 (SPEC_DEVIATIONS.md): when no target exists yet -- the origin term's own
+// statement is FROZEN with nothing later open, or the subscription has no
+// term covering observedAt at all -- this no longer fails the transaction
+// and loses the late event. It durably queues the adjustment intent in
+// pending_late_adjustments instead, and a worker attaches it once a target
+// exists (ProcessNextPendingLateAdjustment, below).
 func (s *PgStore) registerLateEvent(ctx context.Context, tx pgx.Tx, organizationID, subscriptionID string, originTermNo int,
 	m domain.MeterDefinition, usageEventID string, in domain.EventInput, dimJSON []byte, observedAt time.Time, sourceService, reasonPrefix string) (*domain.UsageEventRecord, error) {
 	origin, err := scanStatement(tx.QueryRow(ctx, `SELECT `+usageStatementColumns+` FROM usage_statements
@@ -457,24 +472,76 @@ func (s *PgStore) registerLateEvent(ctx context.Context, tx pgx.Tx, organization
 
 	nowTermNo, terr := resolveTerm(ctx, tx, subscriptionID, observedAt)
 	if terr != nil {
-		return e, fmt.Errorf("%w: %v", domain.ErrNoOpenTermForCorrection, terr)
+		// A8 post-final-term case: no term covers observedAt at all (the
+		// subscription has ended, or has not yet started a next term). There
+		// is nowhere to even look for a target yet; queue the intent rather
+		// than losing the event the transaction above just recorded.
+		if qerr := enqueuePendingLateAdjustment(ctx, tx, organizationID, subscriptionID, m, origin.StatementID,
+			originTermNo, usageEventID, in, dimJSON, observedAt, reasonPrefix); qerr != nil {
+			return e, qerr
+		}
+		return e, nil
 	}
 	target, err := findOrCreateOpenStatement(ctx, tx, subscriptionID, nowTermNo, m, observedAt)
 	if err != nil {
+		if errors.Is(err, domain.ErrStatementInvalidState) {
+			// A8 same-term-frozen case: the window "now" resolves to is
+			// itself not OPEN (typically: the origin statement, FROZEN but
+			// not yet certified, is also the current window, and nothing
+			// later is open yet). Same durable queue as above.
+			if qerr := enqueuePendingLateAdjustment(ctx, tx, organizationID, subscriptionID, m, origin.StatementID,
+				originTermNo, usageEventID, in, dimJSON, observedAt, reasonPrefix); qerr != nil {
+				return e, qerr
+			}
+			return e, nil
+		}
 		return e, err
 	}
+	_, aerr := s.createLateAdjustment(ctx, tx, organizationID, origin.StatementID, target.StatementID, m.MeterKey, usageEventID, in, dimJSON, observedAt, reasonPrefix)
+	return e, aerr
+}
+
+// createLateAdjustment is the common tail of registerLateEvent's immediate
+// path and ProcessNextPendingLateAdjustment's deferred path: insert the
+// usage_adjustments row, bump the target statement's running counters and
+// emit the same usage.late_adjustment_created event either way, so a reader
+// cannot tell from the event alone whether the adjustment attached
+// immediately or only once a worker found a target.
+func (s *PgStore) createLateAdjustment(ctx context.Context, tx pgx.Tx, organizationID, originStatementID, targetStatementID, meterKey, usageEventID string,
+	in domain.EventInput, dimJSON []byte, occurredAt time.Time, reason string) (string, error) {
 	adjID := domain.NewCommercialID(domain.PrefixUsageAdjustment)
 	if _, err := tx.Exec(ctx, `INSERT INTO usage_adjustments (adjustment_id, origin_statement_id, target_statement_id,
 		meter_key, source_usage_event_id, quantity, occurred_at, dimensions, reason, created_at, created_by_principal_id)
 		VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, $9, $10, $11)`,
-		adjID, origin.StatementID, target.StatementID, m.MeterKey, usageEventID, in.Quantity,
-		in.OccurredAt, dimJSON, reasonPrefix, observedAt, "system:usage-ingest"); err != nil {
-		return e, err
+		adjID, originStatementID, targetStatementID, meterKey, usageEventID, in.Quantity,
+		in.OccurredAt, dimJSON, reason, occurredAt, "system:usage-ingest"); err != nil {
+		return "", err
 	}
-	if err := bumpStatement(ctx, tx, &target.StatementID, in.Quantity, observedAt, true); err != nil {
-		return e, err
+	if err := bumpStatement(ctx, tx, &targetStatementID, in.Quantity, occurredAt, true); err != nil {
+		return "", err
 	}
-	return e, s.emit(ctx, tx, "usage.late_adjustment_created", "usage_event", m.MeterKey+"/"+usageEventID, organizationID, "", map[string]any{"adjustment_id": adjID, "origin_statement_id": origin.StatementID, "target_statement_id": target.StatementID})
+	return adjID, s.emit(ctx, tx, "usage.late_adjustment_created", "usage_event", meterKey+"/"+usageEventID, organizationID, "",
+		map[string]any{"adjustment_id": adjID, "origin_statement_id": originStatementID, "target_statement_id": targetStatementID})
+}
+
+// enqueuePendingLateAdjustment durably records a late event's adjustment
+// intent when no valid target statement exists yet (A8). It records
+// everything the eventual usage_adjustments row needs (migration 000025).
+// ON CONFLICT DO NOTHING: usage_event_records' own (meter_key,
+// usage_event_id) primary key already refuses a literal replay of the same
+// late event before this point is ever reached again, and
+// pending_late_adjustments' own unique constraint is a second, structural
+// guarantee that a replay never queues a second pending row for it.
+func enqueuePendingLateAdjustment(ctx context.Context, tx pgx.Tx, organizationID, subscriptionID string, m domain.MeterDefinition,
+	originStatementID string, originTermNo int, usageEventID string, in domain.EventInput, dimJSON []byte, now time.Time, reason string) error {
+	_, err := tx.Exec(ctx, `INSERT INTO pending_late_adjustments (organization_id, subscription_id, meter_key,
+		meter_version, origin_statement_id, origin_term_no, source_usage_event_id, quantity, occurred_at, dimensions,
+		reason, created_at, next_attempt_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9, $10, $11, $12, $12)
+		ON CONFLICT (meter_key, source_usage_event_id) DO NOTHING`,
+		organizationID, subscriptionID, m.MeterKey, m.MeterVersion, originStatementID, originTermNo, usageEventID,
+		in.Quantity, in.OccurredAt, dimJSON, reason, now)
+	return err
 }
 
 const usageAdjustmentColumns = `adjustment_id, origin_statement_id, target_statement_id, meter_key, source_usage_event_id,
