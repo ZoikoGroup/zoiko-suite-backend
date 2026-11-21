@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -179,17 +180,55 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 	return fallback
 }
 
+// bankAccountColumns is every bank-account read's projection. The last
+// column is the account's CURRENT row in bank_account_identifier_tokens
+// (migration 000015) — the real vault token, or '' when the account has
+// none (domain.BankAccount.Tokenized). It is a correlated subquery on the
+// unaliased table name, the same idiom banking-connector-svc's bnk02Columns
+// uses, so the same projection works in SELECT ... FROM bank_accounts and
+// in INSERT/UPDATE bank_accounts ... RETURNING alike.
 const bankAccountColumns = `
 	bank_account_id, tenant_id, legal_entity_id, account_name,
 	masked_account_number, bank_identifier, currency_code, account_status,
 	branch_ref, country, account_type, requested_operational_use, token_version,
-	created_by_principal_id, suspend_reason, close_reason, created_at, updated_at`
+	created_by_principal_id, suspend_reason, close_reason, created_at, updated_at,
+	COALESCE((SELECT t.account_number_token FROM bank_account_identifier_tokens t
+		WHERE t.bank_account_id = bank_accounts.bank_account_id AND t.superseded_by IS NULL), '')`
 
 func scanBankAccount(row pgx.Row, acct *domain.BankAccount) error {
 	return row.Scan(&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
 		&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
 		&acct.BranchRef, &acct.Country, &acct.AccountType, &acct.RequestedOperationalUse, &acct.TokenVersion,
-		&acct.CreatedByPrincipalID, &acct.SuspendReason, &acct.CloseReason, &acct.CreatedAt, &acct.UpdatedAt)
+		&acct.CreatedByPrincipalID, &acct.SuspendReason, &acct.CloseReason, &acct.CreatedAt, &acct.UpdatedAt,
+		&acct.AccountNumberToken)
+}
+
+// insertIdentifierToken writes acct's CURRENT token row (migration 000015)
+// in tx, and supersedes whatever row previously stood for this account (a
+// no-op UPDATE when there was none) — the same insert-then-supersede intent
+// recordAccountHistory already uses for bank_account_history, but SUPERSEDE
+// FIRST here: idx_bank_account_identifier_tokens_current is a unique partial
+// index on (bank_account_id) WHERE superseded_by IS NULL, so inserting the
+// new current row before clearing the old one's "current" status would
+// violate it. The new token_id is generated client-side so the UPDATE can
+// reference it before the row introducing it exists. source is WRITE for a
+// brand-new account tokenized at RegisterBankAccount, ROTATION for
+// RotateAccountIdentifierToken.
+func insertIdentifierToken(ctx context.Context, tx pgx.Tx, acct *domain.BankAccount, source string) error {
+	newTokenID := uuid.New().String()
+	if _, err := tx.Exec(ctx, `
+		UPDATE bank_account_identifier_tokens SET superseded_by = $1
+		WHERE bank_account_id = $2 AND superseded_by IS NULL`,
+		newTokenID, acct.BankAccountID); err != nil {
+		return fmt.Errorf("supersede prior identifier token: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO bank_account_identifier_tokens (token_id, bank_account_id, tenant_id, account_number_token, source)
+		VALUES ($1, $2, $3, $4, $5)`,
+		newTokenID, acct.BankAccountID, acct.TenantID, acct.AccountNumberToken, source); err != nil {
+		return fmt.Errorf("insert identifier token: %w", err)
+	}
+	return nil
 }
 
 // CreateBankAccount registers a new bank account. Idempotent on
@@ -199,6 +238,12 @@ func scanBankAccount(row pgx.Row, acct *domain.BankAccount) error {
 func (s *PgStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccount) (bool, error) {
 	tenantID := tenantFromCtxOrFallback(ctx, acct.TenantID)
 	now := time.Now().UTC()
+
+	// The handler sets this BEFORE calling CreateBankAccount, only when
+	// TOKENIZATION_ENFORCED. scanBankAccount's RETURNING projection below
+	// would otherwise overwrite it with '' — no token row exists yet at
+	// that point — so it is captured here and restored after the scan.
+	pendingToken := acct.AccountNumberToken
 
 	created := false
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -219,6 +264,15 @@ func (s *PgStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccoun
 			now, now)
 		if err := scanBankAccount(row, acct); err == nil {
 			created = true
+			// Write the real token row now, in the same transaction as the
+			// account itself, so a tokenized account is never left without
+			// one.
+			if pendingToken != "" {
+				acct.AccountNumberToken = pendingToken
+				if err := insertIdentifierToken(ctx, tx, acct, "WRITE"); err != nil {
+					return err
+				}
+			}
 			// The initial history entry — without this, GetBankAccountAsOf
 			// has no row to return for any timestamp before the first
 			// amendment, even though the account genuinely existed then.

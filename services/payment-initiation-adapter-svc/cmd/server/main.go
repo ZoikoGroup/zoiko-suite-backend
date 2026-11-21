@@ -21,6 +21,7 @@ import (
 	"zoiko.io/payment-initiation-adapter-svc/internal/authz"
 	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
 	"zoiko.io/payment-initiation-adapter-svc/internal/config"
+	"zoiko.io/payment-initiation-adapter-svc/internal/currency"
 	"zoiko.io/payment-initiation-adapter-svc/internal/handler"
 	"zoiko.io/payment-initiation-adapter-svc/internal/health"
 	"zoiko.io/payment-initiation-adapter-svc/internal/middleware"
@@ -72,7 +73,9 @@ func main() {
 	treasuryClient := clients.NewTreasuryHTTPClient(cfg.TreasuryServiceURL)
 	authorizationClient := clients.NewAuthorizationHTTPClient(cfg.AuthorizationServiceURL)
 
-	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger).WithPayroll(clients.NewPayrollHTTPClient(cfg.PayrollRunServiceURL))
+	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger).
+		WithPayroll(clients.NewPayrollHTTPClient(cfg.PayrollRunServiceURL)).
+		WithCurrency(currency.New(cfg.CurrencyRegistryURL))
 
 	// Background work (the outbox relay, the in-flight sweeper) lives for the life of the process, not for
 	// the startup timeout above.

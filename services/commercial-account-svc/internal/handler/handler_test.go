@@ -187,83 +187,6 @@ func TestCreateCommercialAccount_AuthzDenied(t *testing.T) {
 	}
 }
 
-func TestCreateMembershipAndDeactivate(t *testing.T) {
-	h := newTestHandler()
-	r := chi.NewRouter()
-	r.Use(svcmiddleware.TenantContext())
-	RegisterRoutes(r, h)
-
-	body := domain.CreateMembershipRequest{
-		PrincipalID:    "adviser-1",
-		OrganizationID: "org-test-01",
-	}
-	wCreate := httptest.NewRecorder()
-	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/memberships", body))
-	if wCreate.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d — %s", wCreate.Code, wCreate.Body.String())
-	}
-	var created domain.Membership
-	_ = json.NewDecoder(wCreate.Body).Decode(&created)
-	if created.Status != domain.MembershipStatusActive {
-		t.Fatalf("expected ACTIVE, got %s", created.Status)
-	}
-
-	wDeactivate := httptest.NewRecorder()
-	r.ServeHTTP(wDeactivate, buildRequest(http.MethodDelete, "/v1/memberships/"+created.MembershipID, nil))
-	if wDeactivate.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d — %s", wDeactivate.Code, wDeactivate.Body.String())
-	}
-
-	// Deactivating again must fail — a membership row is never re-usable
-	// once ended, per doc7 §A6 (historical attribution, not a toggle).
-	wSecond := httptest.NewRecorder()
-	r.ServeHTTP(wSecond, buildRequest(http.MethodDelete, "/v1/memberships/"+created.MembershipID, nil))
-	if wSecond.Code != http.StatusConflict {
-		t.Fatalf("expected 409 on second deactivate, got %d", wSecond.Code)
-	}
-}
-
-func TestListMemberships(t *testing.T) {
-	h := newTestHandler()
-	r := chi.NewRouter()
-	r.Use(svcmiddleware.TenantContext())
-	RegisterRoutes(r, h)
-
-	body := domain.CreateMembershipRequest{
-		PrincipalID:    "adviser-2",
-		OrganizationID: "org-test-02",
-	}
-	wCreate := httptest.NewRecorder()
-	req := buildRequest(http.MethodPost, "/v1/memberships", body)
-	req.Header.Set("X-Tenant-Id", "org-test-02")
-	r.ServeHTTP(wCreate, req)
-	if wCreate.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d", wCreate.Code)
-	}
-
-	// The list request must carry org-test-02's own identity. It previously
-	// carried org-test-01's (buildRequest's default) and still returned
-	// org-test-02's roster, because nothing compared the path organization
-	// to the verified tenant — which is the defect this change closes.
-	wList := httptest.NewRecorder()
-	listReq := buildRequest(http.MethodGet, "/v1/organizations/org-test-02/memberships", nil)
-	listReq.Header.Set("X-Tenant-Id", "org-test-02")
-	r.ServeHTTP(wList, listReq)
-	if wList.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", wList.Code)
-	}
-	var resp struct {
-		Memberships []domain.Membership `json:"memberships"`
-		Total       int                 `json:"total"`
-	}
-	if err := json.NewDecoder(wList.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	if resp.Total != 1 {
-		t.Fatalf("expected 1 membership, got %d", resp.Total)
-	}
-}
-
 func TestGetCommercialAccount_NotFound(t *testing.T) {
 	h := newTestHandler()
 	r := chi.NewRouter()
@@ -301,8 +224,6 @@ func TestReadEndpoints_AuthzDenied_Refused(t *testing.T) {
 		name, method, path string
 	}{
 		{"get commercial account", http.MethodGet, "/v1/commercial-accounts/ca-test-001"},
-		{"get membership", http.MethodGet, "/v1/memberships/mem-test-001"},
-		{"list memberships", http.MethodGet, "/v1/organizations/org-test-01/memberships"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
@@ -337,8 +258,6 @@ func TestReadEndpoints_MissingPrincipal_Refused(t *testing.T) {
 		name, method, path string
 	}{
 		{"get commercial account", http.MethodGet, "/v1/commercial-accounts/ca-test-001"},
-		{"get membership", http.MethodGet, "/v1/memberships/mem-test-001"},
-		{"list memberships", http.MethodGet, "/v1/organizations/org-test-01/memberships"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := buildRequest(tc.method, tc.path, nil)

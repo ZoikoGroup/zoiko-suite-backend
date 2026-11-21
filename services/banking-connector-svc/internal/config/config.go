@@ -32,6 +32,13 @@ type Config struct {
 	VaultServiceURL    string
 	TreasuryServiceURL string
 
+	// DocumentVaultServiceURL is BNK-03's raw-statement-file store
+	// (internal/documentvault, SPEC_DEVIATIONS.md A10). Empty disables raw
+	// file storage entirely — IngestStatement behaves exactly as it did
+	// before this client existed, which keeps a caller that sends no raw
+	// file (every pre-existing caller) unaffected.
+	DocumentVaultServiceURL string
+
 	// TokenizationEnforced/TokenizationServiceURL turn on tokenization of
 	// bank account numbers at write time (Security Standard §14, S3
 	// Restricted; internal/tokenization). Disabled by default, like
@@ -81,6 +88,8 @@ func Load() *Config {
 
 		VaultServiceURL:    getEnv("VAULT_SERVICE_URL", "http://secret-vault-integration-svc:8087"),
 		TreasuryServiceURL: getEnv("TREASURY_SERVICE_URL", "http://treasury-svc:8103"),
+
+		DocumentVaultServiceURL: getEnv("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
 
 		TokenizationEnforced:    os.Getenv("TOKENIZATION_ENFORCED") == "true",
 		TokenizationServiceURL:  getEnv("TOKENIZATION_SERVICE_URL", "http://key-management-svc:8143"),

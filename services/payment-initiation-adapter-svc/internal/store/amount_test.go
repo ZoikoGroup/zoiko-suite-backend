@@ -15,14 +15,15 @@ import (
 	"zoiko.io/payment-initiation-adapter-svc/internal/middleware"
 )
 
-// A6: the amount goes into NUMERIC(18,2) as decimal text and comes back out
-// as decimal text, on the attempt, on a later read and on the prepared
-// event. 9999999999999999.99 is the column's largest value and has no
-// float64: through a float it would have been stored as 10000000000000000.
+// A6: the amount goes into NUMERIC(18,4) (migration 000009 widened it from
+// NUMERIC(18,2)) as decimal text and comes back out as decimal text, on the
+// attempt, on a later read and on the prepared event. 99999999999999.9999
+// is the column's largest value and has no float64: through a float it
+// would have lost precision.
 func TestPgStore_AmountRoundTripsExactly(t *testing.T) {
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
-	const largest = "9999999999999999.99"
+	const largest = "99999999999999.9999"
 
 	a, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
@@ -47,7 +48,7 @@ func TestPgStore_AmountRoundTripsExactly(t *testing.T) {
 		PayerAccountVerified: true, IdempotencyKey: "amount-whole-" + tenantID,
 	}, "maker-1", "corr-amount-whole")
 	require.NoError(t, err)
-	assert.Equal(t, domain.Decimal("500.00"), b.Amount)
+	assert.Equal(t, domain.Decimal("500.0000"), b.Amount)
 
 	var payload string
 	require.NoError(t, testPool.QueryRow(ctx,
@@ -62,10 +63,10 @@ func TestPgStore_AmountTheColumnWouldRoundIsRefused(t *testing.T) {
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
 	for amount, want := range map[domain.Decimal]error{
-		"10.005":            domain.ErrAmountPrecision,
-		"10000000000000000": domain.ErrAmountPrecision,
-		"0":                 domain.ErrInvalidAmount,
-		"":                  domain.ErrInvalidAmount,
+		"10.00001":        domain.ErrAmountPrecision, // 5th decimal place: beyond NUMERIC(18,4)'s own scale
+		"100000000000000": domain.ErrAmountPrecision, // 15 integer digits: beyond the column's 14-digit capacity
+		"0":               domain.ErrInvalidAmount,
+		"":                domain.ErrInvalidAmount,
 	} {
 		_, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 			LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",

@@ -1436,6 +1436,58 @@ func TestGetJournal_NotFound(t *testing.T) {
 	}
 }
 
+// SPEC_DEVIATIONS A5 (intercompany-accounting-svc): "no intercompany-account
+// resolution ('Server-resolved: intercompany accounts')." GetJournal now
+// resolves each line's account against the chart of accounts and sets
+// IsIntercompanyAccount — the "Server-resolved" context intercompany-
+// accounting-svc's MatchEntry reads off this same response, not a separate
+// call. An unregistered account code resolves to false, the same bootstrap
+// posture checkAccountRestrictions already uses, and an unrelated account
+// (the tax line) stays false even though the journal has an intercompany
+// line.
+func TestGetJournal_ResolvesIntercompanyAccountPerLine(t *testing.T) {
+	s := newStubStore()
+	s.journals["j1"] = &domain.JournalHeader{
+		JournalID: "j1", TenantID: testTenantID, LegalEntityID: "e1",
+		Status: domain.JournalStatusFinalized,
+	}
+	s.lines["j1"] = []domain.JournalLine{
+		{JournalLineID: "l1", JournalID: "j1", LineNumber: 1, AccountCode: "1890", DebitAmount: 1000},
+		{JournalLineID: "l2", JournalID: "j1", LineNumber: 2, AccountCode: "2200-TAX", CreditAmount: 50},
+		{JournalLineID: "l3", JournalID: "j1", LineNumber: 3, AccountCode: "6000", CreditAmount: 950},
+	}
+	s.accountsByCode[testTenantID+"|1890"] = &domain.Account{
+		AccountCode: "1890", IsIntercompanyAccount: true,
+	}
+	s.accountsByCode[testTenantID+"|6000"] = &domain.Account{
+		AccountCode: "6000", IsIntercompanyAccount: false,
+	}
+	// "2200-TAX" is deliberately left unregistered in the chart.
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/journals/j1", nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result domain.JournalWithLines
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(result.Lines) != 3 {
+		t.Fatalf("expected 3 lines, got %d", len(result.Lines))
+	}
+	if !result.Lines[0].IsIntercompanyAccount {
+		t.Fatal("expected line against account 1890 to resolve is_intercompany_account=true")
+	}
+	if result.Lines[1].IsIntercompanyAccount {
+		t.Fatal("expected the unregistered tax line to resolve is_intercompany_account=false")
+	}
+	if result.Lines[2].IsIntercompanyAccount {
+		t.Fatal("expected the ordinary expense line to resolve is_intercompany_account=false")
+	}
+}
+
 func TestListJournals_RequiresVerifiedTenantScope(t *testing.T) {
 	// tenant_id in the query string is no longer what scopes this read, so
 	// supplying one cannot substitute for having passed identity verification.
