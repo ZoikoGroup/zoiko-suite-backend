@@ -520,6 +520,105 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/validate:
+    post:
+      tags: [definitions]
+      operationId: validateDefinition
+      description: Transitions DRAFT → VALIDATION_PENDING. Validates stage shapes, quorum pool, due hours, escalation target.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/submit-approval:
+    post:
+      tags: [definitions]
+      operationId: submitDefinitionApproval
+      description: Transitions VALIDATION_PENDING → APPROVAL_PENDING. Submits the definition for approval.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/approve:
+    post:
+      tags: [definitions]
+      operationId: approveDefinition
+      description: Transitions VALIDATED → APPROVAL_PENDING (or APPROVAL_PENDING → PUBLISHED). Maker ≠ checker enforced.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code]
+              properties:
+                reason_code: {type: string}
+                narrative: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/reject:
+    post:
+      tags: [definitions]
+      operationId: rejectDefinition
+      description: Transitions VALIDATION_PENDING/APPROVAL_PENDING → REJECTED.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code]
+              properties:
+                reason_code: {type: string}
+                narrative: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/publish:
+    post:
+      tags: [definitions]
+      operationId: publishDefinition
+      description: Transitions APPROVAL_PENDING → PUBLISHED. Computes checksum, sets effective window.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                effective_from: {type: string, format: date-time}
+                effective_to: {type: string, format: date-time}
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
 components:
   securitySchemes:
     identityEnvelope: {type: http, scheme: bearer, bearerFormat: JWT}

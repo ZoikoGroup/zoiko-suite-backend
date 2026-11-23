@@ -47,7 +47,16 @@ type Store interface {
 	ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error)
 	SupersedeWorkflowDefinition(ctx context.Context, oldDefID, newDefID string) error
 
-	// Additional workflow definition lifecycle methods
+	// WFC-01 definition publication lifecycle (WF-S22)
+	ValidateDefinition(ctx context.Context, params domain.ValidateDefinitionParams) (*domain.WorkflowDefinition, error)
+	SubmitDefinitionApproval(ctx context.Context, params domain.SubmitDefinitionApprovalParams) (*domain.WorkflowDefinition, error)
+	ApproveDefinition(ctx context.Context, params domain.ApproveDefinitionParams) (*domain.WorkflowDefinition, error)
+	RejectDefinition(ctx context.Context, params domain.RejectDefinitionParams) (*domain.WorkflowDefinition, error)
+	PublishDefinition(ctx context.Context, params domain.PublishDefinitionParams) (*domain.WorkflowDefinition, error)
+	SuspendDefinition(ctx context.Context, params domain.SuspendDefinitionParams) (*domain.WorkflowDefinition, error)
+	RetireDefinition(ctx context.Context, params domain.RetireDefinitionParams) (*domain.WorkflowDefinition, error)
+
+	// Additional workflow definition lifecycle methods (deprecated aliases)
 	ActivateWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 	SuspendWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 	RetireWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
@@ -1284,6 +1293,184 @@ func (s *PgStore) GetInstanceSummary(ctx context.Context, workflowInstanceID str
 	}
 
 	return summary, nil
+}
+
+// =============================================================================
+// WFC-01: Definition Publication Lifecycle (WF-S22)
+// =============================================================================
+
+func (s *PgStore) ValidateDefinition(ctx context.Context, params domain.ValidateDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "VALIDATION_PENDING", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+}
+
+func (s *PgStore) SubmitDefinitionApproval(ctx context.Context, params domain.SubmitDefinitionApprovalParams) (*domain.WorkflowDefinition, error) {
+	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "APPROVAL_PENDING", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+}
+
+func (s *PgStore) ApproveDefinition(ctx context.Context, params domain.ApproveDefinitionParams) (*domain.WorkflowDefinition, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "VALIDATED", params.ActorPrincipalID, params.CorrelationID, &params.ActorPrincipalID, &now, "", nil, nil, params.Meta)
+}
+
+func (s *PgStore) RejectDefinition(ctx context.Context, params domain.RejectDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "REJECTED", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+}
+
+func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDefinitionParams) (*domain.WorkflowDefinition, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "PUBLISHED", params.ActorPrincipalID, params.CorrelationID, nil, &now, params.ActorPrincipalID, params.EffectiveFrom, params.EffectiveTo, params.Meta)
+}
+
+func (s *PgStore) SuspendDefinition(ctx context.Context, params domain.SuspendDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "SUSPENDED", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+}
+
+func (s *PgStore) RetireDefinition(ctx context.Context, params domain.RetireDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "RETIRED", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+}
+
+// transitionDefinitionStatus is the internal helper for definition status transitions.
+func (s *PgStore) transitionDefinitionStatus(ctx context.Context, definitionID, newStatus, actorPrincipalID, correlationID string, validatedBy, validatedAt *string, publishedBy string, effectiveFrom, effectiveTo *time.Time, meta domain.CommandMeta) (*domain.WorkflowDefinition, error) {
+	var updated *domain.WorkflowDefinition
+
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		// Lock the definition row
+		const lockQuery = `SELECT ` + definitionColumns + ` FROM workflow_definitions WHERE workflow_definition_id = $1 AND tenant_id = $2 FOR UPDATE;`
+		current, err := scanDefinition(tx.QueryRow(ctx, lockQuery, definitionID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrWorkflowNotFound
+			}
+			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrWorkflowNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		currentStatus := ""
+		if current.Status != nil {
+			currentStatus = *current.Status
+		}
+
+		// Check if transition is allowed
+		allowedTransitions := map[string][]string{
+			"DRAFT":              {"VALIDATION_PENDING", "RETIRED"},
+			"VALIDATION_PENDING": {"VALIDATED", "REJECTED", "DRAFT"},
+			"VALIDATED":          {"APPROVAL_PENDING", "DRAFT"},
+			"APPROVAL_PENDING":   {"PUBLISHED", "REJECTED", "VALIDATED"},
+			"PUBLISHED":          {"SUSPENDED", "SUPERSEDED", "RETIRED"},
+			"SUSPENDED":          {"PUBLISHED", "RETIRED"},
+			"REJECTED":           {"DRAFT"},
+			"SUPERSEDED":         {"RETIRED"},
+			"RETIRED":            {},
+		}
+
+		allowed, ok := allowedTransitions[currentStatus]
+		if !ok {
+			return fmt.Errorf("%w: unknown current status %s", domain.ErrInvalidTransition, currentStatus)
+		}
+		transitionAllowed := false
+		for _, s := range allowed {
+			if s == newStatus {
+				transitionAllowed = true
+				break
+			}
+		}
+		if !transitionAllowed {
+			return fmt.Errorf("%w: cannot transition from %s to %s", domain.ErrInvalidTransition, currentStatus, newStatus)
+		}
+
+		// Idempotent: already in target status
+		if currentStatus == newStatus {
+			updated = current
+			return nil
+		}
+
+		// Maker-checker: approver cannot be the same as creator/validator
+		if newStatus == "VALIDATED" && validatedBy != nil && *validatedBy == current.CreatedBy {
+			return fmt.Errorf("%w: approver cannot be the creator", domain.ErrAuthorizationDenied)
+		}
+
+		// Compute checksum for PUBLISHED
+		var checksum string
+		if newStatus == "PUBLISHED" {
+			h := sha256.New()
+			h.Write([]byte(current.WorkflowType))
+			h.Write([]byte(strconv.Itoa(current.Version)))
+			h.Write(current.StagesJSON)
+			checksum = hex.EncodeToString(h.Sum(nil))
+		}
+
+		// Build update query
+		setClauses := []string{"definition_status = $1", "updated_at = NOW()", "row_version = row_version + 1"}
+		args := []any{newStatus}
+		argIdx := 2
+
+		switch newStatus {
+		case "VALIDATED":
+			setClauses = append(setClauses, "validated_by = $"+strconv.Itoa(argIdx), "validated_at = $"+strconv.Itoa(argIdx+1))
+			args = append(args, *validatedBy, *validatedAt)
+			argIdx += 2
+		case "PUBLISHED":
+			setClauses = append(setClauses,
+				"published_by = $"+strconv.Itoa(argIdx),
+				"published_at = $"+strconv.Itoa(argIdx+1),
+				"effective_from = $"+strconv.Itoa(argIdx+2),
+				"effective_to = $"+strconv.Itoa(argIdx+3),
+				"checksum = $"+strconv.Itoa(argIdx+4))
+			args = append(args, publishedBy, time.Now().UTC())
+			if effectiveFrom != nil {
+				args = append(args, *effectiveFrom)
+			} else {
+				args = append(args, time.Now().UTC())
+			}
+			if effectiveTo != nil {
+				args = append(args, *effectiveTo)
+			} else {
+				args = append(args, nil)
+			}
+			args = append(args, checksum)
+			argIdx += 5
+		}
+
+		args = append(args, definitionID, tenantID)
+		updateQuery := `
+			UPDATE workflow_definitions
+			SET ` + strings.Join(setClauses, ", ") + `
+			WHERE workflow_definition_id = $` + strconv.Itoa(len(args)-1) + ` AND tenant_id = $` + strconv.Itoa(len(args)) + `
+			RETURNING ` + definitionColumns + `;`
+
+		updated, err = scanDefinition(tx.QueryRow(ctx, updateQuery, args...))
+		if err != nil {
+			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrWorkflowNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		// Write definition event
+		eventType := "workflow.definition." + strings.ToLower(newStatus)
+		payload := map[string]any{
+			"workflow_definition_id": updated.WorkflowDefinitionID,
+			"workflow_type":          updated.WorkflowType,
+			"version":                updated.Version,
+			"previous_status":        current.Status,
+			"new_status":             updated.Status,
+			"actor_principal_id":     actorPrincipalID,
+		}
+		if validatedBy != nil {
+			payload["validated_by"] = *validatedBy
+		}
+		if publishedBy != "" {
+			payload["published_by"] = publishedBy
+		}
+
+		return s.outboxInsertTx(ctx, tx, eventType, "workflow_definition", updated.WorkflowDefinitionID, correlationID, payload, tenantID, "", actorPrincipalID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 // =============================================================================

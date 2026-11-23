@@ -400,6 +400,89 @@ type ListWorkflowsParams struct {
 	Cursor               *PaginationCursor
 }
 
+// ValidateDefinitionParams holds input for validating a workflow definition.
+type ValidateDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	Meta                 CommandMeta
+}
+
+// SubmitDefinitionApprovalParams holds input for submitting a definition for approval.
+type SubmitDefinitionApprovalParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	Meta                 CommandMeta
+}
+
+// ApproveDefinitionParams holds input for approving a definition (maker ≠ checker).
+type ApproveDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	ReasonCode           string
+	Narrative            *string
+	Authority            ActionAuthority
+	Meta                 CommandMeta
+}
+
+// RejectDefinitionParams holds input for rejecting a definition.
+type RejectDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	ReasonCode           string
+	Narrative            *string
+	Authority            ActionAuthority
+	Meta                 CommandMeta
+}
+
+// PublishDefinitionParams holds input for publishing a validated & approved definition.
+type PublishDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	EffectiveFrom        *time.Time
+	EffectiveTo          *time.Time
+	Meta                 CommandMeta
+}
+
+// SuspendDefinitionParams holds input for suspending a published definition.
+type SuspendDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	ReasonCode           string
+	Narrative            *string
+	Authority            ActionAuthority
+	Meta                 CommandMeta
+}
+
+// RetireDefinitionParams holds input for retiring a definition.
+type RetireDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	ReasonCode           string
+	Narrative            *string
+	Authority            ActionAuthority
+	Meta                 CommandMeta
+}
+
+// EmergencyApproveParams holds input for emergency approval (WF-S25).
+type EmergencyApproveParams struct {
+	WorkflowInstanceID  string
+	ActorPrincipalID    string
+	CorrelationID       string
+	BreakGlassSessionID string
+	ReasonCode          string
+	IncidentRef         *string
+	Scope               *string
+	MaxImpact           *string
+	Meta                CommandMeta
+}
+
 // InstanceSummary holds a summary view of a workflow instance.
 type InstanceSummary struct {
 	WorkflowInstanceID string         `json:"workflow_instance_id"`

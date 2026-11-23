@@ -394,6 +394,21 @@ func (s *stubStore) SuspendWorkflowDefinition(_ context.Context, _ string) error
 func (s *stubStore) RetireWorkflowDefinition(_ context.Context, _ string) error {
 	return s.definitionErr
 }
+func (s *stubStore) ValidateDefinition(_ context.Context, p domain.ValidateDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) SubmitDefinitionApproval(_ context.Context, p domain.SubmitDefinitionApprovalParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) ApproveDefinition(_ context.Context, p domain.ApproveDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) RejectDefinition(_ context.Context, p domain.RejectDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) PublishDefinition(_ context.Context, p domain.PublishDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
 func (s *stubStore) CreateWorkflowDefinition(_ context.Context, p domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
 	return s.workflowDefinition, s.definitionErr
 }
