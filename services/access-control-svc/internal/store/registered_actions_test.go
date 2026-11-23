@@ -169,11 +169,21 @@ var registeredActionMigrations = []struct {
 		"SIGNATORY_SIGN_AS_GENERAL_COUNSEL":   "HIGH",
 		"SIGNATORY_SIGN_AS_TREASURER":         "HIGH",
 	}},
+	{"000062_register_obligation_clock_actions", "obligations-svc", map[string]string{
+		"OBLIGATION_CLOCK_CREATE":             "STANDARD",
+		"OBLIGATION_CLOCK_SATISFY":            "STANDARD",
+		"OBLIGATION_CLOCK_RECALCULATE":        "STANDARD",
+		"OBLIGATION_CLOCK_WAIVE":              "HIGH",
+		"OBLIGATION_CLOCK_NOT_APPLICABLE":     "HIGH",
+		"OBLIGATION_ESCALATION_POLICY_MANAGE": "STANDARD",
+	}},
 }
 
 // templatePublishers are the migrations, in this list, that publish role
 // templates carrying actions earlier migrations registered (rule R5).
-var templatePublishers = []string{"000052_jurisdiction_rules_templates"}
+// 000062 publishes OBLIGATION_MANAGER v4, which inherits v3's actions
+// (000047's EVIDENCE_MANIFEST_READ among them).
+var templatePublishers = []string{"000052_jurisdiction_rules_templates", "000062_register_obligation_clock_actions"}
 
 // newPermCatalog is the permission catalogue used by alias tests. It is a
 // function, not a package-level var: a var would be initialised before
