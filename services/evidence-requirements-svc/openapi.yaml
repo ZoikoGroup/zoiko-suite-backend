@@ -317,6 +317,72 @@ paths:
       - {$ref: '#/components/parameters/RequestID'}
       - {$ref: '#/components/parameters/IfMatch'}
     post: {tags: [pbc], operationId: closeEvidenceRequest, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '412': {$ref: '#/components/responses/PreconditionFailed'}, '428': {$ref: '#/components/responses/PreconditionRequired'}}}
+  /v1/pbc/requests/{request_id}/transitions:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    get:
+      tags: [pbc]
+      operationId: listEvidenceRequestTransitions
+      description: >-
+        ST-2: the request's append-only history (migration 000012), oldest first. One row per creation and per change of
+        status, assignee or due date, with the command, the actor and the record_version it produced. Same authorization as
+        reading the request (assignee or EVIDENCE_REQUEST_MANAGE).
+      responses:
+        '200':
+          description: History
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    transition_id: {type: string, format: uuid}
+                    request_id: {type: string, format: uuid}
+                    from_status: {type: [string, 'null']}
+                    to_status: {type: string}
+                    command: {type: string}
+                    actor: {type: string}
+                    changed_fields: {type: array, items: {type: string}}
+                    assigned_to_principal_id: {type: [string, 'null']}
+                    due_at: {type: [string, 'null'], format: date-time}
+                    record_version: {type: integer}
+                    correlation_id: {type: [string, 'null']}
+                    recorded_at: {type: string, format: date-time}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/pbc/requests/{request_id}/available-actions:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    get:
+      tags: [pbc]
+      operationId: evidenceRequestAvailableActions
+      description: >-
+        ST-2: the commands the request's status allows for this caller, as the assignee and/or a holder of
+        EVIDENCE_REQUEST_MANAGE at the request's legal entity. The commands still enforce their own guards.
+      responses:
+        '200':
+          description: Actions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: {type: string}
+                  status: {type: string}
+                  record_version: {type: integer}
+                  is_assignee: {type: boolean}
+                  is_manager: {type: boolean}
+                  actions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        command: {type: string}
+                        method: {type: string}
+                        path: {type: string}
+                        role: {type: string, enum: [MANAGER, ASSIGNEE]}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
   /v1/pbc/responses/{response_id}/scan-result:
     parameters: [{$ref: '#/components/parameters/ResponseID'}]
     post: {tags: [pbc], operationId: recordScanResult, description: 'The scanner''s callback (EVIDENCE_REQUEST_MANAGE, interim, D-ER-2). Updates the response, not the request; no If-Match.', requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {description: Scan result recorded}, '403': {$ref: '#/components/responses/Problem'}, '404': {$ref: '#/components/responses/Problem'}}}

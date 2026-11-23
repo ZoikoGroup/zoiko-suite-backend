@@ -59,6 +59,14 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
 		return fmt.Errorf("set_config app.tenant_id: %w", err)
 	}
+	// The PBC history trigger (000012) records who ran which command; the
+	// handler puts both on the context (WithCommand).
+	if c, ok := domain.CommandFrom(ctx); ok {
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.actor_id', $1, true), set_config('app.command', $2, true), set_config('app.correlation_id', $3, true)",
+			c.Actor, c.Name, c.CorrelationID); err != nil {
+			return fmt.Errorf("set_config app.command: %w", err)
+		}
+	}
 	if err := fn(tx); err != nil {
 		return err
 	}

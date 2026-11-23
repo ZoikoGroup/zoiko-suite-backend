@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,5 +210,66 @@ func TestPgStore_SubmitResponse_AlwaysCreatesNewVersion(t *testing.T) {
 
 	if _, err := pool.Exec(ctx, `UPDATE evidence_request_responses SET submitted_by_principal_id='tampered' WHERE response_id=$1`, first.ResponseID); err == nil {
 		t.Fatal("expected the reject_evidence_response_mutation trigger to refuse a raw UPDATE on an existing response's content")
+	}
+}
+
+// ER-S6 (ST-2): every creation and every change of status, assignee or due
+// date leaves one history row naming the command and the actor; the history
+// cannot be edited. Runs as a NOBYPASSRLS role, so the trigger's insert is
+// checked against the tenant policy.
+func TestERS6_HistoryRecordsEveryMoveAndIsAppendOnly(t *testing.T) {
+	admin := openTestPool(t)
+	s := store.New(appRolePool(t, admin), zap.NewNop())
+	tenantID := uuid.New().String()
+	base := svcmiddleware.WithTenant(context.Background(), tenantID)
+	cmd := func(name, actor string) context.Context {
+		return domain.WithCommand(base, domain.Command{Actor: actor, Name: name, CorrelationID: "corr-" + name})
+	}
+	req, _, err := s.CreateEvidenceRequest(cmd("create", "auditor-1"), uuid.NewString(), domain.CreateEvidenceRequestParams{
+		TenantID: tenantID, LegalEntityID: uuid.NewString(), Title: "t", AssignedToPrincipalID: "client-1",
+		CreatedByPrincipalID: "auditor-1", CorrelationID: "c-" + uuid.NewString(), DueAt: time.Now().Add(48 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SendEvidenceRequest(cmd("send", "auditor-1"), domain.SendEvidenceRequestParams{RequestID: req.RequestID, TenantID: tenantID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ViewEvidenceRequest(cmd("view", "client-1"), domain.ViewEvidenceRequestParams{RequestID: req.RequestID, TenantID: tenantID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReassignEvidenceRequest(cmd("reassign", "auditor-1"), domain.ReassignEvidenceRequestParams{RequestID: req.RequestID, TenantID: tenantID, NewAssigneePrincipalID: "client-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseEvidenceRequest(cmd("close", "auditor-1"), domain.CloseEvidenceRequestParams{RequestID: req.RequestID, TenantID: tenantID}); err != nil {
+		t.Fatal(err)
+	}
+	hist, err := s.ListEvidenceRequestTransitions(base, tenantID, req.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, h := range hist {
+		from := ""
+		if h.FromStatus != nil {
+			from = *h.FromStatus
+		}
+		got = append(got, h.Command+":"+from+">"+h.ToStatus+"@"+h.Actor)
+	}
+	want := []string{"create:>DRAFT@auditor-1", "send:DRAFT>SENT@auditor-1", "view:SENT>VIEWED@client-1",
+		"reassign:VIEWED>VIEWED@auditor-1", "close:VIEWED>CLOSED@auditor-1"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("history\n got %v\nwant %v", got, want)
+	}
+	if hist[3].AssignedToPrincipalID == nil || *hist[3].AssignedToPrincipalID != "client-2" || hist[3].ChangedFields[0] != "assigned_to_principal_id" {
+		t.Fatalf("reassignment row: %+v", hist[3])
+	}
+	// Another tenant reads no history; nobody edits it.
+	if other, _ := s.ListEvidenceRequestTransitions(svcmiddleware.WithTenant(context.Background(), uuid.NewString()), uuid.NewString(), req.RequestID); len(other) != 0 {
+		t.Fatalf("another tenant read %d rows", len(other))
+	}
+	for _, q := range []string{`UPDATE evidence_request_transitions SET actor = 'x'`, `DELETE FROM evidence_request_transitions`} {
+		if _, err := admin.Exec(context.Background(), q); err == nil {
+			t.Fatalf("%q succeeded", q)
+		}
 	}
 }

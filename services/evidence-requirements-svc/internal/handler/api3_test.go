@@ -28,13 +28,14 @@ const pbcRequestID = "dddddddd-0000-4000-8000-000000000001"
 // stubPBC is a PBCStore whose request sits at version; a command with a
 // non-zero expected version other than that is stale.
 type stubPBC struct {
-	version  int64
-	expected []int64 // the expected version each command was called with
-	calls    int
-	listed   domain.ListEvidenceRequestsFilter
-	requests []*domain.EvidenceRequest
-	assignee string // the request's assigned_to_principal_id
-	writes   int    // view, note and acknowledge calls that reached the store
+	version     int64
+	expected    []int64 // the expected version each command was called with
+	calls       int
+	listed      domain.ListEvidenceRequestsFilter
+	requests    []*domain.EvidenceRequest
+	assignee    string // the request's assigned_to_principal_id
+	writes      int    // view, note and acknowledge calls that reached the store
+	transitions []*domain.EvidenceRequestTransition
 }
 
 func (s *stubPBC) request() *domain.EvidenceRequest {
@@ -101,6 +102,10 @@ func (s *stubPBC) RequestClarification(_ context.Context, p domain.RequestClarif
 func (s *stubPBC) MarkSatisfied(_ context.Context, p domain.MarkSatisfiedParams) (*domain.EvidenceRequest, error) {
 	return s.command(p.ExpectedVersion)
 }
+func (s *stubPBC) ListEvidenceRequestTransitions(context.Context, string, string) ([]*domain.EvidenceRequestTransition, error) {
+	return s.transitions, nil
+}
+
 func (s *stubPBC) CloseEvidenceRequest(_ context.Context, p domain.CloseEvidenceRequestParams) (*domain.EvidenceRequest, error) {
 	return s.command(p.ExpectedVersion)
 }

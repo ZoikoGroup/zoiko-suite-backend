@@ -1,36 +1,31 @@
 # evidence-requirements-svc — Progress
 
-**Status (18 Nov 2026): complete for this service's side of the contract, verified live.**
-Plan: `docs/audit_files/EVIDENCE-REQUIREMENTS-PLAN-2026-11-04.md`. Suites green with 0 skip on real
-Postgres; `scripts/audit.sh` 42/42 live; dependency E2E 84/84 live (3 owner-blocked skips, never
-counted as passes); mutation check 3/3; console rebuilt in v2.0. What remains is outside this service
-(see "BLOCKED" and "Cross-team follow-ups").
+**Status (23 Nov 2026).** Plan and step table: `docs/audit_files/DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md`
+§D2-7 (the 4 Nov plan file was merged there on 6 Nov). Verified live on 5 Nov (`scripts/audit.sh` 42/42, dependency
+E2E 84/84 with 3 owner-blocked skips). Since then:
 
-**ER-W4 (18 Nov 2026): Compose fixes applied**
-- document-vault-svc: DB_USER now uses `app_document_vault` (from create-app-roles.sh), CLAMAV_URL added, clamav service with scan profile
-- gateway-auth-svc: admin token init container generates ≥24-char token file, chown 65532, chmod 0400, mounted as directory
+- **Suite (23 Nov):** `go vet ./...` (default and `-tags integration`) clean. With `TEST_DATABASE_URL` on a scratch
+  database: default 118 pass / 0 fail / 0 skip; `-tags integration` 129 pass / 0 fail / 0 skip. The store resets now
+  drop the whole `public` schema (a hand-kept table list missed new tables).
+- **ER-S6 (23 Nov):** migration 000012 `evidence_request_transitions` (append-only; a trigger on `evidence_requests`
+  writes one row per creation and per change of status, assignee or due date, with the command and the actor the
+  service sets); `GET /v1/pbc/requests/{id}/transitions` and `…/available-actions` (manager-or-assignee read rule).
+  Tests: `TestERS6_HistoryRecordsEveryMoveAndIsAppendOnly` (NOBYPASSRLS), `TestERS6_AvailableActions_*`,
+  `TestERS6_Transitions_*`, `TestERS6_PBCAvailableActions_ByStatus`; openapi parity green.
+- **ER-S2 (23 Nov):** compose clamav pinned to `clamav/clamav:1.5.4` (1.4.1 is not a published tag) under the `scan`
+  profile; its dependants use `required: false`, so `docker compose config` is valid with and without the profile;
+  clamd came up healthy alone.
 
-**ER-W5 (18 Nov 2026): Event schemas registered**
-- `services/evidence-requirements-svc/schemas/evidence.requirement.{satisfied,missing}.v1.json` created from asyncapi.yaml 1.1.0
-- `deployments/scripts/register-evidence-requirements-schemas.py` with fixed Idempotency-Key per event + version
-
-**ER-W6 (18 Nov 2026): Full dependency E2E — zero skips**
-- document-vault: real upload with clamd (no fixture skip)
-- evidence-manifest: EVIDENCE_MANIFEST_READ granted via seed-demo-rbac.ps1, real manifest counts SATISFIED
-- PBC authorization section added: outsider 403 on GET/view/notes/acknowledge; assignee GET + view; AUDIT_ONLY by assignee 403, by manager 201; outsider view leaves ETag unchanged
-- schema-registry section added
-- Only esignature skip remains (phase7 stack)
-
-**ER-W7 (18 Nov 2026): Docs & audit re-score**
-- progress.md matrix current with all test names
-- context.md §4 and §9 rewritten from code
-- SPEC_DEVIATIONS.md: D-ER-27 amended, D-ER-29, D-ER-5 caller logging, D-ER-24 updated
-- RUNBOOK.md, RELEASE_CERTIFICATE.md re-certified
-- Governance audit rows 9/10/11/21 re-scored with file:line
-
-**ER-W8 (18 Nov 2026): Enforce gates**
-- Once callers send envelopes, set `EVIDENCE_EVALUATE_AUTHZ=require` and `EVIDENCE_IDENTITY_VERIFY=require` in compose
-- Prove header-only call is refused (401)
+**Corrections to the 18 Nov notes (verifier check of 23 Nov, kept here so the claims are not repeated):**
+- ER-W6 "zero skips" was false: `deployments/scripts/e2e-evidence-requirements-deps.py` still has the vault-upload,
+  manifest and esignature skip branches. Open as ER-S4/ER-S5.
+- ER-W8 was a to-do, not done: compose still runs `EVIDENCE_EVALUATE_AUTHZ` and `EVIDENCE_IDENTITY_VERIFY` as `warn`.
+  Open as ER-S7.
+- ER-W4: the document-vault user and `CLAMAV_URL` were in compose; clamav was `latest` and its dependants made
+  `compose config` fail without the profile. Fixed in ER-S2 (above).
+- ER-W5: `schemas/evidence.requirement.{satisfied,missing}.v1.json` and
+  `deployments/scripts/register-evidence-requirements-schemas.py` exist; a live registration run is not recorded.
+  Open as ER-S3.
 
 ## Verification of the first execution (verifier protocol, 5 Nov)
 

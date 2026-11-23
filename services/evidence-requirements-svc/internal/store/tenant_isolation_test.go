@@ -116,15 +116,16 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	_, _ = testPool.Exec(ctx, `
-		DROP TABLE IF EXISTS outbox CASCADE;
-		DROP TABLE IF EXISTS evidence_request_receipts CASCADE;
-		DROP TABLE IF EXISTS evidence_request_notes CASCADE;
-		DROP TABLE IF EXISTS evidence_request_responses CASCADE;
-		DROP TABLE IF EXISTS evidence_requests CASCADE;
-		DROP TABLE IF EXISTS evidence_evaluations CASCADE;
-		DROP TABLE IF EXISTS evidence_requirements CASCADE;
-	`)
+	// An empty schema, not a list of tables (the list missed 000012's history
+	// table and 000008's functions).
+	if _, err := testPool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;`); err != nil {
+		fmt.Println("reset schema:", err)
+		testPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
 
 	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE.
 	//
