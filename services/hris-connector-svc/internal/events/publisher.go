@@ -85,8 +85,11 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, topic string, logger *zap
 	return &KafkaPublisher{writer: writer, topic: topic, logger: logger}
 }
 
-func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
-	evt := Event{
+// NewEvent builds the envelope for params. The transactional outbox stores
+// exactly this value at write time, so the message the relay later delivers
+// is the one Publish used to write directly.
+func NewEvent(params PublishParams) Event {
+	return Event{
 		// A fresh UUID per publish, not a deterministic string — see
 		// docs/architecture/known-gaps.md's event_id collision writeup.
 		EventID:       "evt-" + uuid.New().String(),
@@ -102,6 +105,17 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		OccurredAt:    time.Now().UTC(),
 		Payload:       params.Payload,
 	}
+}
+
+// PublishOutbox writes one outbox row's stored envelope to the topic, keyed by
+// the aggregate id as Publish always was. It satisfies outbox.Publisher; a
+// failure is returned so the relay retries the row.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	return p.writer.WriteMessages(ctx, kafka.Message{Key: []byte(aggregateID), Value: payload})
+}
+
+func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
+	evt := NewEvent(params)
 	data, err := json.Marshal(evt)
 	if err != nil {
 		return err

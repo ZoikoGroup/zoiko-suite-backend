@@ -58,4 +58,11 @@ type BNK0304Store interface {
 	ApproveMappingException(ctx context.Context, params domain.ApproveMappingExceptionParams) (*domain.CanonicalTransaction, error)
 	GetCanonicalTransaction(ctx context.Context, tenantID, transactionID string) (*domain.CanonicalTransaction, error)
 	CreateTransactionMapping(ctx context.Context, params domain.CreateTransactionMappingParams) (*domain.TransactionMapping, error)
+	// TransactionLegalEntity and MappingExceptionLegalEntity resolve the
+	// legal entity that owns a canonical transaction / mapping exception
+	// (statement line -> statement -> connection), for authorization. Not
+	// found in the caller's tenant is ErrTransactionNotFound /
+	// ErrMappingExceptionNotFound.
+	TransactionLegalEntity(ctx context.Context, tenantID, transactionID string) (string, error)
+	MappingExceptionLegalEntity(ctx context.Context, tenantID, exceptionID string) (string, error)
 }

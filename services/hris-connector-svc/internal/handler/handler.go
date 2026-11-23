@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/hris-connector-svc/internal/authz"
@@ -20,11 +21,19 @@ import (
 const (
 	HRIS_INTEGRATION_CREATE = "HRIS_INTEGRATION_CREATE"
 	HRIS_SYNC_TRIGGER       = "HRIS_SYNC_TRIGGER"
+
+	// Read actions: an integration (and its sync jobs) is authorized for the
+	// integration's legal entity; an unfiltered list for the requested legal
+	// entity, else the caller's tenant.
+	HRIS_INTEGRATION_READ = "HRIS_INTEGRATION_READ"
+	HRIS_SYNC_READ        = "HRIS_SYNC_READ"
 )
 
+// Handler serves the HRIS API. Events are not published from here: each
+// change is written with its event to the transactional outbox by the store,
+// and internal/outbox.Relay delivers it.
 type Handler struct {
 	store     store.Store
-	publisher events.Publisher
 	authz     *authz.Client
 	providers *provider.Registry
 	logger    *zap.Logger
@@ -33,8 +42,8 @@ type Handler struct {
 // New builds the handler with an EMPTY provider registry: until a real
 // adapter is registered with WithProviders, every sync fails closed with
 // 503 provider_not_configured (see internal/provider's package doc).
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, providers: provider.NewRegistry(), logger: logger}
+func New(st store.Store, az *authz.Client, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, providers: provider.NewRegistry(), logger: logger}
 }
 
 // WithProviders installs the provider adapter registry.
@@ -97,6 +106,7 @@ func (h *Handler) CreateIntegration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	integ := &domain.HrisIntegration{
+		IntegrationID: uuid.New().String(),
 		TenantID:      tenantID,
 		LegalEntityID: req.LegalEntityID,
 		ProviderName:  providerName,
@@ -109,30 +119,63 @@ func (h *Handler) CreateIntegration(w http.ResponseWriter, r *http.Request) {
 		Status: domain.SyncPending,
 	}
 
-	if err := h.store.CreateIntegration(r.Context(), integ); err != nil {
+	populateAliases(integ)
+	// The event is written to the outbox in the same transaction as the row.
+	if err := h.store.CreateIntegration(r.Context(), integ, events.PublishParams{
+		EventType: "hris.integration.created", AggregateID: integ.IntegrationID, TenantID: tenantID,
+		LegalEntityID: integ.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: integ,
+	}); err != nil {
 		h.logger.Error("failed to create HRIS integration", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create HRIS integration")
 		return
 	}
-
-	populateAliases(integ)
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "hris.integration.created", AggregateID: integ.IntegrationID, TenantID: tenantID,
-		LegalEntityID: integ.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: integ,
-	})
 	writeJSON(w, http.StatusCreated, integ)
 }
 
-func (h *Handler) GetIntegrationByID(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+// loadIntegrationForRead requires a principal, resolves id within the
+// caller's tenant (404 for a missing or foreign integration, before any
+// authorization is asked) and authorizes action for its legal entity.
+func (h *Handler) loadIntegrationForRead(w http.ResponseWriter, r *http.Request, id, action string) (*domain.HrisIntegration, bool) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, false
+	}
 	integ, err := h.store.GetIntegrationByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrIntegrationNotFound) {
 			writeError(w, http.StatusNotFound, "HRIS integration not found")
-			return
+			return nil, false
 		}
+		h.logger.Error("failed to get HRIS integration", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to get HRIS integration")
+		return nil, false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, integ.LegalEntityID, action); err != nil {
+		h.writeAuthzErr(w, err)
+		return nil, false
+	}
+	return integ, true
+}
+
+// authorizeRead authorizes a list read for scope (purchase-request-svc
+// pattern): 401 without a principal, 403 on denial, 503 when
+// authorization-svc gives no decision.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, scope, action string) bool {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, action); err != nil {
+		h.writeAuthzErr(w, err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) GetIntegrationByID(w http.ResponseWriter, r *http.Request) {
+	integ, ok := h.loadIntegrationForRead(w, r, chi.URLParam(r, "id"), HRIS_INTEGRATION_READ)
+	if !ok {
 		return
 	}
 	populateAliases(integ)
@@ -141,6 +184,13 @@ func (h *Handler) GetIntegrationByID(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) ListIntegrations(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	scope := legalEntityID
+	if scope == "" {
+		scope = middleware.GetTenantID(r.Context())
+	}
+	if !h.authorizeRead(w, r, scope, HRIS_INTEGRATION_READ) {
+		return
+	}
 	integs, err := h.store.ListIntegrations(r.Context(), legalEntityID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list HRIS integrations")
@@ -205,6 +255,7 @@ func (h *Handler) TriggerSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := &domain.SyncJob{
+		JobID:         uuid.New().String(),
 		IntegrationID: req.IntegrationID,
 		TenantID:      tenantID,
 		SyncType:      req.SyncType,
@@ -227,23 +278,30 @@ func (h *Handler) TriggerSync(w http.ResponseWriter, r *http.Request) {
 		job.CompletedAt = &completed
 	}
 
-	if err := h.store.CreateSyncJob(r.Context(), job); err != nil {
+	job.SyncID = job.JobID
+	// The event is written to the outbox in the same transaction as the job.
+	if err := h.store.CreateSyncJob(r.Context(), job, events.PublishParams{
+		EventType: "hris.sync.triggered", AggregateID: job.JobID, TenantID: tenantID,
+		LegalEntityID: integ.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: job,
+	}); err != nil {
 		h.logger.Error("failed to trigger sync job", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to trigger sync job")
 		return
 	}
-	job.SyncID = job.JobID
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "hris.sync.triggered", AggregateID: job.JobID, TenantID: tenantID,
-		LegalEntityID: integ.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: job,
-	})
 	writeJSON(w, status, job)
 }
 
 func (h *Handler) ListSyncJobs(w http.ResponseWriter, r *http.Request) {
 	integrationID := r.URL.Query().Get("integration_id")
+	if integrationID != "" {
+		// Narrowed to one integration: authorized for its legal entity.
+		if _, ok := h.loadIntegrationForRead(w, r, integrationID, HRIS_SYNC_READ); !ok {
+			return
+		}
+	} else if !h.authorizeRead(w, r, middleware.GetTenantID(r.Context()), HRIS_SYNC_READ) {
+		return
+	}
 	jobs, err := h.store.ListSyncJobs(r.Context(), integrationID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list sync jobs")

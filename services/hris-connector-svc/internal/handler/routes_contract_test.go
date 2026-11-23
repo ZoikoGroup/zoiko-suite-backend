@@ -27,7 +27,7 @@ func fullChainRouter(t *testing.T) *chi.Mux {
 	r.Get("/healthz", health.Handler())
 	r.Get("/readyz", health.ReadyHandler(okPinger{}))
 	t.Helper()
-	h := New(nil, nil, nil, nil)
+	h := New(nil, nil, nil)
 	RegisterRoutes(r, h)
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-Route-Miss", "404")

@@ -14,7 +14,6 @@ import (
 
 	"zoiko.io/hris-connector-svc/internal/authz"
 	"zoiko.io/hris-connector-svc/internal/domain"
-	"zoiko.io/hris-connector-svc/internal/events"
 	"zoiko.io/hris-connector-svc/internal/middleware"
 	"zoiko.io/hris-connector-svc/internal/provider"
 	"zoiko.io/hris-connector-svc/internal/store"
@@ -31,7 +30,7 @@ func (f fixedAdapter) Sync(context.Context, provider.SyncRequest) (provider.Sync
 
 func routerWith(t *testing.T, authzURL string, reg *provider.Registry) chi.Router {
 	t.Helper()
-	h := New(store.NewMemoryStore(), events.NewMockPublisher(), authz.NewClient(authzURL), zap.NewNop())
+	h := New(store.NewMemoryStore(), authz.NewClient(authzURL), zap.NewNop())
 	if reg != nil {
 		h.WithProviders(reg)
 	}

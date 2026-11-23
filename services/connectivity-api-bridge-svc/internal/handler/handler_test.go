@@ -251,7 +251,7 @@ func TestCreateAndIngestBridge(t *testing.T) {
 
 func TestListBridges(t *testing.T) {
 	_, h := setupTestRouter(t)
-	w := h.call("GET", "/v1/bridges?legal_entity_id=le-101", "tenant-test", "", nil)
+	w := h.call("GET", "/v1/bridges?legal_entity_id=le-101", "tenant-test", "reader", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", w.Code)
 	}
