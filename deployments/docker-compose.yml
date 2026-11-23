@@ -1844,6 +1844,10 @@ services:
         condition: service_healthy
       clamav:
         condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
       tenant-svc:
         condition: service_healthy
       # The compose service key is governance-svc (container
@@ -1919,7 +1923,9 @@ services:
   # ── ClamAV for document-vault-svc virus scanning ──────────────────────────────
   # Runs under "scan" profile; document-vault-svc refuses uploads without it.
   clamav:
-    image: clamav/clamav:latest
+    # Pinned (ER-S2): a floating tag changed the scanner under every rebuild
+    # (1.4.1, named in the plan, is not a published tag; 1.5.4 is).
+    image: clamav/clamav:1.5.4
     container_name: zoiko-clamav
     mem_limit: 1g
     cpus: "1.0"
@@ -1989,6 +1995,10 @@ services:
         condition: service_completed_successfully
       clamav:
         condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
       # dead database pool reads as healthy while every read returns 500.
@@ -3284,6 +3294,10 @@ services:
         condition: service_healthy
       clamav:
         condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
       tenant-svc:
         condition: service_healthy
     healthcheck:
@@ -3508,6 +3522,10 @@ services:
         condition: service_healthy
       clamav:
         condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
       asset-management-svc:
         condition: service_healthy
       inventory-management-svc:
@@ -5566,6 +5584,10 @@ services:
         condition: service_healthy
       clamav:
         condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
       tax-determination-svc:
         condition: service_healthy
       policy-svc:
