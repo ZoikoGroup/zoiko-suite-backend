@@ -48,6 +48,8 @@ type WorkflowStore interface {
 	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
 	ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
+	ListWorkflows(ctx context.Context, tenantID string, params domain.ListWorkflowsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
+	GetInstanceSummary(ctx context.Context, workflowInstanceID string) (*domain.InstanceSummary, error)
 
 	// WFC-04: Cases (WF-2)
 	CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, error)
@@ -237,7 +239,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 
 	// List endpoints
+	r.Get("/v1/workflows", h.ListWorkflows)
 	r.Get("/v1/workflows/pending", h.ListPendingApprovals)
+	r.Get("/v1/workflows/{workflow_instance_id}/summary", h.GetInstanceSummary)
 	r.Get("/v1/workflows/{workflow_instance_id}/evidence", h.GetApprovalEvidence)
 	r.Post("/v1/workflows/{workflow_instance_id}/request-changes", h.RequestChanges)
 	r.Route("/v1/audit/engagements", func(r chi.Router) {
@@ -2454,6 +2458,105 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, r, http.StatusOK, resp)
+}
+
+// ListWorkflows handles GET /v1/workflows.
+func (h *Handler) ListWorkflows(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if !h.authorizeRead(w, r, nil, principalID, correlationID, "ListWorkflows") {
+		return
+	}
+
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
+	}
+
+	var cursor *domain.PaginationCursor
+	if cursorStr := r.URL.Query().Get("cursor"); cursorStr != "" {
+		c, err := domain.DecodePaginationCursor(cursorStr)
+		if err != nil {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_cursor",
+				"message": "cursor is not valid",
+			})
+			return
+		}
+		cursor = c
+	}
+
+	params := domain.ListWorkflowsParams{
+		TenantID:             tenantScope,
+		LegalEntityID:        r.URL.Query().Get("legal_entity_id"),
+		WorkflowType:         r.URL.Query().Get("workflow_type"),
+		WorkflowStatus:       r.URL.Query().Get("workflow_status"),
+		SubjectType:          r.URL.Query().Get("subject_type"),
+		SubjectID:            r.URL.Query().Get("subject_id"),
+		WorkflowDefinitionID: r.URL.Query().Get("workflow_definition_id"),
+		Limit:                limit,
+		Cursor:               cursor,
+	}
+
+	instances, nextCursor, err := h.store.ListWorkflows(r.Context(), tenantScope, params)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "ListWorkflows")
+		return
+	}
+	if instances == nil {
+		instances = []*domain.WorkflowInstance{}
+	}
+
+	type listResponse struct {
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                     `json:"next_cursor,omitempty"`
+		Watermark  string                     `json:"watermark,omitempty"`
+	}
+
+	resp := listResponse{
+		Records: instances,
+	}
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			resp.NextCursor = encoded
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, resp)
+}
+
+// GetInstanceSummary handles GET /v1/workflows/{workflow_instance_id}/summary.
+func (h *Handler) GetInstanceSummary(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if !h.authorizeRead(w, r, nil, principalID, correlationID, "GetInstanceSummary") {
+		return
+	}
+
+	summary, err := h.store.GetInstanceSummary(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "GetInstanceSummary")
+		return
+	}
+
+	writeJSON(w, r, http.StatusOK, summary)
 }
 
 // GetApprovalEvidence handles GET /v1/workflows/{workflow_instance_id}/evidence.

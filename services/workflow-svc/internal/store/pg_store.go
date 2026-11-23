@@ -57,6 +57,8 @@ type Store interface {
 	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
 	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
+	ListWorkflows(ctx context.Context, tenantID string, params domain.ListWorkflowsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
+	GetInstanceSummary(ctx context.Context, workflowInstanceID string) (*domain.InstanceSummary, error)
 
 	// WFC-04: Cases (WF-2)
 	CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, error)
@@ -1148,6 +1150,140 @@ func (s *PgStore) ListPendingApprovals(ctx context.Context, tenantID string, par
 	}
 
 	return results, nextCursor, nil
+}
+
+// ListWorkflows lists workflow instances with filters and cursor paging (API-4).
+func (s *PgStore) ListWorkflows(ctx context.Context, tenantID string, params domain.ListWorkflowsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	query := `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE tenant_id = $1`
+	args := []any{tenantID}
+
+	addFilter := func(clause string, value any) {
+		args = append(args, value)
+		query += fmt.Sprintf(" AND %s $%d", clause, len(args))
+	}
+
+	if params.LegalEntityID != "" {
+		addFilter("legal_entity_id =", params.LegalEntityID)
+	}
+	if params.WorkflowType != "" {
+		addFilter("workflow_type =", params.WorkflowType)
+	}
+	if params.WorkflowStatus != "" {
+		addFilter("workflow_status =", params.WorkflowStatus)
+	}
+	if params.SubjectType != "" {
+		addFilter("subject_type =", params.SubjectType)
+	}
+	if params.SubjectID != "" {
+		addFilter("subject_id =", params.SubjectID)
+	}
+	if params.WorkflowDefinitionID != "" {
+		addFilter("workflow_definition_id =", params.WorkflowDefinitionID)
+	}
+
+	query += " ORDER BY started_at DESC, workflow_instance_id DESC"
+
+	if params.Cursor != nil && params.Cursor.StartedAt != "" && params.Cursor.InstanceID != "" {
+		args = append(args, params.Cursor.StartedAt, params.Cursor.InstanceID)
+		query += " AND (started_at, workflow_instance_id) < ($" + fmt.Sprint(len(args)-1) + ", $" + fmt.Sprint(len(args)) + ")"
+	}
+	args = append(args, limit+1)
+	query += fmt.Sprintf(" LIMIT $%d;", len(args))
+
+	var results []*domain.WorkflowInstance
+	var err error
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, args...)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg ListWorkflows failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			w, scanErr := scanInstance(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListWorkflows scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, w)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var nextCursor *domain.PaginationCursor
+	if len(results) > limit {
+		last := results[limit-1]
+		results = results[:limit]
+		nextCursor = &domain.PaginationCursor{
+			StartedAt:  last.StartedAt.UTC().Format(time.RFC3339),
+			InstanceID: last.WorkflowInstanceID,
+		}
+	}
+
+	return results, nextCursor, nil
+}
+
+// GetInstanceSummary returns a summary view of a workflow instance including its stages.
+func (s *PgStore) GetInstanceSummary(ctx context.Context, workflowInstanceID string) (*domain.InstanceSummary, error) {
+	instance, err := s.FindWorkflowByID(ctx, workflowInstanceID)
+	if err != nil {
+		return nil, err
+	}
+
+	stages, err := s.FindStagesByWorkflowID(ctx, workflowInstanceID)
+	if err != nil {
+		return nil, err
+	}
+
+	stageSummaries := make([]domain.StageSummary, len(stages))
+	for i, st := range stages {
+		stageSummaries[i] = domain.StageSummary{
+			StageOrder:          st.StageOrder,
+			StageType:           st.StageType,
+			StageStatus:         st.StageStatus,
+			ApproverPrincipalID: st.ApproverPrincipalID,
+			RequiredApprovals:   st.RequiredApprovals,
+			QuorumApprovers:     st.QuorumApprovers,
+			ActedAt:             st.ActedAt,
+			ActedBy:             st.ActedBy,
+			Rationale:           st.Rationale,
+		}
+	}
+
+	summary := &domain.InstanceSummary{
+		WorkflowInstanceID: instance.WorkflowInstanceID,
+		WorkflowType:       instance.WorkflowType,
+		WorkflowStatus:     instance.WorkflowStatus,
+		CurrentStage:       instance.CurrentStage,
+		InitiatedBy:        instance.InitiatedBy,
+		SubjectType:        instance.SubjectType,
+		SubjectID:          instance.SubjectID,
+		SubjectVersion:     instance.SubjectVersion,
+		StartedAt:          instance.StartedAt,
+		CompletedAt:        instance.CompletedAt,
+		DueAt:              instance.DueAt,
+		NextActionAt:       instance.NextActionAt,
+		EscalationTarget:   instance.EscalationTarget,
+		ReviewCycle:        instance.ReviewCycle,
+		StagesSummary:      stageSummaries,
+	}
+
+	return summary, nil
 }
 
 // =============================================================================

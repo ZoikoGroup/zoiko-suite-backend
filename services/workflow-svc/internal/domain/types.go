@@ -387,6 +387,50 @@ type ListPendingSubmissionsParams struct {
 	Cursor   *PaginationCursor
 }
 
+// ListWorkflowsParams holds input for listing workflow instances with cursor paging (API-4).
+type ListWorkflowsParams struct {
+	TenantID             string
+	LegalEntityID        string
+	WorkflowType         string
+	WorkflowStatus       string
+	SubjectType          string
+	SubjectID            string
+	WorkflowDefinitionID string
+	Limit                int
+	Cursor               *PaginationCursor
+}
+
+// InstanceSummary holds a summary view of a workflow instance.
+type InstanceSummary struct {
+	WorkflowInstanceID string         `json:"workflow_instance_id"`
+	WorkflowType       string         `json:"workflow_type"`
+	WorkflowStatus     string         `json:"workflow_status"`
+	CurrentStage       int            `json:"current_stage"`
+	InitiatedBy        string         `json:"initiated_by"`
+	SubjectType        *string        `json:"subject_type,omitempty"`
+	SubjectID          *string        `json:"subject_id,omitempty"`
+	SubjectVersion     *int           `json:"subject_version,omitempty"`
+	StartedAt          time.Time      `json:"started_at"`
+	CompletedAt        *time.Time     `json:"completed_at,omitempty"`
+	DueAt              *time.Time     `json:"due_at,omitempty"`
+	NextActionAt       *time.Time     `json:"next_action_at,omitempty"`
+	EscalationTarget   *string        `json:"escalation_target,omitempty"`
+	ReviewCycle        int            `json:"review_cycle"`
+	StagesSummary      []StageSummary `json:"stages_summary"`
+}
+
+type StageSummary struct {
+	StageOrder          int        `json:"stage_order"`
+	StageType           string     `json:"stage_type"`
+	StageStatus         string     `json:"stage_status"`
+	ApproverPrincipalID string     `json:"approver_principal_id,omitempty"`
+	RequiredApprovals   *int       `json:"required_approvals,omitempty"`
+	QuorumApprovers     []string   `json:"quorum_approvers,omitempty"`
+	ActedAt             *time.Time `json:"acted_at,omitempty"`
+	ActedBy             *string    `json:"acted_by,omitempty"`
+	Rationale           *string    `json:"rationale,omitempty"`
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var ErrWorkflowNotFound = errorString("workflow not found")

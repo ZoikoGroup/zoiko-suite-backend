@@ -49,6 +49,39 @@ tags:
   - name: definitions
 paths:
   /v1/workflows:
+    get:
+      tags: [instances]
+      operationId: listWorkflows
+      description: List all workflow instances with optional filters. Supports cursor paging (API-4).
+      parameters:
+        - {name: legal_entity_id, in: query, schema: {type: string}}
+        - {name: workflow_type, in: query, schema: {type: string}}
+        - {name: workflow_status, in: query, schema: {type: string}}
+        - {name: subject_type, in: query, schema: {type: string}}
+        - {name: subject_id, in: query, schema: {type: string}}
+        - {name: workflow_definition_id, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {$ref: '#/components/parameters/CorrelationID'}
+      responses:
+        '200':
+          description: Workflow instances
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkflowInstance'}
+                  next_cursor:
+                    type: string
+                  watermark:
+                    type: string
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
     post:
       tags: [instances]
       operationId: createWorkflow
@@ -116,6 +149,23 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WorkflowStage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/summary:
+    get:
+      tags: [instances]
+      operationId: getInstanceSummary
+      description: Returns a summary view of a workflow instance including its stages.
+      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
+      responses:
+        '200':
+          description: Instance summary
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/InstanceSummary'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -687,3 +737,37 @@ components:
         decision_id: {type: [string, 'null']}
         quorum: {type: 'object'}
         occurred_at: {type: string, format: date-time}
+    InstanceSummary:
+      type: object
+      properties:
+        workflow_instance_id: {type: string}
+        workflow_type: {type: string}
+        workflow_status: {type: string}
+        current_stage: {type: integer}
+        initiated_by: {type: string}
+        subject_type: {type: [string, 'null']}
+        subject_id: {type: [string, 'null']}
+        subject_version: {type: [integer, 'null']}
+        started_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        due_at: {type: [string, 'null'], format: date-time}
+        next_action_at: {type: [string, 'null'], format: date-time}
+        escalation_target: {type: [string, 'null']}
+        review_cycle: {type: integer}
+        stages_summary:
+          type: array
+          items: {$ref: '#/components/schemas/StageSummary'}
+    StageSummary:
+      type: object
+      properties:
+        stage_order: {type: integer}
+        stage_type: {type: string}
+        stage_status: {type: string}
+        approver_principal_id: {type: [string, 'null']}
+        required_approvals: {type: [integer, 'null']}
+        quorum_approvers:
+          type: array
+          items: {type: string}
+        acted_at: {type: [string, 'null'], format: date-time}
+        acted_by: {type: [string, 'null']}
+        rationale: {type: [string, 'null']}

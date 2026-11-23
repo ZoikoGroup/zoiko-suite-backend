@@ -296,6 +296,55 @@ func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, p domain.L
 func (s *stubStore) GetApprovalEvidence(_ context.Context, _ string) ([]*domain.WorkflowTransition, error) {
 	return s.approvalTransitions, s.approvalEvidenceErr
 }
+func (s *stubStore) ListWorkflows(_ context.Context, _ string, p domain.ListWorkflowsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 2
+	}
+	start := 0
+	if p.Cursor != nil {
+		for i, inst := range s.pendingApprovals {
+			if inst.WorkflowInstanceID == p.Cursor.InstanceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(s.pendingApprovals) {
+		end = len(s.pendingApprovals)
+	}
+	if start >= len(s.pendingApprovals) {
+		return []*domain.WorkflowInstance{}, nil, s.listPendingApprovalsErr
+	}
+	var nextCursor *domain.PaginationCursor
+	if end < len(s.pendingApprovals) {
+		nextCursor = &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: s.pendingApprovals[end-1].WorkflowInstanceID}
+	}
+	return s.pendingApprovals[start:end], nextCursor, s.listPendingApprovalsErr
+}
+func (s *stubStore) GetInstanceSummary(_ context.Context, workflowInstanceID string) (*domain.InstanceSummary, error) {
+	if s.instance == nil || s.instance.WorkflowInstanceID != workflowInstanceID {
+		return nil, domain.ErrWorkflowNotFound
+	}
+	return &domain.InstanceSummary{
+		WorkflowInstanceID: s.instance.WorkflowInstanceID,
+		WorkflowType:       s.instance.WorkflowType,
+		WorkflowStatus:     s.instance.WorkflowStatus,
+		CurrentStage:       s.instance.CurrentStage,
+		InitiatedBy:        s.instance.InitiatedBy,
+		SubjectType:        s.instance.SubjectType,
+		SubjectID:          s.instance.SubjectID,
+		SubjectVersion:     s.instance.SubjectVersion,
+		StartedAt:          s.instance.StartedAt,
+		CompletedAt:        s.instance.CompletedAt,
+		DueAt:              s.instance.DueAt,
+		NextActionAt:       s.instance.NextActionAt,
+		EscalationTarget:   s.instance.EscalationTarget,
+		ReviewCycle:        s.instance.ReviewCycle,
+		StagesSummary:      []domain.StageSummary{},
+	}, nil
+}
 func (s *stubStore) ListWorkflowDefinitions(_ context.Context, p domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error) {
 	// Sort by workflow_type DESC, version DESC to match the real store
 	defs := make([]*domain.WorkflowDefinition, len(s.workflowDefinitions))
