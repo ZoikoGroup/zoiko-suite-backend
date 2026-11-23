@@ -200,6 +200,9 @@ func (h *ConnectionHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ConnectionHandler) List(w http.ResponseWriter, r *http.Request) {
+	if !h.guard(w, r, ActionConnRead) {
+		return
+	}
 	q := r.URL.Query()
 	f := xicconn.Filter{Status: strings.ToUpper(q.Get("status")), ConnectorID: q.Get("connector_id"), Environment: strings.ToUpper(q.Get("environment"))}
 	list, err := h.repo.List(r.Context(), f)
@@ -215,6 +218,9 @@ func (h *ConnectionHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ConnectionHandler) Get(w http.ResponseWriter, r *http.Request) {
+	if !h.guard(w, r, ActionConnRead) {
+		return
+	}
 	c, err := h.repo.Get(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeConnProblem(w, r, err)
@@ -224,6 +230,9 @@ func (h *ConnectionHandler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ConnectionHandler) Checks(w http.ResponseWriter, r *http.Request) {
+	if !h.guard(w, r, ActionConnRead) {
+		return
+	}
 	list, err := h.repo.ListChecks(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeConnProblem(w, r, err)
@@ -233,6 +242,9 @@ func (h *ConnectionHandler) Checks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ConnectionHandler) Certifications(w http.ResponseWriter, r *http.Request) {
+	if !h.guard(w, r, ActionConnRead) {
+		return
+	}
 	list, err := h.repo.ListCertifications(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeConnProblem(w, r, err)
@@ -242,6 +254,9 @@ func (h *ConnectionHandler) Certifications(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *ConnectionHandler) Events(w http.ResponseWriter, r *http.Request) {
+	if !h.guard(w, r, ActionConnRead) {
+		return
+	}
 	list, err := h.repo.ListEvents(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeConnProblem(w, r, err)
@@ -251,6 +266,9 @@ func (h *ConnectionHandler) Events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ConnectionHandler) Requests(w http.ResponseWriter, r *http.Request) {
+	if !h.guard(w, r, ActionConnRead) {
+		return
+	}
 	list, err := h.repo.ListRequests(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeConnProblem(w, r, err)
