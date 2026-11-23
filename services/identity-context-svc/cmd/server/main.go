@@ -358,7 +358,6 @@ func main() {
 	// identity.session.revoked, like every other revocation, and is streamed
 	// to SIEM as a security signal.
 	sessionCache.WithRevocationHook(capRevocationHook(publisher, siemClient, log)).
-		WithPerSessionRevocationHook(perSessionRevocationHook(publisher, log)).
 		WithWorkloadCap(cfg.SessionCapWorkload)
 
 	// Drain accepted SIEM events on shutdown. Stream returns before delivery,

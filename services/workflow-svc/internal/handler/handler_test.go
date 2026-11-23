@@ -194,6 +194,10 @@ type stubStore struct {
 	pendingNextCursor      *domain.PaginationCursor
 	pendingSubmissionsList []*domain.FormSubmission
 	pendingSubNextCursor   *domain.PaginationCursor
+
+	// WFC-02: Work Items (WF-S23)
+	workItem    *domain.WorkItem
+	workItemErr error
 }
 
 func (s *stubStore) CreateForm(_ context.Context, _ domain.CreateFormParams) (*domain.FormDefinition, bool, error) {
@@ -408,6 +412,42 @@ func (s *stubStore) RejectDefinition(_ context.Context, p domain.RejectDefinitio
 }
 func (s *stubStore) PublishDefinition(_ context.Context, p domain.PublishDefinitionParams) (*domain.WorkflowDefinition, error) {
 	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) CreateWorkItem(_ context.Context, _ domain.CreateWorkItemParams) (*domain.WorkItem, error) {
+	return s.workItem, s.workItemErr
+}
+func (s *stubStore) GetWorkItem(_ context.Context, _ string) (*domain.WorkItem, error) {
+	return s.workItem, s.workItemErr
+}
+func (s *stubStore) ListWorkItems(_ context.Context, _ string, _ domain.ListWorkItemsFilter) ([]*domain.WorkItem, *domain.PaginationCursor, error) {
+	return []*domain.WorkItem{s.workItem}, nil, s.workItemErr
+}
+func (s *stubStore) ClaimWorkItem(_ context.Context, _ string, _ int, _ string, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) ReleaseWorkItem(_ context.Context, _ string, _ int, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) SatisfyWorkItem(_ context.Context, _ domain.SatisfyWorkItemParams) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) WaiveWorkItem(_ context.Context, _ domain.WaiveWorkItemParams) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) TransferWorkItem(_ context.Context, _ domain.TransferWorkItemParams) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) CancelWorkItem(_ context.Context, _ string, _ int, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) EscalateWorkItem(_ context.Context, _ string, _ int, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) ReassignWorkItem(_ context.Context, _ string, _ int, _ string, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) BulkCompleteWorkItems(_ context.Context, _ domain.BulkCompleteWorkItemsParams) ([]*domain.WorkItem, []*domain.WorkItemResult, error) {
+	return []*domain.WorkItem{s.workItem}, []*domain.WorkItemResult{{WorkItemID: "wi-1", Success: true}}, s.workItemErr
 }
 func (s *stubStore) CreateWorkflowDefinition(_ context.Context, p domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
 	return s.workflowDefinition, s.definitionErr

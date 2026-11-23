@@ -26,7 +26,9 @@ type ContextStore interface {
 	// atomically. See package outbox for why that pairing matters.
 	InsertSessionContextWithEvent(ctx context.Context, sc domain.SessionContext, rec outbox.Record) error
 
-	MarkSessionInvalidated(ctx context.Context, sessionContextID, tenantID string, reason domain.InvalidationReason, at time.Time) error
+	// MarkSessionInvalidated records the invalidation and, in the same
+	// transaction and only if it ended the session now, enqueues recs.
+	MarkSessionInvalidated(ctx context.Context, sessionContextID, tenantID string, reason domain.InvalidationReason, at time.Time, recs ...outbox.Record) error
 	FindSessionContext(ctx context.Context, sessionContextID, tenantID string) (*domain.SessionContext, error)
 	FindLiveSessionIDsForPrincipal(ctx context.Context, principalID, tenantID string, now time.Time) ([]string, error)
 	FindLiveSessionIDsForTenant(ctx context.Context, tenantID string, now time.Time) ([]string, error)
@@ -86,18 +88,12 @@ type DurableCache struct {
 	// sessions (SESSION_CAP_WORKLOAD). Zero leaves workloads uncapped.
 	maxSessionsPerWorkload int
 	onRevoke               RevocationHook
-	onSessionRevoked       PerSessionRevocationHook
 }
 
 // RevocationHook is told about every session the concurrency cap ends, so the
 // revocation leaves the service as identity.session.revoked like any other
 // (it used to be recorded on the row and nowhere else).
 type RevocationHook func(ctx context.Context, sessionContextID, principalID, tenantID string, reason domain.InvalidationReason, correlationID string)
-
-// PerSessionRevocationHook is called for every individual session revocation,
-// so each one emits identity.session.revoked through the outbox with full
-// context (tenant_id, actor, correlation_id). This is IC-16 / S1-12 K-6.
-type PerSessionRevocationHook func(ctx context.Context, sessionContextID, principalID, tenantID string, reason domain.InvalidationReason, actorID, correlationID string)
 
 // NewDurableCache wraps a Redis cache with a durable evidence store.
 func NewDurableCache(cache HotCache, store ContextStore, log *zap.Logger, maxSessionsPerPrincipal int) *DurableCache {
@@ -116,13 +112,6 @@ func (d *DurableCache) WithWorkloadCap(n int) *DurableCache {
 // WithRevocationHook sets the hook the concurrency cap calls.
 func (d *DurableCache) WithRevocationHook(h RevocationHook) *DurableCache {
 	d.onRevoke = h
-	return d
-}
-
-// WithPerSessionRevocationHook sets the hook called for every individual
-// session revocation (IC-16 / S1-12 K-6).
-func (d *DurableCache) WithPerSessionRevocationHook(h PerSessionRevocationHook) *DurableCache {
-	d.onSessionRevoked = h
 	return d
 }
 
@@ -321,6 +310,7 @@ func (d *DurableCache) EvictAllForTenant(
 	ctx context.Context,
 	tenantID string,
 	reason domain.InvalidationReason,
+	actorID, correlationID string,
 ) (int, error) {
 	now := time.Now().UTC()
 	ids, err := d.store.FindLiveSessionIDsForTenant(ctx, tenantID, now)
@@ -331,7 +321,7 @@ func (d *DurableCache) EvictAllForTenant(
 	revoked := 0
 	var firstErr error
 	for _, id := range ids {
-		if err := d.Invalidate(ctx, id, tenantID, reason, now, "", ""); err != nil {
+		if err := d.Invalidate(ctx, id, tenantID, reason, now, actorID, correlationID); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -399,11 +389,28 @@ func (d *DurableCache) Invalidate(
 	if err := d.cache.Invalidate(ctx, sessionContextID, reason, at); err != nil {
 		return fmt.Errorf("invalidate cached session: %w", err)
 	}
-	if err := d.store.MarkSessionInvalidated(ctx, sessionContextID, tenantID, reason, at); err != nil {
-		return fmt.Errorf("record session invalidation: %w", err)
+	// IC-16 / D1-1.F21: a revocation with a named actor leaves the service as
+	// identity.session.revoked, written to the outbox in the invalidation's own
+	// transaction (it used to be published afterwards through a hook whose
+	// arguments were in the wrong order, so the event's tenant_id carried the
+	// session id).
+	var recs []outbox.Record
+	if actorID != "" {
+		rec, err := events.Render(events.EventSessionRevoked, tenantID, "", actorID, correlationID, sessionContextID, map[string]any{
+			"session_context_id":  sessionContextID,
+			"principal_id":        sc.PrincipalID,
+			"tenant_id":           tenantID,
+			"invalidation_reason": reason,
+			"actor":               actorID,
+			"correlation_id":      correlationID,
+		})
+		if err != nil {
+			return fmt.Errorf("render session revocation: %w", err)
+		}
+		recs = append(recs, rec)
 	}
-	if d.onSessionRevoked != nil && actorID != "" {
-		d.onSessionRevoked(ctx, sessionContextID, sc.PrincipalID, tenantID, reason, actorID, correlationID)
+	if err := d.store.MarkSessionInvalidated(ctx, sessionContextID, tenantID, reason, at, recs...); err != nil {
+		return fmt.Errorf("record session invalidation: %w", err)
 	}
 	return nil
 }

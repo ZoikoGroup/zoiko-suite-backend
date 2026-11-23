@@ -145,6 +145,20 @@ type WorkflowStore interface {
 	GetSubmissionVersion(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmissionVersionInfo, error)
 	GetValidationResult(ctx context.Context, tenantID, submissionID string) (*domain.ValidationResult, error)
 	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
+
+	// WFC-02: Work Items (WF-S23)
+	CreateWorkItem(ctx context.Context, params domain.CreateWorkItemParams) (*domain.WorkItem, error)
+	GetWorkItem(ctx context.Context, workItemID string) (*domain.WorkItem, error)
+	ListWorkItems(ctx context.Context, tenantID string, filter domain.ListWorkItemsFilter) ([]*domain.WorkItem, *domain.PaginationCursor, error)
+	ClaimWorkItem(ctx context.Context, workItemID string, expectedVersion int, assigneePrincipalID string, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	ReleaseWorkItem(ctx context.Context, workItemID string, expectedVersion int, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	SatisfyWorkItem(ctx context.Context, params domain.SatisfyWorkItemParams) (*domain.WorkItem, bool, error)
+	WaiveWorkItem(ctx context.Context, params domain.WaiveWorkItemParams) (*domain.WorkItem, bool, error)
+	TransferWorkItem(ctx context.Context, params domain.TransferWorkItemParams) (*domain.WorkItem, bool, error)
+	CancelWorkItem(ctx context.Context, workItemID string, expectedVersion int, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	EscalateWorkItem(ctx context.Context, workItemID string, expectedVersion int, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	ReassignWorkItem(ctx context.Context, workItemID string, expectedVersion int, newAssigneePrincipalID string, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	BulkCompleteWorkItems(ctx context.Context, params domain.BulkCompleteWorkItemsParams) ([]*domain.WorkItem, []*domain.WorkItemResult, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -336,6 +350,20 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{submission_id}/supersede", h.SupersedeSubmission)
 		r.Post("/{submission_id}/route", h.RouteToDomain)
 	})
+
+	// WFC-02: Work Items (WF-S23)
+	r.Route("/v1/work-items", func(r chi.Router) {
+		r.Post("/", h.CreateWorkItem)
+		r.Get("/", h.ListWorkItems)
+		r.Get("/{work_item_id}", h.GetWorkItem)
+		r.Post("/{work_item_id}/claim", h.ClaimWorkItem)
+		r.Post("/{work_item_id}/release", h.ReleaseWorkItem)
+		r.Post("/{work_item_id}/complete", h.CompleteWorkItem)
+		r.Post("/{work_item_id}/reassign", h.ReassignWorkItem)
+		r.Post("/{work_item_id}/cancel", h.CancelWorkItem)
+		r.Post("/{work_item_id}/escalate", h.EscalateWorkItem)
+	})
+	r.Post("/v1/work-items/bulk-complete", h.BulkCompleteWorkItems)
 
 	// WFC-04: Cases (WF-2)
 	r.Route("/v1/cases", func(r chi.Router) {

@@ -19,15 +19,23 @@ import (
 	"zoiko.io/identity-context-svc/internal/store"
 )
 
-// sessionEvictor ends every live session of a principal, recording why.
+// sessionEvictor ends every live session of a principal, recording why. A
+// federation deprovisioning names its actor, so every session it ends leaves
+// the service as identity.session.revoked (D1-1.F21).
 type sessionEvictor struct {
 	cache interface {
-		EvictAllForPrincipal(ctx context.Context, principalID, tenantID string, reason domain.InvalidationReason) (int, error)
+		EvictAllForPrincipalWithIDs(ctx context.Context, principalID, tenantID string, reason domain.InvalidationReason, actorID, correlationID string) ([]string, error)
 	}
 }
 
+// federationActor is the actor recorded for sessions a directory's
+// deprovisioning ends.
+const federationActor = "system:federation-deprovisioning"
+
 func (e sessionEvictor) EvictAllForPrincipal(ctx context.Context, principalID, tenantID string) (int, error) {
-	return e.cache.EvictAllForPrincipal(ctx, principalID, tenantID, domain.InvalidationReasonAdminRevoke)
+	ids, err := e.cache.EvictAllForPrincipalWithIDs(ctx, principalID, tenantID, domain.InvalidationReasonAdminRevoke,
+		federationActor, "deprovision-"+principalID)
+	return len(ids), err
 }
 
 // mountFederation wires INT-10 onto the router when FEDERATION_ENABLED, and returns the handler the server

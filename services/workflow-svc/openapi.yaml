@@ -619,6 +619,212 @@ paths:
         '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items:
+    post:
+      tags: [work-items]
+      operationId: createWorkItem
+      description: Creates a new work item.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateWorkItem'}
+      responses:
+        '201': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [work-items]
+      operationId: listWorkItems
+      description: Lists work items with filters and cursor paging (API-4).
+      parameters:
+        - {name: legal_entity_id, in: query, schema: {type: string}}
+        - {name: case_id, in: query, schema: {type: string}}
+        - {name: workflow_instance_id, in: query, schema: {type: string}}
+        - {name: item_type, in: query, schema: {type: string}}
+        - {name: queue, in: query, schema: {type: string}}
+        - {name: assignee_principal_id, in: query, schema: {type: string}}
+        - {name: state, in: query, schema: {type: string}}
+        - {name: mandatory, in: query, schema: {type: boolean}}
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {$ref: '#/components/parameters/CorrelationID'}
+      responses:
+        '200':
+          description: Work items
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkItem'}
+                  next_cursor:
+                    type: string
+                  watermark:
+                    type: string
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/bulk-complete:
+    post:
+      tags: [work-items]
+      operationId: bulkCompleteWorkItems
+      description: Bulk completes work items. Per-item authorization and per-item results.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [work_item_ids]
+              properties:
+                work_item_ids:
+                  type: array
+                  items: {type: string}
+      responses:
+        '200':
+          description: Bulk completion results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkItem'}
+                  results:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkItemResult'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}:
+    get:
+      tags: [work-items]
+      operationId: getWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/claim:
+    post:
+      tags: [work-items]
+      operationId: claimWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assignee_principal_id]
+              properties:
+                assignee_principal_id: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/release:
+    post:
+      tags: [work-items]
+      operationId: releaseWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/complete:
+    post:
+      tags: [work-items]
+      operationId: completeWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                completion_data:
+                  type: object
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/reassign:
+    post:
+      tags: [work-items]
+      operationId: reassignWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_assignee_principal_id, reason]
+              properties:
+                new_assignee_principal_id: {type: string}
+                reason: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/cancel:
+    post:
+      tags: [work-items]
+      operationId: cancelWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/escalate:
+    post:
+      tags: [work-items]
+      operationId: escalateWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
 components:
   securitySchemes:
     identityEnvelope: {type: http, scheme: bearer, bearerFormat: JWT}

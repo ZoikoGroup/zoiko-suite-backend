@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/outbox"
 )
 
 // InsertSessionContext writes the durable evidence record for an issued
@@ -44,12 +45,13 @@ func (s *PgStore) MarkSessionInvalidated(
 	sessionContextID, tenantID string,
 	reason domain.InvalidationReason,
 	at time.Time,
+	recs ...outbox.Record,
 ) error {
 	if tenantID == "" {
 		return errors.New("MarkSessionInvalidated: tenant_id is required")
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE session_contexts
 			   SET invalidated_at = $1, invalidation_reason = $2
 			 WHERE session_context_id = $3
@@ -60,7 +62,13 @@ func (s *PgStore) MarkSessionInvalidated(
 		if err != nil {
 			return fmt.Errorf("mark session_context invalidated: %w", err)
 		}
-		return nil
+		// The revocation event commits with the invalidation (D1-1.F21), and
+		// only when this call ended the session: a repeat is a no-op, not a
+		// second event.
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+		return s.enqueueAll(ctx, tx, recs)
 	})
 }
 
