@@ -668,15 +668,20 @@ func (h *Handler) writeFormAuthzErr(w http.ResponseWriter, r *http.Request, err 
 // =============================================================================
 
 type createCaseRequest struct {
-	WorkflowInstanceID    *string `json:"workflow_instance_id,omitempty"`
-	CaseType              string  `json:"case_type"`                // INVESTIGATION, DISPUTE, EXCEPTION, etc.
-	Title                 string  `json:"title"`
-	Description           string  `json:"description"`
-	AssignedToPrincipalID *string `json:"assigned_to_principal_id,omitempty"`
+	WorkflowInstanceID     *string `json:"workflow_instance_id,omitempty"`
+	CaseFamily             string  `json:"case_family"`               // FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL
+	CaseType               string  `json:"case_type"`                 // INVESTIGATION, DISPUTE, EXCEPTION, etc.
+	Title                  string  `json:"title"`
+	Description            string  `json:"description"`
+	Severity               string  `json:"severity,omitempty"`        // LOW, MEDIUM, HIGH, CRITICAL
+	Confidentiality        string  `json:"confidentiality,omitempty"` // INTERNAL, RESTRICTED, PRIVILEGED
+	AssignedToPrincipalID  *string `json:"assigned_to_principal_id,omitempty"`
 }
 
 func (req createCaseRequest) missingField() string {
 	switch {
+	case req.CaseFamily == "":
+		return "case_family"
 	case req.CaseType == "":
 		return "case_type"
 	case req.Title == "":
@@ -733,6 +738,7 @@ func (h *Handler) CreateCase(w http.ResponseWriter, r *http.Request) {
 		TenantID:             tenantID,
 		LegalEntityID:        "", // will be set from workflow or require in request
 		WorkflowInstanceID:   req.WorkflowInstanceID,
+		CaseFamily:           domain.CaseFamily(req.CaseFamily),
 		CaseType:             req.CaseType,
 		Title:                req.Title,
 		Description:          req.Description,
@@ -847,10 +853,9 @@ func (h *Handler) ListCases(w http.ResponseWriter, r *http.Request) {
 }
 
 type transitionCaseRequest struct {
-	CaseState          string  `json:"case_state"`                    // IN_REVIEW, RESOLVED, CLOSED, ESCALATED
-	ExpectedVersion    int     `json:"expected_version,omitempty"`    // If-Match version
-	ResolutionReason   *string `json:"resolution_reason,omitempty"`   // for RESOLVED
-	CloseReason        *string `json:"close_reason,omitempty"`        // for CLOSED
+	CaseState       string  `json:"case_state"`                    // TRIAGED, IN_PROGRESS, WAITING_INTERNAL, WAITING_EXTERNAL, RESOLVED, CLOSED, REOPENED
+	ExpectedVersion int     `json:"expected_version,omitempty"`    // If-Match version
+	Reason          *string `json:"reason,omitempty"`              // for RESOLVED, CLOSED, REOPENED
 }
 
 // TransitionCase handles POST /v1/cases/{case_id}/status.
@@ -915,8 +920,7 @@ func (h *Handler) TransitionCase(w http.ResponseWriter, r *http.Request) {
 		ExpectedVersion:  expectedVersion,
 		ActorPrincipalID: principalID,
 		CorrelationID:    correlationID,
-		ResolutionReason: req.ResolutionReason,
-		CloseReason:      req.CloseReason,
+		Reason:           req.Reason,
 	}
 
 	updated, transitioned, err := h.store.TransitionCase(r.Context(), params)

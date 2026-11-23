@@ -39,10 +39,6 @@ type Validator interface {
 	// cannot be reached — callers must fail-closed.
 	ValidateExists(ctx context.Context, jurisdictionID string) error
 
-	// ValidateCalendarRule returns nil if the calendar rule exists and matches
-	// the expected version. Returns domain.ErrJurisdictionServiceUnavailable
-	// if jurisdiction-rules-svc cannot be reached — callers must fail-closed.
-	ValidateCalendarRule(ctx context.Context, calendarCode, calendarRuleID string, calendarRuleVersion int) error
 }
 
 // HTTPValidator implements Validator against a real jurisdiction-rules-svc instance.
@@ -116,74 +112,6 @@ func (v *HTTPValidator) ValidateExists(ctx context.Context, jurisdictionID strin
 	if errors.Is(err, circuitbreaker.ErrCircuitOpen) {
 		v.log.Error("circuit breaker open for jurisdiction-rules-svc — failing closed",
 			zap.String("jurisdiction_id", jurisdictionID),
-			zap.String("breaker_state", v.breaker.GetState().String()),
-		)
-		return domain.ErrJurisdictionServiceUnavailable
-	}
-
-	return err
-}
-
-// ValidateCalendarRule calls GET {baseURL}/v1/calendars/{calendarCode}/rules/{calendarRuleID}
-// to verify the calendar rule exists and matches the expected version.
-func (v *HTTPValidator) ValidateCalendarRule(ctx context.Context, calendarCode, calendarRuleID string, calendarRuleVersion int) error {
-	err := v.breaker.Execute(ctx, func() error {
-		target := fmt.Sprintf("%s/v1/calendars/%s/rules/%s", v.baseURL, url.PathEscape(calendarCode), url.PathEscape(calendarRuleID))
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-		if err != nil {
-			return domain.ErrJurisdictionServiceUnavailable
-		}
-		svcenvelope.ForwardTo(ctx, req)
-		idenv.Forward(ctx, req)
-
-		resp, err := v.client.Do(req)
-		if err != nil {
-			v.log.Error("jurisdiction-rules-svc unreachable for calendar rule — failing closed",
-				zap.String("calendar_code", calendarCode),
-				zap.String("calendar_rule_id", calendarRuleID),
-				zap.Error(err),
-			)
-			return domain.ErrJurisdictionServiceUnavailable
-		}
-		defer resp.Body.Close()
-
-		switch resp.StatusCode {
-		case http.StatusOK:
-			// Check the rule version matches
-			var body struct {
-				Version int `json:"version"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-				v.log.Error("unexpected response body from jurisdiction-rules-svc calendar rule",
-					zap.Error(err))
-				return domain.ErrJurisdictionServiceUnavailable
-			}
-			if body.Version != calendarRuleVersion {
-				v.log.Error("calendar rule version mismatch",
-					zap.String("calendar_code", calendarCode),
-					zap.String("calendar_rule_id", calendarRuleID),
-					zap.Int("expected_version", calendarRuleVersion),
-					zap.Int("actual_version", body.Version),
-				)
-				return domain.ErrJurisdictionServiceUnavailable
-			}
-			return nil
-		case http.StatusNotFound:
-			return domain.ErrJurisdictionServiceUnavailable // treat as unavailable, fail-closed
-		default:
-			v.log.Error("unexpected response from jurisdiction-rules-svc calendar rule — failing closed",
-				zap.Int("status", resp.StatusCode),
-				zap.String("calendar_code", calendarCode),
-				zap.String("calendar_rule_id", calendarRuleID),
-			)
-			return domain.ErrJurisdictionServiceUnavailable
-		}
-	})
-
-	if errors.Is(err, circuitbreaker.ErrCircuitOpen) {
-		v.log.Error("circuit breaker open for jurisdiction-rules-svc calendar rule — failing closed",
-			zap.String("calendar_code", calendarCode),
-			zap.String("calendar_rule_id", calendarRuleID),
 			zap.String("breaker_state", v.breaker.GetState().String()),
 		)
 		return domain.ErrJurisdictionServiceUnavailable

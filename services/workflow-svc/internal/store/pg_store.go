@@ -159,18 +159,20 @@ func (s *PgStore) withTenantTx(ctx context.Context, fn func(tx pgx.Tx, tenantID 
 	return tx.Commit(ctx)
 }
 
-// insertOutboxEventTx inserts an event into the outbox within an existing transaction.
-func insertOutboxEventTx(ctx context.Context, tx pgx.Tx, tenantID, eventType, correlationID, legalEntityID, jurisdictionID, actorID string, payload map[string]any) error {
+// insertOutboxEventTx inserts an event into the outbox_events table within an existing transaction.
+// This is a simplified version for case events; the main workflow events use outbox.Insert.
+func insertOutboxEventTx(ctx context.Context, tx pgx.Tx, tenantID, eventType, aggregateType, aggregateID, correlationID, legalEntityID, jurisdictionID, actorID string, payload map[string]any) error {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal outbox payload: %w", err)
 	}
 
 	const query = `
-		INSERT INTO outbox (tenant_id, event_type, correlation_id, legal_entity_id, jurisdiction_id, actor_id, payload, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW());`
+		INSERT INTO outbox_events (outbox_event_id, aggregate_type, aggregate_id, event_type,
+			tenant_id, legal_entity_id, actor_id, correlation_id, headers, payload, destination, created_at)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, '{}'::jsonb, $8, 'kafka', NOW());`
 
-	_, err = tx.Exec(ctx, query, tenantID, eventType, correlationID, legalEntityID, jurisdictionID, actorID, payloadBytes)
+	_, err = tx.Exec(ctx, query, aggregateType, aggregateID, eventType, tenantID, legalEntityID, actorID, correlationID, payloadBytes)
 	if err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
@@ -1265,17 +1267,23 @@ const caseColumns = `
 	tenant_id,
 	legal_entity_id,
 	workflow_instance_id,
+	case_family,
 	case_type,
 	case_state,
+	severity,
+	confidentiality,
 	title,
 	description,
 	assigned_to_principal_id,
+	created_by_principal_id,
+	canonical_case_id,
+	split_from_case_id,
 	opened_at,
+	triaged_at,
 	resolved_at,
 	closed_at,
 	created_at,
 	updated_at,
-	version,
 	row_version`
 
 func scanCase(row pgx.Row) (*domain.Case, error) {
@@ -1285,17 +1293,23 @@ func scanCase(row pgx.Row) (*domain.Case, error) {
 		&c.TenantID,
 		&c.LegalEntityID,
 		&c.WorkflowInstanceID,
+		&c.CaseFamily,
 		&c.CaseType,
 		&c.CaseState,
+		&c.Severity,
+		&c.Confidentiality,
 		&c.Title,
 		&c.Description,
 		&c.AssignedToPrincipal,
+		&c.CreatedByPrincipalID,
+		&c.CanonicalCaseID,
+		&c.SplitFromCaseID,
 		&c.OpenedAt,
+		&c.TriagedAt,
 		&c.ResolvedAt,
 		&c.ClosedAt,
 		&c.CreatedAt,
 		&c.UpdatedAt,
-		&c.Version,
 		&c.RowVersion,
 	)
 	return c, err
@@ -1314,9 +1328,9 @@ func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams
 	const query = `
 		INSERT INTO cases (
 			case_id, tenant_id, legal_entity_id, workflow_instance_id,
-			case_type, case_state, title, description, assigned_to_principal_id,
-			opened_at, created_by_principal_id
-		) VALUES (gen_random_uuid(), $1, $2, $3, $4, 'OPEN', $5, $6, $7, NOW(), $8)
+			case_family, case_type, case_state, severity, confidentiality,
+			title, description, assigned_to_principal_id, created_by_principal_id
+		) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'OPEN', 'MEDIUM', 'INTERNAL', $6, $7, $8, $9)
 		RETURNING ` + caseColumns + `;`
 
 	var c *domain.Case
@@ -1328,7 +1342,7 @@ func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams
 		var scanErr error
 		c, scanErr = scanCase(tx.QueryRow(ctx, query,
 			tenantID, params.LegalEntityID, params.WorkflowInstanceID,
-			params.CaseType, params.Title, params.Description,
+			params.CaseFamily, params.CaseType, params.Title, params.Description,
 			params.AssignedToPrincipal, params.CreatedByPrincipalID))
 		if scanErr != nil {
 			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
@@ -1338,13 +1352,16 @@ func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams
 		}
 
 		// Write case.created event
-		return insertOutboxEventTx(ctx, tx, tenantID, "case.created", params.CorrelationID,
+		return insertOutboxEventTx(ctx, tx, tenantID, "case.created", "case", c.CaseID, params.CorrelationID,
 			params.LegalEntityID, "", params.CreatedByPrincipalID, map[string]any{
-				"case_id":            c.CaseID,
-				"case_type":          c.CaseType,
-				"case_state":         string(c.CaseState),
+				"case_id":             c.CaseID,
+				"case_family":         c.CaseFamily,
+				"case_type":           c.CaseType,
+				"case_state":          string(c.CaseState),
+				"severity":            c.Severity,
+				"confidentiality":     c.Confidentiality,
 				"workflow_instance_id": c.WorkflowInstanceID,
-				"version":            c.Version,
+				"row_version":         c.RowVersion,
 			})
 	})
 	if err != nil {
@@ -1473,7 +1490,7 @@ func (s *PgStore) TransitionCase(ctx context.Context, params domain.TransitionCa
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 
-		if params.ExpectedVersion > 0 && current.Version != params.ExpectedVersion {
+		if params.ExpectedVersion > 0 && current.RowVersion != params.ExpectedVersion {
 			return domain.ErrConcurrencyConflict
 		}
 
@@ -1502,17 +1519,17 @@ func (s *PgStore) TransitionCase(ctx context.Context, params domain.TransitionCa
 		// Validate terminal state requirements
 		switch params.NewState {
 		case domain.CaseStateResolved:
-			if params.ResolutionReason == nil || *params.ResolutionReason == "" {
+			if params.Reason == nil || *params.Reason == "" {
 				return domain.ErrInvalidField
 			}
 		case domain.CaseStateClosed:
-			if params.CloseReason == nil || *params.CloseReason == "" {
+			if params.Reason == nil || *params.Reason == "" {
 				return domain.ErrInvalidField
 			}
 		}
 
 		// Build update query
-		setClauses := []string{"case_state = $1", "updated_at = NOW()", "version = version + 1"}
+		setClauses := []string{"case_state = $1", "updated_at = NOW()", "row_version = row_version + 1"}
 		args := []any{params.NewState}
 		argIdx := 2
 
@@ -1520,22 +1537,29 @@ func (s *PgStore) TransitionCase(ctx context.Context, params domain.TransitionCa
 		now := time.Now().UTC()
 
 		switch params.NewState {
-		case domain.CaseStateInReview:
-			eventType = "case.in_review"
+		case domain.CaseStateTriaged:
+			setClauses = append(setClauses, "triaged_at = $"+strconv.Itoa(argIdx))
+			args = append(args, now)
+			argIdx++
+			eventType = "case.triaged"
+		case domain.CaseStateInProgress:
+			eventType = "case.started"
+		case domain.CaseStateWaitingInternal:
+			eventType = "case.waiting_internal"
+		case domain.CaseStateWaitingExternal:
+			eventType = "case.waiting_external"
 		case domain.CaseStateResolved:
-			setClauses = append(setClauses,
-				"resolved_at = $"+strconv.Itoa(argIdx), "close_reason = $"+strconv.Itoa(argIdx+1))
-			args = append(args, now, *params.ResolutionReason)
-			argIdx += 2
+			setClauses = append(setClauses, "resolved_at = $"+strconv.Itoa(argIdx))
+			args = append(args, now)
+			argIdx++
 			eventType = "case.resolved"
 		case domain.CaseStateClosed:
-			setClauses = append(setClauses,
-				"closed_at = $"+strconv.Itoa(argIdx), "close_reason = $"+strconv.Itoa(argIdx+1))
-			args = append(args, now, *params.CloseReason)
-			argIdx += 2
+			setClauses = append(setClauses, "closed_at = $"+strconv.Itoa(argIdx))
+			args = append(args, now)
+			argIdx++
 			eventType = "case.closed"
-		case domain.CaseStateEscalated:
-			eventType = "case.escalated"
+		case domain.CaseStateReopened:
+			eventType = "case.reopened"
 		}
 
 		args = append(args, params.CaseID, tenantID)
@@ -1555,25 +1579,26 @@ func (s *PgStore) TransitionCase(ctx context.Context, params domain.TransitionCa
 
 		// Write case event
 		payload := map[string]any{
-			"case_id":        updated.CaseID,
-			"case_type":      updated.CaseType,
-			"previous_state": current.CaseState,
-			"new_state":      updated.CaseState,
-			"version":        updated.Version,
+			"case_id":         updated.CaseID,
+			"case_family":     updated.CaseFamily,
+			"case_type":       updated.CaseType,
+			"previous_state":  current.CaseState,
+			"new_state":       updated.CaseState,
+			"row_version":     updated.RowVersion,
 		}
 
 		switch params.NewState {
 		case domain.CaseStateResolved:
 			payload["resolved_by"] = params.ActorPrincipalID
-			payload["resolution_reason"] = *params.ResolutionReason
+			payload["resolution_reason"] = *params.Reason
 		case domain.CaseStateClosed:
 			payload["closed_by"] = params.ActorPrincipalID
-			payload["close_reason"] = *params.CloseReason
-		case domain.CaseStateEscalated:
-			payload["escalated_by"] = params.ActorPrincipalID
+			payload["close_reason"] = *params.Reason
+		case domain.CaseStateReopened:
+			payload["reopened_by"] = params.ActorPrincipalID
 		}
 
-		return insertOutboxEventTx(ctx, tx, tenantID, eventType, params.CorrelationID,
+		return insertOutboxEventTx(ctx, tx, tenantID, eventType, "case", updated.CaseID, params.CorrelationID,
 			updated.LegalEntityID, "", params.ActorPrincipalID, payload)
 	})
 	if err != nil {

@@ -293,6 +293,40 @@ paths:
         '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/available-actions:
+    get:
+      tags: [instances]
+      operationId: getAvailableActions
+      description: Returns the actions available for the current principal on this workflow (ST-2).
+      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
+      responses:
+        '200':
+          description: Available actions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AvailableActions'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/transition-history:
+    get:
+      tags: [instances]
+      operationId: getTransitionHistory
+      description: Returns the complete transition history for a workflow (ST-3).
+      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
+      responses:
+        '200':
+          description: Transition history
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/TransitionHistoryEntry'}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
   /v1/workflows/{workflow_instance_id}/verify-release:
     post:
       tags: [lifecycle]
@@ -628,3 +662,28 @@ components:
         expiry_hours: {type: [integer, 'null']}
         escalation_target: {type: [string, 'null']}
       additionalProperties: true
+    AvailableActions:
+      type: object
+      properties:
+        workflow_instance_id: {type: string}
+        current_stage: {type: integer}
+        current_status: {type: string}
+        actions: {type: array, items: {type: string}}
+        principal_id: {type: string}
+        can_act: {type: boolean}
+        reason: {type: string}
+    TransitionHistoryEntry:
+      type: object
+      properties:
+        transition_id: {type: string}
+        workflow_instance_id: {type: string}
+        from_stage: {type: integer}
+        to_stage: {type: integer}
+        from_status: {type: string}
+        to_status: {type: string}
+        actor_principal_id: {type: string}
+        action_type: {type: string}
+        rationale: {type: string}
+        decision_id: {type: [string, 'null']}
+        quorum: {type: 'object'}
+        occurred_at: {type: string, format: date-time}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -181,10 +182,17 @@ type stubStore struct {
 	approvalTransitions     []*domain.WorkflowTransition
 	approvalEvidenceErr     error
 
+	// WFC-04: Cases
+	caseCreated       *domain.Case
+	caseFindErr       error
+	caseList          []*domain.Case
+	caseTransitioned  *domain.Case
+	caseTransitionErr error
+
 	// For API-4 cursor paging tests
 	pendingApprovals       []*domain.WorkflowInstance
 	pendingNextCursor      *domain.PaginationCursor
-	pendingSubmissions     []*domain.FormSubmission
+	pendingSubmissionsList []*domain.FormSubmission
 	pendingSubNextCursor   *domain.PaginationCursor
 }
 
@@ -225,11 +233,31 @@ func (s *stubStore) GetValidationResult(_ context.Context, _, _ string) (*domain
 	return s.validationResult, s.getValidationResultErr
 }
 func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, p domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
-	if p.Cursor != nil && s.pendingSubNextCursor != nil {
-		// Return next page
-		return s.pendingSubmissions[1:], nil, s.listPendingErr
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 2
 	}
-	return s.pendingSubmissions[:2], s.pendingSubNextCursor, s.listPendingErr
+	start := 0
+	if p.Cursor != nil {
+		for i, sub := range s.pendingSubmissionsList {
+			if sub.SubmissionID == p.Cursor.InstanceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(s.pendingSubmissionsList) {
+		end = len(s.pendingSubmissionsList)
+	}
+	if start >= len(s.pendingSubmissionsList) {
+		return []*domain.FormSubmission{}, nil, s.listPendingErr
+	}
+	var nextCursor *domain.PaginationCursor
+	if end < len(s.pendingSubmissionsList) {
+		nextCursor = &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: s.pendingSubmissionsList[end-1].SubmissionID}
+	}
+	return s.pendingSubmissionsList[start:end], nextCursor, s.listPendingErr
 }
 func (s *stubStore) EscalateToWorkflow(_ context.Context, _ domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error) {
 	return s.escalateToInstance, s.escalateToTransitioned, s.escalateToErr
@@ -238,23 +266,72 @@ func (s *stubStore) RequestChanges(_ context.Context, _, _, _ string, _ *string,
 	return s.requestChangesErr
 }
 func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, p domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
-	if p.Cursor != nil && s.pendingNextCursor != nil {
-		// Return next page
-		return s.pendingApprovals[1:], nil, s.listPendingApprovalsErr
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 2
 	}
-	return s.pendingApprovals[:2], s.pendingNextCursor, s.listPendingApprovalsErr
+	start := 0
+	if p.Cursor != nil {
+		// Find the index after the cursor
+		for i, inst := range s.pendingApprovals {
+			if inst.WorkflowInstanceID == p.Cursor.InstanceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(s.pendingApprovals) {
+		end = len(s.pendingApprovals)
+	}
+	if start >= len(s.pendingApprovals) {
+		return []*domain.WorkflowInstance{}, nil, s.listPendingApprovalsErr
+	}
+	var nextCursor *domain.PaginationCursor
+	if end < len(s.pendingApprovals) {
+		nextCursor = &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: s.pendingApprovals[end-1].WorkflowInstanceID}
+	}
+	return s.pendingApprovals[start:end], nextCursor, s.listPendingApprovalsErr
 }
 func (s *stubStore) GetApprovalEvidence(_ context.Context, _ string) ([]*domain.WorkflowTransition, error) {
 	return s.approvalTransitions, s.approvalEvidenceErr
 }
-func (s *stubStore) CreateWorkflowDefinition(_ context.Context, _ domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
-	return s.workflowDefinition, s.definitionErr
-}
-func (s *stubStore) GetWorkflowDefinition(_ context.Context, _ domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
-	return s.workflowDefinition, s.definitionErr
-}
-func (s *stubStore) ListWorkflowDefinitions(_ context.Context, _ domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error) {
-	return s.workflowDefinitions, nil, s.definitionErr
+func (s *stubStore) ListWorkflowDefinitions(_ context.Context, p domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error) {
+	// Sort by workflow_type DESC, version DESC to match the real store
+	defs := make([]*domain.WorkflowDefinition, len(s.workflowDefinitions))
+	copy(defs, s.workflowDefinitions)
+	sort.Slice(defs, func(i, j int) bool {
+		if defs[i].WorkflowType != defs[j].WorkflowType {
+			return defs[i].WorkflowType > defs[j].WorkflowType
+		}
+		return defs[i].Version > defs[j].Version
+	})
+
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 2
+	}
+	start := 0
+	if p.Cursor != nil {
+		for i, def := range defs {
+			if def.WorkflowDefinitionID == p.Cursor.InstanceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(defs) {
+		end = len(defs)
+	}
+	if start >= len(defs) {
+		return []*domain.WorkflowDefinition{}, nil, s.definitionErr
+	}
+	var nextCursor *domain.PaginationCursor
+	if end < len(defs) {
+		nextCursor = &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: defs[end-1].WorkflowDefinitionID}
+	}
+	return defs[start:end], nextCursor, s.definitionErr
 }
 func (s *stubStore) SupersedeWorkflowDefinition(_ context.Context, _, _ string) error {
 	return s.definitionErr
@@ -267,6 +344,28 @@ func (s *stubStore) SuspendWorkflowDefinition(_ context.Context, _ string) error
 }
 func (s *stubStore) RetireWorkflowDefinition(_ context.Context, _ string) error {
 	return s.definitionErr
+}
+func (s *stubStore) CreateWorkflowDefinition(_ context.Context, p domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) GetWorkflowDefinition(_ context.Context, p domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+
+func (s *stubStore) CreateCase(_ context.Context, _ domain.CreateCaseParams) (*domain.Case, error) {
+	return s.caseCreated, s.caseFindErr
+}
+func (s *stubStore) FindCaseByID(_ context.Context, _ string) (*domain.Case, error) {
+	return s.caseCreated, s.caseFindErr
+}
+func (s *stubStore) ListCases(_ context.Context, _ domain.ListCasesFilter) ([]*domain.Case, error) {
+	return s.caseList, s.caseFindErr
+}
+func (s *stubStore) TransitionCase(_ context.Context, _ domain.TransitionCaseParams) (*domain.Case, bool, error) {
+	return s.caseTransitioned, true, s.caseTransitionErr
+}
+func (s *stubStore) FindCasesByWorkflowInstance(_ context.Context, _ string) ([]*domain.Case, error) {
+	return s.caseList, s.caseFindErr
 }
 
 func (s *stubStore) CreateWorkflow(_ context.Context, p domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
@@ -1405,7 +1504,7 @@ func TestListWorkflowDefinitions_API4Cursor(t *testing.T) {
 	r := newTestRouter(store)
 
 	// Page 1
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflow-definitions?limit=2", nil))
+	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflow-definitions?limit=2", nil), "reader-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1427,7 +1526,7 @@ func TestListWorkflowDefinitions_API4Cursor(t *testing.T) {
 	}
 
 	// Page 2
-	req = scoped(httptest.NewRequest(http.MethodGet, "/v1/workflow-definitions?limit=2&cursor="+resp1.NextCursor, nil))
+	req = scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflow-definitions?limit=2&cursor="+resp1.NextCursor, nil), "reader-1")
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1468,12 +1567,12 @@ func TestListPendingApprovals_API4Cursor(t *testing.T) {
 
 	store := &stubStore{
 		pendingApprovals: insts,
-		pendingNextCursor: &domain.PaginationCursor{WorkflowInstanceID: "inst-1", StageOrder: 1},
+		pendingNextCursor: &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: "inst-1"},
 	}
 	r := newTestRouter(store)
 
 	// Page 1
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/pending?limit=2", nil))
+	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflows/pending?limit=2", nil), "reader-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1495,7 +1594,7 @@ func TestListPendingApprovals_API4Cursor(t *testing.T) {
 	}
 
 	// Page 2
-	req = scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/pending?limit=2&cursor="+resp1.NextCursor, nil))
+	req = scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflows/pending?limit=2&cursor="+resp1.NextCursor, nil), "reader-1")
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1525,18 +1624,24 @@ func TestListPendingSubmissions_API4Cursor(t *testing.T) {
 			SubmissionID: fmt.Sprintf("sub-%d", i),
 			FormID:       "form-1",
 			Status:       "PENDING",
-			RowVersion:   1,
 		}
 	}
 
+	form := &domain.FormDefinition{
+		FormID:       "form-1",
+		TenantID:     "11111111-1111-4111-8111-111111111111",
+		LegalEntityID: "22222222-2222-4222-8222-222222222222",
+		Status:       "PUBLISHED",
+	}
+
 	store := &stubStore{
-		pendingSubmissions: subs,
-		pendingSubNextCursor: &domain.PaginationCursor{SubmissionID: "sub-1"},
+		form:                   form,
+		pendingSubmissionsList: subs,
 	}
 	r := newTestRouter(store)
 
 	// Page 1
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/forms/form-1/pending-submissions?limit=2", nil))
+	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/forms/form-1/pending-submissions?limit=2", nil), "reader-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1558,7 +1663,7 @@ func TestListPendingSubmissions_API4Cursor(t *testing.T) {
 	}
 
 	// Page 2
-	req = scoped(httptest.NewRequest(http.MethodGet, "/v1/forms/form-1/pending-submissions?limit=2&cursor="+resp1.NextCursor, nil))
+	req = scopedAs(httptest.NewRequest(http.MethodGet, "/v1/forms/form-1/pending-submissions?limit=2&cursor="+resp1.NextCursor, nil), "reader-1")
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

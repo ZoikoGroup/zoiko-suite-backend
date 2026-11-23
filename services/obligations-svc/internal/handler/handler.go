@@ -69,23 +69,6 @@ type ObligationStore interface {
 	ListMappings(ctx context.Context, definitionID string) ([]*domain.ObligationEntityMapping, error)
 	FindMapping(ctx context.Context, definitionID, mappingID string) (*domain.ObligationEntityMapping, error)
 	EndMapping(ctx context.Context, definitionID, mappingID string, effectiveTo time.Time, actor, correlationID string) (*domain.ObligationEntityMapping, error)
-
-	// ── Compliance Status ─────────────────────────────────────────────────────
-	CreateComplianceStatus(ctx context.Context, params domain.CreateComplianceStatusParams) (*domain.ComplianceStatus, error)
-	FindComplianceStatusByID(ctx context.Context, complianceStatusID string) (*domain.ComplianceStatus, error)
-	ListComplianceStatuses(ctx context.Context, filter domain.ListComplianceStatusFilter) ([]*domain.ComplianceStatus, error)
-	UpdateComplianceStatus(ctx context.Context, complianceStatusID, statusCode, statusReason, evidenceSufficiencyState string, expectedVersion int, actorID, correlationID string) (*domain.ComplianceStatus, error)
-
-	// ── Exception Cases ───────────────────────────────────────────────────────
-	CreateExceptionCase(ctx context.Context, params domain.CreateExceptionCaseParams) (*domain.ExceptionCase, error)
-	FindExceptionCaseByID(ctx context.Context, exceptionCaseID string) (*domain.ExceptionCase, error)
-	ListExceptionCases(ctx context.Context, filter domain.ListExceptionCasesFilter) ([]*domain.ExceptionCase, error)
-	UpdateExceptionCaseStatus(ctx context.Context, exceptionCaseID, caseStatus string, expectedVersion int, actorID, correlationID string) (*domain.ExceptionCase, error)
-
-	// ── Escalation Records ────────────────────────────────────────────────────
-	CreateEscalationRecord(ctx context.Context, params domain.CreateEscalationRecordParams) (*domain.EscalationRecord, error)
-	FindEscalationRecordByID(ctx context.Context, escalationRecordID string) (*domain.EscalationRecord, error)
-	ListEscalationRecords(ctx context.Context, exceptionCaseID string, limit int) ([]*domain.EscalationRecord, error)
 }
 
 // Handler holds all HTTP handler methods.
@@ -340,7 +323,6 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/obligations/{obligation_id}/clocks/{clock_id}/waive", h.WaiveClock)
 	r.Post("/v1/obligations/{obligation_id}/clocks/{clock_id}/not-applicable", h.NotApplicableClock)
 	registerCompletionRoutes(r, h)
-	RegisterComplianceRoutes(r, h)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {

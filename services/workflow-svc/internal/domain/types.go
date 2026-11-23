@@ -470,53 +470,94 @@ func (e errorString) Error() string { return string(e) }
 // may link to one or more workflows for approval steps. Cases have their own
 // lifecycle and can exist independently of workflows.
 //
-// Case states: OPEN → IN_REVIEW → RESOLVED / CLOSED / ESCALATED
+// Case families: FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL
+// Case states: OPEN → TRIAGED → IN_PROGRESS → WAITING_INTERNAL / WAITING_EXTERNAL → RESOLVED / CLOSED / REOPENED
 // Terminal states: RESOLVED, CLOSED
+// Confidentiality: INTERNAL, RESTRICTED, PRIVILEGED
+// Severity: LOW, MEDIUM, HIGH, CRITICAL
+
+type CaseFamily string
+
+const (
+	CaseFamilyFinancial        CaseFamily = "FINANCIAL"
+	CaseFamilyPayrollHR        CaseFamily = "PAYROLL_HR"
+	CaseFamilyLegalCompliance  CaseFamily = "LEGAL_COMPLIANCE"
+	CaseFamilySecurityPrivacy  CaseFamily = "SECURITY_PRIVACY"
+	CaseFamilyOperational      CaseFamily = "OPERATIONAL"
+)
 
 type CaseState string
 
 const (
-	CaseStateOpen       CaseState = "OPEN"
-	CaseStateInReview   CaseState = "IN_REVIEW"
-	CaseStateResolved   CaseState = "RESOLVED"
-	CaseStateClosed     CaseState = "CLOSED"
-	CaseStateEscalated  CaseState = "ESCALATED"
+	CaseStateOpen             CaseState = "OPEN"
+	CaseStateTriaged          CaseState = "TRIAGED"
+	CaseStateInProgress       CaseState = "IN_PROGRESS"
+	CaseStateWaitingInternal  CaseState = "WAITING_INTERNAL"
+	CaseStateWaitingExternal  CaseState = "WAITING_EXTERNAL"
+	CaseStateResolved         CaseState = "RESOLVED"
+	CaseStateClosed           CaseState = "CLOSED"
+	CaseStateReopened         CaseState = "REOPENED"
 )
 
 var CaseStates = map[CaseState]bool{
-	CaseStateOpen: true, CaseStateInReview: true, CaseStateResolved: true,
-	CaseStateClosed: true, CaseStateEscalated: true,
+	CaseStateOpen: true, CaseStateTriaged: true, CaseStateInProgress: true,
+	CaseStateWaitingInternal: true, CaseStateWaitingExternal: true,
+	CaseStateResolved: true, CaseStateClosed: true, CaseStateReopened: true,
 }
 
+type CaseConfidentiality string
+
+const (
+	CaseConfidentialityInternal      CaseConfidentiality = "INTERNAL"
+	CaseConfidentialityRestricted    CaseConfidentiality = "RESTRICTED"
+	CaseConfidentialityPrivileged    CaseConfidentiality = "PRIVILEGED"
+)
+
+type CaseSeverity string
+
+const (
+	CaseSeverityLow      CaseSeverity = "LOW"
+	CaseSeverityMedium   CaseSeverity = "MEDIUM"
+	CaseSeverityHigh     CaseSeverity = "HIGH"
+	CaseSeverityCritical CaseSeverity = "CRITICAL"
+)
+
 type Case struct {
-	CaseID              string    `json:"case_id"`
-	TenantID            string    `json:"tenant_id"`
-	LegalEntityID       string    `json:"legal_entity_id"`
-	WorkflowInstanceID  *string   `json:"workflow_instance_id,omitempty"` // optional link
-	CaseType            string    `json:"case_type"`                    // INVESTIGATION, DISPUTE, EXCEPTION, etc.
-	CaseState           CaseState `json:"case_state"`
-	Title               string    `json:"title"`
-	Description         string    `json:"description"`
-	AssignedToPrincipal *string   `json:"assigned_to_principal,omitempty"`
-	OpenedAt            time.Time `json:"opened_at"`
-	ResolvedAt          *time.Time `json:"resolved_at,omitempty"`
-	ClosedAt            *time.Time `json:"closed_at,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
-	Version             int       `json:"version"`
-	RowVersion          int       `json:"row_version"`
+	CaseID                string              `json:"case_id"`
+	TenantID              string              `json:"tenant_id"`
+	LegalEntityID         string              `json:"legal_entity_id"`
+	WorkflowInstanceID    *string             `json:"workflow_instance_id,omitempty"` // optional link
+	CaseFamily            CaseFamily          `json:"case_family"`
+	CaseType              string              `json:"case_type"`                    // INVESTIGATION, DISPUTE, EXCEPTION, etc.
+	CaseState             CaseState           `json:"case_state"`
+	Severity              CaseSeverity        `json:"severity"`
+	Confidentiality       CaseConfidentiality `json:"confidentiality"`
+	Title                 string              `json:"title"`
+	Description           string              `json:"description"`
+	AssignedToPrincipal   *string             `json:"assigned_to_principal,omitempty"`
+	CreatedByPrincipalID  string              `json:"created_by_principal_id"`
+	CanonicalCaseID       *string             `json:"canonical_case_id,omitempty"`   // for merge lineage
+	SplitFromCaseID       *string             `json:"split_from_case_id,omitempty"`  // for split lineage
+	OpenedAt              time.Time           `json:"opened_at"`
+	TriagedAt             *time.Time          `json:"triaged_at,omitempty"`
+	ResolvedAt            *time.Time          `json:"resolved_at,omitempty"`
+	ClosedAt              *time.Time          `json:"closed_at,omitempty"`
+	CreatedAt             time.Time           `json:"created_at"`
+	UpdatedAt             time.Time           `json:"updated_at"`
+	RowVersion            int                 `json:"row_version"`
 }
 
 type CreateCaseParams struct {
-	TenantID       string
-	LegalEntityID  string
-	WorkflowInstanceID *string
-	CaseType       string
-	Title          string
-	Description    string
-	AssignedToPrincipal *string
+	TenantID             string
+	LegalEntityID        string
+	WorkflowInstanceID   *string
+	CaseFamily           CaseFamily
+	CaseType             string
+	Title                string
+	Description          string
+	AssignedToPrincipal  *string
 	CreatedByPrincipalID string
-	CorrelationID  string
+	CorrelationID        string
 }
 
 type TransitionCaseParams struct {
@@ -525,33 +566,96 @@ type TransitionCaseParams struct {
 	ExpectedVersion   int
 	ActorPrincipalID  string
 	CorrelationID     string
-	ResolutionReason  *string // for RESOLVED
-	CloseReason       *string // for CLOSED
+	Reason            *string // for transitions
 }
 
 type ListCasesFilter struct {
-	TenantID       string
-	LegalEntityID  string
-	WorkflowInstanceID *string
-	CaseType       string
-	CaseState      CaseState
-	Limit          int
-	Offset         int
-	AfterCreatedAt *time.Time
-	AfterID        string
+	TenantID            string
+	LegalEntityID       string
+	WorkflowInstanceID  *string
+	CaseFamily          CaseFamily
+	CaseType            string
+	CaseState           CaseState
+	Confidentiality     CaseConfidentiality
+	AssignedToPrincipal *string
+	Limit               int
+	Offset              int
+	AfterCreatedAt      *time.Time
+	AfterID             string
 }
 
 var ErrCaseNotFound = errorString("case not found")
 var ErrInvalidCaseTransition = errorString("invalid case state transition")
 
-// Case state transitions
+// Case state transitions per R-001 §6.3
 var CaseStateTransitions = map[CaseState][]CaseState{
-	CaseStateOpen:      {CaseStateInReview, CaseStateEscalated, CaseStateClosed},
-	CaseStateInReview:  {CaseStateResolved, CaseStateClosed, CaseStateEscalated},
-	CaseStateEscalated: {CaseStateInReview, CaseStateResolved, CaseStateClosed},
-	// Terminal states: no transitions out
-	CaseStateResolved:  {},
-	CaseStateClosed:    {},
+	CaseStateOpen:             {CaseStateTriaged, CaseStateClosed},
+	CaseStateTriaged:          {CaseStateInProgress, CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateClosed},
+	CaseStateInProgress:       {CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateResolved, CaseStateClosed},
+	CaseStateWaitingInternal:  {CaseStateInProgress, CaseStateResolved, CaseStateClosed},
+	CaseStateWaitingExternal:  {CaseStateInProgress, CaseStateResolved, CaseStateClosed},
+	CaseStateResolved:         {CaseStateClosed, CaseStateReopened},
+	CaseStateClosed:           {CaseStateReopened},
+	CaseStateReopened:         {CaseStateTriaged, CaseStateInProgress, CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateClosed},
+}
+
+// CaseMember represents a member of a case with a role
+type CaseMember struct {
+	CaseMemberID         string     `json:"case_member_id"`
+	CaseID               string     `json:"case_id"`
+	PrincipalID          string     `json:"principal_id"`
+	Role                 string     `json:"role"` // OWNER, ASSIGNEE, OBSERVER
+	AddedAt              time.Time  `json:"added_at"`
+	AddedByPrincipalID   string     `json:"added_by_principal_id"`
+	RemovedAt            *time.Time `json:"removed_at,omitempty"`
+	RemovedByPrincipalID *string    `json:"removed_by_principal_id,omitempty"`
+}
+
+// CaseNote represents an append-only versioned note on a case
+type CaseNote struct {
+	CaseNoteID          string    `json:"case_note_id"`
+	CaseID              string    `json:"case_id"`
+	PrincipalID         string    `json:"principal_id"`
+	Content             string    `json:"content"`
+	Visibility          string    `json:"visibility"` // INTERNAL, RESTRICTED, PRIVILEGED
+	EvidenceRefs        []string  `json:"evidence_refs"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
+	Version             int       `json:"version"`
+	PreviousNoteID      *string   `json:"previous_note_id,omitempty"`
+}
+
+// CaseLink represents a read-only link to a domain object
+type CaseLink struct {
+	CaseLinkID           string    `json:"case_link_id"`
+	CaseID               string    `json:"case_id"`
+	DomainObjectType     string    `json:"domain_object_type"`
+	DomainObjectID       string    `json:"domain_object_id"`
+	LinkedAt             time.Time `json:"linked_at"`
+	LinkedByPrincipalID  string    `json:"linked_by_principal_id"`
+}
+
+// CaseTransition represents an append-only transition log entry
+type CaseTransition struct {
+	CaseTransitionID   string     `json:"case_transition_id"`
+	CaseID             string     `json:"case_id"`
+	FromState          *CaseState `json:"from_state,omitempty"`
+	ToState            CaseState  `json:"to_state"`
+	ActorPrincipalID   string     `json:"actor_principal_id"`
+	Reason             *string    `json:"reason,omitempty"`
+	TriggeredBy        string     `json:"triggered_by"` // TRIAGE, START, WAIT_INTERNAL, WAIT_EXTERNAL, RESOLVE, CLOSE, REOPEN, MERGE, SPLIT
+	CorrelationID      *string    `json:"correlation_id,omitempty"`
+	CausationID        *string    `json:"causation_id,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+}
+
+// CaseAlias represents a merge alias (source case merged into canonical)
+type CaseAlias struct {
+	AliasID               string    `json:"alias_id"`
+	CanonicalCaseID       string    `json:"canonical_case_id"`
+	AliasCaseID           string    `json:"alias_case_id"`
+	MergedAt              time.Time `json:"merged_at"`
+	MergedByPrincipalID   string    `json:"merged_by_principal_id"`
 }
 
 // =============================================================================
