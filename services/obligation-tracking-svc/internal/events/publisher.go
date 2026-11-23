@@ -2,10 +2,9 @@ package events
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	kafka "github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
@@ -42,11 +41,6 @@ type PublishParams struct {
 	Payload       interface{}
 }
 
-// Publisher is the interface for emitting domain events.
-type Publisher interface {
-	Publish(ctx context.Context, params PublishParams) error
-}
-
 // MessageWriter is the one method KafkaPublisher needs from *kafka.Writer.
 // Narrowed to an interface purely so publisher_test.go can assert envelope
 // content without a live broker.
@@ -76,11 +70,13 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, topic string, logger *zap
 	return &KafkaPublisher{writer: writer, topic: topic, logger: logger}
 }
 
-func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
-	evt := Event{
-		// A fresh UUID per publish, not a deterministic string — see
-		// docs/architecture/known-gaps.md's event_id collision writeup.
-		EventID:       "evt-" + uuid.New().String(),
+// NewEvent builds the envelope for one event, exactly as the old direct
+// Publish did, with event_id derived from the outbox row id so it is stable
+// across delivery retries. The store writes it to the transactional outbox
+// in the same transaction as the change it describes.
+func NewEvent(outboxEventID string, params PublishParams) Event {
+	return Event{
+		EventID:       "evt-" + outboxEventID,
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
 		SchemaVersion: "1.0",
@@ -93,16 +89,24 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		OccurredAt:    time.Now().UTC(),
 		Payload:       params.Payload,
 	}
-	data, err := json.Marshal(evt)
-	if err != nil {
-		return err
-	}
-	err = p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(params.ObligationID),
-		Value: data,
+}
+
+// PublishOutbox publishes one already-built envelope, keyed by
+// params.ObligationID as before. The stable outbox event id travels as the
+// X-Event-ID header across every retry so consumers can de-duplicate
+// at-least-once delivery. A failure is RETURNED (the outbox relay keeps the
+// row and retries) — the old Publish logged it and returned nil, dropping
+// the event.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: []kafka.Header{{Key: "X-Event-ID", Value: []byte(outboxEventID)}},
 	})
 	if err != nil {
-		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", params.EventType), zap.Error(err))
+		p.logger.Warn("outbox kafka write failed",
+			zap.String("outbox_event_id", outboxEventID), zap.String("topic", p.topic), zap.Error(err))
+		return fmt.Errorf("kafka write: %w", err)
 	}
 	return nil
 }
