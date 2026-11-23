@@ -507,7 +507,14 @@ settled:
 	if err != nil {
 		return fail(DueNoCalendar, "time zone "+tz+" cannot be loaded")
 	}
-	at := time.Date(due.Year(), due.Month(), due.Day(), h, mi, s, ns, loc).UTC()
+	at, rule := ResolveLocalInstant(due.Year(), due.Month(), due.Day(), h, mi, s, ns, loc)
+	switch rule {
+	case LocalTimeNonexistent:
+		step("%02d:%02d on %s does not exist in %s (clocks go forward): rule %s, the first instant after the gap", h, mi, res.DueDate, tz, rule)
+	case LocalTimeAmbiguous:
+		step("%02d:%02d on %s occurs twice in %s (clocks go back): rule %s, the earlier occurrence", h, mi, res.DueDate, tz, rule)
+	}
+	at = at.UTC()
 	res.DueAt = &at
 	if res.Timezone == "" {
 		res.Timezone = "UTC"
@@ -606,4 +613,62 @@ func SelectionDate(f DueFacts) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+// Local wall-clock resolution (R-001 §7.3, R-INV-18). Go's time.Date does not
+// guarantee which offset it picks for an ambiguous local time and silently
+// moves a nonexistent one, so the due instant is resolved by a documented,
+// deterministic rule instead:
+//   - a wall time that exists once maps to that instant (LocalTimeExact);
+//   - a wall time inside a forward gap (spring forward) does not exist and
+//     resolves to the first instant after the gap, the transition itself
+//     (LocalTimeNonexistent);
+//   - a wall time inside a backward fold (fall back) occurs twice and resolves
+//     to the earlier occurrence (LocalTimeAmbiguous).
+const (
+	LocalTimeExact       = "EXACT"
+	LocalTimeNonexistent = "NONEXISTENT_FIRST_INSTANT_AFTER_GAP"
+	LocalTimeAmbiguous   = "AMBIGUOUS_EARLIER_OCCURRENCE"
+)
+
+// ResolveLocalInstant returns the instant of a wall-clock time in loc and the
+// rule that produced it (one of the LocalTime* constants).
+func ResolveLocalInstant(y int, mo time.Month, d, h, mi, s, ns int, loc *time.Location) (time.Time, string) {
+	wall := time.Date(y, mo, d, h, mi, s, ns, time.UTC) // the wall clock read as if it were UTC
+	// Any instant showing this wall time lies within ±14h of it (the widest
+	// offsets in use), so the offsets in force over ±26h cover every candidate.
+	offsets := map[int]bool{}
+	for _, probe := range []time.Duration{-26 * time.Hour, -14 * time.Hour, 0, 14 * time.Hour, 26 * time.Hour} {
+		_, off := wall.Add(probe).In(loc).Zone()
+		offsets[off] = true
+	}
+	var cands []time.Time
+	for off := range offsets {
+		t := wall.Add(-time.Duration(off) * time.Second)
+		lt := t.In(loc)
+		if lt.Year() == y && lt.Month() == mo && lt.Day() == d && lt.Hour() == h && lt.Minute() == mi && lt.Second() == s && lt.Nanosecond() == ns {
+			cands = append(cands, t)
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].Before(cands[j]) })
+	switch {
+	case len(cands) == 1:
+		return cands[0].In(loc), LocalTimeExact
+	case len(cands) > 1:
+		return cands[0].In(loc), LocalTimeAmbiguous
+	}
+	// A gap: find the transition, the first instant whose offset is the one in
+	// force after the gap, by bisection on whole seconds (zone transitions fall
+	// on whole seconds).
+	lo, hi := wall.Add(-26*time.Hour).Unix(), wall.Add(26*time.Hour).Unix()
+	_, after := time.Unix(hi, 0).In(loc).Zone()
+	for hi-lo > 1 {
+		mid := lo + (hi-lo)/2
+		if _, off := time.Unix(mid, 0).In(loc).Zone(); off == after {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return time.Unix(hi, 0).In(loc), LocalTimeNonexistent
 }

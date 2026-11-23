@@ -594,6 +594,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 **Critical Constraint**
  Historical actions must always be explainable against the rule set active at time of execution.
 
+- Due-instant rule for daylight-saving changes (recorded 23 Nov 2026, JR-DST-1): `CalculateDueDate` resolves the authority-local cutoff or end of day through `domain.ResolveLocalInstant` (`services/jurisdiction-rules-svc/internal/domain/obligations.go`). A local time that does not exist (clocks go forward) resolves to the first instant after the gap; a local time that occurs twice (clocks go back) resolves to the earlier occurrence. The calculation's explanation names the rule applied (`NONEXISTENT_FIRST_INSTANT_AFTER_GAP` or `AMBIGUOUS_EARLIER_OCCURRENCE`), satisfying R-001 §7.3 and R-INV-18.
+
 ## **8.3 Authorization Service**
 
 **Purpose**
