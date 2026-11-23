@@ -113,12 +113,11 @@ func producedEventTypes() []string {
 		events.EventPasswordResetRequest,
 		events.EventPasswordResetDecided,
 		events.EventPasswordResetExpired,
-		// IC-17: reserved for future emission (declared in asyncapi.yaml).
-		"identity.subject.invited",
-		"identity.idp.registered",
-		"identity.idp.status_changed",
-		"identity.federation.login",
-		"identity.group_role_mapping.proposed",
+		// D1-1.F22 (23 Nov 2026): identity.subject.invited, identity.idp.registered,
+		// identity.idp.status_changed, identity.federation.login and
+		// identity.group_role_mapping.proposed were declared "reserved" with no
+		// producer, which let TestEveryPublishedContractEventIsProduced pass for
+		// events nothing emits. They are out of the contract until a producer exists.
 		// EventSubjectInvited, EventIdPRegistered, EventIdPStatusChanged,
 		// EventFederatedLogin, EventGroupMappingProposed, EventGroupMappingDecided,
 		// EventGroupMembershipChange, EventSCIMConnectionCreated,

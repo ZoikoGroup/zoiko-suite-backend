@@ -88,11 +88,6 @@ channels:
           - $ref: "#/components/messages/PasswordResetRequested"
           - $ref: "#/components/messages/PasswordResetDecided"
           - $ref: "#/components/messages/PasswordResetExpired"
-          - $ref: "#/components/messages/SubjectInvited"
-          - $ref: "#/components/messages/IdPRegistered"
-          - $ref: "#/components/messages/IdPStatusChanged"
-          - $ref: "#/components/messages/FederatedLogin"
-          - $ref: "#/components/messages/GroupMappingProposed"
           - $ref: "#/components/messages/StepUpSucceeded"
           - $ref: "#/components/messages/StepUpFailed"
           - $ref: "#/components/messages/TenantContextCacheInvalidated"
@@ -580,56 +575,6 @@ components:
       summary: |
         IC-13. Written when a reset request's ExpiresAt is reached while still
         PENDING_APPROVAL. Payload: request_id, principal_id (the subject), reason.
-      payload:
-        allOf:
-          - $ref: "#/components/schemas/Envelope"
-          - type: object
-
-    SubjectInvited:
-      name: identity.subject.invited
-      title: A human subject was invited to activate their account
-      summary: |
-        IC-17. Reserved for future use when invitation flow is implemented.
-      payload:
-        allOf:
-          - $ref: "#/components/schemas/Envelope"
-          - type: object
-
-    IdPRegistered:
-      name: identity.idp.registered
-      title: An external identity provider was registered for a tenant
-      summary: |
-        IC-17. Reserved for future use when IdP registration flow is implemented.
-      payload:
-        allOf:
-          - $ref: "#/components/schemas/Envelope"
-          - type: object
-
-    IdPStatusChanged:
-      name: identity.idp.status_changed
-      title: An external identity provider's status changed
-      summary: |
-        IC-17. Reserved for future use when IdP status changes are implemented.
-      payload:
-        allOf:
-          - $ref: "#/components/schemas/Envelope"
-          - type: object
-
-    FederatedLogin:
-      name: identity.federation.login
-      title: A user logged in via an external identity provider
-      summary: |
-        IC-17. Reserved for future use when federated login events are emitted.
-      payload:
-        allOf:
-          - $ref: "#/components/schemas/Envelope"
-          - type: object
-
-    GroupMappingProposed:
-      name: identity.group_role_mapping.proposed
-      title: A group-to-role mapping was proposed for an IdP
-      summary: |
-        IC-17. Reserved for future use when group mapping flow is implemented.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
