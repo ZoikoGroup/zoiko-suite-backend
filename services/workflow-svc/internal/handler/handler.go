@@ -56,6 +56,9 @@ type WorkflowStore interface {
 	TransitionCase(ctx context.Context, params domain.TransitionCaseParams) (*domain.Case, bool, error)
 	FindCasesByWorkflowInstance(ctx context.Context, workflowInstanceID string) ([]*domain.Case, error)
 
+	// Quorum helper
+	IsQuorumApprover(ctx context.Context, workflowStageID, principalID string) (bool, error)
+
 	// Workflow definitions (WFC-02) — see internal/store/pg_store.go.
 	CreateWorkflowDefinition(ctx context.Context, params domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error)
 	GetWorkflowDefinition(ctx context.Context, params domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error)

@@ -115,6 +115,8 @@ type WorkflowStage struct {
 	ApproverPrincipalID string `json:"approver_principal_id,omitempty"`
 	// RequiredApprovals is set only for a QUORUM stage — the N in N-of-M.
 	RequiredApprovals *int `json:"required_approvals,omitempty"`
+	// QuorumApprovers lists the eligible approvers for a QUORUM stage.
+	QuorumApprovers []string `json:"quorum_approvers,omitempty"`
 
 	// StageStatus: PENDING | APPROVED | REJECTED | SKIPPED.
 	StageStatus string `json:"stage_status"`
@@ -209,11 +211,20 @@ type CreateWorkflowParams struct {
 	Stages                    []CreateWorkflowStageInput
 	// DueAt is when the whole approval expires (R-001 Expire): past it, a
 	// PENDING or ESCALATED instance becomes EXPIRED. nil = no expiry.
-	DueAt *time.Time
+	DueAt        *time.Time
+	NextActionAt *time.Time
 	// Signatory, when set, binds the workflow to a verified policy-svc
 	// SIGNATORY_MATRIX decision (ZS-GOV-INT-002 §4.2); it is stored in the
 	// same transaction as the instance.
 	Signatory *SignatoryBinding
+	// ExpiryHours: an instance started from this definition expires this
+	// long after it starts (000020).
+	ExpiryHours *int
+	// R-001 §9.1 common columns
+	CreatedBy       string
+	Plane           string
+	DataClass       string
+	ResidencyRegion string
 }
 
 // SubmitActionParams holds input for approving or rejecting the current stage.
@@ -314,6 +325,21 @@ type WorkflowDefinition struct {
 	// escalated to when a stage deadline passes.
 	ExpiryHours      *int    `json:"expiry_hours,omitempty"`
 	EscalationTarget *string `json:"escalation_target,omitempty"`
+
+	// Publication lifecycle fields (WF-S22)
+	Status        *string    `json:"status,omitempty"` // DRAFT, VALIDATION_PENDING, VALIDATED, APPROVAL_PENDING, PUBLISHED, REJECTED, SUSPENDED, SUPERSEDED, RETIRED
+	EffectiveFrom *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+	ValidatedBy   *string    `json:"validated_by,omitempty"`
+	ValidatedAt   *time.Time `json:"validated_at,omitempty"`
+	ApprovedBy    *string    `json:"approved_by,omitempty"`
+	ApprovedAt    *time.Time `json:"approved_at,omitempty"`
+	PublishedBy   *string    `json:"published_by,omitempty"`
+	PublishedAt   *time.Time `json:"published_at,omitempty"`
+	Checksum      *string    `json:"checksum,omitempty"` // sha256 of canonical stages+settings
+
+	// Parsed stages (not stored in DB)
+	Stages []CreateWorkflowStageInput `json:"stages,omitempty"`
 }
 
 // CreateWorkflowDefinitionParams holds input for creating a workflow definition.
@@ -614,6 +640,7 @@ type CaseMember struct {
 // CaseNote represents an append-only versioned note on a case
 type CaseNote struct {
 	CaseNoteID     string    `json:"case_note_id"`
+	TenantID       string    `json:"tenant_id"`
 	CaseID         string    `json:"case_id"`
 	PrincipalID    string    `json:"principal_id"`
 	Content        string    `json:"content"`
@@ -628,6 +655,7 @@ type CaseNote struct {
 // CaseLink represents a read-only link to a domain object
 type CaseLink struct {
 	CaseLinkID          string    `json:"case_link_id"`
+	TenantID            string    `json:"tenant_id"`
 	CaseID              string    `json:"case_id"`
 	DomainObjectType    string    `json:"domain_object_type"`
 	DomainObjectID      string    `json:"domain_object_id"`
@@ -656,6 +684,278 @@ type CaseAlias struct {
 	AliasCaseID         string    `json:"alias_case_id"`
 	MergedAt            time.Time `json:"merged_at"`
 	MergedByPrincipalID string    `json:"merged_by_principal_id"`
+}
+
+// =============================================================================
+// WFC-04: Case Commands (WF-S2)
+// =============================================================================
+
+// TriageCaseParams holds input for triaging a case (OPEN → TRIAGED).
+type TriageCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Assignee         *string // optional assignee for the case
+	Meta             CommandMeta
+}
+
+// StartCaseParams holds input for starting a case (TRIAGED → IN_PROGRESS).
+type StartCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// WaitCaseParams holds input for waiting a case (IN_PROGRESS → WAITING_INTERNAL/EXTERNAL).
+type WaitCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	WaitType         string // "internal" or "external"
+	Reason           string
+	Meta             CommandMeta
+}
+
+// ResumeCaseParams holds input for resuming a case (WAITING_* → IN_PROGRESS).
+type ResumeCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// ResolveCaseParams holds input for resolving a case (IN_PROGRESS/WAITING_* → RESOLVED).
+type ResolveCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	OutcomeCode      string // mandatory per closure gate (WF-S3)
+	EvidenceRefs     []string
+	Meta             CommandMeta
+}
+
+// CloseCaseParams holds input for closing a case (RESOLVED → CLOSED).
+type CloseCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// ReopenCaseParams holds input for reopening a case (CLOSED/RESOLVED → REOPENED).
+type ReopenCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Reason           string // mandatory per WF-S3
+	Meta             CommandMeta
+}
+
+// MergeCaseParams holds input for merging cases into a canonical case.
+type MergeCaseParams struct {
+	CanonicalCaseID  string
+	AliasCaseID      string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// SplitCaseParams holds input for splitting a case into a new case.
+type SplitCaseParams struct {
+	SourceCaseID     string
+	NewCaseFamily    CaseFamily
+	NewCaseType      string
+	Title            string
+	Description      string
+	ActorPrincipalID string
+	CorrelationID    string
+	EvidenceScope    []string // subset of evidence refs to carry over
+	Meta             CommandMeta
+}
+
+// AddCaseMemberParams holds input for adding a member to a case.
+type AddCaseMemberParams struct {
+	CaseID           string
+	PrincipalID      string
+	Role             string // OWNER, ASSIGNEE, OBSERVER
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// RemoveCaseMemberParams holds input for removing a member from a case.
+type RemoveCaseMemberParams struct {
+	CaseID           string
+	PrincipalID      string
+	Role             string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// CreateCaseNoteParams holds input for creating a case note.
+type CreateCaseNoteParams struct {
+	CaseID        string
+	PrincipalID   string
+	Content       string
+	Visibility    string // INTERNAL, RESTRICTED, PRIVILEGED
+	EvidenceRefs  []string
+	CorrelationID string
+	Meta          CommandMeta
+}
+
+// UpdateCaseNoteParams holds input for updating a case note (creates new version).
+type UpdateCaseNoteParams struct {
+	CaseNoteID      string
+	PrincipalID     string
+	Content         string
+	Visibility      string
+	EvidenceRefs    []string
+	ExpectedVersion int
+	CorrelationID   string
+	Meta            CommandMeta
+}
+
+// CreateCaseLinkParams holds input for linking a domain object to a case.
+type CreateCaseLinkParams struct {
+	CaseID           string
+	DomainObjectType string
+	DomainObjectID   string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// CreateWorkItemParams holds input for creating a work item on a case.
+type CreateWorkItemParams struct {
+	TenantID            string
+	LegalEntityID       string
+	CaseID              *string
+	WorkflowInstanceID  *string
+	ItemType            string
+	Queue               *string
+	Role                *string
+	AssigneePrincipalID *string
+	Mandatory           bool
+	CompletionSchema    map[string]any
+	DueAt               *time.Time
+	ActorPrincipalID    string
+	CorrelationID       string
+	Meta                CommandMeta
+}
+
+// SatisfyWorkItemParams holds input for satisfying a work item.
+type SatisfyWorkItemParams struct {
+	WorkItemID       string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CompletionData   map[string]any
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// WaiveWorkItemParams holds input for waiving a mandatory work item.
+type WaiveWorkItemParams struct {
+	WorkItemID       string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	Reason           string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// TransferWorkItemParams holds input for transferring a work item to another case/workflow.
+type TransferWorkItemParams struct {
+	WorkItemID       string
+	ExpectedVersion  int
+	NewCaseID        *string
+	NewWorkflowID    *string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// OpenCaseFromObligationParams holds input for opening a case from an obligation milestone (WF-S7).
+type OpenCaseFromObligationParams struct {
+	SourceType       string // "obligation"
+	SourceID         string
+	Milestone        string
+	TenantID         string
+	LegalEntityID    string
+	CaseFamily       CaseFamily
+	CaseType         string
+	Title            string
+	Description      string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// WorkItem represents a generic work item for cases and workflows (WFC-02).
+type WorkItem struct {
+	WorkItemID          string         `json:"work_item_id"`
+	TenantID            string         `json:"tenant_id"`
+	LegalEntityID       string         `json:"legal_entity_id"`
+	CaseID              *string        `json:"case_id,omitempty"`
+	WorkflowInstanceID  *string        `json:"workflow_instance_id,omitempty"`
+	ItemType            string         `json:"item_type"` // APPROVAL, REVIEW, INVESTIGATION, etc.
+	Queue               *string        `json:"queue,omitempty"`
+	Role                *string        `json:"role,omitempty"`
+	AssigneePrincipalID *string        `json:"assignee_principal_id,omitempty"`
+	State               string         `json:"state"` // UNASSIGNED, CLAIMED, COMPLETED, CANCELLED
+	Mandatory           bool           `json:"mandatory"`
+	CompletionSchema    map[string]any `json:"completion_schema,omitempty"`
+	DueAt               *time.Time     `json:"due_at,omitempty"`
+	CreatedAt           time.Time      `json:"created_at"`
+	UpdatedAt           time.Time      `json:"updated_at"`
+	RowVersion          int            `json:"row_version"`
+}
+
+// WorkItemAssignment represents the assignment history of a work item.
+type WorkItemAssignment struct {
+	WorkItemAssignmentID string    `json:"work_item_assignment_id"`
+	WorkItemID           string    `json:"work_item_id"`
+	PreviousAssigneeID   *string   `json:"previous_assignee_id,omitempty"`
+	NewAssigneeID        string    `json:"new_assignee_id"`
+	ActorPrincipalID     string    `json:"actor_principal_id"`
+	Reason               *string   `json:"reason,omitempty"`
+	AssignedAt           time.Time `json:"assigned_at"`
+}
+
+type ListWorkItemsFilter struct {
+	TenantID            string
+	LegalEntityID       string
+	CaseID              *string
+	WorkflowInstanceID  *string
+	ItemType            string
+	Queue               *string
+	AssigneePrincipalID *string
+	State               string
+	Mandatory           *bool
+	Limit               int
+	Cursor              *PaginationCursor
+}
+
+type BulkCompleteWorkItemsParams struct {
+	TenantID         string
+	WorkItemIDs      []string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+type WorkItemResult struct {
+	WorkItemID string `json:"work_item_id"`
+	Success    bool   `json:"success"`
+	Error      string `json:"error,omitempty"`
 }
 
 // =============================================================================

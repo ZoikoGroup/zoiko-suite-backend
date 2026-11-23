@@ -11,7 +11,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
-	"zoiko.io/workflow-svc/internal/store"
 )
 
 const (
@@ -1094,11 +1093,7 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 			actions = []string{"APPROVE", "REJECT", "REQUEST_CHANGES"}
 		} else if stage.StageType == domain.StageTypeQuorum {
 			// Check if principal is in quorum pool
-			// For now, check via store
-			var eligible bool
-			err := h.store.(*store.PgStore).Pool().QueryRow(r.Context(),
-				`SELECT EXISTS(SELECT 1 FROM workflow_stage_quorum_approvers WHERE workflow_stage_id = $1 AND approver_principal_id = $2)`,
-				stage.WorkflowStageID, principalID).Scan(&eligible)
+			eligible, err := h.store.IsQuorumApprover(r.Context(), stage.WorkflowStageID, principalID)
 			if err == nil && eligible {
 				canAct = true
 				actions = []string{"APPROVE", "REJECT"}

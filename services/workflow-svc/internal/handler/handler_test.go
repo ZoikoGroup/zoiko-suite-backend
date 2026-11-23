@@ -388,6 +388,9 @@ func (s *stubStore) FindCurrentStage(_ context.Context, _ string) (*domain.Workf
 func (s *stubStore) IsCurrentStageApprover(_ context.Context, _, _ string) (bool, error) {
 	return s.currentStageApprover, s.currentStageApproverErr
 }
+func (s *stubStore) IsQuorumApprover(_ context.Context, _, _ string) (bool, error) {
+	return s.currentStageApprover, s.currentStageApproverErr
+}
 func (s *stubStore) SubmitAction(_ context.Context, p domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
 	s.submitParams = p
 	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
