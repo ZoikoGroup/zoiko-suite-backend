@@ -144,3 +144,25 @@ func TestAC2_PlatformServiceIdentitiesProvisionedWithATenantsFirstRole(t *testin
 		t.Fatal("the other writer's grant must be untouched")
 	}
 }
+
+// OB-S8 / OB-S11: migration 000044 provisions obligations-svc's clock worker
+// identity: it may ask jurisdiction-rules-svc for a calculation and open an
+// escalation case, nothing more.
+func TestOBS8_ObligationsServiceIdentityProvisionedWithATenantsFirstRole(t *testing.T) {
+	f := newFixture(t)
+	entity := uuid.NewString()
+	if f.granted(t, "svc-obligations", entity, "OBLIGATION_CALCULATION_CALCULATE") {
+		t.Fatal("precondition: svc-obligations holds a grant in a tenant that has no role yet")
+	}
+	f.role(t)
+	for _, a := range []string{"OBLIGATION_CALCULATION_CALCULATE", "CASE_OPEN"} {
+		if !f.granted(t, "svc-obligations", entity, a) {
+			t.Fatalf("svc-obligations must hold %s on any entity of the tenant", a)
+		}
+	}
+	for _, a := range []string{actionDecisionRecord, actionDecisionRead, "OBLIGATION_CLOCK_WAIVE", "CASE_CLOSE"} {
+		if f.granted(t, "svc-obligations", entity, a) {
+			t.Fatalf("svc-obligations must not hold %s", a)
+		}
+	}
+}

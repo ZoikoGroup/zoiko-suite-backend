@@ -263,7 +263,7 @@ func stateEvent(to domain.ClockState) string {
 	case domain.ClockStateSuperseded:
 		return "obligation.clock.superseded"
 	}
-	return "obligation.clock.updated"
+	return "obligation.clock." + strings.ToLower(string(to)) // unreachable: every state is named above
 }
 
 // computedEffectiveAt is the logical instant of a computed move: due_at for
